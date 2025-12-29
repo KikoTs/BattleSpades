@@ -1,0 +1,52 @@
+# BattleSpades Server Configuration
+# Protocol 1.0 Battle Builders
+
+[server]
+name = "BattleSpades Server"
+port = 32887
+max_players = 32
+tick_rate = 60  # Server updates per second
+
+[network]
+timeout_ms = 10000
+max_connections = 64
+bandwidth_limit = 0  # 0 = unlimited
+
+[game]
+default_mode = "ctf"
+default_map = "classicgen"
+respawn_time = 5.0
+friendly_fire = false
+fall_damage = true
+build_damage = true
+
+[teams]
+team1_name = "Blue"
+team1_color = [0, 0, 255]
+team2_name = "Green"
+team2_color = [0, 255, 0]
+auto_balance = true
+balance_threshold = 2
+
+[weapons]
+rifle_damage = 49
+smg_damage = 29
+shotgun_damage = 27
+spade_damage = 50
+grenade_damage = 100
+
+[world]
+map_size_x = 512
+map_size_y = 512
+map_size_z = 64
+water_level = 62
+water_damage = true
+
+[admin]
+password = "changeme"
+log_commands = true
+
+[logging]
+level = "INFO"
+file = "server.log"
+console = true

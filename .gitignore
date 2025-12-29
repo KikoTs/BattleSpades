@@ -1,0 +1,66 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Cython generated files
+*.c
+*.cpp
+aoslib/*.c
+aoslib/*.html
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+server.log
+
+# Local config overrides
+config.local.toml
+
+# Map files (too large for git)
+maps/*.vxl
+!maps/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Aoslib built files
+aoslib/*.c
+aoslib/*.html
+aoslib/*.cpp
+aoslib/*.so.c
+!aoslib/*_c.cpp
