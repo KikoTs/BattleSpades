@@ -3,7 +3,7 @@
 
 [server]
 name = "BattleSpades Server"
-port = 32887
+port = 27015
 max_players = 32
 tick_rate = 60  # Server updates per second
 
@@ -47,6 +47,7 @@ password = "changeme"
 log_commands = true
 
 [logging]
-level = "INFO"
+level = "DEBUG"
 file = "server.log"
 console = true
+suppress_packets = [2, 4]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = PlayerUpdate)

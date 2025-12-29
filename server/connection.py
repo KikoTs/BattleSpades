@@ -10,7 +10,7 @@ from typing import Optional, TYPE_CHECKING
 from aoslib.packet import (
     MapDataStart, MapDataChunk, MapDataEnd,
     StateData, ExistingPlayer, CreatePlayer,
-    NewPlayerConnection, InitialInfo
+    NewPlayerConnection, InitialInfo, SteamSessionTicket
 )
 from aoslib.bytes import ByteReader
 
@@ -20,6 +20,19 @@ if TYPE_CHECKING:
     from server.player import Player
 
 logger = logging.getLogger(__name__)
+
+
+def lzf_decompress(data: bytes) -> bytes:
+    """Simple LZF decompression - fallback to zlib if LZF not available."""
+    try:
+        import lzf
+        return lzf.decompress(data, len(data) * 10)
+    except ImportError:
+        # Fallback - try zlib
+        try:
+            return zlib.decompress(data)
+        except:
+            return data
 
 
 class Connection:
@@ -37,44 +50,70 @@ class Connection:
         self.authenticated = False
         self.map_sent = False
         self.state_sent = False
+        self.steam_key: Optional[bytes] = None
     
     def send(self, data: bytes, reliable: bool = True):
         """Send packet to this connection."""
         import enet
         
+        # Add compression prefix (0x30 = uncompressed, 0x31 = LZF compressed)
+        prefixed_data = bytes([0x30]) + data
+        
         flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
-        packet = enet.Packet(data, flags)
+        packet = enet.Packet(prefixed_data, flags)
         self.peer.send(0, packet)
     
     def disconnect(self, reason: int = 0):
         """Disconnect this peer."""
         self.peer.disconnect(reason)
     
-    async def send_map_data(self):
-        """Send map data to client."""
-        logger.debug(f"Sending map data to {self.peer.address}")
+    def decrypt(self, data: bytes) -> bytes:
+        """Decrypt packet data using steam key."""
+        if not self.steam_key:
+            return data
+        return bytes(b ^ self.steam_key[i % len(self.steam_key)] for i, b in enumerate(data))
+    
+    def on_connect(self, data: int):
+        """Called when connection is established."""
+        logger.debug(f"Connection established from {self.peer.address} (protocol={data})")
+        # Protocol version check could go here
+        # For now just log it
+    
+    def on_disconnect(self):
+        """Called when connection is closed."""
+        logger.debug(f"Connection closed from {self.peer.address}")
+    
+    async def on_receive(self, data: bytes):
+        """Handle incoming packet - dispatches to appropriate handler."""
+        if len(data) < 2:
+            return
         
-        # Send MapDataStart
-        start_packet = MapDataStart()
-        self.send(bytes(start_packet.generate()))
+        # Handle compression prefix
+        if data[0] == 0x31:
+            # LZF compressed
+            data = lzf_decompress(data[1:])
+        else:
+            # Skip prefix byte
+            data = data[1:]
         
-        # Get compressed map data
-        chunker = self.server.world_manager.get_chunker()
+        # Decrypt if we have steam key
+        data = self.decrypt(data)
         
-        percent = 0
-        for chunk in chunker.iter():
-            chunk_packet = MapDataChunk()
-            chunk_packet.percent_complete = min(99, percent)
-            chunk_packet.data = chunk
-            self.send(bytes(chunk_packet.generate()))
-            percent += 1
+        if len(data) < 1:
+            return
         
-        # Send MapDataEnd
-        end_packet = MapDataEnd()
-        self.send(bytes(end_packet.generate()))
+        packet_id = data[0]
+        logger.debug(f"RECV packet_id={packet_id} len={len(data)} from {self.peer.address}")
         
-        self.map_sent = True
-        logger.debug(f"Map data sent to {self.peer.address}")
+        # Route to handler
+        if self.player:
+            # Forward to packet handler for joined players
+            from protocol.packet_handler import PacketHandler
+            handler = PacketHandler(self.server)
+            await handler.handle(self.player, data)
+        else:
+            # Handle pre-join packets
+            await self.handle_pre_join_packet(data)
     
     async def send_state_data(self, player_id: int):
         """Send game state to newly joined player."""
@@ -151,12 +190,71 @@ class Connection:
             return
         
         packet_id = data[0]
+        logger.debug(f"PRE-JOIN packet_id={packet_id} len={len(data)} hex={data[:32].hex()}")
+        
         reader = ByteReader(data[1:])
         
+        # SteamSessionTicket (48) - client sends this first after connect
+        if packet_id == 48:
+            logger.info(f"Received SteamSessionTicket from {self.peer.address}")
+            try:
+                packet = SteamSessionTicket(reader)
+                self.steam_key = getattr(packet, 'ticket', None)
+                self.authenticated = True
+                logger.debug(f"Steam authenticated, sending connection data")
+                # Now send all connection data
+                await self.send_connection_data()
+            except Exception as e:
+                logger.error(f"Error parsing SteamSessionTicket: {e}")
+                # Still proceed even if parsing fails
+                await self.send_connection_data()
+        
         # NewPlayerConnection (15)
-        if packet_id == 15:
+        elif packet_id == 15:
+            logger.debug(f"Decoding NewPlayerConnection")
             packet = NewPlayerConnection(reader)
             await self._on_new_player(packet)
+        else:
+            logger.debug(f"Unknown pre-join packet ID: {packet_id}")
+    
+    async def send_connection_data(self):
+        """Send all initial data to client after authentication."""
+        logger.info(f"Sending connection data to {self.peer.address}")
+        
+        # Send initial info
+        # await self.send_info()
+        
+        # Send map data
+        await self.send_map_data()
+        
+        # Note: State and player list will be sent after client sends NewPlayerConnection
+    
+    async def send_map_data(self):
+        """Send map data to client."""
+        logger.debug(f"Sending map data to {self.peer.address}")
+        
+        # Send MapDataStart
+        start_packet = MapDataStart()
+        self.send(bytes(start_packet.generate()))
+        
+        # Get compressed map data
+        chunker = self.server.world_manager.get_chunker()
+        
+        chunk_list = list(chunker.iter())
+        total_chunks = len(chunk_list)
+        
+        for idx, chunk in enumerate(chunk_list):
+            chunk_packet = MapDataChunk()
+            chunk_packet.percent_complete = min(99, int((idx / max(1, total_chunks)) * 100))
+            chunk_packet.data = chunk
+            self.send(bytes(chunk_packet.generate()))
+        
+        # Send MapDataEnd
+        end_packet = MapDataEnd()
+        self.send(bytes(end_packet.generate()))
+        
+        self.map_sent = True
+        logger.info(f"Map data sent to {self.peer.address} ({total_chunks} chunks)")
     
     async def _on_new_player(self, packet: NewPlayerConnection):
         """Handle new player joining."""

@@ -40,6 +40,9 @@ class PacketHandler:
         
         packet_id = data[0]
         
+        # Log received packet
+        logger.debug(f"RECV [{player.name}] packet_id={packet_id} len={len(data)} hex={data[:32].hex()}...")
+        
         # Get handler
         handler = _handlers.get(packet_id)
         if handler is None:
@@ -55,6 +58,7 @@ class PacketHandler:
         try:
             reader = ByteReader(data[1:])  # Skip packet ID byte
             packet = packet_class(reader)
+            logger.debug(f"DECODE [{player.name}] {packet_class.__name__}")
             await handler(self.server, player, packet)
         except Exception as e:
             logger.error(f"Error handling packet {packet_id}: {e}", exc_info=True)

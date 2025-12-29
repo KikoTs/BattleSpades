@@ -23,6 +23,7 @@ from .player import Player
 from .team import Team
 from .world_manager import WorldManager
 from .connection import Connection
+from .a2s_query import A2SHandler
 
 if TYPE_CHECKING:
     import enet
@@ -62,6 +63,9 @@ class BattleSpadesServer:
         # World
         self.world_manager = WorldManager(config)
         
+        # A2S Query handler for Steam browser and LAN discovery
+        self.a2s_handler = A2SHandler(self)
+        
         # Game mode
         self.mode = None
     
@@ -86,15 +90,22 @@ class BattleSpadesServer:
         
         logger.info(f"Starting BattleSpades server on port {self.config.port}")
         
-        # Create ENet host
-        address = enet.Address(b"0.0.0.0", self.config.port)
+        # Create ENet host - matching reference pattern
+        address = enet.Address(b"", self.config.port)
         self.host = enet.Host(
             address,
             peerCount=self.config.max_players,
-            channelLimit=2,
+            channelLimit=1,  # Reference uses 1 channel
             incomingBandwidth=0,
             outgoingBandwidth=0,
         )
+        
+        # Enable compression like reference
+        self.host.compress_with_range_coder()
+        
+        # Set intercept for A2S queries (reference pattern)
+        self.host.intercept = self._intercept
+        logger.info("A2S/LAN intercept registered")
         
         # Load map
         self.world_manager.load_map(self.config.map_name)
@@ -117,7 +128,10 @@ class BattleSpadesServer:
         )
     
     async def stop(self):
-        """Stop the server gracefully."""
+        """Stop the server."""
+        if not self.running:
+            return
+        
         logger.info("Stopping server...")
         self.running = False
         
@@ -125,8 +139,8 @@ class BattleSpadesServer:
             await self.mode.on_mode_end()
         
         # Disconnect all players
-        for connection in list(self.connections.values()):
-            connection.disconnect()
+        for peer in list(self.connections.keys()):
+            peer.disconnect()
         
         if self.host:
             self.host.flush()
@@ -134,26 +148,51 @@ class BattleSpadesServer:
         
         logger.info("Server stopped")
     
-    async def _network_loop(self):
-        """Handle ENet events."""
+    def _intercept(self, address, data: bytes):
+        """Intercept raw UDP packets for A2S/LAN queries."""
+        # Handle A2S queries here
+        return self.a2s_handler.intercept(address, data)
+    
+    def _net_update(self):
+        """Process ENet events - synchronous, called from network loop."""
         import enet
         
+        while True:
+            if self.host is None:
+                return
+            
+            try:
+                event = self.host.service(0)
+                event_type = event.type
+                
+                if not event or event_type == enet.EVENT_TYPE_NONE:
+                    return
+                
+                peer = event.peer
+                
+                if event_type == enet.EVENT_TYPE_CONNECT:
+                    logger.info(f"ENET CONNECT from {peer.address} data={event.data}")
+                    self._on_connect_sync(peer, event.data)
+                    
+                elif event_type == enet.EVENT_TYPE_DISCONNECT:
+                    logger.info(f"ENET DISCONNECT from {peer.address}")
+                    self._on_disconnect_sync(peer)
+                    
+                elif event_type == enet.EVENT_TYPE_RECEIVE:
+                    logger.debug(f"ENET RECEIVE from {peer.address} len={len(event.packet.data)}")
+                    asyncio.create_task(self._on_receive(peer, event.packet))
+                    
+            except Exception as e:
+                logger.error(f"Error in net_update: {e}", exc_info=True)
+    
+    async def _network_loop(self):
+        """Handle ENet events."""
         while self.running:
             if self.host is None:
                 break
             
-            event = self.host.service(0)
-            
-            if event.type == enet.EVENT_TYPE_CONNECT:
-                await self._on_connect(event.peer)
-            
-            elif event.type == enet.EVENT_TYPE_DISCONNECT:
-                await self._on_disconnect(event.peer)
-            
-            elif event.type == enet.EVENT_TYPE_RECEIVE:
-                await self._on_receive(event.peer, event.packet.data)
-            
-            await asyncio.sleep(0.001)  # 1ms poll interval
+            self._net_update()
+            await asyncio.sleep(1/60)  # 60 Hz network update
     
     async def _game_loop(self):
         """Main game tick loop at configured tick rate."""
@@ -170,6 +209,9 @@ class BattleSpadesServer:
                 # Update players
                 for player in self.players.values():
                     player.update(self.tick_interval)
+                
+                # Update A2S handler
+                self.a2s_handler.update()
                 
                 # Update game mode
                 if self.mode:
@@ -206,23 +248,26 @@ class BattleSpadesServer:
             
             await asyncio.sleep(update_interval)
     
-    async def _on_connect(self, peer):
-        """Handle new connection."""
-        peer_id = peer.incomingPeerID
-        logger.info(f"New connection from {peer.address}")
+    def _on_connect_sync(self, peer, data: int = 0):
+        """Handle new connection (sync version for net_update)."""
+        logger.info(f"New connection from {peer.address} (proto_ver={data})")
         
-        connection = Connection(peer, self)
-        self.connections[peer_id] = connection
+        # Check if connection already exists
+        connection = self.connections.get(peer)
+        if connection is None:
+            connection = Connection(peer, self)
+            self.connections[peer] = connection
         
-        # Send initial handshake / map data
-        await connection.send_map_data()
+        # Call connection's on_connect
+        connection.on_connect(data)
     
-    async def _on_disconnect(self, peer):
-        """Handle disconnection."""
-        peer_id = peer.incomingPeerID
+    def _on_disconnect_sync(self, peer):
+        """Handle disconnection (sync version for net_update)."""
+        connection = self.connections.pop(peer, None)
+        if not connection:
+            return
         
-        connection = self.connections.pop(peer_id, None)
-        if connection and connection.player:
+        if connection.player:
             player = connection.player
             logger.info(f"Player {player.name} disconnected")
             
@@ -233,36 +278,36 @@ class BattleSpadesServer:
             # Remove from players
             self.players.pop(player.id, None)
             
-            # Notify game mode
-            if self.mode:
-                await self.mode.on_player_leave(player)
-            
             # Broadcast disconnect
             left_packet = PlayerLeft()
             left_packet.player_id = player.id
             self.broadcast(bytes(left_packet.generate()))
-    
-    async def _on_receive(self, peer, data: bytes):
-        """Handle incoming packet."""
-        peer_id = peer.incomingPeerID
-        connection = self.connections.get(peer_id)
         
+        connection.on_disconnect()
+    
+    async def _on_receive(self, peer, packet):
+        """Handle received packet."""
+        connection = self.connections.get(peer)
         if not connection:
             return
         
-        # Route to packet handler
-        from protocol.packet_handler import PacketHandler
-        handler = PacketHandler(self)
+        # Get packet data
+        data = bytes(packet.data)
         
-        if connection.player:
-            await handler.handle(connection.player, data)
-        else:
-            # Handle pre-join packets (NewPlayerConnection, etc.)
-            await connection.handle_pre_join_packet(data)
+        # Let connection handle packet routing (includes decompression, decryption)
+        await connection.on_receive(data)
+    
+    def get_connection(self, peer):
+        """Get connection for a peer."""
+        return self.connections.get(peer)
     
     def broadcast(self, data: bytes, exclude: Optional[Player] = None):
         """Send packet to all connected players."""
         import enet
+        
+        packet_id = data[0] if len(data) > 0 else -1
+        if packet_id not in self.config.log_suppress_packets:
+            logger.debug(f"SEND broadcast packet_id={packet_id} len={len(data)} to {len(self.connections)} clients")
         
         for connection in self.connections.values():
             if exclude and connection.player == exclude:
@@ -271,6 +316,10 @@ class BattleSpadesServer:
     
     def broadcast_team(self, team_id: int, data: bytes):
         """Send packet to all players on a team."""
+        packet_id = data[0] if len(data) > 0 else -1
+        if packet_id not in self.config.log_suppress_packets:
+            logger.debug(f"SEND team={team_id} packet_id={packet_id} len={len(data)}")
+        
         for connection in self.connections.values():
             if connection.player and connection.player.team == team_id:
                 connection.send(data)

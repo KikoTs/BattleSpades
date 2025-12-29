@@ -30,6 +30,7 @@ class ServerConfig:
     friendly_fire: bool = False
     fall_damage: bool = True
     build_damage: bool = True
+    score_limit: int = 10
     
     # Team settings
     team1_name: str = "Blue"
@@ -49,9 +50,11 @@ class ServerConfig:
     # World settings
     map_size_x: int = 512
     map_size_y: int = 512
-    map_size_z: int = 64
+    map_size_z: int = 255
     water_level: int = 62
     water_damage: bool = True
+    fog_color_rgb: Tuple[int, int, int] = (128, 200, 255)
+    maps_path: str = "maps"
     
     # Admin settings
     admin_password: str = "changeme"
@@ -61,6 +64,24 @@ class ServerConfig:
     log_level: str = "INFO"
     log_file: str = "server.log"
     log_console: bool = True
+    log_suppress_packets: List[int] = field(default_factory=lambda: [2])  # Suppress WorldUpdate by default
+    
+    # Aliases for compatibility with server code
+    @property
+    def map_name(self) -> str:
+        return self.default_map
+    
+    @property
+    def game_mode(self) -> str:
+        return self.default_mode
+    
+    @property
+    def server_name(self) -> str:
+        return self.name
+    
+    @property
+    def fog_color(self) -> Tuple[int, int, int]:
+        return self.fog_color_rgb
 
 
 def load_config(path: Optional[Path] = None) -> ServerConfig:
@@ -149,5 +170,7 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.log_level = lg.get("level", config.log_level)
         config.log_file = lg.get("file", config.log_file)
         config.log_console = lg.get("console", config.log_console)
+        if "suppress_packets" in lg:
+            config.log_suppress_packets = lg["suppress_packets"]
     
     return config

@@ -29,7 +29,7 @@ logger = logging.getLogger("BattleSpades")
 def handle_shutdown(server: BattleSpadesServer):
     """Signal handler for graceful shutdown."""
     logger.info("Shutdown signal received...")
-    server.stop()
+    asyncio.create_task(server.stop())
 
 
 async def main():
@@ -41,6 +41,11 @@ async def main():
     # Load configuration
     config_path = Path(__file__).parent / "config.toml"
     config = load_config(config_path)
+    
+    # Apply log level from config
+    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+    logging.getLogger().setLevel(log_level)
+    logger.info(f"Log level set to: {config.log_level.upper()}")
 
     # Create and start server
     server = BattleSpadesServer(config)
@@ -55,11 +60,11 @@ async def main():
             signal.signal(sig, lambda s, f: handle_shutdown(server))
 
     try:
-        await server.run()
+        await server.start()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
     finally:
-        await server.shutdown()
+        await server.stop()
 
     logger.info("Server stopped.")
 

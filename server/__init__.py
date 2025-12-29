@@ -8,6 +8,7 @@ from .player import Player
 from .team import Team
 from .world_manager import WorldManager
 from .connection import Connection
+from .a2s_query import A2SHandler
 
 __all__ = [
     "ServerConfig",
@@ -17,4 +18,5 @@ __all__ = [
     "Team",
     "WorldManager",
     "Connection",
+    "A2SHandler",
 ]
