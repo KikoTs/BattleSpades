@@ -87,6 +87,10 @@ class CTFMode(BaseMode):
             if not player.alive:
                 continue
             
+            # Skip spectators (team must be 0 or 1)
+            if player.team not in (0, 1):
+                continue
+            
             # Check intel pickup
             enemy_team = 1 - player.team
             if self.intel_holder[enemy_team] is None:

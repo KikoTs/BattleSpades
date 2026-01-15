@@ -13,7 +13,7 @@ from typing import Dict, Optional, TYPE_CHECKING
 from aoslib.vxl import AceMap
 from aoslib.packet import (
     WorldUpdate, StateData, CreatePlayer, ExistingPlayer, 
-    PlayerLeft, MapDataStart, MapDataChunk, MapDataEnd,
+    PlayerLeft, MapSyncStart, MapSyncChunk, MapSyncEnd,
     ClockSync, FogColor, ChatMessage
 )
 from aoslib.bytes import ByteWriter
@@ -208,7 +208,7 @@ class BattleSpadesServer:
                 
                 # Update players
                 for player in self.players.values():
-                    player.update(self.tick_interval)
+                    await player.update(self.tick_interval)
                 
                 # Update A2S handler
                 self.a2s_handler.update()
@@ -244,7 +244,7 @@ class BattleSpadesServer:
             
             # Broadcast update
             data = bytes(world_update.generate())
-            self.broadcast(data)
+            #self.broadcast(data)
             
             await asyncio.sleep(update_interval)
     

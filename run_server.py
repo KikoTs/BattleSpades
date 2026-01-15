@@ -23,6 +23,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# Add file handler
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+file_handler = logging.FileHandler(log_dir / "log.txt", mode='a')
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
+logging.getLogger().addHandler(file_handler)
+
 logger = logging.getLogger("BattleSpades")
 
 

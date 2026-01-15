@@ -12,7 +12,7 @@ Contains:
 # Map constants
 VXL_MAP_X = 512
 VXL_MAP_Y = 512
-VXL_MAP_Z = 255
+VXL_MAP_Z = 240
 VXL_DEFAULT_COLOR = 0xFF674028
 
 # These will be properly imported after Cython build

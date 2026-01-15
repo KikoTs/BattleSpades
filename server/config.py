@@ -33,10 +33,10 @@ class ServerConfig:
     score_limit: int = 10
     
     # Team settings
-    team1_name: str = "Blue"
-    team1_color: Tuple[int, int, int] = (0, 0, 255)
-    team2_name: str = "Green"
-    team2_color: Tuple[int, int, int] = (0, 255, 0)
+    team1_name: str = "TEAM1_COLOR"
+    team1_color: Tuple[int, int, int] = (44, 117, 179)
+    team2_name: str = "TEAM2_COLOR"
+    team2_color: Tuple[int, int, int] = (137, 179, 44)
     auto_balance: bool = True
     balance_threshold: int = 2
     

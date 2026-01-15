@@ -64,6 +64,11 @@ class Player:
         self.yaw: float = 0.0    # Horizontal angle (radians)
         self.pitch: float = 0.0  # Vertical angle (radians)
         
+        # 3D orientation vector (for WorldUpdate)
+        self.o_x: float = 1.0
+        self.o_y: float = 0.0
+        self.o_z: float = 0.0
+        
         # Velocity
         self.vx: float = 0.0
         self.vy: float = 0.0
@@ -114,14 +119,14 @@ class Player:
         self.x, self.y, self.z = value
     
     @property
-    def orientation(self) -> Tuple[float, float]:
-        """Get orientation as (yaw, pitch) tuple."""
-        return (self.yaw, self.pitch)
+    def orientation(self) -> Tuple[float, float, float]:
+        """Get orientation as (o_x, o_y, o_z) tuple."""
+        return (self.o_x, self.o_y, self.o_z)
     
     @orientation.setter
-    def orientation(self, value: Tuple[float, float]):
+    def orientation(self, value: Tuple[float, float, float]):
         """Set orientation from tuple."""
-        self.yaw, self.pitch = value
+        self.o_x, self.o_y, self.o_z = value
     
     @property
     def velocity(self) -> Tuple[float, float, float]:
@@ -252,6 +257,27 @@ class Player:
         """Update weapon input state."""
         self.input.primary_fire = primary
         self.input.secondary_fire = secondary
+    
+    def get_input_byte(self) -> int:
+        """Pack input state into a single byte for WorldUpdate."""
+        byte = 0
+        if self.input.up:
+            byte |= 0x01
+        if self.input.down:
+            byte |= 0x02
+        if self.input.left:
+            byte |= 0x04
+        if self.input.right:
+            byte |= 0x08
+        if self.input.jump:
+            byte |= 0x10
+        if self.input.crouch:
+            byte |= 0x20
+        if self.input.sneak:
+            byte |= 0x40
+        if self.input.sprint:
+            byte |= 0x80
+        return byte
     
     def send(self, data: bytes, reliable: bool = True):
         """Send data to this player's connection."""

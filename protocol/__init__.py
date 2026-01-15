@@ -7,8 +7,6 @@ Packet handling using aoslib Cython packets.
 from aoslib.packet import (
     Loader,
     CLIENT_LOADERS,
-    tofixed,
-    fromfixed,
 )
 
 from .packet_handler import (
@@ -25,8 +23,6 @@ from .serialization import (
 __all__ = [
     "Loader",
     "CLIENT_LOADERS",
-    "tofixed",
-    "fromfixed",
     "handle_packet",
     "register_handler",
     "PacketHandler",

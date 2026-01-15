@@ -5,6 +5,7 @@ Protocol and game constants for Ace of Spades Battle Builders.
 # =============================================================================
 # Protocol Version
 # =============================================================================
+from enum import IntEnum
 PROTOCOL_VERSION = 1
 PROTOCOL_NAME = "Battle Builders"
 
@@ -13,7 +14,7 @@ PROTOCOL_NAME = "Battle Builders"
 # =============================================================================
 MAP_SIZE_X = 512
 MAP_SIZE_Y = 512
-MAP_SIZE_Z = 64
+MAP_SIZE_Z = 255
 
 # Water level (Z is down, so this is near the bottom)
 WATER_LEVEL = 62
@@ -185,3 +186,35 @@ DISCONNECT_BANNED = 1
 DISCONNECT_KICKED = 2
 DISCONNECT_WRONG_VERSION = 3
 DISCONNECT_FULL = 4
+
+
+# =============================================================================
+# Team Classes
+# =============================================================================
+# Correct Classes dumped from the client
+class CLASS(IntEnum):
+    SOLDIER = 0
+    SCOUT = 1
+    ROCKETEER = 2
+    MINER = 3
+    ZOMBIE = 4
+    CLASSIC_SOLDIER = 5
+    GANGSTER_1 = 6
+    GANGSTER_2 = 7
+    GANGSTER_3 = 8
+    GANGSTER_4 = 9
+    GANGSTER_VIP_1 = 10
+    GANGSTER_VIP_2 = 11
+    ENGINEER = 12
+    UGCBUILDER = 13
+    FAST_ZOMBIE = 14
+    JUMP_ZOMBIE = 15
+    SPECIALIST = 16
+    MEDIC = 17
+    NOOF = 18
+    
+DEFAULT_TEAM_CLASSES = [CLASS.SOLDIER, CLASS.SCOUT, CLASS.ENGINEER, CLASS.MINER, CLASS.ROCKETEER, CLASS.SPECIALIST, CLASS.MEDIC]
+CLASSIC_TEAM_CLASSES = [CLASS.CLASSIC_SOLDIER]
+MAFIA_TEAM_CLASSES = [CLASS.GANGSTER_1, CLASS.GANGSTER_2, CLASS.GANGSTER_3, CLASS.GANGSTER_4]
+UGC_TEAM_CLASSES = [CLASS.UGCBUILDER]
+ZOMBIE_TEAM_CLASSES = [CLASS.ZOMBIE, CLASS.FAST_ZOMBIE, CLASS.JUMP_ZOMBIE]

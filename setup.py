@@ -36,6 +36,7 @@ extensions = [
         "aoslib.vxl",
         ["aoslib/vxl.pyx"],
         include_dirs=[np.get_include()],
+        language="c++",
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
     ),

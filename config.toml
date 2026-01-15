@@ -14,7 +14,7 @@ bandwidth_limit = 0  # 0 = unlimited
 
 [game]
 default_mode = "ctf"
-default_map = "classicgen"
+default_map = "CityOfChicago"
 respawn_time = 5.0
 friendly_fire = false
 fall_damage = true
@@ -38,7 +38,7 @@ grenade_damage = 100
 [world]
 map_size_x = 512
 map_size_y = 512
-map_size_z = 64
+map_size_z = 255
 water_level = 62
 water_damage = true
 
@@ -50,4 +50,4 @@ log_commands = true
 level = "DEBUG"
 file = "server.log"
 console = true
-suppress_packets = [2, 4]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = PlayerUpdate)
+suppress_packets = [2, 4, 56, 57]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = PlayerUpdate)
