@@ -39,9 +39,7 @@ class PacketHandler:
             return
         
         packet_id = data[0]
-        
-        # Log received packet
-        logger.debug(f"RECV [{player.name}] packet_id={packet_id} len={len(data)} hex={data[:32].hex()}...")
+        # Note: RECV logging is done in connection.py::on_receive() with full hex + parsed fields
         
         # Get handler
         handler = _handlers.get(packet_id)
@@ -58,7 +56,9 @@ class PacketHandler:
         try:
             reader = ByteReader(data[1:])  # Skip packet ID byte
             packet = packet_class(reader)
-            logger.debug(f"DECODE [{player.name}] {packet_class.__name__}")
+            # Only log DECODE for non-suppressed packets
+            if packet_id not in self.server.config.log_suppress_packets:
+                logger.debug(f"DECODE [{player.name}] {packet_class.__name__}")
             await handler(self.server, player, packet)
         except Exception as e:
             logger.error(f"Error handling packet {packet_id}: {e}", exc_info=True)

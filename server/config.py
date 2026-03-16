@@ -53,7 +53,7 @@ class ServerConfig:
     map_size_z: int = 255
     water_level: int = 62
     water_damage: bool = True
-    fog_color_rgb: Tuple[int, int, int] = (128, 200, 255)
+    fog_color_rgb: Tuple[int, int, int] = (12, 13, 11)
     maps_path: str = "maps"
     
     # Admin settings
@@ -64,7 +64,7 @@ class ServerConfig:
     log_level: str = "INFO"
     log_file: str = "server.log"
     log_console: bool = True
-    log_suppress_packets: List[int] = field(default_factory=lambda: [2])  # Suppress WorldUpdate by default
+    log_suppress_packets: List[int] = field(default_factory=lambda: [2, 4, 11])  # Suppress WorldUpdate, ClientData, SetColor
     
     # Aliases for compatibility with server code
     @property

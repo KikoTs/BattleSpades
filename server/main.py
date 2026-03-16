@@ -179,7 +179,6 @@ class BattleSpadesServer:
                     self._on_disconnect_sync(peer)
                     
                 elif event_type == enet.EVENT_TYPE_RECEIVE:
-                    logger.debug(f"ENET RECEIVE from {peer.address} len={len(event.packet.data)}")
                     asyncio.create_task(self._on_receive(peer, event.packet))
                     
             except Exception as e:

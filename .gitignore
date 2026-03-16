@@ -64,3 +64,5 @@ aoslib/*.html
 aoslib/*.cpp
 aoslib/*.so.c
 !aoslib/*_c.cpp
+
+ace.py/

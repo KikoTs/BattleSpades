@@ -25,6 +25,47 @@ for name, cls in inspect.getmembers(aoslib.packet):
 
 def get_packet_name(packet_id: int) -> str:
     return PACKET_NAMES.get(packet_id, "Unknown")
+
+def format_packet_fields(packet) -> str:
+    """Format packet fields for debug logging."""
+    fields = []
+    # Get all public attributes (exclude private/dunder and methods)
+    for attr in dir(packet):
+        if attr.startswith('_') or attr in ('id', 'read', 'write', 'generate', 'compress_packet'):
+            continue
+        try:
+            value = getattr(packet, attr)
+            # Skip methods and callables
+            if callable(value):
+                continue
+            # Truncate long lists/bytes for readability
+            if isinstance(value, (list, tuple)) and len(value) > 5:
+                value = f"{type(value).__name__}[{len(value)} items]"
+            elif isinstance(value, bytes) and len(value) > 32:
+                value = f"bytes[{len(value)}]"
+            elif isinstance(value, str) and len(value) > 50:
+                value = f"'{value[:50]}...'"
+            fields.append(f"{attr}={value!r}")
+        except Exception:
+            pass
+    return ", ".join(fields) if fields else "(no fields)"
+
+def try_parse_packet_for_logging(packet_id: int, data: bytes):
+    """Try to parse packet data and return formatted fields, or None if failed."""
+    if packet_id not in PACKET_NAMES:
+        return None
+    packet_name = PACKET_NAMES[packet_id]
+    try:
+        packet_class = getattr(aoslib.packet, packet_name, None)
+        if packet_class is None:
+            return None
+        reader = ByteReader(data[1:])  # Skip packet ID byte
+        packet = packet_class()
+        packet.read(reader)
+        return format_packet_fields(packet)
+    except Exception as e:
+        return f"(parse error: {e})"
+
 from aoslib.bytes import ByteReader
 
 if TYPE_CHECKING:
@@ -35,32 +76,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def lzf_compress(s: bytes) -> bytes:
-    """Compress a bytes object using the LZF algorithm (chunking only)."""
-    result = bytearray()
-    
-    # Split into 32-byte chunks
-    while len(s) > 32:
-        result.extend(b'\x1F' + s[:32])
-        s = s[32:]
-    
-    if len(s) > 0:
-        result.extend(bytes([len(s)-1]) + s)
-    
-    return bytes(result)
-
-
-def lzf_decompress(data: bytes) -> bytes:
-    """Simple LZF decompression - fallback to zlib if LZF not available."""
-    try:
-        import lzf
-        return lzf.decompress(data, len(data) * 10)
-    except (ImportError, AttributeError):
-        # Fallback - try zlib (lzf module may not have decompress)
-        try:
-            return zlib.decompress(data)
-        except:
-            return data
+from server.util import lzf_compress, lzf_decompress
 
 
 class Connection:
@@ -78,7 +94,7 @@ class Connection:
         self.authenticated = False
         self.map_sent = False
         self.state_sent = False
-        self.steam_key: Optional[bytes] = None
+        self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
         
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
@@ -94,7 +110,10 @@ class Connection:
         if not suppressed:
             hex_data = ' '.join(f'{b:02X}' for b in data)
             packet_name = get_packet_name(packet_id)
+            parsed_fields = try_parse_packet_for_logging(packet_id, data)
             logger.debug(f"SEND packet_id={packet_id} ({packet_name}) len={len(data)} hex={hex_data} to {self.peer.address}")
+            if parsed_fields:
+                logger.debug(f"  -> Fields: {parsed_fields}")
         
         # Add compression (chunking using fake LZF) and prefix
         compressed = lzf_compress(data)
@@ -144,7 +163,7 @@ class Connection:
             # Skip prefix byte
             data = data[1:]
         
-        # Decrypt if we have steam key
+        # Decrypt ONLY if player is fully joined (pre-join packets are NOT encrypted)
         data = self.decrypt(data)
         
         if len(data) < 1:
@@ -156,7 +175,11 @@ class Connection:
         suppressed = packet_id in self.server.config.log_suppress_packets
         if not suppressed:
              packet_name = get_packet_name(packet_id)
-             logger.debug(f"RECV packet_id={packet_id} ({packet_name}) len={len(data)} from {self.peer.address}")
+             hex_data = ' '.join(f'{b:02X}' for b in data)
+             parsed_fields = try_parse_packet_for_logging(packet_id, data)
+             logger.debug(f"RECV packet_id={packet_id} ({packet_name}) len={len(data)} hex={hex_data} from {self.peer.address}")
+             if parsed_fields:
+                 logger.debug(f"  -> Fields: {parsed_fields}")
         
         # Check if anyone is waiting for this packet
         if packet_id in self._waiters:
@@ -241,7 +264,7 @@ class Connection:
     async def send_skybox(self):
         """Send skybox data to client."""
         skybox = SkyboxData()
-        skybox.value = "CityOfChicago.txt"
+        skybox.value = "Chicago.txt"
         self.send(bytes(skybox.generate()), prefix=0x30)
     
     async def send_existing_players(self, new_player: 'Player' = None):
@@ -284,9 +307,13 @@ class Connection:
             logger.info(f"Received SteamSessionTicket from {self.peer.address}")
             try:
                 packet = SteamSessionTicket(reader)
+                # Set steam key immediately - subsequent packets will be decrypted
                 self.steam_key = getattr(packet, 'ticket', None)
                 self.authenticated = True
-                logger.debug(f"Steam authenticated, sending connection data")
+                if self.steam_key:
+                    logger.debug(f"Steam key set, len={len(self.steam_key)}")
+                else:
+                    logger.debug(f"No steam key (offline mode)")
                 # Now send all connection data
                 await self.send_connection_data()
             except Exception as e:

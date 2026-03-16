@@ -50,4 +50,4 @@ log_commands = true
 level = "DEBUG"
 file = "server.log"
 console = true
-suppress_packets = [2, 4, 56, 57]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = PlayerUpdate)
+suppress_packets = [2, 4, 11, 56, 57]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = ClientData, 11 = SetColor)

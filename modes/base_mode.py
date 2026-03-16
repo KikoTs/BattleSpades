@@ -141,11 +141,13 @@ class BaseMode(ABC):
     
     async def broadcast_message(self, message: str):
         """Broadcast a system message to all players."""
-        from protocol.packets import ChatMessage
-        from aoslib.constants import CHAT_SYSTEM
+        from aoslib.packet import ChatMessage
         
-        packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=message)
-        self.server.broadcast(packet.write())
+        packet = ChatMessage()
+        packet.player_id = 255  # System message
+        packet.chat_type = 2  # CHAT_SYSTEM
+        packet.value = message
+        self.server.broadcast(bytes(packet.generate()))
     
     async def check_win_condition(self) -> Optional[int]:
         """
