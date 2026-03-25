@@ -81,3 +81,5 @@ aoslib-reversed/
 .exp
 .lib
 .obj
+
+logs/
