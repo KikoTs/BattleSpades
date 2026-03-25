@@ -2,6 +2,15 @@
 Player commands - available to all players.
 """
 
+from server.game_constants import (
+    CHAT_ALL,
+    KILL_TEAM_CHANGE,
+    TEAM1,
+    TEAM2,
+    TEAM_SPECTATOR,
+)
+from shared.packet import ChatMessage, KillAction
+
 from .command_handler import register_command, CommandContext, send_message, get_all_commands
 
 
@@ -54,44 +63,45 @@ async def cmd_kill(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "You're already dead!")
         return
     
-    ctx.player.die(killer=ctx.player, kill_type=5)  # KILL_TEAM_CHANGE (suicide)
+    ctx.player.die(killer=ctx.player, kill_type=KILL_TEAM_CHANGE)
     
     # Broadcast kill
-    from protocol.packets import KillAction
-    packet = KillAction(
-        player_id=ctx.player.id,
-        killer_id=ctx.player.id,
-        kill_type=5,
-        respawn_time=int(ctx.server.config.respawn_time),
-    )
-    ctx.server.broadcast(packet.write())
+    packet = KillAction()
+    packet.player_id = ctx.player.id
+    packet.killer_id = ctx.player.id
+    packet.kill_type = KILL_TEAM_CHANGE
+    packet.respawn_time = int(ctx.server.config.respawn_time)
+    packet.kill_count = ctx.player.kills
+    packet.isDominationKill = 0
+    packet.isRevengeKill = 0
+    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(
     name="team",
-    usage="/team <blue|green|spectator>",
+    usage="/team <team1|team2|spectator>",
     description="Change your team",
 )
 async def cmd_team(ctx: CommandContext):
     """Change team."""
     if not ctx.args:
-        await send_message(ctx.server, ctx.player, "Usage: /team <blue|green|spectator>")
+        await send_message(ctx.server, ctx.player, "Usage: /team <team1|team2|spectator>")
         return
     
     team_name = ctx.args[0].lower()
     
     team_map = {
-        "blue": 0,
-        "0": 0,
-        "green": 1, 
-        "1": 1,
-        "spectator": -1,
-        "spec": -1,
-        "-1": -1,
+        "team1": TEAM1,
+        str(TEAM1): TEAM1,
+        "team2": TEAM2,
+        str(TEAM2): TEAM2,
+        "spectator": TEAM_SPECTATOR,
+        "spec": TEAM_SPECTATOR,
+        str(TEAM_SPECTATOR): TEAM_SPECTATOR,
     }
     
     if team_name not in team_map:
-        await send_message(ctx.server, ctx.player, "Invalid team. Use: blue, green, or spectator")
+        await send_message(ctx.server, ctx.player, "Invalid team. Use: team1, team2, or spectator")
         return
     
     new_team = team_map[team_name]
@@ -112,7 +122,7 @@ async def cmd_team(ctx: CommandContext):
     
     # Kill player to respawn on new team
     if ctx.player.alive:
-        ctx.player.die(kill_type=5)
+        ctx.player.die(kill_type=KILL_TEAM_CHANGE)
     
     team_name = ctx.server.teams[new_team].name if new_team in ctx.server.teams else "Spectator"
     await send_message(ctx.server, ctx.player, f"You joined {team_name}")
@@ -184,12 +194,12 @@ async def cmd_me(ctx: CommandContext):
     if not ctx.raw_args:
         return
     
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_ALL
-    
     message = f"* {ctx.player.name} {ctx.raw_args}"
-    packet = ChatMessage(player_id=ctx.player.id, chat_type=CHAT_ALL, message=message)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = ctx.player.id
+    packet.chat_type = CHAT_ALL
+    packet.value = message
+    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(

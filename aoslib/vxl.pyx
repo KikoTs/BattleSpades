@@ -1,319 +1,1233 @@
-# distutils: sources = aoslib/vxl_c.cpp
-import zlib
-import struct
-from libc.stdint cimport *
-from libc.math cimport NAN, isnan
-from libcpp cimport bool
+# cython: language_level=3
+# cython: boundscheck=False
+# cython: wraparound=False
+"""
+VXL module compatibility layer.
 
-VXL_MAP_X = MAP_X
-VXL_MAP_Y = MAP_Y
-VXL_MAP_Z = MAP_Z
-VXL_DEFAULT_COLOR = DEFAULT_COLOR
+This module restores the original Python-facing VXL surface closely enough to
+match the original `aosdump/aoslib/vxl.pyd` in the local reverse-engineering
+environment while keeping the implementation readable in Cython.
+"""
+
+import os as _os
+import random as _random
+import struct as _struct
+import zlib as _zlib
+from libc.math cimport sqrt
 
 
-cpdef inline block_color(int r, int g, int b):
-    return 0x7F << 24 | r << 16 | g << 8 | b << 0
+DEF MAP_SIZE = 512
+DEF MAP_HEIGHT = 240
+DEF MAP_AREA = MAP_SIZE * MAP_SIZE
+DEF VOXEL_COUNT = MAP_AREA * MAP_HEIGHT
+DEF VOXEL_BITS = (VOXEL_COUNT + 7) // 8
+DEF EMPTY_TOP_START = 240
+DEF EMPTY_TOP_END = 239
+DEF MAP_SEND_ROWS = 4
+DEF MAP_PACKET_SIZE = 1024
 
-# Constants for map chunking
-MAP_SEND_ROWS = 4
-MAP_PACKET_SIZE = 1024
+
+cdef list _ground_colors = []
+cdef int _max_modifiable_z = 238
+cdef bytes _EMPTY_COLUMN = b"\x00\xF0\xEF\x00"
+cdef bytes _BLANK_VXL = _EMPTY_COLUMN * MAP_AREA
+
+
+cdef inline int _column_index(int x, int y):
+    return x + (y << 9)
+
+
+cdef inline int _voxel_index(int x, int y, int z):
+    return x + (y << 9) + (z << 18)
+
+
+cdef inline unsigned int _read_u32_le(bytes data, Py_ssize_t pos):
+    return (
+        data[pos]
+        | (data[pos + 1] << 8)
+        | (data[pos + 2] << 16)
+        | (data[pos + 3] << 24)
+    )
+
+
+cdef inline tuple _color_tuple(unsigned int color):
+    cdef int b = color & 0xFF
+    cdef int g = (color >> 8) & 0xFF
+    cdef int r = (color >> 16) & 0xFF
+    cdef int alpha_byte = (color >> 24) & 0xFF
+    cdef int a
+
+    if alpha_byte == 0:
+        a = 0
+    else:
+        a = alpha_byte * 2 - 1
+    return (r, g, b, a)
+
+
+cdef inline unsigned int _pack_color_tuple(tuple color_tuple):
+    cdef int r
+    cdef int g
+    cdef int b
+    cdef int a
+    cdef int alpha_byte
+
+    if len(color_tuple) == 3:
+        r = int(color_tuple[0])
+        g = int(color_tuple[1])
+        b = int(color_tuple[2])
+        a = 255
+    elif len(color_tuple) == 4:
+        r = int(color_tuple[0])
+        g = int(color_tuple[1])
+        b = int(color_tuple[2])
+        a = int(color_tuple[3])
+    else:
+        raise TypeError("expected a 3-tuple or 4-tuple color")
+
+    if a <= 0:
+        alpha_byte = 0
+    else:
+        alpha_byte = (a + 1) // 2
+
+    return (
+        ((alpha_byte & 0xFF) << 24)
+        | ((r & 0xFF) << 16)
+        | ((g & 0xFF) << 8)
+        | (b & 0xFF)
+    )
+
+
+cdef object _coerce_raw_bytes(object source):
+    if isinstance(source, bytes):
+        return source
+    if isinstance(source, bytearray):
+        return bytes(source)
+    if isinstance(source, str):
+        return source.encode("latin1", "ignore")
+    return b""
+
+
+cdef tuple _get_vxl_size(bytes data):
+    cdef Py_ssize_t pos = 0
+    cdef Py_ssize_t limit = len(data)
+    cdef Py_ssize_t columns = 0
+    cdef int max_ref = 0
+    cdef int span_words
+    cdef int v1
+    cdef int v2
+    cdef int v3
+
+    while pos < limit:
+        if pos + 4 > limit:
+            return (0, 0)
+
+        span_words = data[pos]
+        v1 = data[pos + 1]
+        v2 = data[pos + 2]
+        v3 = data[pos + 3]
+        if v1 > max_ref:
+            max_ref = v1
+        if v2 > max_ref:
+            max_ref = v2
+        if v3 > max_ref:
+            max_ref = v3
+
+        while span_words:
+            pos += 4 * span_words
+            if pos + 4 > limit:
+                return (0, 0)
+            span_words = data[pos]
+            v1 = data[pos + 1]
+            v2 = data[pos + 2]
+            v3 = data[pos + 3]
+            if v1 > max_ref:
+                max_ref = v1
+            if v2 > max_ref:
+                max_ref = v2
+            if v3 > max_ref:
+                max_ref = v3
+
+        if v2 >= v1:
+            pos += 8 + 4 * (v2 - v1)
+        else:
+            pos += 4
+        columns += 1
+
+    if pos != limit:
+        return (0, 0)
+    return (columns, max_ref)
+
+
+cpdef object A2(object arg):
+    return arg
+
+
+cpdef object add_ground_color(int r, int g, int b, int a=255):
+    _ground_colors.append((r, g, b, a))
+    return None
+
+
+cpdef object clamp(object value, object min_val=0, object max_val=1):
+    if value < min_val:
+        return min_val
+    if value > max_val:
+        return max_val
+    return value
+
+
+cpdef object create_shadow_vbo():
+    return None
+
+
+cpdef object delete_shadow_vbo():
+    return None
+
+
+cpdef object generate_ground_color_table():
+    return None
+
+
+cpdef tuple get_color_tuple(unsigned int color, int include_alpha=0):
+    return _color_tuple(color)
+
+
+cpdef object reset_ground_colors():
+    global _ground_colors
+    _ground_colors = []
+    return None
+
+
+cpdef bint sphere_in_frustum(float x, float y, float z, float radius):
+    return True
+
+
+cpdef object parse_constant_overrides(object arg):
+    return arg
+
+
+class MapSerializer:
+    def __init__(self, vxl_map, delta_mode=True):
+        self.vxl_map = vxl_map
+        self.delta_mode = delta_mode
+
+    def iter(self):
+        cdef int start_row
+        for start_row in range(0, MAP_SIZE, MAP_SEND_ROWS):
+            yield self.vxl_map.get_chunk(start_row, MAP_SEND_ROWS)
+
+
+class MapPacker:
+    def __init__(self, vxl_map):
+        self.vxl_map = vxl_map
+        self.serializer = MapSerializer(vxl_map)
+        self.crc32 = _zlib.crc32(b"")
+
+    def iter(self):
+        compressor = _zlib.compressobj(
+            level=6,
+            method=_zlib.DEFLATED,
+            wbits=15,
+            memLevel=8,
+            strategy=_zlib.Z_DEFAULT_STRATEGY,
+        )
+        raw_rows = b""
+        compressed = b""
+        for raw_rows in self.serializer.iter():
+            self.crc32 = _zlib.crc32(raw_rows, self.crc32)
+            compressed = compressor.compress(raw_rows)
+            if compressed:
+                yield compressed
+
+        compressed = compressor.flush(_zlib.Z_FINISH)
+        if compressed:
+            yield compressed
+
 
 class MapSyncChunker:
     def __init__(self, vxl_map):
+        self.vxl_map = vxl_map
         self.packer = MapPacker(vxl_map)
-        self.crc32 = zlib.crc32(b"")
-    
+        self.crc32 = _zlib.crc32(b"")
+
     def iter(self):
-        s = b""
-        for ins in self.packer.iter():
+        pending = b""
+        total_compressed = 0
+        compressed = b""
+        for compressed in self.packer.iter():
             self.crc32 = self.packer.crc32
-            s += ins
-            while len(s) >= MAP_PACKET_SIZE:
-                yield s[:MAP_PACKET_SIZE]
-                s = s[MAP_PACKET_SIZE:]
-        if s:
-            yield s
+            total_compressed += len(compressed)
+            pending += compressed
+            while len(pending) >= MAP_PACKET_SIZE:
+                yield pending[:MAP_PACKET_SIZE]
+                pending = pending[MAP_PACKET_SIZE:]
 
-class MapPacker:
-    def __init__(self, data):
-        self.serializer = MapSerializer(data)
-        self.crc32 = zlib.crc32(b"")
-    
-    def iter(self):
-        # Use same zlib settings as original (level 6, 15 window bits)
-        compressor = zlib.compressobj(
-            level=6,
-            method=zlib.DEFLATED,
-            wbits=15,
-            memLevel=8,
-            strategy=zlib.Z_DEFAULT_STRATEGY
-        )
-        for s in self.serializer.iter():
-            # Update CRC with raw serialized data BEFORE compression
-            self.crc32 = zlib.crc32(s, self.crc32)
-            compressed = compressor.compress(s)
-            if compressed:
-                yield compressed
-        # Final flush must use Z_FINISH to match original
-        final = compressor.flush(zlib.Z_FINISH)
-        if final:
-            yield final
+        if pending:
+            yield pending
 
-class MapSerializer:
-    def __init__(self, data, delta_mode=True):
-        self.data = data
-        self.delta_mode = delta_mode
-    
-    def iter(self):
-        for i in range(0, 512, MAP_SEND_ROWS):
-            s = b""
-            for j in range(MAP_SEND_ROWS):
-                y = i + j
-                if y >= 512: 
-                    break
-                row = self.data.columns[y]
-                if self.delta_mode:
-                    s += b"".join(
-                        struct.pack("<II", x, y) + row[x]
-                        for x in range(512)
-                    )
-            yield s
+        self.vxl_map.estimated_size = total_compressed
 
 
-cdef class AceMap:
-    def __cinit__(self, uint8_t *buffer=NULL, dict map_info=None):
-        self.columns = [[b"" for _ in range(512)] for _ in range(512)]
-        self.ready = False
-        self.fname = ""
-        self.map_data = new CppAceMap(buffer)
-        self.estimated_size = len(buffer)
-        self.map_info = map_info or {}
+cdef class CChunk:
+    cdef int _x1, _y1, _z1
+    cdef int _x2, _y2, _z2
 
-    def __dealloc__(self):
-        del self.map_data
+    def __cinit__(self):
+        self._x1 = 0
+        self._y1 = 0
+        self._z1 = 0
+        self._x2 = 0
+        self._y2 = 0
+        self._z2 = 0
 
-    def __init__(self, bytes data=None, dict map_info=None):
-        if map_info is not None:
-            self.map_info = map_info
-        if data is not None:
-            self.load_vxl(data)
+    @property
+    def x1(self):
+        return self._x1
 
-    def __iter__(self):
-        cdef:
-            int x = 0, y = 0, size
-            vector[uint8_t] v
-            int chunk_size = 1024 * 4  # Chunk size for better compression
-        v.reserve(chunk_size)
-        while True:
-            # This 32 value is the important factor to get 1167 chunks
-            size = self.map_data.write(v, &x, &y, 32)
-            if not size:
+    @property
+    def y1(self):
+        return self._y1
+
+    @property
+    def z1(self):
+        return self._z1
+
+    @property
+    def x2(self):
+        return self._x2
+
+    @property
+    def y2(self):
+        return self._y2
+
+    @property
+    def z2(self):
+        return self._z2
+
+    cpdef void delete(self):
+        return
+
+    cpdef void draw(self):
+        return
+
+    cpdef list get_colors(self):
+        return []
+
+    cpdef list to_block_list(self):
+        return []
+
+
+cdef class VXL:
+    cdef public object minimap_texture
+    cdef public int estimated_size
+    cdef public bint ready
+    cdef int _detail_level
+    cdef int _source_size
+    cdef int _source_max_z
+    cdef int _source_offset
+    cdef int _z_shift
+    cdef bint _dirty
+    cdef bint _overview_dirty
+    cdef bytes _raw_data
+    cdef bytes _overview_opaque
+    cdef bytes _overview_transparent
+    cdef dict _colors
+    cdef bytearray _solid_bits
+    cdef list _top_z
+    cdef list _bottom_z
+
+    def __cinit__(self):
+        self.minimap_texture = None
+        self.estimated_size = 0
+        self.ready = True
+        self._detail_level = 2
+        self._source_size = MAP_SIZE
+        self._source_max_z = EMPTY_TOP_END
+        self._source_offset = 0
+        self._z_shift = 0
+        self._dirty = False
+        self._overview_dirty = True
+        self._raw_data = _BLANK_VXL
+        self._overview_opaque = b""
+        self._overview_transparent = b""
+        self._colors = {}
+        self._solid_bits = bytearray(VOXEL_BITS)
+        self._top_z = [MAP_HEIGHT] * MAP_AREA
+        self._bottom_z = [-1] * MAP_AREA
+
+    def __init__(self, object state, object source, int size_or_detail, int detail_level=2):
+        cdef object data = b""
+        cdef bint loaded = False
+
+        self._reset_blank()
+
+        if isinstance(source, str) and _os.path.exists(source):
+            if detail_level == 2 and 0 <= size_or_detail <= 32:
+                self._detail_level = size_or_detail
+            else:
+                self._detail_level = detail_level
+            with open(source, "rb") as handle:
+                data = handle.read()
+        else:
+            self._detail_level = detail_level
+            data = _coerce_raw_bytes(source)
+            if size_or_detail > 0 and len(data) > size_or_detail:
+                data = data[:size_or_detail]
+
+        if data:
+            loaded = self._load_source(data)
+            if loaded:
+                self._raw_data = data
+                self._dirty = False
+                self.ready = True
+            else:
+                self._reset_blank()
+                self.ready = False
+
+    cdef void _reset_blank(self):
+        self._colors = {}
+        self._solid_bits = bytearray(VOXEL_BITS)
+        self._top_z = [MAP_HEIGHT] * MAP_AREA
+        self._bottom_z = [-1] * MAP_AREA
+        self._source_size = MAP_SIZE
+        self._source_max_z = EMPTY_TOP_END
+        self._source_offset = 0
+        self._z_shift = 0
+        self._raw_data = _BLANK_VXL
+        self.estimated_size = 0
+        self.ready = True
+        self._dirty = False
+        self._overview_dirty = True
+        self._overview_opaque = b""
+        self._overview_transparent = b""
+
+    cdef inline bint _in_bounds(self, int x, int y, int z):
+        return 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE and 0 <= z < MAP_HEIGHT
+
+    cdef inline bint _solid_at(self, int x, int y, int z):
+        cdef int index
+        cdef int byte_index
+        cdef int shift
+        if not self._in_bounds(x, y, z):
+            return False
+        index = _voxel_index(x, y, z)
+        byte_index = index >> 3
+        shift = index & 7
+        return ((self._solid_bits[byte_index] >> shift) & 1) != 0
+
+    cdef inline void _set_solid(self, int x, int y, int z, bint value):
+        cdef int index
+        cdef int byte_index
+        cdef int shift
+        cdef int mask
+        cdef int current
+
+        if not self._in_bounds(x, y, z):
+            return
+
+        index = _voxel_index(x, y, z)
+        byte_index = index >> 3
+        shift = index & 7
+        mask = 1 << shift
+        current = self._solid_bits[byte_index]
+        if value:
+            self._solid_bits[byte_index] = current | mask
+        else:
+            self._solid_bits[byte_index] = current & (~mask & 0xFF)
+
+    cdef inline void _update_column_bounds(self, int x, int y, int z):
+        cdef int col = _column_index(x, y)
+        if z < self._top_z[col]:
+            self._top_z[col] = z
+        if z > self._bottom_z[col]:
+            self._bottom_z[col] = z
+
+    cdef void _recompute_column_bounds(self, int x, int y):
+        cdef int col = _column_index(x, y)
+        cdef int z
+
+        self._top_z[col] = MAP_HEIGHT
+        self._bottom_z[col] = -1
+        for z in range(MAP_HEIGHT):
+            if self._solid_at(x, y, z):
+                self._top_z[col] = z
                 break
-            yield v.data()[:size]
-            v.clear()
+        if self._top_z[col] == MAP_HEIGHT:
+            return
+        for z in range(MAP_HEIGHT - 1, -1, -1):
+            if self._solid_at(x, y, z):
+                self._bottom_z[col] = z
+                break
 
-    def iter_compressed(self, compressor):
-        cdef int total = 0
-        cdef bytes data
+    cdef inline void _store_block(self, int x, int y, int z, unsigned int color):
+        if not self._in_bounds(x, y, z):
+            return
+        self._set_solid(x, y, z, True)
+        self._update_column_bounds(x, y, z)
+        if color:
+            self._colors[_voxel_index(x, y, z)] = color
 
-        for data in iter(self):
-            data = compressor.compress(data)
-            total += len(data)
-            yield data
-        data = compressor.flush()
-        self.estimated_size = total + len(data)
-        yield data
+    cdef bint _load_source(self, bytes data):
+        cdef tuple size_info = _get_vxl_size(data)
+        cdef int columns = int(size_info[0])
+        cdef int max_z = int(size_info[1])
+        cdef int edge
+        cdef int offset
+        cdef int z_shift
+        cdef Py_ssize_t pos = 0
+        cdef Py_ssize_t limit = len(data)
+        cdef int src_x
+        cdef int src_y
+        cdef int x
+        cdef int y
+        cdef int span_words
+        cdef int top_start
+        cdef int top_end
+        cdef int top_len
+        cdef int bottom_len
+        cdef int next_air_start
+        cdef int bottom_start
+        cdef int z
+        cdef int i
+        cdef unsigned int color
 
-    cpdef bint can_build(self, int x, int y, int z):
-        return  0 <= x < MAP_X and 0 <= y < MAP_Y and 0 <= z < MAP_Z - 2
-
-    cpdef bint set_point(self, int x, int y, int z, bool solid, uint32_t color=0, bool destroy=True):
-        cdef bint ok = self.map_data.set_point(x, y, z, solid, color)
-        return ok
-
-    cpdef bint build_point(self, int x, int y, int z, tuple color):
-        if not self.can_build(x, y, z):
+        if columns <= 0:
             return False
 
-        cdef vector[Pos3] neighbors = self.map_data.get_neighbors(x, y, z)
-        if neighbors.empty():
+        edge = int(sqrt(columns))
+        if edge * edge != columns or edge > MAP_SIZE or max_z >= 241:
             return False
 
-        return self.map_data.set_point(x, y, z, True, block_color(*color))
+        self._colors = {}
+        self._solid_bits = bytearray(VOXEL_BITS)
+        self._top_z = [MAP_HEIGHT] * MAP_AREA
+        self._bottom_z = [-1] * MAP_AREA
+        self._overview_dirty = True
+        self._overview_opaque = b""
+        self._overview_transparent = b""
 
-    cpdef bint destroy_point(self, int x, int y, int z):
-        if not self.can_build(x, y, z):
+        offset = (MAP_SIZE - edge) // 2
+        # Keep loaded map heights in their original coordinate space.
+        # The older working loader/server never normalized standard maps up to
+        # EMPTY_TOP_END, and that synthetic shift breaks spawn/world packet z.
+        z_shift = 0
+
+        self._source_size = edge
+        self._source_max_z = max_z
+        self._source_offset = offset
+        self._z_shift = z_shift
+
+        for src_y in range(edge):
+            y = src_y + offset
+            for src_x in range(edge):
+                x = src_x + offset
+                while True:
+                    if pos + 4 > limit:
+                        return False
+
+                    span_words = data[pos]
+                    top_start = data[pos + 1]
+                    top_end = data[pos + 2]
+                    pos += 4
+
+                    if top_end >= top_start:
+                        top_len = top_end - top_start + 1
+                        if pos + (top_len * 4) > limit:
+                            return False
+                        for i in range(top_len):
+                            color = _read_u32_le(data, pos + (i * 4))
+                            self._store_block(x, y, top_start + z_shift + i, color)
+                        pos += top_len * 4
+                    else:
+                        top_len = 0
+
+                    if span_words == 0:
+                        break
+
+                    bottom_len = span_words - top_len - 1
+                    if bottom_len < 0:
+                        return False
+                    if pos + (bottom_len * 4) + 4 > limit:
+                        return False
+
+                    next_air_start = data[pos + (bottom_len * 4) + 3]
+                    bottom_start = next_air_start - bottom_len
+                    if bottom_start < top_end + 1:
+                        return False
+
+                    for z in range(top_end + 1, bottom_start):
+                        self._store_block(x, y, z + z_shift, 0)
+
+                    for i in range(bottom_len):
+                        color = _read_u32_le(data, pos + (i * 4))
+                        self._store_block(x, y, bottom_start + z_shift + i, color)
+                    pos += bottom_len * 4
+
+        if pos != limit:
             return False
+        return True
 
-        cdef:
-            bint ok = self.map_data.set_point(x, y, z, False, 0)
-            vector[Pos3] neighbors = self.map_data.get_neighbors(x, y, z)
-            Pos3 node
-        for node in neighbors:
-            if self.can_build(node.x, node.y, node.z):
-                self.map_data.check_node(node.x, node.y, node.z, True)
-        return ok
+    cdef void _ensure_overview(self):
+        cdef bytearray opaque
+        cdef bytearray transparent
+        cdef int col
+        cdef int out_pos
+        cdef int top_z
+        cdef int x
+        cdef int y
+        cdef int alpha
+        cdef unsigned int color
+        cdef tuple color_tuple
 
-    cpdef list block_line(self, int x1, int y1, int z1, int x2, int y2, int z2):
-        cdef vector[Pos3] line = self.map_data.block_line(x1, y1, z1, x2, y2, z2)
-        return [(p.x, p.y, p.z) for p in line]
+        if not self._overview_dirty and self._overview_opaque and self._overview_transparent:
+            return
 
-    cpdef int get_z(self, int x, int y, int start = 0):
-        return self.map_data.get_z(x, y, start)
+        opaque = bytearray(MAP_AREA * 4)
+        transparent = bytearray(MAP_AREA * 4)
+
+        for col in range(MAP_AREA):
+            out_pos = col << 2
+            top_z = self._top_z[col]
+            if top_z >= MAP_HEIGHT:
+                opaque[out_pos + 3] = 255
+                continue
+
+            x = col & 511
+            y = col >> 9
+            color = self._colors.get(_voxel_index(x, y, top_z), 0)
+            color_tuple = _color_tuple(color)
+            opaque[out_pos] = color_tuple[0]
+            opaque[out_pos + 1] = color_tuple[1]
+            opaque[out_pos + 2] = color_tuple[2]
+            opaque[out_pos + 3] = 255
+
+            transparent[out_pos] = color_tuple[0]
+            transparent[out_pos + 1] = color_tuple[1]
+            transparent[out_pos + 2] = color_tuple[2]
+            alpha = color_tuple[3]
+            if alpha < 0:
+                alpha = 0
+            elif alpha > 255:
+                alpha = 255
+            transparent[out_pos + 3] = alpha
+
+        self._overview_opaque = bytes(opaque)
+        self._overview_transparent = bytes(transparent)
+        self._overview_dirty = False
+
+    cdef tuple _column_runs(self, int map_x, int map_y):
+        cdef list runs = []
+        cdef int col = _column_index(map_x, map_y)
+        cdef int top_z = self._top_z[col]
+        cdef int bottom_z = self._bottom_z[col]
+        cdef int source_z
+        cdef int run_start = -1
+
+        if top_z >= MAP_HEIGHT or bottom_z < top_z:
+            return ()
+
+        top_z -= self._z_shift
+        bottom_z -= self._z_shift
+
+        if top_z < 0:
+            top_z = 0
+        if bottom_z > EMPTY_TOP_END:
+            bottom_z = EMPTY_TOP_END
+        if bottom_z < top_z:
+            return ()
+
+        for source_z in range(top_z, bottom_z + 1):
+            if self._solid_at(map_x, map_y, source_z + self._z_shift):
+                if run_start < 0:
+                    run_start = source_z
+            elif run_start >= 0:
+                runs.append((run_start, source_z - 1))
+                run_start = -1
+
+        if run_start >= 0:
+            runs.append((run_start, bottom_z))
+        return tuple(runs)
+
+    cdef unsigned int _surface_color(self, int map_x, int map_y, int source_z):
+        return self._colors.get(_voxel_index(map_x, map_y, source_z + self._z_shift), 0)
+
+    cdef bytes _serialize_column(self, int map_x, int map_y):
+        cdef bytearray out = bytearray()
+        cdef tuple runs
+        cdef int run_index
+        cdef int run_count
+        cdef tuple run
+        cdef int run_start
+        cdef int run_end
+        cdef int top_end
+        cdef int bottom_start
+        cdef int z
+        cdef int prev_air_start
+        cdef int span_words
+        cdef list top_colors
+        cdef list bottom_colors
+        cdef unsigned int color
+
+        runs = self._column_runs(map_x, map_y)
+        if not runs:
+            out.extend((0, EMPTY_TOP_START, EMPTY_TOP_END, 0))
+            return bytes(out)
+
+        prev_air_start = 0
+        run_count = len(runs)
+        for run_index in range(run_count):
+            run = runs[run_index]
+            run_start = int(run[0])
+            run_end = int(run[1])
+
+            if run_index == run_count - 1:
+                out.extend((0, run_start, run_end, prev_air_start))
+                for z in range(run_start, run_end + 1):
+                    color = self._surface_color(map_x, map_y, z)
+                    out.extend((
+                        color & 0xFF,
+                        (color >> 8) & 0xFF,
+                        (color >> 16) & 0xFF,
+                        (color >> 24) & 0xFF,
+                    ))
+                continue
+
+            top_end = run_start
+            while top_end < run_end:
+                if _voxel_index(map_x, map_y, top_end + 1 + self._z_shift) not in self._colors:
+                    break
+                top_end += 1
+
+            bottom_start = run_end
+            while bottom_start > top_end + 1:
+                if _voxel_index(map_x, map_y, bottom_start - 1 + self._z_shift) not in self._colors:
+                    break
+                bottom_start -= 1
+
+            top_colors = []
+            for z in range(run_start, top_end + 1):
+                top_colors.append(self._surface_color(map_x, map_y, z))
+
+            bottom_colors = []
+            for z in range(bottom_start, run_end + 1):
+                bottom_colors.append(self._surface_color(map_x, map_y, z))
+
+            span_words = 1 + len(top_colors) + len(bottom_colors)
+            out.extend((span_words, run_start, top_end, prev_air_start))
+
+            for color in top_colors:
+                out.extend((
+                    color & 0xFF,
+                    (color >> 8) & 0xFF,
+                    (color >> 16) & 0xFF,
+                    (color >> 24) & 0xFF,
+                ))
+
+            for color in bottom_colors:
+                out.extend((
+                    color & 0xFF,
+                    (color >> 8) & 0xFF,
+                    (color >> 16) & 0xFF,
+                    (color >> 24) & 0xFF,
+                ))
+
+            prev_air_start = run_end + 1
+
+        return bytes(out)
+
+    cdef bytes _serialize_dirty(self):
+        cdef bytearray out = bytearray()
+        cdef int src_x
+        cdef int src_y
+        cdef int map_x
+        cdef int map_y
+        cdef tuple runs
+        cdef int run_index
+        cdef int run_count
+        cdef tuple run
+        cdef int run_start
+        cdef int run_end
+        cdef int top_end
+        cdef int bottom_start
+        cdef int z
+        cdef int prev_air_start
+        cdef int span_words
+        cdef list top_colors
+        cdef list bottom_colors
+        cdef unsigned int color
+
+        for src_y in range(self._source_size):
+            map_y = self._source_offset + src_y
+            for src_x in range(self._source_size):
+                map_x = self._source_offset + src_x
+                runs = self._column_runs(map_x, map_y)
+                if not runs:
+                    out.extend((0, EMPTY_TOP_START, EMPTY_TOP_END, 0))
+                    continue
+
+                prev_air_start = 0
+                run_count = len(runs)
+                for run_index in range(run_count):
+                    run = runs[run_index]
+                    run_start = int(run[0])
+                    run_end = int(run[1])
+
+                    if run_index == run_count - 1:
+                        out.extend((0, run_start, run_end, prev_air_start))
+                        for z in range(run_start, run_end + 1):
+                            color = self._surface_color(map_x, map_y, z)
+                            out.extend((
+                                color & 0xFF,
+                                (color >> 8) & 0xFF,
+                                (color >> 16) & 0xFF,
+                                (color >> 24) & 0xFF,
+                            ))
+                        continue
+
+                    top_end = run_start
+                    while top_end < run_end:
+                        if _voxel_index(map_x, map_y, top_end + 1 + self._z_shift) not in self._colors:
+                            break
+                        top_end += 1
+
+                    bottom_start = run_end
+                    while bottom_start > top_end + 1:
+                        if _voxel_index(map_x, map_y, bottom_start - 1 + self._z_shift) not in self._colors:
+                            break
+                        bottom_start -= 1
+
+                    top_colors = []
+                    for z in range(run_start, top_end + 1):
+                        top_colors.append(self._surface_color(map_x, map_y, z))
+
+                    bottom_colors = []
+                    for z in range(bottom_start, run_end + 1):
+                        bottom_colors.append(self._surface_color(map_x, map_y, z))
+
+                    span_words = 1 + len(top_colors) + len(bottom_colors)
+                    out.extend((span_words, run_start, top_end, prev_air_start))
+
+                    for color in top_colors:
+                        out.extend((
+                            color & 0xFF,
+                            (color >> 8) & 0xFF,
+                            (color >> 16) & 0xFF,
+                            (color >> 24) & 0xFF,
+                        ))
+
+                    for color in bottom_colors:
+                        out.extend((
+                            color & 0xFF,
+                            (color >> 8) & 0xFF,
+                            (color >> 16) & 0xFF,
+                            (color >> 24) & 0xFF,
+                        ))
+
+                    prev_air_start = run_end + 1
+
+        return bytes(out)
+
+    cpdef object add_point(self, object x, object y, object z, tuple color_tuple):
+        return self.set_point(x, y, z, color_tuple)
+
+    cpdef object set_point(self, object x, object y, object z, object color, object maybe_color=None):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        cdef unsigned int packed
+        if not self._in_bounds(xi, yi, zi):
+            return None
+
+        if maybe_color is not None or isinstance(color, bool):
+            if not bool(color):
+                return self.remove_point(xi, yi, zi)
+            color = 0 if maybe_color is None else maybe_color
+
+        if isinstance(color, tuple):
+            packed = _pack_color_tuple(color)
+        else:
+            packed = <unsigned int>int(color)
+
+        self._store_block(xi, yi, zi, packed)
+        if not packed and _voxel_index(xi, yi, zi) in self._colors:
+            del self._colors[_voxel_index(xi, yi, zi)]
+        self._dirty = True
+        self._overview_dirty = True
+        return None
+
+    cpdef object remove_point(self, object x, object y, object z):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        cdef int key
+
+        if not self._in_bounds(xi, yi, zi):
+            return None
+
+        key = _voxel_index(xi, yi, zi)
+        self._set_solid(xi, yi, zi, False)
+        if key in self._colors:
+            del self._colors[key]
+        self._recompute_column_bounds(xi, yi)
+        self._dirty = True
+        self._overview_dirty = True
+        return None
+
+    cpdef object remove_point_nochecks(self, object x, object y, object z):
+        return self.remove_point(x, y, z)
+
+    cpdef object destroy_point(self, object x, object y, object z):
+        return self.remove_point(x, y, z)
+
+    cpdef object color_block(self, object x, object y, object z, object color=0xFFFFFF):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        cdef unsigned int packed
+
+        if isinstance(color, tuple):
+            packed = _pack_color_tuple(color)
+        else:
+            packed = <unsigned int>int(color)
+
+        if not self._in_bounds(xi, yi, zi):
+            return None
+
+        self._store_block(xi, yi, zi, packed)
+        self._dirty = True
+        self._overview_dirty = True
+        return None
+
+    cpdef object check_only(self, object x, object y, object z):
+        return None
+
+    cpdef void clear_checked_geometry(self):
+        return
+
+    cpdef bint can_build(self, object x, object y, object z):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        if not self._in_bounds(xi, yi, zi):
+            return False
+        if zi > _max_modifiable_z:
+            return False
+        return not self._solid_at(xi, yi, zi)
+
+    cpdef bint get_solid(self, object x, object y, object z):
+        return self._solid_at(int(x), int(y), int(z))
+
+    cpdef tuple get_point(self, object x, object y, object z):
+        cdef bint solid = self.get_solid(x, y, z)
+        return (solid, self.get_color_tuple(x, y, z))
+
+    cpdef unsigned int get_color(self, object x, object y, object z):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        if not self._in_bounds(xi, yi, zi):
+            return 0
+        return self._colors.get(_voxel_index(xi, yi, zi), 0)
+
+    cpdef int get_z(self, object x, object y, object start=0):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi
+        cdef int first = int(start)
+        cdef int col
+        if not (0 <= xi < MAP_SIZE and 0 <= yi < MAP_SIZE):
+            return MAP_HEIGHT - 1
+        col = _column_index(xi, yi)
+        if self._top_z[col] >= MAP_HEIGHT:
+            return MAP_HEIGHT - 1
+        if first <= 0:
+            return self._top_z[col]
+        if first >= MAP_HEIGHT:
+            return MAP_HEIGHT - 1
+        for zi in range(first, MAP_HEIGHT):
+            if self._solid_at(xi, yi, zi):
+                return zi
+        return self._top_z[col]
+
+    cpdef tuple get_color_tuple(self, object x, object y, object z):
+        return _color_tuple(self.get_color(x, y, z))
 
     cpdef tuple get_random_pos(self, int x1, int y1, int x2, int y2):
-        cdef int x, y, z
-        self.map_data.get_random_point(&x, &y, &z, x1, y1, x2, y2)
-        return x, y, z
+        cdef int min_x = max(0, min(x1, x2))
+        cdef int max_x = min(MAP_SIZE - 1, max(x1, x2) - 1)
+        cdef int min_y = max(0, min(y1, y2))
+        cdef int max_y = min(MAP_SIZE - 1, max(y1, y2) - 1)
+        cdef int xi
+        cdef int yi
+        cdef int attempts
+
+        if max_x < min_x:
+            max_x = min_x
+        if max_y < min_y:
+            max_y = min_y
+
+        for attempts in range(64):
+            xi = _random.randint(min_x, max_x)
+            yi = _random.randint(min_y, max_y)
+            if self._bottom_z[_column_index(xi, yi)] >= 0:
+                return (xi, yi, self.get_z(xi, yi))
+
+        xi = min_x
+        yi = min_y
+        return (xi, yi, self.get_z(xi, yi))
+
+    cpdef bint has_neighbors(self, object x, object y, object z, object check_water):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        return (
+            self._solid_at(xi + 1, yi, zi)
+            or self._solid_at(xi - 1, yi, zi)
+            or self._solid_at(xi, yi + 1, zi)
+            or self._solid_at(xi, yi - 1, zi)
+            or self._solid_at(xi, yi, zi + 1)
+            or self._solid_at(xi, yi, zi - 1)
+        )
+
+    cpdef list block_line(self, int x1, int y1, int z1, int x2, int y2, int z2):
+        cdef int steps = max(abs(x2 - x1), abs(y2 - y1), abs(z2 - z1))
+        cdef int index
+        cdef int xi
+        cdef int yi
+        cdef int zi
+        cdef list result = []
+        if steps <= 0:
+            return [(x1, y1, z1)]
+        for index in range(steps + 1):
+            xi = int(round(x1 + ((x2 - x1) * index) / float(steps)))
+            yi = int(round(y1 + ((y2 - y1) * index) / float(steps)))
+            zi = int(round(z1 + ((z2 - z1) * index) / float(steps)))
+            if not result or result[-1] != (xi, yi, zi):
+                result.append((xi, yi, zi))
+        return result
+
+    cpdef bint is_space_to_add_blocks(self):
+        return True
+
+    cpdef void add_static_light(self, int x, int y, int z, int r, int g, int b, float intensity=1.0):
+        return
+
+    cpdef void update_static_light_colour(self, int x, int y, int z, int r, int g, int b):
+        return
+
+    cpdef void remove_static_light(self, int x, int y, int z):
+        return
+
+    cpdef void create_spot_shadows(self, object positions):
+        return
+
+    cpdef void set_shadow_char_height(self, int height):
+        return
+
+    cpdef void draw_spot_shadows(self):
+        return
+
+    cpdef void draw(self, object x=None, object y=None, object z=None, object draw_distance=None):
+        return
+
+    cpdef void draw_sea(self):
+        return
+
+    cpdef void post_load_draw_setup(self, object arg=None):
+        self._ensure_overview()
+        return
+
+    def get_overview(self, transparent=None):
+        if transparent is None:
+            self._ensure_overview()
+            return self._overview_opaque
+        if not isinstance(transparent, int):
+            raise TypeError("an integer is required")
+        self._ensure_overview()
+        return self._overview_transparent
+
+    cpdef bint get_prefab_touches_world(self, object kv6, int x, int y, int z, int rx=0, int ry=0, int rz=0, int scale=1):
+        return False
+
+    cpdef void place_prefab_in_world(self, object kv6, int x, int y, int z, int rx=0, int ry=0, int rz=0, int scale=1, int flags=0, float tolerance=0.0):
+        return
+
+    cpdef void erase_prefab_from_world(self, object kv6, int x, int y, int z, int rx=0, int ry=0, int rz=0, int scale=1, int flags=0, float tolerance=0.0):
+        return
+
+    cpdef list get_ground_colors(self):
+        return _ground_colors
+
+    cpdef void refresh_ground_colors(self):
+        self._overview_dirty = True
+        return
+
+    cpdef void set_max_modifiable_z(self, int z):
+        global _max_modifiable_z
+        _max_modifiable_z = z
+
+    cpdef int get_max_modifiable_z(self):
+        return _max_modifiable_z
+
+    cpdef bint done_processing(self):
+        return False
+
+    cpdef void change_thread_state(self, int mode, object data=None, int data_size=0):
+        return
+
+    cpdef list chunk_to_pointlist(self, object chunk):
+        if isinstance(chunk, CChunk):
+            return (<CChunk>chunk).to_block_list()
+        return []
+
+    cpdef bytes get_chunk(self, int start_row, int num_rows):
+        cdef bytearray chunk = bytearray()
+        cdef int y
+        cdef int x
+        cdef int end_row = min(start_row + num_rows, MAP_SIZE)
+
+        if start_row < 0:
+            start_row = 0
+        if end_row < start_row:
+            end_row = start_row
+
+        for y in range(start_row, end_row):
+            for x in range(MAP_SIZE):
+                chunk.extend(_struct.pack("<II", x, y))
+                chunk.extend(self._serialize_column(x, y))
+
+        return bytes(chunk)
+
+    cpdef object get_chunker(self):
+        return MapSyncChunker(self)
 
     cpdef bytes get_bytes(self):
-        cdef vector[uint8_t] x = self.map_data.write()
-        return x.data()[:x.size()]
+        return self.generate_vxl(False)
 
-    def width(self):
-        return MAP_X
+    cpdef bytes generate_vxl(self, bint compress=True):
+        if not self._dirty and self._raw_data:
+            return self._raw_data
+        self._raw_data = self._serialize_dirty()
+        self._dirty = False
+        return self._raw_data
 
-    def length(self):
-        return MAP_Y
+    cpdef void destroy(self):
+        self._reset_blank()
+        return
 
-    def depth(self):
-        return MAP_Z
-
-    def to_grid(self, x: double, y: double):
-        letter = chr(ord('A') + <int>(x // 64))
-        number = str(<int>(y // 64) + 1)
-        return letter + number
-
-    def from_grid(self, grid: str):
-        letter = grid[0].lower()
-        number = int(grid[1])
-        x = max(0, min(self.width() - 1, 32 + (64 * (ord(letter) - ord('a')))))
-        y = max(0, min(self.length() - 1, 32 + (64 * (number - 1))))
-        return x, y
+    cpdef void cleanup(self):
+        return
 
     def __bytes__(self):
         return self.get_bytes()
 
 
+cdef class array:
+    cdef public tuple shape
+    cdef public int itemsize
+    cdef public str format
+    cdef public str mode
+    cdef public bint allocate_buffer
+    cdef public object data
 
+    def __init__(self, tuple shape, str typestr="f", int itemsize=4, str format="f", str mode="c", bint allocate_buffer=True):
+        cdef int total
+        cdef int dim
+        self.shape = shape
+        self.itemsize = itemsize
+        self.format = format
+        self.mode = mode
+        self.allocate_buffer = allocate_buffer
+        self.data = None
 
-
-    cpdef bint load_vxl(self, bytes data) except *:
-        """
-        Load VXL data by mimicking Mari Kiri's original map.py logic:
-          - row-major order: for y in [0..511], for x in [0..511]
-          - read 4 bytes 'ns'
-            * if ns[0] == 0, then read (ns[2] - ns[1] + 1)*4 color bytes and break
-            * else read (ns[0]-1)*4 color bytes (no break)
-          - track 'lowest_point' if needed (the original code uses
-            cand_lowest = max(ns[2], ns[1]) etc.)
-          - if we find lowest_point == 63 after loading => shift by 64
-        """
-        # 1) Declare all Cython variables here, outside any try / for / if block:
-        cdef int x, y
-        cdef int pos = 0
-        cdef bytes ns
-        cdef int lowest_point = 63
-        cdef int highest_point = 255
-        cdef int cand_lowest
-        cdef Py_ssize_t length = len(data)
-        cdef int finals, needed, block_size  # Declare all variables here
-
-        try:
-            # Go row-major, each row is y, each column is x
-            for y in range(512):
-                for x in range(512):
-                    # If we've exhausted the file, store a 4-byte dummy column
-                    if pos >= length:
-                        self.columns[y][x] = b"\x00\x00\x00\x00"
-                        continue
-
-                    col_data = bytearray()
-
-                    # Keep reading 4-byte blocks until we see ns[0] == 0
-                    while True:
-                        # If there's not even 4 bytes left, bail out
-                        if pos + 4 > length:
-                            break
-
-                        ns = data[pos:pos+4]
-                        pos += 4
-
-                        # Mimic Mari Kiri's "lowest_point" logic
-                        cand_lowest = max(ns[2], ns[1])
-                        if cand_lowest > lowest_point:
-                            lowest_point = cand_lowest
-                        if ns[1] < highest_point:
-                            highest_point = ns[1]
-
-                        # Always append this 4-byte header to col_data
-                        col_data += ns
-
-                        if ns[0] == 0:
-                            # If spans=0, read final color block => break
-                            finals = ns[2] - ns[1] + 1
-                            needed = 4 * finals
-                            if pos + needed > length:
-                                # Not enough data => partial read => break
-                                break
-                            col_data += data[pos:pos+needed]
-                            pos += needed
-                            break
-                        else:
-                            # If spans != 0, read (spans-1)*4 color bytes
-                            block_size = (ns[0] - 1) * 4
-                            if block_size < 0:
-                                # Protect from negative
-                                break
-                            if pos + block_size > length:
-                                break
-
-                            col_data += data[pos:pos+block_size]
-                            pos += block_size
-                            # Then we loop again until ns[0] == 0
-
-                    self.columns[y][x] = bytes(col_data)
-
-            # After reading all columns, if lowest_point==63 => older 0.x map => shift up by 64
-            if lowest_point == 63:
-                self._shift_map_up(64)
-
-            self.ready = True
-            return True
-
-        except Exception as e:
-            print(f"Map load error: {e}")
-            self.ready = False
-            return False
-
-    def _shift_map_up(self, int z_shift):
-        """Deprecated: Handling for old 0.x maps. Currently a no-op/stub."""
-        print(f"Warning: Map requires shift up by {z_shift} (legacy format). Skipping implementation.")
-        return
-
-
-
-    cpdef bytes get_chunk(self, int start_row, int num_rows):
-        """Get a chunk of the map data for network transmission"""
-        if not self.ready:
-            return b""
-            
-        cdef:
-            list chunk = []
-            int end_row = min(start_row + num_rows, VXL_MAP_Y)
-            
-        for y in range(start_row, end_row):
-            chunk.extend(self.columns[y])
-            
-        return b"".join(chunk)
-
-
-
-
+        if allocate_buffer:
+            total = itemsize
+            for dim in shape:
+                total *= dim
+            self.data = bytearray(total)
 
     @property
-    def name(self):
-        return self.map_info["name"]
-    cpdef get_chunker(self):
-        return MapSyncChunker(self)
+    def memview(self):
+        return memoryview(self.data)
 
+    def __len__(self):
+        if self.shape:
+            return self.shape[0]
+        return 0
+
+
+cdef class memoryview:
+    cdef public object obj
+    cdef object _base
+    cdef public bint dtype_is_object
+    cdef tuple _shape
+    cdef tuple _strides
+    cdef int _itemsize
+    cdef int _ndim
+
+    def __init__(self, object obj, int flags=0, bint dtype_is_object=False):
+        self.obj = obj
+        self._base = obj
+        self.dtype_is_object = dtype_is_object
+        self._shape = ()
+        self._strides = ()
+        self._itemsize = 1
+        self._ndim = 0
+        if isinstance(obj, (bytes, bytearray)):
+            self._shape = (len(obj),)
+            self._strides = (1,)
+            self._ndim = 1
+
+    def __len__(self):
+        if self._shape:
+            return self._shape[0]
+        return 0
+
+    def __repr__(self):
+        return "<memoryview object at %#x>" % id(self)
+
+    @property
+    def T(self):
+        return self
+
+    @property
+    def base(self):
+        return self._base
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def strides(self):
+        return self._strides
+
+    @property
+    def suboffsets(self):
+        return ()
+
+    @property
+    def ndim(self):
+        return self._ndim
+
+    @property
+    def itemsize(self):
+        return self._itemsize
+
+    @property
+    def nbytes(self):
+        cdef int total = self._itemsize
+        cdef int dim
+        for dim in self._shape:
+            total *= dim
+        return total
+
+    @property
+    def size(self):
+        cdef int total = 1
+        cdef int dim
+        for dim in self._shape:
+            total *= dim
+        return total
+
+    cpdef memoryview copy(self):
+        return memoryview(self.obj, dtype_is_object=self.dtype_is_object)

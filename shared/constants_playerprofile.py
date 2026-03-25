@@ -1,0 +1,411 @@
+# uncompyle6 version 3.9.2 OKAY Decrypted
+# Python bytecode version base 2.7 (62211)
+# Decompiled from: Python 3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]
+# Embedded file name: C:\TeamCity\buildAgent\work\dc8eb0b1d2cf198a\Main\client\standalone\build\pyi.win32\run_obfuscated\out00-PYZ.pyz\shared.constants_playerprofile
+from shared.playerStat import PlayerStat
+from shared.constants import *
+
+CATEGORY_SUMMARY, CATEGORY_GENERAL, CATEGORY_WEAPON_ACCURACY, CATEGORY_WEAPON_POINTS, CATEGORY_SOLDIER, CATEGORY_SCOUT, CATEGORY_ENGINEER, CATEGORY_MINER, CATEGORY_GANGSTER, CATEGORY_CLASSIC, CATEGORY_ZOMBIE, CATEGORY_SPECIALIST, CATEGORY_MEDIC, CATEGORY_TDM, CATEGORY_VIP, CATEGORY_TC, CATEGORY_OCC, CATEGORY_DIA, CATEGORY_CTF, CATEGORY_ZOM, CATEGORY_DEM, CATEGORY_MH, CATEGORY_MAPS = range(23)
+A3060 = CATEGORY_SUMMARY
+A3061 = CATEGORY_GENERAL
+A3062 = CATEGORY_WEAPON_ACCURACY
+A3063 = CATEGORY_WEAPON_POINTS
+A3064 = CATEGORY_SOLDIER
+A3065 = CATEGORY_SCOUT
+A3066 = CATEGORY_ENGINEER
+A3067 = CATEGORY_MINER
+A3068 = CATEGORY_GANGSTER
+A3069 = CATEGORY_CLASSIC
+A3070 = CATEGORY_ZOMBIE
+A3071 = CATEGORY_SPECIALIST
+A3072 = CATEGORY_MEDIC
+A3073 = CATEGORY_TDM
+A3074 = CATEGORY_VIP
+A3075 = CATEGORY_TC
+A3076 = CATEGORY_OCC
+A3077 = CATEGORY_DIA
+A3078 = CATEGORY_CTF
+A3079 = CATEGORY_ZOM
+A3080 = CATEGORY_DEM
+A3081 = CATEGORY_MH
+A3082 = CATEGORY_MAPS
+
+
+
+PLAYER_PROFILE_CATEGORYS = {
+    CATEGORY_SUMMARY: "SUMMARY",
+    CATEGORY_GENERAL: "GENERAL",
+    CATEGORY_WEAPON_ACCURACY: "WEAPON_ACCURACY",
+    CATEGORY_WEAPON_POINTS: "WEAPON_POINTS",
+    CATEGORY_SOLDIER: "SOLDIER",
+    CATEGORY_SCOUT: "SCOUT",
+    CATEGORY_ENGINEER: "ENGINEER2",
+    CATEGORY_MINER: "MINER",
+    CATEGORY_GANGSTER: "GANGSTER",
+    CATEGORY_CLASSIC: "A2362",
+    CATEGORY_ZOMBIE: "ZOMBIE",
+    CATEGORY_SPECIALIST: "SPECIALIST",
+    CATEGORY_MEDIC: "MEDIC",
+    CATEGORY_TDM: "TDM_TITLE",
+    CATEGORY_VIP: "VIP_MODE_TITLE",
+    CATEGORY_TC: "TC_TITLE",
+    CATEGORY_OCC: "OCCUPATION_MODE_TITLE",
+    CATEGORY_DIA: "DIAMOND_MINE_TITLE",
+    CATEGORY_CTF: "CTF_TITLE",
+    CATEGORY_ZOM: "ZOMBIE_MODE_TITLE",
+    CATEGORY_DEM: "DEMOLITION_TITLE",
+    CATEGORY_MH: "MULTIHILL_TITLE",
+    CATEGORY_MAPS: "HOURS_PLAYED",
+}
+A3083 = PLAYER_PROFILE_CATEGORYS
+
+PLAYER_PROFILE_CATEGORY_STATS = [
+    PlayerStat(GAME_WINS_TOTAL, CATEGORY_GENERAL),
+    PlayerStat(GAME_LOSSES_TOTAL, CATEGORY_GENERAL),
+    PlayerStat(GAME_DRAWS_TOTAL, CATEGORY_GENERAL),
+    PlayerStat(MAP_SINGLEBLOCKS_ADDED_TOTAL, CATEGORY_GENERAL, True, level1_requirement=200, multiplier=1.21),
+    PlayerStat(MAP_PREFAB_ADDED_TOTAL, CATEGORY_GENERAL, True, level1_requirement=50, multiplier=1.18),
+    PlayerStat(MAP_BLOCKS_DESTROYED_TOTAL, CATEGORY_GENERAL, True, level1_requirement=1000, multiplier=1.21),
+    PlayerStat(KILL_SCORE_REASON, CATEGORY_GENERAL, True, level1_requirement=25),
+    PlayerStat(KILL_SCORE_HEADSHOT_REASON, CATEGORY_GENERAL, True, level1_requirement=10),
+    PlayerStat(KILL_SCORE_MELEE_REASON, CATEGORY_GENERAL, True, level1_requirement=10),
+    PlayerStat(KILL_SCORE_ASSIST_REASON, CATEGORY_GENERAL, True, level1_requirement=15),
+    PlayerStat(KILL_SCORE_REVENGE_REASON, CATEGORY_GENERAL, True, level1_requirement=5),
+    PlayerStat(KILL_SCORE_DISTRACT_REASON, CATEGORY_GENERAL, True, level1_requirement=10),
+    PlayerStat(KILL_SCORE_PAYBACK_REASON, CATEGORY_GENERAL, True, level1_requirement=5),
+    PlayerStat(KILL_SCORE_RELOAD_REASON, CATEGORY_GENERAL, True, level1_requirement=10),
+    PlayerStat(KILL_SCORE_DEFEND_REASON, CATEGORY_GENERAL, True, level1_requirement=15),
+    PlayerStat(SOLDIER_MINIGUN_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_RPG_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_RPG2_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_GRENADE_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_APG_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_SPADE_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_KNIFE_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SOLDIER_MINIGUN_DEMOLISH_TOTAL, CATEGORY_SOLDIER, True, level1_requirement=500, multiplier=1.12),
+    PlayerStat(SOLDIER_RPG_FALL_TOTAL, CATEGORY_SOLDIER, True, level1_requirement=3),
+    PlayerStat(SOLDIER_AIRBORNE_ROCKET_KILLS, CATEGORY_SOLDIER, True, level1_requirement=5),
+    PlayerStat(SOLDIER_ASSAULTRIFLE_KILLS, CATEGORY_SOLDIER, True, level1_requirement=20),
+    PlayerStat(SCOUT_SNIPER_KILLS, CATEGORY_SCOUT, True, level1_requirement=20),
+    PlayerStat(SCOUT_SNIPER2_KILLS, CATEGORY_SCOUT, True, level1_requirement=20),
+    PlayerStat(SCOUT_LANDMINE_KILLS, CATEGORY_SCOUT, True, level1_requirement=5),
+    PlayerStat(SCOUT_PICKAXE_KILLS, CATEGORY_SCOUT, True, level1_requirement=20),
+    PlayerStat(SCOUT_KNIFE_KILLS, CATEGORY_SCOUT, True, level1_requirement=10),
+    PlayerStat(SCOUT_SNIPER_STREAK3_TOTAL, CATEGORY_SCOUT, True, level1_requirement=5),
+    PlayerStat(SCOUT_SNIPER_STREAK6_TOTAL, CATEGORY_SCOUT, True, level1_requirement=10),
+    PlayerStat(SCOUT_SNIPER_HEADSHOT_TOTAL, CATEGORY_SCOUT, True, level1_requirement=10),
+    PlayerStat(SCOUT_SNIPER2_SPEED_TOTAL, CATEGORY_SCOUT, True, level1_requirement=5),
+    PlayerStat(SPECIALIST_AUTOPISTOL_KILLS, CATEGORY_SCOUT, True, level1_requirement=15),
+    PlayerStat(ENGINEER_SMG_KILLS, CATEGORY_ENGINEER, True, level1_requirement=20),
+    PlayerStat(ENGINEER_TURRET_KILLS, CATEGORY_ENGINEER, True, level1_requirement=5),
+    PlayerStat(ENGINEER_SNOWBLOWER_KILLS, CATEGORY_ENGINEER, True, level1_requirement=5),
+    PlayerStat(ENGINEER_PICKAXE_KILLS, CATEGORY_ENGINEER, True, level1_requirement=10),
+    PlayerStat(ENGINEER_JETPACK_KILLS, CATEGORY_ENGINEER, True, level1_requirement=10),
+    PlayerStat(ENGINEER_JETPACK_SMG_KILLS, CATEGORY_ENGINEER, True, level1_requirement=10),
+    PlayerStat(ENGINEER_MINELAUNCHER_KILLS, CATEGORY_ENGINEER, True, level1_requirement=5),
+    PlayerStat(MINER_SHOTGUN_KILLS, CATEGORY_MINER, True, level1_requirement=20),
+    PlayerStat(MINER_SHOTGUN2_KILLS, CATEGORY_MINER, True, level1_requirement=20),
+    PlayerStat(MINER_DYNAMITE_KILLS, CATEGORY_MINER, True, level1_requirement=5),
+    PlayerStat(MINER_SUPERSPADE_KILLS, CATEGORY_MINER, True, level1_requirement=10),
+    PlayerStat(MINER_PICKAXE_KILLS, CATEGORY_MINER, True, level1_requirement=10),
+    PlayerStat(MINER_DRILL_DEMOLISH_TOTAL, CATEGORY_MINER, True, level1_requirement=500, multiplier=1.18),
+    PlayerStat(MINER_DYNAMITE_BELOW_KILLS, CATEGORY_MINER, True, level1_requirement=5),
+    PlayerStat(MINER_SHOTGUN_HEADSHOT_TOTAL, CATEGORY_MINER, True, level1_requirement=10),
+    PlayerStat(MINER_SHOTGUN_ZOMBIE_KILLS, CATEGORY_MINER, True, level1_requirement=10),
+    PlayerStat(MINER_C4_KILLS, CATEGORY_MINER, True, level1_requirement=5),
+    PlayerStat(GANGSTER_TOMMYGUN_KILLS, CATEGORY_GANGSTER, True, level1_requirement=5),
+    PlayerStat(GANGSTER_PISTOL_KILLS, CATEGORY_GANGSTER, True, level1_requirement=5),
+    PlayerStat(GANGSTER_MOLOTOV_KILLS, CATEGORY_GANGSTER, True, level1_requirement=5),
+    PlayerStat(GANGSTER_CROWBAR_KILLS, CATEGORY_GANGSTER, True, level1_requirement=5),
+    PlayerStat(CLASSIC_SOLDIER_RIFLE_KILLS, CATEGORY_CLASSIC, True, level1_requirement=50),
+    PlayerStat(CLASSIC_SOLDIER_GRENADE_KILLS, CATEGORY_CLASSIC, True, level1_requirement=10),
+    PlayerStat(CLASSIC_SOLDIER_SPADE_KILLS, CATEGORY_CLASSIC, True, level1_requirement=10),
+    PlayerStat(CLASSIC_SOLDIER_RIFLE_HEADSHOT_TOTAL, CATEGORY_CLASSIC, True, level1_requirement=25),
+    PlayerStat(CLASSIC_SOLDIER_INTEL_KILLS, CATEGORY_CLASSIC, True, level1_requirement=5),
+    PlayerStat(ZOMBIE_HUMANS_KILLED_TOTAL, CATEGORY_ZOMBIE, True, level1_requirement=25),
+    PlayerStat(ZOMBIE_HUMANS_KILLED_IN_WATER_TOTAL, CATEGORY_ZOMBIE, True, level1_requirement=5),
+    PlayerStat(ZOMBIE_HUMANS_KILLED_AS_PATIENTZERO_TOTAL, CATEGORY_ZOMBIE, True, level1_requirement=10),
+    PlayerStat(ZOMBIE_BLOCKS_DESTROYED_TOTAL, CATEGORY_ZOMBIE, True, level1_requirement=666, multiplier=1.18),
+    PlayerStat(ZOMBIE_HANDS_KILLS_TOTAL, CATEGORY_ZOMBIE, True, level1_requirement=25),
+    PlayerStat(SPECIALIST_MACHETE_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=20),
+    PlayerStat(SPECIALIST_SPADE_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=15),
+    PlayerStat(SPECIALIST_CHEMICALBOMB_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=5),
+    PlayerStat(SPECIALIST_GRENADELAUNCHER_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=20),
+    PlayerStat(SPECIALIST_AUTOPISTOL_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=15),
+    PlayerStat(SPECIALIST_SMG_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=15),
+    PlayerStat(SPECIALIST_AUTOSHOTGUN_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=25),
+    PlayerStat(SPECIALIST_STICKYGRENADE_KILLS, CATEGORY_SPECIALIST, True, level1_requirement=10),
+    PlayerStat(MEDIC_RIOTSTICK_KILLS, CATEGORY_MEDIC, True, level1_requirement=10),
+    PlayerStat(MEDIC_PICKAXE_KILLS, CATEGORY_MEDIC, True, level1_requirement=5),
+    PlayerStat(MEDIC_LIGHTMACHINEGUN_KILLS, CATEGORY_MEDIC, True, level1_requirement=25),
+    PlayerStat(MEDIC_SHOTGUN2_KILLS, CATEGORY_MEDIC, True, level1_requirement=15),
+    PlayerStat(MEDIC_RIOTSHIELD_KILLS, CATEGORY_MEDIC, True, level1_requirement=5),
+    PlayerStat(TDM_MODE_SCORE_REASON, CATEGORY_TDM, show_score=True),
+    PlayerStat(VIP_MODE_SCORE_REASON, CATEGORY_VIP, show_score=True),
+    PlayerStat(VIP_SURVIVE_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=50),
+    PlayerStat(VIP_ESCORT_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=10),
+    PlayerStat(VIP_KILLENEMYVIP_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=10),
+    PlayerStat(VIP_DISTRACT_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=5),
+    PlayerStat(VIP_KILL_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=10),
+    PlayerStat(VIP_ASSAULT_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=10),
+    PlayerStat(VIP_ASSAULT_ENEMY_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=10),
+    PlayerStat(VIP_DEFEND_SCORE_REASON, CATEGORY_VIP, True, level1_requirement=5),
+    PlayerStat(TC_MODE_SCORE_REASON, CATEGORY_TC, show_score=True),
+    PlayerStat(TC_OCCUPY_SCORE_REASON, CATEGORY_TC, True, level1_requirement=25),
+    PlayerStat(TC_CLAIM_SCORE_REASON, CATEGORY_TC, True, level1_requirement=10),
+    PlayerStat(TC_CONTROL_SCORE_REASON, CATEGORY_TC, True, level1_requirement=5),
+    PlayerStat(TC_DEFEND_SCORE_REASON, CATEGORY_TC, True, level1_requirement=10),
+    PlayerStat(TC_ASSAULT_SCORE_REASON, CATEGORY_TC, True, level1_requirement=10),
+    PlayerStat(TC_CONTEND_SCORE_REASON, CATEGORY_TC, True, level1_requirement=100),
+    PlayerStat(OC_MODE_SCORE_REASON, CATEGORY_OCC, show_score=True),
+    PlayerStat(OCC_OCCUPY_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=250),
+    PlayerStat(OCC_CARRY_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=25),
+    PlayerStat(OCC_BOOM_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=5),
+    PlayerStat(OCC_DISTRACT_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=5),
+    PlayerStat(OCC_CARRIER_DEFEND_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=10),
+    PlayerStat(OCC_DEFEND_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=10),
+    PlayerStat(OCC_ASSAULT_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=10),
+    PlayerStat(OCC_SURVIVE_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=5),
+    PlayerStat(OCC_INTERCEPT_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=5),
+    PlayerStat(OCC_LASTMAN_TOTAL, CATEGORY_OCC, True, level1_requirement=5),
+    PlayerStat(OCC_DISPOSAL_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=250),
+    PlayerStat(OCC_INTERCEPT_DISPOSAL_SCORE_REASON, CATEGORY_OCC, True, level1_requirement=250),
+    PlayerStat(DIA_MODE_SCORE_REASON, CATEGORY_DIA, show_score=True),
+    PlayerStat(DIA_CAPTURE_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=10),
+    PlayerStat(DIA_UNCOVER_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=10),
+    PlayerStat(DIA_CARRY_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=25),
+    PlayerStat(DIA_ESCORT_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=15),
+    PlayerStat(DIA_DISTRACT_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=10),
+    PlayerStat(DIA_CARRIER_DEFEND_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=10),
+    PlayerStat(DIA_DEFEND_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=15),
+    PlayerStat(DIA_ASSAULT_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=5),
+    PlayerStat(DIA_INTERCEPT_SCORE_REASON, CATEGORY_DIA, True, level1_requirement=10),
+    PlayerStat(DIA_STEAL_TOTAL, CATEGORY_DIA, True, level1_requirement=5),
+    PlayerStat(DIA_FINDANDCASHIN_TOTAL, CATEGORY_DIA, True, level1_requirement=3),
+    PlayerStat(CTF_MODE_SCORE_REASON, CATEGORY_CTF, show_score=True),
+    PlayerStat(CTF_CAPTURE_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=5),
+    PlayerStat(CTF_CARRY_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=25),
+    PlayerStat(CTF_ESCORT_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=15),
+    PlayerStat(CTF_CLAIM_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=5),
+    PlayerStat(CTF_DISTRACT_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=10),
+    PlayerStat(CTF_DEFEND_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=15),
+    PlayerStat(CTF_ASSAULT_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=10),
+    PlayerStat(CTF_ASSAULT_ENEMY_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=10),
+    PlayerStat(CTF_CARRIER_DEFEND_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=10),
+    PlayerStat(CTF_INTERCEPT_SCORE_REASON, CATEGORY_CTF, True, level1_requirement=10),
+    PlayerStat(ZOM_MODE_SCORE_REASON, CATEGORY_ZOM, show_score=True),
+    PlayerStat(ZOM_SURVIVE_SCORE_REASON, CATEGORY_ZOM, True, level1_requirement=250),
+    PlayerStat(ZOM_LASTMAN_SCORE_REASON, CATEGORY_ZOM, True, level1_requirement=28),
+    PlayerStat(ZOM_KILLSURVIVOR_SCORE_REASON, CATEGORY_ZOM, True, level1_requirement=10),
+    PlayerStat(ZOM_LASTMAN_ZOMBIEKILL_SCORE_REASON, CATEGORY_ZOM, True, level1_requirement=5),
+    PlayerStat(ZOM_ZOMBIES_KILLED_TOTAL, CATEGORY_ZOM, True, level1_requirement=50),
+    PlayerStat(ZOM_TIME_SURVIVED_TOTAL, CATEGORY_ZOM, True, level1_requirement=1800, multiplier=1.16),
+    PlayerStat(ZOM_LASTMAN_TIME_TOTAL, CATEGORY_ZOM, True, level1_requirement=28),
+    PlayerStat(ZOM_PISTOL_ZOMBIEKILL_TOTAL, CATEGORY_ZOM, True, level1_requirement=5),
+    PlayerStat(ZOM_LASTMAN_KILLS_TOTAL, CATEGORY_ZOM, True, level1_requirement=5),
+    PlayerStat(ZOM_LASTMANSTANDING_TOTAL, CATEGORY_ZOM, True, level1_requirement=60),
+    PlayerStat(DEM_MODE_SCORE_REASON, CATEGORY_DEM, show_score=True),
+    PlayerStat(DEM_DESTROY_SCORE_REASON, CATEGORY_DEM, True, level1_requirement=200),
+    PlayerStat(DEM_REPAIR_SCORE_REASON, CATEGORY_DEM, True, level1_requirement=100),
+    PlayerStat(DEM_DEFEND_SCORE_REASON, CATEGORY_DEM, True, level1_requirement=10),
+    PlayerStat(DEM_ASSAULT_SCORE_REASON, CATEGORY_DEM, True, level1_requirement=10),
+    PlayerStat(DEM_REPAIR_TOTAL, CATEGORY_DEM, True, level1_requirement=1000, multiplier=1.16),
+    PlayerStat(DEM_DAMAGE_TOTAL, CATEGORY_DEM, True, level1_requirement=1000, multiplier=1.16),
+    PlayerStat(DEM_FINAL_DAMAGE_TOBASE_TOTAL, CATEGORY_DEM, True, level1_requirement=5),
+    PlayerStat(MH_MODE_SCORE_REASON, CATEGORY_MH, show_score=True),
+    PlayerStat(MH_OCCUPY_SCORE_REASON, CATEGORY_MH, True, level1_requirement=100),
+    PlayerStat(MH_FIRST_SCORE_REASON, CATEGORY_MH, True, level1_requirement=5),
+    PlayerStat(MH_CLAIM_SCORE_REASON, CATEGORY_MH, True, level1_requirement=5),
+    PlayerStat(MH_CONTROL_SCORE_REASON, CATEGORY_MH, True, level1_requirement=10),
+    PlayerStat(MH_DEFEND_SCORE_REASON, CATEGORY_MH, True, level1_requirement=10),
+    PlayerStat(MH_ASSAULT_SCORE_REASON, CATEGORY_MH, True, level1_requirement=10),
+    PlayerStat(MH_CONTEST_SCORE_REASON, CATEGORY_MH, True, level1_requirement=5),
+    PlayerStat(MH_SURVIVE_AIRSTRIKE_TOTAL, CATEGORY_MH, True, level1_requirement=5),
+    PlayerStat(MH_TRIGGER_AIRSTRIKE_TOTAL, CATEGORY_MH, True, level1_requirement=10),
+    PlayerStat(ANCIENT_EGYPT_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(ARCTIC_BASE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(BRAN_CASTLE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(DRAGON_ISLAND_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(LONDON_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(LUNAR_BASE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(MAYAN_JUNGLE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(SPOOKY_MANSION_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(TOKYO_NEON_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(HIESVILLE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(BLOCK_NESS_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(CASTLE_WARS_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(DOUBLE_DRAGON_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(WW1_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(TO_THE_BRIDGE_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(CROSSROADS_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(WINTER_VALLEY_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(TRENCHES_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(CITY_OF_CHICAGO_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+    PlayerStat(ALCATRAZ_TIME_SCORE, CATEGORY_MAPS, value_modifier=PlayerStat.value_modifier_mins_to_hours),
+]
+
+A3084 = PLAYER_PROFILE_CATEGORY_STATS
+
+for weaponID in range(NUMBER_OF_WEAPONS):
+    if weaponID is NULL_TOOL or weaponID is FAKE_PISTOL_TOOL:
+        continue
+    accuracy_stat = PlayerStat(
+        WEAPON_SHOOT_STATS[weaponID],
+        CATEGORY_WEAPON_ACCURACY,
+        show_score=True,
+        value_modifier=PlayerStat.value_modifier_percentage,
+    )
+    A3085 = accuracy_stat
+    PLAYER_PROFILE_CATEGORY_STATS.append(accuracy_stat)
+    accuracy_stat = PlayerStat(WEAPON_ACCUMULATED_POINTS_STATS[weaponID], CATEGORY_WEAPON_POINTS, show_score=True)
+    PLAYER_PROFILE_CATEGORY_STATS.append(accuracy_stat)
+
+
+class Criterion:
+    def __init__(self, criterion, level_requirement):
+        self.criterion = criterion
+        self.level_requirement = level_requirement
+
+
+RANK_BEGINNER = "BEGINNER"
+RANK_INTERMEDIATE = "INTERMEDIATE"
+RANK_ADVANCED = "ADVANCED"
+A3086 = RANK_BEGINNER
+A3087 = RANK_INTERMEDIATE
+A3088 = RANK_ADVANCED
+
+
+LEVEL_CRITERIA_SOLDIER = {
+    RANK_BEGINNER: (Criterion(SOLDIER_RPG_KILLS, 1), Criterion(KILL_SCORE_MELEE_REASON, 1), Criterion(SOLDIER_RPG_FALL_TOTAL, 1)),
+    RANK_INTERMEDIATE: (Criterion(SOLDIER_RPG2_KILLS, 5), Criterion(SOLDIER_KNIFE_KILLS, 5), Criterion(SOLDIER_MINIGUN_DEMOLISH_TOTAL, 5)),
+    RANK_ADVANCED: (Criterion(SOLDIER_MINIGUN_KILLS, 20), Criterion(SOLDIER_AIRBORNE_ROCKET_KILLS, 20), Criterion(COMBAT_KILLSATLOWHEALTH_TOTAL, 20)),
+}
+A3089 = LEVEL_CRITERIA_SOLDIER
+
+
+LEVEL_CRITERIA_SCOUT = {
+    RANK_BEGINNER: (Criterion(SCOUT_SNIPER_KILLS, 1), Criterion(SCOUT_LANDMINE_KILLS, 1), Criterion(KILL_SCORE_HEADSHOT_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(SCOUT_SNIPER2_KILLS, 5), Criterion(SCOUT_SNIPER_STREAK3_TOTAL, 5), Criterion(COMBAT_KILL_JETPACK_TOTAL, 5)),
+    RANK_ADVANCED: (Criterion(SCOUT_SNIPER2_SPEED_TOTAL, 20), Criterion(SCOUT_SNIPER_STREAK6_TOTAL, 20), Criterion(SCOUT_SNIPER_HEADSHOT_TOTAL, 20)),
+}
+A3090 = LEVEL_CRITERIA_SCOUT
+
+
+LEVEL_CRITERIA_ENGINEER = {
+    RANK_BEGINNER: (Criterion(ENGINEER_SMG_KILLS, 1), Criterion(ENGINEER_TURRET_KILLS, 1), Criterion(ENGINEER_JETPACK_KILLS, 1)),
+    RANK_INTERMEDIATE: (Criterion(ENGINEER_SNOWBLOWER_KILLS, 5), Criterion(KILL_SCORE_DISTRACT_REASON, 5), Criterion(KILL_SCORE_RELOAD_REASON, 5)),
+    RANK_ADVANCED: (Criterion(ENGINEER_JETPACK_KILLS, 20), Criterion(COMBAT_TURRET_EVASION_TOTAL, 20)),
+}
+A3091 = LEVEL_CRITERIA_ENGINEER
+
+
+LEVEL_CRITERIA_MINER = {
+    RANK_BEGINNER: (Criterion(MINER_SHOTGUN_KILLS, 1), Criterion(MAP_BLOCKS_DESTROYED_TOTAL, 1), Criterion(MAP_SINGLEBLOCKS_ADDED_TOTAL, 1)),
+    RANK_INTERMEDIATE: (Criterion(MINER_SHOTGUN2_KILLS, 5), Criterion(MINER_DRILL_DEMOLISH_TOTAL, 5), Criterion(KILL_SCORE_DEFEND_REASON, 5)),
+    RANK_ADVANCED: (Criterion(MINER_DYNAMITE_KILLS, 20), Criterion(KILL_SCORE_ASSIST_REASON, 20), Criterion(MINER_PICKAXE_KILLS, 20)),
+}
+A3092 = LEVEL_CRITERIA_MINER
+
+
+LEVEL_CRITERIA_GANGSTER = {
+    RANK_BEGINNER: (Criterion(GANGSTER_TOMMYGUN_KILLS, 1), Criterion(KILL_SCORE_PAYBACK_REASON, 1), Criterion(GANGSTER_PISTOL_KILLS, 1)),
+    RANK_INTERMEDIATE: (Criterion(GANGSTER_MOLOTOV_KILLS, 5), Criterion(KILL_SCORE_REVENGE_REASON, 5), Criterion(GANGSTER_PISTOL_KILLS, 5)),
+    RANK_ADVANCED: (Criterion(GANGSTER_CROWBAR_KILLS, 20), Criterion(VIP_KILL_SCORE_REASON, 20), Criterion(GANGSTER_PISTOL_KILLS, 20)),
+}
+A3093 = LEVEL_CRITERIA_GANGSTER
+
+
+LEVEL_CRITERIA_SPECIALIST  = {
+    RANK_BEGINNER: (Criterion(SPECIALIST_AUTOSHOTGUN_KILLS, 1), Criterion(SPECIALIST_GRENADELAUNCHER_KILLS, 1), Criterion(SPECIALIST_MACHETE_KILLS, 1)),
+    RANK_INTERMEDIATE: (Criterion(SPECIALIST_SMG_KILLS, 5), Criterion(SPECIALIST_STICKYGRENADE_KILLS, 5), Criterion(SPECIALIST_MACHETE_KILLS, 5)),
+    RANK_ADVANCED: (Criterion(SPECIALIST_AUTOSHOTGUN_KILLS, 20), Criterion(SPECIALIST_AUTOPISTOL_KILLS, 20), Criterion(SPECIALIST_MACHETE_KILLS, 20)),
+}
+A3094 = LEVEL_CRITERIA_SPECIALIST
+
+
+LEVEL_CRITERIA_MEDIC = {
+    RANK_BEGINNER: (Criterion(MEDIC_LIGHTMACHINEGUN_KILLS, 1), Criterion(MEDIC_RIOTSHIELD_KILLS, 1), Criterion(MEDIC_RIOTSTICK_KILLS, 1)),
+    RANK_INTERMEDIATE: (Criterion(MEDIC_LIGHTMACHINEGUN_KILLS, 5), Criterion(MEDIC_RIOTSHIELD_KILLS, 5), Criterion(MEDIC_PICKAXE_KILLS, 5)),
+    RANK_ADVANCED: (Criterion(MEDIC_LIGHTMACHINEGUN_KILLS, 20), Criterion(MEDIC_RIOTSHIELD_KILLS, 20), Criterion(MEDIC_RIOTSTICK_KILLS, 20)),
+}
+A3095 = LEVEL_CRITERIA_MEDIC
+
+
+LEVEL_CRITERIA_TDM = {
+    RANK_BEGINNER: (Criterion(KILL_SCORE_REASON, 1), Criterion(KILL_SCORE_ASSIST_REASON, 1), Criterion(COMBAT_5INAROW_TOTAL, 1)),
+    RANK_INTERMEDIATE: (Criterion(KILL_SCORE_HEADSHOT_REASON, 5), Criterion(KILL_SCORE_MELEE_REASON, 5), Criterion(COMBAT_10INAROW_TOTAL, 5)),
+    RANK_ADVANCED: (Criterion(KILL_SCORE_PAYBACK_REASON, 20), Criterion(KILL_SCORE_REVENGE_REASON, 20), Criterion(COMBAT_15INAROW_TOTAL, 20)),
+}
+A3096 = LEVEL_CRITERIA_TDM
+
+
+LEVEL_CRITERIA_CTF = {
+    RANK_BEGINNER: (Criterion(CTF_CARRY_SCORE_REASON, 1), Criterion(CTF_ESCORT_SCORE_REASON, 1), Criterion(CTF_DEFEND_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(CTF_CAPTURE_SCORE_REASON, 5), Criterion(CTF_ASSAULT_ENEMY_SCORE_REASON, 5), Criterion(CTF_CLAIM_SCORE_REASON, 5)),
+    RANK_ADVANCED: (Criterion(CTF_INTERCEPT_SCORE_REASON, 20), Criterion(CTF_ASSAULT_SCORE_REASON, 20), Criterion(CTF_CARRIER_DEFEND_SCORE_REASON, 20)),
+}
+A3097 = LEVEL_CRITERIA_CTF
+
+
+LEVEL_CRITERIA_DIA = {
+    RANK_BEGINNER: (Criterion(DIA_UNCOVER_SCORE_REASON, 1), Criterion(DIA_CARRY_SCORE_REASON, 1), Criterion(DIA_ESCORT_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(DIA_CAPTURE_SCORE_REASON, 5), Criterion(DIA_DISTRACT_SCORE_REASON, 5), Criterion(DIA_CARRIER_DEFEND_SCORE_REASON, 5)),
+    RANK_ADVANCED: (Criterion(DIA_FINDANDCASHIN_TOTAL, 20), Criterion(DIA_STEAL_TOTAL, 20), Criterion(DIA_ASSAULT_SCORE_REASON, 20)),
+}
+A3098 = LEVEL_CRITERIA_DIA
+
+
+LEVEL_CRITERIA_DEMO = {
+    RANK_BEGINNER: (Criterion(DEM_DESTROY_SCORE_REASON, 1), Criterion(DEM_REPAIR_SCORE_REASON, 1), Criterion(MAP_PREFAB_ADDED_TOTAL, 1)),
+    RANK_INTERMEDIATE: (Criterion(DEM_ASSAULT_SCORE_REASON, 5), Criterion(DEM_DEFEND_SCORE_REASON, 5), Criterion(DEM_FINAL_DAMAGE_TOBASE_TOTAL, 5)),
+    RANK_ADVANCED: (Criterion(DEM_DAMAGE_TOTAL, 20), Criterion(DEM_REPAIR_TOTAL, 20), Criterion(MINER_SNOWBLOWER_KILLS, 20)),
+}
+A3099 = LEVEL_CRITERIA_DEMO
+
+
+LEVEL_CRITERIA_MH = {
+    RANK_BEGINNER: (Criterion(MH_OCCUPY_SCORE_REASON, 1), Criterion(MH_CONTEST_SCORE_REASON, 1), Criterion(MH_CLAIM_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(MH_FIRST_SCORE_REASON, 5), Criterion(MH_ASSAULT_SCORE_REASON, 5), Criterion(MH_DEFEND_SCORE_REASON, 5)),
+    RANK_ADVANCED: (Criterion(MH_SURVIVE_AIRSTRIKE_TOTAL, 20), Criterion(MH_TRIGGER_AIRSTRIKE_TOTAL, 20), Criterion(MH_CONTEST_SCORE_REASON, 20)),
+}
+A3100 = LEVEL_CRITERIA_MH
+
+
+LEVEL_CRITERIA_OCC = {
+    RANK_BEGINNER: (Criterion(OCC_OCCUPY_SCORE_REASON, 1), Criterion(OCC_CARRY_SCORE_REASON, 1), Criterion(OCC_INTERCEPT_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(OCC_BOOM_SCORE_REASON, 5), Criterion(OCC_CARRIER_DEFEND_SCORE_REASON, 5), Criterion(OCC_DISTRACT_SCORE_REASON, 5)),
+    RANK_ADVANCED: (Criterion(OCC_SURVIVE_SCORE_REASON, 20), Criterion(OCC_LASTMAN_TOTAL, 20), Criterion(OCC_ASSAULT_SCORE_REASON, 20)),
+}
+A3101 = LEVEL_CRITERIA_OCC
+
+
+LEVEL_CRITERIA_TC = {
+    RANK_BEGINNER: (Criterion(TC_OCCUPY_SCORE_REASON, 1), Criterion(TC_CONTROL_SCORE_REASON, 1), Criterion(TC_DEFEND_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(TC_CLAIM_SCORE_REASON, 5), Criterion(TC_ASSAULT_SCORE_REASON, 5), Criterion(TC_DEFEND_SCORE_REASON, 5)),
+    RANK_ADVANCED: (Criterion(COMBAT_5INAROW_TOTAL, 20), Criterion(TC_CONTROL_SCORE_REASON, 20), Criterion(TC_ASSAULT_SCORE_REASON, 20)),
+}
+A3102 = LEVEL_CRITERIA_TC
+
+
+LEVEL_CRITERIA_VIP = {
+    RANK_BEGINNER: (Criterion(VIP_ESCORT_SCORE_REASON, 1), Criterion(VIP_SURVIVE_SCORE_REASON, 1), Criterion(VIP_KILL_SCORE_REASON, 1)),
+    RANK_INTERMEDIATE: (Criterion(VIP_KILLENEMYVIP_SCORE_REASON, 5), Criterion(VIP_DISTRACT_SCORE_REASON, 5), Criterion(VIP_KILL_SCORE_REASON, 5)),
+    RANK_INTERMEDIATE: (Criterion(VIP_KILLENEMYVIP_SCORE_REASON, 20), Criterion(VIP_DEFEND_SCORE_REASON, 20), Criterion(VIP_KILL_SCORE_REASON, 20)),
+}
+A3103 = LEVEL_CRITERIA_VIP
+
+
+LEVEL_CRITERIA_ZOM = {
+    RANK_BEGINNER: (Criterion(ZOM_SURVIVE_SCORE_REASON, 1), Criterion(ZOM_ZOMBIES_KILLED_TOTAL, 1), Criterion(ZOMBIE_HANDS_KILLS_TOTAL, 1)),
+    RANK_INTERMEDIATE: (Criterion(ZOM_LASTMAN_SCORE_REASON, 5), Criterion(ZOM_LASTMAN_ZOMBIEKILL_SCORE_REASON, 5), Criterion(ZOMBIE_HUMANS_KILLED_AS_PATIENTZERO_TOTAL, 5)),
+    RANK_ADVANCED: (Criterion(ZOM_PISTOL_ZOMBIEKILL_TOTAL, 20), Criterion(ZOMBIE_HUMANS_KILLED_IN_WATER_TOTAL, 20), Criterion(MINER_SHOTGUN_ZOMBIE_KILLS, 20)),
+}
+A3104 = LEVEL_CRITERIA_ZOM
+
+
+LEVEL_CRITERIA_CLASSIC = {
+    RANK_BEGINNER: (Criterion(CLASSIC_SOLDIER_RIFLE_KILLS, 1), Criterion(CLASSIC_SOLDIER_GRENADE_KILLS, 1), Criterion(CLASSIC_SOLDIER_SPADE_KILLS, 1)),
+    RANK_INTERMEDIATE: (Criterion(CLASSIC_SOLDIER_INTEL_KILLS, 5), Criterion(CLASSIC_SOLDIER_RIFLE_KILLS, 5), Criterion(CLASSIC_SOLDIER_GRENADE_KILLS, 5)),
+    RANK_ADVANCED: (Criterion(CLASSIC_SOLDIER_RIFLE_HEADSHOT_TOTAL, 20), Criterion(CLASSIC_SOLDIER_GRENADE_KILLS, 20), Criterion(CLASSIC_SOLDIER_SPADE_KILLS, 20)),
+}
+A3105 = LEVEL_CRITERIA_CLASSIC

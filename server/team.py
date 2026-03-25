@@ -4,6 +4,8 @@ Team management for BattleSpades.
 
 from typing import List, Tuple, Optional, TYPE_CHECKING
 
+from .game_constants import TEAM1
+
 if TYPE_CHECKING:
     from .player import Player
 
@@ -67,10 +69,9 @@ class Team:
         """
         if not self.spawn_points:
             # Default spawn based on team
-            if self.id == 0:  # Blue team - West
+            if self.id == TEAM1:  # Team 1 - West
                 return (64.0, 256.0, 58.0)
-            else:  # Green team - East
-                return (448.0, 256.0, 58.0)
+            return (448.0, 256.0, 58.0)
         
         point = self.spawn_points[self.spawn_index]
         self.spawn_index = (self.spawn_index + 1) % len(self.spawn_points)

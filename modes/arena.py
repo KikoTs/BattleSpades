@@ -7,6 +7,8 @@ import time
 import logging
 from typing import Optional, List, TYPE_CHECKING
 
+from server.game_constants import TEAM1, TEAM2
+
 from .base_mode import BaseMode
 
 if TYPE_CHECKING:
@@ -39,7 +41,7 @@ class ArenaMode(BaseMode):
         
         # Round state
         self.current_round = 0
-        self.round_wins = {0: 0, 1: 0}
+        self.round_wins = {TEAM1: 0, TEAM2: 0}
         
         self.round_started = False
         self.round_ended = False
@@ -55,7 +57,7 @@ class ArenaMode(BaseMode):
     async def on_mode_start(self):
         """Start arena mode."""
         await super().on_mode_start()
-        self.round_wins = {0: 0, 1: 0}
+        self.round_wins = {TEAM1: 0, TEAM2: 0}
         await self._start_new_round()
         logger.info("Arena mode started")
     
@@ -120,17 +122,17 @@ class ArenaMode(BaseMode):
             self.alive_players.remove(player)
         
         # Check if team is eliminated
-        team_alive = {0: 0, 1: 0}
+        team_alive = {TEAM1: 0, TEAM2: 0}
         for p in self.alive_players:
             if p.alive:
                 team_alive[p.team] += 1
         
         # Check win condition
-        if team_alive[0] == 0 and team_alive[1] > 0:
-            await self._end_round(winner=1)
-        elif team_alive[1] == 0 and team_alive[0] > 0:
-            await self._end_round(winner=0)
-        elif team_alive[0] == 0 and team_alive[1] == 0:
+        if team_alive[TEAM1] == 0 and team_alive[TEAM2] > 0:
+            await self._end_round(winner=TEAM2)
+        elif team_alive[TEAM2] == 0 and team_alive[TEAM1] > 0:
+            await self._end_round(winner=TEAM1)
+        elif team_alive[TEAM1] == 0 and team_alive[TEAM2] == 0:
             await self._end_round(winner=None)  # Draw
     
     async def _end_round(self, winner: Optional[int]):
@@ -147,8 +149,10 @@ class ArenaMode(BaseMode):
             logger.info(f"Round {self.current_round} was a draw")
         
         # Show round score
+        team1_name = self.server.teams[TEAM1].name
+        team2_name = self.server.teams[TEAM2].name
         await self.broadcast_message(
-            f"Score - Blue: {self.round_wins[0]} | Green: {self.round_wins[1]}"
+            f"Score - {team1_name}: {self.round_wins[TEAM1]} | {team2_name}: {self.round_wins[TEAM2]}"
         )
         
         # Check for match win
@@ -163,15 +167,15 @@ class ArenaMode(BaseMode):
     async def _end_round_timeout(self):
         """Handle round ending due to time limit."""
         # Team with more alive players wins
-        team_alive = {0: 0, 1: 0}
+        team_alive = {TEAM1: 0, TEAM2: 0}
         for p in self.alive_players:
             if p.alive:
                 team_alive[p.team] += 1
         
-        if team_alive[0] > team_alive[1]:
-            winner = 0
-        elif team_alive[1] > team_alive[0]:
-            winner = 1
+        if team_alive[TEAM1] > team_alive[TEAM2]:
+            winner = TEAM1
+        elif team_alive[TEAM2] > team_alive[TEAM1]:
+            winner = TEAM2
         else:
             winner = None
         

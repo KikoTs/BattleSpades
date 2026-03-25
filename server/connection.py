@@ -3,23 +3,45 @@ Connection - ENet peer wrapper.
 Handles map transfer and player state.
 """
 
-from aoslib.constants import DEFAULT_TEAM_CLASSES
+import asyncio
+import inspect
 import logging
 import zlib
-import asyncio
 from typing import Optional, TYPE_CHECKING, Dict, Type
 
-from aoslib.packet import (
-    MapSyncStart, MapSyncChunk, MapSyncEnd, MapDataValidation,
-    StateData, ExistingPlayer, CreatePlayer,
-    NewPlayerConnection, InitialInfo, SteamSessionTicket, SkyboxData,
+import shared.packet as shared_packet
+from protocol.runtime_packets import decode_runtime_packet
+from shared.bytes import ByteReader
+from shared.packet import (
+    ClientInMenu,
+    ClockSync,
+    CreatePlayer,
+    ExistingPlayer,
+    InitialInfo,
+    MapDataValidation,
+    MapSyncChunk,
+    MapSyncEnd,
+    MapSyncStart,
+    NewPlayerConnection,
+    SetClassLoadout,
+    SetHP,
+    SkyboxData,
+    StateData,
+    SteamSessionTicket,
 )
-import aoslib.packet
-import inspect
+from server.game_constants import (
+    DEFAULT_TEAM_CLASSES,
+    DEFAULT_WEAPON_TOOL,
+    TEAM1,
+    TEAM2,
+    TEAM_NEUTRAL,
+    TEAM_SPECTATOR,
+    is_playable_team,
+)
 
 # Build packet name mapping
 PACKET_NAMES = {}
-for name, cls in inspect.getmembers(aoslib.packet):
+for name, cls in inspect.getmembers(shared_packet):
     if inspect.isclass(cls) and hasattr(cls, 'id') and isinstance(cls.id, int):
         PACKET_NAMES[cls.id] = name
 
@@ -56,7 +78,10 @@ def try_parse_packet_for_logging(packet_id: int, data: bytes):
         return None
     packet_name = PACKET_NAMES[packet_id]
     try:
-        packet_class = getattr(aoslib.packet, packet_name, None)
+        runtime_packet = decode_runtime_packet(packet_id, data[1:])
+        if runtime_packet is not None:
+            return format_packet_fields(runtime_packet)
+        packet_class = getattr(shared_packet, packet_name, None)
         if packet_class is None:
             return None
         reader = ByteReader(data[1:])  # Skip packet ID byte
@@ -65,8 +90,6 @@ def try_parse_packet_for_logging(packet_id: int, data: bytes):
         return format_packet_fields(packet)
     except Exception as e:
         return f"(parse error: {e})"
-
-from aoslib.bytes import ByteReader
 
 if TYPE_CHECKING:
     import enet
@@ -77,6 +100,27 @@ logger = logging.getLogger(__name__)
 
 
 from server.util import lzf_compress, lzf_decompress
+
+
+WIRE_TEAM_SPECTATOR = TEAM_SPECTATOR
+WIRE_TEAM_NEUTRAL = TEAM_NEUTRAL
+DEFAULT_WIRE_TEAM = TEAM1
+SPAWN_HP_DAMAGE_TYPE = 2
+
+
+def wire_team_to_internal(team_id: int) -> Optional[int]:
+    """Convert wire team IDs into reversed runtime team IDs."""
+    return team_id if is_playable_team(team_id) else None
+
+
+def internal_team_to_wire(team_id: int) -> int:
+    """Convert runtime team IDs into the wire representation."""
+    return team_id if is_playable_team(team_id) else DEFAULT_WIRE_TEAM
+
+
+def is_non_playable_wire_team(team_id: int) -> bool:
+    """Return True for spectator/neutral wire team IDs."""
+    return team_id in (WIRE_TEAM_SPECTATOR, WIRE_TEAM_NEUTRAL)
 
 
 class Connection:
@@ -95,6 +139,11 @@ class Connection:
         self.map_sent = False
         self.state_sent = False
         self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
+        self.pending_class_id: Optional[int] = None
+        self.pending_loadout: list[int] = []
+        self.pending_prefabs: list[str] = []
+        self.pending_ugc_tools: list[int] = []
+        self.in_menu: Optional[bool] = None
         
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
@@ -139,6 +188,51 @@ class Connection:
         if not self.steam_key:
             return data
         return bytes(b ^ self.steam_key[i % len(self.steam_key)] for i, b in enumerate(data))
+
+    def send_clock_sync_response(self, client_time: int):
+        """Reply to a client clock sync packet."""
+        packet = ClockSync()
+        packet.client_time = client_time
+        packet.server_loop_count = self.server.loop_count
+        self.send(bytes(packet.generate()))
+
+    def _cache_pre_join_loadout(self, packet: SetClassLoadout):
+        """Store pre-join loadout state for the first spawn."""
+        self.pending_class_id = packet.class_id
+        self.pending_loadout = list(packet.loadout)
+        self.pending_prefabs = list(packet.prefabs)
+        self.pending_ugc_tools = list(packet.ugc_tools)
+
+    def _resolve_join_team(self, wire_team: int) -> tuple[int, int]:
+        """Resolve the initial playable team from the client's wire team ID."""
+        internal_team = wire_team_to_internal(wire_team)
+        if internal_team is not None:
+            return internal_team, wire_team
+
+        fallback_internal = wire_team_to_internal(DEFAULT_WIRE_TEAM)
+        if is_non_playable_wire_team(wire_team):
+            logger.warning(
+                "Client requested non-playable wire team %s during initial spawn; defaulting to %s",
+                wire_team,
+                DEFAULT_WIRE_TEAM,
+            )
+        else:
+            logger.warning(
+                "Unknown wire team %s during initial spawn; defaulting to %s",
+                wire_team,
+                DEFAULT_WIRE_TEAM,
+            )
+        return fallback_internal, internal_team_to_wire(fallback_internal)
+
+    def _send_spawn_hp(self, hp: int = 100):
+        """Send the initial HP packet expected immediately after first spawn."""
+        packet = SetHP()
+        packet.hp = hp
+        packet.damage_type = SPAWN_HP_DAMAGE_TYPE
+        packet.source_x = 0.0
+        packet.source_y = 0.0
+        packet.source_z = 0.0
+        self.send(bytes(packet.generate()))
     
     def on_connect(self, data: int):
         """Called when connection is established."""
@@ -163,7 +257,7 @@ class Connection:
             # Skip prefix byte
             data = data[1:]
         
-        # Decrypt ONLY if player is fully joined (pre-join packets are NOT encrypted)
+        # Once the Steam ticket has been received, subsequent packets are XOR-encrypted.
         data = self.decrypt(data)
         
         if len(data) < 1:
@@ -239,14 +333,14 @@ class Connection:
         state.team_headcount_type = 6
         
         # Team 1
-        team1 = self.server.teams[0]
+        team1 = self.server.teams[TEAM1]
         state.team1_name = team1.name
         state.team1_color = team1.color
         state.team1_score = team1.score
         state.team1_classes = DEFAULT_TEAM_CLASSES  # All classes available
         
         # Team 2
-        team2 = self.server.teams[1]
+        team2 = self.server.teams[TEAM2]
         state.team2_name = team2.name
         state.team2_color = team2.color
         state.team2_score = team2.score
@@ -276,7 +370,7 @@ class Connection:
             packet = ExistingPlayer()
             packet.player_id = player.id
             packet.demo_player = 0
-            packet.team = player.team
+            packet.team = internal_team_to_wire(player.team)
             packet.class_id = player.class_id
             packet.tool = player.tool
             packet.pickup = 0
@@ -284,7 +378,7 @@ class Connection:
             packet.score = player.kills
             packet.forced_team = 0
             packet.local_language = 0
-            packet.color = player.color
+            packet.color = getattr(player, 'color', player.block_color)
             packet.name = player.name
             packet.loadout = []
             packet.prefabs = []
@@ -326,6 +420,23 @@ class Connection:
             logger.debug(f"Decoding NewPlayerConnection")
             packet = NewPlayerConnection(reader)
             await self._on_new_player(packet)
+        elif packet_id == SetClassLoadout.id:
+            packet = SetClassLoadout(reader)
+            self._cache_pre_join_loadout(packet)
+            logger.debug(
+                "Cached pre-join loadout: class_id=%s loadout=%s prefabs=%s ugc_tools=%s",
+                packet.class_id,
+                packet.loadout,
+                packet.prefabs,
+                packet.ugc_tools,
+            )
+        elif packet_id == ClockSync.id:
+            packet = ClockSync(reader)
+            self.send_clock_sync_response(packet.client_time)
+        elif packet_id == ClientInMenu.id:
+            packet = ClientInMenu(reader)
+            self.in_menu = bool(packet.in_menu)
+            logger.debug("Client pre-join menu state updated: in_menu=%s", self.in_menu)
         else:
             logger.debug(f"Unknown pre-join packet ID: {packet_id}")
     
@@ -410,16 +521,17 @@ class Connection:
     async def send_map_data(self):
         """Send map data to client."""
         logger.debug(f"Sending map data to {self.peer.address}")
+        client_crc = None
         
         # Wait for MapDataValidation from client
         try:
             client_validation = await self.wait_for(MapDataValidation, timeout=5.0)
-            crc = client_validation.crc
-            logger.info(f"Client sent map CRC: {crc}")
+            client_crc = client_validation.crc
+            logger.info(f"Client sent map CRC: {client_crc}")
 
             # send map data validation
             packet = MapDataValidation()
-            packet.crc = crc
+            packet.crc = client_crc
             self.send(bytes(packet.generate()), prefix=0x31)
             
             # Allow client to process validation and state change
@@ -433,16 +545,35 @@ class Connection:
         
         # Get compressed map data
         chunker = self.server.world_manager.get_chunker()
+        if chunker is None:
+            logger.warning("No map chunker available for %s", self.peer.address)
+            return
         
         self.send(bytes(start_packet.generate()), prefix=0x32)
         
         chunk_list = list(chunker.iter())
         total_chunks = len(chunk_list)
+        server_crc = int(getattr(chunker, "crc32", 0))
+        estimated_size = int(getattr(getattr(self.server.world_manager, "map", None), "estimated_size", 0))
+        logger.info(
+            "Prepared map sync for %s: chunks=%s server_crc=%s estimated_size=%s",
+            self.peer.address,
+            total_chunks,
+            server_crc,
+            estimated_size,
+        )
+        if client_crc is not None and client_crc != server_crc:
+            logger.warning(
+                "Client/server map CRC mismatch for %s: client=%s server=%s",
+                self.peer.address,
+                client_crc,
+                server_crc,
+            )
         
         for idx, chunk in enumerate(chunk_list):
             chunk_packet = MapSyncChunk()
             # User fix: int((index / total_chunks) * 100)
-            chunk_packet.percent_complete = int((idx / total_chunks) * 100) + 1
+            chunk_packet.percent_complete = int((idx / max(total_chunks, 1)) * 100) + 1
             
             chunk_packet.data = chunk
             self.send(bytes(chunk_packet.generate()), prefix=0x31)
@@ -464,10 +595,13 @@ class Connection:
             self.disconnect(reason=3)  # Server full
             return
         
-        # Create player (weapon defaults to rifle if not specified)
-        weapon = getattr(packet, 'weapon', 0)  # Default to WEAPON_RIFLE
-        player = Player(player_id, packet.name, packet.team, weapon, self)
-        player.class_id = packet.class_id
+        # NewPlayerConnection does not carry a concrete tool, so start with the default weapon tool.
+        weapon = DEFAULT_WEAPON_TOOL
+        internal_team, wire_team = self._resolve_join_team(packet.team)
+        player = Player(player_id, packet.name, internal_team, weapon, self)
+        player.class_id = (
+            self.pending_class_id if self.pending_class_id is not None else packet.class_id
+        )
         
         self.player = player
         self.server.players[player_id] = player
@@ -476,7 +610,13 @@ class Connection:
         if player.team in self.server.teams:
             self.server.teams[player.team].add_player(player)
         
-        logger.info(f"Player {player.name} (ID {player_id}) joined team {player.team}")
+        logger.info(
+            "Player %s (ID %s) joined wire team %s as internal team %s",
+            player.name,
+            player_id,
+            wire_team,
+            player.team,
+        )
         
         # State, Skybox and Existing players are sent in send_connection_data
         
@@ -485,26 +625,27 @@ class Connection:
         create_packet.player_id = player_id
         create_packet.demo_player = 0
         create_packet.class_id = player.class_id
-        create_packet.team = player.team
-        create_packet.dead = 1
-        create_packet.local_language = 0
+        create_packet.team = wire_team
+        create_packet.dead = 0
+        create_packet.local_language = packet.local_language
         
         # Spawn position
         spawn = self.server.world_manager.get_spawn_point(player.team)
         create_packet.x = spawn[0]
         create_packet.y = spawn[1]
         create_packet.z = spawn[2]
-        create_packet.ori_x = 1.0
+        create_packet.ori_x = 0.0
         create_packet.ori_y = 0.0
-        create_packet.ori_z = 0.0
+        create_packet.ori_z = 255.5
         create_packet.name = player.name
-        create_packet.loadout = []
-        create_packet.prefabs = []
+        create_packet.loadout = list(self.pending_loadout)
+        create_packet.prefabs = list(self.pending_prefabs)
         
         self.server.broadcast(bytes(create_packet.generate()))
         
         # Spawn player
         player.spawn(spawn[0], spawn[1], spawn[2])
+        self._send_spawn_hp()
         
         # Notify game mode
         if self.server.mode:

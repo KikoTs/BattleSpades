@@ -14,6 +14,8 @@ import random
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
+from .game_constants import TEAM1, TEAM2
+
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
     import enet
@@ -375,10 +377,10 @@ class A2SHandler:
         }
         
         # Team scores
-        if 0 in self.server.teams:
-            rules["team1_score"] = str(self.server.teams[0].score)
-        if 1 in self.server.teams:
-            rules["team2_score"] = str(self.server.teams[1].score)
+        if TEAM1 in self.server.teams:
+            rules["team1_score"] = str(self.server.teams[TEAM1].score)
+        if TEAM2 in self.server.teams:
+            rules["team2_score"] = str(self.server.teams[TEAM2].score)
         
         packet = bytearray(A2SConstants.PREFIX_BYTES)
         packet.append(A2SConstants.A2S_RULES_RESPONSE)

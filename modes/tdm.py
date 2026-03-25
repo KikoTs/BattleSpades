@@ -6,6 +6,8 @@ Two teams fight for kills until score or time limit is reached.
 import logging
 from typing import Optional, TYPE_CHECKING
 
+from server.game_constants import KILL_HEADSHOT, TEAM1, TEAM2
+
 from .base_mode import BaseMode
 
 if TYPE_CHECKING:
@@ -49,8 +51,6 @@ class TDMMode(BaseMode):
     
     async def on_player_kill(self, killer: 'Player', victim: 'Player', kill_type: int):
         """Award points for kills."""
-        from aoslib.constants import KILL_HEADSHOT
-        
         # Award team points
         points = self.kill_points
         if kill_type == KILL_HEADSHOT:
@@ -71,10 +71,10 @@ class TDMMode(BaseMode):
     
     async def _broadcast_scores(self):
         """Broadcast current team scores."""
-        blue_score = self.server.teams[0].score
-        green_score = self.server.teams[1].score
+        team1 = self.server.teams[TEAM1]
+        team2 = self.server.teams[TEAM2]
         
-        message = f"Score - Blue: {blue_score} | Green: {green_score}"
+        message = f"Score - {team1.name}: {team1.score} | {team2.name}: {team2.score}"
         # Could send as system message for HUD update
     
     async def on_tick(self, tick: int):
@@ -83,11 +83,11 @@ class TDMMode(BaseMode):
         
         # Every 60 seconds, announce scores
         if tick % (60 * self.server.tick_rate) == 0:
-            blue_score = self.server.teams[0].score
-            green_score = self.server.teams[1].score
+            blue_score = self.server.teams[TEAM1].score
+            green_score = self.server.teams[TEAM2].score
             
             if blue_score != green_score:
-                leader = 0 if blue_score > green_score else 1
+                leader = TEAM1 if blue_score > green_score else TEAM2
                 team_name = self.server.teams[leader].name
                 diff = abs(blue_score - green_score)
                 await self.broadcast_message(f"{team_name} leads by {diff} points!")

@@ -6,6 +6,9 @@ import logging
 from typing import Callable, Dict, List, Optional, Awaitable, TYPE_CHECKING
 from dataclasses import dataclass
 
+from server.game_constants import CHAT_SYSTEM
+from shared.packet import ChatMessage
+
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
     from server.player import Player
@@ -120,11 +123,11 @@ async def handle_command(server: 'BattleSpadesServer', player: 'Player', message
 
 async def send_message(server: 'BattleSpadesServer', player: 'Player', message: str):
     """Send a system message to a specific player."""
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=message)
-    player.send(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = message
+    player.send(bytes(packet.generate()))
 
 
 def get_command(name: str) -> Optional[Command]:

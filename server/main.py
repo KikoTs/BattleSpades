@@ -10,15 +10,23 @@ import logging
 import time
 from typing import Dict, Optional, TYPE_CHECKING
 
-from aoslib.vxl import AceMap
-from aoslib.packet import (
-    WorldUpdate, StateData, CreatePlayer, ExistingPlayer, 
-    PlayerLeft, MapSyncStart, MapSyncChunk, MapSyncEnd,
-    ClockSync, FogColor, ChatMessage
+from shared.packet import (
+    ChatMessage,
+    ClockSync,
+    CreatePlayer,
+    ExistingPlayer,
+    FogColor,
+    MapSyncChunk,
+    MapSyncEnd,
+    MapSyncStart,
+    PlayerLeft,
+    StateData,
+    WorldUpdate,
 )
-from aoslib.bytes import ByteWriter
 
 from .config import ServerConfig
+from .combat_runtime import CombatSystem
+from .game_constants import TEAM1, TEAM2
 from .player import Player
 from .team import Team
 from .world_manager import WorldManager
@@ -53,15 +61,18 @@ class BattleSpadesServer:
         self.players: Dict[int, Player] = {}
         self.connections: Dict[int, Connection] = {}
         self._next_player_id = 0
+        self.entities: Dict[int, object] = {}
+        self.rocket_turrets: Dict[int, object] = {}
         
         # Teams
         self.teams = {
-            0: Team(0, config.team1_name, config.team1_color),
-            1: Team(1, config.team2_name, config.team2_color),
+            TEAM1: Team(TEAM1, config.team1_name, config.team1_color),
+            TEAM2: Team(TEAM2, config.team2_name, config.team2_color),
         }
         
         # World
         self.world_manager = WorldManager(config)
+        self.combat = CombatSystem(self)
         
         # A2S Query handler for Steam browser and LAN discovery
         self.a2s_handler = A2SHandler(self)
@@ -219,33 +230,33 @@ class BattleSpadesServer:
             await asyncio.sleep(0.001)
     
     async def _world_update_loop(self):
-        """Send world updates to clients at lower frequency."""
-        update_interval = 1.0 / 20.0  # 20 Hz
-        
+        """Send world updates to clients at the authoritative server tick rate."""
+        update_interval = self.tick_interval
+
         while self.running:
-            # Build WorldUpdate packet
-            world_update = WorldUpdate()
-            world_update.loop_count = self.loop_count
-            
-            for pid, player in self.players.items():
-                if player.alive:
-                    world_update[pid] = (
-                        (player.x, player.y, player.z),  # position
-                        player.orientation,               # orientation
-                        (player.vx, player.vy, player.vz),  # velocity
-                        0,  # ping
-                        0,  # pong
-                        player.health,
-                        player.get_input_byte(),
-                        0,  # action
-                        player.tool,
-                    )
-            
-            # Broadcast update
-            data = bytes(world_update.generate())
-            #self.broadcast(data)
-            
+            data = self.build_world_update_data()
+            if self.connections:
+                self.broadcast(data)
+
             await asyncio.sleep(update_interval)
+
+    def build_world_update_packet(self) -> WorldUpdate:
+        """Build the current WorldUpdate snapshot for all active players."""
+        world_update = WorldUpdate()
+        world_update.loop_count = self.loop_count
+
+        for pid, player in self.players.items():
+            if not player.alive or not player.spawned:
+                continue
+            world_update[pid] = player.world_update_snapshot()
+
+        world_update.updated_entities = list(self.entities.values())
+        world_update.rocket_turrets = list(self.rocket_turrets.values())
+        return world_update
+
+    def build_world_update_data(self) -> bytes:
+        """Serialize the current WorldUpdate packet."""
+        return bytes(self.build_world_update_packet().generate())
     
     def _on_connect_sync(self, peer, data: int = 0):
         """Handle new connection (sync version for net_update)."""

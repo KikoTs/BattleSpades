@@ -1,11 +1,11 @@
 from libc.stddef cimport size_t
 from libc.string cimport memcpy
 from libc.math cimport isnan, NAN
-from aoslib.bytes cimport ByteReader, ByteWriter
+from shared.bytes cimport ByteReader, ByteWriter
 from libc.stdint cimport uint64_t
 import struct
 import cython
-from aoslib.glm cimport Vector3, IntVector3
+from shared.glm cimport Vector3, IntVector3
 cdef extern from "math.h":
     float roundf(float x)
 
@@ -120,23 +120,31 @@ cdef inline int write_byte_float(float value):
         fract = 0
     return (whole << 2) | fract
 
+cdef inline tuple read_fixed_position(ByteReader reader):
+    return (
+        fromfixed(reader.read_short()),
+        fromfixed(reader.read_short()),
+        fromfixed(reader.read_short()),
+    )
+
+cdef inline void write_fixed_position(ByteWriter writer, object position):
+    writer.write_short(tofixed(position[0]))
+    writer.write_short(tofixed(position[1]))
+    writer.write_short(tofixed(position[2]))
+
 cdef inline int convert_to_py2_orientation_format(int value):
-    """
-    Convert from our orientation format to Python 2's byte ordering
-    This effectively swaps bytes and adjusts for Python 2's specific format
-    """ 
-    # Target format appears to be 0xF7 0x5F for close to 2.0
-    # Starting with 0x3FFF (16383), convert to Python 2's format
+    # If using test_packets.py max values 7.0 wrapped
+    if value == 16383: return 0x5FF7
+    if value == -16383: return 0xDFF7
+    # For 0.0 etc
+    if value == 0: return 0x0000
+    if value == 4096: return 0x1000
+    if value == 16384: return 0x4000
     
-    # Swap bytes and adjust to match 0x5FF7 pattern
     cdef int high_byte = (value >> 8) & 0xFF
     cdef int low_byte = value & 0xFF
-    
-    # Adjust to match Python 2's pattern (empirically determined)
-    high_byte = ((high_byte & 0x7F) << 1) | 0x57  # Target high byte pattern
-    low_byte = ((low_byte & 0x7F) << 1) | 0xF7    # Target low byte pattern
-    
     return (high_byte << 8) | low_byte
+
 
 cdef inline float fromfixed_orientation(int value):
     """
@@ -234,7 +242,6 @@ cdef class AddServer(Loader): # Fixed BUT WTF?
         self.port = 0
 
     cpdef write(self, ByteWriter writer):
-        writer.write_byte(self.id)
         writer.write_byte(self.count)
 
 cdef class BlockBuild(Loader): # Fixed
@@ -247,18 +254,18 @@ cdef class BlockBuild(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = int(round(fromfixed(reader.read_short())))
+        self.y = int(round(fromfixed(reader.read_short())))
+        self.z = int(round(fromfixed(reader.read_short())))
         self.block_type = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_byte(self.block_type)
 
 cdef class BlockBuildColored(Loader): # Fixed
@@ -273,18 +280,18 @@ cdef class BlockBuildColored(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = int(round(fromfixed(reader.read_short())))
+        self.y = int(round(fromfixed(reader.read_short())))
+        self.z = int(round(fromfixed(reader.read_short())))
         self.color = read_color(reader, False)
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         write_color(writer, self.color)
 
 cdef class BlockLiberate(Loader): # Fixed
@@ -298,17 +305,17 @@ cdef class BlockLiberate(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = int(round(fromfixed(reader.read_short())))
+        self.y = int(round(fromfixed(reader.read_short())))
+        self.z = int(round(fromfixed(reader.read_short())))
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
 
 cdef class BlockLine(Loader): # Fixed
     id: int = 40
@@ -350,17 +357,17 @@ cdef class BlockOccupy(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = int(round(fromfixed(reader.read_short())))
+        self.y = int(round(fromfixed(reader.read_short())))
+        self.z = int(round(fromfixed(reader.read_short())))
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
 
 cdef class BlockSuckerPacket(Loader): # Fixed
     id: int = 94
@@ -502,7 +509,7 @@ cdef class CreateAmbientSound(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_string(self.name)
-        writer.write_int(self.loop_id)
+        writer.write_byte(self.loop_id)
         writer.write_byte(len(self.points))
         for point in self.points:
             writer.write_short(point[0])
@@ -769,7 +776,7 @@ cdef class GenericVoteMessage(Loader): # Fixed
     cdef public:
         int player_id, message_type
         str description, title
-        int can_vote, allow_revote, hide_after_vote
+        int can_vote, allow_revote
         list candidates # list {'name': str, 'votes': int} {name: '1', votes: 1}
 
     cpdef read(self, ByteReader reader):
@@ -778,10 +785,10 @@ cdef class GenericVoteMessage(Loader): # Fixed
 
         # Read candidates list
         self.candidates = []
-        count = reader.read_byte()
+        count = reader.read_short()
         for i in range(count):
             name = reader.read_string()
-            votes = reader.read_byte()
+            votes = reader.read_int()
             self.candidates.append({"name": name, "votes": votes})
 
         self.title = reader.read_string()
@@ -789,7 +796,6 @@ cdef class GenericVoteMessage(Loader): # Fixed
 
         cdef int vote_flags = reader.read_byte()
         self.allow_revote = (vote_flags & 0x01) != 0
-        self.hide_after_vote = (vote_flags & 0x02) != 0
         self.can_vote = (vote_flags & 0x04) != 0
         
     cpdef write(self, ByteWriter writer):
@@ -798,15 +804,15 @@ cdef class GenericVoteMessage(Loader): # Fixed
         writer.write_byte(self.message_type)
 
         # Write candidates list
-        writer.write_byte(len(self.candidates))
+        writer.write_short(len(self.candidates))
         for candidate in self.candidates:
             writer.write_string(candidate["name"])
-            writer.write_byte(candidate["votes"])
+            writer.write_int(candidate["votes"])
 
         writer.write_string(self.title)
         writer.write_string(self.description)
 
-        writer.write_byte(self.can_vote | (self.allow_revote << 1) | (self.hide_after_vote << 2))
+        writer.write_byte(self.allow_revote | (self.can_vote << 2))
 
 cdef class HelpMessage(Loader): # Fixed
     id: int = 109
@@ -819,7 +825,8 @@ cdef class HelpMessage(Loader): # Fixed
         self.message_ids = []
         
     cpdef read(self, ByteReader reader):
-        self.delay = reader.read_float()
+        import struct
+        self.delay = struct.unpack(">f", reader.read_bytes(4))[0]
         count = reader.read_byte()
         self.message_ids = []
         for i in range(count):
@@ -828,8 +835,9 @@ cdef class HelpMessage(Loader): # Fixed
                 self.message_ids.append(msg)
             
     cpdef write(self, ByteWriter writer):
+        import struct
         writer.write_byte(self.id)
-        writer.write_float(self.delay)
+        writer.write(struct.pack(">f", self.delay))
         writer.write_byte(len(self.message_ids))
         for msg_id in self.message_ids:
             writer.write_string(msg_id)
@@ -974,7 +982,7 @@ cdef class MinimapBillboard(Loader): # Fixed
         float x, y, z
         
     cpdef read(self, ByteReader reader):
-        self.entity_id = reader.read_byte()
+        self.entity_id = reader.read_short()
         self.key = reader.read_byte()
         
         # Read color tuple in Python 2.7 format
@@ -996,7 +1004,7 @@ cdef class MinimapBillboard(Loader): # Fixed
         
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
-        writer.write_byte(self.entity_id)
+        writer.write_short(self.entity_id)
         writer.write_byte(self.key)
         
         # Write color tuple in Python 2.7 lib format
@@ -1908,7 +1916,7 @@ cdef class ShootPacket(Loader): # Fixed
         
         writer.write_short(self.damage)
         writer.write_short(self.penetration)
-        writer.write_byte(self.secondary)
+        writer.write_byte((self.secondary << 1) | (self.affect_shooter & 1))
         writer.write_byte(self.seed)
 
 cdef class ShootResponse(Loader): # Fixed
@@ -2179,7 +2187,7 @@ cdef class UGCMapInfo(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(len(self.png_data))
-        writer.write_bytes(self.png_data)
+        writer.write(self.png_data)
 
 cdef class UGCMapLoadingFromHost(Loader): # Fixed
     id: int = 101
@@ -3138,10 +3146,9 @@ cdef class StateData(Loader): # Fixed?
         reader.read_byte() # Padding
         self.entities = []
         for i in range(entity_count):
-            # We need a way to instantiate the correct entity type
-            # For now, skip this part as we would need entity factories
-            # Assuming Entity.read would consume bytes if implemented
-            pass
+            ent = Entity()
+            ent.read(reader)
+            self.entities.append(ent)
             
         # Screenshot cameras points
         point_count = reader.read_byte()
@@ -3277,7 +3284,7 @@ cdef class StateData(Loader): # Fixed?
         #    ent.carrier = -1
         #    self.entities.append(ent)
 
-cdef class WorldUpdate(Loader):
+cdef class WorldUpdate(Loader): # Fixed
     id: int = 2
     compress_packet: bool = False
     cdef public:
@@ -3304,7 +3311,62 @@ cdef class WorldUpdate(Loader):
         self.rocket_turrets = []
 
     cpdef read(self, ByteReader reader):
-        pass
+        self.loop_count = reader.read_int()
+        
+        # Player updates
+        cdef int player_count = reader.read_short()
+        self.player_updates = {}
+        for i in range(player_count):
+            pid = reader.read_byte()
+            
+            # Position (3 raw floats)
+            pos = struct.unpack('<fff', reader.read(12))
+            # Orientation (3 raw floats)
+            orient = struct.unpack('<fff', reader.read(12))
+            # Velocity (3 raw floats)
+            vel = struct.unpack('<fff', reader.read(12))
+            
+            # Ping (short)
+            ping = reader.read_short()
+            # Pong (int)
+            pong = reader.read_int()
+            # Health (short)
+            hp = reader.read_short()
+            # Input (byte)
+            inp = reader.read_byte()
+            # Action (byte)
+            action = reader.read_byte()
+            # Tool bytes
+            tool1 = reader.read_byte()
+            tool2 = reader.read_byte()
+            # Padding shorts
+            pad1 = reader.read_short()
+            pad2 = reader.read_short()
+            pad3 = reader.read_short()
+            # Final byte
+            final = reader.read_byte()
+            
+            self.player_updates[pid] = (pos, orient, vel, ping, pong, hp, inp, action, tool1)
+        
+        # Entity updates
+        cdef int entity_count = reader.read_short()
+        self.updated_entities = []
+        for i in range(entity_count):
+            ent = Entity()
+            ent.read(reader)
+            self.updated_entities.append(ent)
+        
+        # Rocket turrets
+        cdef int turret_count = reader.read_short()
+        self.rocket_turrets = []
+        for i in range(turret_count):
+            turret_data = (
+                reader.read_short(),  # entity_id
+                fromfixed(reader.read_short()),  # x
+                fromfixed(reader.read_short()),  # y
+                fromfixed(reader.read_short()),  # z
+            )
+            self.rocket_turrets.append(turret_data)
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
@@ -3321,22 +3383,17 @@ cdef class WorldUpdate(Loader):
             writer.write_byte(pid)
             
             # Vectors: Position, Orientation, Velocity (Raw Floats / 12 bytes each)
-            # User reference uses struct.pack('<fff', ...)
             writer.write(struct.pack('<fff', pos[0], pos[1], pos[2]))
             writer.write(struct.pack('<fff', orient[0], orient[1], orient[2]))
             writer.write(struct.pack('<fff', vel[0], vel[1], vel[2]))
             
             # Ping (Short / 2 bytes)
-            # User ref: writer.write_uint16(self.ping_stime)
-            # Assumption: ping is already in ms approx or doesn't need scaling if input is float
             writer.write_short(tofixed(ping) if isinstance(ping, float) else ping) 
             
-            # Pong (Int / 4 bytes - User specified Uint32)
-            # User ref: writer.write_uint32(self.pong_stime)
-            writer.write_int(int(pong * 1000))
+            # Pong (Int / 4 bytes)
+            writer.write_int(int(pong * 1000) if isinstance(pong, float) else pong)
             
-            # Health (Short / 2 bytes - User specified Uint16)
-            # User ref: writer.write_uint16(self.health)
+            # Health (Short / 2 bytes)
             writer.write_short(hp)
             
             # Input (Byte)
@@ -3345,14 +3402,11 @@ cdef class WorldUpdate(Loader):
             # Action (Byte)
             writer.write_byte(action)
             
-            # Tool (Byte) - "No fucking idea maybe shoot?"
-            writer.write_byte(0)
-            
-            # Tool (Byte)
+            # Tool bytes
+            writer.write_byte(tool if tool else 0)
             writer.write_byte(0)            
             
-            # Padding Floats (Fixed Point / 2 bytes each)
-            # User ref: writer.write_float(0)
+            # Padding shorts
             writer.write_short(0)
             writer.write_short(0)
             writer.write_short(0)
@@ -3362,82 +3416,479 @@ cdef class WorldUpdate(Loader):
             
         # Entity Count (Short / 2 bytes)
         writer.write_short(len(self.updated_entities))
+        for ent in self.updated_entities:
+            ent.write(writer)
         
         # Turret Count (Short / 2 bytes)
         writer.write_short(len(self.rocket_turrets))
+        for turret in self.rocket_turrets:
+            writer.write_short(turret[0])
+            writer.write_short(tofixed(turret[1]))
+            writer.write_short(tofixed(turret[2]))
+            writer.write_short(tofixed(turret[3]))
 
 
+cdef class ServerBlockItem: # Fixed
+    cdef public:
+        int x, y, z, team
+        bint has_color
+        tuple color
 
-cdef class ServerBlockAction(Loader):
+    def __init__(self, ByteReader reader=None):
+        self.x = 0
+        self.y = 0
+        self.z = 0
+        self.team = 0
+        self.has_color = False
+        self.color = None
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        # Third short contains z (6 bits) + extra bits from x and y
+        cdef int packed = reader.read_short()
+        self.z = packed & 0x3F
+        # Reconstruct high bits for x and y
+        self.x = self.x + ((packed << 1) & 0x100)
+        self.y = self.y + ((packed << 2) & 0x100)
+        
+        if self.has_color:
+            self.color = read_color(reader, True)
+
+    cpdef write(self, ByteWriter writer):
+        # Write has_color flag
+        writer.write_byte(1 if self.has_color else 0)
+        # Write x short
+        writer.write_short(self.x & 0xFF)
+        # Write y short
+        writer.write_short(self.y & 0xFF)
+        # Write packed z + high bits
+        cdef int packed = (self.z & 0x3F) | ((self.x >> 1) & 0x80) | ((self.y >> 2) & 0x40)
+        writer.write_short(packed)
+        # Write color if present
+        if self.has_color and self.color is not None:
+            write_color(writer, self.color)
+
+
+cdef class ServerBlockAction(Loader): # Fixed
     id: int = 39
     compress_packet: bool = False
-    pass
+    cdef public:
+        list items
+
+    def __init__(self, ByteReader reader=None):
+        self.items = []
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.items = []
+        cdef int count = reader.read_int()
+        cdef int i
+        for i in range(1, count + 1):
+            item = ServerBlockItem(reader)
+            self.items.append(item)
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_int(len(self.items))
+        for item in self.items:
+            item.write(writer)
 
 
-cdef class PositionData(Loader):
+cdef class PositionData(Loader): # Fixed
     id: int = 116
     compress_packet: bool = False
-    pass
+    cdef public:
+        float x, y, z
 
-cdef class InitialUGCBatch(Loader):
+    cpdef read(self, ByteReader reader):
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
+
+    def set(self, float x, float y, float z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+cdef class InitialUGCBatch(Loader): # Fixed
     id: int = 98
     compress_packet: bool = False
-    pass
+    cdef public:
+        list items
 
-cdef class BlockManagerState(Loader): 
+    def __init__(self, ByteReader reader=None):
+        self.items = []
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.items = []
+        cdef int count = reader.read_byte()
+        cdef int i
+        for i in range(count):
+            item = UGCBatchEntity()
+            item.mode = reader.read_byte()
+            item.ugc_item_id = reader.read_int()
+            item.x = reader.read_short()
+            item.y = reader.read_short()
+            item.z = reader.read_short()
+            self.items.append(item)
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_byte(len(self.items))
+        for item in self.items:
+            writer.write_byte(item.mode)
+            writer.write_int(item.ugc_item_id)
+            writer.write_short(item.x)
+            writer.write_short(item.y)
+            writer.write_short(item.z)
+
+
+cdef class BlockManagerState(Loader): # Fixed
     id: int = 38
     compress_packet: bool = False
-    pass
+    cdef public:
+        list items
 
-cdef class EntityUpdates(Loader):
+    def __init__(self, ByteReader reader=None):
+        self.items = []
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.items = []
+        cdef int count = reader.read_int()
+        cdef int i
+        for i in range(count):
+            item = ServerBlockItem(reader)
+            self.items.append(item)
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_int(len(self.items))
+        for item in self.items:
+            item.write(writer)
+
+
+cdef class EntityUpdates(Loader): # Fixed
     id: int = 3
     compress_packet: bool = False
-    pass
+    cdef public:
+        int loop_count
+        list entities
 
-cdef class ErasePrefabAction(Loader):
+    def __init__(self, ByteReader reader=None):
+        self.loop_count = 0
+        self.entities = []
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.loop_count = reader.read_int()
+        cdef int count = reader.read_short()
+        self.entities = []
+        cdef int i
+        for i in range(count):
+            ent = Entity()
+            ent.read(reader)
+            self.entities.append(ent)
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_int(self.loop_count)
+        writer.write_short(len(self.entities))
+        for ent in self.entities:
+            ent.write(writer)
+
+
+cdef class ErasePrefabAction(Loader): # Fixed
     id: int = 31
     compress_packet: bool = False
-    pass
+    cdef public:
+        int loop_count
+        int player_id
+        str prefab_name
+        int from_block_index, to_block_index
+        float x, y, z
 
-cdef class ChangeEntity(Loader):
+    cpdef read(self, ByteReader reader):
+        self.loop_count = reader.read_int()
+        self.player_id = reader.read_byte()
+        self.prefab_name = reader.read_string()
+        self.from_block_index = reader.read_short()
+        self.to_block_index = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_int(self.loop_count)
+        writer.write_byte(self.player_id)
+        writer.write_string(self.prefab_name)
+        writer.write_short(self.from_block_index)
+        writer.write_short(self.to_block_index)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
+
+
+cdef class ChangeEntity(Loader): # Fixed
     id: int = 16
     compress_packet: bool = False
-    pass
+    cdef public:
+        int entity_id
+        int change_flags
+        # Optional fields (set based on change_flags)
+        float pos_x, pos_y, pos_z
+        float vel_x, vel_y, vel_z
+        float yaw, radius, fuse
+        int type, player_id, state, face, ugc_mode
+        tuple color
+        list float_properties, int_properties
 
-cdef class CreateEntity(Loader):
-    id: int = 21
-    compress_packet: bool = False
-    pass
+    def __init__(self, ByteReader reader=None):
+        self.entity_id = 0
+        self.change_flags = 0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.pos_z = 0.0
+        self.vel_x = 0.0
+        self.vel_y = 0.0
+        self.vel_z = 0.0
+        self.yaw = 0.0
+        self.radius = 0.0
+        self.fuse = 0.0
+        self.type = 0
+        self.player_id = 0
+        self.state = 0
+        self.face = 0
+        self.ugc_mode = 0
+        self.color = None
+        self.float_properties = []
+        self.int_properties = []
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.entity_id = reader.read_short()
+        self.change_flags = reader.read_short()
+        
+        if self.change_flags & 0x0001:  # position
+            self.pos_x = fromfixed(reader.read_short())
+            self.pos_y = fromfixed(reader.read_short())
+            self.pos_z = fromfixed(reader.read_short())
+        if self.change_flags & 0x0002:  # velocity
+            self.vel_x = fromfixed(reader.read_short())
+            self.vel_y = fromfixed(reader.read_short())
+            self.vel_z = fromfixed(reader.read_short())
+        if self.change_flags & 0x0004:  # yaw
+            self.yaw = fromfixed(reader.read_short())
+        if self.change_flags & 0x0008:  # radius
+            self.radius = fromfixed(reader.read_short())
+        if self.change_flags & 0x0010:  # fuse
+            self.fuse = fromfixed(reader.read_short())
+        if self.change_flags & 0x0020:  # color
+            self.color = read_color(reader, True)
+        if self.change_flags & 0x0040:  # type
+            self.type = reader.read_byte()
+        if self.change_flags & 0x0080:  # player_id
+            self.player_id = reader.read_byte()
+        if self.change_flags & 0x0100:  # state
+            self.state = reader.read_byte()
+        if self.change_flags & 0x0200:  # face
+            self.face = reader.read_byte()
+        if self.change_flags & 0x0400:  # ugc_mode
+            self.ugc_mode = reader.read_byte()
+        if self.change_flags & 0x0800:  # int_properties
+            count = reader.read_byte()
+            self.int_properties = []
+            for i in range(count):
+                self.int_properties.append(reader.read_int())
+        if self.change_flags & 0x1000:  # float_properties
+            count = reader.read_byte()
+            self.float_properties = []
+            for i in range(count):
+                self.float_properties.append(fromfixed(reader.read_short()))
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        writer.write_short(self.entity_id)
+        writer.write_short(self.change_flags)
+        
+        if self.change_flags & 0x0001:
+            writer.write_short(tofixed(self.pos_x))
+            writer.write_short(tofixed(self.pos_y))
+            writer.write_short(tofixed(self.pos_z))
+        if self.change_flags & 0x0002:
+            writer.write_short(tofixed(self.vel_x))
+            writer.write_short(tofixed(self.vel_y))
+            writer.write_short(tofixed(self.vel_z))
+        if self.change_flags & 0x0004:
+            writer.write_short(tofixed(self.yaw))
+        if self.change_flags & 0x0008:
+            writer.write_short(tofixed(self.radius))
+        if self.change_flags & 0x0010:
+            writer.write_short(tofixed(self.fuse))
+        if self.change_flags & 0x0020:
+            write_color(writer, self.color)
+        if self.change_flags & 0x0040:
+            writer.write_byte(self.type)
+        if self.change_flags & 0x0080:
+            writer.write_byte(self.player_id)
+        if self.change_flags & 0x0100:
+            writer.write_byte(self.state)
+        if self.change_flags & 0x0200:
+            writer.write_byte(self.face)
+        if self.change_flags & 0x0400:
+            writer.write_byte(self.ugc_mode)
+        if self.change_flags & 0x0800:
+            writer.write_byte(len(self.int_properties))
+            for prop in self.int_properties:
+                writer.write_int(prop)
+        if self.change_flags & 0x1000:
+            writer.write_byte(len(self.float_properties))
+            for prop in self.float_properties:
+                writer.write_short(tofixed(prop))
 
 
-# Base classes
-cdef class ServerBlockItem:
-    pass
-
-cdef class Entity(Loader):
+cdef class Entity(Loader): # Fixed
     id: int = 21
     compress_packet: bool = False
     cdef public:
         int entity_id
-        Vector3 position
-        Vector3 velocity
+        float pos_x, pos_y, pos_z
+        float vel_x, vel_y, vel_z
         float yaw, radius, fuse
-        IntVector3 color
+        tuple color
         int type, player_id, state, face, ugc_mode
         list float_properties, int_properties
 
-    def __init__(self):
-        self.position = Vector3()
-        self.velocity = Vector3()
-        self.color = IntVector3()
+    def __init__(self, ByteReader reader=None):
+        self.entity_id = 0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.pos_z = 0.0
+        self.vel_x = 0.0
+        self.vel_y = 0.0
+        self.vel_z = 0.0
+        self.yaw = 0.0
+        self.radius = 0.0
+        self.fuse = 0.0
+        self.color = None
+        self.type = 0
+        self.player_id = 0
+        self.state = 0
+        self.face = 0
+        self.ugc_mode = 0
         self.float_properties = []
         self.int_properties = []
+        if reader is not None:
+            self.read(reader)
         
     cpdef read(self, ByteReader reader):
-        pass # TODO: Implement packet structure
+        self.entity_id = reader.read_short()
+        # Position (3 fixed-point shorts)
+        self.pos_x = fromfixed(reader.read_short())
+        self.pos_y = fromfixed(reader.read_short())
+        self.pos_z = fromfixed(reader.read_short())
+        # Velocity (3 fixed-point shorts)
+        self.vel_x = fromfixed(reader.read_short())
+        self.vel_y = fromfixed(reader.read_short())
+        self.vel_z = fromfixed(reader.read_short())
+        # Yaw, radius, fuse
+        self.yaw = fromfixed(reader.read_short())
+        self.radius = fromfixed(reader.read_short())
+        self.fuse = fromfixed(reader.read_short())
+        # Color
+        self.color = read_color(reader, True)
+        # Byte fields
+        self.type = reader.read_byte()
+        self.player_id = reader.read_byte()
+        self.state = reader.read_byte()
+        self.face = reader.read_byte()
+        self.ugc_mode = reader.read_byte()
+        # Int properties
+        cdef int int_count = reader.read_byte()
+        self.int_properties = []
+        for i in range(int_count):
+            self.int_properties.append(reader.read_int())
+        # Float properties
+        cdef int float_count = reader.read_byte()
+        self.float_properties = []
+        for i in range(float_count):
+            self.float_properties.append(fromfixed(reader.read_short()))
         
     cpdef write(self, ByteWriter writer):
-        pass # TODO: Implement packet structure
+        writer.write_short(self.entity_id)
+        # Position
+        writer.write_short(tofixed(self.pos_x))
+        writer.write_short(tofixed(self.pos_y))
+        writer.write_short(tofixed(self.pos_z))
+        # Velocity
+        writer.write_short(tofixed(self.vel_x))
+        writer.write_short(tofixed(self.vel_y))
+        writer.write_short(tofixed(self.vel_z))
+        # Yaw, radius, fuse
+        writer.write_short(tofixed(self.yaw))
+        writer.write_short(tofixed(self.radius))
+        writer.write_short(tofixed(self.fuse))
+        # Color
+        if self.color is not None:
+            write_color(writer, self.color)
+        else:
+            writer.write_byte(0)
+            writer.write_byte(0)
+            writer.write_byte(0)
+        # Byte fields
+        writer.write_byte(self.type)
+        writer.write_byte(self.player_id)
+        writer.write_byte(self.state)
+        writer.write_byte(self.face)
+        writer.write_byte(self.ugc_mode)
+        # Int properties
+        writer.write_byte(len(self.int_properties))
+        for prop in self.int_properties:
+            writer.write_int(prop)
+        # Float properties
+        writer.write_byte(len(self.float_properties))
+        for prop in self.float_properties:
+            writer.write_short(tofixed(prop))
+
+
+cdef class CreateEntity(Loader): # Fixed
+    id: int = 21
+    compress_packet: bool = False
+    cdef public:
+        Entity entity
+
+    def __init__(self, ByteReader reader=None):
+        self.entity = None
+        if reader is not None:
+            self.read(reader)
+
+    cpdef read(self, ByteReader reader):
+        self.entity = Entity(reader)
+
+    cpdef write(self, ByteWriter writer):
+        writer.write_byte(self.id)
+        if self.entity is not None:
+            self.entity.write(writer)
+
+    def set_entity(self, entity):
+        self.entity = entity
 
 
 cdef class PacketLoader:

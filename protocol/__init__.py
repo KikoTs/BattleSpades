@@ -1,10 +1,9 @@
 """
 protocol - Network Protocol
-Packet handling using aoslib Cython packets.
+Packet handling using the reversed shared Cython packets.
 """
 
-# Import packet classes from aoslib (compiled Cython)
-from aoslib.packet import (
+from shared.packet import (
     Loader,
     CLIENT_LOADERS,
 )

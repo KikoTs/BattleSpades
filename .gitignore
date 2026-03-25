@@ -65,4 +65,19 @@ aoslib/*.cpp
 aoslib/*.so.c
 !aoslib/*_c.cpp
 
+# Shared built files
+shared/*.c
+shared/*.html
+shared/*.cpp
+shared/*.so.c
+!shared/*_c.cpp
+
+#Projects
 ace.py/
+aoslib-reversed/
+
+.deleted/
+
+.exp
+.lib
+.obj

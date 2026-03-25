@@ -2,6 +2,9 @@
 Admin commands - requires admin permission.
 """
 
+from server.game_constants import CHAT_SYSTEM
+from shared.packet import ChatMessage
+
 from .command_handler import register_command, CommandContext, send_message
 
 
@@ -26,13 +29,12 @@ async def cmd_kick(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, f"Player not found: {target_name}")
         return
     
-    # Broadcast kick message
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
     msg = f"{target.name} was kicked: {reason}"
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=msg)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = msg
+    ctx.server.broadcast(bytes(packet.generate()))
     
     target.disconnect(reason=2)  # DISCONNECT_KICKED
 
@@ -61,13 +63,12 @@ async def cmd_ban(ctx: CommandContext):
     
     # TODO: Add to ban list
     
-    # Broadcast ban message
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
     msg = f"{target.name} was banned: {reason}"
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=msg)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = msg
+    ctx.server.broadcast(bytes(packet.generate()))
     
     target.disconnect(reason=1)  # DISCONNECT_BANNED
 

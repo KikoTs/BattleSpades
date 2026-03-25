@@ -2,6 +2,9 @@
 Server commands - admin commands for server management.
 """
 
+from server.game_constants import CHAT_SYSTEM, TEAM1, TEAM2
+from shared.packet import ChatMessage, FogColor
+
 from .command_handler import register_command, CommandContext, send_message
 
 
@@ -21,13 +24,12 @@ async def cmd_map(ctx: CommandContext):
     
     map_name = ctx.args[0]
     
-    # Broadcast map change
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
     msg = f"Changing map to {map_name}..."
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=msg)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = msg
+    ctx.server.broadcast(bytes(packet.generate()))
     
     # Load new map
     if ctx.server.world_manager.load_map(map_name):
@@ -73,13 +75,12 @@ async def cmd_mode(ctx: CommandContext):
     ctx.server.mode = mode_class(ctx.server)
     await ctx.server.mode.on_mode_start()
     
-    # Broadcast mode change
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
     msg = f"Game mode changed to {ctx.server.mode.name}"
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=msg)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = msg
+    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(
@@ -105,12 +106,11 @@ async def cmd_restart(ctx: CommandContext):
         spawn = ctx.server.world_manager.get_spawn_point(player.team)
         player.spawn(*spawn)
     
-    # Broadcast
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message="Match restarted!")
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = "Match restarted!"
+    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(
@@ -125,12 +125,12 @@ async def cmd_say(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "Usage: /say <message>")
         return
     
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
     message = f"[SERVER] {ctx.raw_args}"
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, message=message)
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = message
+    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(
@@ -155,9 +155,9 @@ async def cmd_fog(ctx: CommandContext):
     
     color = (r << 16) | (g << 8) | b
     
-    from protocol.packets import FogColor
-    packet = FogColor(color)
-    ctx.server.broadcast(packet.write())
+    packet = FogColor()
+    packet.color = color
+    ctx.server.broadcast(bytes(packet.generate()))
     
     await send_message(ctx.server, ctx.player, f"Fog color set to ({r}, {g}, {b})")
 
@@ -196,18 +196,20 @@ async def cmd_time(ctx: CommandContext):
 )
 async def cmd_balance(ctx: CommandContext):
     """Force team balance."""
-    team_counts = {0: len(ctx.server.teams[0].players), 
-                   1: len(ctx.server.teams[1].players)}
+    team_counts = {
+        TEAM1: len(ctx.server.teams[TEAM1].players),
+        TEAM2: len(ctx.server.teams[TEAM2].players),
+    }
     
-    diff = abs(team_counts[0] - team_counts[1])
+    diff = abs(team_counts[TEAM1] - team_counts[TEAM2])
     
     if diff <= 1:
         await send_message(ctx.server, ctx.player, "Teams are already balanced")
         return
     
     # Determine larger team
-    larger_team = 0 if team_counts[0] > team_counts[1] else 1
-    smaller_team = 1 - larger_team
+    larger_team = TEAM1 if team_counts[TEAM1] > team_counts[TEAM2] else TEAM2
+    smaller_team = TEAM2 if larger_team == TEAM1 else TEAM1
     
     to_move = diff // 2
     
@@ -229,10 +231,8 @@ async def cmd_balance(ctx: CommandContext):
                            f"You were moved to {ctx.server.teams[smaller_team].name}")
         moved += 1
     
-    # Broadcast
-    from protocol.packets import ChatMessage
-    from aoslib.constants import CHAT_SYSTEM
-    
-    packet = ChatMessage(player_id=255, chat_type=CHAT_SYSTEM, 
-                         message=f"Teams balanced ({moved} players moved)")
-    ctx.server.broadcast(packet.write())
+    packet = ChatMessage()
+    packet.player_id = 255
+    packet.chat_type = CHAT_SYSTEM
+    packet.value = f"Teams balanced ({moved} players moved)"
+    ctx.server.broadcast(bytes(packet.generate()))

@@ -6,6 +6,9 @@ Provides hooks for game events that modes can override.
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, List, Tuple
 
+from server.game_constants import CHAT_SYSTEM
+from shared.packet import ChatMessage
+
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
     from server.player import Player
@@ -141,11 +144,9 @@ class BaseMode(ABC):
     
     async def broadcast_message(self, message: str):
         """Broadcast a system message to all players."""
-        from aoslib.packet import ChatMessage
-        
         packet = ChatMessage()
         packet.player_id = 255  # System message
-        packet.chat_type = 2  # CHAT_SYSTEM
+        packet.chat_type = CHAT_SYSTEM
         packet.value = message
         self.server.broadcast(bytes(packet.generate()))
     

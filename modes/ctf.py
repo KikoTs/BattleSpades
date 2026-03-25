@@ -7,12 +7,24 @@ import time
 import logging
 from typing import Optional, Tuple, TYPE_CHECKING
 
+from server.game_constants import PLAYER_HEIGHT, TEAM1, TEAM2
+
 from .base_mode import BaseMode
 
 if TYPE_CHECKING:
     from server.player import Player
 
 logger = logging.getLogger(__name__)
+
+
+def _ground_anchor(server, x: float, y: float, fallback_z: float = 62.0 - PLAYER_HEIGHT) -> tuple[float, float, float]:
+    world_manager = getattr(server, "world_manager", None)
+    if world_manager is None:
+        return (x, y, fallback_z)
+    try:
+        return (x, y, float(world_manager.get_height(int(x), int(y))) - PLAYER_HEIGHT)
+    except Exception:
+        return (x, y, fallback_z)
 
 
 class CTFMode(BaseMode):
@@ -38,24 +50,24 @@ class CTFMode(BaseMode):
         
         # Intel positions (set during on_mode_start)
         self.intel_positions = {
-            0: (0.0, 0.0, 0.0),  # Blue intel
-            1: (0.0, 0.0, 0.0),  # Green intel
+            TEAM1: (0.0, 0.0, 0.0),
+            TEAM2: (0.0, 0.0, 0.0),
         }
         
         # Base positions (tent locations)
         self.base_positions = {
-            0: (0.0, 0.0, 0.0),
-            1: (0.0, 0.0, 0.0),
+            TEAM1: (0.0, 0.0, 0.0),
+            TEAM2: (0.0, 0.0, 0.0),
         }
         
         # Intel state
         self.intel_holder = {
-            0: None,  # Who is holding blue intel
-            1: None,  # Who is holding green intel
+            TEAM1: None,
+            TEAM2: None,
         }
         
         # Pickup cooldown (to prevent instant re-grab)
-        self.intel_drop_time = {0: 0.0, 1: 0.0}
+        self.intel_drop_time = {TEAM1: 0.0, TEAM2: 0.0}
         self.pickup_cooldown = 2.0  # Seconds
     
     async def on_mode_start(self):
@@ -64,12 +76,12 @@ class CTFMode(BaseMode):
         
         # Set default positions based on map
         # Blue team on west side, green on east
-        self.base_positions[0] = (64.0, 256.0, 60.0)
-        self.base_positions[1] = (448.0, 256.0, 60.0)
+        self.base_positions[TEAM1] = _ground_anchor(self.server, 64.0, 256.0)
+        self.base_positions[TEAM2] = _ground_anchor(self.server, 448.0, 256.0)
         
         # Intel slightly in front of base
-        self.intel_positions[0] = (80.0, 256.0, 60.0)
-        self.intel_positions[1] = (432.0, 256.0, 60.0)
+        self.intel_positions[TEAM1] = _ground_anchor(self.server, 80.0, 256.0)
+        self.intel_positions[TEAM2] = _ground_anchor(self.server, 432.0, 256.0)
         
         # Update team objects
         for team_id, pos in self.intel_positions.items():
@@ -87,12 +99,11 @@ class CTFMode(BaseMode):
             if not player.alive:
                 continue
             
-            # Skip spectators (team must be 0 or 1)
-            if player.team not in (0, 1):
+            if player.team not in (TEAM1, TEAM2):
                 continue
             
             # Check intel pickup
-            enemy_team = 1 - player.team
+            enemy_team = TEAM2 if player.team == TEAM1 else TEAM1
             if self.intel_holder[enemy_team] is None:
                 # Intel is on ground
                 intel_pos = self.intel_positions[enemy_team]
@@ -112,10 +123,6 @@ class CTFMode(BaseMode):
         """Player picks up intel."""
         self.intel_holder[intel_team] = player
         self.server.teams[intel_team].pick_up_intel(player)
-        
-        # Broadcast pickup
-        from protocol.packets import IntelPickup
-        self.server.broadcast(IntelPickup(player.id).write())
         
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} has the {team_name} intel!")
@@ -138,10 +145,6 @@ class CTFMode(BaseMode):
         # Check for win
         winning = self.server.teams[player.team].score >= self.score_limit
         
-        # Broadcast capture
-        from protocol.packets import IntelCapture
-        self.server.broadcast(IntelCapture(player.id, winning).write())
-        
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} captured the {team_name} intel!")
         
@@ -152,7 +155,7 @@ class CTFMode(BaseMode):
     
     async def on_player_death(self, player: 'Player', killer: Optional['Player'], kill_type: int):
         """Drop intel if player was holding it."""
-        for team_id in (0, 1):
+        for team_id in (TEAM1, TEAM2):
             if self.intel_holder[team_id] == player:
                 await self._drop_intel(player, team_id)
                 break
@@ -168,10 +171,6 @@ class CTFMode(BaseMode):
         
         self.server.teams[intel_team].drop_intel(*drop_pos)
         
-        # Broadcast drop
-        from protocol.packets import IntelDrop
-        self.server.broadcast(IntelDrop(player.id, *drop_pos).write())
-        
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} dropped the {team_name} intel!")
         
@@ -179,14 +178,14 @@ class CTFMode(BaseMode):
     
     async def on_player_leave(self, player: 'Player'):
         """Handle player leaving with intel."""
-        for team_id in (0, 1):
+        for team_id in (TEAM1, TEAM2):
             if self.intel_holder[team_id] == player:
                 await self._drop_intel(player, team_id)
                 break
     
     async def on_player_team_change(self, player: 'Player', old_team: int, new_team: int):
         """Handle player changing team while holding intel."""
-        enemy_team = 1 - old_team
+        enemy_team = TEAM2 if old_team == TEAM1 else TEAM1
         if self.intel_holder[enemy_team] == player:
             await self._drop_intel(player, enemy_team)
     
