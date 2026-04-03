@@ -83,3 +83,5 @@ aoslib-reversed/
 .obj
 
 logs/
+/maps/*.txtc
+/maps/*.png
