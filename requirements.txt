@@ -1,15 +1,15 @@
 # BattleSpades Server Dependencies
 
 # Networking
-pyenet>=1.3.17
+pyenet
 
 # Cython build
-Cython>=3.0.0
-numpy>=1.24.0
+Cython
+numpy
 
 # Configuration
-toml>=0.10.2
+toml
 
 # Testing
-pytest>=7.0.0
-pytest-asyncio>=0.20.0
+pytest
+pytest-asyncio
