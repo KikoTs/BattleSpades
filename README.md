@@ -43,6 +43,9 @@ BattleSpades/
 
 2. Install dependencies:
    ```bash
+   python3.10 -m venv venv
+   .\venv\Scripts\activate.ps1  # Windows
+   source venv/bin/activate   # Linux/MacOS
    pip install -r requirements.txt
    ```
 
