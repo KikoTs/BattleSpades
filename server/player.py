@@ -247,6 +247,9 @@ class Player:
         self._hover_since: float = 0.0
         self._last_damage_at: float = 0.0
         self.disguised: bool = False        # specialist disguise toggle
+        # Client-chosen loadout + prefab selection (SetClassLoadout / join).
+        self.loadout: list = []
+        self.prefabs: list = []
         # Mid-game class/loadout change, applied at the next respawn.
         self.pending_class_id = None
         self.pending_loadout = None

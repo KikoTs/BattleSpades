@@ -251,6 +251,119 @@ async def handle_oriented_item(server, player, packet):
     server.spawn_grenade(player, packet)
 
 
+@register_handler(30)  # BuildPrefabAction
+async def handle_build_prefab(server, player, packet):
+    """A player placed a prefab. Faithful port of the original server's
+    prefabManager.build_prefab: the client sends only NAME + anchor +
+    quarter-turn rotations; the server expands the KV6 model into blocks
+    (roll->pitch->yaw rotation, 50/50 team-color blend), validates (class
+    allow-list, world contact, player collision, block budget), places the
+    blocks, and broadcasts each as BlockBuildColored(33) + PrefabComplete(29)
+    back to the builder."""
+    if not player.alive or not player.spawned:
+        return
+    from server import prefabs as P
+
+    name = str(getattr(packet, "prefab_name", "") or "")
+    if not name:
+        return
+    if not P.prefab_allowed(player, name):
+        logger.info("PREFAB rejected (not in class list): %s by %s", name, player.name)
+        return
+    model = P.get_registry().get(name)
+    if model is None:
+        return
+
+    yaw = int(getattr(packet, "prefab_yaw", 0)) & 3
+    pitch = int(getattr(packet, "prefab_pitch", 0)) & 3
+    roll = int(getattr(packet, "prefab_roll", 0)) & 3
+    position = getattr(packet, "position", None)
+    if not position:
+        return
+
+    # Color: the packet carries the client's color choice; fall back to the
+    # player's team color. Blended 50/50 with each voxel's model color.
+    base_color = getattr(packet, "color", None)
+    if not base_color or len(base_color) != 3:
+        team = server.teams.get(player.team)
+        base_color = tuple(getattr(team, "color", (128, 128, 128)))
+
+    cells = P.expand_prefab(model, position, yaw, pitch, roll, base_color=base_color)
+
+    # Budget: whole prefab must fit the player's block count.
+    infinite = bool(getattr(server.teams.get(player.team), "infinite_blocks", False))
+    if not infinite and len(cells) > int(getattr(player, "blocks", 0)):
+        logger.info("PREFAB rejected (blocks %d > budget %d): %s by %s",
+                    len(cells), player.blocks, name, player.name)
+        return
+    # Placement rules from the original: must touch the world, must not
+    # entomb a player.
+    if not P.touches_world(server.world_manager, cells):
+        logger.info("PREFAB rejected (floating): %s by %s", name, player.name)
+        return
+    if P.collides_with_player(cells, server.players.values()):
+        logger.info("PREFAB rejected (player collision): %s by %s", name, player.name)
+        return
+
+    from shared.packet import BlockBuildColored, PrefabComplete
+    placed = 0
+    wm = server.world_manager
+    for (x, y, z), color in cells:
+        if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z < 256):
+            continue
+        try:
+            wm.set_block(int(x), int(y), int(z), solid=True, color=color)
+        except Exception:
+            continue
+        out = BlockBuildColored()
+        out.loop_count = server.loop_count
+        out.player_id = player.id
+        out.x, out.y, out.z = int(x), int(y), int(z)
+        # cdef int field: pack (r,g,b) as 0xRRGGBB (write_color unpacks it).
+        out.color = (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
+        server.broadcast(bytes(out.generate()), reliable=True)
+        placed += 1
+
+    if placed and not infinite:
+        player.blocks = max(0, int(player.blocks) - placed)
+
+    done = PrefabComplete()
+    player.send(bytes(done.generate()), reliable=True)
+    logger.info("PREFAB %s by %s at %s yaw=%d: placed %d/%d blocks",
+                name, player.name, tuple(position), yaw, placed, len(cells))
+
+
+@register_handler(31)  # ErasePrefabAction
+async def handle_erase_prefab(server, player, packet):
+    """Carve/undo a placed prefab: expand the same model at the same anchor +
+    rotation and destroy those exact cells (broadcast through the verified
+    Damage(37) block-destroy path, falling chunks included)."""
+    if not player.alive or not player.spawned:
+        return
+    from server import prefabs as P
+
+    name = str(getattr(packet, "prefab_name", "") or "")
+    model = P.get_registry().get(name) if name else None
+    if model is None:
+        return
+    yaw = int(getattr(packet, "prefab_yaw", 0)) & 3
+    pitch = int(getattr(packet, "prefab_pitch", 0)) & 3
+    roll = int(getattr(packet, "prefab_roll", 0)) & 3
+    position = (int(getattr(packet, "x", 0)), int(getattr(packet, "y", 0)),
+                int(getattr(packet, "z", 0)))
+
+    cells = P.expand_prefab(model, position, yaw, pitch, roll)
+    targets = [c for (c, _color) in cells
+               if server.world_manager.get_solid(int(c[0]), int(c[1]), int(c[2]))]
+    if not targets:
+        return
+    destroyed = server.world_manager.destroy_blocks(targets)
+    if destroyed:
+        get_combat_system(server)._broadcast_block_destroy(player, destroyed)
+    logger.info("PREFAB erase %s by %s at %s: removed %d blocks",
+                name, player.name, position, len(destroyed or []))
+
+
 @register_handler(13)  # SetClassLoadout (mid-game)
 async def handle_set_class_loadout(server, player, packet):
     """The player picked a new class/loadout from the in-game menu. Original

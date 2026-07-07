@@ -672,6 +672,10 @@ class Connection:
         create_packet.name = player.name
         create_packet.loadout = list(self.pending_loadout)
         create_packet.prefabs = list(self.pending_prefabs)
+        # Persist the choices on the player: loadout drives jetpack/ammo at
+        # spawn; prefabs feed the prefab allow-list (BuildPrefabAction).
+        player.loadout = list(self.pending_loadout)
+        player.prefabs = list(self.pending_prefabs)
 
         # The joiner needs its OWN CreatePlayer to bind its local player to the
         # server id — deliver it directly (one packet is safe mid-transition).

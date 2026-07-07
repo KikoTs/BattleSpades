@@ -69,11 +69,11 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 26 | PlayMusic | — | Planned | Start music track (sounds). |
 | 27 | StopMusic | — | Planned | Stop music (sounds). |
 | 28 | CreatePlayer | S→C | Sent | Spawns a player on clients; also carries the roster. |
-| 29 | PrefabComplete | — | Planned | Prefab build finished notification (building/UGC). |
-| 30 | BuildPrefabAction | — | Planned | Place a multi-block prefab (building/UGC). |
-| 31 | ErasePrefabAction | — | Planned | Remove a placed prefab (building/UGC). |
+| 29 | PrefabComplete | S→C | Sent | Sent to the builder when a prefab finishes placing. |
+| 30 | BuildPrefabAction | C→S | Handled | Prefab placement: server expands the KV6 model (server/prefabs.py), validates class list / block budget / world contact, places + broadcasts BlockBuildColored per block. |
+| 31 | ErasePrefabAction | C→S | Handled | Prefab carve (UGC tool): destroys the expanded cell set via the verified Damage(37) block-destroy path. Wire layout carries no rotation fields — unverified vs live client. |
 | 32 | BlockBuild | both | Handled+Sent | Single-block place; handled on receive, also sent by combat. |
-| 33 | BlockBuildColored | — | Planned | Place a block with an explicit color (building). |
+| 33 | BlockBuildColored | S→C | Sent | Per-block colored placement — the broadcast stream for placed prefabs. |
 | 34 | BlockOccupy | — | Planned | Mark a block occupied (building). |
 | 35 | BlockLiberate | C→S | Handled | Block destroy request (spade dig). |
 | 36 | ExplodeCorpse | — | Planned | Gib a corpse (combat/death FX). |
