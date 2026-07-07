@@ -251,6 +251,57 @@ async def handle_oriented_item(server, player, packet):
     server.spawn_grenade(player, packet)
 
 
+@register_handler(13)  # SetClassLoadout (mid-game)
+async def handle_set_class_loadout(server, player, packet):
+    """The player picked a new class/loadout from the in-game menu. Original
+    semantics: it applies at the NEXT SPAWN (the current life is unchanged).
+    The pre-join copy of this packet is handled in the connection handshake;
+    this handler covers changes while already playing."""
+    player.pending_class_id = int(getattr(packet, "class_id", player.class_id))
+    loadout = list(getattr(packet, "loadout", []) or [])
+    if loadout:
+        player.pending_loadout = loadout
+    prefabs = list(getattr(packet, "prefabs", []) or [])
+    if prefabs:
+        player.prefabs = prefabs
+    logger.info("LOADOUT %s -> class=%d loadout=%s (applies at respawn)",
+                player.name, player.pending_class_id, loadout)
+
+
+@register_handler(90)  # PlaceMedPack
+async def handle_place_medpack(server, player, packet):
+    """A medic placed a medpack. Register a server-side heal entity (touch =
+    heal teammates, limited uses). NOT broadcast as a wire entity yet — the
+    medpack's CreateEntity type id is unverified against the compiled client
+    (an unknown type/state crashes it natively)."""
+    if not player.alive or not player.spawned:
+        return
+    import shared.constants as C
+    from server.entities.behaviors import MedpackBehavior
+    from server.game_constants import TEAM_NEUTRAL
+
+    x, y, z = float(packet.x), float(packet.y), float(packet.z)
+    # Sanity: must be near the placer (client validates placement radius 5).
+    dx, dy, dz = x - player.x, y - player.y, z - player.z
+    if dx * dx + dy * dy + dz * dz > 100.0:
+        return
+    server.entity_registry.place(
+        int(getattr(C, "HEALTH_DROP_POINT_ENTITY", 19)), x, y, z,
+        state=TEAM_NEUTRAL, kind="medpack",
+        behavior=MedpackBehavior(team=player.team),
+    )
+    logger.info("MEDPACK placed by %s at (%.1f,%.1f,%.1f)", player.name, x, y, z)
+
+
+@register_handler(95)  # DisguisePacket
+async def handle_disguise(server, player, packet):
+    """Specialist toggled disguise. Tracked server-side; the visual (rendering
+    as the enemy team on other clients) needs the wire mechanism verified —
+    the packet carries no player_id, so it can't simply be rebroadcast."""
+    player.disguised = bool(getattr(packet, "active", 0))
+    logger.info("DISGUISE %s -> %s", player.name, player.disguised)
+
+
 @register_handler(49)  # ChatMessage
 async def handle_chat(server, player, packet):
     """Handle chat messages."""

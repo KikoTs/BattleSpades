@@ -27,7 +27,7 @@ from shared.packet import (
 
 from .config import ServerConfig
 from .combat_runtime import CombatSystem, get_combat_system
-from .game_constants import TEAM1, TEAM2, MAX_HEALTH
+from .game_constants import TEAM1, TEAM2, MAX_HEALTH, DEFAULT_BLOCK_HEALTH
 from .player import Player, set_movement_authority, INPUT_DELAY_TICKS
 from .team import Team
 from .world_manager import WorldManager
@@ -89,7 +89,8 @@ class BattleSpadesServer:
         self.ban_manager = BanManager()
         # In-flight thrown grenades (server-authoritative blast). Each is a
         # dict: {x,y,z, vx,vy,vz, explode_at, thrower_id}.
-        self.pending_grenades: list = []
+        from server.projectiles import ProjectileEngine
+        self.projectile_engine = ProjectileEngine()
         # In-game packets received since the last simulation tick; drained
         # synchronously at the start of each tick so an input that ARRIVED
         # before tick N is guaranteed to be APPLIED at tick N (dispatching
@@ -195,6 +196,17 @@ class BattleSpadesServer:
                     self.broadcast_destroy_entity(grave_id)
                 player._grave_entity_id = None
 
+            # Apply a mid-game class/loadout change (SetClassLoadout while
+            # alive) at the respawn boundary — original-server semantics.
+            pending_class = getattr(player, 'pending_class_id', None)
+            if pending_class is not None:
+                player.class_id = int(pending_class)
+                player.pending_class_id = None
+            pending_loadout = getattr(player, 'pending_loadout', None)
+            if pending_loadout is not None:
+                player.loadout = list(pending_loadout)
+                player.pending_loadout = None
+
             spawn = self.world_manager.get_spawn_point(player.team)
             player.spawn(spawn[0], spawn[1], spawn[2])
             player.death_time = 0.0
@@ -205,13 +217,14 @@ class BattleSpadesServer:
                 self.queue_mode_event('on_player_spawn', player)
 
     def spawn_grenade(self, player, packet) -> None:
-        """Register a thrown grenade + rebroadcast it so other clients render
-        and simulate the projectile locally (arc + explosion FX + sound)."""
-        import shared.constants as C
+        """A player used an oriented item (grenade family, RPG/RPG2 rocket,
+        drill, snowball, sticky/chemical). Register the server-authoritative
+        projectile + rebroadcast the packet so every other client renders and
+        simulates it locally (arc/flight + explosion FX + sound)."""
+        from server.projectiles import PROJECTILE_SPECS
         tool = int(getattr(packet, "tool", 0))
-        throwable = set(int(t) for t in getattr(C, "THROWABLE_EXPLOSIVE_TOOLS", [11, 31, 32]))
-        if tool not in throwable:
-            return  # RPG rockets / other oriented items not modeled yet
+        if tool not in PROJECTILE_SPECS:
+            return  # not a projectile tool (deployables ride Place* packets)
 
         pos = getattr(packet, "position", None)
         vel = getattr(packet, "velocity", None)
@@ -225,7 +238,7 @@ class BattleSpadesServer:
         fuse = max(0.0, min(float(getattr(packet, "value", 3.0)), 10.0))
 
         # Rebroadcast to everyone EXCEPT the thrower (whose own client already
-        # simulates it locally) so other clients see/hear the grenade.
+        # simulates it locally) so other clients see/hear the projectile.
         from shared.packet import UseOrientedItem
         out = UseOrientedItem()
         out.loop_count = self.loop_count
@@ -241,80 +254,35 @@ class BattleSpadesServer:
             try:
                 conn.send(data)
             except Exception:
-                logger.debug("grenade rebroadcast failed", exc_info=True)
+                logger.debug("projectile rebroadcast failed", exc_info=True)
 
-        self.pending_grenades.append({
-            "x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]),
-            "vx": float(vel[0]), "vy": float(vel[1]), "vz": float(vel[2]),
-            "explode_at": time.time() + fuse,
-            "thrower_id": player.id,
-        })
-        logger.info("GRENADE thrown by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f",
-                    player.name, tool, pos[0], pos[1], pos[2], fuse)
+        p = self.projectile_engine.spawn(tool, pos, vel, fuse, player.id)
+        if p is not None:
+            logger.info("PROJECTILE %s by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f",
+                        p.spec.name, player.name, tool, pos[0], pos[1], pos[2], fuse)
 
-    # Grenade physics, PORTED from the compiled client (world.pyd native mover
-    # sub_10011E90, decompiled 2026-07-07): gravity is world_gravity(1.0)*30*dt
-    # on vz (NOT the player's damped model), displacement is vel*dt with NO ×32
-    # scale (the old ×32 flung the blast up to ~2000 blocks away), speed capped
-    # at MAX_SPEED, and a wall/floor hit REFLECTS the entry-axis velocity then
-    # damps the whole velocity by ×0.36. Position resolves int(pos) for the
-    # blast so the server crater matches where the client's local sim landed.
-    _GREN_GRAVITY = 30.0
-    _GREN_MAX_SPEED = 511.98999
-    _GREN_BOUNCE_DAMP = 0.36
+    # Projectile physics lives in server/projectiles.py (the grenade math is
+    # the verified port of the compiled client's mover sub_10011E90; rockets/
+    # drill/snowball fly per the client's extracted flight constants).
 
     def _update_grenades(self, dt: float) -> None:
-        if not self.pending_grenades:
-            return
-        now = time.time()
-        wm = self.world_manager
-        still_flying = []
-        for g in self.pending_grenades:
-            if now >= g["explode_at"]:
-                self._explode_grenade(g)
-                continue
+        """Advance all in-flight projectiles; apply any explosions."""
+        explosions = self.projectile_engine.update(dt, self.world_manager)
+        for ex in explosions:
+            self._explode_projectile(ex)
 
-            g["vz"] += self._GREN_GRAVITY * dt
-            speed = (g["vx"] ** 2 + g["vy"] ** 2 + g["vz"] ** 2) ** 0.5
-            if speed > self._GREN_MAX_SPEED:
-                k = self._GREN_MAX_SPEED / speed
-                g["vx"] *= k; g["vy"] *= k; g["vz"] *= k
+    def _explode_projectile(self, ex) -> None:
+        """Detonate a projectile: crater a 3x3x3 block cube (damage-gated for
+        weak warheads) and damage nearby players with distance falloff +
+        line-of-sight. Grenade-family numbers match the live-verified blast."""
+        gx, gy, gz = ex.x, ex.y, ex.z
+        thrower = self.players.get(ex.thrower_id)
+        logger.info("%s explode at (%.1f,%.1f,%.1f)", ex.spec.name.upper(), gx, gy, gz)
 
-            x, y, z = g["x"], g["y"], g["z"]
-            nx = x + g["vx"] * dt
-            ny = y + g["vy"] * dt
-            nz = z + g["vz"] * dt
-
-            if wm.get_solid(int(nx), int(ny), int(nz)):
-                # Axis-separated entry test to pick the reflected axis, then
-                # damp the whole velocity (matches the native ×0.36 on any hit).
-                bounced = False
-                if wm.get_solid(int(nx), int(y), int(z)):
-                    g["vx"] = -g["vx"]; nx = x; bounced = True
-                if wm.get_solid(int(x), int(ny), int(z)):
-                    g["vy"] = -g["vy"]; ny = y; bounced = True
-                if wm.get_solid(int(x), int(y), int(nz)):
-                    g["vz"] = -g["vz"]; nz = z; bounced = True
-                if not bounced:
-                    # Diagonal/corner: reflect vertical (the common floor case).
-                    g["vz"] = -g["vz"]; nx = x; ny = y; nz = z
-                g["vx"] *= self._GREN_BOUNCE_DAMP
-                g["vy"] *= self._GREN_BOUNCE_DAMP
-                g["vz"] *= self._GREN_BOUNCE_DAMP
-
-            g["x"], g["y"], g["z"] = nx, ny, nz
-            still_flying.append(g)
-        self.pending_grenades = still_flying
-
-    def _explode_grenade(self, g: dict) -> None:
-        """Detonate: destroy a 3x3x3 block cube and damage nearby players with
-        distance falloff + line-of-sight (matches the reference server)."""
-        import shared.constants as C
-        gx, gy, gz = g["x"], g["y"], g["z"]
-        thrower = self.players.get(g["thrower_id"])
-        logger.info("GRENADE explode at (%.1f,%.1f,%.1f)", gx, gy, gz)
-
-        # Block destruction: 3x3x3 centered on the impact cell.
+        # Crater: 3x3x3 centered on the impact cell. Warheads whose per-block
+        # damage meets the default block health destroy outright (grenade
+        # family, RPG, drill); weaker ones (RPG2: 2) accumulate block damage
+        # through the combat system so repeated hits break through.
         bx, by, bz = int(gx), int(gy), int(gz)
         positions = [
             (ax, ay, az)
@@ -322,16 +290,24 @@ class BattleSpadesServer:
             for ay in range(by - 1, by + 2)
             for az in range(bz - 1, bz + 2)
         ]
-        if getattr(self.config, "build_damage", True):
-            destroyed = self.world_manager.destroy_blocks(positions)
-            if destroyed:
-                get_combat_system(self)._broadcast_block_destroy(
-                    thrower if thrower is not None else None, destroyed
-                )
+        if getattr(self.config, "build_damage", True) and ex.block_damage > 0.0:
+            if ex.block_damage >= DEFAULT_BLOCK_HEALTH or ex.spec.behavior != "contact":
+                destroyed = self.world_manager.destroy_blocks(positions)
+                if destroyed:
+                    get_combat_system(self)._broadcast_block_destroy(
+                        thrower if thrower is not None else None, destroyed
+                    )
+            else:
+                combat = get_combat_system(self)
+                for block in positions:
+                    if self.world_manager.get_solid(*block):
+                        combat._apply_block_damage(thrower, block, ex.block_damage)
 
-        # Player blast damage: within 16 blocks, falloff min(100, 4096/sq_dist),
-        # gated on line-of-sight.
-        grenade_kill = int(getattr(C, "GRENADE_KILL", 3))
+        # Player blast damage: within 16 blocks, LOS-gated. Same falloff CURVE
+        # as the live-verified grenade (min(100, 4096/sq)), scaled to each
+        # warhead's max damage so a 140-damage rocket and a 10-damage snowball
+        # share the verified shape.
+        scale = ex.damage / 100.0
         for target in list(self.players.values()):
             if not target.alive or not target.spawned:
                 continue
@@ -341,11 +317,22 @@ class BattleSpadesServer:
             sq = dx * dx + dy * dy + dz * dz
             if sq >= 256.0:  # 16 blocks
                 continue
-            # LOS: reject if a solid block sits between the grenade and target.
+            # LOS: reject if a solid block sits between the blast and target.
             if self._blocked_los(gx, gy, gz, target.x, target.y, target.z):
                 continue
-            damage = 100 if sq <= 1.0 else min(100.0, 4096.0 / sq)
-            target.damage(int(round(damage)), source=thrower, kill_type=grenade_kill)
+            damage = ex.damage if sq <= 1.0 else min(ex.damage, (4096.0 / sq) * scale)
+            dmg = int(round(damage))
+            if dmg > 0:
+                target.damage(dmg, source=thrower, kill_type=ex.spec.kill_type)
+
+        # Route blast damage to damageable entities (future deployables:
+        # turrets, mines, C4...). No-ops today — nothing sets takes_damage yet.
+        ctx = self._build_entity_ctx()
+        for ent in self.entity_registry.all():
+            if ent.alive and ent.behavior is not None and ent.behavior.takes_damage:
+                dxe, dye, dze = ent.x - gx, ent.y - gy, ent.z - gz
+                if dxe * dxe + dye * dye + dze * dze < 64.0:  # 8 blocks
+                    self.entity_registry.damage_entity(ent.entity_id, ex.damage, thrower, ctx)
 
     def _blocked_los(self, x0, y0, z0, x1, y1, z1) -> bool:
         dx, dy, dz = x1 - x0, y1 - y0, z1 - z0

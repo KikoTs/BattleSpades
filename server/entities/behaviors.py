@@ -64,6 +64,36 @@ class GraveBehavior(EntityBehavior):
     model (graves are diggable in some modes)."""
 
 
+class MedpackBehavior(EntityBehavior):
+    """A medic's placed medpack: heals teammates who step on it, for a limited
+    number of uses, then despawns.
+
+    The real heal amount/model lives in compiled client code (not in the
+    constant catalog) — this uses full-heal-per-touch with 3 uses, flagged for
+    live calibration. One instance per placed medpack (it carries use state).
+    """
+
+    touch_radius = 3.0
+
+    def __init__(self, team: int, heal_amount: int = 100, uses: int = 3):
+        self.team = int(team)
+        self.heal_amount = int(heal_amount)
+        self.uses = int(uses)
+
+    def on_touch(self, ent, player, ctx) -> bool:
+        if player.team != self.team:
+            return False
+        if getattr(player, "health", 0) >= 100:
+            return False
+        player.heal(self.heal_amount)
+        self.uses -= 1
+        if self.uses <= 0:
+            ent.alive = False
+            if ctx.destroy is not None:
+                ctx.destroy(ent.entity_id)
+        return True
+
+
 class IntelBehavior(EntityBehavior):
     """CTF intel/flag pickup — a thin adapter over the mode's existing intel
     state. On touch it hands off to ``mode.pick_up_intel(player, ent)``.

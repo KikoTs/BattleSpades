@@ -34,6 +34,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-jetpack-type fuel/behavior table from the client (keys 66-69; value
+# indices: 0 start_delay, 1 max_fuel, 2 activation_cost, 3 refill_rate,
+# 4 flying_consumption, 5 burdened_slowdown, 6 refill_delay_due_damage,
+# 7 fall_damage_multiplier, 8 death_acceleration).
+_JETPACK_PROPERTIES: dict = dict(getattr(C, "JETPACK_PROPERTIES", {}) or {})
+
 JUMP_BUFFER_SECONDS = 0.25
 POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
 
@@ -232,6 +238,18 @@ class Player:
         self.admin: bool = False
         self.muted: bool = False
         self.god_mode: bool = False
+        # Jetpack (per-class equipment; JETPACK_PROPERTIES keys 66-69).
+        # Fuel model mirrors the client's local sim so hover reconciliation
+        # stays close (constants extracted from the client 2026-07-07).
+        self.jetpack_id: int = 0            # 0 / NO_JETPACK(65) = none
+        self.jetpack_fuel: float = 100.0
+        self.jetpack_active: bool = False
+        self._hover_since: float = 0.0
+        self._last_damage_at: float = 0.0
+        self.disguised: bool = False        # specialist disguise toggle
+        # Mid-game class/loadout change, applied at the next respawn.
+        self.pending_class_id = None
+        self.pending_loadout = None
         self.grounded: bool = True
         self.airborne: bool = False
         self.wade: bool = False
@@ -408,6 +426,14 @@ class Player:
         world_object.sneak = self.input.sneak
         world_object.sprint = self.input.sprint
         world_object.hover = self.input.hover
+        # Jetpack: equipped flag + whether thrust is firing this tick (drives
+        # the mover's 0.05x gravity + water-friction branch, same as the
+        # client's local sim).
+        try:
+            world_object.jetpack = bool(self.jetpack_id in _JETPACK_PROPERTIES)
+            world_object.jetpack_active = bool(self.jetpack_active)
+        except Exception:
+            pass
         collisions = self._build_player_collision_positions()
         world_object.set_crouch(self.input.crouch, collisions, len(collisions))
 
@@ -637,6 +663,23 @@ class Player:
         self.blocks = self.movement_profile.starting_blocks
         self.grenades = MAX_GRENADES
         self._reset_ammo()
+        # Jetpack: the client's chosen loadout may carry a jetpack id (66-69)
+        # in the equipment slot; otherwise fall back to the class default.
+        jetpack = 0
+        for item in (getattr(self, "loadout", None) or []):
+            if int(item) in _JETPACK_PROPERTIES:
+                jetpack = int(item)
+                break
+        if not jetpack:
+            try:
+                from server.class_data import get_loadout
+                jetpack = int(get_loadout(self.class_id).jetpack)
+            except Exception:
+                jetpack = 0
+        self.jetpack_id = jetpack if jetpack in _JETPACK_PROPERTIES else 0
+        self.jetpack_fuel = 100.0
+        self.jetpack_active = False
+        self._hover_since = 0.0
         self.last_reported_position = (x, y, z)
         self.last_position_drift = 0.0
         self.last_position_drift_vector = (0.0, 0.0, 0.0)
@@ -687,6 +730,14 @@ class Player:
 
     def get_weapon_profile(self):
         if self.is_spade_tool():
+            # Per-tool melee stats (pickaxe 50 player/7 block, superspade
+            # 50/7.5, knife 20/1, crowbar 80/5, ...) from the catalog; the
+            # generic spade profile only as a fallback for unknown tools.
+            from server.game_constants import WEAPON_CATALOG
+            tool = self.tool if self.tool_is_raw else self.weapon
+            profile = WEAPON_CATALOG.get(int(tool))
+            if profile is not None and profile.is_melee:
+                return profile
             return SPADE_PROFILE
         return WEAPON_PROFILES.get(
             self.get_combat_weapon_type(),
@@ -769,6 +820,9 @@ class Player:
             return False
         if self.god_mode:
             return False
+
+        # Pauses jetpack fuel regen for the type's refill-delay window.
+        self._last_damage_at = time.time()
 
         amount = max(0, int(round(amount)))
         if amount <= 0:
@@ -965,6 +1019,7 @@ class Player:
             positions,
         )
         pre_position = self.last_native_pre_update.get("position", (self.x, self.y, self.z))
+        self._update_jetpack(dt)
         self._apply_input_state_to_world(trigger_jump=trigger_jump)
         result = world_object.update(dt, positions)
         self.last_native_result = int(result or 0)
@@ -978,6 +1033,46 @@ class Player:
             "post_update",
             positions,
         )
+
+    def _update_jetpack(self, dt: float) -> None:
+        """Advance the jetpack fuel model one tick (constants from the client's
+        JETPACK_PROPERTIES table, extracted 2026-07-07):
+          - Z held (hover input): after START_DELAY, activate — pay the
+            one-time ACTIVATION_COST, then drain FLYING_CONSUMPTION/s.
+          - Fuel empty or Z released: thrust off.
+          - Idle: regen REFILL_RATE/s, paused REFILL_DELAY_DUE_DAMAGE after
+            taking damage.
+        The active flag feeds the mover's 0.05x-gravity branch."""
+        props = _JETPACK_PROPERTIES.get(self.jetpack_id)
+        if props is None:
+            self.jetpack_active = False
+            return
+        start_delay = float(props.get(0, 0.25))
+        max_fuel = float(props.get(1, 100))
+        activation_cost = float(props.get(2, 10))
+        refill_rate = float(props.get(3, 10))
+        drain = float(props.get(4, 75))
+        refill_delay = float(props.get(6, 2.0))
+
+        if self.input.hover:
+            # dt-accumulated hold time (deterministic at the sim rate).
+            self._hover_since += dt
+            if not self.jetpack_active:
+                if self._hover_since >= start_delay and self.jetpack_fuel >= max(activation_cost, 1.0):
+                    self.jetpack_active = True
+                    self.jetpack_fuel -= activation_cost
+            if self.jetpack_active:
+                self.jetpack_fuel -= drain * dt
+                if self.jetpack_fuel <= 0.0:
+                    self.jetpack_fuel = 0.0
+                    self.jetpack_active = False
+        else:
+            self._hover_since = 0.0
+            self.jetpack_active = False
+
+        if not self.jetpack_active and self.jetpack_fuel < max_fuel:
+            if (time.time() - self._last_damage_at) >= refill_delay:
+                self.jetpack_fuel = min(max_fuel, self.jetpack_fuel + refill_rate * dt)
 
     def update_input(
         self,
