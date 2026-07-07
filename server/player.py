@@ -956,6 +956,20 @@ class Player:
     def add_blocks(self, count: int = 1):
         self.blocks = min(self.movement_profile.max_blocks, self.blocks + count)
 
+    def restock_blocks(self):
+        """Block-crate pickup: refill the block wallet to the class max and
+        tell the client — Restock(69) with type=5 is the block refill (client
+        sets its local block_count to max; measured live 2026-07-07)."""
+        if not self.alive:
+            return
+        self.add_blocks(self.movement_profile.max_blocks)
+        if self.connection:
+            from shared.packet import Restock
+            pkt = Restock()
+            pkt.player_id = self.id
+            pkt.type = 5
+            self.connection.send(bytes(pkt.generate()))
+
     def remove_block(self) -> bool:
         if self.blocks > 0:
             self.blocks -= 1

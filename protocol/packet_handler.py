@@ -305,27 +305,42 @@ async def handle_build_prefab(server, player, packet):
         logger.info("PREFAB rejected (player collision): %s by %s", name, player.name)
         return
 
-    from shared.packet import BlockBuildColored, PrefabComplete
-    placed = 0
-    wm = server.world_manager
+    from shared.packet import BlockBuild, BlockBuildColored, PrefabComplete
+    placed = 0        # NEW cells only — the client charges a block per newly
+    new_cells = 0     # added cell, so the server wallet must match that, not
+    wm = server.world_manager  # the total (prefab bases overlap terrain).
     for (x, y, z), color in cells:
         if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z < 256):
             continue
+        was_solid = wm.get_solid(int(x), int(y), int(z))
         try:
             wm.set_block(int(x), int(y), int(z), solid=True, color=color)
         except Exception:
             continue
+        if not was_solid:
+            new_cells += 1
+        # Spectators get the blended-color block; the BUILDER gets plain
+        # BlockBuild(32) instead — the ONLY packet its client deducts a block
+        # for (measured live 2026-07-07: 32 with own id -> block_count-1;
+        # colored 33 deducts nothing). The server VXL keeps the blended color
+        # so map syncs/new joiners see the true prefab.
         out = BlockBuildColored()
         out.loop_count = server.loop_count
         out.player_id = player.id
         out.x, out.y, out.z = int(x), int(y), int(z)
         # cdef int field: pack (r,g,b) as 0xRRGGBB (write_color unpacks it).
         out.color = (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
-        server.broadcast(bytes(out.generate()), reliable=True)
+        server.broadcast(bytes(out.generate()), reliable=True, exclude=player)
+        own = BlockBuild()
+        own.loop_count = server.loop_count
+        own.player_id = player.id
+        own.x, own.y, own.z = int(x), int(y), int(z)
+        own.block_type = 0
+        player.send(bytes(own.generate()), reliable=True)
         placed += 1
 
-    if placed and not infinite:
-        player.blocks = max(0, int(player.blocks) - placed)
+    if new_cells and not infinite:
+        player.blocks = max(0, int(player.blocks) - new_cells)
 
     done = PrefabComplete()
     player.send(bytes(done.generate()), reliable=True)

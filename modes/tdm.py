@@ -102,7 +102,7 @@ class TDMMode(BaseMode):
             int(C.HEALTH_CRATE): ("health", PickupCrateBehavior(
                 lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0)),
             int(getattr(C, "BLOCK_CRATE", 5)): ("block", PickupCrateBehavior(
-                lambda p: p.add_blocks(p.movement_profile.max_blocks), respawn_delay=15.0)),
+                lambda p: p.restock_blocks(), respawn_delay=15.0)),
         }
         placed = 0
         for i, (sx, sy) in enumerate(spots):

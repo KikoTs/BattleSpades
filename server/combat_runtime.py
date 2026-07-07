@@ -151,9 +151,17 @@ class CombatSystem:
         return out
 
     def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
-        """Raycast terrain from the CLIENT's reported origin/direction and
-        remove the targeted block(s). Secondary (right-click) digs a 3-tall
-        column, primary digs one cell.
+        """Raycast terrain from the CLIENT's reported origin/direction and dig
+        a 1x1x3 column (the classic spade dig), crediting the digger.
+
+        The dig is broadcast as ONE Damage with type=SPADE_DAMAGE(2) at the
+        center cell. That is the ONLY wire path that makes the client both
+        (a) self-expand to the (z-1, z, z+1) column and (b) add the destroyed
+        blocks to the digger's wallet (measured live 2026-07-07: type-2
+        credited block_count; type-6/WEAPON did not). So the server removes the
+        same column and mirrors the credit — a WEAPON_DAMAGE dig would break
+        the blocks visually but leave the client's block count untouched, which
+        is exactly the "mining doesn't replenish" symptom.
         """
         if direction is None:
             return False
@@ -168,22 +176,22 @@ class CombatSystem:
         )
         if block_pos is None:
             return False
-        if getattr(packet, "secondary", 0):
-            positions = [
-                (block_pos[0], block_pos[1], block_pos[2] - 1),
-                (block_pos[0], block_pos[1], block_pos[2]),
-                (block_pos[0], block_pos[1], block_pos[2] + 1),
-            ]
-        else:
-            positions = [block_pos]
+        import shared.constants as C
+        positions = [
+            (block_pos[0], block_pos[1], block_pos[2] - 1),
+            (block_pos[0], block_pos[1], block_pos[2]),
+            (block_pos[0], block_pos[1], block_pos[2] + 1),
+        ]
         destroyed = self.server.world_manager.destroy_blocks(positions)
         if not destroyed:
             return False
-        # Mining replenishes the digger's block inventory (+1 per block, class
-        # max cap) — mirrors the client's own local count so the server-side
-        # budget (which gates prefab placement) doesn't drift.
+        # Server-side wallet mirrors the client's own credit.
         player.add_blocks(len(destroyed))
-        self._broadcast_block_destroy(player, destroyed)
+        self._broadcast_block_damage(
+            player, block_pos, self._BLOCK_KILL_DAMAGE,
+            damage_type=int(getattr(C, "SPADE_DAMAGE", 2)),
+        )
+        self._collapse_unsupported(player, destroyed)
         return True
 
     def handle_block_destroy(self, player, packet) -> bool:
