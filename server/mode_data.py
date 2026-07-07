@@ -34,10 +34,17 @@ class ModeData:
 
 
 def _all_classes() -> tuple[int, ...]:
-    """Every real class id (0-17). DLC-gated classes still appear in the list;
-    the client greys them out via its own dlc_manager if not owned."""
+    """Every MENU-SELECTABLE class. DLC-gated classes still appear (the client
+    greys them via its own dlc_manager if not owned).
+
+    EXCLUDES FAST_ZOMBIE(14) and JUMP_ZOMBIE(15): the client's
+    global_images.class_icons has NO icon for those two zombie-mode-internal
+    variants, so listing them in a team's class_list makes selectClass.py crash
+    with KeyError when it renders the class picker (verified live 2026-07-08).
+    """
     from server.class_data import CLASS_IDS
-    return tuple(int(x) for x in CLASS_IDS)
+    excluded = {int(C.CLASS_FAST_ZOMBIE), int(C.CLASS_JUMP_ZOMBIE)}
+    return tuple(int(x) for x in CLASS_IDS if int(x) not in excluded)
 
 
 def _allowed_for(code: str) -> tuple[int, ...]:
