@@ -5,7 +5,7 @@
 name = "BattleSpades Server"
 port = 27015
 max_players = 32
-tick_rate = 60  # Server updates per second
+tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 
 [network]
 timeout_ms = 10000
@@ -13,17 +13,34 @@ max_connections = 64
 bandwidth_limit = 0  # 0 = unlimited
 
 [game]
-default_mode = "ctf"
-default_map = "CityOfChicago"
+default_mode = "tdm"
+# Server-side dev AI players (0 = none). Bots fight autonomously (TDM
+# kill->score->respawn). The old "client crashes rendering non-local
+# players" was an IDENTITY bug (StateData.player_id was always 0) — fixed
+# 2026-07-06 via per-connection id reservation; bots are safe for live play.
+bot_count = 2
+default_map = "ArcticBase"
+# "client" = echo client-reported positions (fallback while physics parity work
+# is in progress); "server" = authoritative server simulation (the server's
+# physics engine is oracle-calibrated to match the client's compiled engine).
+movement_authority = "server"
+# MEASURED 2026-06-12: the client uses its local map file ONLY for CRC
+# validation ??? world CONTENT comes exclusively from the MapSync stream
+# (with an empty delta sync the client world stays hollow forever).
+# Keep "full". ("auto" sends only changed columns on CRC match ??? broken
+# until the client-side world-base question is solved.)
+map_sync_mode = "full"
 respawn_time = 5.0
 friendly_fire = false
 fall_damage = true
 build_damage = true
 
 [teams]
-team1_name = "Blue"
+# Team names are STRING-TABLE IDS the client localizes (TEAM1_COLOR -> "Blue"),
+# NOT literal text — literals render as "Missing string <name>" in-game.
+team1_name = "TEAM1_COLOR"
 team1_color = [0, 0, 255]
-team2_name = "Green"
+team2_name = "TEAM2_COLOR"
 team2_color = [0, 255, 0]
 auto_balance = true
 balance_threshold = 2
@@ -51,3 +68,45 @@ level = "DEBUG"
 file = "server.log"
 console = true
 suppress_packets = [2, 4, 11, 56, 57]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = ClientData, 11 = SetColor)
+
+[debug]
+debug_parity = true
+debug_parity_host = "127.0.0.1"
+debug_parity_port = 32895
+# A/B test: false = no WorldUpdate broadcasts (pure client-side prediction,
+# no corrections). If walking is smooth with false and chunky with true,
+# the jank is in the WorldUpdate/correction loop.
+broadcast_world_updates = true
+# Self-row policy. MUST be true (measured 6/6, then re-reproduced 2026-06-13):
+#   true (REQUIRED): the client receives its own row each tick, which keeps its
+#     reconciliation anchor (network_position / network_position_loop_count)
+#     fresh and tracking the server. Walking has a minor residual ~0.13-block
+#     ADJUST chop from the client's game-loop rate (~60.7Hz) vs our 60Hz, but
+#     movement is correct.
+#   false (BROKEN ??? do not use): with no self-row the anchor stays at the
+#     CreatePlayer spawn with loop_count 0. The client then predicts forward,
+#     but the first jump fires apply_player_network_correction, which looks up
+#     movement_history[0], finds nothing, and HARD-SNAPS to network_position =
+#     spawn. Reproduced cleanly: walk 18 blocks, jump -> teleport to spawn.
+#     (The contract's "no network_position_updated -> no correction" reading
+#     missed that spawn/CreatePlayer arms the anchor; empirical wins.)
+worldupdate_include_self = true
+# (Only used when worldupdate_include_self = true.) Constant added to the
+# per-recipient self-row stamp = player.last_applied_input_loop (the consumed
+# input's loop_count). +2 is the measured structural phase between that and the
+# client's movement_history index; calibrate with debug_selfrow + reconcile_sim.
+worldupdate_loop_offset = -1
+worldupdate_self_row_interval = 2
+# Log every self-row's (stamp, position) to logs/selfrow_samples.ndjson so the
+# offline simulator (tmp/reconcile_sim.py) can replicate the client's exact
+# reconciliation and report the snap/adjust/no-op distribution. Turn ON for one
+# 12s walk to deterministically calibrate worldupdate_loop_offset on a given
+# client, then OFF for normal play.
+debug_selfrow = false
+# Client clock margin knob. MEASURED: +1 is silently ignored by the client
+# (under its resync threshold) ??? keep 0; determinism comes from
+# INPUT_DELAY_TICKS=1 in server/player.py instead.
+clock_sync_loop_bias = 0
+
+
+

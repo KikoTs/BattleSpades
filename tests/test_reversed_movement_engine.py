@@ -8,11 +8,12 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *args, **kwargs: {}))
 
 import shared.constants as C
+from aoslib import world as native_world_module
 from aoslib.world import Player as NativeWorldPlayer
 from aoslib.vxl import VXL
 
 from server.config import ServerConfig
-from server.game_constants import PLAYER_HEIGHT, TEAM1
+from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1
 from server.player import Player
 from server.world_manager import WorldManager
 
@@ -49,7 +50,11 @@ def flatten_patch(world_manager, cell_x=100, cell_y=100, radius=4):
 
 
 def make_spawn(world_manager, cell_x=100, cell_y=100):
-    return (float(cell_x) + 0.5, float(cell_y) + 0.5, float(GROUND_Z) - PLAYER_HEIGHT)
+    return (
+        float(cell_x) + 0.5,
+        float(cell_y) + 0.5,
+        float(GROUND_Z) - PLAYER_STANDING_POS_ABOVE_GROUND,
+    )
 
 
 def add_step(world_manager, base_x, base_y, top_z, extra_height, width=3):
@@ -123,7 +128,9 @@ def test_player_cannot_walk_through_wall_blocks():
     assert math.isclose(player.y, start_y, abs_tol=0.25)
 
 
-def test_low_and_tall_front_walls_both_block_forward_progress():
+def test_one_block_step_climbs_but_two_block_wall_blocks():
+    """Oracle-calibrated: the live engine glides up single-block steps while
+    walking (gradual climb, no teleport); two-block walls block."""
     base_x = 100
     base_y = 100
 
@@ -133,10 +140,17 @@ def test_low_and_tall_front_walls_both_block_forward_progress():
     add_step(one_block_world, base_x, base_y, top_z, extra_height=1)
 
     player = make_player(one_block_world, base_x, base_y, flatten=False)
+    start_z = player.z
     player.set_orientation_vector(1.0, 0.0, 0.0)
     player.update_input(True, False, False, False, False, False, False, False)
-    advance_player(player, 60)
-    one_block_end_x = player.x
+    # 35 ticks: enough for the faithful gradual glide to carry the player up
+    # and onto the step and settle grounded (oracle C_step_full grounds by
+    # ~f60), but not so far that it walks off the step's narrow (~3-block) far
+    # edge. The old substep climb settled faster, so this used to read 45.
+    advance_player(player, 35)
+    assert player.x > base_x + 1.5      # walked onto the step
+    assert player.z < start_z - 0.5     # actually rose onto the step
+    assert player.grounded
 
     two_block_world = make_world_manager()
     flatten_patch(two_block_world, base_x, base_y)
@@ -147,10 +161,8 @@ def test_low_and_tall_front_walls_both_block_forward_progress():
     block_start_x = blocker.x
     blocker.set_orientation_vector(1.0, 0.0, 0.0)
     blocker.update_input(True, False, False, False, False, False, False, False)
-    advance_player(blocker, 60)
-    assert one_block_end_x < base_x + 1.0
+    advance_player(blocker, 120)
     assert blocker.x < block_start_x + 0.8
-    assert math.isclose(one_block_end_x, blocker.x, abs_tol=0.1)
 
 
 def test_class_profile_applies_blocks_and_movement_multipliers():
@@ -191,13 +203,22 @@ def test_crouch_toggle_shifts_height_once():
     start_z = player.z
 
     player.update_input(False, False, False, False, False, True, False, False)
+    assert math.isclose(player.z, start_z, abs_tol=1e-6)
+    assert player._world_object.crouch is False
+    asyncio.run(player.update(1.0 / 60.0))
     assert math.isclose(player.z, start_z + 0.9, abs_tol=1e-6)
+    assert player._world_object.crouch is True
 
     player.update_input(False, False, False, False, False, True, False, False)
     assert math.isclose(player.z, start_z + 0.9, abs_tol=1e-6)
+    assert player._world_object.crouch is True
 
     player.update_input(False, False, False, False, False, False, False, False)
+    assert math.isclose(player.z, start_z + 0.9, abs_tol=1e-6)
+    assert player._world_object.crouch is True
+    asyncio.run(player.update(1.0 / 60.0))
     assert math.isclose(player.z, start_z, abs_tol=1e-6)
+    assert player._world_object.crouch is False
 
 
 def test_forward_speed_stays_stable_at_extreme_pitch():
@@ -252,65 +273,69 @@ def test_forward_and_strafe_speed_match_at_extreme_pitch():
     assert abs(forward_distance - strafe_distance) <= 0.15
 
 
-def test_holding_jump_does_not_auto_repeat_after_landing():
+def test_holding_jump_auto_repeats_like_the_client():
+    """Measured client behavior: while the jump key is held, the Character
+    re-triggers the jump every frame the player is grounded — holding jump
+    bunny-hops. The server mirrors that (no edge detection, no queue)."""
     player = make_player()
     player.update_input(False, False, False, False, True, False, False, False)
 
-    grounded_ticks = 0
-    landing_z = None
-    min_z_after_landing = None
+    jump_launches = 0
+    was_grounded = True
     for _ in range(240):
         asyncio.run(player.update(1.0 / 60.0))
-        if player.grounded:
-            grounded_ticks += 1
-            if landing_z is None and grounded_ticks >= 5:
-                landing_z = player.z
-        else:
-            grounded_ticks = 0
-            if landing_z is not None:
-                if min_z_after_landing is None:
-                    min_z_after_landing = player.z
-                else:
-                    min_z_after_landing = min(min_z_after_landing, player.z)
+        if was_grounded and player.airborne and player.vz < -0.2:
+            jump_launches += 1
+        was_grounded = player.grounded
 
-    assert landing_z is not None
-    if min_z_after_landing is None:
-        min_z_after_landing = landing_z
-    assert min_z_after_landing >= landing_z - 0.25
+    assert jump_launches >= 2  # kept hopping the whole time
 
 
-def test_buffered_jump_triggers_once_on_landing():
+def test_held_jump_fires_on_landing_release_does_not():
+    """The 'buffered jump' emerges naturally: if the key is still held when
+    the player lands, the next tick jumps again. If the key was released
+    mid-air, landing stays grounded."""
     player = make_player()
-    start_z = player.z
 
+    # Press and hold: first jump launches.
     player.update_input(False, False, False, False, True, False, False, False)
     asyncio.run(player.update(1.0 / 60.0))
-    player.update_input(False, False, False, False, False, False, False, False)
+    assert player.airborne
 
-    buffered_press_sent = False
-    min_z_after_buffer = None
-
+    # Keep holding through the whole arc: must launch again after landing.
+    relaunched = False
     for _ in range(240):
-        if (
-            not buffered_press_sent
-            and player.airborne
-            and player.vz > 0.0
-            and player.z > start_z - 0.35
-        ):
-            player.update_input(False, False, False, False, True, False, False, False)
-            buffered_press_sent = True
-
+        was_grounded = player.grounded
         asyncio.run(player.update(1.0 / 60.0))
-        if buffered_press_sent:
-            if min_z_after_buffer is None:
-                min_z_after_buffer = player.z
-            else:
-                min_z_after_buffer = min(min_z_after_buffer, player.z)
+        if was_grounded and player.airborne and player.vz < -0.2:
+            relaunched = True
+            break
+    assert relaunched
 
-    assert buffered_press_sent
-    assert min_z_after_buffer is not None
-    assert min_z_after_buffer < start_z - 1.0
-    assert player.grounded
+    # Now release mid-air: landing must NOT relaunch.
+    player2 = make_player()
+    player2.update_input(False, False, False, False, True, False, False, False)
+    asyncio.run(player2.update(1.0 / 60.0))
+    player2.update_input(False, False, False, False, False, False, False, False)
+    for _ in range(240):
+        asyncio.run(player2.update(1.0 / 60.0))
+    assert player2.grounded
+    assert abs(player2.vz) < 1e-4
+
+
+def test_held_jump_uses_native_impulse():
+    player = make_player()
+    player.update_input(False, False, False, False, True, False, False, False)
+    asyncio.run(player.update(1.0 / 60.0))
+
+    impulse = (
+        native_world_module.get_debug_movement_overrides()["jump_impulse"]
+        * player.movement_profile.jump_multiplier
+    )
+    # The impulse replaces the gravity step on the jump frame, then the
+    # vertical damping divides by (1 + dt) — measured live.
+    expected_vz = impulse / (1.0 + 1.0 / 60.0)
+    assert math.isclose(player.vz, expected_vz, abs_tol=1e-6)
 
 
 def test_native_world_player_jumps_from_ground_with_single_trigger():
@@ -329,6 +354,45 @@ def test_native_world_player_jumps_from_ground_with_single_trigger():
     assert native.airborne is True
     assert native.velocity.z < 0.0
     assert native.position.z < start[2]
+
+
+def test_native_world_wade_follows_ground_contact_in_water_zone():
+    """Oracle-calibrated wade semantics: the flag only changes on ground
+    contact (feet at/below the waterplane => wade), and is held unchanged
+    while airborne."""
+    world_manager = make_world_manager()
+    # Underwater shelf: solid at z=240 grounds the player with feet ~239.99,
+    # i.e. below the waterplane at Z_ABOVE_WATERPLANE (238).
+    for x in range(98, 104):
+        for y in range(98, 104):
+            world_manager.map.set_point(x, y, 240, True, TEST_COLOR)
+
+    native = NativeWorldPlayer(world_manager.world)
+    native.set_orientation((1.0, 0.0, 0.0))
+    native.set_position(100.5, 100.5, 235.0)
+    native.set_velocity(0.0, 0.0, 0.0)
+    assert native.wade is False
+    for _ in range(240):
+        native.update(1.0 / 60.0, [])
+    assert native.airborne is False
+    assert native.wade is True
+
+    # Held while airborne, even far above the water zone.
+    native.set_position(100.5, 100.5, 200.0)
+    native.set_velocity(0.0, 0.0, 0.0)
+    native.update(1.0 / 60.0, [])
+    assert native.airborne is True
+    assert native.wade is True
+
+    # Grounding on dry land (GROUND_Z terrain is far above the waterplane)
+    # clears it.
+    flatten_patch(world_manager)
+    native.set_position(100.5, 100.5, float(GROUND_Z) - 4.0)
+    native.set_velocity(0.0, 0.0, 0.0)
+    for _ in range(240):
+        native.update(1.0 / 60.0, [])
+    assert native.airborne is False
+    assert native.wade is False
 
 
 def test_soft_correction_ignores_small_drift():
@@ -407,5 +471,7 @@ def test_open_map_turning_keeps_velocity_bounded():
     assert player.x > start[0] + 5.0
     assert player.y > start[1] + 0.5
     assert max_horizontal_speed < 0.5
-    assert math.isclose(player.vx, 0.0, abs_tol=1e-6)
-    assert math.isclose(player.vy, 0.0, abs_tol=1e-6)
+    # The real engine has no hard zero-clamp: velocity decays by /(1+4*dt)
+    # per grounded frame (oracle-calibrated), so after 60 idle ticks a small
+    # residual remains.
+    assert math.hypot(player.vx, player.vy) < 0.02

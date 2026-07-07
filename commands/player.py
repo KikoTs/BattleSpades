@@ -63,18 +63,9 @@ async def cmd_kill(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "You're already dead!")
         return
     
+    # Player.die() already broadcasts the KillAction — don't send a second
+    # one here (that double-fired the death packet to every client).
     ctx.player.die(killer=ctx.player, kill_type=KILL_TEAM_CHANGE)
-    
-    # Broadcast kill
-    packet = KillAction()
-    packet.player_id = ctx.player.id
-    packet.killer_id = ctx.player.id
-    packet.kill_type = KILL_TEAM_CHANGE
-    packet.respawn_time = int(ctx.server.config.respawn_time)
-    packet.kill_count = ctx.player.kills
-    packet.isDominationKill = 0
-    packet.isRevengeKill = 0
-    ctx.server.broadcast(bytes(packet.generate()))
 
 
 @register_command(

@@ -24,17 +24,29 @@ class DummyPeer:
 
 
 class DummyWorldManager:
-    def __init__(self, map_obj):
+    def __init__(self, map_obj, map_file_crc=0):
         self.map = map_obj
+        self.map_file_crc = map_file_crc
+        self.dirty_columns = set()
 
     def get_chunker(self):
         return self.map.get_chunker()
 
+    def serialize_dirty_columns_compressed(self):
+        import zlib
+
+        if not self.dirty_columns:
+            return b""
+        raw = self.map.serialize_columns(sorted(self.dirty_columns))
+        return zlib.compress(raw, 6) if raw else b""
+
 
 class DummyServer:
-    def __init__(self, map_obj):
-        self.world_manager = DummyWorldManager(map_obj)
-        self.config = SimpleNamespace(log_suppress_packets=set())
+    def __init__(self, map_obj, map_file_crc=0):
+        self.world_manager = DummyWorldManager(map_obj, map_file_crc)
+        self.config = SimpleNamespace(
+            log_suppress_packets=set(), map_sync_mode="auto"
+        )
         self.players = {}
         self.connections = {}
 
@@ -44,26 +56,30 @@ def fixture_map_path() -> Path:
 
 
 def raw_column_surface_z(data: bytes, target_x: int, target_y: int) -> int:
+    """Topmost solid z of a column straight from the raw file bytes.
+
+    Walks EVERY span record of every column (a column is a sequence of
+    records ending with span_words == 0). The old version consumed only
+    the first record per column, drifting out of sync on multi-span
+    columns and attributing data to the wrong (x, y).
+    """
     pos = 0
     for y in range(512):
         for x in range(512):
-            header = data[pos : pos + 4]
-            span_words = header[0]
-            top_start = header[1]
-            top_end = header[2]
-            pos += 4
-
+            surface = None
+            while True:
+                span_words = data[pos]
+                top_start = data[pos + 1]
+                top_end = data[pos + 2]
+                if surface is None and top_end >= top_start:
+                    surface = top_start
+                if span_words == 0:
+                    top_len = top_end - top_start + 1 if top_end >= top_start else 0
+                    pos += 4 + top_len * 4
+                    break
+                pos += span_words * 4
             if x == target_x and y == target_y:
-                if top_end >= top_start:
-                    return top_start
-                return 239
-
-            if span_words == 0:
-                if top_end >= top_start:
-                    pos += (top_end - top_start + 1) * 4
-                continue
-
-            pos += (span_words - 1) * 4
+                return surface if surface is not None else 239
 
     raise AssertionError(f"column ({target_x}, {target_y}) not found")
 
@@ -136,12 +152,8 @@ def test_get_z_returns_surface_block_not_column_bottom():
     assert world_map.get_random_pos(64, 64, 65, 65) == (64, 64, 120)
 
 
-def test_send_map_data_uses_restored_vxl_chunker(caplog):
-    world_map = VXL(1, str(fixture_map_path()), 3)
-    server = DummyServer(world_map)
+def _run_send_map_data(server, client_crc):
     connection = Connection(DummyPeer(), server)
-
-    client_crc = 0x1234ABCD
     sent_packets = []
 
     async def fake_wait_for(packet_class, timeout=5.0):
@@ -151,13 +163,27 @@ def test_send_map_data_uses_restored_vxl_chunker(caplog):
 
     connection.wait_for = fake_wait_for
     connection.send = lambda data, reliable=True, prefix=0x30: sent_packets.append((prefix, data))
+    asyncio.run(connection.send_map_data())
+    return sent_packets
+
+
+def test_send_map_data_uses_restored_vxl_chunker(caplog):
+    """Mismatched client CRC -> full world sync stream."""
+    import zlib
+
+    path = fixture_map_path()
+    file_crc = zlib.crc32(path.read_bytes()) & 0xFFFFFFFF
+    world_map = VXL(1, str(path), 3)
+    server = DummyServer(world_map, map_file_crc=file_crc)
 
     caplog.set_level(logging.INFO)
-    asyncio.run(connection.send_map_data())
+    sent_packets = _run_send_map_data(server, client_crc=0x1234ABCD)
 
+    # The validation reply carries OUR file CRC (never an echo).
     validation = MapDataValidation(ByteReader(sent_packets[0][1][1:]))
     assert sent_packets[0][0] == 0x31
-    assert validation.crc == client_crc
+    expected_wire_crc = file_crc - (1 << 32) if file_crc >= (1 << 31) else file_crc
+    assert validation.crc == expected_wire_crc
 
     assert sent_packets[1][0] == 0x32
     assert sent_packets[1][1][0] == MapSyncStart.id
@@ -173,6 +199,10 @@ def test_send_map_data_uses_restored_vxl_chunker(caplog):
     assert percents == sorted(percents)
     assert percents[-1] == 100
 
+    # MEASURED: MapSyncStart is the bare id byte — any extra payload is
+    # parsed by the real client as a truncated next packet and crashes it.
+    assert len(sent_packets[1][1]) == 1
+
     assert sent_packets[-1][0] == 0x31
     assert sent_packets[-1][1][0] == MapSyncEnd.id
 
@@ -181,3 +211,57 @@ def test_send_map_data_uses_restored_vxl_chunker(caplog):
     assert [packet.data for packet in chunk_packets] == expected_chunks
     assert world_map.estimated_size > 0
     assert any("Prepared map sync" in record.message for record in caplog.records)
+
+
+def test_send_map_data_matching_crc_sends_delta_only():
+    """Matching client CRC -> the client's local file is the world base;
+    only columns changed since map load are streamed (none on fresh map)."""
+    import zlib
+
+    path = fixture_map_path()
+    file_crc = zlib.crc32(path.read_bytes()) & 0xFFFFFFFF
+    world_map = VXL(1, str(path), 3)
+    server = DummyServer(world_map, map_file_crc=file_crc)
+
+    client_crc = file_crc - (1 << 32) if file_crc >= (1 << 31) else file_crc
+    sent_packets = _run_send_map_data(server, client_crc=client_crc)
+
+    chunk_packets = [
+        data for prefix, data in sent_packets if data and data[0] == MapSyncChunk.id
+    ]
+    assert chunk_packets == []  # fresh map: nothing to sync
+
+    assert sent_packets[1][1][0] == MapSyncStart.id
+    assert len(sent_packets[1][1]) == 1  # bare id byte (measured wire format)
+    assert sent_packets[-1][1][0] == MapSyncEnd.id
+
+
+def test_send_map_data_matching_crc_streams_dirty_columns():
+    """Blocks changed after load are still delivered to matched-CRC clients."""
+    import zlib
+
+    path = fixture_map_path()
+    file_crc = zlib.crc32(path.read_bytes()) & 0xFFFFFFFF
+    world_map = VXL(1, str(path), 3)
+    server = DummyServer(world_map, map_file_crc=file_crc)
+    surface = world_map.get_z(150, 250)
+    world_map.set_point(150, 250, max(0, surface - 1), 0x7F00AA00)
+    server.world_manager.dirty_columns.add((150, 250))
+
+    client_crc = file_crc - (1 << 32) if file_crc >= (1 << 31) else file_crc
+    sent_packets = _run_send_map_data(server, client_crc=client_crc)
+
+    chunk_packets = [
+        MapSyncChunk(ByteReader(data[1:]))
+        for prefix, data in sent_packets
+        if data and data[0] == MapSyncChunk.id
+    ]
+    assert chunk_packets
+    payload = b"".join(packet.data for packet in chunk_packets)
+    raw = zlib.decompress(payload)
+    # Record format: u32 x, u32 y, column spans
+    import struct
+
+    x, y = struct.unpack_from("<II", raw, 0)
+    assert (x, y) == (150, 250)
+    assert raw[8:] == bytes(world_map.serialize_columns([(150, 250)]))[8:]

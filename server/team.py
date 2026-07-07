@@ -82,9 +82,11 @@ class Team:
         self.score += points
     
     def add_capture(self):
-        """Record a capture (flag/intel)."""
+        """Record a capture (flag/intel). +1 team score per capture matches
+        the reference (a single capture used to add 10 into a 10-point limit,
+        instantly ending CTF on the first flag)."""
         self.captures += 1
-        self.add_score(10)
+        self.add_score(1)
     
     def add_kill(self):
         """Record a kill."""

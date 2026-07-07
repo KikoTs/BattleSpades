@@ -1,0 +1,438 @@
+{
+  "results": [
+    {
+      "data": {
+        "is_32bit": true, 
+        "version": "2.7.18 (v2.7.18:8d21aa21f2, Apr 20 2020, 13:19:08) [MSC v.1500 32 bit (Intel)]", 
+        "nonsteam_exists": true, 
+        "nonsteam_root": "G:\\AoSRevival\\aceofspades_nonsteam", 
+        "platform": "win32"
+      }, 
+      "ok": true, 
+      "check": "python.version_and_bitness", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "packet_flags": [
+          "PACKET_FLAG_NO_ALLOCATE", 
+          "PACKET_FLAG_RELIABLE", 
+          "PACKET_FLAG_UNRELIABLE_FRAGMENT", 
+          "PACKET_FLAG_UNSEQUENCED"
+        ], 
+        "has_Host": true, 
+        "has_Packet": true, 
+        "event_types": [
+          "EVENT_TYPE_CONNECT", 
+          "EVENT_TYPE_DISCONNECT", 
+          "EVENT_TYPE_NONE", 
+          "EVENT_TYPE_RECEIVE"
+        ], 
+        "module_file": "G:\\AoSRevival\\aceofspades_nonsteam\\enet.pyd", 
+        "has_Peer": true, 
+        "has_Address": true
+      }, 
+      "ok": true, 
+      "check": "enet.import", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "host_repr": "<enet.Host object at 0x036C35A8>", 
+        "compress_with_range_coder": "ok"
+      }, 
+      "ok": true, 
+      "check": "enet.client_host_construct", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "ByteWriter_methods": [
+          "pad", 
+          "rewind", 
+          "tell", 
+          "write", 
+          "write_byte", 
+          "write_float", 
+          "write_int", 
+          "write_pystring", 
+          "write_short", 
+          "write_string", 
+          "write_string_size", 
+          "write_uint64"
+        ], 
+        "BW_snake_case_works": true, 
+        "public_count": 3, 
+        "sample_names": [
+          "ByteReader", 
+          "ByteWriter", 
+          "NoDataLeft"
+        ], 
+        "ByteReader_methods": [
+          "data_left", 
+          "read", 
+          "read_byte", 
+          "read_float", 
+          "read_int", 
+          "read_pystring", 
+          "read_reader", 
+          "read_short", 
+          "read_string", 
+          "read_uint64", 
+          "rewind", 
+          "seek", 
+          "skip_bytes", 
+          "tell"
+        ], 
+        "has_ByteReader": true, 
+        "module_file": "G:\\AoSRevival\\aceofspades_nonsteam\\shared\\bytes.pyd", 
+        "BW_round_trip_bytes_hex": "423412bebafeca", 
+        "has_ByteWriter": true
+      }, 
+      "ok": true, 
+      "check": "shared.bytes.import_and_api", 
+      "ms": 6
+    }, 
+    {
+      "data": {
+        "compress_64A_first16_hex": "014141e03300014141", 
+        "module_file": "G:\\AoSRevival\\aceofspades_nonsteam\\shared\\lzf.pyd", 
+        "public": [
+          "compress", 
+          "decompress", 
+          "decompress_client"
+        ], 
+        "compress_64A_len": 9, 
+        "round_trip_ok": true
+      }, 
+      "ok": true, 
+      "check": "shared.lzf.import_and_compress", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "sample_input_len": 64, 
+        "server_chunking_hex_first32": "1f41414141414141414141414141414141414141414141414141414141414141", 
+        "real_lzf_len": 9, 
+        "server_chunking_len": 66, 
+        "are_they_equal": false, 
+        "real_lzf_hex_first32": "014141e03300014141"
+      }, 
+      "ok": true, 
+      "check": "shared.lzf.vs_server_chunking", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "module_file": "G:\\AoSRevival\\aceofspades_nonsteam\\shared\\packet.pyd", 
+        "classes": {
+          "ChatMessage": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 49, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "MapSyncEnd": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 59, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "NewPlayerConnection": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 15, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "ClientData": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 4, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "MapSyncStart": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 55, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "PlayerLeft": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 64, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "WorldUpdate": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 2, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "SetHP": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 5, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "ExistingPlayer": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 14, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "CreatePlayer": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 28, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "SteamSessionTicket": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 105, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "InitialInfo": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 114, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "ClockSync": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 0, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "MapDataValidation": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 60, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "SkyboxData": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 51, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "MapSyncChunk": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 57, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "StateData": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 45, 
+            "has_write": true, 
+            "present": true
+          }, 
+          "PositionData": {
+            "has_id_attr": true, 
+            "has_generate": true, 
+            "has_read": true, 
+            "id": 116, 
+            "has_write": true, 
+            "present": true
+          }
+        }
+      }, 
+      "ok": true, 
+      "check": "shared.packet.import_and_class_ids", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "first_byte_equals_id": true, 
+        "default_ctor_fields": [
+          "compress_packet", 
+          "id", 
+          "ticket", 
+          "ticket_size"
+        ], 
+        "first_byte": 105, 
+        "generate_bytes_len": 5, 
+        "generate_first16_hex": "6900000000", 
+        "generate_type": "ByteWriter"
+      }, 
+      "ok": true, 
+      "check": "shared.packet.api_shape_steam_ticket", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "fields_set": {
+          "client_time": 305419896, 
+          "server_loop_count": 12345
+        }, 
+        "raw_len": 9, 
+        "raw_hex": "007856341239300000", 
+        "id_attr": 0, 
+        "first_byte": 0, 
+        "fields_after_read": {
+          "client_time": 305419896, 
+          "server_loop_count": 12345
+        }, 
+        "round_trip_ok": true, 
+        "readback_ctor_from_reader": "ok", 
+        "first_byte_is_id": true
+      }, 
+      "ok": true, 
+      "check": "shared.packet.api_shape_clock_sync", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "sample": {
+          "0": [
+            "AddServer", 
+            "ClockSync", 
+            "item"
+          ], 
+          "1": [
+            "PlaceDynamite"
+          ], 
+          "2": [
+            "WorldUpdate"
+          ], 
+          "3": [
+            "EntityUpdates"
+          ], 
+          "4": [
+            "ClientData"
+          ]
+        }, 
+        "collisions": {
+          "0": [
+            "AddServer", 
+            "ClockSync", 
+            "item"
+          ]
+        }, 
+        "min_id": 0, 
+        "unique_ids": 119, 
+        "max_id": 118
+      }, 
+      "ok": true, 
+      "check": "shared.packet.full_id_catalog", 
+      "ms": 4
+    }, 
+    {
+      "data": {
+        "TEAM_NEUTRAL": 1, 
+        "TEAM_SPECTATOR": 0, 
+        "MASTER_VERSION": 32, 
+        "MAX_PACKET_DECOMPRESSION_SIZE": 1000000, 
+        "TEAM1": 2, 
+        "TEAM2": 3, 
+        "PROXY_PACKET": "<missing>", 
+        "PACKET_COMPRESSION": 1, 
+        "PROTOCOL_VERSION": 168, 
+        "PROXY_BYTES": "<missing>", 
+        "SPADES_GAME_APP_ID": 480
+      }, 
+      "ok": true, 
+      "check": "shared.constants.protocol_version_etc", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "suspicious_names": []
+      }, 
+      "ok": true, 
+      "check": "xor_layer.search_in_shared_packet", 
+      "ms": 3
+    }, 
+    {
+      "data": {
+        "decompress_client.with_outsize_64": {
+          "first16_hex": "41414141414141414141414141414141", 
+          "matches_sample": true, 
+          "len": 64
+        }, 
+        "decompress_client.with_outsize_66": {
+          "first16_hex": "41414141414141414141414141414141", 
+          "matches_sample": true, 
+          "len": 64
+        }, 
+        "real_decompress_with_chunked.matches": true, 
+        "real_decompress_with_chunked.bytes_first16": "41414141414141414141414141414141", 
+        "decompress_client.no_args_error": "TypeError('function takes exactly 2 arguments (1 given)',)", 
+        "chunked_input_len": 66
+      }, 
+      "ok": true, 
+      "check": "shared.lzf.decompress_client_with_server_chunking", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "raw_len": 15, 
+        "first_byte_is_id": true, 
+        "raw_hex": "31070068656c6c6f20776f726c6400", 
+        "readback": {
+          "player_id": 7, 
+          "chat_type": 0, 
+          "value": "hello world"
+        }, 
+        "round_trip_ok": true
+      }, 
+      "ok": true, 
+      "check": "shared.packet.chat_message_round_trip", 
+      "ms": 0
+    }, 
+    {
+      "data": {
+        "raw_len": 5, 
+        "round_trip_ok": true, 
+        "id": 60, 
+        "crc_after_read": 305419896, 
+        "first_byte": 60
+      }, 
+      "ok": true, 
+      "check": "shared.packet.map_data_validation_round_trip", 
+      "ms": 0
+    }
+  ], 
+  "summary": {
+    "failed": 0, 
+    "total": 15, 
+    "check": "__summary__", 
+    "passed": 15, 
+    "failures": []
+  }
+}

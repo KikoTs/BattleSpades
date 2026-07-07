@@ -214,12 +214,16 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
     assert target_connection.sent_packets == []
     assert wall not in server.world_manager.block_damage
     assert server.world_manager.get_solid(*wall) is False
-    assert [packet[0] for packet in server.broadcast_packets[:7]] == [6, 34, 6, 34, 6, 34, 32]
-    last_block_hit = BlockOccupy(ByteReader(server.broadcast_packets[5][1:]))
-    assert (last_block_hit.x, last_block_hit.y, last_block_hit.z) == wall
-    destroy_packet = BlockBuild(ByteReader(server.broadcast_packets[6][1:]))
-    assert destroy_packet.block_type == BLOCK_ACTION_DESTROY
-    assert (destroy_packet.x, destroy_packet.y, destroy_packet.z) == wall
+    # Block damage/removal both ride Damage(37) — the ONLY packet this
+    # client mutates world geometry from (decompiled gameScene contract).
+    # Two hit-damage broadcasts, then the destroying shot sends kill-damage.
+    assert [packet[0] for packet in server.broadcast_packets[:6]] == [6, 37, 6, 37, 6, 37]
+    from shared.packet import Damage
+    last_hit = Damage(ByteReader(server.broadcast_packets[3][1:]))
+    assert (int(last_hit.position[0]), int(last_hit.position[1]), int(last_hit.position[2])) == wall
+    destroy_packet = Damage(ByteReader(server.broadcast_packets[5][1:]))
+    assert destroy_packet.damage >= 31.0  # kill-damage guarantees removal
+    assert (int(destroy_packet.position[0]), int(destroy_packet.position[1]), int(destroy_packet.position[2])) == wall
 
     asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker, seed=4).generate())))
 
@@ -262,10 +266,12 @@ def test_direct_block_destroy_refunds_one_block():
 
     assert builder.blocks == 11
     assert server.world_manager.get_solid(*block) is False
-    assert server.broadcast_packets[-1][0] == 32
-    destroy_packet = BlockBuild(ByteReader(server.broadcast_packets[-1][1:]))
-    assert destroy_packet.block_type == BLOCK_ACTION_DESTROY
-    assert (destroy_packet.x, destroy_packet.y, destroy_packet.z) == block
+    # Removal rides Damage(37) with kill-damage (BlockBuild is add-only).
+    assert server.broadcast_packets[-1][0] == 37
+    from shared.packet import Damage
+    destroy_packet = Damage(ByteReader(server.broadcast_packets[-1][1:]))
+    assert destroy_packet.damage >= 31.0
+    assert (int(destroy_packet.position[0]), int(destroy_packet.position[1]), int(destroy_packet.position[2])) == block
 
 
 def test_spade_destroy_breaks_vertical_three_block_column():
@@ -288,10 +294,12 @@ def test_spade_destroy_breaks_vertical_three_block_column():
     assert server.world_manager.get_solid(center[0], center[1], 60) is False
     assert server.world_manager.get_solid(center[0], center[1], 61) is False
     assert server.broadcast_packets
-    assert all(packet_bytes[0] == 32 for packet_bytes in server.broadcast_packets)
+    # Every removal is a kill-damage Damage(37) — the only client destroy path.
+    from shared.packet import Damage
+    assert all(packet_bytes[0] == 37 for packet_bytes in server.broadcast_packets)
     for packet_bytes in server.broadcast_packets:
-        destroy_packet = BlockBuild(ByteReader(packet_bytes[1:]))
-        assert destroy_packet.block_type == BLOCK_ACTION_DESTROY
+        destroy_packet = Damage(ByteReader(packet_bytes[1:]))
+        assert destroy_packet.damage >= 31.0
 
 
 def test_block_build_consumes_inventory_and_clears_old_damage():
@@ -376,4 +384,5 @@ def test_raw_reversed_block_tool_id_can_destroy_blocks():
     asyncio.run(PacketHandler(server).handle(builder, bytes(packet.generate())))
 
     assert server.world_manager.get_solid(*block) is False
-    assert server.broadcast_packets[-1][0] == 32
+    # Removal broadcast = Damage(37), the only client destroy path.
+    assert server.broadcast_packets[-1][0] == 37

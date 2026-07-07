@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import math
 import struct
 import sys
@@ -14,7 +14,7 @@ from shared.packet import ClientData, PositionData, WorldUpdate
 
 from protocol.packet_handler import PacketHandler
 from server.config import ServerConfig
-from server.game_constants import PLAYER_HEIGHT, TEAM1
+from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1
 from server.main import BattleSpadesServer
 from server.player import Player
 from server.world_manager import WorldManager
@@ -53,6 +53,10 @@ class DummyConnection:
         self.server = server
         self.player = player
         self.sent_packets = []
+        # Represents a fully-joined, in-game client (gameplay broadcasts are
+        # gated on this; a connecting client gets none until its first
+        # ClientData). See server.main.broadcast.
+        self.in_game = True
 
     def send(self, data, reliable=True, prefix=0x30):
         self.sent_packets.append(data)
@@ -68,7 +72,11 @@ def flatten_patch(world_manager, cell_x=100, cell_y=100, radius=4):
 
 
 def make_spawn(world_manager, cell_x=100, cell_y=100):
-    return (float(cell_x) + 0.5, float(cell_y) + 0.5, float(GROUND_Z) - PLAYER_HEIGHT)
+    return (
+        float(cell_x) + 0.5,
+        float(cell_y) + 0.5,
+        float(GROUND_Z) - PLAYER_STANDING_POS_ABOVE_GROUND,
+    )
 
 
 def make_player(server=None, cell_x=100, cell_y=100):
@@ -128,9 +136,15 @@ def test_world_update_serializes_reference_layout():
     assert reader.read_short() == 95
     assert reader.read_byte() == 0x31
     assert reader.read_byte() == 0x42
-    assert reader.read_byte() == C.MINIGUN_TOOL
+    # The byte after the action byte is a per-player STATE bitfield the client
+    # bit-splits (parachute/disguise/goo), NOT the tool id — writing the raw
+    # tool id here made weapon switches toggle those states. We write 0.
     assert reader.read_byte() == 0
-    assert reader.read_short() == 0
+    assert reader.read_byte() == 0
+    # Pickup id byte: 0xFF (-1) = "no pickup". Sending 0 crashes the client
+    # minimap (PICKUPS[0] KeyError) — measured on the stock Steam client.
+    assert reader.read_byte() == 0xFF
+    assert reader.read_byte() == 0
     assert reader.read_short() == 0
     assert reader.read_short() == 0
     assert reader.read_byte() == 0
@@ -155,7 +169,7 @@ def test_world_update_read_parses_player_updates_and_counts():
 
     parsed = WorldUpdate(ByteReader(bytes(packet.generate())[1:]))
     update = parsed.player_updates[1]
-    position, orientation, velocity, movement, ping, health, input_flags, action_flags, tool_id = update
+    position, orientation, velocity, movement, ping, health, input_flags, action_flags, state_byte = update
 
     assert parsed.loop_count == 77
     assert len(parsed.updated_entities) == 0
@@ -168,7 +182,9 @@ def test_world_update_read_parses_player_updates_and_counts():
     assert health == 100
     assert input_flags == 0x11
     assert action_flags == 0x02
-    assert tool_id == C.RIFLE_TOOL
+    # write() emits 0 for the post-action STATE byte (not the tool id, which
+    # the client never reads from WorldUpdate), so the round-trip yields 0.
+    assert state_byte == 0
 
 
 def test_world_update_round_trips_its_serialized_bytes():
@@ -273,9 +289,12 @@ def test_client_data_updates_player_state_and_flags():
     assert player.tool == C.MINIGUN_TOOL
     assert player.orientation[0] > 0.99
     assert player.input.jump is True
-    assert player.pending_jump is True
     assert player.pack_input_flags() == 0x15
-    assert player.pack_action_flags() == 0x95
+    # WorldUpdate action byte uses the client's DISPLAY layout, which remaps
+    # zoom/hover/weapon_deployed vs the ClientData SEND layout. ClientData
+    # 0x95 (primary|zoom|can_display_weapon|hover) packs to display 0x55
+    # (primary 0x01 | can_display 0x10 | zoom 0x40 | hover→jetpack 0x04).
+    assert player.pack_action_flags() == 0x41
 
 
 def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_yaw():
@@ -308,12 +327,12 @@ def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_ya
     assert math.isclose(player.orientation[2], -0.6653 / expected_magnitude, abs_tol=1e-3)
     assert player.input.palette_enabled is True
     assert player.input.jump is True
-    assert player.pending_jump is True
     assert player.pack_input_flags() == 0x15
-    assert player.pack_action_flags() == 0x95
+    # See note above: 0x95 send-layout -> 0x55 display-layout in pack.
+    assert player.pack_action_flags() == 0x41
 
 
-def test_repeated_live_client_data_preserves_pending_jump_until_tick():
+def test_repeated_live_client_data_held_jump_launches_on_next_tick():
     server = SimpleNamespace(
         config=SimpleNamespace(log_suppress_packets=set()),
         world_manager=make_world_manager(),
@@ -341,11 +360,9 @@ def test_repeated_live_client_data_preserves_pending_jump_until_tick():
     asyncio.run(handler.handle(player, raw_packet))
 
     assert player.input.jump is True
-    assert player.pending_jump is True
 
     advance_player(player, 1.0 / 60.0)
 
-    assert player.pending_jump is False
     assert player.airborne is True
     assert player.z < start_z
 
@@ -465,7 +482,7 @@ def test_player_movement_is_normalized_and_lands_back_on_ground():
     assert idle_player.position == start
 
 
-def test_holding_jump_is_consumed_once():
+def test_released_jump_settles_back_to_ground():
     player, _ = make_player(SimpleNamespace(world_manager=make_world_manager()))
     start = player.position
     player.update_input(False, False, False, False, True, False, False, False)
@@ -474,6 +491,10 @@ def test_holding_jump_is_consumed_once():
     mid_z = player.z
     assert mid_z < start[2]
 
+    # Release the key mid-air: the player completes the arc and stays down
+    # (held jump would keep bunny-hopping — that's the client behavior,
+    # pinned in test_reversed_movement_engine).
+    player.update_input(False, False, False, False, False, False, False, False)
     advance_player(player, 2.0)
     assert math.isclose(player.z, start[2], abs_tol=0.25)
     assert player.grounded is True
@@ -552,8 +573,12 @@ def test_server_broadcasts_world_update_to_connected_clients():
 
     parsed = WorldUpdate(ByteReader(connection_one.sent_packets[0][1:]))
     update = parsed.player_updates[player_one.id]
-    update_position, _, _, _, _, _, update_input_flags, _, update_tool_id = update
-    assert update_tool_id == C.RIFLE_TOOL
+    update_position, _, _, _, _, _, update_input_flags, _, update_state_byte = update
+    # The byte after 'action' is a per-player state bitfield (not the tool id):
+    # we write 0 (no parachute/disguise/goo) so weapon switching can't toggle
+    # those states. See shared/packet.pyx WorldUpdate.write.
+    assert update_state_byte == 0
     assert update_position[0] > player_two.position[0] - 20.0
     assert update_position[0] > player_one.last_reported_position[0] - 0.01
     assert update_input_flags == player_one.pack_input_flags()
+

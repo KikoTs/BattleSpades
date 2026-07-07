@@ -25,8 +25,18 @@ def _fromfixed(value: int) -> float:
 
 
 def _fromfixed_orientation(value: int) -> float:
+    """Decode the original AoS orientation type (sign-magnitude 16-bit).
+
+    Encoding is piecewise (verified empirically against shared.packet.pyd):
+        |v| < 1.0:  mag = round(|v| * 8192)            -> mag in [0, 8192)
+        |v| >= 1.0: mag = round(16384 + (|v|-1)*8192)  -> mag in [16384, 24576]
+    The gap [8192, 16384) is never emitted by the encoder. For decoding,
+    we treat mag >= 16384 as the extended-range branch.
+    """
     sign = -1.0 if (value & 0x8000) else 1.0
     magnitude = value & 0x7FFF
+    if magnitude >= 16384:
+        return sign * ((magnitude - 8192) / 8192.0)
     return sign * (magnitude / 8192.0)
 
 
@@ -115,6 +125,13 @@ def decode_client_data_payload(payload: bytes) -> RuntimeClientData:
         crouch=bool(input_flags & 0x20),
         sneak=bool(input_flags & 0x40),
         sprint=bool(input_flags & 0x80),
+        # ClientData action-flag layout (client SEND side, MEASURED from the
+        # compiled client's ClientData.read, 2026-07-07): 0x04=zoom,
+        # 0x40=is_weapon_deployed, 0x80=hover. NOTE this is DIFFERENT from the
+        # WorldUpdate action byte the client APPLIES as remote state
+        # (0x04=jetpack, 0x40=zoom, 0x80=weapon_deployed) — the client itself
+        # remaps send-vs-display, so server/player.py pack_action_flags uses
+        # the display layout while this parse uses the send layout.
         primary=bool(action_flags & 0x01),
         secondary=bool(action_flags & 0x02),
         zoom=bool(action_flags & 0x04),

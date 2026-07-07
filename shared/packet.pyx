@@ -248,24 +248,28 @@ cdef class BlockBuild(Loader): # Fixed
     id: int = 32
     compress_packet: bool = False
     cdef public:
-        int loop_count, player_id, block_type 
+        int loop_count, player_id, block_type
         int x, y, z
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = int(round(fromfixed(reader.read_short())))
-        self.y = int(round(fromfixed(reader.read_short())))
-        self.z = int(round(fromfixed(reader.read_short())))
+        # Block coords are raw shorts on the wire (verified empirically vs
+        # the original shared.packet.pyd encoder — see scripts/probe_originals.py
+        # check 'shared.packet.block_coord_format'). Earlier code used
+        # fromfixed/tofixed which gave a 64x mismatch with the original client.
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        self.z = reader.read_short()
         self.block_type = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
         writer.write_byte(self.block_type)
 
 cdef class BlockBuildColored(Loader): # Fixed
@@ -280,18 +284,18 @@ cdef class BlockBuildColored(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = int(round(fromfixed(reader.read_short())))
-        self.y = int(round(fromfixed(reader.read_short())))
-        self.z = int(round(fromfixed(reader.read_short())))
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        self.z = reader.read_short()
         self.color = read_color(reader, False)
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
         write_color(writer, self.color)
 
 cdef class BlockLiberate(Loader): # Fixed
@@ -305,17 +309,17 @@ cdef class BlockLiberate(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = int(round(fromfixed(reader.read_short())))
-        self.y = int(round(fromfixed(reader.read_short())))
-        self.z = int(round(fromfixed(reader.read_short())))
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        self.z = reader.read_short()
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
 
 cdef class BlockLine(Loader): # Fixed
     id: int = 40
@@ -357,17 +361,17 @@ cdef class BlockOccupy(Loader): # Fixed
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = int(round(fromfixed(reader.read_short())))
-        self.y = int(round(fromfixed(reader.read_short())))
-        self.z = int(round(fromfixed(reader.read_short())))
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        self.z = reader.read_short()
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
 
 cdef class BlockSuckerPacket(Loader): # Fixed
     id: int = 94
@@ -1259,9 +1263,9 @@ cdef class PlaceC4(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_byte(self.face)
 
 cdef class PlaceDynamite(Loader): # Fixed
@@ -1282,9 +1286,9 @@ cdef class PlaceDynamite(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_byte(self.face)
 
 cdef class PlaceFlareBlock(Loader): # Fixed
@@ -1303,9 +1307,9 @@ cdef class PlaceFlareBlock(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
 
 cdef class PlaceLandmine(Loader): # Fixed
     id: int = 89
@@ -1326,9 +1330,9 @@ cdef class PlaceLandmine(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
 
 cdef class PlaceMG(Loader): # Fixed
     id: int = 87
@@ -1350,9 +1354,9 @@ cdef class PlaceMG(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_short(tofixed(self.yaw))
 
 cdef class PlaceMedPack(Loader): # Fixed
@@ -1375,9 +1379,9 @@ cdef class PlaceMedPack(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_byte(self.face)
 
 cdef class PlaceRadarStation(Loader): # Fixed
@@ -1398,9 +1402,9 @@ cdef class PlaceRadarStation(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
 
 cdef class PlaceRocketTurret(Loader): # Fixed
     id: int = 88
@@ -1422,9 +1426,9 @@ cdef class PlaceRocketTurret(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
         writer.write_byte(self.player_id)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_short(tofixed(self.yaw))
 
 cdef class PlaceUGC(Loader): # Fixed
@@ -1446,9 +1450,9 @@ cdef class PlaceUGC(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         writer.write_byte(self.ugc_item_id)
         writer.write_byte(self.placing)
 
@@ -2401,9 +2405,9 @@ cdef class PaintBlockPacket(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(self.x)
-        writer.write_short(self.y)
-        writer.write_short(self.z)
+        writer.write_short(tofixed(self.x))
+        writer.write_short(tofixed(self.y))
+        writer.write_short(tofixed(self.z))
         write_color(writer, self.color)
 
 cdef class LocalisedMessage(Loader): # Fixed
@@ -2547,9 +2551,15 @@ cdef class MapSyncStart(Loader): # Fixed
         int size
 
     cpdef read(self, ByteReader reader):
-        self.size = reader.read_int()
+        self.size = 0
 
     cpdef write(self, ByteWriter writer):
+        # MEASURED against the live client: packet 55 is the BARE id byte.
+        # aosprotocol.1x.md claims a `size: int` field, but appending one
+        # crashes the real client — NetworkClient.process_current_data
+        # parses the buffer back-to-back and reads the 4 extra bytes as a
+        # truncated ClockSync (id 0x00) -> shared.bytes.NoDataLeft, which
+        # kills the whole game update loop.
         writer.write_byte(self.id)
 
 cdef class MapDataStart(Loader): # Fixed
@@ -2728,6 +2738,9 @@ cdef class ClientData(Loader): # Fixed
         self.sneak = (flags & 0x40) != 0
         self.sprint = (flags & 0x80) != 0
 
+        # ClientData action-flag layout (client SEND side): 0x04=zoom,
+        # 0x40=is_weapon_deployed, 0x80=hover. Differs from the WorldUpdate
+        # display layout (see server/player.py pack_action_flags).
         cdef int flags2 = reader.read_byte()
         self.primary = (flags2 & 0x01) != 0
         self.secondary = (flags2 & 0x02) != 0
@@ -2777,7 +2790,7 @@ cdef class ClientData(Loader): # Fixed
         )
         writer.write_byte(flags)
         
-        # flags2
+        # flags2 (action) — ClientData SEND layout, matches read()
         cdef int flags2 = (
             (0x01 if self.primary else 0) |
             (0x02 if self.secondary else 0) |
@@ -3339,8 +3352,16 @@ cdef class WorldUpdate(Loader): # Fixed
             # Tool bytes
             tool1 = reader.read_byte()
             tool2 = reader.read_byte()
-            # Padding shorts
-            pad1 = reader.read_short()
+            # Pickup id (SIGNED byte): the id of the pickup this player is
+            # carrying, or -1 (0xFF) for "no pickup". The client reads this
+            # straight into player.pickup_id and the minimap does
+            # PICKUPS[pickup_id] for any non-None value — so 0 (or any id
+            # not in the client's PICKUPS table) crashes the minimap with
+            # KeyError the instant a non-local player renders. -1 -> None is
+            # the correct "not carrying" sentinel. (Verified live on the
+            # stock Steam client, 2026-07-06.)
+            pickup = reader.read_byte()
+            pad1_hi = reader.read_byte()
             pad2 = reader.read_short()
             pad3 = reader.read_short()
             # Final byte
@@ -3401,16 +3422,29 @@ cdef class WorldUpdate(Loader): # Fixed
             
             # Action (Byte)
             writer.write_byte(action)
-            
-            # Tool bytes
-            writer.write_byte(tool if tool else 0)
-            writer.write_byte(0)            
-            
+
+            # STATE bitfield byte (NOT the tool id!). MEASURED: the compiled
+            # client bit-splits this byte into per-player display state —
+            # 0x01=parachute_active, 0x02=disguise_active, 0x08=touching_goo
+            # (in-water look). It writes NOTHING to the equipped tool from
+            # here (the weapon comes from CreatePlayer/loadout). The old code
+            # wrote the raw tool id here, so switching weapons set these bits
+            # as a side effect of the id's binary value (tool 1 -> parachute,
+            # 2 -> disguise, 8 -> goo) — the reported "weapon switch changes
+            # water/fire/parachute state" bug. Write 0 (no active state); real
+            # parachute/disguise/goo packing is a future enhancement.
+            writer.write_byte(0)
+            writer.write_byte(0)
+
+            # Pickup id: 0xFF (-1) = "no pickup". Sending 0 (or any id not in
+            # the client's PICKUPS table) crashes the minimap. See read().
+            writer.write_byte(0xFF)
+            writer.write_byte(0)
+
             # Padding shorts
             writer.write_short(0)
             writer.write_short(0)
-            writer.write_short(0)
-            
+
             # Final Byte
             writer.write_byte(0)
             
@@ -3767,17 +3801,36 @@ cdef class ChangeEntity(Loader): # Fixed
 cdef class Entity(Loader): # Fixed
     id: int = 21
     compress_packet: bool = False
+    # Wire layout reverse-engineered 1:1 from the compiled client
+    # (shared.packet.so: Entity.read @0x3dad0, Entity.write @0x3e880,
+    #  tp_new @0xbc0d0, property getters @0xbc130-0xbd1c0). Field order on
+    # the wire is: id(short) type(byte) state(byte) player_id(byte)
+    #   p_x p_y p_z v_x v_y v_z yaw r g b radius (11 fixed-point shorts)
+    #   face(byte) fuse(fixed short) int_count(byte) float_count(byte)
+    #   ugc_mode(byte) int_properties[int_count] (4-byte ints)
+    #   float_properties[float_count] (fixed-point shorts).
+    # NOTE: color is NOT a packed 3-byte color in the wire record; the
+    # client carries it as three separate fixed-point float channels r/g/b.
+    # We keep `color` as a Python attribute for compatibility (derived from
+    # r/g/b), but it is never read/written directly.
     cdef public:
         int entity_id
+        int type, player_id, state, face
         float pos_x, pos_y, pos_z
         float vel_x, vel_y, vel_z
-        float yaw, radius, fuse
-        tuple color
-        int type, player_id, state, face, ugc_mode
+        float yaw
+        float color_r, color_g, color_b
+        float radius, fuse
+        int ugc_mode
         list float_properties, int_properties
+        tuple color
 
     def __init__(self, ByteReader reader=None):
         self.entity_id = 0
+        self.type = 0
+        self.player_id = 0
+        self.state = 0
+        self.face = 0
         self.pos_x = 0.0
         self.pos_y = 0.0
         self.pos_z = 0.0
@@ -3785,85 +3838,97 @@ cdef class Entity(Loader): # Fixed
         self.vel_y = 0.0
         self.vel_z = 0.0
         self.yaw = 0.0
+        self.color_r = 0.0
+        self.color_g = 0.0
+        self.color_b = 0.0
         self.radius = 0.0
         self.fuse = 0.0
-        self.color = None
-        self.type = 0
-        self.player_id = 0
-        self.state = 0
-        self.face = 0
         self.ugc_mode = 0
+        self.color = None
         self.float_properties = []
         self.int_properties = []
         if reader is not None:
             self.read(reader)
-        
+
     cpdef read(self, ByteReader reader):
+        # id: 16-bit short  (vtable slot +24 in the client)
         self.entity_id = reader.read_short()
-        # Position (3 fixed-point shorts)
+        # type / state / player_id: single bytes (vtable slot +16)
+        self.type = reader.read_byte()
+        self.state = reader.read_byte()
+        self.player_id = reader.read_byte()
+        # 11 fixed-point shorts: position, velocity, yaw, color r/g/b
         self.pos_x = fromfixed(reader.read_short())
         self.pos_y = fromfixed(reader.read_short())
         self.pos_z = fromfixed(reader.read_short())
-        # Velocity (3 fixed-point shorts)
         self.vel_x = fromfixed(reader.read_short())
         self.vel_y = fromfixed(reader.read_short())
         self.vel_z = fromfixed(reader.read_short())
-        # Yaw, radius, fuse
         self.yaw = fromfixed(reader.read_short())
+        self.color_r = fromfixed(reader.read_short())
+        self.color_g = fromfixed(reader.read_short())
+        self.color_b = fromfixed(reader.read_short())
         self.radius = fromfixed(reader.read_short())
-        self.fuse = fromfixed(reader.read_short())
-        # Color
-        self.color = read_color(reader, True)
-        # Byte fields
-        self.type = reader.read_byte()
-        self.player_id = reader.read_byte()
-        self.state = reader.read_byte()
+        # face: single byte
         self.face = reader.read_byte()
-        self.ugc_mode = reader.read_byte()
-        # Int properties
+        # fuse: one more fixed-point short
+        self.fuse = fromfixed(reader.read_short())
+        # property framing: three bytes -> int_count, float_count, ugc_mode
         cdef int int_count = reader.read_byte()
+        cdef int float_count = reader.read_byte()
+        self.ugc_mode = reader.read_byte()
+        # int_properties: int_count 4-byte ints (vtable slot +32)
         self.int_properties = []
         for i in range(int_count):
             self.int_properties.append(reader.read_int())
-        # Float properties
-        cdef int float_count = reader.read_byte()
+        # float_properties: float_count fixed-point shorts
         self.float_properties = []
         for i in range(float_count):
             self.float_properties.append(fromfixed(reader.read_short()))
-        
+        # Compatibility: expose color as an (r,g,b) tuple of ints 0..255
+        self.color = (int(self.color_r), int(self.color_g), int(self.color_b))
+
     cpdef write(self, ByteWriter writer):
+        cdef float cr = self.color_r
+        cdef float cg = self.color_g
+        cdef float cb = self.color_b
+        # If color_r/g/b are unset but a legacy `color` tuple was supplied,
+        # fall back to it so existing callers keep working.
+        if cr == 0.0 and cg == 0.0 and cb == 0.0 and self.color is not None:
+            if isinstance(self.color, tuple) and len(self.color) >= 3:
+                cr = self.color[0]
+                cg = self.color[1]
+                cb = self.color[2]
+        # id: 16-bit short
         writer.write_short(self.entity_id)
-        # Position
+        # type / state / player_id: single bytes
+        writer.write_byte(self.type)
+        writer.write_byte(self.state)
+        writer.write_byte(self.player_id)
+        # 11 fixed-point shorts: position, velocity, yaw, color r/g/b
         writer.write_short(tofixed(self.pos_x))
         writer.write_short(tofixed(self.pos_y))
         writer.write_short(tofixed(self.pos_z))
-        # Velocity
         writer.write_short(tofixed(self.vel_x))
         writer.write_short(tofixed(self.vel_y))
         writer.write_short(tofixed(self.vel_z))
-        # Yaw, radius, fuse
         writer.write_short(tofixed(self.yaw))
+        writer.write_short(tofixed(cr))
+        writer.write_short(tofixed(cg))
+        writer.write_short(tofixed(cb))
         writer.write_short(tofixed(self.radius))
-        writer.write_short(tofixed(self.fuse))
-        # Color
-        if self.color is not None:
-            write_color(writer, self.color)
-        else:
-            writer.write_byte(0)
-            writer.write_byte(0)
-            writer.write_byte(0)
-        # Byte fields
-        writer.write_byte(self.type)
-        writer.write_byte(self.player_id)
-        writer.write_byte(self.state)
+        # face: single byte
         writer.write_byte(self.face)
-        writer.write_byte(self.ugc_mode)
-        # Int properties
+        # fuse: fixed-point short
+        writer.write_short(tofixed(self.fuse))
+        # property framing: int_count, float_count, ugc_mode bytes
         writer.write_byte(len(self.int_properties))
+        writer.write_byte(len(self.float_properties))
+        writer.write_byte(self.ugc_mode)
+        # int_properties: 4-byte ints
         for prop in self.int_properties:
             writer.write_int(prop)
-        # Float properties
-        writer.write_byte(len(self.float_properties))
+        # float_properties: fixed-point shorts
         for prop in self.float_properties:
             writer.write_short(tofixed(prop))
 

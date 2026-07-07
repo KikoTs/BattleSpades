@@ -7,7 +7,7 @@ import time
 import logging
 from typing import Optional, Tuple, TYPE_CHECKING
 
-from server.game_constants import PLAYER_HEIGHT, TEAM1, TEAM2
+from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1, TEAM2
 
 from .base_mode import BaseMode
 
@@ -17,14 +17,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _ground_anchor(server, x: float, y: float, fallback_z: float = 62.0 - PLAYER_HEIGHT) -> tuple[float, float, float]:
+def _ground_anchor(
+    server,
+    x: float,
+    y: float,
+    fallback_z: float = 62.0 - PLAYER_STANDING_POS_ABOVE_GROUND,
+) -> tuple[float, float, float]:
     world_manager = getattr(server, "world_manager", None)
     if world_manager is None:
         return (x, y, fallback_z)
     try:
-        return (x, y, float(world_manager.get_height(int(x), int(y))) - PLAYER_HEIGHT)
+        # Anchor on the nearest DRY column so a base/intel whose nominal spot is
+        # over water snaps to the shoreline instead of the seabed.
+        return world_manager.dry_ground_anchor(x, y)
     except Exception:
         return (x, y, fallback_z)
+
+
+def _intel_near(server, base_pos, dx: float) -> tuple[float, float, float]:
+    """Place the intel `dx` blocks along +x from the base, re-anchored to dry
+    ground (keeps it out of the water near shoreline bases)."""
+    return _ground_anchor(server, base_pos[0] + dx, base_pos[1])
 
 
 class CTFMode(BaseMode):
@@ -74,14 +87,21 @@ class CTFMode(BaseMode):
         """Initialize intel and base positions."""
         await super().on_mode_start()
         
-        # Set default positions based on map
-        # Blue team on west side, green on east
-        self.base_positions[TEAM1] = _ground_anchor(self.server, 64.0, 256.0)
-        self.base_positions[TEAM2] = _ground_anchor(self.server, 448.0, 256.0)
-        
-        # Intel slightly in front of base
-        self.intel_positions[TEAM1] = _ground_anchor(self.server, 80.0, 256.0)
-        self.intel_positions[TEAM2] = _ground_anchor(self.server, 432.0, 256.0)
+        # Anchor bases on the map author's spawn-zone markers (the true team
+        # bases), falling back to the dry shore near the legacy west/east points
+        # when a map has no markers.
+        wm = getattr(self.server, "world_manager", None)
+        if wm is not None and hasattr(wm, "team_base_anchor"):
+            self.base_positions[TEAM1] = wm.team_base_anchor(TEAM1)
+            self.base_positions[TEAM2] = wm.team_base_anchor(TEAM2)
+        else:
+            self.base_positions[TEAM1] = _ground_anchor(self.server, 64.0, 256.0)
+            self.base_positions[TEAM2] = _ground_anchor(self.server, 448.0, 256.0)
+
+        # Intel sits a few blocks toward midfield from each base, re-anchored to
+        # dry ground so it never floats over water.
+        self.intel_positions[TEAM1] = _intel_near(self.server, self.base_positions[TEAM1], +12.0)
+        self.intel_positions[TEAM2] = _intel_near(self.server, self.base_positions[TEAM2], -12.0)
         
         # Update team objects
         for team_id, pos in self.intel_positions.items():
@@ -140,10 +160,14 @@ class CTFMode(BaseMode):
         
         # Add score
         player.captures += 1
-        self.server.teams[player.team].add_capture()
-        
+        capturing_team = self.server.teams[player.team]
+        capturing_team.add_capture()
+        # Push the new team score to the HUD (CTF never did this, so the
+        # score bar stayed frozen at its spawn value).
+        self.server.broadcast_set_score(capturing_team)
+
         # Check for win
-        winning = self.server.teams[player.team].score >= self.score_limit
+        winning = capturing_team.score >= self.score_limit
         
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} captured the {team_name} intel!")

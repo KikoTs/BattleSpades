@@ -117,11 +117,16 @@ async def handle_packet(server: 'BattleSpadesServer', player: 'Player', data: by
 
 @register_handler(4)  # ClientData
 async def handle_client_data(server, player, packet):
-    """Handle client input/orientation data."""
+    """Handle client input/orientation data.
+
+    Movement inputs are recorded by the client's loop_count and consumed at
+    the matching (delayed) simulation tick — see Player.apply_buffered_input.
+    They are also applied immediately so non-movement systems (combat aim,
+    tool state) see the freshest data.
+    """
     previous_jump_held = player.jump_held
     previous_pending_jump = getattr(player, "pending_jump", False)
-    player.set_orientation_vector(packet.o_x, packet.o_y, packet.o_z)
-    player.update_input(
+    flags = (
         packet.up,
         packet.down,
         packet.left,
@@ -131,6 +136,24 @@ async def handle_client_data(server, player, packet):
         packet.sneak,
         packet.sprint,
     )
+    player.record_input_frame(
+        packet.loop_count,
+        flags,
+        (packet.o_x, packet.o_y, packet.o_z),
+    )
+    if packet.jump and player.connection is not None:
+        logger.info("RAWJUMP %s sent jump=1 at client_loop=%s", player.name, packet.loop_count)
+    # Sampled diagnostic: verify the client's loop_count stamps actually
+    # align with our tick counter (the input buffer depends on it).
+    if packet.loop_count % 120 == 0:
+        logger.info(
+            "ClientData stamp check: client_loop=%s server_loop=%s flags=%02X",
+            packet.loop_count,
+            getattr(server, "loop_count", -1),
+            player.pack_input_flags(),
+        )
+    player.set_orientation_vector(packet.o_x, packet.o_y, packet.o_z)
+    player.update_input(*flags)
     player.update_action_input(
         packet.primary,
         packet.secondary,
@@ -205,6 +228,27 @@ async def handle_block_destroy(server, player, packet):
         return
 
     get_combat_system(server).handle_block_destroy(player, packet)
+
+
+@register_handler(40)  # BlockLine — how the 1.x client PLACES blocks
+async def handle_block_line(server, player, packet):
+    """Handle block placement (the client sends BlockLine, never BlockBuild)."""
+    if not player.alive:
+        return
+
+    get_combat_system(server).handle_block_line(player, packet)
+
+
+@register_handler(10)  # UseOrientedItem — thrown grenades / RPG rockets
+async def handle_oriented_item(server, player, packet):
+    """A player threw a grenade (or fired an RPG). The client sends its own
+    predicted position+velocity+fuse; we rebroadcast it so every OTHER client
+    renders and simulates the projectile (arc + explosion FX + sound), and we
+    register a server-authoritative grenade that applies blast damage and
+    block destruction when the fuse expires."""
+    if not player.alive or not player.spawned:
+        return
+    server.spawn_grenade(player, packet)
 
 
 @register_handler(49)  # ChatMessage
@@ -288,22 +332,22 @@ async def handle_client_in_menu(server, player, packet):
         player.connection.in_menu = bool(packet.in_menu)
 
 
-@register_handler(10)  # UseOrientedItem (grenade, etc.)
-async def handle_use_oriented_item(server, player, packet):
-    """Handle oriented item use (grenades, etc.)."""
-    if not player.alive:
-        return
-    
-    # Broadcast to all players
-    from shared.packet import UseOrientedItem
-    broadcast_packet = UseOrientedItem()
-    broadcast_packet.loop_count = packet.loop_count
-    broadcast_packet.player_id = player.id
-    broadcast_packet.tool = packet.tool
-    broadcast_packet.value = packet.value
-    broadcast_packet.position = packet.position
-    broadcast_packet.velocity = packet.velocity
-    server.broadcast(bytes(broadcast_packet.generate()))
+@register_handler(241)  # DebugParityToggle
+async def handle_debug_parity_toggle(server, player, packet):
+    if getattr(server, 'debug_parity', None) is not None:
+        server.debug_parity.handle_toggle(player, packet)
+
+
+@register_handler(242)  # DebugClientSample
+async def handle_debug_client_sample(server, player, packet):
+    if getattr(server, 'debug_parity', None) is not None:
+        server.debug_parity.handle_client_sample(player, packet)
+
+
+@register_handler(243)  # DebugClientEvent
+async def handle_debug_client_event(server, player, packet):
+    if getattr(server, 'debug_parity', None) is not None:
+        server.debug_parity.handle_client_event(player, packet)
 
 
 @register_handler(76)  # WeaponReload

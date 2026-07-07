@@ -55,9 +55,11 @@ class BaseMode(ABC):
     
     async def on_tick(self, tick: int):
         """Called every game tick."""
+        if self.ended:
+            return
         import time
         self.elapsed_time = time.time() - self.start_time
-        
+
         # Check time limit
         if self.time_limit > 0 and self.elapsed_time >= self.time_limit:
             await self._end_by_time()
@@ -161,17 +163,30 @@ class BaseMode(ABC):
         return None
     
     async def _end_by_score(self, winner: int):
-        """End game due to score limit reached."""
+        """End game due to score limit reached (fires exactly once)."""
+        if self.ended:
+            return
+        self.ended = True
+        self.winner = winner
         team = self.server.teams[winner]
         await self.broadcast_message(f"{team.name} team wins!")
         await self.on_mode_end(winner)
-    
+
     async def _end_by_time(self):
-        """End game due to time limit."""
+        """End game due to time limit (fires exactly once).
+
+        Without the `ended` guard this re-fires EVERY TICK once the timer
+        expires, flooding ChatMessage on the single reliable ENet channel
+        and starving every other gameplay packet (blocks, kills, entities,
+        score) — which reads in-game as "nothing works".
+        """
+        if self.ended:
+            return
+        self.ended = True
         # Determine winner by score
         scores = [(t.id, t.score) for t in self.server.teams.values()]
         scores.sort(key=lambda x: x[1], reverse=True)
-        
+
         if scores[0][1] > scores[1][1]:
             winner = scores[0][0]
             team = self.server.teams[winner]
@@ -179,5 +194,6 @@ class BaseMode(ABC):
         else:
             await self.broadcast_message("Time's up! It's a draw!")
             winner = None
-        
+
+        self.winner = winner
         await self.on_mode_end(winner)

@@ -78,53 +78,46 @@ def _raw_vxl_size(data: bytes) -> tuple[int, int]:
     return (columns, max_ref)
 
 
-def _raw_column_surface_z(data: bytes, target_x: int, target_y: int) -> Optional[int]:
+def _walk_raw_columns(data: bytes):
+    """Yield (x, y, surface_z_or_None) for every column of the raw file.
+
+    A column is a SEQUENCE of span records terminated by span_words == 0;
+    walking only the first record per column drifts out of sync on
+    multi-span columns (overhangs/buildings) and attributes data to the
+    wrong (x, y).
+    """
     pos = 0
+    limit = len(data)
     for y in range(MAP_SIZE):
         for x in range(MAP_SIZE):
-            if pos + 4 > len(data):
-                return None
+            surface = None
+            while True:
+                if pos + 4 > limit:
+                    return
+                span_words = data[pos]
+                top_start = data[pos + 1]
+                top_end = data[pos + 2]
+                if surface is None and top_end >= top_start:
+                    surface = top_start
+                if span_words == 0:
+                    top_len = top_end - top_start + 1 if top_end >= top_start else 0
+                    pos += 4 + top_len * 4
+                    break
+                pos += span_words * 4
+            yield (x, y, surface)
 
-            span_words = data[pos]
-            top_start = data[pos + 1]
-            top_end = data[pos + 2]
-            pos += 4
 
-            if x == target_x and y == target_y:
-                if top_end >= top_start:
-                    return top_start
-                return None
-
-            if span_words == 0:
-                if top_end >= top_start:
-                    pos += (top_end - top_start + 1) * 4
-                continue
-
-            pos += (span_words - 1) * 4
-
+def _raw_column_surface_z(data: bytes, target_x: int, target_y: int) -> Optional[int]:
+    for x, y, surface in _walk_raw_columns(data):
+        if x == target_x and y == target_y:
+            return surface
     return None
 
 
 def _find_first_surface_column(data: bytes) -> tuple[int, int, int] | None:
-    pos = 0
-    for y in range(MAP_SIZE):
-        for x in range(MAP_SIZE):
-            if pos + 4 > len(data):
-                return None
-
-            span_words = data[pos]
-            top_start = data[pos + 1]
-            top_end = data[pos + 2]
-            pos += 4
-
-            if top_end >= top_start:
-                return (x, y, top_start)
-
-            if span_words == 0:
-                continue
-
-            pos += (span_words - 1) * 4
-
+    for x, y, surface in _walk_raw_columns(data):
+        if surface is not None:
+            return (x, y, surface)
     return None
 
 

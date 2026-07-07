@@ -133,7 +133,14 @@ class Connection:
         self.peer = peer
         self.server = server
         self.player: Optional['Player'] = None
-        
+        # The client learns ITS OWN id from StateData.player_id, which is
+        # sent BEFORE the Player object exists — so the id must be reserved
+        # at connection-data time and reused at NewPlayerConnection. Sending
+        # the default 0 breaks identity whenever id 0 is taken (e.g. bots):
+        # the client mistakes another player for itself (ghost self at
+        # spawn, corrections toward the id-0 player, icon KeyErrors).
+        self.reserved_player_id: Optional[int] = None
+
         # Connection state
         self.authenticated = False
         self.map_sent = False
@@ -144,7 +151,13 @@ class Connection:
         self.pending_prefabs: list[str] = []
         self.pending_ugc_tools: list[int] = []
         self.in_menu: Optional[bool] = None
-        
+        # True once the client is fully in the GameScene (it has started its
+        # input loop = first ClientData received). Until then the server must
+        # NOT send it gameplay broadcasts (other players' CreatePlayer/Kill/
+        # ChatMessage/StateData/WorldUpdate) — a flood during the async world
+        # build / GameScene transition crashes the compiled client natively.
+        self.in_game = False
+
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
     
@@ -190,10 +203,19 @@ class Connection:
         return bytes(b ^ self.steam_key[i % len(self.steam_key)] for i, b in enumerate(data))
 
     def send_clock_sync_response(self, client_time: int):
-        """Reply to a client clock sync packet."""
+        """Reply to a client clock sync packet.
+
+        clock_sync_loop_bias (+1 default) makes the client pace its clock
+        one tick AHEAD of ours, so its ClientData for frame N arrives
+        before our tick N simulates — deterministic input timing instead
+        of a per-packet race (see ServerConfig.clock_sync_loop_bias).
+        """
         packet = ClockSync()
         packet.client_time = client_time
-        packet.server_loop_count = self.server.loop_count
+        packet.server_loop_count = (
+            self.server.loop_count
+            + int(getattr(self.server.config, "clock_sync_loop_bias", 0))
+        )
         self.send(bytes(packet.generate()))
 
     def _cache_pre_join_loadout(self, packet: SetClassLoadout):
@@ -233,6 +255,13 @@ class Connection:
         packet.source_y = 0.0
         packet.source_z = 0.0
         self.send(bytes(packet.generate()))
+        # Restock(69) refills the client's tool counters (grenades included).
+        # Without it a fresh spawn may have zero grenades to throw.
+        from shared.packet import Restock
+        restock = Restock()
+        restock.player_id = self.player.id if self.player else 0
+        restock.type = 0
+        self.send(bytes(restock.generate()))
     
     def on_connect(self, data: int):
         """Called when connection is established."""
@@ -282,6 +311,16 @@ class Connection:
                 future.set_result(data)
                 return # Consume the packet
         
+        # First ClientData (4) means the client has entered the GameScene and
+        # started its input loop. NOW it can safely receive the live roster +
+        # entities and the ongoing gameplay broadcast stream — never before.
+        if packet_id == 4 and self.player is not None and not self.in_game:
+            self.in_game = True
+            try:
+                self.server.reveal_world_to(self)
+            except Exception:
+                logger.debug("reveal_world_to failed", exc_info=True)
+
         # Route to handler
         if self.player:
             # Forward to packet handler for joined players
@@ -311,47 +350,13 @@ class Connection:
                 del self._waiters[packet_id]
     
     async def send_state_data(self, player_id: int = -1):
-        """Send game state to newly joined player."""
-        state = StateData()
-        
-        state.player_id = player_id if player_id != -1 else 0 # Placeholder or 255 for "not assigned yet"?
-        state.fog_color = self.server.config.fog_color
-        state.gravity = 1.0
-        
-        # Light settings
-        state.light_color = (180, 192, 220)
-        state.light_direction = (0.203125, 0.796875, 0.0)
-        state.back_light_color = (64, 64, 64)
-        state.back_light_direction = (-0.078125, -0.578125, 0.296875)
-        state.ambient_light_color = (52, 56, 64)
-        state.ambient_light_intensity = 0.203125
-        state.time_scale = 1.0
-        
-        # Game settings
-        state.score_limit = self.server.config.score_limit
-        state.mode_type = 8  # CTF
-        state.team_headcount_type = 6
-        
-        # Team 1
-        team1 = self.server.teams[TEAM1]
-        state.team1_name = team1.name
-        state.team1_color = team1.color
-        state.team1_score = team1.score
-        state.team1_classes = DEFAULT_TEAM_CLASSES  # All classes available
-        
-        # Team 2
-        team2 = self.server.teams[TEAM2]
-        state.team2_name = team2.name
-        state.team2_color = team2.color
-        state.team2_score = team2.score
-        state.team2_classes = DEFAULT_TEAM_CLASSES
-        
-        state.prefabs = ['supertower']
-        state.entities = []
-        state.screenshot_cameras_points = [(0.0, 0.0, 0.0)]
-        state.screenshot_cameras_rotations = [(0.0, 0.0, 0.0)]
-        state.has_map_ended = 0
-        
+        """Send game state to newly joined player.
+
+        The actual packet construction lives in server.builders.state_data
+        so any per-mode/per-config field changes happen in one place.
+        """
+        from server.builders import build_state_data
+        state = build_state_data(self.server, player_id=player_id)
         self.send(bytes(state.generate()), prefix=0x31)
         self.state_sent = True
 
@@ -362,27 +367,45 @@ class Connection:
         self.send(bytes(skybox.generate()), prefix=0x30)
     
     async def send_existing_players(self, new_player: 'Player' = None):
-        """Send info about existing players to new player."""
+        """Announce the current roster to a joining client.
+
+        Uses CreatePlayer (not ExistingPlayer) on purpose. MEASURED on the
+        UNMODIFIED Steam client (2026-07-06): ExistingPlayer stores its
+        `pickup` byte VERBATIM as the player's pickup_id — there is NO
+        "no pickup" sentinel (0, 255 and everything else are stored as-is)
+        — and the compiled minimap does `PICKUPS[pickup_id]` for any
+        non-None pickup_id, where PICKUPS only has keys {14, 15, 16}
+        (BOMB/DIAMOND/INTEL). Every value we can send either crashes the
+        stock client with KeyError (the long-standing "minimap KeyError 0"
+        crash) or paints a false pickup icon. CreatePlayer processing
+        leaves pickup_id = None (the correct normal-icon state), carries
+        the same roster data PLUS a live position, and is already
+        broadcast for every respawn without issues. Players genuinely
+        carrying a pickup announce it via the pickup packets.
+        """
         for player in self.server.players.values():
             if new_player and player.id == new_player.id:
                 continue
-            
-            packet = ExistingPlayer()
+            if not player.alive or not player.spawned:
+                continue
+
+            packet = CreatePlayer()
             packet.player_id = player.id
             packet.demo_player = 0
-            packet.team = internal_team_to_wire(player.team)
             packet.class_id = player.class_id
-            packet.tool = player.tool
-            packet.pickup = 0
-            packet.dead = 0 if player.alive else 1
-            packet.score = player.kills
-            packet.forced_team = 0
-            packet.local_language = 0
-            packet.color = getattr(player, 'color', player.block_color)
+            packet.team = internal_team_to_wire(player.team)
+            packet.dead = 0
+            packet.local_language = getattr(player, 'local_language', 0)
+            packet.x, packet.y, packet.z = player.x, player.y, player.z
+            # Real orientation unit vector — a degenerate one NaNs the
+            # client's look-at basis (see _broadcast_create_player).
+            packet.ori_x = player.o_x
+            packet.ori_y = player.o_y
+            packet.ori_z = player.o_z
             packet.name = player.name
-            packet.loadout = []
-            packet.prefabs = []
-            
+            packet.loadout = list(getattr(player, 'loadout', []) or [])
+            packet.prefabs = list(getattr(player, 'prefabs', []) or [])
+
             self.send(bytes(packet.generate()))
     
     async def handle_pre_join_packet(self, data: bytes):
@@ -450,134 +473,131 @@ class Connection:
         # Send map data
         await self.send_map_data()
 
+        # Reserve this client's player id NOW: StateData must carry the same
+        # id the Player will get at NewPlayerConnection (see __init__ note).
+        if self.reserved_player_id is None:
+            reserved = self.server.get_next_player_id()
+            if reserved >= 0:
+                self.reserved_player_id = reserved
+                self.server.reserved_player_ids.add(reserved)
+
         # Notes: State and players should sent "right away" (before NewPlayerConnection)
-        await self.send_state_data()
+        await self.send_state_data(
+            self.reserved_player_id if self.reserved_player_id is not None else -1
+        )
         await self.send_skybox()
         await self.send_existing_players()
 
 
     async def send_info(self):
-        """Send InitialInfo (packet 114) to client."""
-        packet = InitialInfo()
-        
-        # Server info
-        packet.server_steam_id = 90087911866072064
-        packet.server_ip = 0
-        packet.server_port = self.server.config.port
-        packet.query_port = self.server.config.port
-        packet.server_name = self.server.config.server_name
-        
-        # Game mode info // hardcoded ctf
-        packet.mode_name = "CTF_TITLE"
-        packet.mode_description = "CTF_DESCRIPTION"
-        packet.mode_infographic_text1 = "CTF_INFOGRAPHIC_TEXT1"
-        packet.mode_infographic_text2 = "CTF_INFOGRAPHIC_TEXT2"
-        packet.mode_infographic_text3 = "CTF_INFOGRAPHIC_TEXT3"
-        packet.mode_key = 8
-        
-        # Map info
-        packet.map_name = self.server.world_manager.map_name if self.server.world_manager else self.server.config.map_name
-        packet.filename = "London" # Hard coded, why the fuck check the client map when the server sends it over the air any fucking way?
-        packet.checksum = 592649088 # For same reason as above
-        packet.map_is_ugc = 0
-        packet.ugc_mode = 8
-        
-        # Game rules & Settings
-        packet.classic = 0
-        packet.enable_minimap = 1
-        packet.same_team_collision = 0
-        packet.max_draw_distance = 192
-        packet.enable_colour_picker = 1
-        packet.enable_colour_palette = 0
-        packet.enable_deathcam = 1
-        packet.enable_sniper_beam = 1
-        packet.enable_spectator = 1
-        packet.exposed_teams_always_on_minimap = 0
-        packet.enable_numeric_hp = 1
-        packet.texture_skin = None
-        packet.beach_z_modifiable = 1
-        packet.enable_minimap_height_icons = 0
-        packet.enable_fall_on_water_damage = 1
-        packet.block_wallet_multiplier = 1.0
-        packet.block_health_multiplier = 1.0
-        packet.enable_player_score = 1
-        packet.allow_shooting_holding_intel = 1
-        packet.friendly_fire = 1
-        packet.enable_corpse_explosion = 1
-        
-        # Initialize lists
-        packet.disabled_tools = [0]
-        packet.disabled_classes = []
-        packet.movement_speed_multipliers = [1.40625, 1.59375, 1.09375, 1.25, 1.40625, 1.65625, 1.328125, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 3.0, 3.0, 1.0, 1.546875, 1.34375]
-        packet.ugc_prefab_sets = [0, 1]
-        packet.ground_colors = [(59, 58, 55, 238), (40, 54, 64, 239)]
-        packet.custom_game_rules = []
-        packet.loadout_overrides = {}
-        
-        # Send
+        """Send InitialInfo (packet 114) to client.
+
+        All field construction is in server.builders.initial_info — one
+        place to drive map/mode/multipliers from real state.
+        """
+        from server.builders import build_initial_info
+        packet = build_initial_info(self.server)
         self.send(bytes(packet.generate()))
-        logger.info(f"Sent InitialInfo to {self.peer.address}")
-    
+        logger.info(
+            "Sent InitialInfo to %s map=%s mode_key=%d crc=%d",
+            self.peer.address, packet.map_name, packet.mode_key, packet.checksum,
+        )
+
+
     async def send_map_data(self):
-        """Send map data to client."""
+        """Send map data to client.
+
+        Validation contract (measured against the original client + maps):
+        - InitialInfo.checksum and our MapDataValidation reply both carry
+          the CRC32 of the RAW .vxl file bytes; the client compares them
+          against the crc32 of its local copy of `filename`.
+        - On a match the client loads its pristine local file as the world
+          base, so the MapSync stream only needs the columns changed since
+          map load (empty on a fresh map).
+        - On a mismatch we stream the full world state as sync chunks (the
+          client applies (x, y, column) records onto whatever base it has).
+        """
         logger.debug(f"Sending map data to {self.peer.address}")
+        wm = self.server.world_manager
+        server_crc = int(getattr(wm, "map_file_crc", 0)) & 0xFFFFFFFF
+        server_crc_wire = server_crc - (1 << 32) if server_crc >= (1 << 31) else server_crc
         client_crc = None
-        
-        # Wait for MapDataValidation from client
+
+        # Wait for MapDataValidation from client (its local file CRC)
         try:
             client_validation = await self.wait_for(MapDataValidation, timeout=5.0)
             client_crc = client_validation.crc
             logger.info(f"Client sent map CRC: {client_crc}")
-
-            # send map data validation
-            packet = MapDataValidation()
-            packet.crc = client_crc
-            self.send(bytes(packet.generate()), prefix=0x31)
-            
-            # Allow client to process validation and state change
-            await asyncio.sleep(0.1)
-            
         except asyncio.TimeoutError:
             logger.warning(f"Client {self.peer.address} timed out sending MapDataValidation")
-        
-        # Send MapSyncStart
-        start_packet = MapSyncStart()
-        
-        # Get compressed map data
-        chunker = self.server.world_manager.get_chunker()
-        if chunker is None:
-            logger.warning("No map chunker available for %s", self.peer.address)
-            return
-        
-        self.send(bytes(start_packet.generate()), prefix=0x32)
-        
-        chunk_list = list(chunker.iter())
+
+        # Reply with OUR map file CRC — the truth, never an echo of the
+        # client's value (echoing made every client believe its local map
+        # was the right base regardless of which map we actually run).
+        packet = MapDataValidation()
+        packet.crc = server_crc_wire
+        self.send(bytes(packet.generate()), prefix=0x31)
+
+        # Allow client to process validation and state change
+        await asyncio.sleep(0.1)
+
+        crc_match = (
+            client_crc is not None
+            and (int(client_crc) & 0xFFFFFFFF) == server_crc
+        )
+        sync_mode = str(getattr(self.server.config, "map_sync_mode", "auto")).lower()
+        use_delta = crc_match and sync_mode != "full"
+
+        if use_delta:
+            payload = wm.serialize_dirty_columns_compressed()
+            chunk_list = [
+                payload[i:i + 1024] for i in range(0, len(payload), 1024)
+            ]
+            logger.info(
+                "Map CRC match for %s (crc=%s): delta sync, %s dirty columns, %s bytes",
+                self.peer.address,
+                server_crc,
+                len(getattr(wm, "dirty_columns", ()) or ()),
+                len(payload),
+            )
+        else:
+            chunker = wm.get_chunker()
+            if chunker is None:
+                logger.warning("No map chunker available for %s", self.peer.address)
+                return
+            chunk_list = list(chunker.iter())
+            if client_crc is not None and not crc_match:
+                logger.warning(
+                    "Client/server map file CRC mismatch for %s: client=%s server=%s "
+                    "— streaming full world state",
+                    self.peer.address,
+                    client_crc,
+                    server_crc,
+                )
+
         total_chunks = len(chunk_list)
-        server_crc = int(getattr(chunker, "crc32", 0))
-        estimated_size = int(getattr(getattr(self.server.world_manager, "map", None), "estimated_size", 0))
+        total_size = sum(len(chunk) for chunk in chunk_list)
         logger.info(
-            "Prepared map sync for %s: chunks=%s server_crc=%s estimated_size=%s",
+            "Prepared map sync for %s: chunks=%s size=%s server_file_crc=%s mode=%s",
             self.peer.address,
             total_chunks,
+            total_size,
             server_crc,
-            estimated_size,
+            "delta" if use_delta else "full",
         )
-        if client_crc is not None and client_crc != server_crc:
-            logger.warning(
-                "Client/server map CRC mismatch for %s: client=%s server=%s",
-                self.peer.address,
-                client_crc,
-                server_crc,
-            )
-        
+
+        start_packet = MapSyncStart()
+        start_packet.size = total_size
+        self.send(bytes(start_packet.generate()), prefix=0x32)
+
         for idx, chunk in enumerate(chunk_list):
             chunk_packet = MapSyncChunk()
             # User fix: int((index / total_chunks) * 100)
             chunk_packet.percent_complete = int((idx / max(total_chunks, 1)) * 100) + 1
-            
+
             chunk_packet.data = chunk
             self.send(bytes(chunk_packet.generate()), prefix=0x31)
-        
+
         # Send MapSyncEnd
         end_packet = MapSyncEnd()
         self.send(bytes(end_packet.generate()), prefix=0x31)
@@ -588,8 +608,15 @@ class Connection:
     async def _on_new_player(self, packet: NewPlayerConnection):
         """Handle new player joining."""
         from server.player import Player
-        
-        player_id = self.server.get_next_player_id()
+
+        # Use the id already promised to this client in StateData.player_id
+        # (reserved during send_connection_data) — the client's whole
+        # identity model is keyed on it.
+        if self.reserved_player_id is not None and self.reserved_player_id >= 0:
+            player_id = self.reserved_player_id
+            self.server.reserved_player_ids.discard(player_id)
+        else:
+            player_id = self.server.get_next_player_id()
         if player_id < 0:
             logger.warning("Server full, rejecting connection")
             self.disconnect(reason=3)  # Server full
@@ -634,19 +661,37 @@ class Connection:
         create_packet.x = spawn[0]
         create_packet.y = spawn[1]
         create_packet.z = spawn[2]
-        create_packet.ori_x = 0.0
-        create_packet.ori_y = 0.0
-        create_packet.ori_z = 255.5
+        # Real orientation unit vector (default (1,0,0)). NEVER send a
+        # degenerate vector like (0,0,255.5): the client builds a non-local
+        # player's look-at basis from this, and a forward vector parallel to
+        # the z-up axis (or non-unit) NaNs the matrix and natively crashes the
+        # renderer when it instantiates the model.
+        create_packet.ori_x = player.o_x
+        create_packet.ori_y = player.o_y
+        create_packet.ori_z = player.o_z
         create_packet.name = player.name
         create_packet.loadout = list(self.pending_loadout)
         create_packet.prefabs = list(self.pending_prefabs)
-        
-        self.server.broadcast(bytes(create_packet.generate()))
+
+        # The joiner needs its OWN CreatePlayer to bind its local player to the
+        # server id — deliver it directly (one packet is safe mid-transition).
+        # Other players only learn about the joiner once THEY'RE in-game, so
+        # broadcast (gameplay-gated) reaches just settled clients.
+        create_bytes = bytes(create_packet.generate())
+        self.send(create_bytes)
+        self.server.broadcast(create_bytes, exclude=player)
         
         # Spawn player
         player.spawn(spawn[0], spawn[1], spawn[2])
         self._send_spawn_hp()
+        if getattr(self.server, 'debug_parity', None) is not None:
+            self.server.debug_parity.on_player_join(player)
         
         # Notify game mode
         if self.server.mode:
             await self.server.mode.on_player_join(player)
+
+        # NB: the live roster + map entities are revealed to this client on its
+        # FIRST ClientData (server.reveal_world_to), i.e. once it's actually in
+        # the GameScene — never in the join handshake (that floods the
+        # transition and crashes the client). See on_receive / reveal_world_to.

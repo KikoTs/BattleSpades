@@ -17,21 +17,50 @@ sys.path.insert(0, str(Path(__file__).parent))
 from server.main import BattleSpadesServer
 from server.config import load_config
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+# Configure logging — NON-BLOCKING. Handlers that write to stdout/files run
+# synchronously on the calling thread by default, and the game loop logs
+# from the asyncio thread: a slow console pipe or disk flush would stall
+# the 60Hz simulation (visible as movement lag bursts). All records go into
+# a queue; a dedicated background thread drains it to the real handlers.
+import queue
+from logging.handlers import QueueHandler, QueueListener
+
+_log_format = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"
 )
 
-# Add file handler
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
-file_handler = logging.FileHandler(log_dir / "log.txt", mode='a')
-file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
-logging.getLogger().addHandler(file_handler)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_format)
+_file_handler = logging.FileHandler(log_dir / "log.txt", mode="a")
+_file_handler.setFormatter(_log_format)
+
+_log_queue: "queue.SimpleQueue" = queue.SimpleQueue()
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_root.addHandler(QueueHandler(_log_queue))
+_log_listener = QueueListener(
+    _log_queue, _console_handler, _file_handler, respect_handler_level=True
+)
+# Start the listener on a DAEMON thread (mirrors QueueListener.start
+# internals): if the main thread dies, a non-daemon thread would keep a
+# zombie process alive that still owns the server port.
+import threading
+_log_listener._thread = _log_listener_thread = threading.Thread(
+    target=_log_listener._monitor, daemon=True
+)
+_log_listener_thread.start()
 
 logger = logging.getLogger("BattleSpades")
+
+# Native crashes (segfaults in enet/Cython extensions) kill the process with
+# no Python traceback; faulthandler writes the thread stacks to a file so
+# they stop being silent.
+import faulthandler
+_faulthandler_file = open(log_dir / "faulthandler.log", "a")
+faulthandler.enable(_faulthandler_file)
 
 
 def handle_shutdown(server: BattleSpadesServer):

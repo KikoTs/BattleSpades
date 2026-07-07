@@ -1,105 +1,282 @@
-# BattleSpades - Ace of Spades Server
-# Protocol 1.0 Battle Builders
+<div align="center">
 
-A high-performance Python + Cython server for Ace of Spades using the Battle Builders protocol.
+# BattleSpades
 
-## Features
+**A from-scratch, 1:1 server for _Ace of Spades 1.x_ (Battle Builders)**
 
-- **ENet Networking** - Reliable UDP networking with pyenet
-- **Asyncio** - Non-blocking async I/O for high concurrency
-- **Cython Core** - Performance-critical physics and map operations in Cython
-- **Modular Design** - Easy to extend with game modes, commands, and plugins
+Python 3 + Cython · ENet · server-authoritative · physics reverse-engineered from the original compiled client
 
-## Project Structure
+</div>
+
+---
+
+BattleSpades is a clean-room reimplementation of the dedicated server for the classic
+**Ace of Spades "Battle Builders" (0.x/1.x)** protocol. It talks to the **original,
+unmodified game client** — the physics, netcode, and packet formats were reverse-engineered
+from the compiled game and calibrated until the server simulates movement, shooting, and
+block edits identically to what the client predicts locally.
+
+The goal: a **complete, correct, hackable** server that anyone can run in one command, so the
+classic game stays alive and playable — and so it's a solid base for ports to other languages.
+
+> Works with the stock Steam client, the non-Steam client, and the open-source
+> [aceofspades_revival](https://github.com/KikoTs/aceofspades_revival) client build.
+
+## Table of contents
+
+- [Status](#status)
+- [Quick start](#quick-start)
+- [What works](#what-works)
+- [Architecture](#architecture)
+- [Building from source](#building-from-source)
+- [ENet networking](#enet-networking)
+- [Configuration](#configuration)
+- [Running & hosting](#running--hosting)
+- [Commands](#commands)
+- [Testing & tooling](#testing--tooling)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Credits](#credits)
+- [License](#license)
+
+## Status
+
+**Playable.** The netcode and core gameplay are reverse-engineered and verified against the
+real client: movement is frame-accurate, and jumping, shooting, block build/break, grenades,
+structure collapse, pickups, deaths/respawns, and bots all work and stay in sync with the
+client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
+what's still on the list.
+
+- **87/87** unit tests pass (`py -m pytest tests/ -q`)
+- Movement parity: mean client↔server position delta in the **millimetre** range over
+  thousands of frames (`py scripts/replay_parity.py` — must stay `ALL PASS`)
+- Physics ground truth and every measured constant live in
+  [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md)
+
+## Quick start
+
+You need **Python 3.8+** (3.12 recommended) and a **C compiler** (MSVC Build Tools on
+Windows, `gcc`/`clang` on Linux/macOS — needed to build the Cython extensions and `pyenet`).
+
+**One-liner** — clone, install deps, build the Cython core, and launch:
+
+**Linux / macOS**
+```bash
+git clone https://github.com/KikoTs/BattleSpades.git && cd BattleSpades && ./scripts/install.sh && python run_server.py
+```
+
+**Windows (PowerShell)**
+```powershell
+git clone https://github.com/KikoTs/BattleSpades.git; cd BattleSpades; .\scripts\install.ps1; python run_server.py
+```
+
+Then point any Ace of Spades 1.x client at `your.ip:27015`. The default config spawns a TDM
+match on `ArcticBase` with 2 practice bots so you can connect and see other players moving
+immediately.
+
+<details>
+<summary>Manual steps (what the installer does)</summary>
+
+```bash
+pip install -r requirements.txt          # deps (pyenet, Cython, numpy, toml, pytest)
+python setup.py build_ext --inplace      # compile the Cython extensions
+python run_server.py                     # start the server on port 27015
+```
+</details>
+
+## What works
+
+| Area | State |
+|---|---|
+| **Movement / physics** | Frame-accurate server sim, oracle-calibrated to the compiled client (walk, sprint, crouch, wade, climb, gravity, friction) |
+| **Jumping** | Full client↔server-synced jump (input edge-latched, reconciliation calibrated) |
+| **Shooting** | Rifle / SMG / shotgun / spade, hit-scan from the client's reported aim, headshots, tracers rendered at the right spot |
+| **Blocks** | Build (BlockLine) + break (spade dig & bullet damage) — the **exact** aimed cell is removed on every client, block-colored debris |
+| **Structure collapse** | Cut a structure off from the ground and the disconnected chunk falls (flood-fill detection + client fall animation) |
+| **Grenades** | Thrown entity + fuse + bounce physics + blast damage (falloff + line-of-sight) + 3×3×3 block destruction |
+| **Pickups** | Ammo / health crates, restock on spawn |
+| **Combat lifecycle** | Damage, kills, kill feed, death → grave entity → timed respawn |
+| **Game modes** | Team Deathmatch, Capture the Flag, Arena (round-based) |
+| **Bots** | Human-like AI (aim error/slew, reaction delay, burst fire + reload, strafing, line-of-sight) — great for solo testing |
+| **Map transfer** | Full VXL streaming with correct CRC validation |
+| **Admin / chat** | Player + admin command set, team management |
+
+## Architecture
 
 ```
 BattleSpades/
-├── aoslib/          # Cython core library (VXL, physics, math)
-├── server/          # Main server logic
-├── protocol/        # Packet definitions and handlers
-├── modes/           # Game modes (CTF, TDM, Arena)
-├── commands/        # Player and admin commands
-├── plugins/         # Optional plugin system
-├── maps/            # VXL map files
-├── scripts/         # Build and utility scripts
-└── tests/           # Unit tests
+├── run_server.py       # entry point (async event loop + logging)
+├── config.toml         # all server settings
+├── setup.py            # Cython build definition
+│
+├── aoslib/             # Cython core (compiled)
+│   ├── world.pyx       #   movement physics, boxclipmove, grenade/entity sim
+│   ├── vxl.pyx         #   byte-faithful VXL map format
+│   └── kv6.pyx         #   voxel model format
+├── shared/             # Cython wire layer (compiled)
+│   ├── packet.pyx      #   every packet's read/write (the protocol)
+│   ├── bytes.pyx       #   ByteReader/ByteWriter
+│   └── glm.pyx         #   vector math
+│
+├── server/             # server logic (pure Python)
+│   ├── main.py         #   60 Hz sim loop, WorldUpdate broadcast, entities, grenades
+│   ├── player.py       #   per-player state, input buffering, reconciliation
+│   ├── combat_runtime.py  # shooting, block damage, collapse
+│   ├── world_manager.py   # map ops, block mutation, flood-fill
+│   ├── connection.py   #   ENet peer + handshake
+│   └── bots.py         #   bot AI
+├── protocol/           # packet dispatch + runtime decoders
+├── modes/              # tdm / ctf / arena
+├── commands/           # player + admin commands
+├── plugins/            # optional plugin hooks
+├── maps/               # stock .vxl maps (shipped)
+├── scripts/            # build + reverse-engineering / verification tooling
+├── tests/              # pytest suite
+└── docs/               # calibration, netcode, runbook, roadmap
 ```
 
-## Requirements
+**Design principles**
 
-- Python 3.8+
-- Cython
-- pyenet
-- numpy
-- toml
+- **Server-authoritative** — the server re-simulates every player at a fixed **60 Hz**;
+  the client predicts locally and is reconciled via per-player WorldUpdate self-rows.
+- **Cython where it counts** — physics, map ops, and (de)serialization are compiled; game
+  logic stays in readable Python.
+- **Non-blocking** — asyncio event loop; logging is queue-based so handlers never stall the
+  loop.
 
-## Installation
+## Building from source
 
-1. Clone the repository:
-   ```bash
-   git clone <repository>
-   cd BattleSpades
-   ```
+The Cython extensions must be compiled before first run (and re-compiled after editing any
+`.pyx`). **Stop the server before rebuilding** — a running server locks the compiled
+`.pyd`/`.so` files.
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+python setup.py build_ext --inplace
+# or the convenience wrapper:
+python scripts/build.py
+```
 
-3. Build Cython extensions:
-   ```bash
-   python scripts/build.py
-   # or
-   python setup.py build_ext --inplace
-   ```
+Requires a working C toolchain:
 
-4. Run the server:
-   ```bash
-   python run_server.py
-   ```
+| Platform | Toolchain |
+|---|---|
+| **Windows** | [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) → "Desktop development with C++" (MSVC + Windows SDK) |
+| **Debian/Ubuntu** | `sudo apt install build-essential python3-dev` |
+| **Fedora/RHEL** | `sudo dnf install gcc python3-devel` |
+| **macOS** | `xcode-select --install` |
+
+See [`docs/BUILDING.md`](docs/BUILDING.md) for cross-compilation notes (the project ships on
+**Windows x64** and **Linux amd64/arm64**).
+
+## ENet networking
+
+BattleSpades uses **[pyenet](https://github.com/piqueserver/pyenet)** (a Python binding for
+the [ENet](http://enet.bespin.org/) reliable-UDP library) — the same transport the original
+game uses (protocol version 168, single channel, range-coder compression).
+
+`pip install -r requirements.txt` pulls in `pyenet`, which **compiles ENet from source**, so
+the C toolchain above is required. On most Linux/Windows setups this "just works". Gotchas:
+
+- **No prebuilt wheel for your platform?** `pip` builds it from the sdist — make sure the C
+  toolchain and Python headers (`python3-dev`) are installed.
+- **Cross-compiling / uncommon arch (e.g. arm64):** you may need to build ENet + pyenet for
+  that specific target. Notes in [`docs/BUILDING.md`](docs/BUILDING.md).
+- ENet is the main thing standing between this server and truly trivial multi-platform
+  distribution — see the [Roadmap](#roadmap) for the planned native replacement.
 
 ## Configuration
 
-Edit `config.toml` to configure:
+Everything lives in [`config.toml`](config.toml). Highlights:
 
-- Server name, port, max players
-- Default game mode and map
-- Team names and colors
-- Weapon damage values
-- Admin password
+```toml
+[server]
+name = "BattleSpades Server"
+port = 27015
+max_players = 32
+tick_rate = 60          # server simulation rate — keep at 60 (client-paired, physics-calibrated)
+
+[game]
+default_mode = "tdm"    # tdm | ctf | arena
+default_map = "ArcticBase"
+bot_count = 2           # dev AI players (0 = none)
+respawn_time = 5.0
+friendly_fire = false
+
+[teams]
+team1_name = "TEAM1_COLOR"   # string-table IDs the client localizes (renders "Blue"/"Green")
+team2_name = "TEAM2_COLOR"
+
+[admin]
+password = "changeme"        # CHANGE THIS before hosting publicly
+```
+
+> Never save `config.toml` with a UTF-8 **BOM** (e.g. PowerShell `Set-Content -Encoding utf8`)
+> — the BOM breaks `toml.load` and the server silently falls back to defaults.
+
+For local tweaks that shouldn't be committed, use `config.local.toml` (gitignored).
+
+## Running & hosting
+
+```bash
+python run_server.py
+```
+
+To host publicly, forward **UDP `27015`** (or your configured port) and set a real
+`admin.password`. The server advertises itself over the classic A2S/master query path, so it
+can appear in server browsers that support the 1.x protocol.
 
 ## Commands
 
-### Player Commands
-- `/help` - Show available commands
-- `/kill` - Kill yourself
-- `/team <blue|green>` - Change team
-- `/score` - Show team scores
-- `/players` - List players
-- `/pm <player> <msg>` - Private message
+**Player** — `/help`, `/kill`, `/team <blue|green>`, `/score`, `/players`, `/pm <player> <msg>`
 
-### Admin Commands
-- `/admin <password>` - Login as admin
-- `/kick <player> [reason]` - Kick player
-- `/ban <player> [reason]` - Ban player
-- `/mute <player>` - Mute player
-- `/map <name>` - Change map
-- `/mode <ctf|tdm|arena>` - Change game mode
-- `/tp <player>` - Teleport
+**Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/map <name>`,
+`/mode <ctf|tdm|arena>`, `/tp <player>`
 
-## Game Modes
+## Testing & tooling
 
-- **CTF** - Capture the Flag
-- **TDM** - Team Deathmatch
-- **Arena** - Round-based elimination
-
-## Development
-
-Run tests:
 ```bash
-pytest tests/ -v
+py -m pytest tests/ -q          # unit tests (currently 87 passing)
+py scripts/replay_parity.py     # offline movement-parity check (must be ALL PASS)
 ```
+
+The `scripts/` directory also holds the reverse-engineering rig used to build this server:
+an in-game **physics oracle / console** (`game_console.py`, `auto_join.py`,
+`oracle_experiments.py`) that drives the real client to extract ground-truth physics and
+replay it through the Python engine. Details in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+## Roadmap
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full list. In short:
+
+- **Near term** — end-of-round scoreboard screen, per-player scoreboard column, HUD round
+  timer; polish grenade/collapse visuals; reconnect-lifecycle hardening.
+- **Content** — more maps, weapons, and classes; finish CTF/Arena scoring parity.
+- **Big one — native ENet:** replace the compiled C `pyenet` dependency with a **native Go
+  ENet** implementation, so the server can be built as a single static binary for any
+  platform without cross-compiling ENet per architecture. This is the main blocker to
+  drop-in multi-platform distribution.
+- **Long term** — the project is intentionally a clean, documented base so it can be **ported
+  to other languages** (Go, Rust, …) if/when the community wants to carry it forward.
+
+## Contributing
+
+Contributions welcome — especially maps, game modes, and platform build reports. Please:
+
+1. Keep `py -m pytest tests/ -q` and `py scripts/replay_parity.py` green.
+2. Rebuild Cython (`python setup.py build_ext --inplace`) after editing any `.pyx`.
+3. Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md)
+   before touching netcode or physics — those values are hard-won measurements.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Credits
+
+- Built for the **Ace of Spades revival** effort. Companion open-source client build:
+  [KikoTs/aceofspades_revival](https://github.com/KikoTs/aceofspades_revival).
+- _Ace of Spades_ was created by Ben Aksoy / Jagex. This is an independent, non-commercial
+  server reimplementation for preservation and play; it ships no proprietary game code.
+- Networking via [pyenet](https://github.com/piqueserver/pyenet) / [ENet](http://enet.bespin.org/).
 
 ## License
 
-MIT License
+MIT — see [`LICENSE`](LICENSE).

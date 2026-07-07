@@ -19,13 +19,14 @@ from server.game_constants import (
     MAX_BLOCKS,
     MAX_GRENADES,
     MAX_HEALTH,
-    PLAYER_CROUCH_HEIGHT,
-    PLAYER_HEIGHT,
+    PLAYER_CROUCHING_POS_ABOVE_GROUND,
+    PLAYER_STANDING_POS_ABOVE_GROUND,
     SPADE_PROFILE,
     SPADE_TOOL_IDS,
     WEAPON_PROFILES,
     WEAPON_TOOL_IDS,
 )
+from aoslib import world as native_world
 from aoslib.world import Player as WorldPlayer
 
 if TYPE_CHECKING:
@@ -34,15 +35,57 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 JUMP_BUFFER_SECONDS = 0.25
-POSITION_SAMPLE_FRESHNESS_SECONDS = 0.20
-POSITION_DRIFT_DEADZONE = 0.25
-POSITION_HARD_SNAP_THRESHOLD = 4.0
-POSITION_SOFT_CORRECTION_RATE = 0.15
-MAX_HORIZONTAL_SOFT_CORRECTION = 0.12
-MAX_VERTICAL_SOFT_CORRECTION = 0.08
+POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
+
+# The client stamps every ClientData with its loop_count. Measured live
+# (2026-06-12 evening): the packet stamped N arrives while the server runs
+# tick N — i.e. it RACES the tick boundary, and ~per-packet it is applied
+# at tick N or N+1 nondeterministically. That jitter is what made self-row
+# reconciliation yank the walking player by exactly one step (the client
+# pairs our row against its history at the stamp; a coin-flip input lag
+# cannot be compensated by any fixed stamp offset).
+#
+# INPUT_DELAY_TICKS=1 makes the pairing exact BY CONSTRUCTION: tick N
+# simulates with input N-1 (always arrived), and the WorldUpdate stamp
+# (loop_count - INPUT_DELAY_TICKS) labels the snapshot with the input tick
+# actually used — our post-tick-N state equals the client's post-frame-
+# (N-1) state bit-for-bit (same input sequence, same engine), so self-row
+# corrections are zero-diff. Costs 16.7ms of server-side input latency,
+# invisible under client prediction.
+INPUT_DELAY_TICKS = 1
+INPUT_HISTORY_LIMIT = 128
+# Input consumption (see Player.simulate_tick): exactly one physics step per
+# tick, applying the freshest buffered input — paced at real time so the server
+# can never outrun the client (which is what caused the run-off-the-map / snap).
+POSITION_DRIFT_DEADZONE = 0.6
+POSITION_HARD_SNAP_THRESHOLD = 6.0
+POSITION_SOFT_CORRECTION_RATE = 0.12
+MAX_HORIZONTAL_SOFT_CORRECTION = 0.50
+MAX_VERTICAL_SOFT_CORRECTION = 0.2
 MAX_VERTICAL_SOFT_CORRECTION_DISTANCE = 0.75
 WORLD_ORIENTATION_HORIZONTAL_EPSILON = 0.001
-VELOCITY_ZERO_THRESHOLD = 0.001
+VELOCITY_ZERO_THRESHOLD = 0.0001
+PLAYER_RADIUS = float(getattr(C, "PLAYER_RADIUS", 0.45))
+
+# Movement authority for all players ("server" or "client"); set at startup
+# from ServerConfig.movement_authority. In "client" mode the server pins each
+# player's position to their latest fresh PositionData report so WorldUpdate
+# echoes the client's own movement instead of fighting it with the (not yet
+# parity-accurate) server simulation.
+_MOVEMENT_AUTHORITY = "server"
+CLIENT_AUTHORITY_FRESHNESS_SECONDS = 1.0
+
+
+def set_movement_authority(value: str) -> None:
+    global _MOVEMENT_AUTHORITY
+    value = str(value).lower()
+    if value not in ("server", "client"):
+        raise ValueError(f"movement_authority must be 'server' or 'client', got {value!r}")
+    _MOVEMENT_AUTHORITY = value
+
+
+def get_movement_authority() -> str:
+    return _MOVEMENT_AUTHORITY
 
 
 @dataclass(frozen=True)
@@ -64,23 +107,44 @@ class MovementProfile:
 
 
 def get_movement_profile(class_id: int) -> MovementProfile:
+    """Per-class movement+damage profile.
+
+    Movement fields are sourced from server.class_data.MOVEMENT so the
+    InitialInfo we send the client (built from the same module) and the
+    server-side simulation use the same multipliers. Damage and starting
+    blocks come from shared.constants directly.
+    """
+    from server.class_data import get_movement, get_damage
+
     starting_blocks, max_blocks = C.CLASS_BLOCKS.get(class_id, (MAX_BLOCKS, MAX_BLOCKS))
+    m = get_movement(class_id)
+    d = get_damage(class_id)
     return MovementProfile(
         starting_blocks=starting_blocks,
         max_blocks=max_blocks,
-        accel_multiplier=C.CLASS_ACCEL_MULTIPLIER.get(class_id, 0.7),
-        sprint_multiplier=C.CLASS_SPRINT_MULTIPLIER.get(class_id, 1.4),
-        jump_multiplier=C.CLASS_JUMP_MULTIPLIER.get(class_id, 1.2),
-        crouch_sneak_multiplier=C.CLASS_CROUCH_SNEAK_MULTIPLIER.get(class_id, 0.5),
-        can_sprint_uphill=C.CLASS_CAN_SPRINT_UPHILL.get(class_id, True),
-        water_friction=C.CLASS_WATER_FRICTION.get(class_id, 8.0),
-        damage_multiplier=C.CLASS_DAMAGE_MULTIPLIER.get(class_id, 1.0),
-        headshot_damage_multiplier=C.CLASS_HEADSHOT_DAMAGE_MULTIPLIER.get(class_id, 1.0),
-        fall_on_water_damage_multiplier=C.CLASS_FALL_ON_WATER_DAMAGE_MULTIPLIER.get(class_id, 0.5),
-        falling_damage_min_distance=C.CLASS_FALLING_DAMAGE_MIN_DISTANCE.get(class_id, 10),
-        falling_damage_max_distance=C.CLASS_FALLING_DAMAGE_MAX_DISTANCE.get(class_id, 40),
-        falling_damage_max_damage=C.CLASS_FALLING_DAMAGE_MAX_DAMAGE.get(class_id, MAX_HEALTH),
+        accel_multiplier=m.accel_multiplier,
+        sprint_multiplier=m.sprint_multiplier,
+        jump_multiplier=m.jump_multiplier,
+        crouch_sneak_multiplier=m.crouch_sneak_multiplier,
+        can_sprint_uphill=m.can_sprint_uphill,
+        water_friction=m.water_friction,
+        damage_multiplier=d.damage_multiplier,
+        headshot_damage_multiplier=d.headshot_multiplier,
+        fall_on_water_damage_multiplier=m.fall_on_water_damage_multiplier,
+        falling_damage_min_distance=m.falling_damage_min_distance,
+        falling_damage_max_distance=m.falling_damage_max_distance,
+        falling_damage_max_damage=m.falling_damage_max_damage,
     )
+
+
+def _native_movement_overrides() -> dict[str, float]:
+    try:
+        overrides = native_world.get_debug_movement_overrides()
+    except Exception:
+        return {}
+    if isinstance(overrides, dict):
+        return overrides
+    return {}
 
 
 @dataclass
@@ -178,16 +242,35 @@ class Player:
 
         self.last_update: float = time.time()
         self.last_position_update: float = 0.0
+        # loop_count -> (input flags tuple, orientation tuple); see
+        # record_input_frame / apply_buffered_input.
+        self.input_history: dict[int, tuple] = {}
+        # Next client loop_count to consume (strict in-order cursor).
+        self._input_cursor: Optional[int] = None
         self.last_reported_position: Optional[Tuple[float, float, float]] = None
+        # The client loop_count of the input frame the simulation last
+        # consumed — the ONLY correct stamp for this player's WorldUpdate
+        # self-row (a fixed loop-derived stamp mislabels packets whenever
+        # transit latency isn't exactly the local-machine value).
+        self.last_applied_input_loop: Optional[int] = None
         self.last_position_drift: float = 0.0
         self.last_position_drift_vector: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-        self.last_climb_time: float = 0.0
         self.last_fall_result: int = 0
         self.movement_time: float = 0.0
         self.jump_held: bool = False
         self.jump_last_held: bool = False
         self.pending_jump: bool = False
         self.jump_buffer_until: float = 0.0
+        self.last_landed: bool = False
+        self.last_step_delta: float = 0.0
+        self.last_trigger_jump: bool = False
+        self.last_buffered_jump_active: bool = False
+        self.last_collision_count: int = 0
+        self.last_collision_preview: list[tuple[float, float, float, float]] = []
+        self.last_native_update_dt: float = 0.0
+        self.last_native_result: int = 0
+        self.last_native_pre_update: dict = {}
+        self.last_native_post_update: dict = {}
 
         self.kills: int = 0
         self.deaths: int = 0
@@ -209,9 +292,23 @@ class Player:
         return None
 
     def _current_height(self) -> float:
+        return self._current_contact_offset() + PLAYER_RADIUS
+
+    def _current_contact_offset(self) -> float:
+        overrides = _native_movement_overrides()
         if self.input.crouch and not self.wade:
-            return PLAYER_CROUCH_HEIGHT
-        return PLAYER_HEIGHT
+            return float(
+                overrides.get(
+                    "crouching_pos_above_ground",
+                    PLAYER_CROUCHING_POS_ABOVE_GROUND,
+                )
+            )
+        return float(
+            overrides.get(
+                "standing_pos_above_ground",
+                PLAYER_STANDING_POS_ABOVE_GROUND,
+            )
+        )
 
     def _orientation_for_world(self, x: float, y: float, z: float) -> tuple[float, float, float]:
         horizontal_magnitude = math.sqrt(x * x + y * y)
@@ -251,10 +348,15 @@ class Player:
         return positions
 
     def _apply_class_profile_to_world(self, world_object) -> None:
-        world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier)
-        world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier)
+        # The client scales its accel/sprint/crouch multipliers by the
+        # InitialInfo speed scale (wire-rounded); the server simulation must
+        # use identical effective values or prediction drifts (rubber-band).
+        from server.class_data import speed_scale
+        scale = speed_scale(self._class_id)
+        world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier * scale)
+        world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier * scale)
         world_object.set_class_jump_multiplier(self.movement_profile.jump_multiplier)
-        world_object.set_class_crouch_sneak_multiplier(self.movement_profile.crouch_sneak_multiplier)
+        world_object.set_class_crouch_sneak_multiplier(self.movement_profile.crouch_sneak_multiplier * scale)
         world_object.set_class_can_sprint_uphill(self.movement_profile.can_sprint_uphill)
         world_object.set_class_water_friction(self.movement_profile.water_friction)
         world_object.set_class_fall_on_water_damage_multiplier(
@@ -317,6 +419,73 @@ class Player:
             return (0.0, 0.0, 1.0)
         return (hx / magnitude, hy / magnitude, hz / magnitude)
 
+    def _capture_native_debug_state(
+        self,
+        world_object,
+        phase: str,
+        positions: list[tuple[float, float, float, float]] | None = None,
+    ) -> dict:
+        if world_object is None:
+            return {}
+        if positions is None:
+            positions = []
+        try:
+            position = tuple(world_object.position)
+        except Exception:
+            position = (self.x, self.y, self.z)
+        try:
+            velocity = tuple(world_object.velocity)
+        except Exception:
+            velocity = (self.vx, self.vy, self.vz)
+        try:
+            orientation = tuple(world_object.orientation)
+        except Exception:
+            orientation = (self.o_x, self.o_y, self.o_z)
+        try:
+            side = tuple(world_object.s)
+        except Exception:
+            side = (self.side_x, self.side_y, self.side_z)
+        preview = []
+        for item in positions[:4]:
+            try:
+                preview.append(tuple(round(float(value), 4) for value in item[:4]))
+            except Exception:
+                continue
+        return {
+            "phase": phase,
+            "position": tuple(round(float(value), 4) for value in position[:3]),
+            "velocity": tuple(round(float(value), 4) for value in velocity[:3]),
+            "orientation": tuple(round(float(value), 4) for value in orientation[:3]),
+            "side": tuple(round(float(value), 4) for value in side[:3]),
+            "airborne": bool(world_object.airborne),
+            "grounded": not bool(world_object.airborne),
+            "wade": bool(world_object.wade),
+            "crouch": bool(self.input.crouch),
+            "sprint": bool(self.input.sprint),
+            "sneak": bool(self.input.sneak),
+            "hover": bool(self.input.hover),
+            "jump_held": bool(self.jump_held),
+            "pending_jump": bool(self.pending_jump),
+            "contact_offset": round(self._current_contact_offset(), 4),
+            "height": round(self._current_height(), 4),
+            "collision_count": len(positions),
+            "collision_preview": preview,
+        }
+
+    def get_debug_movement_state(self) -> dict:
+        return {
+            "pre_update": dict(self.last_native_pre_update or {}),
+            "post_update": dict(self.last_native_post_update or {}),
+            "collision_count": int(self.last_collision_count),
+            "collision_preview": list(self.last_collision_preview or []),
+            "trigger_jump": bool(self.last_trigger_jump),
+            "landed": bool(self.last_landed),
+            "step_delta": round(float(self.last_step_delta), 4),
+            "fall_result": int(self.last_fall_result),
+            "native_result": int(self.last_native_result),
+            "dt": round(float(self.last_native_update_dt), 6),
+        }
+
     def _sync_cached_vectors(self):
         if self._world_object is None:
             return
@@ -338,7 +507,6 @@ class Player:
         self.airborne = bool(self._world_object.airborne)
         self.wade = bool(self._world_object.wade)
         self.grounded = not self.airborne
-        self.last_climb_time = 0.0
 
     @property
     def class_id(self) -> int:
@@ -460,6 +628,11 @@ class Player:
         self.alive = True
         self.spawned = True
         self.input = InputState()
+        # Re-anchor the input cursor to the next inputs that arrive after
+        # this spawn (stale pre-spawn inputs must not drive the new body).
+        self.input_history = {}
+        self._input_cursor = None
+        self.last_applied_input_loop = None
         self.blocks = self.movement_profile.starting_blocks
         self.grenades = MAX_GRENADES
         self._reset_ammo()
@@ -468,7 +641,6 @@ class Player:
         self.last_position_drift_vector = (0.0, 0.0, 0.0)
         self.movement_time = 0.0
         self.last_fall_result = 0
-        self.last_climb_time = 0.0
         self.airborne = False
         self.wade = False
         self.grounded = True
@@ -476,6 +648,16 @@ class Player:
         self.jump_last_held = False
         self.pending_jump = False
         self.jump_buffer_until = 0.0
+        self.last_landed = False
+        self.last_step_delta = 0.0
+        self.last_trigger_jump = False
+        self.last_buffered_jump_active = False
+        self.last_collision_count = 0
+        self.last_collision_preview = []
+        self.last_native_update_dt = 0.0
+        self.last_native_result = 0
+        self.last_native_pre_update = {}
+        self.last_native_post_update = {}
         self.last_shot_time = 0.0
         self.reload_end_time = 0.0
         self.reloading = False
@@ -607,7 +789,10 @@ class Player:
         return False
 
     def die(self, killer: Optional["Player"] = None, kill_type: int = 0):
-        if not self.alive and not self.spawned:
+        # Idempotent per death: guard on `alive` alone. The old
+        # `not alive and not spawned` let a death slip through for an
+        # already-dead-but-still-spawned edge case (double death bookkeeping).
+        if not self.alive:
             return
 
         self.alive = False
@@ -644,6 +829,38 @@ class Player:
             packet.isRevengeKill = 0
             server.broadcast(bytes(packet.generate()))
 
+            # Spawn a GRAVE entity where the player died (rendered until the
+            # player respawns). Gated on the same entities_wire_ready flag the
+            # crates use, since a bad Entity field crashes the compiled client.
+            reg = getattr(server, "entity_registry", None)
+            if reg is not None and getattr(server.config, "entities_wire_ready", False):
+                try:
+                    from server.game_constants import TEAM_NEUTRAL
+                    grave = reg.place(
+                        int(getattr(C, "GRAVE_ENTITY", 11)),
+                        self.x, self.y, self.z,
+                        state=TEAM_NEUTRAL, kind="grave", player_id=self.id,
+                    )
+                    self._grave_entity_id = grave.entity_id
+                    server.broadcast_create_entity(grave)
+                except Exception:
+                    logger.debug("grave spawn failed", exc_info=True)
+
+        # Notify the active mode (drained next tick, never inline-async). Every
+        # death fires on_player_death; a CROSS-TEAM kill by another player also
+        # fires on_player_kill (the scoring hook). The team guard keeps
+        # friendly-fire / environmental self-credit from awarding score even if
+        # a future path passes a same-team killer; team-change deaths come
+        # through with killer=None and so never score.
+        if server is not None and getattr(server, "mode", None) is not None:
+            server.queue_mode_event("on_player_death", self, killer, kill_type)
+            if (
+                killer is not None
+                and killer is not self
+                and killer.team != self.team
+            ):
+                server.queue_mode_event("on_player_kill", killer, self, kill_type)
+
         logger.debug("Player %s died (killer: %s)", self.name, killer.name if killer else "none")
 
     def heal(self, amount: int):
@@ -659,6 +876,20 @@ class Player:
                 packet.source_y = 0.0
                 packet.source_z = 0.0
                 self.connection.send(bytes(packet.generate()))
+
+    def restock_ammo(self, restock_type: int = 0):
+        """Refill ammo reserve+clip (server-side) and tell the client to
+        refill its own ammo counters/play the pickup sound via Restock(69).
+        Ammo is client-authoritative for display, so the packet is required."""
+        if not self.alive:
+            return
+        self._reset_ammo()
+        if self.connection:
+            from shared.packet import Restock
+            pkt = Restock()
+            pkt.player_id = self.id
+            pkt.type = int(restock_type)
+            self.connection.send(bytes(pkt.generate()))
 
     def add_blocks(self, count: int = 1):
         self.blocks = min(self.movement_profile.max_blocks, self.blocks + count)
@@ -690,35 +921,6 @@ class Player:
     def set_color(self, color: int):
         self.block_color = color
 
-    def _buffered_jump_is_active(self) -> bool:
-        if self.jump_buffer_until <= 0.0:
-            return False
-        if self.movement_time > self.jump_buffer_until:
-            self.jump_buffer_until = 0.0
-            return False
-        return True
-
-    def _launch_buffered_jump(self, world_object, positions) -> bool:
-        if world_object is None or not self._buffered_jump_is_active():
-            return False
-
-        world_object.set_velocity(self.vx, self.vy, self.movement_profile.jump_multiplier * -0.36)
-        world_object.jump = False
-        world_object.update(0.0, positions)
-        self.pending_jump = False
-        self.jump_buffer_until = 0.0
-        self._sync_cached_vectors()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Consumed buffered jump for %s: held=%s airborne=%s z=%.4f vz=%.4f",
-                self.name,
-                self.jump_held,
-                self.airborne,
-                self.z,
-                self.vz,
-            )
-        return True
-
     async def update(self, dt: float):
         if not self.alive or not self.spawned:
             return
@@ -734,38 +936,43 @@ class Player:
         self.last_update = time.time()
         self.movement_time += dt
         was_airborne = self.airborne
-        buffered_jump_active = self._buffered_jump_is_active()
-        trigger_jump = self.pending_jump
-        if trigger_jump and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Consuming pending jump for %s: held=%s grounded=%s pos=(%.4f, %.4f, %.4f)",
-                self.name,
-                self.jump_held,
-                self.grounded,
-                self.x,
-                self.y,
-                self.z,
-            )
-        self._apply_input_state_to_world(trigger_jump=trigger_jump)
+        # Mirror the live client's input pipeline exactly (measured via the
+        # in-game tracer): while the jump key is HELD, the Character sets
+        # the world object's jump flag every frame the player is grounded —
+        # no edge detection, no queue, no buffer. The buffered-jump-on-
+        # landing behavior emerges naturally (key still held when landing).
+        trigger_jump = bool(self.input.jump) and not bool(world_object.airborne)
+        self.last_trigger_jump = bool(trigger_jump)
+        if bool(self.input.jump):
+            logger.info("JUMPDBG %s jump_in=1 airborne=%s trigger=%s z=%.3f vz=%.3f",
+                        self.name, bool(world_object.airborne), trigger_jump,
+                        float(self.z), float(getattr(world_object, 'velocity', type('x',(),{'z':0})).z))
+        self.last_native_update_dt = float(dt)
         positions = self._build_player_collision_positions()
+        self.last_collision_count = len(positions)
+        self.last_collision_preview = [
+            tuple(round(float(value), 4) for value in item[:4])
+            for item in positions[:4]
+        ]
+        self.last_native_pre_update = self._capture_native_debug_state(
+            world_object,
+            "pre_update",
+            positions,
+        )
+        pre_position = self.last_native_pre_update.get("position", (self.x, self.y, self.z))
+        self._apply_input_state_to_world(trigger_jump=trigger_jump)
         result = world_object.update(dt, positions)
-        if trigger_jump:
-            self.pending_jump = False
+        self.last_native_result = int(result or 0)
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
-        if trigger_jump and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Pending jump result for %s: airborne=%s grounded=%s z=%.4f vz=%.4f",
-                self.name,
-                self.airborne,
-                self.grounded,
-                self.z,
-                self.vz,
-            )
-        if buffered_jump_active and was_airborne and self.grounded:
-            self._launch_buffered_jump(world_object, positions)
-        if self.jump_buffer_until > 0.0 and self.vz < -0.05:
-            self.jump_buffer_until = 0.0
+        self._apply_client_authority_pin()
+        self.last_landed = bool(was_airborne and self.grounded)
+        self.last_step_delta = round(float(self.z - pre_position[2]), 4)
+        self.last_native_post_update = self._capture_native_debug_state(
+            world_object,
+            "post_update",
+            positions,
+        )
 
     def update_input(
         self,
@@ -788,26 +995,65 @@ class Player:
         self.input.crouch = crouch
         self.input.sneak = sneak
         self.input.sprint = sprint
+        # No jump edge-detection or queuing here: the held jump flag is
+        # consumed directly each tick in update() (client-pipeline mirror).
 
-        if self.jump_held and not self.jump_last_held:
-            if self.grounded:
-                self.pending_jump = True
-            else:
-                self.jump_buffer_until = self.movement_time + JUMP_BUFFER_SECONDS
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Queued jump input for %s: held=%s grounded=%s pending_jump=%s buffer_until=%.3f",
-                    self.name,
-                    self.jump_held,
-                    self.grounded,
-                    self.pending_jump,
-                    self.jump_buffer_until,
-                )
+    def record_input_frame(
+        self,
+        loop_count: int,
+        flags: tuple,
+        orientation: tuple,
+    ) -> None:
+        """Store the movement inputs the client used for its frame
+        `loop_count` so the simulation can apply them at the matching
+        (delayed) server tick."""
+        self.input_history[int(loop_count)] = (flags, orientation)
+        if len(self.input_history) > INPUT_HISTORY_LIMIT:
+            for key in sorted(self.input_history)[:-INPUT_HISTORY_LIMIT]:
+                del self.input_history[key]
 
-        world_object = self._ensure_world_object()
-        if world_object is not None:
-            self._apply_input_state_to_world(trigger_jump=False, world_object=world_object)
-            self._sync_cached_vectors()
+    async def simulate_tick(self, dt: float) -> None:
+        """Advance this player's simulation by exactly ONE physics step.
+
+        Authoritative-server movement, simplest correct form: apply the
+        FRESHEST buffered client input (one physics step), drop the rest,
+        and always step once. One step per tick means the server advances at
+        real time and CANNOT outrun the client; applying the newest input
+        keeps it current with the client's latest direction (intermediate
+        inputs during a continuous walk carry the same direction, so dropping
+        them costs nothing). The self-row is stamped with last_applied_input_loop
+        so the client still pairs it to the matching history frame.
+
+        (Earlier experiments that consumed multiple inputs per tick made the
+        server sprint multiple-times real-time and run off the map, which is
+        what reconciled the client back toward spawn on every jump.)
+        """
+        if not self.alive or not self.spawned:
+            return
+
+        if self.input_history:
+            best = max(self.input_history)
+            flags, orientation = self.input_history[best]
+            # Movement direction + orientation come from the FRESHEST frame,
+            # but JUMP is an EDGE (the key is held only ~1-2 client frames).
+            # Picking only the freshest frame drops a jump whose press landed
+            # in an earlier buffered frame — the reason human jumps never
+            # registered server-side while held walk always did. Latch jump
+            # (index 4) if ANY buffered frame this tick had it.
+            if not flags[4] and any(f[0][4] for f in self.input_history.values()):
+                flags = flags[:4] + (True,) + flags[5:]
+            self.last_applied_input_loop = best
+            self.set_orientation_vector(*orientation)
+            self.update_input(*flags)
+            self.input_history.clear()
+
+        await self.update(dt)
+
+    def _tick_idle(self) -> None:
+        """Per-tick housekeeping on a held frame (no physics step)."""
+        if self.reloading and time.monotonic() >= self.reload_end_time:
+            if self.finish_reload():
+                self._broadcast_reload_state(True)
 
     def update_action_input(
         self,
@@ -835,6 +1081,21 @@ class Player:
         if world_object is not None:
             world_object.hover = hover
             self._sync_cached_vectors()
+
+    def _apply_client_authority_pin(self):
+        if _MOVEMENT_AUTHORITY != "client":
+            return
+        if self._world_object is None or self.last_reported_position is None:
+            return
+        if self.last_position_update <= 0.0:
+            return
+        if (time.time() - self.last_position_update) > CLIENT_AUTHORITY_FRESHNESS_SECONDS:
+            # Stale report (client paused/lagging): let the simulation free-run
+            # rather than freezing the player at an old position.
+            return
+        self._world_object.set_position(*self.last_reported_position)
+        self._sync_cached_vectors()
+        self._record_position_drift()
 
     def _record_position_drift(self):
         if self.last_reported_position is None:
@@ -925,22 +1186,30 @@ class Player:
         return byte
 
     def pack_action_flags(self) -> int:
+        # WorldUpdate action byte. Only VERIFIED-safe display bits are emitted.
+        # MEASURED client-side meaning of this byte: 0x20=is_on_fire, 0x40=zoom,
+        # 0x80=is_weapon_deployed (0x01/0x02 = fire/muzzle).
+        #
+        # DO NOT set 0x04 / 0x08 / 0x10. PROVEN (decompiled world.pyd +
+        # gameScene, 2026-07-07): the client reads one of these as
+        # jetpack_passive, which makes its physics SKIP GRAVITY entirely — the
+        # player floats at rest, `airborne` latches True forever, and the local
+        # jump impulse (gated on !airborne) can never fire. With self-rows on
+        # (worldupdate_include_self=true) the client's always-on ClientData bits
+        # can_pickup(0x08)/can_display_weapon(0x10) were echoed straight back
+        # into this byte -> the client permanently believed it was jetpacking
+        # -> "jump stuck, thinks we're in air". Re-map 0x04/0x08/0x10 with the
+        # marker-byte replay method before ever emitting them again.
         byte = 0
         if self.input.primary_fire:
             byte |= 0x01
         if self.input.secondary_fire:
             byte |= 0x02
-        if self.input.zoom:
-            byte |= 0x04
-        if self.input.can_pickup:
-            byte |= 0x08
-        if self.input.can_display_weapon:
-            byte |= 0x10
         if self.input.is_on_fire:
             byte |= 0x20
-        if self.input.is_weapon_deployed:
+        if self.input.zoom:
             byte |= 0x40
-        if self.input.hover:
+        if self.input.is_weapon_deployed:
             byte |= 0x80
         return byte
 

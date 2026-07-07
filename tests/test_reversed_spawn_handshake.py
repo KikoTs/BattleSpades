@@ -24,7 +24,7 @@ from server.connection import (
     wire_team_to_internal,
 )
 from server.config import ServerConfig
-from server.game_constants import PLAYER_HEIGHT, TEAM_NEUTRAL, TEAM_SPECTATOR, TEAM1, TEAM2
+from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM_NEUTRAL, TEAM_SPECTATOR, TEAM1, TEAM2
 from server.player import Player
 from server.team import Team
 from server.world_manager import WorldManager
@@ -142,7 +142,13 @@ def test_world_manager_spawn_ignores_stale_random_pos_z():
     world_manager.map = FakeMap()
     world_manager.world = None
 
-    assert world_manager.get_spawn_point(TEAM_NEUTRAL) == (100.5, 200.5, 120.0 - PLAYER_HEIGHT)
+    # Spawn is half a block above standing height (drop-in: feet exactly on
+    # the block boundary is a degenerate equilibrium — see world_manager).
+    assert world_manager.get_spawn_point(TEAM_NEUTRAL) == (
+        100.5,
+        200.5,
+        120.0 - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
+    )
 
 
 def test_pre_join_clock_sync_and_menu_state_are_handled():
@@ -203,13 +209,28 @@ def test_spawn_uses_cached_loadout_and_sends_hp():
         "prefab_superbarrier",
     ]
 
-    set_hp = SetHP(ByteReader(sent_packets[0][1:]))
+    # The joiner also receives its OWN CreatePlayer directly (gameplay
+    # broadcasts are gated until it's in-game, so the spawn echo can't ride
+    # the broadcast). It binds the local player to the server id.
+    own_create = CreatePlayer(ByteReader(sent_packets[0][1:]))
+    assert own_create.player_id == connection.player.id
+
+    # SetHP follows — locate it by id rather than a fixed index.
+    set_hp_data = next(p for p in sent_packets if p and p[0] == SetHP.id)
+    set_hp = SetHP(ByteReader(set_hp_data[1:]))
     assert set_hp.hp == 100
     assert set_hp.damage_type == 2
     assert (set_hp.source_x, set_hp.source_y, set_hp.source_z) == (0.0, 0.0, 0.0)
 
 
-def test_existing_player_packets_use_wire_team_ids():
+def test_roster_announced_as_create_player_with_wire_team_ids():
+    """The roster is sent as CreatePlayer, NOT ExistingPlayer: the stock
+    client stores ExistingPlayer.pickup verbatim as pickup_id (no sentinel
+    exists) and its minimap crashes with KeyError on any non-PICKUPS value.
+    CreatePlayer leaves pickup_id = None — measured on the unmodified Steam
+    client, 2026-07-06."""
+    from shared.packet import CreatePlayer as CreatePlayerPacket
+
     server = DummyServer()
     connection = make_connection(server)
     sent_packets = []
@@ -218,15 +239,20 @@ def test_existing_player_packets_use_wire_team_ids():
     existing_player = Player(7, "Other", TEAM2, C.RIFLE_TOOL, None)
     existing_player.class_id = 2
     existing_player.alive = True
+    existing_player.spawned = True
     existing_player.kills = 4
     existing_player.block_color = 0x123456
+    existing_player.x, existing_player.y, existing_player.z = 100.5, 200.5, 50.0
     server.players[existing_player.id] = existing_player
 
     asyncio.run(connection.send_existing_players())
 
-    packet = ExistingPlayer(ByteReader(sent_packets[0][1:]))
+    assert sent_packets, "roster packet should be sent for the existing player"
+    assert sent_packets[0][0] == CreatePlayerPacket.id
+    packet = CreatePlayerPacket(ByteReader(sent_packets[0][1:]))
     assert packet.player_id == 7
     assert packet.team == TEAM2
+    assert packet.name == "Other"
 
 
 def test_joined_clock_sync_replies_with_server_loop_count():

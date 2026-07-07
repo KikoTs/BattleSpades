@@ -383,6 +383,10 @@ cdef class VXL:
                 self._reset_blank()
                 self.ready = False
 
+        # The compiled client force-fills the z=239 bed on every load (file and
+        # MapSync paths); mirror it so the server collision world matches.
+        self._fill_floor()
+
     cdef void _reset_blank(self):
         self._colors = {}
         self._solid_bits = bytearray(VOXEL_BITS)
@@ -465,6 +469,25 @@ cdef class VXL:
         self._update_column_bounds(x, y, z)
         if color:
             self._colors[_voxel_index(x, y, z)] = color
+
+    cdef void _fill_floor(self):
+        """Force-fill the bottom row (z=239) solid for every column, mirroring
+        the compiled engine's post_load_map_setup @0xd140 / initialise_floor.
+
+        The client ALWAYS lays this bed (also on the MapSync network-build
+        path), so without it the server world is hollow under open water and a
+        0.45-radius box that the client rests on the bed falls through on the
+        server -> seabed collision desync. Uses _store_block (NOT set_point) so
+        _dirty stays clear and generate_vxl() keeps returning the byte-faithful
+        original file; the MapSync stream serializes in-memory columns, so the
+        client still receives the bed. Also makes get_z==239 a reliable
+        water-column classifier for spawning."""
+        cdef int x, y
+        cdef int z = MAP_HEIGHT - 1
+        for y in range(MAP_SIZE):
+            for x in range(MAP_SIZE):
+                if not self._solid_at(x, y, z):
+                    self._store_block(x, y, z, 0)
 
     cdef bint _load_source(self, bytes data):
         cdef tuple size_info = _get_vxl_size(data)
@@ -965,11 +988,27 @@ cdef class VXL:
         if max_y < min_y:
             max_y = min_y
 
+        cdef int zi
+
+        # A column is DRY land iff its topmost solid is above the waterplane
+        # (get_z <= MAP_HEIGHT-2 = 238). Sea/lake columns and empty columns
+        # report the forced bed at z=239 and are rejected — the old test
+        # (_bottom_z >= 0, "any solid anywhere") accepted every sea column on
+        # the first draw, dropping spawns into the water at the shoreline.
         for attempts in range(64):
             xi = _random.randint(min_x, max_x)
             yi = _random.randint(min_y, max_y)
-            if self._bottom_z[_column_index(xi, yi)] >= 0:
-                return (xi, yi, self.get_z(xi, yi))
+            zi = self.get_z(xi, yi)
+            if zi <= MAP_HEIGHT - 2:
+                return (xi, yi, zi)
+
+        # No dry column drawn in 64 tries: scan deterministically for the first
+        # one so an almost-fully-wet rect still lands on land where possible.
+        for yi in range(min_y, max_y + 1):
+            for xi in range(min_x, max_x + 1):
+                zi = self.get_z(xi, yi)
+                if zi <= MAP_HEIGHT - 2:
+                    return (xi, yi, zi)
 
         xi = min_x
         yi = min_y
@@ -1096,6 +1135,21 @@ cdef class VXL:
                 chunk.extend(self._serialize_column(x, y))
 
         return bytes(chunk)
+
+    cpdef bytes serialize_columns(self, object columns):
+        """Serialize specific (x, y) columns in the map-sync record format
+        (u32 x, u32 y, column spans) — the delta complement of get_chunk."""
+        cdef bytearray out = bytearray()
+        cdef int x
+        cdef int y
+        for item in columns:
+            x = int(item[0])
+            y = int(item[1])
+            if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+                continue
+            out.extend(_struct.pack("<II", x, y))
+            out.extend(self._serialize_column(x, y))
+        return bytes(out)
 
     cpdef object get_chunker(self):
         return MapSyncChunker(self)

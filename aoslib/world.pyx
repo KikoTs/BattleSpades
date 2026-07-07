@@ -20,8 +20,17 @@ _GLOBAL_GRAVITY = 1.0
 _CUBE_SQ_DISTANCE = 0.0
 _RAY_DEFAULT_LENGTH = 128.0
 _PLAYER_RADIUS = 0.45
-_PLAYER_HEIGHT = 2.7
-_PLAYER_CROUCH_HEIGHT = 1.8
+# Contact offsets drive grounding, landing, and anchor semantics.
+# Derived body heights are retained for overlap math and debug compatibility.
+_PLAYER_STANDING_CONTACT_OFFSET = 2.25
+_PLAYER_CROUCHING_CONTACT_OFFSET = 1.35
+_PLAYER_STANDING_BODY_HEIGHT = _PLAYER_STANDING_CONTACT_OFFSET + _PLAYER_RADIUS
+_PLAYER_CROUCHING_BODY_HEIGHT = _PLAYER_CROUCHING_CONTACT_OFFSET + _PLAYER_RADIUS
+
+_PLAYER_STANDING_POS_ABOVE_GROUND = _PLAYER_STANDING_CONTACT_OFFSET
+_PLAYER_CROUCHING_POS_ABOVE_GROUND = _PLAYER_CROUCHING_CONTACT_OFFSET
+_PLAYER_HEIGHT = _PLAYER_STANDING_BODY_HEIGHT
+_PLAYER_CROUCH_HEIGHT = _PLAYER_CROUCHING_BODY_HEIGHT
 _PLAYER_CROUCH_SHIFT = 0.9
 _FALL_SLOW_DOWN = 0.24
 _FALL_DAMAGE_VELOCITY = 0.58
@@ -37,6 +46,30 @@ _COLLISION_STEP = 1.0
 _CLIMB_CHECK_START = 0.3
 _CLIMB_SHIFT = -1.35
 _PHYSICS_SCALE = 32.0
+_WADE_SURFACE_Z = Z_ABOVE_WATERPLANE + 1.0
+
+_DEBUG_MOVEMENT_DEFAULTS = {
+    "standing_pos_above_ground": _PLAYER_STANDING_POS_ABOVE_GROUND,
+    "crouching_pos_above_ground": _PLAYER_CROUCHING_POS_ABOVE_GROUND,
+    "crouch_shift": _PLAYER_CROUCH_SHIFT,
+    # Oracle-calibrated (live game probes via scripts/oracle_experiments.py):
+    # ground friction divisor is 1+4*dt, air is 1+2*dt — measured, not the
+    # other way around as the aoslib-reversed reimplementation claims.
+    # Jump impulse measured live: vz after the jump frame is exactly
+    # (-0.36 * jump_multiplier) / (1 + dt) — base impulse -0.36, and it
+    # REPLACES the gravity step on the jump frame.
+    "jump_impulse": -0.36,
+    "ground_friction": 4.0,
+    "air_friction": 2.0,
+    "water_friction_scale": 1.0,
+    "accel_multiplier_scale": 1.0,
+    "sprint_multiplier_scale": 1.0,
+    "crouch_sneak_multiplier_scale": 1.0,
+    "climb_step_height": 1.0,
+    "climb_shift": _CLIMB_SHIFT,
+    "fall_slow_down": _FALL_SLOW_DOWN,
+}
+_DEBUG_MOVEMENT_OVERRIDES = dict(_DEBUG_MOVEMENT_DEFAULTS)
 
 
 def A2():
@@ -45,6 +78,47 @@ def A2():
 
 def parse_constant_overrides():
     return None
+
+
+def _movement_override(name):
+    return float(_DEBUG_MOVEMENT_OVERRIDES.get(name, _DEBUG_MOVEMENT_DEFAULTS[name]))
+
+
+def _debug_movement_state():
+    overrides = dict(_DEBUG_MOVEMENT_OVERRIDES)
+    overrides["standing_height"] = overrides["standing_pos_above_ground"] + _PLAYER_RADIUS
+    overrides["crouch_height"] = overrides["crouching_pos_above_ground"] + _PLAYER_RADIUS
+    return overrides
+
+
+def get_debug_movement_override_names():
+    return list(sorted(_DEBUG_MOVEMENT_DEFAULTS.keys()))
+
+
+def get_debug_movement_overrides():
+    return _debug_movement_state()
+
+
+def set_debug_movement_override(name, value):
+    name = str(name)
+    if name not in _DEBUG_MOVEMENT_DEFAULTS:
+        raise KeyError(name)
+    _DEBUG_MOVEMENT_OVERRIDES[name] = float(value)
+    return float(_DEBUG_MOVEMENT_OVERRIDES[name])
+
+
+def reset_debug_movement_override(name):
+    name = str(name)
+    if name not in _DEBUG_MOVEMENT_DEFAULTS:
+        raise KeyError(name)
+    _DEBUG_MOVEMENT_OVERRIDES[name] = float(_DEBUG_MOVEMENT_DEFAULTS[name])
+    return float(_DEBUG_MOVEMENT_OVERRIDES[name])
+
+
+def reset_debug_movement_overrides():
+    _DEBUG_MOVEMENT_OVERRIDES.clear()
+    _DEBUG_MOVEMENT_OVERRIDES.update(_DEBUG_MOVEMENT_DEFAULTS)
+    return _debug_movement_state()
 
 
 def floor(value):
@@ -428,19 +502,41 @@ cdef class Object:
         return None
 
 
-def _player_height(crouch, wade):
+def _player_body_height(crouch, wade):
+    return _player_contact_offset(crouch, wade) + _PLAYER_RADIUS
+
+
+def _player_contact_offset(crouch, wade):
     if crouch and not wade:
-        return _PLAYER_CROUCH_HEIGHT
-    return _PLAYER_HEIGHT
+        return _movement_override("crouching_pos_above_ground")
+    return _movement_override("standing_pos_above_ground")
 
 
-def _aabb_collides(map_obj, x, y, z, radius, height):
+def _is_wading(position_z, crouch):
+    body_bottom_z = float(position_z) + _player_body_height(crouch, False)
+    return body_bottom_z > (_WADE_SURFACE_Z + 1e-4)
+
+
+def _wade_zone(position_z, crouch):
+    """Oracle-calibrated wade check: feet (anchor + contact offset) at or
+    below the water surface. Only evaluated while grounded — the live
+    engine holds the previous wade value while airborne.
+
+    Threshold pinned by live data: grounded feet at 238.99 is dry (the
+    real client says wade=False there) while 239.99 is wading, so the
+    boundary is Z_ABOVE_WATERPLANE + 1.0 — the same value as the original
+    _WADE_SURFACE_Z constant."""
+    feet = float(position_z) + _player_contact_offset(crouch, False)
+    return feet >= float(Z_ABOVE_WATERPLANE) + 1.0
+
+
+def _aabb_collides(map_obj, x, y, z, radius, contact_offset):
     min_x = int(_math.floor(x - radius))
     max_x = int(_math.floor(x + radius))
     min_y = int(_math.floor(y - radius))
     max_y = int(_math.floor(y + radius))
-    min_z = int(_math.floor(z))
-    max_z = int(_math.floor(z + height - 1e-6))
+    min_z = int(_math.floor((z - radius) + 1e-6))
+    max_z = int(_math.floor(z + contact_offset - 1e-6))
 
     if max_x < 0 or max_y < 0 or min_x >= MAP_X or min_y >= MAP_Y:
         return True
@@ -467,10 +563,14 @@ def _clipbox(map_obj, x, y, z):
     return _is_solid(map_obj, int(x), int(y), sample_z)
 
 
+# Ground-contact probe tolerance, measured from the live engine by binary
+# search (oracle grounded with feet up to ~0.00875 above the surface).
+_GROUNDED_PROBE_EPSILON = 0.00875
+
+
 def _grounded(map_obj, position, crouch, wade):
-    height = _player_height(crouch, wade)
-    feet = position.z + height
-    sample_z = int(_math.floor(feet + 1e-4))
+    feet = position.z + _player_contact_offset(crouch, wade)
+    sample_z = int(_math.floor(feet + _GROUNDED_PROBE_EPSILON))
     for bx in (int(_math.floor(position.x - _PLAYER_RADIUS)), int(_math.floor(position.x + _PLAYER_RADIUS))):
         for by in (int(_math.floor(position.y - _PLAYER_RADIUS)), int(_math.floor(position.y + _PLAYER_RADIUS))):
             if _is_solid(map_obj, bx, by, sample_z):
@@ -478,58 +578,318 @@ def _grounded(map_obj, position, crouch, wade):
     return feet >= MAP_Z
 
 
-def _move_box(position, velocity, dt, map_obj, crouch, wade, can_climb):
-    height = _player_height(crouch, wade)
-    dx = velocity.x * dt * _PHYSICS_SCALE
-    dy = velocity.y * dt * _PHYSICS_SCALE
-    dz = velocity.z * dt * _PHYSICS_SCALE
-    steps = int(max(1.0, _math.ceil(max(abs(dx), abs(dy), abs(dz)) / 0.25)))
-    sx = dx / steps
-    sy = dy / steps
-    sz = dz / steps
-    collided_down = False
-    climbed = False
+cdef bint _clip(map_obj, double x, double y, double z):
+    """Faithful port of the compiled engine's clipbox @0x3c00 with
+    allow_below_water = False (boxclipmove always passes 0) and no entity
+    list / lock-box bounds (the infantry path).
 
-    for _ in range(steps):
-        nx = position.x + sx
-        if not _aabb_collides(map_obj, nx, position.y, position.z, _PLAYER_RADIUS, height):
-            position.x = nx
-        elif can_climb and not _aabb_collides(map_obj, nx, position.y, position.z - 1.0, _PLAYER_RADIUS, height):
-            position.x = nx
-            position.z -= 1.0
-            velocity.x *= 0.5
-            velocity.y *= 0.5
-            climbed = True
+    Truncation semantics matter at block boundaries: a probe exactly on an
+    integer face belongs to the HIGHER block (<int> of a guaranteed-positive
+    coordinate == floor); z in (-1, 0) is EMPTY (only z<0 is open air);
+    x/y outside [0, 511] read SOLID; the open-water row 239 samples the bed
+    at 238, and z>239 is the solid world floor."""
+    cdef int ix, iy, iz, v10
+    if x < 0.0:
+        return True
+    ix = <int>x
+    if ix > 511:
+        return True
+    if y < 0.0:
+        return True
+    iy = <int>y
+    if iy > 511:
+        return True
+    iz = <int>z
+    if iz < 0:
+        return False
+    v10 = 238
+    if iz != 239:
+        v10 = iz
+        if iz > 238:
+            return True
+    if map_obj is None:
+        return False
+    if 0 <= v10 <= 239 and 0 <= iy <= 511 and 0 <= ix <= 511:
+        return bool(map_obj.get_solid(ix, iy, v10))
+    return False
+
+
+cdef bint _clip_corners(map_obj, double cx, double cy, double z):
+    """The four AABB corners at radius 0.45 — the only horizontal probe set
+    the live engine uses (a single z level, the head block is never probed by
+    a lateral move)."""
+    return (_clip(map_obj, cx - 0.45, cy - 0.45, z)
+            or _clip(map_obj, cx - 0.45, cy + 0.45, z)
+            or _clip(map_obj, cx + 0.45, cy - 0.45, z)
+            or _clip(map_obj, cx + 0.45, cy + 0.45, z))
+
+
+cdef bint _solid_int(map_obj, int x, int y, int z):
+    if map_obj is None:
+        return False
+    return bool(map_obj.get_solid(x, y, z))
+
+
+def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
+              can_uphill, airborne, wade):
+    """Faithful port of the compiled engine's boxclipmove @0x3e90.
+
+    ONE pass per frame (no substepping): X section -> X glide pass -> Y
+    section (using the X-glided z) -> Y glide pass -> finalize. Verified
+    byte-for-byte against logs/oracle/movebox_probes.json (scripts/
+    replay_movebox.py, all probes within 1e-4 blocks of the live client).
+
+    Key behaviours the old sweep got wrong:
+      * a blocked vertical move keeps the FRAME-START z exactly (landing does
+        not partially advance), the fix for the 0.57-block hard-landing error;
+      * each horizontal axis runs a glide pass that lifts the box out of a
+        penetrated step by (4*v_axis^2 + 0.05)*dt*32 (both axes fire for a
+        straight climb -> the oracle-measured +0.1), with a head-revert that
+        zeroes the axis velocity only when the head is blocked;
+      * climb is gated by not-crouch / not-hover / (not-sprint or
+        can_sprint_uphill) — there is NO orientation.z and NO wade gate;
+      * velocity is zeroed only on a one-block-up climb-probe hit or a glide
+        head-revert, never unconditionally on a blocked wall.
+
+    Mutates position/velocity in place. Returns
+    (climbed, landed, airborne, wade_or_None, crouch); wade_or_None is the new
+    wade value only on a landing frame (else None -> caller keeps its value)."""
+    cdef double px = position.x, py = position.y, pz = position.z
+    cdef double vx = velocity.x, vy = velocity.y, vz = velocity.z
+    cdef bint cr = bool(crouch), hv = bool(hover), sp = bool(sprint)
+    cdef bint up = bool(can_uphill), air = bool(airborne), wd = bool(wade)
+    cdef double v35, v6, v32, m, rad, v31, v36, v40, v33, wx, wy
+    cdef double v34, v15, v37, v45, v41, v46, v49, v54, v22, v57
+    cdef double v26, v27, v28
+    cdef int lp, v10, v12, i14, i17, i18, ii
+    cdef bint climbed = False, advanced, hit, overlap
+
+    v35 = dt * _PHYSICS_SCALE
+    v6 = vx * v35 + px                 # candidate new x
+    v32 = vy * v35 + py               # candidate new y
+    if cr and not hv:
+        lp = 2; m = 0.89999998; rad = 0.44999999
+    else:
+        lp = 3; m = 1.3499999; rad = 0.89999998
+    v31 = rad
+    v36 = pz + rad
+    v40 = m + v36                      # feet z
+    v33 = v6
+    wx = px
+    wy = py
+
+    # ---- X section ----
+    v10 = 0
+    advanced = False
+    while True:
+        if _clip_corners(map_obj, v6, py, v40 - v10):
+            break
+        v10 += 1
+        if v10 >= lp:
+            wx = v33
+            advanced = True
+            break
+    if not advanced and not cr and not hv and ((not sp) or up):
+        v12 = 0
+        hit = False
+        while v12 < lp:
+            if _clip_corners(map_obj, v6, py, (v40 - v12) - 1.0):
+                vx = 0.0
+                hit = True
+                break
+            v12 += 1
+        if not hit:
+            v49 = (v36 - m) - 1.0
+            if not _clip_corners(map_obj, v6, wy, v49):
+                wx = v33
+                climbed = True
+
+    # ---- X glide pass ----
+    v34 = 0.0
+    v15 = v36
+    i14 = 0
+    overlap = True
+    while True:
+        if _clip_corners(map_obj, wx, wy, v40 - i14):
+            break
+        i14 += 1
+        if i14 >= lp:
+            overlap = False
+            break
+    if overlap:
+        v34 = ((vx * vx * 4.0) + 0.050000001) * v35
+        v41 = _math.floor(v36 - m)
+        if _clip_corners(map_obj, wx, wy, v41):
+            wx = px
+            vx = 0.0
         else:
-            velocity.x = 0.0
+            v15 = v36 - v34
+            vz = 0.0
+    v37 = v15
+    v45 = m + v15
 
-        ny = position.y + sy
-        if not _aabb_collides(map_obj, position.x, ny, position.z, _PLAYER_RADIUS, height):
-            position.y = ny
-        elif can_climb and not _aabb_collides(map_obj, position.x, ny, position.z - 1.0, _PLAYER_RADIUS, height):
-            position.y = ny
-            position.z -= 1.0
-            velocity.x *= 0.5
-            velocity.y *= 0.5
-            climbed = True
+    # ---- Y section (at the X-advanced x, with the glided z) ----
+    i17 = 0
+    advanced = False
+    while True:
+        if _clip_corners(map_obj, wx, v32, v45 - i17):
+            break
+        i17 += 1
+        if i17 >= lp:
+            wy = v32
+            advanced = True
+            break
+    if not advanced and not cr and not hv and ((not sp) or up):
+        ii = 0
+        hit = False
+        while ii < lp:
+            if _clip_corners(map_obj, wx, v32, (v45 - ii) - 1.0):
+                vy = 0.0
+                hit = True
+                break
+            ii += 1
+        if not hit:
+            v54 = (v37 - m) - 1.0
+            if not _clip_corners(map_obj, wx, v32, v54):
+                wy = v32
+                climbed = True
+
+    # ---- Y glide pass ----
+    i18 = 0
+    overlap = True
+    while True:
+        if _clip_corners(map_obj, wx, wy, v45 - i18):
+            break
+        i18 += 1
+        if i18 >= lp:
+            overlap = False
+            break
+    if overlap:
+        v34 = ((vy * vy * 4.0) + 0.050000001) * v35
+        v46 = _math.floor(v37 - m)
+        if _clip_corners(map_obj, wx, wy, v46):
+            wy = py
+            vy = 0.0
         else:
-            velocity.y = 0.0
+            v37 = v37 - v34
+            vz = 0.0
 
-        nz = position.z + sz
-        if not _aabb_collides(map_obj, position.x, position.y, nz, _PLAYER_RADIUS, height):
-            position.z = nz
+    # ---- finalize ----
+    position.x = wx
+    position.y = wy
+    if climbed:
+        velocity.x = vx
+        velocity.y = vy
+        velocity.z = vz
+        position.z = v37 - v31
+        return (True, False, False, None, cr)
+    if v34 != 0.0:
+        # Glide frame: the vertical move is skipped entirely (z frozen at the
+        # glided value, airborne untouched). Auto-crouch into a 1.x-block gap.
+        if not cr:
+            v26 = _math.floor(m + v37)
+            if _clip(map_obj, wx, wy, v26):
+                v27 = _math.floor(v37)
+                if not _clip(map_obj, wx, wy, v27):
+                    v28 = _math.floor(v37 - m)
+                    if not _clip(map_obj, wx, wy, v28):
+                        cr = True
+        velocity.x = vx
+        velocity.y = vy
+        velocity.z = vz
+        position.z = v37 - v31
+        return (False, False, air, None, cr)
+
+    # normal vertical move
+    v22 = m if vz >= 0.0 else -m
+    v37 = v37 + v35 * vz
+    air = True
+    v57 = _math.floor(v22 + v37)
+    if not _clip_corners(map_obj, wx, wy, v57):
+        velocity.x = vx
+        velocity.y = vy
+        velocity.z = vz
+        position.z = v37 - v31
+        return (False, False, True, None, cr)
+    # vertical blocked -> keep the exact frame-start z (no partial advance)
+    position.z = pz
+    velocity.x = vx
+    velocity.y = vy
+    velocity.z = 0.0
+    if vz >= 0.0:                      # landing (downward blocked)
+        return (False, True, False, (pz > 237.0), cr)
+    return (False, False, air, None, cr)   # ceiling bump: stays airborne
+
+
+def _check_for_ground_holes(position, velocity, dt, map_obj, crouch, hover,
+                            up, down, left, right):
+    """Faithful port of check_for_ground_holes @0x2290.
+
+    When the player is grounded and pressing NO movement key, but the block at
+    floor(feet + 1.0) under its own column is empty (it is standing on a ledge
+    lip), the live engine OVERWRITES horizontal velocity to drift toward the
+    hole centre at offset*dt*5 — provided the chosen axis offset is <= 0.2 and
+    a straight (or one resolved diagonal) neighbour is solid. The server used to
+    stand perfectly still here, diverging from the client until reconciliation
+    yanked the player into the cliff face."""
+    cdef double x = position.x, y = position.y, z = position.z
+    cdef double v2, v7, v8, v12, v13
+    cdef int v4, v5, v6, v9, v14
+    cdef bint v10, v11, v15, v16, v17, v19, v20
+
+    if crouch and not hover:
+        v2 = z + 1.3499999
+    else:
+        v2 = z + 2.25
+    if up or down or left or right:
+        return
+    v4 = <int>_math.floor(x)
+    v5 = <int>_math.floor(y)
+    v6 = <int>_math.floor(v2 + 1.0)
+    if not (v6 > 239 or v6 < 0 or v5 > 511 or v5 < 0 or v4 > 511
+            or not _solid_int(map_obj, v4, v5, v6)):
+        return
+
+    v7 = (<double>v4 + 0.5) - x
+    v8 = _math.fabs(v7)
+    if v8 != 0.0:
+        v9 = v4 - <int>(v7 / v8)
+    else:
+        v9 = -(1 << 30)
+    v11 = True
+    if 0 <= v6 <= 239 and 0 <= v5 <= 511 and 0 <= v9 <= 511:
+        v11 = not _solid_int(map_obj, v9, v5, v6)
+
+    v12 = (<double>v5 + 0.5) - y
+    v13 = _math.fabs(v12)
+    if v13 != 0.0:
+        v14 = v5 - <int>(v12 / v13)
+    else:
+        v14 = -(1 << 30)
+    v10 = True
+    if 0 <= v6 <= 239 and 0 <= v14 <= 511 and 0 <= v4 <= 511:
+        v10 = not _solid_int(map_obj, v4, v14, v6)
+
+    v15 = not v11                      # push_x (x neighbour solid)
+    v16 = v10 and v11                  # both straight neighbours empty
+    v17 = not v10                      # push_y (y neighbour solid)
+    if (v16 and 0 <= v6 <= 239 and 0 <= v14 <= 511 and 0 <= v9 <= 511
+            and _solid_int(map_obj, v9, v14, v6)):
+        # both straight neighbours empty but the diagonal is solid: pick one
+        # axis by signed dy <= dx -> push y, else push x.
+        if v12 <= v7:
+            v17 = True
         else:
-            if sz > 0.0:
-                collided_down = True
-            velocity.z = 0.0
+            v15 = True
 
-    if position.z > MAP_Z:
-        position.z = float(MAP_Z)
-        velocity.z = 0.0
-        collided_down = True
-
-    airborne = not (collided_down or _grounded(map_obj, position, crouch, wade))
-    return collided_down, climbed, airborne
+    v19 = v15
+    if (not v19) or v8 <= 0.2:
+        v20 = v17
+        if (not v20) or v13 <= 0.2:
+            if v19:
+                velocity.x = (v7 * dt) * 5.0
+            if v20:
+                velocity.y = (v12 * dt) * 5.0
 
 
 def _sign(value):
@@ -546,15 +906,15 @@ def _collide_with_players(player, positions, dt):
 
     position = player.position
     velocity = player.velocity
-    own_height = _player_height(player.crouch, player.wade)
-    own_center_z = position.z + ((own_height - 0.45) - (0.5 * own_height))
+    own_body_height = _player_body_height(player.crouch, player.wade)
+    own_center_z = position.z + ((own_body_height - 0.45) - (0.5 * own_body_height))
     scale = max(dt * 32.0, 1e-6)
     collisions = 0
 
     for item in positions:
         try:
             ox, oy, oz = item[:3]
-            other_height = float(item[3]) if len(item) >= 4 else _PLAYER_HEIGHT
+            other_body_height = float(item[3]) if len(item) >= 4 else _PLAYER_STANDING_BODY_HEIGHT
         except Exception:
             continue
 
@@ -565,8 +925,11 @@ def _collide_with_players(player, positions, dt):
         if push <= 0.0:
             continue
 
-        other_center_z = float(oz) + ((other_height - 0.45) - (0.5 * other_height))
-        vertical_overlap = max(0.0, ((0.5 * other_height) + (0.5 * own_height)) - abs(own_center_z - other_center_z))
+        other_center_z = float(oz) + ((other_body_height - 0.45) - (0.5 * other_body_height))
+        vertical_overlap = max(
+            0.0,
+            ((0.5 * other_body_height) + (0.5 * own_body_height)) - abs(own_center_z - other_center_z),
+        )
         if vertical_overlap <= 0.0:
             continue
 
@@ -825,22 +1188,23 @@ cdef class Player(Object):
 
     def set_crouch(self, crouch, players, noof_players):
         target = bool(crouch)
+        crouch_shift = _movement_override("crouch_shift")
         if target == self._crouch:
             return None
         if target:
             if not self._airborne:
-                self._position.z += _PLAYER_CROUCH_SHIFT
+                self._position.z += crouch_shift
             self._crouch = True
             return None
         if self._parent is None or self._parent.map is None or not _aabb_collides(
             self._parent.map,
             self._position.x,
             self._position.y,
-            self._position.z - _PLAYER_CROUCH_SHIFT,
+            self._position.z - crouch_shift,
             _PLAYER_RADIUS,
-            _PLAYER_HEIGHT,
+            _player_contact_offset(False, self._wade),
         ):
-            self._position.z -= _PLAYER_CROUCH_SHIFT
+            self._position.z -= crouch_shift
             self._crouch = False
         return None
 
@@ -924,20 +1288,29 @@ cdef class Player(Object):
 
         dt = float(dt)
         map_obj = self._parent.map if self._parent is not None else None
-        self._wade = (self._position.z + _player_height(self._crouch, False)) >= Z_ABOVE_WATERPLANE
+        # wade is NOT recomputed here: the live engine holds the previous
+        # value while airborne and only re-evaluates it on ground contact
+        # (after the move, below). Oracle-calibrated.
         self._jump_this_frame = bool(self._jump)
+        jumped_this_frame = False
         if self._jump:
             self._jump = False
-            self._velocity.z = -0.46 * self._jump_multiplier
+            self._velocity.z = _movement_override("jump_impulse") * self._jump_multiplier
             self._airborne = True
+            jumped_this_frame = True
 
-        accel = dt * 3.0 * self._accel_multiplier
-        if self._airborne:
-            accel *= self._jump_multiplier
-        elif (self._crouch and not self._wade) or self._sneak:
-            accel *= self._crouch_sneak_multiplier
+        # Oracle-calibrated: accel is the selected class multiplier (the
+        # crouch/sneak and sprint multipliers REPLACE the base multiplier,
+        # they do not stack) scaled by dt — no 3.0 base factor.
+        if (self._crouch and not self._wade) or self._sneak:
+            accel = self._crouch_sneak_multiplier * _movement_override("crouch_sneak_multiplier_scale")
         elif self._sprint and not self._burdened:
-            accel *= self._sprint_multiplier
+            accel = self._sprint_multiplier * _movement_override("sprint_multiplier_scale")
+        else:
+            accel = self._accel_multiplier * _movement_override("accel_multiplier_scale")
+        if self._airborne:
+            accel *= 0.5
+        accel *= dt
 
         if (self._up or self._down) and (self._left or self._right):
             accel *= _math.sqrt(0.5)
@@ -963,32 +1336,47 @@ cdef class Player(Object):
             gravity_step *= 0.75
         if self._jetpack_active:
             gravity_step *= 0.05
-        if not self._wade:
-            self._velocity.z += gravity_step
-        elif self._crouch:
+        # Oracle-calibrated: gravity applies normally while wading (the
+        # airborne bounce frames during a water-floor settle show the full
+        # gravity step with wade=1). Only the crouch buoyancy differs.
+        # On the jump frame the impulse REPLACES the gravity step entirely
+        # (measured: post-frame vz == impulse / (1 + dt) exactly).
+        if jumped_this_frame:
+            pass
+        elif self._wade and self._crouch:
             self._velocity.z += ((_GLOBAL_GRAVITY + 1.0) * 0.025) * 0.5
+        else:
+            self._velocity.z += gravity_step
         self._velocity.z /= divisor
 
-        if self._wade:
-            horizontal_divisor = (dt * self._water_friction) + 1.0
+        if self._wade or self._hover or self._jetpack_active:
+            horizontal_divisor = (dt * (self._water_friction * _movement_override("water_friction_scale"))) + 1.0
         elif not self._airborne:
-            horizontal_divisor = (dt * 4.0) + 1.0
+            horizontal_divisor = (dt * _movement_override("ground_friction")) + 1.0
         else:
-            horizontal_divisor = divisor
+            horizontal_divisor = (dt * _movement_override("air_friction")) + 1.0
         self._velocity.x /= horizontal_divisor
         self._velocity.y /= horizontal_divisor
 
         _collide_with_players(self, positions, dt)
         landing_speed = self._velocity.z
-        collided_down, climbed, airborne = _move_box(
+        # Single-pass boxclipmove port (aoslib.world.so @0x3e90). It owns the
+        # airborne/wade flags exactly as the compiled engine does: airborne is
+        # set inside the move (cleared on a downward landing or a climb, held
+        # through a glide frame), and wade is written only on a landing frame.
+        climbed, collided_down, airborne, wade_out, new_crouch = _move_box(
             self._position,
             self._velocity,
             dt,
             map_obj,
             self._crouch,
+            self._hover,
+            self._sprint,
+            self._can_sprint_uphill,
+            self._airborne,
             self._wade,
-            not self._crouch,
         )
+        self._crouch = new_crouch
 
         if self._lock_box is not None and len(self._lock_box) == 6:
             x1, y1, z1, x2, y2, z2 = self._lock_box
@@ -997,14 +1385,37 @@ cdef class Player(Object):
             self._position.z = min(max(self._position.z, z1), z2)
 
         if climbed:
-            self._climb_timer = 0.25
+            self._climb_timer = 0.1
         else:
             self._climb_timer = max(0.0, self._climb_timer - dt)
 
-        self._wade = (self._position.z + _player_height(self._crouch, False)) >= Z_ABOVE_WATERPLANE
-        self._airborne = airborne and not _grounded(map_obj, self._position, self._crouch, self._wade)
+        if jumped_this_frame:
+            self._airborne = True
+        else:
+            self._airborne = bool(airborne)
+        if wade_out is not None:
+            self._wade = bool(wade_out)
 
-        if collided_down and landing_speed > _FALL_SLOW_DOWN:
+        # Defensive world-bottom clamp (the z=239 floor fill normally makes
+        # this unreachable; mirrors move_player's p.z>240 -> 239 guard).
+        if self._position.z > MAP_Z:
+            self._position.z = float(MAP_Z)
+            self._velocity.z = 0.0
+            collided_down = True
+
+        # Idle ledge-lip nudge: when grounded and not pressing a movement key,
+        # the live engine creeps toward a hole centre at the lip. Without this
+        # the server stands still where the client drifts -> the reconciliation
+        # anchor diverges and yanks the player into the cliff ("randomly stuck
+        # on cliffs and edges").
+        if not self._airborne:
+            _check_for_ground_holes(
+                self._position, self._velocity, dt, map_obj,
+                self._crouch, self._hover,
+                self._up, self._down, self._left, self._right,
+            )
+
+        if collided_down and landing_speed > _movement_override("fall_slow_down"):
             self._velocity.x *= 0.7
             self._velocity.y *= 0.7
             if landing_speed > _FALL_DAMAGE_VELOCITY:
