@@ -253,10 +253,6 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full list. In short:
 - **Near term** — end-of-round scoreboard screen, per-player scoreboard column, HUD round
   timer; polish grenade/collapse visuals; reconnect-lifecycle hardening.
 - **Content** — more maps, weapons, and classes; finish CTF/Arena scoring parity.
-- **Big one — native ENet:** replace the compiled C `pyenet` dependency with a **native Go
-  ENet** implementation, so the server can be built as a single static binary for any
-  platform without cross-compiling ENet per architecture. This is the main blocker to
-  drop-in multi-platform distribution.
 - **Long term** — the project is intentionally a clean, documented base so it can be **ported
   to other languages** (Go, Rust, …) if/when the community wants to carry it forward.
 
