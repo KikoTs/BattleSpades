@@ -56,6 +56,10 @@ class MapEntity:
     alive: bool = True
     respawn_at: float = 0.0
     home: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Moving entities (projectiles): initial velocity + collision radius the
+    # client uses to simulate flight locally. Static entities leave these 0.
+    vel: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    radius: float = 0.0
     # Optional server-side behavior (Phase-2). Runtime only — NEVER serialized
     # (to_wire_entity does not read it, so the wire output stays byte-identical).
     behavior: Optional[EntityBehavior] = None
@@ -64,8 +68,10 @@ class MapEntity:
         ent = Entity()
         ent.entity_id = int(self.entity_id)
         ent.pos_x, ent.pos_y, ent.pos_z = float(self.x), float(self.y), float(self.z)
-        ent.vel_x = ent.vel_y = ent.vel_z = 0.0
-        ent.yaw = ent.radius = ent.fuse = 0.0
+        ent.vel_x, ent.vel_y, ent.vel_z = (float(v) for v in self.vel)
+        ent.yaw = 0.0
+        ent.radius = float(self.radius)
+        ent.fuse = 0.0
         ent.color = self.color
         ent.type = int(self.type)
         ent.player_id = int(self.player_id)
@@ -95,12 +101,15 @@ class EntityRegistry:
 
     def place(self, type: int, x: float, y: float, z: float, *,
               state: int = TEAM_NEUTRAL, color=None, kind: str = "crate",
-              player_id: int = 0, behavior: Optional[EntityBehavior] = None) -> MapEntity:
+              player_id: int = 0, behavior: Optional[EntityBehavior] = None,
+              vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+              radius: float = 0.0) -> MapEntity:
         ent = MapEntity(
             entity_id=self.allocate_id(), type=int(type),
             x=float(x), y=float(y), z=float(z),
             state=int(state), color=color, kind=kind, player_id=int(player_id),
             home=(float(x), float(y), float(z)), behavior=behavior,
+            vel=tuple(float(v) for v in vel), radius=float(radius),
         )
         self._entities[ent.entity_id] = ent
         return ent
@@ -115,8 +124,11 @@ class EntityRegistry:
         return list(self._entities.values())
 
     def static_entities(self) -> List[MapEntity]:
-        """Entities to include in the StateData join snapshot (alive ones)."""
-        return [e for e in self._entities.values() if e.alive]
+        """Entities to include in a joining client's snapshot (alive, static).
+        Short-lived moving projectiles are excluded — a mid-flight rocket
+        streamed as a static join entity would render frozen/stale."""
+        return [e for e in self._entities.values()
+                if e.alive and e.kind != "projectile"]
 
     def clear(self) -> None:
         self._entities.clear()

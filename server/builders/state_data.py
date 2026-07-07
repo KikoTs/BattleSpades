@@ -84,8 +84,13 @@ def build_state_data(server: 'BattleSpadesServer',
     pkt.team2_show_max_score = True
 
     # ---- Prefabs / entities --------------------------------------------
-    # TODO: drive prefabs from the mode's prefab table once Phase 1 is in.
-    pkt.prefabs = ['supertower']
+    # StateData.prefabs is the MAP-SPECIFIC prefab set (client map_prefabs);
+    # the class-select screen appends each entry to EVERY class's prefab list
+    # as a MAP_PREFAB and looks its image up by name in the prefab palette.
+    # A bogus/hardcoded name (the old 'supertower') therefore injected a
+    # wrong/overflowing entry into every class. Ship none — each class's real
+    # prefabs come from the client's local CLASS_ITEMS/PREFAB_LISTS.
+    pkt.prefabs = []
     # The join handshake NEVER carries entities. Cramming crates into the
     # join-time StateData makes the compiled client process them mid-
     # GameScene-transition (world still building) and crash natively at

@@ -237,29 +237,51 @@ class BattleSpadesServer:
 
         fuse = max(0.0, min(float(getattr(packet, "value", 3.0)), 10.0))
 
-        # Rebroadcast to everyone EXCEPT the thrower (whose own client already
-        # simulates it locally) so other clients see/hear the projectile.
-        from shared.packet import UseOrientedItem
-        out = UseOrientedItem()
-        out.loop_count = self.loop_count
-        out.player_id = player.id
-        out.tool = tool
-        out.value = fuse
-        out.position = tuple(float(v) for v in pos)
-        out.velocity = tuple(float(v) for v in vel)
-        data = bytes(out.generate())
-        for conn in list(self.connections.values()):
-            if not conn.in_game or conn.player is None or conn.player.id == player.id:
-                continue
-            try:
-                conn.send(data)
-            except Exception:
-                logger.debug("projectile rebroadcast failed", exc_info=True)
-
         p = self.projectile_engine.spawn(tool, pos, vel, fuse, player.id)
-        if p is not None:
-            logger.info("PROJECTILE %s by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f",
-                        p.spec.name, player.name, tool, pos[0], pos[1], pos[2], fuse)
+        if p is None:
+            return
+
+        if p.spec.entity_type:
+            # Rocket/drill/snowball/molotov: NEITHER the firer nor other clients
+            # spawn these locally (the client's send_rocket sends no local
+            # entity — measured 2026-07-07). The server owns the flying entity:
+            # spawn a CreateEntity of the right ENTITY type carrying the initial
+            # pos+velocity so EVERY client renders + simulates the projectile,
+            # and DestroyEntity on explosion plays the blast FX (see _explode).
+            from server.connection import internal_team_to_wire
+            state = internal_team_to_wire(player.team)
+            ent = self.entity_registry.place(
+                int(p.spec.entity_type),
+                float(pos[0]), float(pos[1]), float(pos[2]),
+                state=state, kind="projectile", player_id=player.id,
+                vel=(float(vel[0]), float(vel[1]), float(vel[2])),
+                radius=0.02,
+            )
+            p.entity_id = ent.entity_id
+            self.broadcast_create_entity(ent)
+        else:
+            # Grenade family: the client renders a thrown grenade from the
+            # rebroadcast UseOrientedItem. Send it to everyone EXCEPT the
+            # thrower (whose client already simulates its own throw).
+            from shared.packet import UseOrientedItem
+            out = UseOrientedItem()
+            out.loop_count = self.loop_count
+            out.player_id = player.id
+            out.tool = tool
+            out.value = fuse
+            out.position = tuple(float(v) for v in pos)
+            out.velocity = tuple(float(v) for v in vel)
+            data = bytes(out.generate())
+            for conn in list(self.connections.values()):
+                if not conn.in_game or conn.player is None or conn.player.id == player.id:
+                    continue
+                try:
+                    conn.send(data)
+                except Exception:
+                    logger.debug("projectile rebroadcast failed", exc_info=True)
+
+        logger.info("PROJECTILE %s by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f eid=%d",
+                    p.spec.name, player.name, tool, pos[0], pos[1], pos[2], fuse, p.entity_id)
 
     # Projectile physics lives in server/projectiles.py (the grenade math is
     # the verified port of the compiled client's mover sub_10011E90; rockets/
@@ -278,6 +300,14 @@ class BattleSpadesServer:
         gx, gy, gz = ex.x, ex.y, ex.z
         thrower = self.players.get(ex.thrower_id)
         logger.info("%s explode at (%.1f,%.1f,%.1f)", ex.spec.name.upper(), gx, gy, gz)
+
+        # Remove the flying entity on all clients (plays the explosion FX for
+        # rocket/drill/snowball/molotov, which the client would otherwise fly
+        # forever — stop_on_collision is False on the client's projectile).
+        eid = int(getattr(ex, "entity_id", 0) or 0)
+        if eid:
+            if self.entity_registry.remove(eid) is not None:
+                self.broadcast_destroy_entity(eid)
 
         # Crater: 3x3x3 centered on the impact cell. Warheads whose per-block
         # damage meets the default block health destroy outright (grenade

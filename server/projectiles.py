@@ -63,6 +63,12 @@ class ProjectileSpec:
     destroyed_damage: float = 0.0
     destroyed_block_damage: float = 0.0
     approximate: bool = False     # numbers not in the client constant catalog
+    # Client-rendered flying entity (ENTITY id) — the server spawns a
+    # CreateEntity of this type so ALL clients see + simulate the projectile
+    # (the firing client does NOT predict rockets locally). 0 = no entity;
+    # such projectiles ride the rebroadcast UseOrientedItem instead (grenades,
+    # which the client already renders as thrown grenades).
+    entity_type: int = 0
 
 
 def _kill(name: str, default: int) -> int:
@@ -84,7 +90,8 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         _kill("ANTIPERSONNEL_GRENADE_KILL", 23), 23),
     int(getattr(C, "MOLOTOV_TOOL", 33)): ProjectileSpec(
         "molotov", "contact", 1.0, 50.0, 3.0,
-        _kill("MOLOTOV_KILL", 24), 24, approximate=True),
+        _kill("MOLOTOV_KILL", 24), 24, approximate=True,
+        entity_type=int(getattr(C, "MOLOTOV_ENTITY", 27))),
     int(getattr(C, "DYNAMITE_TOOL", 21)): ProjectileSpec(
         "dynamite", "bounce", 1.0, 100.0, 5.0,
         _kill("DYNAMITE_KILL", 15), 16),
@@ -96,13 +103,15 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "ROCKET_GRAVITY_MULTIPLIER", 0.05)),
         float(getattr(C, "ROCKET_EXPLOSION_DAMAGE", 140)),
         float(getattr(C, "ROCKET_EXPLOSION_BLOCK_DAMAGE", 5)),
-        _kill("ROCKET_KILL", 4), 8),
+        _kill("ROCKET_KILL", 4), 8,
+        entity_type=int(getattr(C, "ROCKET_ENTITY", 21))),
     int(C.RPG2_TOOL): ProjectileSpec(
         "rocket2", "contact",
         float(getattr(C, "ROCKET2_GRAVITY_MULTIPLIER", 0.025)),
         float(getattr(C, "ROCKET2_EXPLOSION_DAMAGE", 50)),
         float(getattr(C, "ROCKET2_EXPLOSION_BLOCK_DAMAGE", 2)),
-        _kill("ROCKET2_KILL", 5), 9),
+        _kill("ROCKET2_KILL", 5), 9,
+        entity_type=int(getattr(C, "ROCKET2_ENTITY", 22))),
     int(C.DRILLGUN_TOOL): ProjectileSpec(
         "drill", "contact",
         float(getattr(C, "DRILL_GRAVITY_MULTIPLIER", 1.5)),
@@ -111,13 +120,15 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         _kill("DRILL_KILL", 6), 10,
         lifespan=float(getattr(C, "DRILL_LIFESPAN", 3.0)),
         destroyed_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_DAMAGE", 95)),
-        destroyed_block_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_BLOCK_DAMAGE", 10.0))),
+        destroyed_block_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_BLOCK_DAMAGE", 10.0)),
+        entity_type=int(getattr(C, "DRILL_ENTITY", 23))),
     int(getattr(C, "SNOWBLOWER_TOOL", 29)): ProjectileSpec(
         "snowball", "contact",
         float(getattr(C, "SNOWBALL_GRAVITY_MULTIPLIER", 0.5)),
         float(getattr(C, "SNOWBALL_EXPLOSION_DAMAGE", 10)),
         float(getattr(C, "SNOWBALL_EXPLOSION_BLOCK_DAMAGE", 0)),
-        _kill("SNOWBALL_KILL", 21), 20),
+        _kill("SNOWBALL_KILL", 21), 20,
+        entity_type=int(getattr(C, "SNOWBALL_ENTITY", 24))),
     int(getattr(C, "STICKY_GRENADE_TOOL", 57)): ProjectileSpec(
         "sticky_grenade", "stick", 1.0, 100.0, 4.0,
         _kill("STICKY_GRENADE_KILL", 34), 39, approximate=True),
@@ -130,7 +141,7 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
 class Projectile:
     __slots__ = ("spec", "tool", "x", "y", "z", "vx", "vy", "vz",
                  "explode_at", "thrower_id", "stuck", "spawned_at",
-                 "lifespan_at")
+                 "lifespan_at", "entity_id")
 
     def __init__(self, spec, tool, pos, vel, fuse, thrower_id, now):
         self.spec = spec
@@ -144,16 +155,19 @@ class Projectile:
         self.lifespan_at = now + spec.lifespan if spec.lifespan > 0.0 else 0.0
         self.thrower_id = int(thrower_id)
         self.stuck = False
+        self.entity_id = 0     # wire entity id (0 = none), set by the server
 
 
 class Explosion:
     """What the engine hands back to the server for damage application."""
-    __slots__ = ("x", "y", "z", "thrower_id", "spec", "damage", "block_damage")
+    __slots__ = ("x", "y", "z", "thrower_id", "spec", "damage", "block_damage",
+                 "entity_id")
 
     def __init__(self, proj: Projectile, destroyed: bool = False):
         self.x, self.y, self.z = proj.x, proj.y, proj.z
         self.thrower_id = proj.thrower_id
         self.spec = proj.spec
+        self.entity_id = proj.entity_id
         if destroyed and proj.spec.destroyed_damage > 0.0:
             self.damage = proj.spec.destroyed_damage
             self.block_damage = proj.spec.destroyed_block_damage

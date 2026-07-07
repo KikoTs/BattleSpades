@@ -33,6 +33,13 @@ class ModeData:
     allowed_classes: tuple[int, ...] = field(default_factory=tuple)
 
 
+def _all_classes() -> tuple[int, ...]:
+    """Every real class id (0-17). DLC-gated classes still appear in the list;
+    the client greys them out via its own dlc_manager if not owned."""
+    from server.class_data import CLASS_IDS
+    return tuple(int(x) for x in CLASS_IDS)
+
+
 def _allowed_for(code: str) -> tuple[int, ...]:
     classic = code == 'cctf'
     mafia = code in ('tc', 'vip')
@@ -40,6 +47,9 @@ def _allowed_for(code: str) -> tuple[int, ...]:
         return tuple(int(x) for x in C.CLASSIC_TEAM_CLASSES)
     if mafia:
         return tuple(int(x) for x in C.MAFIA_TEAM_CLASSES)
+    if code == 'tdm':
+        # Deathmatch: every class available (incl. DLC), per user request.
+        return _all_classes()
     if code == 'zom':
         # Survivors get default classes; zombies are a separate team.
         return tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
