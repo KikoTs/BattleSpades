@@ -47,7 +47,7 @@ structure collapse, pickups, deaths/respawns, and bots all work and stay in sync
 client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
 what's still on the list.
 
-- **87/87** unit tests pass (`py -m pytest tests/ -q`)
+- **106/106** unit tests pass (`py -m pytest tests/ -q`)
 - Movement parity: mean client↔server position delta in the **millimetre** range over
   thousands of frames (`py scripts/replay_parity.py` — must stay `ALL PASS`)
 - Physics ground truth and every measured constant live in
@@ -55,8 +55,10 @@ what's still on the list.
 
 ## Quick start
 
-You need **Python 3.8+** (3.12 recommended) and a **C compiler** (MSVC Build Tools on
-Windows, `gcc`/`clang` on Linux/macOS — needed to build the Cython extensions and `pyenet`).
+You need **Python 3.10–3.12** (3.12 is the primary dev target) and a **C compiler** (MSVC
+Build Tools on Windows, `gcc`/`clang` on Linux/macOS — needed to build the Cython extensions
+and `pyenet`). Python 3.13+ can currently fail the `pyenet` build; 3.10–3.12 are the tested
+range. A virtual environment (`venv`) is recommended so the compiled deps stay isolated.
 
 **One-liner** — clone, install deps, build the Cython core, and launch:
 
@@ -78,7 +80,12 @@ immediately.
 <summary>Manual steps (what the installer does)</summary>
 
 ```bash
-pip install -r requirements.txt          # deps (pyenet, Cython, numpy, toml, pytest)
+# (recommended) create + activate an isolated environment first
+python3.10 -m venv venv
+source venv/bin/activate         # Linux/macOS
+# .\venv\Scripts\Activate.ps1    # Windows (PowerShell)
+
+pip install -r requirements.txt          # deps (pyenet, Cython, toml, pytest)
 python setup.py build_ext --inplace      # compile the Cython extensions
 python run_server.py                     # start the server on port 27015
 ```
@@ -90,7 +97,7 @@ python run_server.py                     # start the server on port 27015
 |---|---|
 | **Movement / physics** | Frame-accurate server sim, oracle-calibrated to the compiled client (walk, sprint, crouch, wade, climb, gravity, friction) |
 | **Jumping** | Full client↔server-synced jump (input edge-latched, reconciliation calibrated) |
-| **Shooting** | Rifle / SMG / shotgun / spade, hit-scan from the client's reported aim, headshots, tracers rendered at the right spot |
+| **Shooting** | All hit-scan guns (rifle, SMG, shotgun, sniper, pistol, MG) driven by the client's own per-weapon damage / fire-rate / clip tables; hit-scan from the reported aim, headshots, tracers at the right spot |
 | **Blocks** | Build (BlockLine) + break (spade dig & bullet damage) — the **exact** aimed cell is removed on every client, block-colored debris |
 | **Structure collapse** | Cut a structure off from the ground and the disconnected chunk falls (flood-fill detection + client fall animation) |
 | **Grenades** | Thrown entity + fuse + bounce physics + blast damage (falloff + line-of-sight) + 3×3×3 block destruction |
@@ -181,8 +188,6 @@ the C toolchain above is required. On most Linux/Windows setups this "just works
   toolchain and Python headers (`python3-dev`) are installed.
 - **Cross-compiling / uncommon arch (e.g. arm64):** you may need to build ENet + pyenet for
   that specific target. Notes in [`docs/BUILDING.md`](docs/BUILDING.md).
-- ENet is the main thing standing between this server and truly trivial multi-platform
-  distribution — see the [Roadmap](#roadmap) for the planned native replacement.
 
 ## Configuration
 
@@ -237,7 +242,7 @@ can appear in server browsers that support the 1.x protocol.
 ## Testing & tooling
 
 ```bash
-py -m pytest tests/ -q          # unit tests (currently 87 passing)
+py -m pytest tests/ -q          # unit tests (currently 106 passing)
 py scripts/replay_parity.py     # offline movement-parity check (must be ALL PASS)
 ```
 
@@ -274,6 +279,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - _Ace of Spades_ was created by Ben Aksoy / Jagex. This is an independent, non-commercial
   server reimplementation for preservation and play; it ships no proprietary game code.
 - Networking via [pyenet](https://github.com/piqueserver/pyenet) / [ENet](http://enet.bespin.org/).
+- Community fixes: build & setup improvements from [@TylerJaacks](https://github.com/TylerJaacks).
 
 ## License
 

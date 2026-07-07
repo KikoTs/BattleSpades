@@ -77,5 +77,10 @@ ace.py/
 aoslib-reversed/
 aceofspades/
 
-# NOTE: maps/*.vxl ARE tracked — the 4 stock Battle Builders maps ship
-# with the server so a fresh clone runs out of the box.
+# ── Maps ────────────────────────────────────────────────────────────
+# maps/*.vxl ARE tracked — the 4 stock Battle Builders maps ship with the
+# server so a fresh clone runs out of the box. But ignore generated map
+# artifacts (minimap thumbnails / compiled metadata) so a player's local
+# game files aren't committed by accident.
+/maps/*.txtc
+/maps/*.png
