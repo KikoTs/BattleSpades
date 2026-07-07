@@ -97,6 +97,77 @@ class MedpackBehavior(EntityBehavior):
         return True
 
 
+class TimedExplosiveBehavior(EntityBehavior):
+    """Dynamite / timed charge: detonates a fixed fuse after placement,
+    regardless of proximity. Explosion runs through the server's shared blast
+    (crater + player damage)."""
+
+    def __init__(self, thrower_id, fuse, damage, block_damage, crater_radius, kill_type):
+        self.thrower_id = int(thrower_id)
+        self.fuse = float(fuse)
+        self.damage = float(damage)
+        self.block_damage = float(block_damage)
+        self.crater_radius = int(crater_radius)
+        self.kill_type = int(kill_type)
+        self._detonate_at = None
+
+    def on_tick(self, ent, dt, ctx) -> None:
+        if self._detonate_at is None:
+            self._detonate_at = ctx.now + self.fuse
+            return
+        if ctx.now >= self._detonate_at:
+            _detonate_deployable(self, ent, ctx)
+
+
+class ProximityMineBehavior(EntityBehavior):
+    """Landmine: arms after a short delay, then detonates when an ENEMY (not
+    the placer's team) enters the trigger radius."""
+
+    def __init__(self, thrower_id, team, damage, block_damage, crater_radius,
+                 kill_type, trigger_radius=2.5, arm_delay=1.0):
+        self.thrower_id = int(thrower_id)
+        self.team = int(team)
+        self.damage = float(damage)
+        self.block_damage = float(block_damage)
+        self.crater_radius = int(crater_radius)
+        self.kill_type = int(kill_type)
+        self.trigger_radius = float(trigger_radius)
+        self.arm_delay = float(arm_delay)
+        self._armed_at = None
+
+    def on_tick(self, ent, dt, ctx) -> None:
+        if self._armed_at is None:
+            self._armed_at = ctx.now + self.arm_delay
+            return
+        if ctx.now < self._armed_at:
+            return
+        r2 = self.trigger_radius ** 2
+        for player in ctx.players:
+            if getattr(player, "team", None) == self.team:
+                continue  # own team never trips it
+            dx = player.x - ent.x
+            dy = player.y - ent.y
+            dz = player.z - ent.z
+            if (dx * dx + dy * dy + dz * dz) <= r2:
+                _detonate_deployable(self, ent, ctx)
+                return
+
+
+def _detonate_deployable(behavior, ent, ctx) -> None:
+    """Shared detonation for timed/proximity deployables: run the server blast,
+    despawn the entity, and tell clients (removes the model + FX)."""
+    thrower = ctx.server.players.get(behavior.thrower_id) if ctx.server else None
+    if ctx.server is not None:
+        ctx.server._apply_blast(
+            ent.x, ent.y, ent.z, behavior.damage, behavior.block_damage,
+            behavior.kill_type, thrower,
+            crater_radius=behavior.crater_radius, force_destroy=True,
+        )
+    ent.alive = False
+    if ctx.destroy is not None:
+        ctx.destroy(ent.entity_id)
+
+
 class IntelBehavior(EntityBehavior):
     """CTF intel/flag pickup — a thin adapter over the mode's existing intel
     state. On touch it hands off to ``mode.pick_up_intel(player, ent)``.

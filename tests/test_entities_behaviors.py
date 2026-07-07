@@ -207,6 +207,74 @@ def test_block_crate_refills_blocks_only():
     assert p.healed == 0             # health untouched
 
 
+# --- deployables: dynamite (timed) + landmine (proximity) --------------------
+
+class FakeServer:
+    def __init__(self):
+        self.players = {}
+        self.blasts = []
+
+    def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
+                     crater_radius=1, force_destroy=True):
+        self.blasts.append((gx, gy, gz, damage, block_damage, kill_type,
+                            crater_radius, force_destroy))
+
+
+def deploy_ctx(server, players, now):
+    created, destroyed = [], []
+    c = EntityContext(dt=1 / 60, now=now, players=players, server=server,
+                      create=created.append, destroy=destroyed.append)
+    c._destroyed = destroyed
+    return c
+
+
+def test_dynamite_detonates_after_fuse():
+    from server.entities.behaviors import TimedExplosiveBehavior
+    reg = EntityRegistry()
+    srv = FakeServer()
+    b = TimedExplosiveBehavior(thrower_id=7, fuse=7.0, damage=300.0,
+                               block_damage=5.0, crater_radius=2, kill_type=15)
+    e = reg.place(C.DYNAMITE_ENTITY, 100.0, 100.0, 60.0, behavior=b)
+
+    reg.tick(deploy_ctx(srv, [], now=1000.0))     # first tick arms the fuse (t0)
+    assert e.alive and srv.blasts == []
+    reg.tick(deploy_ctx(srv, [], now=1005.0))     # 5s < 7s fuse
+    assert e.alive and srv.blasts == []
+    c = deploy_ctx(srv, [], now=1008.0)           # 8s >= 7s
+    reg.tick(c)
+    assert not e.alive
+    assert len(srv.blasts) == 1
+    assert srv.blasts[0][3] == 300.0              # damage
+    assert srv.blasts[0][6] == 2                  # crater_radius
+    assert c._destroyed == [e.entity_id]
+
+
+def test_landmine_triggers_on_enemy_not_teammate():
+    from server.entities.behaviors import ProximityMineBehavior
+    reg = EntityRegistry()
+    srv = FakeServer()
+    b = ProximityMineBehavior(thrower_id=7, team=2, damage=100.0,
+                              block_damage=3.0, crater_radius=1, kill_type=14,
+                              trigger_radius=2.5, arm_delay=1.0)
+    e = reg.place(C.LANDMINE_ENTITY, 100.0, 100.0, 60.0, behavior=b)
+
+    teammate = FakePlayer(100.5, 100.0, 60.0)
+    teammate.team = 2
+    enemy = FakePlayer(101.0, 100.0, 60.0)
+    enemy.team = 3
+
+    reg.tick(deploy_ctx(srv, [teammate, enemy], now=1000.0))   # arms (t0)
+    assert e.alive and srv.blasts == []
+    reg.tick(deploy_ctx(srv, [teammate], now=1000.5))          # not yet armed
+    assert e.alive and srv.blasts == []
+    reg.tick(deploy_ctx(srv, [teammate], now=1002.0))          # armed, only teammate near
+    assert e.alive and srv.blasts == []                        # teammate never trips it
+    reg.tick(deploy_ctx(srv, [teammate, enemy], now=1002.5))   # enemy in range
+    assert not e.alive
+    assert len(srv.blasts) == 1
+    assert srv.blasts[0][3] == 100.0
+
+
 # --- wire-safety regression guard ------------------------------------------
 
 def test_behavior_does_not_change_wire_bytes():

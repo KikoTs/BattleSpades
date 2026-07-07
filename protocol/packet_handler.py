@@ -421,6 +421,69 @@ async def handle_place_medpack(server, player, packet):
     logger.info("MEDPACK placed by %s at (%.1f,%.1f,%.1f)", player.name, x, y, z)
 
 
+def _deploy_pos(player, packet):
+    """Common Place* validation: parse block coords, reject NaN/far placements
+    (the client already range-checks; this guards against a bad/hostile
+    packet). Returns (x, y, z) or None."""
+    try:
+        x, y, z = float(packet.x), float(packet.y), float(packet.z)
+    except Exception:
+        return None
+    if any(v != v or abs(v) > 1e6 for v in (x, y, z)):
+        return None
+    dx, dy, dz = x - player.x, y - player.y, z - player.z
+    if dx * dx + dy * dy + dz * dz > 225.0:   # 15 blocks
+        return None
+    return (x, y, z)
+
+
+@register_handler(1)  # PlaceDynamite
+async def handle_place_dynamite(server, player, packet):
+    """Miner dynamite: a timed charge that craters + damages on a 7s fuse."""
+    if not player.alive or not player.spawned:
+        return
+    pos = _deploy_pos(player, packet)
+    if pos is None:
+        return
+    import shared.constants as C
+    from server.entities.behaviors import TimedExplosiveBehavior
+    from server.connection import internal_team_to_wire
+    from server.game_constants import KILL_TYPES
+    behavior = TimedExplosiveBehavior(
+        player.id, fuse=7.0, damage=300.0, block_damage=5.0,
+        crater_radius=2, kill_type=KILL_TYPES.get("DYNAMITE_KILL", 15))
+    ent = server.entity_registry.place(
+        int(getattr(C, "DYNAMITE_ENTITY", 10)), pos[0], pos[1], pos[2],
+        state=internal_team_to_wire(player.team), kind="deployable",
+        player_id=player.id, behavior=behavior)
+    server.broadcast_create_entity(ent)
+    logger.info("DYNAMITE placed by %s at %s (7s fuse)", player.name, pos)
+
+
+@register_handler(89)  # PlaceLandmine
+async def handle_place_landmine(server, player, packet):
+    """Scout landmine: arms, then detonates when an enemy walks near it."""
+    if not player.alive or not player.spawned:
+        return
+    pos = _deploy_pos(player, packet)
+    if pos is None:
+        return
+    import shared.constants as C
+    from server.entities.behaviors import ProximityMineBehavior
+    from server.connection import internal_team_to_wire
+    from server.game_constants import KILL_TYPES
+    behavior = ProximityMineBehavior(
+        player.id, player.team, damage=100.0, block_damage=3.0,
+        crater_radius=1, kill_type=KILL_TYPES.get("LANDMINE_KILL", 14),
+        trigger_radius=2.5, arm_delay=1.0)
+    ent = server.entity_registry.place(
+        int(getattr(C, "LANDMINE_ENTITY", 9)), pos[0], pos[1], pos[2],
+        state=internal_team_to_wire(player.team), kind="deployable",
+        player_id=player.id, behavior=behavior)
+    server.broadcast_create_entity(ent)
+    logger.info("LANDMINE placed by %s at %s", player.name, pos)
+
+
 @register_handler(95)  # DisguisePacket
 async def handle_disguise(server, player, packet):
     """Specialist toggled disguise. Tracked server-side; the visual (rendering

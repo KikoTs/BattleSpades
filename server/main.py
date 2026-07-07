@@ -309,19 +309,28 @@ class BattleSpadesServer:
             if self.entity_registry.remove(eid) is not None:
                 self.broadcast_destroy_entity(eid)
 
-        # Crater: 3x3x3 centered on the impact cell. Warheads whose per-block
-        # damage meets the default block health destroy outright (grenade
-        # family, RPG, drill); weaker ones (RPG2: 2) accumulate block damage
-        # through the combat system so repeated hits break through.
+        # Projectiles that don't self-destroy blocks (RPG2, block_damage 2)
+        # ACCUMULATE damage; grenade-family + strong warheads destroy outright.
+        force_destroy = ex.spec.behavior != "contact"
+        self._apply_blast(gx, gy, gz, ex.damage, ex.block_damage,
+                          ex.spec.kill_type, thrower, crater_radius=1,
+                          force_destroy=force_destroy)
+
+    def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
+                     crater_radius: int = 1, force_destroy: bool = True) -> None:
+        """Shared explosion: crater a cube of `crater_radius` and damage nearby
+        players with the live-verified falloff. Used by projectiles AND
+        deployables (dynamite/landmine/C4)."""
         bx, by, bz = int(gx), int(gy), int(gz)
+        r = max(1, int(crater_radius))
         positions = [
             (ax, ay, az)
-            for ax in range(bx - 1, bx + 2)
-            for ay in range(by - 1, by + 2)
-            for az in range(bz - 1, bz + 2)
+            for ax in range(bx - r, bx + r + 1)
+            for ay in range(by - r, by + r + 1)
+            for az in range(bz - r, bz + r + 1)
         ]
-        if getattr(self.config, "build_damage", True) and ex.block_damage > 0.0:
-            if ex.block_damage >= DEFAULT_BLOCK_HEALTH or ex.spec.behavior != "contact":
+        if getattr(self.config, "build_damage", True) and block_damage > 0.0:
+            if block_damage >= DEFAULT_BLOCK_HEALTH or force_destroy:
                 destroyed = self.world_manager.destroy_blocks(positions)
                 if destroyed:
                     get_combat_system(self)._broadcast_block_destroy(
@@ -331,13 +340,12 @@ class BattleSpadesServer:
                 combat = get_combat_system(self)
                 for block in positions:
                     if self.world_manager.get_solid(*block):
-                        combat._apply_block_damage(thrower, block, ex.block_damage)
+                        combat._apply_block_damage(thrower, block, block_damage)
 
         # Player blast damage: within 16 blocks, LOS-gated. Same falloff CURVE
         # as the live-verified grenade (min(100, 4096/sq)), scaled to each
-        # warhead's max damage so a 140-damage rocket and a 10-damage snowball
-        # share the verified shape.
-        scale = ex.damage / 100.0
+        # warhead's max damage.
+        scale = damage / 100.0
         for target in list(self.players.values()):
             if not target.alive or not target.spawned:
                 continue
@@ -347,22 +355,11 @@ class BattleSpadesServer:
             sq = dx * dx + dy * dy + dz * dz
             if sq >= 256.0:  # 16 blocks
                 continue
-            # LOS: reject if a solid block sits between the blast and target.
             if self._blocked_los(gx, gy, gz, target.x, target.y, target.z):
                 continue
-            damage = ex.damage if sq <= 1.0 else min(ex.damage, (4096.0 / sq) * scale)
-            dmg = int(round(damage))
+            dmg = int(round(damage if sq <= 1.0 else min(damage, (4096.0 / sq) * scale)))
             if dmg > 0:
-                target.damage(dmg, source=thrower, kill_type=ex.spec.kill_type)
-
-        # Route blast damage to damageable entities (future deployables:
-        # turrets, mines, C4...). No-ops today — nothing sets takes_damage yet.
-        ctx = self._build_entity_ctx()
-        for ent in self.entity_registry.all():
-            if ent.alive and ent.behavior is not None and ent.behavior.takes_damage:
-                dxe, dye, dze = ent.x - gx, ent.y - gy, ent.z - gz
-                if dxe * dxe + dye * dye + dze * dze < 64.0:  # 8 blocks
-                    self.entity_registry.damage_entity(ent.entity_id, ex.damage, thrower, ctx)
+                target.damage(dmg, source=thrower, kill_type=int(kill_type))
 
     def _blocked_los(self, x0, y0, z0, x1, y1, z1) -> bool:
         dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
