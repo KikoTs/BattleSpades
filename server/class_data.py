@@ -266,17 +266,19 @@ def _build_damage_table() -> dict[int, ClassDamage]:
         table[cid] = ClassDamage(class_id=cid,
                                   damage_multiplier=g1.damage_multiplier,
                                   headshot_multiplier=g1.headshot_multiplier)
-    # Unknown — use soldier
-    soldier = table[int(C.CLASS_SOLDIER)]
-    for cid in (int(C.CLASS_FAST_ZOMBIE), int(C.CLASS_JUMP_ZOMBIE),
-                int(C.CLASS_SPECIALIST), int(C.CLASS_MEDIC)):
-        if cid in (int(C.CLASS_FAST_ZOMBIE), int(C.CLASS_JUMP_ZOMBIE)):
-            base = table[int(C.CLASS_ZOMBIE)]
-        else:
-            base = soldier
+    # Classes without named damage constants: use the ground-truth values
+    # extracted from the client (docs/CONTENT_TABLES.md §2) rather than cloning
+    # soldier/zombie. (damage_multiplier, headshot_multiplier)
+    explicit_damage = {
+        int(C.CLASS_FAST_ZOMBIE): (0.5, 2.5),
+        int(C.CLASS_JUMP_ZOMBIE): (0.5, 1.5),
+        int(C.CLASS_SPECIALIST):  (1.1765, 1.5),
+        int(C.CLASS_MEDIC):       (1.0, 1.0),
+    }
+    for cid, (dmg, head) in explicit_damage.items():
         table[cid] = ClassDamage(class_id=cid,
-                                  damage_multiplier=base.damage_multiplier,
-                                  headshot_multiplier=base.headshot_multiplier)
+                                 damage_multiplier=dmg,
+                                 headshot_multiplier=head)
     return table
 
 
@@ -285,3 +287,119 @@ DAMAGE: dict[int, ClassDamage] = _build_damage_table()
 
 def get_damage(class_id: int) -> ClassDamage:
     return DAMAGE.get(int(class_id), DAMAGE[int(C.CLASS_SOLDIER)])
+
+
+# ---------------------------------------------------------------------------
+# Per-class loadouts (selectable tool options + jetpack)
+# ---------------------------------------------------------------------------
+#
+# Each slot lists the tool ids the class may equip in that slot; the client
+# lets the player pick one per slot (SetClassLoadout). default_loadout() takes
+# the first of each. Sourced from CLASS_ITEMS (docs/CONTENT_TABLES.md §2).
+
+def _t(name: str) -> int:
+    return int(getattr(C, name))
+
+
+@dataclass(frozen=True)
+class ClassLoadout:
+    class_id: int
+    primary: tuple[int, ...]
+    secondary: tuple[int, ...]
+    equipment: tuple[int, ...]
+    melee: tuple[int, ...]
+    jetpack: int  # NO_JETPACK when the class has none
+
+
+NO_JETPACK = _t("NO_JETPACK")
+
+
+def _build_loadout_table() -> dict[int, ClassLoadout]:
+    table: dict[int, ClassLoadout] = {}
+
+    def add(cid, primary=(), secondary=(), equipment=(), melee=(), jetpack="NO_JETPACK"):
+        table[int(cid)] = ClassLoadout(
+            class_id=int(cid),
+            primary=tuple(_t(n) for n in primary),
+            secondary=tuple(_t(n) for n in secondary),
+            equipment=tuple(_t(n) for n in equipment),
+            melee=tuple(_t(n) for n in melee),
+            jetpack=_t(jetpack),
+        )
+
+    add(C.CLASS_SOLDIER,
+        primary=("MINIGUN_TOOL", "ASSAULT_RIFLE_TOOL"),
+        secondary=("RPG_TOOL", "RPG2_TOOL"),
+        equipment=("GRENADE_TOOL", "ANTIPERSONNEL_GRENADE_TOOL"),
+        melee=("SPADE_TOOL", "KNIFE_TOOL"))
+    add(C.CLASS_SCOUT,
+        primary=("SNIPER_TOOL", "SNIPER2_TOOL"),
+        secondary=("PISTOL_TOOL", "AUTOMATIC_PISTOL_TOOL"),
+        equipment=("LANDMINE_TOOL", "RADAR_STATION_TOOL"),
+        melee=("PICKAXE_TOOL", "KNIFE_TOOL"))
+    add(C.CLASS_ROCKETEER,
+        primary=("SMG_TOOL",),
+        secondary=("ROCKET_TURRET_TOOL", "GRENADE_TOOL"),
+        melee=("SPADE_TOOL", "PICKAXE_TOOL"),
+        jetpack="JETPACK2")
+    add(C.CLASS_MINER,
+        primary=("SHOTGUN_TOOL", "SHOTGUN2_TOOL"),
+        secondary=("DRILLGUN_TOOL", "BLOCK_SUCKER_TOOL"),
+        equipment=("DYNAMITE_TOOL", "C4_TOOL"),
+        melee=("SUPERSPADE_TOOL",))
+    add(C.CLASS_ZOMBIE, primary=("ZOMBIEHAND_TOOL",))
+    add(C.CLASS_CLASSIC_SOLDIER,
+        primary=("RIFLE_TOOL", "CLASSIC_SMG_TOOL", "CLASSIC_SHOTGUN_TOOL"),
+        equipment=("CLASSIC_GRENADE_TOOL",),
+        melee=("CLASSIC_SPADE_TOOL",))
+    # Gangster variants (mafia team) all share the same loadout.
+    for gc in (C.CLASS_GANGSTER_1, C.CLASS_GANGSTER_2, C.CLASS_GANGSTER_3,
+               C.CLASS_GANGSTER_4, C.CLASS_GANGSTER_VIP_1, C.CLASS_GANGSTER_VIP_2):
+        add(gc,
+            primary=("TOMMYGUN_TOOL",),
+            secondary=("SNUB_PISTOL_TOOL",),
+            equipment=("MOLOTOV_TOOL",),
+            melee=("CROWBAR_TOOL",))
+    add(C.CLASS_ENGINEER,
+        primary=("SMG_TOOL",),
+        secondary=("ROCKET_TURRET_TOOL", "SNOWBLOWER_TOOL", "MINE_LAUNCHER_TOOL"),
+        equipment=("DISGUISE_TOOL",),
+        melee=("PICKAXE_TOOL",),
+        jetpack="JETPACK_ENGINEER")
+    add(C.CLASS_UGCBUILDER,
+        primary=("UGC_DRILLGUN_TOOL",),
+        secondary=("UGC_SNOWBLOWER_TOOL",),
+        melee=("UGC_SUPERSPADE_TOOL",),
+        jetpack="JETPACK_UGCBUILDER")
+    add(C.CLASS_FAST_ZOMBIE, primary=("ZOMBIEHAND_TOOL",))
+    add(C.CLASS_JUMP_ZOMBIE, primary=("ZOMBIEHAND_TOOL",))
+    add(C.CLASS_SPECIALIST,
+        primary=("AUTO_SHOTGUN_TOOL", "SMG_TOOL"),
+        secondary=("AUTOMATIC_PISTOL_TOOL", "GRENADE_LAUNCHER_WEAPON_TOOL"),
+        equipment=("CHEMICALBOMB_TOOL", "STICKY_GRENADE_TOOL"),
+        melee=("SPADE_TOOL", "MACHETE_TOOL"))
+    add(C.CLASS_MEDIC,
+        primary=("LIGHT_MACHINE_GUN_TOOL", "SHOTGUN2_TOOL"),
+        secondary=("RIOTSHIELD_TOOL",),
+        equipment=("MEDPACK_TOOL",),
+        melee=("PICKAXE_TOOL", "RIOTSTICK_TOOL"))
+    return table
+
+
+LOADOUTS: dict[int, ClassLoadout] = _build_loadout_table()
+
+
+def get_loadout(class_id: int) -> ClassLoadout:
+    return LOADOUTS.get(int(class_id), LOADOUTS[int(C.CLASS_SOLDIER)])
+
+
+def default_loadout(class_id: int) -> dict[str, int]:
+    """The default tool in each slot (first option) for a class."""
+    lo = get_loadout(class_id)
+    return {
+        "primary": lo.primary[0] if lo.primary else -1,
+        "secondary": lo.secondary[0] if lo.secondary else -1,
+        "equipment": lo.equipment[0] if lo.equipment else -1,
+        "melee": lo.melee[0] if lo.melee else -1,
+        "jetpack": lo.jetpack,
+    }

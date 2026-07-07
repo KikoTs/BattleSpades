@@ -47,29 +47,49 @@ async def cmd_kick(ctx: CommandContext):
     description="Ban a player from the server",
 )
 async def cmd_ban(ctx: CommandContext):
-    """Ban a player."""
+    """Ban a player. /ban <player> [duration] [reason].
+
+    Duration accepts 30m / 2h / 1d / 90 (seconds) / perma. If the second arg
+    isn't a duration it's treated as the start of the reason (permanent ban).
+    """
     if not ctx.args:
         await send_message(ctx.server, ctx.player, "Usage: /ban <player> [duration] [reason]")
         return
-    
+
+    from server.bans import parse_duration, address_host
+
     target_name = ctx.args[0]
-    # TODO: Parse duration and reason
-    reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "Banned by admin"
-    
+
+    # Second token may be a duration or the first word of the reason.
+    rest = ctx.args[1:]
+    duration = 0
+    if rest:
+        parsed = parse_duration(rest[0])
+        if parsed >= 0:
+            duration = parsed
+            rest = rest[1:]
+    reason = " ".join(rest) if rest else "Banned by admin"
+
     target = ctx.server.get_player_by_name(target_name)
     if not target:
         await send_message(ctx.server, ctx.player, f"Player not found: {target_name}")
         return
-    
-    # TODO: Add to ban list
-    
-    msg = f"{target.name} was banned: {reason}"
+
+    # Persist the ban keyed by IP so it survives reconnects and restarts.
+    ip = None
+    if target.connection and getattr(target.connection, "peer", None) is not None:
+        ip = address_host(target.connection.peer)
+    if ip:
+        ctx.server.ban_manager.add(ip, target.name, reason, duration)
+
+    when = "permanently" if duration <= 0 else f"for {ctx.args[1]}"
+    msg = f"{target.name} was banned {when}: {reason}"
     packet = ChatMessage()
     packet.player_id = 255
     packet.chat_type = CHAT_SYSTEM
     packet.value = msg
     ctx.server.broadcast(bytes(packet.generate()))
-    
+
     target.disconnect(reason=1)  # DISCONNECT_BANNED
 
 
@@ -187,9 +207,12 @@ async def cmd_god(ctx: CommandContext):
             return
     else:
         target = ctx.player
-    
-    # TODO: Implement god mode flag
-    await send_message(ctx.server, ctx.player, f"God mode toggled for {target.name}")
+
+    target.god_mode = not target.god_mode
+    state = "ON" if target.god_mode else "OFF"
+    await send_message(ctx.server, ctx.player, f"God mode {state} for {target.name}")
+    if target is not ctx.player:
+        await send_message(ctx.server, target, f"An admin set your god mode {state}.")
 
 
 @register_command(

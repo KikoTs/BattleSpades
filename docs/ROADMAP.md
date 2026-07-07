@@ -34,10 +34,33 @@ playable and hostable, and so it's a clean base others can build on or port.
 - **Stability:** reconnect / ENet peer-lifecycle hardening for long-running
   public servers.
 
-## Content 🗺️
+## The full game — content build-out 🗺️
+
+The 1.x client ships far more than the server implements today. The goal is the
+**complete** game, built dependency-first so foundational systems are shared and
+modes stack on top of them (the systems built for TDM get reused for Zombie with
+different props). The full inventory: **13 game modes**, **66 weapons/tools**,
+**18 classes**, **40 entity types**, plus deployables, projectiles, and jetpacks.
+
+Layered plan (`data → systems → modes → presentation`):
+
+1. **Foundations — data:** a real per-weapon profile for all 66 tools and real
+   per-class stats + loadouts, sourced from the original client's constants.
+2. **Foundations — systems:** a tickable **entity behavior system** (respawns,
+   touch/damage hooks, server-side collision), a **projectile engine** (grenades,
+   molotov, RPG rockets, drill, snowball, mine-launcher), **deployables** (turrets,
+   landmines, C4, dynamite, medpacks, radar), and status effects (fire, disguise,
+   jetpack).
+3. **Modes:** Team Deathmatch, Capture the Flag (+ Classic), Territory Control,
+   Multi-Hill, **Zombie**, VIP, Demolition, Occupation, Diamond Mine, Tutorial,
+   and the UGC map-creator mode — each composing the systems above.
+4. **Presentation:** end-of-round scoreboard, per-player scores, HUD round timer,
+   sounds, minimap objectives, and vote-kick.
+
+The full protocol surface (~119 packets) is kept and documented in
+[`PROTOCOL.md`](PROTOCOL.md); each feature lights up the packets it needs.
 
 - More stock and community maps.
-- Additional weapons, tools, and classes from the 1.x arsenal.
 - Configurable game rules per mode.
 
 ## The big one — native ENet 🧩

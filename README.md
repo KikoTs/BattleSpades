@@ -97,7 +97,7 @@ python run_server.py                     # start the server on port 27015
 | **Pickups** | Ammo / health crates, restock on spawn |
 | **Combat lifecycle** | Damage, kills, kill feed, death → grave entity → timed respawn |
 | **Game modes** | Team Deathmatch, Capture the Flag, Arena (round-based) |
-| **Bots** | Human-like AI (aim error/slew, reaction delay, burst fire + reload, strafing, line-of-sight) — great for solo testing |
+| **Bots** | Basic combat AI (aim error/slew, reaction delay, burst fire + reload, strafing, line-of-sight) — handy for solo testing; smarter objective-aware bots are on the roadmap |
 | **Map transfer** | Full VXL streaming with correct CRC validation |
 | **Admin / chat** | Player + admin command set, team management |
 
@@ -227,10 +227,12 @@ can appear in server browsers that support the 1.x protocol.
 
 ## Commands
 
-**Player** — `/help`, `/kill`, `/team <blue|green>`, `/score`, `/players`, `/pm <player> <msg>`
+**Player** — `/help`, `/kill`, `/team <blue|green>`, `/score`, `/players`,
+`/pm <player> <msg>`, `/me <action>`, `/stats`, `/ping`
 
-**Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/map <name>`,
-`/mode <ctf|tdm|arena>`, `/tp <player>`
+**Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
+`/tp <player>`, `/god`, `/map <name>`, `/mode <ctf|tdm>`, `/restart`, `/say <msg>`,
+`/fog <r> <g> <b>`, `/time`, `/balance`
 
 ## Testing & tooling
 

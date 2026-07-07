@@ -199,9 +199,17 @@ async def cmd_me(ctx: CommandContext):
     description="Show your ping",
 )
 async def cmd_ping(ctx: CommandContext):
-    """Show ping."""
-    # TODO: Get actual ping from connection
-    await send_message(ctx.server, ctx.player, "Pong!")
+    """Show ping (ENet round-trip time)."""
+    rtt = None
+    conn = getattr(ctx.player, "connection", None)
+    peer = getattr(conn, "peer", None) if conn else None
+    if peer is not None:
+        # pyenet exposes the smoothed RTT in milliseconds.
+        rtt = getattr(peer, "roundTripTime", None)
+    if rtt is None:
+        await send_message(ctx.server, ctx.player, "Ping unavailable (no active connection).")
+    else:
+        await send_message(ctx.server, ctx.player, f"Your ping: {int(rtt)} ms")
 
 
 @register_command(

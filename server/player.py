@@ -231,6 +231,7 @@ class Player:
         self.alive: bool = False
         self.admin: bool = False
         self.muted: bool = False
+        self.god_mode: bool = False
         self.grounded: bool = True
         self.airborne: bool = False
         self.wade: bool = False
@@ -765,6 +766,8 @@ class Player:
 
     def damage(self, amount: int, source: Optional["Player"] = None, kill_type: int = 0) -> bool:
         if not self.alive:
+            return False
+        if self.god_mode:
             return False
 
         amount = max(0, int(round(amount)))

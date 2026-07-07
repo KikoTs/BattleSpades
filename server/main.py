@@ -79,6 +79,14 @@ class BattleSpadesServer:
         # crates live here and reach clients via StateData (join) + CreateEntity.
         from server.entities.registry import EntityRegistry
         self.entity_registry = EntityRegistry()
+        # Plugin system: loaded at startup, fired at the mode-event + tick
+        # dispatch points below. Drop a *.py with a BasePlugin subclass in
+        # plugins/ and it's auto-discovered.
+        from plugins.base_plugin import PluginManager
+        self.plugin_manager = PluginManager(self)
+        # Persistent ban list (bans.json), enforced on connect.
+        from server.bans import BanManager
+        self.ban_manager = BanManager()
         # In-flight thrown grenades (server-authoritative blast). Each is a
         # dict: {x,y,z, vx,vy,vz, explode_at, thrower_id}.
         self.pending_grenades: list = []
@@ -130,6 +138,32 @@ class BattleSpadesServer:
             if i not in self.players and i not in self.reserved_player_ids:
                 return i
         return -1
+
+    async def _load_plugins(self) -> None:
+        """Discover and load every BasePlugin subclass in the plugins/ package
+        (any *.py except the base/dunder files). Failures are logged, never
+        fatal — a bad plugin can't take the server down."""
+        import importlib
+        import inspect
+        import pkgutil
+        import plugins as plugins_pkg
+        from plugins.base_plugin import BasePlugin
+
+        loaded = 0
+        for mod_info in pkgutil.iter_modules(plugins_pkg.__path__):
+            if mod_info.name in ("base_plugin",) or mod_info.name.startswith("_"):
+                continue
+            try:
+                module = importlib.import_module(f"plugins.{mod_info.name}")
+            except Exception:
+                logger.error("Failed to import plugin module %s", mod_info.name, exc_info=True)
+                continue
+            for _, obj in inspect.getmembers(module, inspect.isclass):
+                if issubclass(obj, BasePlugin) and obj is not BasePlugin and obj.__module__ == module.__name__:
+                    if await self.plugin_manager.load_plugin(obj):
+                        loaded += 1
+        if loaded:
+            logger.info("Loaded %d plugin(s)", loaded)
 
     def queue_mode_event(self, name: str, *args) -> None:
         """Queue a game-logic event for the active mode. Drained once per tick
@@ -506,6 +540,9 @@ class BattleSpadesServer:
             self.mode = mode_class(self)
             await self.mode.on_mode_start()
 
+        # Auto-discover + load plugins from the plugins/ package.
+        await self._load_plugins()
+
         # Dev bots: spawn after the mode is up so they join the active match.
         bot_count = int(getattr(self.config, "bot_count", 0) or 0)
         if bot_count > 0:
@@ -676,6 +713,11 @@ class BattleSpadesServer:
                             handler = getattr(self.mode, name, None)
                             if handler is not None:
                                 await handler(*args)
+                            # Fan the same event out to plugins (they hook the
+                            # same names: on_player_spawn/kill/join/leave/...).
+                            await self.plugin_manager.call_event(name, *args)
+                # Per-tick plugin hook.
+                await self.plugin_manager.call_event('on_tick', self.loop_count)
 
                 # Respawn scheduler (mode-agnostic): bring dead players back
                 # after config.respawn_time. snapshot the list — spawn()
@@ -843,7 +885,18 @@ class BattleSpadesServer:
     def _on_connect_sync(self, peer, data: int = 0):
         """Handle new connection (sync version for net_update)."""
         logger.info(f"New connection from {peer.address} (proto_ver={data})")
-        
+
+        # Reject banned IPs before we allocate any state for them.
+        from server.bans import address_host
+        ban = self.ban_manager.is_banned(address_host(peer))
+        if ban is not None:
+            logger.info("Rejected banned client %s (%s)", peer.address, ban.get("reason"))
+            try:
+                peer.disconnect(1)  # DISCONNECT_BANNED
+            except Exception:
+                pass
+            return
+
         # Check if connection already exists
         connection = self.connections.get(peer)
         if connection is None:

@@ -139,10 +139,11 @@ def test_rifle_body_hit_sends_hp_and_broadcasts_shot():
 
     asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker).generate())))
 
-    assert target.health == 50
+    # RIFLE torso damage = 70 (real client value); soldier damage_multiplier 1.0.
+    assert target.health == 30
     assert server.broadcast_packets[0][0] == 6
     hp_packet = SetHP(ByteReader(target_connection.sent_packets[0][1:]))
-    assert hp_packet.hp == 50
+    assert hp_packet.hp == 30
     assert hp_packet.damage_type == 1
 
 
@@ -227,7 +228,8 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
 
     asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker, seed=4).generate())))
 
-    assert target.health == 50
+    # One rifle body hit after the wall breaks: 100 - 70 = 30.
+    assert target.health == 30
 
 
 def test_build_damage_flag_disables_weapon_block_damage():
