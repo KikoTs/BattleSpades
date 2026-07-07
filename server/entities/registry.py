@@ -17,14 +17,28 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from shared.packet import Entity
 
 from server.game_constants import TEAM_NEUTRAL
+from server.entities.behaviors import EntityBehavior
 
 # Entity sits flat on the ground, default +Z up face.
 _FACE_UP = 4
+
+
+@dataclass
+class EntityContext:
+    """Per-tick context handed to entity behaviors. Built once per frame in the
+    server loop so behaviors never touch sockets/players directly."""
+    dt: float
+    now: float
+    players: list                                  # alive + spawned players
+    world: object = None                           # world_manager
+    server: object = None
+    create: Optional[Callable] = None              # broadcast_create_entity
+    destroy: Optional[Callable] = None             # broadcast_destroy_entity
 
 
 @dataclass
@@ -42,6 +56,9 @@ class MapEntity:
     alive: bool = True
     respawn_at: float = 0.0
     home: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Optional server-side behavior (Phase-2). Runtime only — NEVER serialized
+    # (to_wire_entity does not read it, so the wire output stays byte-identical).
+    behavior: Optional[EntityBehavior] = None
 
     def to_wire_entity(self) -> Entity:
         ent = Entity()
@@ -78,12 +95,12 @@ class EntityRegistry:
 
     def place(self, type: int, x: float, y: float, z: float, *,
               state: int = TEAM_NEUTRAL, color=None, kind: str = "crate",
-              player_id: int = 0) -> MapEntity:
+              player_id: int = 0, behavior: Optional[EntityBehavior] = None) -> MapEntity:
         ent = MapEntity(
             entity_id=self.allocate_id(), type=int(type),
             x=float(x), y=float(y), z=float(z),
             state=int(state), color=color, kind=kind, player_id=int(player_id),
-            home=(float(x), float(y), float(z)),
+            home=(float(x), float(y), float(z)), behavior=behavior,
         )
         self._entities[ent.entity_id] = ent
         return ent
@@ -111,3 +128,51 @@ class EntityRegistry:
             now = time.time()
         return [e for e in self._entities.values()
                 if not e.alive and e.respawn_at > 0.0 and now >= e.respawn_at]
+
+    # ------------------------------------------------------------------
+    # Per-tick behavior driver (Phase-2)
+    # ------------------------------------------------------------------
+
+    def tick(self, ctx: EntityContext) -> None:
+        """Advance all entity behaviors for one frame: on_tick, proximity
+        touch, then due respawns. Replaces the ad-hoc crate polling that used
+        to live in the server loop. Pure computation + broadcast callbacks —
+        no I/O, safe to call synchronously in the 60 Hz loop."""
+        # 1. per-entity on_tick (only alive entities whose behavior overrides it)
+        for ent in list(self._entities.values()):
+            b = ent.behavior
+            if ent.alive and b is not None and type(b).on_tick is not EntityBehavior.on_tick:
+                b.on_tick(ent, ctx.dt, ctx)
+
+        # 2. proximity touch (alive entities with a touch radius vs alive players)
+        touchers = [e for e in self._entities.values()
+                    if e.alive and e.behavior is not None and e.behavior.touch_radius > 0.0]
+        if touchers and ctx.players:
+            for player in ctx.players:
+                for ent in touchers:
+                    if not ent.alive:          # a prior touch this tick despawned it
+                        continue
+                    r = ent.behavior.touch_radius
+                    dx = player.x - ent.x
+                    dy = player.y - ent.y
+                    dz = player.z - ent.z
+                    if (dx * dx + dy * dy + dz * dz) <= r * r:
+                        ent.behavior.on_touch(ent, player, ctx)
+
+        # 3. respawns (re-create entities whose timer elapsed)
+        for ent in self.due_respawns(ctx.now):
+            ent.alive = True
+            ent.respawn_at = 0.0
+            if ctx.create is not None:
+                ctx.create(ent)
+
+    def damage_entity(self, entity_id: int, amount: float, source, ctx: EntityContext) -> None:
+        """Route damage to an entity's behavior (deployables, diggable graves,
+        ...). No-op unless the entity is alive and its behavior takes damage."""
+        ent = self._entities.get(int(entity_id))
+        if ent is None or not ent.alive:
+            return
+        b = ent.behavior
+        if b is None or not b.takes_damage:
+            return
+        b.on_damage(ent, amount, source, ctx)

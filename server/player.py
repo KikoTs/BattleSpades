@@ -839,10 +839,12 @@ class Player:
             if reg is not None and getattr(server.config, "entities_wire_ready", False):
                 try:
                     from server.game_constants import TEAM_NEUTRAL
+                    from server.entities.behaviors import GraveBehavior
                     grave = reg.place(
                         int(getattr(C, "GRAVE_ENTITY", 11)),
                         self.x, self.y, self.z,
                         state=TEAM_NEUTRAL, kind="grave", player_id=self.id,
+                        behavior=GraveBehavior(),
                     )
                     self._grave_entity_id = grave.entity_id
                     server.broadcast_create_entity(grave)

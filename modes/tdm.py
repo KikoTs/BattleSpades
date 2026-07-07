@@ -9,7 +9,8 @@ from typing import Optional, TYPE_CHECKING
 import shared.constants as C
 
 from server import mode_data
-from server.game_constants import KILL_HEADSHOT, TEAM_NEUTRAL, TEAM1, TEAM2
+from server.game_constants import KILL_HEADSHOT, MAX_HEALTH, TEAM_NEUTRAL, TEAM1, TEAM2
+from server.entities.behaviors import PickupCrateBehavior
 
 from .base_mode import BaseMode
 
@@ -88,14 +89,20 @@ class TDMMode(BaseMode):
         spots.append((256.0, 256.0))
         spots.append((260.0, 260.0))
 
-        # Alternate ammo / health.
+        # Alternate ammo / health. One shared behavior instance per crate type
+        # (the entity is passed into each hook, so instances are reusable).
         types = [C.AMMO_CRATE, C.HEALTH_CRATE]
+        ammo_behavior = PickupCrateBehavior(lambda p: p.restock_ammo(), respawn_delay=15.0)
+        health_behavior = PickupCrateBehavior(lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0)
         placed = 0
         for i, (sx, sy) in enumerate(spots):
             x, y, z = wm.dry_ground_anchor(sx, sy)
             etype = types[i % 2]
-            kind = "ammo" if etype == C.AMMO_CRATE else "health"
-            ent = reg.place(etype, x, y, z, state=TEAM_NEUTRAL, kind=kind)
+            if etype == C.AMMO_CRATE:
+                kind, behavior = "ammo", ammo_behavior
+            else:
+                kind, behavior = "health", health_behavior
+            ent = reg.place(etype, x, y, z, state=TEAM_NEUTRAL, kind=kind, behavior=behavior)
             # Only put crates on the wire once the Entity format is verified
             # against the compiled client (a mismatch crashes it). Registered
             # server-side either way.

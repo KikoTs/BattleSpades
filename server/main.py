@@ -355,45 +355,20 @@ class BattleSpadesServer:
         hit = self.world_manager.raycast(x0, y0, z0, dx / dist, dy / dist, dz / dist, dist - 0.5)
         return hit is not None
 
-    async def _check_crate_pickups(self) -> None:
-        """Per-tick: refill ammo/health for players standing on a crate, then
-        despawn the crate and schedule its respawn. Without this, crates
-        render but grant nothing (there was NO server-side pickup logic)."""
-        reg = getattr(self, 'entity_registry', None)
-        if reg is None or not self.players:
-            return
-        import shared.constants as C
-        crates = [e for e in reg.all()
-                  if e.alive and e.type in (int(C.AMMO_CRATE), int(C.HEALTH_CRATE))]
-        if not crates:
-            return
-        now = time.time()
-        pickup_r2 = 3.0 * 3.0  # ~3 block pickup radius, squared
-        for player in self.players.values():
-            if not player.alive or not player.spawned:
-                continue
-            for ent in crates:
-                if not ent.alive:
-                    continue
-                dx = player.x - ent.x
-                dy = player.y - ent.y
-                dz = player.z - ent.z
-                if (dx * dx + dy * dy + dz * dz) > pickup_r2:
-                    continue
-                if ent.type == int(C.AMMO_CRATE):
-                    player.restock_ammo()
-                else:
-                    player.heal(MAX_HEALTH)
-                # Despawn + schedule respawn (~15s), tell clients.
-                ent.alive = False
-                ent.respawn_at = now + 15.0
-                self.broadcast_destroy_entity(ent.entity_id)
-
-        # Re-create crates whose respawn timer elapsed.
-        for ent in reg.due_respawns(now):
-            ent.alive = True
-            ent.respawn_at = 0.0
-            self.broadcast_create_entity(ent)
+    def _build_entity_ctx(self):
+        """Build the per-tick EntityContext handed to entity behaviors. Players
+        are pre-filtered to alive + spawned so behaviors never re-check."""
+        from server.entities.registry import EntityContext
+        players = [p for p in self.players.values() if p.alive and p.spawned]
+        return EntityContext(
+            dt=self.tick_interval,
+            now=time.time(),
+            players=players,
+            world=self.world_manager,
+            server=self,
+            create=self.broadcast_create_entity,
+            destroy=self.broadcast_destroy_entity,
+        )
 
     def _broadcast_create_player(self, player, spawn) -> None:
         """Re-announce a (re)spawned player to all clients as alive."""
@@ -724,8 +699,9 @@ class BattleSpadesServer:
                 # doesn't mutate self.players but a handler might.
                 await self._process_respawns()
 
-                # Ammo/health crate pickups + crate respawn.
-                await self._check_crate_pickups()
+                # Entity behaviors: crate pickups + respawn, and any future
+                # tickable entities (deployables, capture points, ...).
+                self.entity_registry.tick(self._build_entity_ctx())
 
                 # In-flight grenade fuses / detonation.
                 self._update_grenades(self.tick_interval)
