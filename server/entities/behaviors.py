@@ -43,7 +43,10 @@ class PickupCrateBehavior(EntityBehavior):
     ``_check_crate_pickups`` behavior (a full player still consumes the crate).
     """
 
-    touch_radius = 3.0            # ~3-block pickup radius (squared in registry)
+    # The client's own crate pickup range (CRATE_DISTANCE = 2.5). The old 3.0
+    # radius + closely spaced crates let one walk-through consume BOTH the
+    # ammo and health crate at once ("everything replenishes everything").
+    touch_radius = 2.5
 
     def __init__(self, refill, respawn_delay: float = 15.0):
         self.refill = refill

@@ -166,6 +166,47 @@ def test_grave_is_inert_and_explicitly_removable():
     assert reg.get(g.entity_id) is None
 
 
+# --- crate separation + block crate ------------------------------------------
+
+def test_pickup_radius_matches_client_crate_distance():
+    # CRATE_DISTANCE = 2.5 in the client; a wider radius plus close crates let
+    # one walk-through consume ammo AND health at once.
+    assert PickupCrateBehavior(lambda p: None).touch_radius == 2.5
+
+
+def test_adjacent_crates_no_longer_double_trigger():
+    """Two crates 8 blocks apart: a player at one must NOT trigger the other."""
+    reg = EntityRegistry()
+    a = ammo_crate(reg, 100.0, 100.0, 60.0)
+    b = ammo_crate(reg, 108.0, 100.0, 60.0)
+    p = FakePlayer(100.0, 100.0, 60.0)
+    reg.tick(ctx([p]))
+    assert p.restocked == 1          # only the near crate
+    assert a.alive is False
+    assert b.alive is True
+
+
+def test_block_crate_refills_blocks_only():
+    class BlockPlayer(FakePlayer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.blocks = 10
+            self.movement_profile = SimpleNamespace(max_blocks=1000)
+
+        def add_blocks(self, n):
+            self.blocks = min(self.movement_profile.max_blocks, self.blocks + n)
+
+    reg = EntityRegistry()
+    behavior = PickupCrateBehavior(
+        lambda p: p.add_blocks(p.movement_profile.max_blocks), respawn_delay=15.0)
+    reg.place(int(getattr(C, "BLOCK_CRATE", 5)), 100.0, 100.0, 60.0, behavior=behavior)
+    p = BlockPlayer(100.0, 100.0, 60.0)
+    reg.tick(ctx([p]))
+    assert p.blocks == 1000          # blocks topped up
+    assert p.restocked == 0          # ammo untouched
+    assert p.healed == 0             # health untouched
+
+
 # --- wire-safety regression guard ------------------------------------------
 
 def test_behavior_does_not_change_wire_bytes():

@@ -179,6 +179,10 @@ class CombatSystem:
         destroyed = self.server.world_manager.destroy_blocks(positions)
         if not destroyed:
             return False
+        # Mining replenishes the digger's block inventory (+1 per block, class
+        # max cap) — mirrors the client's own local count so the server-side
+        # budget (which gates prefab placement) doesn't drift.
+        player.add_blocks(len(destroyed))
         self._broadcast_block_destroy(player, destroyed)
         return True
 

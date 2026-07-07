@@ -79,29 +79,36 @@ class TDMMode(BaseMode):
             return
         reg.clear()
 
+        # Three crate types per base + midfield, spaced 8 blocks apart so the
+        # 2.5-block pickup radii can never overlap (overlap made one
+        # walk-through consume ammo AND health at once).
         spots = []
         for team in (TEAM1, TEAM2):
             bx, by, _bz = wm.team_base_anchor(team)
-            # Two crates a few blocks apart near the base.
-            spots.append((bx + 3.0, by))
-            spots.append((bx - 3.0, by))
-        # Midfield neutral crates.
+            spots.append((bx + 8.0, by))
+            spots.append((bx - 8.0, by))
+            spots.append((bx, by + 8.0))
+        spots.append((248.0, 256.0))
         spots.append((256.0, 256.0))
-        spots.append((260.0, 260.0))
+        spots.append((264.0, 256.0))
 
-        # Alternate ammo / health. One shared behavior instance per crate type
-        # (the entity is passed into each hook, so instances are reusable).
-        types = [C.AMMO_CRATE, C.HEALTH_CRATE]
-        ammo_behavior = PickupCrateBehavior(lambda p: p.restock_ammo(), respawn_delay=15.0)
-        health_behavior = PickupCrateBehavior(lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0)
+        # One shared behavior instance per crate type (the entity is passed
+        # into each hook, so instances are reusable). Each crate refills ONLY
+        # its own resource; block crates top up the block inventory.
+        types = [C.AMMO_CRATE, C.HEALTH_CRATE, int(getattr(C, "BLOCK_CRATE", 5))]
+        behaviors = {
+            int(C.AMMO_CRATE): ("ammo", PickupCrateBehavior(
+                lambda p: p.restock_ammo(), respawn_delay=15.0)),
+            int(C.HEALTH_CRATE): ("health", PickupCrateBehavior(
+                lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0)),
+            int(getattr(C, "BLOCK_CRATE", 5)): ("block", PickupCrateBehavior(
+                lambda p: p.add_blocks(p.movement_profile.max_blocks), respawn_delay=15.0)),
+        }
         placed = 0
         for i, (sx, sy) in enumerate(spots):
             x, y, z = wm.dry_ground_anchor(sx, sy)
-            etype = types[i % 2]
-            if etype == C.AMMO_CRATE:
-                kind, behavior = "ammo", ammo_behavior
-            else:
-                kind, behavior = "health", health_behavior
+            etype = int(types[i % 3])
+            kind, behavior = behaviors[etype]
             ent = reg.place(etype, x, y, z, state=TEAM_NEUTRAL, kind=kind, behavior=behavior)
             # Only put crates on the wire once the Entity format is verified
             # against the compiled client (a mismatch crashes it). Registered
