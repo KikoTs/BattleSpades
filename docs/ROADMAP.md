@@ -63,19 +63,6 @@ The full protocol surface (~119 packets) is kept and documented in
 - More stock and community maps.
 - Configurable game rules per mode.
 
-## The big one — native ENet 🧩
-
-Today the only hard-to-port dependency is **ENet** (via the compiled C
-`pyenet` binding). Distributing to a new OS/architecture means building ENet for
-that target — the "compile ENet three times for three arches" tax.
-
-**Plan:** replace `pyenet` with a **native Go implementation of the ENet
-protocol**, so the server (or a networking sidecar) can be produced as a single
-static binary per platform with no per-arch C build. This unlocks:
-
-- drop-in **multi-platform** distribution (Windows x64, Linux amd64/arm64, more);
-- a cleaner path to embedding the transport in ports to other languages.
-
 ## Long term / community 🌍
 
 The codebase is deliberately clean and heavily documented so it can be **carried
