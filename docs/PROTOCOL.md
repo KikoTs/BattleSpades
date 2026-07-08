@@ -92,8 +92,8 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 49 | ChatMessage | both | Handled+Sent | Chat; handled on receive, broadcast by server + commands. |
 | 50 | LocalisedMessage | — | Planned | String-table localized message (UI/chat). |
 | 51 | SkyboxData | S→C | Sent | Skybox visuals (sent at join, prefix 0x30). |
-| 52 | MapEnded | — | Planned | End-of-map signal (match lifecycle). |
-| 53 | ShowGameStats | — | Planned | Show end-of-map stats screen (match lifecycle). |
+| 52 | MapEnded | S→C | Sent | End-of-round signal, sent with the stats screen (server/scoreboard.py). |
+| 53 | ShowGameStats | S→C | Sent | Opens the full-screen end-of-round scores/credits screen (base_mode end sequence). LIVE-VERIFIED. |
 | 54 | MapDataStart | — | Planned | Legacy map-data transfer start (map-sync-legacy). |
 | 55 | MapSyncStart | S→C | Sent | Bare-id map sync start (prefix 0x32). |
 | 56 | MapDataChunk | — | Planned | Legacy map-data chunk (map-sync-legacy). |
