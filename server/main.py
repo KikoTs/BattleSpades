@@ -209,14 +209,20 @@ class BattleSpadesServer:
                 player.loadout = list(pending_loadout)
                 player.pending_loadout = None
 
-            spawn = self.world_manager.get_spawn_point(player.team)
-            player.spawn(spawn[0], spawn[1], spawn[2])
-            player.death_time = 0.0
-            self._broadcast_create_player(player, spawn)
-            # Refill the respawned client's tool counters (grenades included).
-            player.restock_ammo()
-            if self.mode is not None:
-                self.queue_mode_event('on_player_spawn', player)
+            self.respawn_player(player)
+
+    def respawn_player(self, player) -> None:
+        """Spawn (or re-spawn) a player at their team spawn and re-render the
+        live body on every client. Shared by the death-timer respawn loop and
+        the end-of-round restart."""
+        spawn = self.world_manager.get_spawn_point(player.team)
+        player.spawn(spawn[0], spawn[1], spawn[2])
+        player.death_time = 0.0
+        self._broadcast_create_player(player, spawn)
+        # Refill the respawned client's tool counters (grenades included).
+        player.restock_ammo()
+        if self.mode is not None:
+            self.queue_mode_event('on_player_spawn', player)
 
     def spawn_grenade(self, player, packet) -> None:
         """A player used an oriented item (grenade family, RPG/RPG2 rocket,

@@ -15,6 +15,10 @@ from shared.packet import SetScore, DisplayCountdown, GameStats  # noqa: E402
 from server import scoreboard  # noqa: E402
 
 
+def _pkt_id(data):
+    return data[0]
+
+
 class FakeServer:
     def __init__(self):
         self.sent = []
@@ -69,3 +73,15 @@ def test_game_stats_lists_all_players():
     pkt = GameStats(ByteReader(srv.sent[0][1:]))
     assert pkt.noOfStats == 3
     assert set(pkt.player_ids) == {1, 2, 3}
+
+
+def test_show_game_stats_emits_packet_53():
+    srv = FakeServer()
+    scoreboard.show_game_stats(srv)
+    assert _pkt_id(srv.sent[0]) == 53
+
+
+def test_send_map_ended_emits_packet_52():
+    srv = FakeServer()
+    scoreboard.send_map_ended(srv)
+    assert _pkt_id(srv.sent[0]) == 52

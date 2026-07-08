@@ -19,7 +19,8 @@ Constants (from shared.constants, verified live):
 from __future__ import annotations
 
 import shared.constants as C
-from shared.packet import GameStats, DisplayCountdown, SetScore
+from shared.packet import (GameStats, DisplayCountdown, SetScore,
+                           ShowGameStats, MapEnded)
 from server.connection import internal_team_to_wire
 
 SCORE_TEAM = int(C.SCORE.TEAM)
@@ -73,3 +74,17 @@ def broadcast_game_stats(server, winner: int | None = None) -> None:
     # stat_type 0 = "kills" column; the client labels the row from this.
     pkt.types = [0 for _ in players]
     server.broadcast(bytes(pkt.generate()))
+
+
+def show_game_stats(server) -> None:
+    """Trigger the client's full-screen end-of-round stats screen
+    (ShowGameStats 53). LIVE-VERIFIED: this is the packet that pops the
+    scores/credits screen (the client renders it from the accumulated
+    per-player SetScore stream + the level screenshot)."""
+    server.broadcast(bytes(ShowGameStats().generate()))
+
+
+def send_map_ended(server) -> None:
+    """Signal the map has ended (MapEnded 52). Sent alongside the stats
+    screen so the client's has_map_ended state matches the StateData flag."""
+    server.broadcast(bytes(MapEnded().generate()))

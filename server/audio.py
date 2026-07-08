@@ -35,10 +35,23 @@ SND_TURRET_PLACE = 30
 SND_BUILD_LANDMINE = 31
 SND_PREFAB_BUILD = 32
 
+# Music track names. The client's INGAME_MUSIC table (constants_audio.py:11)
+# uses "<base>_001-004" RANGE strings — the client resolves the range and
+# picks a random variant. LIVE-VERIFIED: the client accepts both the range
+# form and a specific "..._001" via process_packet_play_music.
+GAMEPLAY_MUSIC = "last_man_standing_001-004"   # the in-game combat bed
+ENDING_MUSIC = "game_ending_001-004"           # last-minute + victory sting
+SECONDARY_TRACKS = ["secondary_menu_bed_001", "secondary_menu_bed_002"]
+
 # Timeout music: played once when the round clock crosses this many seconds
-# remaining (TIMEOUT_MUSIC_LENGTH from constants_gamemode — the tracks are
-# authored to land their crescendo exactly at 0:00).
+# remaining (the game_ending tracks are ~61s and authored to crescendo at
+# 0:00). TIME_AFTER_WIN_BEFORE_SCORES = 5.0 (constants_gamemode).
 TIMEOUT_MUSIC_SECONDS = 61.0
+TIME_AFTER_WIN_BEFORE_SCORES = 5.0
+# Re-send the gameplay bed on this cadence so a ~5-min track never leaves the
+# round silent; the client crossfades (DEFAULT_MUSIC_FADE_TIME=6.5) each time,
+# and the range string re-rolls the variant — "always random funky".
+MUSIC_ROTATE_INTERVAL = 130.0
 GAME_ENDING_TRACKS = ["game_ending_001", "game_ending_002",
                       "game_ending_003", "game_ending_004"]
 
@@ -87,6 +100,16 @@ def stop_music(server) -> None:
     server.broadcast(bytes(pkt.generate()))
 
 
+def play_gameplay_music(server) -> None:
+    """Start the in-game music bed (client re-rolls the variant each call)."""
+    play_music(server, GAMEPLAY_MUSIC)
+
+
+def play_ending_music(server) -> None:
+    """The victory / last-minute tension track (game_ending range)."""
+    play_music(server, ENDING_MUSIC)
+
+
 def play_timeout_music(server) -> None:
-    """The last-minute tension track — pick one of the four endings."""
-    play_music(server, random.choice(GAME_ENDING_TRACKS))
+    """The last-minute tension track — the game_ending range string."""
+    play_music(server, ENDING_MUSIC)

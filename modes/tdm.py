@@ -129,6 +129,9 @@ class TDMMode(BaseMode):
 
     async def on_player_kill(self, killer: 'Player', victim: 'Player', kill_type: int):
         """Award team + personal points for a cross-team kill and check win."""
+        # No scoring once the round has ended (during the stats screen / restart).
+        if self.ended:
+            return
         from server.scoreboard import send_player_score, send_team_score
 
         points = self.kill_points

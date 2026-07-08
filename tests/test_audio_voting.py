@@ -58,7 +58,15 @@ def test_play_timeout_music_uses_ending_track():
     srv = FakeServer()
     audio.play_timeout_music(srv)
     pkt = PlayMusic(ByteReader(srv.sent[0][1:]))
-    assert pkt.name in audio.GAME_ENDING_TRACKS
+    assert pkt.name == audio.ENDING_MUSIC
+
+
+def test_play_gameplay_music_uses_ingame_bed():
+    srv = FakeServer()
+    audio.play_gameplay_music(srv)
+    pkt = PlayMusic(ByteReader(srv.sent[0][1:]))
+    assert pkt.name == audio.GAMEPLAY_MUSIC
+    assert "last_man_standing" in pkt.name
 
 
 # --- voting ------------------------------------------------------------------

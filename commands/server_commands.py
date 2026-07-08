@@ -91,26 +91,45 @@ async def cmd_mode(ctx: CommandContext):
     description="Restart the current round/match",
 )
 async def cmd_restart(ctx: CommandContext):
-    """Restart round."""
-    # Reset teams
-    for team in ctx.server.teams.values():
-        team.reset()
-    
-    # Restart mode
+    """Restart the round immediately (skips the end-of-round stats screen)."""
     if ctx.server.mode:
-        await ctx.server.mode.on_mode_end()
-        await ctx.server.mode.on_mode_start()
-    
-    # Respawn all players
-    for player in ctx.server.players.values():
-        spawn = ctx.server.world_manager.get_spawn_point(player.team)
-        player.spawn(*spawn)
-    
+        # _restart_round resets teams + revives the mode + respawns everyone
+        # and restarts the music bed. Do NOT route through on_mode_end here —
+        # that would kick off the full end sequence (which restarts again).
+        await ctx.server.mode._restart_round()
+
     packet = ChatMessage()
     packet.player_id = 255
     packet.chat_type = CHAT_SYSTEM
     packet.value = "Match restarted!"
     ctx.server.broadcast(bytes(packet.generate()))
+
+
+@register_command(
+    name="endround",
+    aliases=["endgame", "forceend"],
+    admin_only=True,
+    usage="/endround [team]",
+    description="Force the current round to end (victory audio → stats screen → restart)",
+)
+async def cmd_endround(ctx: CommandContext):
+    """Force-trigger the end-of-round sequence. Optional team arg (1/2) sets
+    the winner; otherwise the current score leader wins."""
+    mode = ctx.server.mode
+    if mode is None or mode.ended:
+        await send_message(ctx.server, ctx.player, "No active round to end.")
+        return
+    winner = None
+    if ctx.args:
+        try:
+            from server.game_constants import TEAM1, TEAM2
+            winner = {1: TEAM1, 2: TEAM2}.get(int(ctx.args[0]))
+        except (ValueError, IndexError):
+            winner = None
+    if winner is not None:
+        await mode._end_by_score(winner)
+    else:
+        await mode._end_by_time()
 
 
 @register_command(
