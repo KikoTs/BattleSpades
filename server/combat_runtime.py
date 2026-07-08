@@ -341,16 +341,17 @@ class CombatSystem:
         packet.type = self._damage_type_for(player) if damage_type is None else int(damage_type)
         packet.damage = min(float(damage), self._BLOCK_KILL_DAMAGE)
         packet.face = 0
-        # chunk_check=0: the client removes ONLY this exact cell and does NOT
-        # run its own flood-fill collapse. chunk_check=1 lets the client decide
-        # what falls, and its verdict can diverge from ours — on CityOfChicago a
-        # single shot made the client's flood-fill declare a huge region
-        # unsupported and WIPE THE WHOLE MAP client-side while the server's world
-        # stayed intact (client/server VXL desync). The server's own
-        # _collapse_unsupported already broadcasts every genuinely-fallen block
-        # as its own Damage(37), so real collapses still happen — server-driven
-        # and authoritative — we just take the runaway visual away from the client.
-        packet.chunk_check = 0
+        # chunk_check=1 lets the CLIENT flood-fill connectivity after the removal
+        # and ANIMATE any now-disconnected chunk falling (the classic collapse
+        # visual). This is correct as long as both VXLs are GROUNDED: the earlier
+        # whole-map-wipe was NOT caused by chunk_check — it was the floating-map
+        # bug (aoslib/vxl.pyx dropped the underground, so the client's flood-fill
+        # found no ground and declared the whole map unsupported). With the VXL
+        # underground fill in place the map is solid, so chunk_check=1 stays
+        # localized (measured 2026-07-09: a single shot removes 1 block, no wipe)
+        # AND we keep the falling-block animation. The server's own
+        # _collapse_unsupported mirrors the same removals so both worlds agree.
+        packet.chunk_check = 1
         packet.seed = int(seed) & 0xFF
         # causer_id is an ENTITY id the client reads UNSIGNED (measured: -1
         # decodes to 65535 -> entities[65535] lookup aborts the whole damage
