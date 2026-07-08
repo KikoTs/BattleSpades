@@ -18,8 +18,8 @@ default_mode = "tdm"
 # kill->score->respawn). The old "client crashes rendering non-local
 # players" was an IDENTITY bug (StateData.player_id was always 0) — fixed
 # 2026-07-06 via per-connection id reservation; bots are safe for live play.
-bot_count = 2
-default_map = "ArcticBase"
+bot_count = 0
+default_map = "CityOfChicago"
 # "client" = echo client-reported positions (fallback while physics parity work
 # is in progress); "server" = authoritative server simulation (the server's
 # physics engine is oracle-calibrated to match the client's compiled engine).

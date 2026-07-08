@@ -341,11 +341,16 @@ class CombatSystem:
         packet.type = self._damage_type_for(player) if damage_type is None else int(damage_type)
         packet.damage = min(float(damage), self._BLOCK_KILL_DAMAGE)
         packet.face = 0
-        # chunk_check=1 tells the client to flood-fill connectivity after the
-        # removal and ANIMATE any now-disconnected chunk falling (the classic
-        # collapse). Our server-side find_unsupported_chunks mirrors the same
-        # removal so both VXLs agree; the client owns the visual.
-        packet.chunk_check = 1
+        # chunk_check=0: the client removes ONLY this exact cell and does NOT
+        # run its own flood-fill collapse. chunk_check=1 lets the client decide
+        # what falls, and its verdict can diverge from ours — on CityOfChicago a
+        # single shot made the client's flood-fill declare a huge region
+        # unsupported and WIPE THE WHOLE MAP client-side while the server's world
+        # stayed intact (client/server VXL desync). The server's own
+        # _collapse_unsupported already broadcasts every genuinely-fallen block
+        # as its own Damage(37), so real collapses still happen — server-driven
+        # and authoritative — we just take the runaway visual away from the client.
+        packet.chunk_check = 0
         packet.seed = int(seed) & 0xFF
         # causer_id is an ENTITY id the client reads UNSIGNED (measured: -1
         # decodes to 65535 -> entities[65535] lookup aborts the whole damage

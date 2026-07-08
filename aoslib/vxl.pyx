@@ -564,6 +564,17 @@ cdef class VXL:
                         top_len = 0
 
                     if span_words == 0:
+                        # LAST span of the column: in the AoS/VXL format
+                        # everything below the final surface run is SOLID
+                        # underground, down to the map floor. Without this fill
+                        # the loader (which starts all-air and only adds explicit
+                        # solids) leaves the column a thin surface shell over a
+                        # lone bedrock voxel -> the whole map renders FLOATING
+                        # client-side, and one dug block cascade-collapses it.
+                        # Measured 2026-07-09: CityOfChicago col (256,128) went
+                        # from [188,239] (2 solids) to [188..239] (52, grounded).
+                        for z in range(top_end + 1, MAP_HEIGHT):
+                            self._store_block(x, y, z + z_shift, 0)
                         break
 
                     bottom_len = span_words - top_len - 1
