@@ -105,8 +105,12 @@ def test_cross_team_kill_scores_one_point():
 
     assert server.teams[TEAM1].score == mode.kill_points
     assert server.teams[TEAM2].score == 0
-    assert server.state_pushes == 1  # score pushed to clients
+    # A cross-team kill broadcasts two SetScore(85) packets: the killer's
+    # personal score (type=PLAYER) and the team's bar (type=TEAM).
+    setscores = [d for d in server.broadcast_packets if d and d[0] == 85]
+    assert len(setscores) == 2
     assert killer.kills == 1
+    assert killer.score == 100
 
 
 def test_headshot_awards_bonus():

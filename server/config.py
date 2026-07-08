@@ -80,6 +80,11 @@ class ServerConfig:
     admin_password: str = "changeme"
     log_commands: bool = True
 
+    # Per-mode setting overlays from config.toml [modes.<code>] tables.
+    # e.g. mode_settings["tdm"] = {"score_limit": 200, "time_limit": 900,
+    # "kill_points": 1, "headshot_bonus": 1}. Empty = use mode_data defaults.
+    mode_settings: dict = field(default_factory=dict)
+
     # Logging
     log_level: str = "INFO"
     log_file: str = "server.log"
@@ -216,6 +221,13 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.map_size_z = w.get("map_size_z", config.map_size_z)
         config.water_level = w.get("water_level", config.water_level)
         config.water_damage = w.get("water_damage", config.water_damage)
+
+    # Per-mode overlays: [modes.tdm], [modes.ctf], ... Each table's keys
+    # override that mode's defaults (score_limit, time_limit, kill_points...).
+    if "modes" in data and isinstance(data["modes"], dict):
+        for code, settings in data["modes"].items():
+            if isinstance(settings, dict):
+                config.mode_settings[str(code)] = dict(settings)
 
     if "admin" in data:
         a = data["admin"]

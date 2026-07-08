@@ -720,6 +720,17 @@ class BattleSpadesServer:
                 # In-flight grenade fuses / detonation.
                 self._update_grenades(self.tick_interval)
 
+                # HUD round-timer countdown (DisplayCountdown 84) — seconds
+                # REMAINING, sent ~once/sec (not every frame; it's a whole
+                # second display and 60Hz would flood the reliable channel).
+                if (self.mode is not None and self.mode.started
+                        and not self.mode.ended
+                        and getattr(self.mode, "time_limit", 0) > 0
+                        and self.loop_count % self.tick_rate == 0):
+                    from server.scoreboard import send_round_timer
+                    remaining = self.mode.time_limit - self.mode.elapsed_time
+                    send_round_timer(self, remaining)
+
                 tick_ms = (time.perf_counter() - tick_start) * 1000.0
                 stat_ticks += 1
                 stat_sum_ms += tick_ms

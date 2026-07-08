@@ -35,6 +35,20 @@ friendly_fire = false
 fall_damage = true
 build_damage = true
 
+# Per-gamemode rules. Each [modes.<code>] table overrides that mode's
+# built-in defaults (server/mode_data.py). Omit a key to keep the default.
+#   score_limit  — win threshold (TDM: team kills; CTF: intel captures)
+#   time_limit   — round length in seconds (0 = no clock)
+[modes.tdm]
+score_limit = 200      # play to 200 team kills
+time_limit = 900       # 15-minute round clock
+kill_points = 1        # team points per kill
+headshot_bonus = 1     # extra team point for a headshot kill
+
+[modes.ctf]
+score_limit = 10       # intel captures to win
+time_limit = 2400      # 40-minute round clock
+
 [teams]
 # Team names are STRING-TABLE IDS the client localizes (TEAM1_COLOR -> "Blue"),
 # NOT literal text — literals render as "Missing string <name>" in-game.

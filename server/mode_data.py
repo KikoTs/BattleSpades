@@ -78,16 +78,20 @@ def _mode_data(code: str) -> ModeData:
         infographic1='{}_INFOGRAPHIC_TEXT1'.format(code_upper),
         infographic2='{}_INFOGRAPHIC_TEXT2'.format(code_upper),
         infographic3='{}_INFOGRAPHIC_TEXT3'.format(code_upper),
+        # Score/win limits. TDM plays to 200 team kills (user spec). CTF to
+        # the intel-capture count. Sourced here so wire HUD + rules agree.
         default_score_limit={
-            'ctf': 10, 'cctf': 10, 'tdm': 50, 'dem': 5, 'mh': 100,
+            'ctf': 10, 'cctf': 10, 'tdm': 200, 'dem': 5, 'mh': 100,
             'oc': 100, 'dia': 10, 'tc': 100, 'vip': 5, 'zom': 1,
             'ugc': 0,
         }.get(code, 10),
+        # Round clock (seconds). Original game lengths from
+        # constants_gamemode.DEFAULT_MODE_GAME_LENGTH (TDM = 900 = 15 min).
         default_time_limit={
-            'ctf': 1200.0, 'cctf': 1200.0, 'tdm': 600.0, 'dem': 300.0,
-            'mh': 900.0, 'oc': 600.0, 'dia': 600.0, 'tc': 900.0,
-            'vip': 300.0, 'zom': 600.0, 'ugc': 0.0,
-        }.get(code, 600.0),
+            'ctf': 2400.0, 'cctf': 5400.0, 'tdm': 900.0, 'dem': 900.0,
+            'mh': 1500.0, 'oc': 900.0, 'dia': 900.0, 'tc': 1500.0,
+            'vip': 900.0, 'zom': 600.0, 'ugc': 0.0,
+        }.get(code, 900.0),
         classic=(code == 'cctf'),
         mafia=(code in ('tc', 'vip')),
         allowed_classes=_allowed_for(code),

@@ -49,7 +49,9 @@ class BaseMode(ABC):
         self.start_time = time.time()
     
     async def on_mode_end(self, winner: Optional[int] = None):
-        """Called when the mode ends."""
+        """Called when the mode ends — pop up the end-of-round stats widget."""
+        from server.scoreboard import broadcast_game_stats
+        broadcast_game_stats(self.server, winner)
         self.ended = True
         self.winner = winner
     
@@ -169,7 +171,7 @@ class BaseMode(ABC):
         self.ended = True
         self.winner = winner
         team = self.server.teams[winner]
-        await self.broadcast_message(f"{team.name} team wins!")
+        await self.broadcast_message(f"{team.name} wins!")
         await self.on_mode_end(winner)
 
     async def _end_by_time(self):
@@ -190,7 +192,7 @@ class BaseMode(ABC):
         if scores[0][1] > scores[1][1]:
             winner = scores[0][0]
             team = self.server.teams[winner]
-            await self.broadcast_message(f"Time's up! {team.name} team wins!")
+            await self.broadcast_message(f"Time's up! {team.name} wins!")
         else:
             await self.broadcast_message("Time's up! It's a draw!")
             winner = None

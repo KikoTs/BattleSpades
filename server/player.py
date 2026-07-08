@@ -297,6 +297,9 @@ class Player:
         self.kills: int = 0
         self.deaths: int = 0
         self.captures: int = 0
+        # Personal scoreboard number (the client's per-player column). Driven
+        # by the mode via scoreboard.send_player_score on each scoring event.
+        self.score: int = 0
 
         self._class_id: int = int(C.CLASS.SOLDIER)
         self.movement_profile = get_movement_profile(self._class_id)

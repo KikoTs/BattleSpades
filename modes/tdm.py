@@ -49,9 +49,12 @@ class TDMMode(BaseMode):
         # overlay) wins when present; the generic config.score_limit is a
         # CTF-era default and is NOT used for TDM.
         md = mode_data.get(server.config.game_mode)
-        override = getattr(server.config, "mode_score_limit", None)
-        self.score_limit = int(override) if override else int(md.default_score_limit)
-        self.time_limit = float(md.default_time_limit)
+        # [modes.tdm] overlay from config.toml wins over the mode-data default.
+        overlay = getattr(server.config, "mode_settings", {}).get("tdm", {})
+        self.score_limit = int(overlay.get("score_limit", md.default_score_limit))
+        self.time_limit = float(overlay.get("time_limit", md.default_time_limit))
+        self.kill_points = int(overlay.get("kill_points", self.kill_points))
+        self.headshot_bonus = int(overlay.get("headshot_bonus", self.headshot_bonus))
 
     async def on_mode_start(self):
         """Start TDM mode."""
@@ -121,7 +124,9 @@ class TDMMode(BaseMode):
                     else " (not yet on wire — Entity format unverified)")
 
     async def on_player_kill(self, killer: 'Player', victim: 'Player', kill_type: int):
-        """Award team points for a cross-team kill and check the win."""
+        """Award team + personal points for a cross-team kill and check win."""
+        from server.scoreboard import send_player_score, send_team_score
+
         points = self.kill_points
         if kill_type == KILL_HEADSHOT:
             points += self.headshot_bonus
@@ -131,10 +136,16 @@ class TDMMode(BaseMode):
             return
         team.add_score(points)
 
-        # Push the new score with the lightweight SetScore(85) packet. NEVER
-        # re-broadcast StateData here — the compiled client re-inits the scene
-        # on a mid-game StateData (reloads prefabs / UGC palette) and crashes.
-        self.server.broadcast_set_score(team)
+        # Personal scoreboard: the client's per-player column. Award the
+        # generic per-kill score (100, +50 headshot) so the leaderboard fills.
+        # (killer.kills is already incremented in Player.die.)
+        killer.score += 150 if kill_type == KILL_HEADSHOT else 100
+        send_player_score(self.server, killer)
+
+        # Team score bar (SetScore type=TEAM). NEVER re-broadcast StateData —
+        # the compiled client re-inits the scene on a mid-game StateData
+        # (reloads prefabs / UGC palette) and crashes.
+        send_team_score(self.server, team)
 
         if team.score >= self.score_limit:
             await self._end_by_score(killer.team)
