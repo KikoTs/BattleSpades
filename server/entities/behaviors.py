@@ -48,12 +48,17 @@ class PickupCrateBehavior(EntityBehavior):
     # ammo and health crate at once ("everything replenishes everything").
     touch_radius = 2.5
 
-    def __init__(self, refill, respawn_delay: float = 15.0):
+    def __init__(self, refill, respawn_delay: float = 15.0, sound_id: int = None):
         self.refill = refill
         self.respawn_delay = float(respawn_delay)
+        # Client SOUND_ID for the pickup cue (ammo 13 / health 14 / blocks 15).
+        self.sound_id = sound_id
 
     def on_touch(self, ent, player, ctx) -> bool:
         self.refill(player)
+        if self.sound_id is not None:
+            from server.audio import play_sound_to
+            play_sound_to(player, self.sound_id)
         ent.alive = False
         ent.respawn_at = ctx.now + self.respawn_delay
         if ctx.destroy is not None:

@@ -98,14 +98,18 @@ class TDMMode(BaseMode):
         # One shared behavior instance per crate type (the entity is passed
         # into each hook, so instances are reusable). Each crate refills ONLY
         # its own resource; block crates top up the block inventory.
+        from server.audio import SND_CRATE, SND_HEALTHCRATE, SND_CRATE_BLOCKS
         types = [C.AMMO_CRATE, C.HEALTH_CRATE, int(getattr(C, "BLOCK_CRATE", 5))]
         behaviors = {
             int(C.AMMO_CRATE): ("ammo", PickupCrateBehavior(
-                lambda p: p.restock_ammo(), respawn_delay=15.0)),
+                lambda p: p.restock_ammo(), respawn_delay=15.0,
+                sound_id=SND_CRATE)),
             int(C.HEALTH_CRATE): ("health", PickupCrateBehavior(
-                lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0)),
+                lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0,
+                sound_id=SND_HEALTHCRATE)),
             int(getattr(C, "BLOCK_CRATE", 5)): ("block", PickupCrateBehavior(
-                lambda p: p.restock_blocks(), respawn_delay=15.0)),
+                lambda p: p.restock_blocks(), respawn_delay=15.0,
+                sound_id=SND_CRATE_BLOCKS)),
         }
         placed = 0
         for i, (sx, sy) in enumerate(spots):
@@ -141,6 +145,12 @@ class TDMMode(BaseMode):
         # (killer.kills is already incremented in Player.die.)
         killer.score += 150 if kill_type == KILL_HEADSHOT else 100
         send_player_score(self.server, killer)
+
+        # Audio stingers: a "good" cue to the killer, a "bad" cue to the victim.
+        from server.audio import play_sound_to, SND_EVENT_POSITIVE, SND_EVENT_NEGATIVE
+        play_sound_to(killer, SND_EVENT_POSITIVE, volume=0.6)
+        if victim.connection is not None:
+            play_sound_to(victim, SND_EVENT_NEGATIVE, volume=0.6)
 
         # Team score bar (SetScore type=TEAM). NEVER re-broadcast StateData —
         # the compiled client re-inits the scene on a mid-game StateData

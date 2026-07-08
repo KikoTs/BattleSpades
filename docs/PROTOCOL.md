@@ -63,11 +63,11 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 20 | HitEntity | — | Planned | Report a hit on an entity (entity mgmt/combat). |
 | 21 | Entity / CreateEntity | S→C | Sent | Entity wire format + create; CreateEntity sent for crates. Both share id 21. |
 | 22 | CreateAmbientSound | — | Planned | Register a looping ambient sound source (sounds). |
-| 23 | PlaySound | — | Planned | One-shot positional sound (sounds). |
+| 23 | PlaySound | S→C | Sent | One-shot positional/UI sound (server/audio.py — crate pickups, kill/death stingers). LIVE-VERIFIED. |
 | 24 | PlayAmbientSound | — | Planned | Start an ambient loop (sounds). |
 | 25 | StopSound | — | Planned | Stop a playing sound (sounds). |
-| 26 | PlayMusic | — | Planned | Start music track (sounds). |
-| 27 | StopMusic | — | Planned | Stop music (sounds). |
+| 26 | PlayMusic | S→C | Sent | Music track (server/audio.py — last-minute game_ending track at 61s remaining). |
+| 27 | StopMusic | S→C | Sent | Stop the current music track (server/audio.py). |
 | 28 | CreatePlayer | S→C | Sent | Spawns a player on clients; also carries the roster. |
 | 29 | PrefabComplete | S→C | Sent | Sent to the builder when a prefab finishes placing. |
 | 30 | BuildPrefabAction | C→S | Handled | Prefab placement: server expands the KV6 model (server/prefabs.py), validates class list / block budget / world contact, places + broadcasts BlockBuildColored per block. |
@@ -87,8 +87,8 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 44 | MinimapZoneClear | — | Planned | Clear minimap zones (minimap). |
 | 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). |
 | 46 | KillAction | S→C | Sent | Broadcast kill/death event. |
-| 47 | GenericVoteMessage | — | Planned | Vote prompt/tally (voting). |
-| 48 | InitiateKickMessage | — | Planned | Start a kick vote (voting). |
+| 47 | GenericVoteMessage | both | Handled+Sent | Vote overlay open/update/close (server/voting.py) + client CAST. Title/description is a repr'd localized-string tuple (client ast.literal_evals it). |
+| 48 | InitiateKickMessage | C→S | Handled | Client starts a kick vote → VoteManager (server/voting.py). |
 | 49 | ChatMessage | both | Handled+Sent | Chat; handled on receive, broadcast by server + commands. |
 | 50 | LocalisedMessage | — | Planned | String-table localized message (UI/chat). |
 | 51 | SkyboxData | S→C | Sent | Skybox visuals (sent at join, prefix 0x30). |
@@ -107,7 +107,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 64 | PlayerLeft | S→C | Sent | Announce a player disconnect. |
 | 65 | ProgressBar | — | Planned | UI progress bar (capture/build progress). |
 | 66 | RankUps | — | Planned | XP/rank changes at map end (match lifecycle/progression). |
-| 67 | GameStats | — | Planned | End-of-map stats payload (match lifecycle). |
+| 67 | GameStats | S→C | Sent | End-of-round scoreboard widget (server/scoreboard.py, on_mode_end). |
 | 68 | UGCObjectives | — | Planned | UGC-defined objectives (UGC). |
 | 69 | Restock | S→C | Sent | Refill ammo/health/blocks at a restock zone. |
 | 70 | PickPickup | — | Planned | Pick up a dropped item (pickups). |
@@ -124,7 +124,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 81 | TeamLockScore | — | Planned | Lock team score (mode rules). |
 | 82 | TeamInfiniteBlocks | — | Planned | Grant a team infinite blocks (mode rules). |
 | 83 | TeamMapVisibility | — | Planned | Per-team map visibility (minimap/mode rules). |
-| 84 | DisplayCountdown | — | Planned | Countdown timer overlay (match lifecycle). |
+| 84 | DisplayCountdown | S→C | Sent | HUD round-timer countdown (server/scoreboard.py, seconds remaining). LIVE-VERIFIED. |
 | 85 | SetScore | S→C | Sent | Lightweight mid-game team/player score update (HUD). |
 | 86 | UseCommand | — | Planned | Generic "use" action (deployables/interaction). |
 | 87 | PlaceMG | — | Planned | Deploy a machine-gun turret (deployables). |

@@ -493,6 +493,38 @@ async def handle_disguise(server, player, packet):
     logger.info("DISGUISE %s -> %s", player.name, player.disguised)
 
 
+@register_handler(48)  # InitiateKickMessage — start a kick vote
+async def handle_initiate_kick(server, player, packet):
+    """A player pressed 'vote kick' on someone. Open a server-run vote; the
+    GenericVoteMessage(47) broadcast pops the overlay on every client."""
+    import time
+    from server.voting import KICK_CANCEL
+    reason = int(getattr(packet, "reason", 0))
+    if reason == KICK_CANCEL:
+        server.vote_manager.cancel()
+        return
+    target = server.players.get(int(getattr(packet, "target_id", -1)))
+    if target is None:
+        return
+    server.vote_manager.start_kick(player, target, reason, time.time())
+
+
+@register_handler(47)  # GenericVoteMessage — a player cast a vote
+async def handle_generic_vote(server, player, packet):
+    """A player voted in the active vote. candidate index 0 = Yes, 1 = No
+    (matches the candidate list order the server broadcast)."""
+    from server.voting import VOTE_CAST
+    if int(getattr(packet, "message_type", -1)) != VOTE_CAST:
+        return
+    # The client reports its choice in the first candidate slot's vote count
+    # convention; simplest robust read is the candidate name it echoes.
+    choice_yes = True
+    cands = getattr(packet, "candidates", None) or []
+    if cands and isinstance(cands[0], dict):
+        choice_yes = str(cands[0].get("name", "Yes")).lower().startswith("y")
+    server.vote_manager.cast(player, choice_yes)
+
+
 @register_handler(49)  # ChatMessage
 async def handle_chat(server, player, packet):
     """Handle chat messages."""

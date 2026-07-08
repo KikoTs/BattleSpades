@@ -33,10 +33,12 @@ class BaseMode(ABC):
         self.started = False
         self.ended = False
         self.winner: Optional[int] = None  # Winning team ID
-        
+
         # Round timing
         self.start_time: float = 0.0
         self.elapsed_time: float = 0.0
+        # Timeout music fires exactly once, TIMEOUT_MUSIC_SECONDS before the end.
+        self._timeout_music_played = False
     
     # =========================================================================
     # Lifecycle Events
@@ -61,6 +63,13 @@ class BaseMode(ABC):
             return
         import time
         self.elapsed_time = time.time() - self.start_time
+
+        # Last-minute tension music (the original's 61s "game_ending" track).
+        if self.time_limit > 0 and not self._timeout_music_played:
+            from server.audio import TIMEOUT_MUSIC_SECONDS, play_timeout_music
+            if self.time_limit - self.elapsed_time <= TIMEOUT_MUSIC_SECONDS:
+                self._timeout_music_played = True
+                play_timeout_music(self.server)
 
         # Check time limit
         if self.time_limit > 0 and self.elapsed_time >= self.time_limit:

@@ -91,6 +91,8 @@ class BattleSpadesServer:
         # dict: {x,y,z, vx,vy,vz, explode_at, thrower_id}.
         from server.projectiles import ProjectileEngine
         self.projectile_engine = ProjectileEngine()
+        from server.voting import VoteManager
+        self.vote_manager = VoteManager(self)
         # In-game packets received since the last simulation tick; drained
         # synchronously at the start of each tick so an input that ARRIVED
         # before tick N is guaranteed to be APPLIED at tick N (dispatching
@@ -730,6 +732,10 @@ class BattleSpadesServer:
                     from server.scoreboard import send_round_timer
                     remaining = self.mode.time_limit - self.mode.elapsed_time
                     send_round_timer(self, remaining)
+
+                # Vote-kick timeout (auto-fail after VOTE_DURATION).
+                if self.vote_manager.active and self.loop_count % self.tick_rate == 0:
+                    self.vote_manager.tick(time.time())
 
                 tick_ms = (time.perf_counter() - tick_start) * 1000.0
                 stat_ticks += 1
