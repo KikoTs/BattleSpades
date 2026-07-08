@@ -93,10 +93,12 @@ def test_end_sequence_emits_music_stats_and_restarts(monkeypatch):
 
     srv, mode = _run(scenario())
     ids = [d[0] for d in srv.broadcast_packets if d]
-    # Ending music (PlayMusic 26) up front, the game_ending range string.
-    assert 26 in ids
+    # Ending music: StopMusic(27) then PlayMusic(26) with a SPECIFIC game_ending
+    # track (the client won't override playing music, and won't resolve ranges).
+    assert 27 in ids and 26 in ids
+    from server import audio as _audio
     first_music = next(d for d in srv.broadcast_packets if d and d[0] == 26)
-    assert PlayMusic(ByteReader(first_music[1:])).name == "game_ending_001-004"
+    assert PlayMusic(ByteReader(first_music[1:])).name in _audio.GAME_ENDING_TRACKS
     # Stats screen packets present, GameStats(67) before ShowGameStats(53); MapEnded(52) too.
     assert 67 in ids and 53 in ids and 52 in ids
     assert ids.index(67) < ids.index(53)

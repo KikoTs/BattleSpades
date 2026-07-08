@@ -83,20 +83,10 @@ class BaseMode(ABC):
         now = time.time()
         self.elapsed_time = now - self.start_time
 
-        # Keep the music bed alive: re-send periodically (the client crossfades
-        # and the range string re-rolls the variant — "always random funky").
-        from server.audio import (MUSIC_ROTATE_INTERVAL, TIMEOUT_MUSIC_SECONDS,
-                                   play_gameplay_music, play_timeout_music)
-        if (not self._timeout_music_played
-                and now - self._last_music_at >= MUSIC_ROTATE_INTERVAL):
-            # Don't rotate into the last-minute window — the ending track owns it.
-            if not (self.time_limit > 0
-                    and self.time_limit - self.elapsed_time <= TIMEOUT_MUSIC_SECONDS
-                                                              + MUSIC_ROTATE_INTERVAL):
-                play_gameplay_music(self.server)
-                self._last_music_at = now
-
-        # Last-minute tension music (the original's 61s "game_ending" track).
+        # The gameplay bed (started in on_mode_start) alure-loops forever, so no
+        # re-send is needed. Swap to the last-minute "game_ending" track once,
+        # 61s before the clock runs out.
+        from server.audio import TIMEOUT_MUSIC_SECONDS, play_timeout_music
         if self.time_limit > 0 and not self._timeout_music_played:
             if self.time_limit - self.elapsed_time <= TIMEOUT_MUSIC_SECONDS:
                 self._timeout_music_played = True

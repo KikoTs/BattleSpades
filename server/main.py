@@ -430,6 +430,21 @@ class BattleSpadesServer:
         After this runs, connection.in_game is True so the ongoing gameplay
         broadcast stream (kills, respawns, scores, WorldUpdate) flows normally.
         """
+        # World ambience + the in-game music bed for this now-settled client
+        # (a mid-round joiner must get both directly — the round-start
+        # broadcast already fired before they arrived). play_music_to sends
+        # StopMusic+PlayMusic (needed to clear the client's leftover menu music).
+        try:
+            import random
+            from server.audio import send_map_ambient, play_music_to, \
+                GAMEPLAY_TRACKS
+            player = getattr(connection, "player", None)
+            if player is not None:
+                send_map_ambient(self, player)
+            play_music_to(connection, random.choice(GAMEPLAY_TRACKS))
+        except Exception:
+            logger.debug("reveal ambient/music send failed", exc_info=True)
+
         if not getattr(self.config, "entities_wire_ready", False):
             return
         from shared.packet import CreateEntity

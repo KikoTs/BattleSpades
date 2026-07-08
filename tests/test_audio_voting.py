@@ -54,19 +54,62 @@ def test_play_sound_to_single_player():
     assert not pkt.positioned
 
 
-def test_play_timeout_music_uses_ending_track():
+def test_play_timeout_music_sends_stop_then_specific_ending():
     srv = FakeServer()
     audio.play_timeout_music(srv)
-    pkt = PlayMusic(ByteReader(srv.sent[0][1:]))
-    assert pkt.name == audio.ENDING_MUSIC
+    # StopMusic(27) FIRST (clears any playing track), then PlayMusic(26).
+    assert srv.sent[0][0] == 27
+    pkt = PlayMusic(ByteReader(srv.sent[1][1:]))
+    assert pkt.name in audio.GAME_ENDING_TRACKS   # a SPECIFIC track, not a range
 
 
-def test_play_gameplay_music_uses_ingame_bed():
+def test_map_ambient_packet_matches_client_wire():
+    # The client reads CreateAmbientSound as: id, name(null-term), loop_id(byte),
+    # count(byte), points(3x short). Verified byte-identical to the client's own
+    # canonical output for amb_arctic (2026-07-08).
+    ca = audio._ambient_packet("amb_arctic", 1, [(100, 200, 40), (300, 400, 41)])
+    expected = (b"\x16" + b"amb_arctic\x00" + b"\x01\x02"
+                + b"\x64\x00\xc8\x00\x28\x00\x2c\x01\x90\x01\x29\x00")
+    assert ca == expected
+
+
+def test_send_map_ambient_picks_map_track_and_grid():
+    # Parse the raw wire bytes directly (id, name\0, loop_id byte, count byte)
+    # — the compiled CreateAmbientSound.read still has a loop_id read bug the
+    # .pyx source fixes on next rebuild; the WRITE is what ships and is correct.
+    srv = FakeServer()
+    srv.world_manager = SimpleNamespace(map_name="ArcticBase",
+                                        map_size_x=512, map_size_y=512)
+    player = FakePlayer(1)
+    audio.send_map_ambient(srv, player)
+    assert len(player.sent) == 1
+    data = player.sent[0]
+    assert data[0] == 22                    # CreateAmbientSound id
+    assert b"amb_arctic\x00" in data[:16]   # null-terminated map ambient name
+    nul = data.index(0, 1)                  # end of the name string
+    loop_id = data[nul + 1]
+    count = data[nul + 2]
+    assert loop_id == 1
+    assert count == 64                      # 8x8 grid over 512x512 @ step 64
+
+
+def test_send_map_ambient_falls_back_for_unknown_map():
+    srv = FakeServer()
+    srv.world_manager = SimpleNamespace(map_name="SomeCustomMap",
+                                        map_size_x=512, map_size_y=512)
+    player = FakePlayer(1)
+    audio.send_map_ambient(srv, player)
+    assert audio.DEFAULT_AMBIENT.encode() + b"\x00" in player.sent[0][:16]
+
+
+def test_play_gameplay_music_sends_stop_then_specific_track():
     srv = FakeServer()
     audio.play_gameplay_music(srv)
-    pkt = PlayMusic(ByteReader(srv.sent[0][1:]))
-    assert pkt.name == audio.GAMEPLAY_MUSIC
+    assert srv.sent[0][0] == 27                   # StopMusic first
+    pkt = PlayMusic(ByteReader(srv.sent[1][1:]))
+    assert pkt.name in audio.GAMEPLAY_TRACKS      # a SPECIFIC track
     assert "last_man_standing" in pkt.name
+    assert "-" not in pkt.name                    # never a range string
 
 
 # --- voting ------------------------------------------------------------------

@@ -505,7 +505,9 @@ cdef class CreateAmbientSound(Loader): # Fixed
 
     cpdef read(self, ByteReader reader):
         self.name = reader.read_string()
-        self.loop_id = reader.read_int()
+        # loop_id is a single BYTE on the wire (matches write + the compiled
+        # client's CreateAmbientSound.read — verified byte-identical 2026-07-08).
+        self.loop_id = reader.read_byte()
         self.points = []
         for i in range(reader.read_byte()):
             self.points.append((reader.read_short(), reader.read_short(), reader.read_short()))
