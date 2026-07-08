@@ -511,6 +511,7 @@ cdef class VXL:
         cdef int bottom_start
         cdef int z
         cdef int i
+        cdef int has_surface
         cdef unsigned int color
 
         if columns <= 0:
@@ -543,6 +544,7 @@ cdef class VXL:
             y = src_y + offset
             for src_x in range(edge):
                 x = src_x + offset
+                has_surface = 0
                 while True:
                     if pos + 4 > limit:
                         return False
@@ -560,6 +562,7 @@ cdef class VXL:
                             color = _read_u32_le(data, pos + (i * 4))
                             self._store_block(x, y, top_start + z_shift + i, color)
                         pos += top_len * 4
+                        has_surface = 1
                     else:
                         top_len = 0
 
@@ -573,8 +576,17 @@ cdef class VXL:
                         # client-side, and one dug block cascade-collapses it.
                         # Measured 2026-07-09: CityOfChicago col (256,128) went
                         # from [188,239] (2 solids) to [188..239] (52, grounded).
-                        for z in range(top_end + 1, MAP_HEIGHT):
-                            self._store_block(x, y, z + z_shift, 0)
+                        #
+                        # BUT only for columns that HAVE a land surface. Open
+                        # water is stored as an EMPTY column (no top run anywhere,
+                        # raw surface None) whose only solid is the z=239 waterbed
+                        # laid by _fill_floor; the client renders water wherever a
+                        # column is empty above that bed. Filling those solid
+                        # (CityOfChicago col (0,0) -> [200..239]) DELETES the water.
+                        # has_surface gates the fill so water columns stay water.
+                        if has_surface:
+                            for z in range(top_end + 1, MAP_HEIGHT):
+                                self._store_block(x, y, z + z_shift, 0)
                         break
 
                     bottom_len = span_words - top_len - 1
