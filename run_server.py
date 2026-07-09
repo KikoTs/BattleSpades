@@ -32,9 +32,22 @@ _log_format = logging.Formatter(
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 
+# Player names carry arbitrary Unicode (emoji, flags, non-Latin scripts). The
+# Windows console + default FileHandler encode as cp1252, so a name like
+# "beta keks🇷🇺" raised UnicodeEncodeError in the listener thread on EVERY
+# packet logged for that player — spamming tracebacks and dropping log lines.
+# Force UTF-8 (with errors="replace" as a last resort) on both sinks.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_format)
-_file_handler = logging.FileHandler(log_dir / "log.txt", mode="a")
+_file_handler = logging.FileHandler(
+    log_dir / "log.txt", mode="a", encoding="utf-8", errors="replace"
+)
 _file_handler.setFormatter(_log_format)
 
 _log_queue: "queue.SimpleQueue" = queue.SimpleQueue()
