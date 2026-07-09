@@ -10,7 +10,7 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *args, **kwargs: {}))
 import shared.constants as C
 from aoslib.vxl import VXL
 from shared.bytes import ByteReader
-from shared.packet import BlockBuild, BlockLiberate, BlockOccupy, KillAction, SetHP, ShootPacket, WeaponReload
+from shared.packet import BlockBuild, BlockLiberate, BlockLine, BlockOccupy, KillAction, SetHP, ShootPacket, WeaponReload
 
 from protocol.packet_handler import PacketHandler
 from server.config import ServerConfig
@@ -311,6 +311,10 @@ def test_block_build_consumes_inventory_and_clears_old_damage():
     player.blocks = 5
 
     block = (101, 100, 60)
+    # The client only places blocks that FACE-touch an existing solid
+    # (map.has_neighbors(...,1)); give this cell ground to rest on (z+1 is
+    # BELOW, z grows downward) so the server's parity gate accepts it.
+    server.world_manager.set_block(101, 100, 61, True, TEST_COLOR)
     server.world_manager.block_damage[block] = DEFAULT_BLOCK_HEALTH - 1.0
 
     packet = BlockBuild()
@@ -327,6 +331,126 @@ def test_block_build_consumes_inventory_and_clears_old_damage():
     broadcast_packet = BlockBuild(ByteReader(server.broadcast_packets[-1][1:]))
     assert broadcast_packet.block_type == BLOCK_ACTION_BUILD
     assert (broadcast_packet.x, broadcast_packet.y, broadcast_packet.z) == block
+
+
+def test_block_line_replicates_as_one_native_block_line_packet():
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 5
+    # Ground under the line (z+1 is BELOW): the client only renders blocks that
+    # face-touch a solid, so the server must only accept supported cells.
+    for x in range(101, 104):
+        server.world_manager.set_block(x, 100, 61, True, TEST_COLOR)
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 60)
+    packet.x2, packet.y2, packet.z2 = (103, 100, 60)
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.blocks == 2
+    assert all(server.world_manager.get_solid(x, 100, 60) for x in range(101, 104))
+    assert len(server.broadcast_packets) == 1
+    assert server.broadcast_packets[0][0] == BlockLine.id
+    replicated = BlockLine(ByteReader(server.broadcast_packets[0][1:]))
+    assert replicated.loop_count == server.loop_count
+    assert replicated.player_id == player.id
+    assert (replicated.x1, replicated.y1, replicated.z1) == (101, 100, 60)
+    assert (replicated.x2, replicated.y2, replicated.z2) == (103, 100, 60)
+
+
+def test_block_line_rejects_unsupported_floating_cells():
+    """The client's gate is map.has_neighbors(x,y,z,1) — a block touching
+    nothing is silently dropped. If the server accepts such a placement it
+    keeps blocks NO client has: the build never appears, the builder loses
+    inventory, and the server carries collision where every client sees air
+    (a server-side "invisible wall"). Measured live 2026-07-10.
+    """
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 5
+    # No ground anywhere near z=60 -> the whole line floats.
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 60)
+    packet.x2, packet.y2, packet.z2 = (103, 100, 60)
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.blocks == 5
+    assert all(server.world_manager.get_solid(x, 100, 60) is False for x in range(101, 104))
+    assert server.broadcast_packets == []
+
+
+def test_block_line_supports_cells_on_earlier_cells_of_the_same_line():
+    """A line may extend outward from the ground: each cell rests on the one
+    placed before it, matching the client's in-order add_block walk."""
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 5
+    # Ground ONLY under the first cell; 102 and 103 float unless 101/102 support them.
+    server.world_manager.set_block(101, 100, 61, True, TEST_COLOR)
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 60)
+    packet.x2, packet.y2, packet.z2 = (103, 100, 60)
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.blocks == 2
+    assert all(server.world_manager.get_solid(x, 100, 60) for x in range(101, 104))
+    assert len(server.broadcast_packets) == 1
+    assert server.broadcast_packets[0][0] == BlockLine.id
+
+
+def test_block_line_is_atomic_when_any_cell_cannot_be_built():
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 5
+    server.world_manager.set_block(102, 100, 60, True, TEST_COLOR)
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 60)
+    packet.x2, packet.y2, packet.z2 = (103, 100, 60)
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.blocks == 5
+    assert server.world_manager.get_solid(101, 100, 60) is False
+    assert server.world_manager.get_solid(102, 100, 60) is True
+    assert server.world_manager.get_solid(103, 100, 60) is False
+    assert server.broadcast_packets == []
+
+
+def test_block_line_is_atomic_when_inventory_cannot_cover_it():
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 2
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 60)
+    packet.x2, packet.y2, packet.z2 = (103, 100, 60)
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.blocks == 2
+    assert all(server.world_manager.get_solid(x, 100, 60) is False for x in range(101, 104))
+    assert server.broadcast_packets == []
 
 
 def test_reload_is_server_validated_and_completes_in_update():
