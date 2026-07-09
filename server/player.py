@@ -1325,6 +1325,19 @@ class Player:
             byte |= 0x01
         if self.input.secondary_fire:
             byte |= 0x02
+        # 0x04 = jetpack active (display + reduced-gravity flight on the client).
+        # SAFE here ONLY because it is gated on jetpack_active: the server's fuel
+        # model (driven by the client's hover/Z bit) sets this True only while
+        # the player is actually firing the jetpack with fuel, and clears it the
+        # instant they release Z or run dry. That is the OPPOSITE of the old
+        # jump-stuck bug, which came from 0x08/0x10 being set UNCONDITIONALLY
+        # (echoed from always-on ClientData bits) so the client believed it was
+        # perma-jetpacking and skipped gravity forever. A transient, truthful
+        # 0x04 makes the jetpack visible on others AND drives server-authoritative
+        # flight; when it clears, normal gravity + jumping resume. (If a jump
+        # regression shows up, this bit is the first suspect — revert to 0.)
+        if getattr(self, "jetpack_active", False):
+            byte |= 0x04
         if self.input.is_on_fire:
             byte |= 0x20
         if self.input.zoom:
