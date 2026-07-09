@@ -561,11 +561,18 @@ class Connection:
                 len(payload),
             )
         else:
-            chunker = wm.get_chunker()
-            if chunker is None:
-                logger.warning("No map chunker available for %s", self.peer.address)
-                return
-            chunk_list = list(chunker.iter())
+            # Full sync: stream the RAW .vxl bytes (native implicit-underground
+            # encoding, ~0.5 MB) rather than re-serializing our filled in-memory
+            # grid, which explicitly writes every underground voxel into a 36 MB
+            # stream the strict client rejects (Steam join crash 2026-07-09).
+            _iter_full = getattr(wm, "iter_full_sync_chunks", None)
+            chunk_list = _iter_full() if _iter_full is not None else None
+            if chunk_list is None:
+                chunker = wm.get_chunker()
+                if chunker is None:
+                    logger.warning("No map chunker available for %s", self.peer.address)
+                    return
+                chunk_list = list(chunker.iter())
             if client_crc is not None and not crc_match:
                 logger.warning(
                     "Client/server map file CRC mismatch for %s: client=%s server=%s "
