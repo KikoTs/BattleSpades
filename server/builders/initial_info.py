@@ -34,12 +34,44 @@ def _server_steam_id(server: 'BattleSpadesServer') -> int:
 
 
 def _map_filename(server: 'BattleSpadesServer') -> str:
-    """The original protocol carries both `map_name` (display) and
-    `filename` (the .vxl basename the client may have cached). Default
-    them to the same — the server streams the map anyway, so any
-    mismatch only annoys cache lookups."""
+    """The original protocol carries both `map_name` (DISPLAY) and
+    `filename` (the .vxl basename the client may have cached). `filename`
+    is the raw basename used for the .vxl / CRC; `map_name` is the display
+    name (see _map_display_name)."""
     name = server.world_manager.map_name if server.world_manager else server.config.map_name
     return name or 'classicgen'
+
+
+# The compiled client builds the end-of-round stats screenshot path as
+# `level_screenshots/<map_name><0..N>.png`. The stock assets are named with
+# SPACES and lowercase connectors ("City of Chicago0.png", "Arctic Base0.png"),
+# so sending the bare .vxl basename ("CityOfChicago") makes ShowGameStats(53)
+# raise ResourceNotFoundException and CRASH the client at the end of the round.
+# map_name must therefore be the spaced DISPLAY name; filename stays the
+# basename. Keys are our .vxl basenames; values match the stock screenshot set.
+_MAP_DISPLAY_NAMES = {
+    "ArcticBase": "Arctic Base",
+    "CastleWars": "Castle Wars",
+    "CityOfChicago": "City of Chicago",
+    "20thCenturyTown": "WW",          # stock ships WW0-3.png for this theme
+    "London": "London",
+    "Alcatraz": "Alcatraz",
+    "Invasion": "Invasion",
+    "Frontier": "Frontier",
+    "Trenches": "Trenches",
+    "Crossroads": "Crossroads",
+}
+
+
+def _map_display_name(server: 'BattleSpadesServer') -> str:
+    """Spaced display name matching the stock level-screenshot assets."""
+    base = _map_filename(server)
+    if base in _MAP_DISPLAY_NAMES:
+        return _MAP_DISPLAY_NAMES[base]
+    # Fallback: split CamelCase into words ("DragonIsland" -> "Dragon Island").
+    import re
+    spaced = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', base)
+    return spaced
 
 
 def _map_checksum(server: 'BattleSpadesServer') -> int:
@@ -94,7 +126,9 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     pkt.mode_key = mode.mode_id
 
     # ---- Map metadata ---------------------------------------------------
-    pkt.map_name = _map_filename(server)
+    # map_name = spaced DISPLAY name (drives the end-game screenshot lookup);
+    # filename = raw .vxl basename (drives the map transfer + CRC validation).
+    pkt.map_name = _map_display_name(server)
     pkt.filename = _map_filename(server)
     pkt.checksum = _map_checksum(server)
     pkt.map_is_ugc = 0
