@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import struct
 import zlib
 from typing import Optional, Tuple
 
@@ -47,6 +48,17 @@ class WorldManager:
         # file is a valid world base (measured: London.vxl crc32 == 592649088,
         # the value the original server declared for London).
         self.map_file_crc: int = 0
+        # Raw bytes of the .vxl this world was loaded from. Streamed verbatim
+        # for the full MapSync so the client rebuilds the map in its native
+        # implicit-underground encoding (identical to its own local copy) —
+        # re-serializing our in-memory grid instead writes every filled
+        # underground voxel explicitly, bloating a 3 MB map into a 36 MB
+        # stream the strict client rejects (Steam-client join crash, 2026-07-09).
+        self.map_raw_bytes: bytes | None = None
+        # Cached full-sync chunk list (raw column spans wrapped as (x,y,spans)
+        # records, zlib-compressed, sliced into 1 KB packets). Built lazily on
+        # first join, invalidated when a new map loads.
+        self._full_sync_chunks: list[bytes] | None = None
         # Columns modified since map load — what a matched-CRC client is
         # missing relative to its local file. Sent as the MapSync delta.
         self.dirty_columns: set[tuple[int, int]] = set()
@@ -76,7 +88,10 @@ class WorldManager:
             self.map = VXL(1, map_path, 3)
             self.map_name = name.replace('.vxl', '')
             with open(map_path, 'rb') as handle:
-                self.map_file_crc = zlib.crc32(handle.read()) & 0xFFFFFFFF
+                raw = handle.read()
+            self.map_raw_bytes = raw
+            self._full_sync_chunks = None
+            self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
             self._refresh_world()
             self._scan_spawn_markers()
@@ -101,9 +116,12 @@ class WorldManager:
                 color = 0x7F008F00  # Green grass
                 self.map.set_point(x, y, ground_z, color)
 
-        # No file backs a generated map; the CRC of its serialized form is
-        # what a (hypothetical) client cache would have to match.
-        self.map_file_crc = zlib.crc32(self.map.generate_vxl()) & 0xFFFFFFFF
+        # No file backs a generated map; the CRC (and the full-sync bytes) come
+        # from its byte-faithful serialized form.
+        raw = self.map.generate_vxl()
+        self.map_raw_bytes = raw
+        self._full_sync_chunks = None
+        self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
         self._refresh_world()
         logger.info("Generated flat map")
@@ -448,6 +466,72 @@ class WorldManager:
         if self.map is None:
             return None
         return self.map.get_chunker()
+
+    def iter_full_sync_chunks(self):
+        """Full-map MapSync payload as MAP_PACKET_SIZE (1024-byte) chunks.
+
+        The client's stream-builder consumes ``(u32 x, u32 y, column-spans)``
+        records (the same layout ``VXL.get_chunk`` emits). We build those
+        records by wrapping the RAW .vxl file's own column spans — which use
+        the native *implicit-underground* encoding (a final span with
+        span_words==0 means "solid to the map floor", so only the visible
+        surface colours are on the wire).
+
+        This is the crux of the 2026-07-09 Steam-client join crash: our
+        in-memory grid fills the underground solid for collision, and
+        ``get_chunk`` re-serialises every one of those filled voxels
+        *explicitly* — 36 MB uncompressed, which the strict client rejects
+        mid-build. Re-wrapping the raw spans instead keeps the exact record
+        format the client wants at ~5 MB (the client refills the underground
+        itself, so the world is still solid and correctly coloured).
+
+        Cached after first build (the raw file never changes at runtime).
+        Returns a list of byte chunks, or None if no raw bytes are available
+        or the file can't be walked cleanly (caller falls back to
+        get_chunker()).
+        """
+        if self._full_sync_chunks is not None:
+            return self._full_sync_chunks
+        raw = self.map_raw_bytes
+        if not raw:
+            return None
+        MAP_SIZE = 512
+        MAP_PACKET_SIZE = 1024  # matches aoslib/vxl.pyx DEF MAP_PACKET_SIZE
+        n = len(raw)
+        out = bytearray()
+        pos = 0
+        for y in range(MAP_SIZE):
+            for x in range(MAP_SIZE):
+                start = pos
+                # Walk this column's span list to its terminating span.
+                while True:
+                    if pos + 4 > n:
+                        logger.warning("Map walker overran %s at col (%d,%d) — "
+                                       "falling back to chunker", self.map_name, x, y)
+                        return None
+                    span_words = raw[pos]
+                    top_start = raw[pos + 1]
+                    top_end = raw[pos + 2]
+                    top_len = (top_end - top_start + 1) if top_end >= top_start else 0
+                    if span_words == 0:
+                        pos += 4 + top_len * 4   # header + top-run colours; last span
+                        break
+                    pos += span_words * 4        # whole span is span_words 4-byte words
+                out += struct.pack("<II", x, y)
+                out += raw[start:pos]
+        if pos != n:
+            logger.warning("Map walker consumed %d/%d bytes of %s — falling back "
+                           "to chunker", pos, n, self.map_name)
+            return None
+        compressed = zlib.compress(bytes(out), 6)
+        self._full_sync_chunks = [
+            compressed[i:i + MAP_PACKET_SIZE]
+            for i in range(0, len(compressed), MAP_PACKET_SIZE)
+        ]
+        logger.info("Built full-sync stream for %s: %d records, %d B raw, %d B "
+                    "compressed, %d chunks", self.map_name, MAP_SIZE * MAP_SIZE,
+                    len(out), len(compressed), len(self._full_sync_chunks))
+        return self._full_sync_chunks
 
     def serialize_dirty_columns_compressed(self) -> bytes:
         """Serialize the columns changed since map load, zlib-compressed in
