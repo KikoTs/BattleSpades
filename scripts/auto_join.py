@@ -52,9 +52,14 @@ def main() -> int:
     ap.add_argument("--class-id", type=int, default=0)
     ap.add_argument("--wait", type=float, default=120.0,
                     help="seconds to wait for the game console to come up")
+    ap.add_argument("--console-port", type=int, default=32896,
+                    help="tracer console port; launch a 2nd client with "
+                         "PHYSICS_TRACER_CONSOLE_PORT=32897 (and "
+                         "PHYSICS_TRACER_PORT=32898) to drive two observable "
+                         "clients for replication tests")
     args = ap.parse_args()
 
-    console = GameConsole()
+    console = GameConsole(port=args.console_port)
     print("waiting for game console...")
     console.connect(wait_seconds=args.wait)
     print("console up; waiting for game manager (boot)...")

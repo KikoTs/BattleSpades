@@ -19,7 +19,7 @@ from server.game_constants import (
     MELEE_RANGE,
     PLAYER_WIDTH_HALF,
 )
-from shared.packet import BlockBuild, ShootPacket
+from shared.packet import BlockBuild, BlockLine, ShootPacket
 
 logger = logging.getLogger(__name__)
 
@@ -119,12 +119,41 @@ class CombatSystem:
         player._broadcast_reload_state(False)
         return True
 
+    # The CLIENT refuses to place a block that touches nothing: its gate is
+    # `map.has_neighbors(x, y, z, 1)` — FACE adjacency (the 6 axis neighbours),
+    # not diagonal — plus `get_max_modifiable_z() == 238`. Live-measured on the
+    # real client 2026-07-10: directly above the surface -> True, any gap -> False.
+    #
+    # Our world_manager.can_build only checks bounds/solidity, so the server used
+    # to accept FLOATING placements the client silently drops. The server then
+    # held blocks no client had: builds "didn't appear", the builder lost
+    # inventory for nothing, and the server carried collision where every client
+    # saw air (a server-side "invisible wall"). Mirror the client's rule exactly.
+    _NEIGHBOR_OFFSETS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+    MAX_MODIFIABLE_Z = 238
+
+    def _block_supported(self, x: int, y: int, z: int, pending=()) -> bool:
+        """Client-parity placement gate: the cell must FACE-touch an existing
+        solid, or a cell committed earlier in this same line (the client's
+        add_block loop walks the generated points in order, so a later cell may
+        rest on an earlier one)."""
+        if not (0 <= z <= self.MAX_MODIFIABLE_Z):
+            return False
+        wm = self.server.world_manager
+        for dx, dy, dz in self._NEIGHBOR_OFFSETS:
+            neighbor = (x + dx, y + dy, z + dz)
+            if neighbor in pending or wm.get_solid(*neighbor):
+                return True
+        return False
+
     def handle_block_build(self, player, packet) -> bool:
         if not player.alive or not player.spawned or not player.is_block_tool():
             return False
 
         x, y, z = packet.x, packet.y, packet.z
         if not self.server.world_manager.can_build(x, y, z):
+            return False
+        if not self._block_supported(x, y, z):
             return False
         if not player.remove_block():
             return False
@@ -133,52 +162,93 @@ class CombatSystem:
         self._broadcast_block_mutation(player, (x, y, z), BLOCK_ACTION_BUILD)
         return True
 
+    # Longest line the server will accept. The client regenerates the cells
+    # from the echoed ENDPOINTS with its own generator, so the server must
+    # never truncate/sparsify a line (server cells != client cells); overlong
+    # lines are rejected whole instead.
+    BLOCK_LINE_MAX_CELLS = 64
+
     def handle_block_line(self, player, packet) -> bool:
         """BlockLine (id 40) — how the 1.x client actually PLACES blocks (it
-        never emits BlockBuild/id 32). Builds every cell on the line from
-        (x1,y1,z1) to (x2,y2,z2); a single tap has equal endpoints -> 1 cell.
+        never emits BlockBuild/id 32). ATOMIC: the whole line builds or none
+        of it does, and the announcement to other clients is ONE sanitized
+        BlockLine(40) echo.
+
+        IDA ground truth (docs/REPLICATION_IDA_FINDINGS.md): the client's
+        native remote-placement path is process_packet_block_line
+        (sub_1018D690) — it regenerates the cells from the packet's endpoints
+        and add_block()s each one. Our old per-cell BlockBuild(32) conversion
+        reached every client but did not render (measured live 2026-07-09);
+        the original server likewise echoes a line as one packet 40. Atomicity
+        is what makes the single echo safe: the client rebuilds the FULL line
+        from the endpoints, so the server must commit exactly those cells.
         """
         if not player.alive or not player.spawned or not player.is_block_tool():
             return False
 
-        cells = self._block_line_cells(
-            (packet.x1, packet.y1, packet.z1),
-            (packet.x2, packet.y2, packet.z2),
-        )
-        built = []
-        for (x, y, z) in cells:
-            if not self.server.world_manager.can_build(x, y, z):
-                continue
-            if not player.remove_block():
-                break  # out of blocks
-            self.server.world_manager.set_block(x, y, z, True, player.block_color)
-            built.append((x, y, z))
+        x1, y1, z1 = packet.x1, packet.y1, packet.z1
+        x2, y2, z2 = packet.x2, packet.y2, packet.z2
 
-        if not built:
+        # NOTE: do NOT call world_manager.block_line — the compiled
+        # vxl.cp312.pyd's block_line ACCESS-VIOLATES (stale/broken build,
+        # segfaults on both empty and real maps; reproduced 2026-07-10).
+        # Rasterize in pure Python with the identical algorithm instead.
+        # A single tap has equal endpoints -> 1 cell.
+        cells = self._block_line_cells((x1, y1, z1), (x2, y2, z2))
+        if not cells or len(cells) > self.BLOCK_LINE_MAX_CELLS:
             return False
-        for pos in built:
-            self._broadcast_block_mutation(player, pos, BLOCK_ACTION_BUILD)
+
+        # Validate the COMPLETE line before mutating anything. Support is
+        # checked PROGRESSIVELY (a cell may rest on an earlier cell of the same
+        # line), mirroring the client's in-order add_block walk; if any cell is
+        # unsupported the client would drop it, so the server rejects the whole
+        # line rather than commit blocks no client will ever render.
+        if player.blocks < len(cells):
+            return False
+        pending: set[tuple[int, int, int]] = set()
+        for cell in cells:
+            if not self.server.world_manager.can_build(*cell):
+                return False
+            if not self._block_supported(*cell, pending=pending):
+                return False
+            pending.add(cell)
+
+        # Commit: consume the full cost, build every cell.
+        player.blocks -= len(cells)
+        for (x, y, z) in cells:
+            self.server.world_manager.set_block(x, y, z, True, player.block_color)
+
+        echo = BlockLine()
+        echo.loop_count = self.server.loop_count
+        echo.player_id = player.id
+        echo.x1, echo.y1, echo.z1 = x1, y1, z1
+        echo.x2, echo.y2, echo.z2 = x2, y2, z2
+        self.server.broadcast(bytes(echo.generate()))
         return True
 
-    def _block_line_cells(self, a, b, max_len: int = 64):
-        """Integer cells along the segment a..b inclusive (deduped, capped)."""
+    def _block_line_cells(self, a, b):
+        """Integer cells along the segment a..b inclusive.
+
+        Mirrors aoslib/vxl.pyx block_line EXACTLY (same rounding expression,
+        consecutive-only dedupe, NO truncation) because the remote client
+        regenerates the cells from the echoed endpoints with its own
+        generator — any divergence here desyncs server world vs client world.
+        (Pure Python because the compiled pyd's block_line segfaults.)
+        Overlong lines are the CALLER's job to reject, never sparsify.
+        """
         x1, y1, z1 = a
         x2, y2, z2 = b
-        n = max(abs(x2 - x1), abs(y2 - y1), abs(z2 - z1))
-        if n == 0:
+        steps = max(abs(x2 - x1), abs(y2 - y1), abs(z2 - z1))
+        if steps <= 0:
             return [(x1, y1, z1)]
-        n = min(n, max_len)
-        seen = set()
         out = []
-        for i in range(n + 1):
-            t = i / float(n)
+        for i in range(steps + 1):
             cell = (
-                int(round(x1 + (x2 - x1) * t)),
-                int(round(y1 + (y2 - y1) * t)),
-                int(round(z1 + (z2 - z1) * t)),
+                int(round(x1 + ((x2 - x1) * i) / float(steps))),
+                int(round(y1 + ((y2 - y1) * i) / float(steps))),
+                int(round(z1 + ((z2 - z1) * i) / float(steps))),
             )
-            if cell not in seen:
-                seen.add(cell)
+            if not out or out[-1] != cell:
                 out.append(cell)
         return out
 
