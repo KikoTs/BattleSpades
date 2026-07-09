@@ -513,6 +513,7 @@ cdef class VXL:
         cdef int i
         cdef int has_surface
         cdef unsigned int color
+        cdef unsigned int surface_color
 
         if columns <= 0:
             return False
@@ -545,6 +546,7 @@ cdef class VXL:
             for src_x in range(edge):
                 x = src_x + offset
                 has_surface = 0
+                surface_color = 0
                 while True:
                     if pos + 4 > limit:
                         return False
@@ -563,6 +565,9 @@ cdef class VXL:
                             self._store_block(x, y, top_start + z_shift + i, color)
                         pos += top_len * 4
                         has_surface = 1
+                        # Remember the deepest surface color so the underground
+                        # fill below can inherit it (see the span_words==0 branch).
+                        surface_color = color
                     else:
                         top_len = 0
 
@@ -584,9 +589,17 @@ cdef class VXL:
                         # column is empty above that bed. Filling those solid
                         # (CityOfChicago col (0,0) -> [200..239]) DELETES the water.
                         # has_surface gates the fill so water columns stay water.
+                        #
+                        # Fill with the SURFACE color, NOT 0: a color-0 solid
+                        # block is INVISIBLE to the client mesher (it renders
+                        # nothing) yet still blocks bullets -> "invisible blocks
+                        # that only appear when you shoot them" where the fill is
+                        # exposed (cliffs, land/water edges). Inheriting the
+                        # surface color makes exposed underground render as
+                        # terrain. Measured 2026-07-09: fill was color 0 at z>=176.
                         if has_surface:
                             for z in range(top_end + 1, MAP_HEIGHT):
-                                self._store_block(x, y, z + z_shift, 0)
+                                self._store_block(x, y, z + z_shift, surface_color)
                         break
 
                     bottom_len = span_words - top_len - 1
@@ -600,8 +613,13 @@ cdef class VXL:
                     if bottom_start < top_end + 1:
                         return False
 
+                    # Solid interior between the top surface run and the bottom
+                    # cave-ceiling run. Use the surface color (NOT 0): a color-0
+                    # solid block is invisible to the mesher yet blocks bullets,
+                    # so exposed interior (cave mouths, cliffs) reads as
+                    # "invisible blocks you can only see after shooting them".
                     for z in range(top_end + 1, bottom_start):
-                        self._store_block(x, y, z + z_shift, 0)
+                        self._store_block(x, y, z + z_shift, surface_color)
 
                     for i in range(bottom_len):
                         color = _read_u32_le(data, pos + (i * 4))
