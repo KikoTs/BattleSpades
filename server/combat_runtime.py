@@ -30,6 +30,38 @@ HEADSHOT_HEIGHT = 0.35
 BODY_HEIGHT_PADDING = 1.0
 
 
+def _build_melee_profiles():
+    """Per-tool dig behavior. (damage_type, block_damage_per_hit, is_column).
+
+    - damage_type: the client BlockManager self-expands + credits the wallet by
+      this int. LIVE-MEASURED 2026-07-09 cells removed per hit: SPADE_DAMAGE(2)
+      = a 3-tall column (z-1,z,z+1); PICKAXE(0)/KNIFE(1)/CROWBAR(26)/WEAPON(6)
+      = exactly 1 cell. All melee types credit the digger's block wallet.
+    - block_damage_per_hit: how fast blocks break (DEFAULT_BLOCK_HEALTH=5.0).
+      spade 5 (1 hit), pickaxe 9 (1 hit, fast miner), knife 1 (5 hits, weak),
+      crowbar 5, superspade 7.5. This is the user-visible "different damage".
+    - is_column: True = classic instant 3-tall spade dig; False = single cell.
+    """
+    import shared.constants as C
+
+    def T(name, default):
+        return int(getattr(C, name, default))
+
+    return {
+        T("SPADE_TOOL", 2):        (T("SPADE_DAMAGE", 2),      5.0, True),
+        T("CLASSIC_SPADE_TOOL", 4):(T("SPADE_DAMAGE", 2),      3.0, True),
+        T("SUPERSPADE_TOOL", 3):   (T("SUPERSPADE_DAMAGE", 3), 7.5, True),
+        T("PICKAXE_TOOL", 0):      (T("PICKAXE_DAMAGE", 0),    9.0, False),
+        T("KNIFE_TOOL", 1):        (T("KNIFE_DAMAGE", 1),      1.0, False),
+        T("CROWBAR_TOOL", 34):     (T("CROWBAR_DAMAGE", 26),   5.0, False),
+        T("MACHETE_TOOL", 50):     (T("MACHETE_DAMAGE", 35),   2.0, False),
+    }
+
+
+MELEE_DIG_PROFILES = _build_melee_profiles()
+DEFAULT_MELEE_PROFILE = (2, 5.0, True)   # spade fallback
+
+
 def get_combat_system(server):
     combat = getattr(server, "combat", None)
     if combat is None:
@@ -152,47 +184,61 @@ class CombatSystem:
 
     def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
         """Raycast terrain from the CLIENT's reported origin/direction and dig
-        a 1x1x3 column (the classic spade dig), crediting the digger.
+        per the player's CURRENT tool (MELEE_DIG_PROFILES).
 
-        The dig is broadcast as ONE Damage with type=SPADE_DAMAGE(2) at the
-        center cell. That is the ONLY wire path that makes the client both
-        (a) self-expand to the (z-1, z, z+1) column and (b) add the destroyed
-        blocks to the digger's wallet (measured live 2026-07-07: type-2
-        credited block_count; type-6/WEAPON did not). So the server removes the
-        same column and mirrors the credit — a WEAPON_DAMAGE dig would break
-        the blocks visually but leave the client's block count untouched, which
-        is exactly the "mining doesn't replenish" symptom.
+        - Spade family (is_column): the classic instant 3-tall dig — one hit
+          removes the (z-1, z, z+1) column; the broadcast SPADE_DAMAGE(2) at the
+          center makes the client self-expand to the same column.
+        - Pickaxe / knife / crowbar (single cell): accumulate the tool's
+          per-hit block damage on the one hit cell (knife 1 -> 5 hits/block,
+          pickaxe 9 -> 1 hit); the block breaks when it reaches
+          DEFAULT_BLOCK_HEALTH on both sides. Each tool broadcasts its OWN
+          damage type so the client shows the right particles + credits the
+          wallet (all melee types are block-granting, measured single-cell).
         """
         if direction is None:
             return False
         block_pos = self.server.world_manager.raycast(
-            origin[0],
-            origin[1],
-            origin[2],
-            direction[0],
-            direction[1],
-            direction[2],
+            origin[0], origin[1], origin[2],
+            direction[0], direction[1], direction[2],
             MELEE_RANGE,
         )
         if block_pos is None:
             return False
-        import shared.constants as C
-        positions = [
-            (block_pos[0], block_pos[1], block_pos[2] - 1),
-            (block_pos[0], block_pos[1], block_pos[2]),
-            (block_pos[0], block_pos[1], block_pos[2] + 1),
-        ]
-        destroyed = self.server.world_manager.destroy_blocks(positions)
-        if not destroyed:
-            return False
-        # Server-side wallet mirrors the client's own credit.
-        player.add_blocks(len(destroyed))
-        self._broadcast_block_damage(
-            player, block_pos, self._BLOCK_KILL_DAMAGE,
-            damage_type=int(getattr(C, "SPADE_DAMAGE", 2)),
-        )
-        self._collapse_unsupported(player, destroyed)
-        return True
+
+        dmg_type, block_dmg, is_column = MELEE_DIG_PROFILES.get(
+            getattr(player, "tool", None), DEFAULT_MELEE_PROFILE)
+        x, y, z = block_pos
+        wm = self.server.world_manager
+
+        if is_column:
+            # Instant 3-tall column dig (one hit clears the column).
+            positions = [(x, y, z - 1), (x, y, z), (x, y, z + 1)]
+            destroyed = wm.destroy_blocks(positions)
+            if not destroyed:
+                return False
+            wm.clear_block_damage(x, y, z)
+            player.add_blocks(len(destroyed))
+            self._broadcast_block_damage(
+                player, block_pos, self._BLOCK_KILL_DAMAGE, damage_type=dmg_type)
+            self._collapse_unsupported(player, destroyed)
+            return True
+
+        # Single-cell tool: accumulate damage until the block breaks.
+        total, destroyed = wm.apply_block_damage(
+            x, y, z, block_dmg, threshold=DEFAULT_BLOCK_HEALTH)
+        if destroyed:
+            player.add_blocks(1)
+            self._broadcast_block_damage(
+                player, block_pos, self._BLOCK_KILL_DAMAGE, damage_type=dmg_type)
+            self._collapse_unsupported(player, [block_pos])
+            return True
+        if total > 0.0:
+            # Partial crack — the client accumulates the same per-hit amount.
+            self._broadcast_block_damage(
+                player, block_pos, block_dmg, damage_type=dmg_type)
+            return True
+        return False
 
     def handle_block_destroy(self, player, packet) -> bool:
         if not player.alive or not player.spawned:
