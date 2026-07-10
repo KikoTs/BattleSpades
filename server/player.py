@@ -67,6 +67,8 @@ INPUT_HISTORY_LIMIT = 128
 # movement_history entry (no ADJUST/SNAP). The cap only bounds a pathological
 # backlog so a flood can't stall the 60Hz loop.
 INPUT_DRAIN_MAX = 8
+# Slack on the server-side fire-rate gate: one 60Hz sim tick (~16.7ms).
+FIRE_RATE_GRACE = 1.0 / 60.0
 # Input consumption (see Player.simulate_tick): exactly one physics step per
 # tick, applying the freshest buffered input — paced at real time so the server
 # can never outrun the client (which is what caused the run-off-the-map / snap).
@@ -789,7 +791,13 @@ class Player:
         current_time = time.monotonic() if now is None else now
         if self.reloading and current_time < self.reload_end_time:
             return False
-        if current_time - self.last_shot_time < profile.fire_interval:
+        # Grace on the cadence gate. The client fires on ITS clock; by the time
+        # the shot reaches us, jitter routinely compresses the inter-arrival gap
+        # slightly below fire_interval. With a hard compare a steady full-auto
+        # stream loses shots at random — read as "the server's fire rate is
+        # wrong". One sim tick of slack admits legitimate cadence while still
+        # clamping anything meaningfully faster than the weapon allows.
+        if current_time - self.last_shot_time < profile.fire_interval - FIRE_RATE_GRACE:
             return False
 
         if self.is_spade_tool():
