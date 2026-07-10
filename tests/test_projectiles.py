@@ -5,9 +5,12 @@ Ground truth: docs/CONTENT_TABLES.md + the 2026-07-07 client extraction
 (ROCKET 75u/s g*0.05 blast 140/5, ROCKET2 150u/s g*0.025 50/2, DRILL 20u/s
 g*1.5 lifespan 3s 50/5 -> destroyed 95/10, SNOWBALL 50u/s g*0.5 10/0).
 """
+from types import SimpleNamespace
+
 import shared.constants as C
 from server.projectiles import (
-    PROJECTILE_SPECS, ProjectileEngine, BASE_GRAVITY, BOUNCE_DAMP,
+    PROJECTILE_SPECS, DrillContact, ProjectileDeployment, ProjectileEngine,
+    BASE_GRAVITY, BOUNCE_DAMP,
 )
 
 DT = 1.0 / 60.0
@@ -41,7 +44,8 @@ class FloorWorld:
 
 def test_specs_cover_requested_tools():
     for tool in (C.GRENADE_TOOL, C.RPG_TOOL, C.RPG2_TOOL, C.DRILLGUN_TOOL,
-                 C.SNOWBLOWER_TOOL, C.STICKY_GRENADE_TOOL, C.CHEMICALBOMB_TOOL):
+                 C.SNOWBLOWER_TOOL, C.STICKY_GRENADE_TOOL, C.CHEMICALBOMB_TOOL,
+                 C.GRENADE_LAUNCHER_WEAPON_TOOL, C.MINE_LAUNCHER_TOOL):
         assert int(tool) in PROJECTILE_SPECS, f"tool {tool} missing"
 
 
@@ -57,6 +61,21 @@ def test_rocket_spec_matches_client_constants():
     assert d.lifespan == 3.0 and d.destroyed_damage == 95
     sb = PROJECTILE_SPECS[int(C.SNOWBLOWER_TOOL)]
     assert sb.damage == 10 and sb.block_damage == 0
+
+
+def test_late_explosive_specs_match_recovered_client_constants():
+    chemical = PROJECTILE_SPECS[int(C.CHEMICALBOMB_TOOL)]
+    sticky = PROJECTILE_SPECS[int(C.STICKY_GRENADE_TOOL)]
+    launcher = PROJECTILE_SPECS[int(C.GRENADE_LAUNCHER_WEAPON_TOOL)]
+    mine = PROJECTILE_SPECS[int(C.MINE_LAUNCHER_TOOL)]
+
+    assert (chemical.behavior, chemical.damage, chemical.block_damage,
+            chemical.blast_radius) == ("contact", 50.0, 3.0, 3.0)
+    assert (sticky.damage, sticky.block_damage, sticky.blast_radius) == (200.0, 6.0, 5.0)
+    assert (launcher.behavior, launcher.damage, launcher.block_damage,
+            launcher.blast_radius, launcher.lifespan) == ("contact", 100.0, 6.0, 4.0, 3.0)
+    assert (mine.behavior, mine.damage, mine.block_damage,
+            mine.blast_radius) == ("deploy", 100.0, 15.0, 3.0)
 
 
 def test_unknown_tool_not_spawned():
@@ -123,6 +142,64 @@ def test_rocket_no_tunneling_through_thin_wall():
     assert explosions[0].x < 120.0
 
 
+def test_rocket_sweeps_into_player_before_wall():
+    """Regression: rockets used to test voxels only and phase through every
+    player. The swept body test must catch a target between tick endpoints."""
+    eng = ProjectileEngine()
+    eng.spawn(
+        int(C.RPG2_TOOL), (100.0, 100.0, 30.0), (150.0, 0.0, 0.0),
+        0.0, 1, now=0.0,
+    )
+    target = SimpleNamespace(
+        id=2, alive=True, spawned=True,
+        x=106.0, y=100.0, z=29.0,
+        input=SimpleNamespace(crouch=False),
+    )
+    explosions = []
+    t = 0.0
+    for _ in range(10):
+        t += DT
+        explosions = eng.update(DT, OpenWorld(), now=t, players=[target])
+        if explosions:
+            break
+    assert len(explosions) == 1
+    assert explosions[0].x < target.x
+
+
+def test_contact_projectile_does_not_hit_its_owner_body():
+    eng = ProjectileEngine()
+    eng.spawn(
+        int(C.RPG_TOOL), (100.0, 100.0, 30.0), (75.0, 0.0, 0.0),
+        0.0, 1, now=0.0,
+    )
+    owner = SimpleNamespace(
+        id=1, alive=True, spawned=True,
+        x=100.0, y=100.0, z=29.0,
+        input=SimpleNamespace(crouch=False),
+    )
+    assert eng.update(DT, OpenWorld(), now=DT, players=[owner]) == []
+    assert len(eng.projectiles) == 1
+
+
+def test_mine_launcher_contact_deploys_instead_of_exploding():
+    eng = ProjectileEngine()
+    eng.spawn(
+        int(C.MINE_LAUNCHER_TOOL),
+        (100.0, 100.0, 30.0), (75.0, 0.0, 0.0),
+        0.0, 1, now=0.0,
+    )
+    events = []
+    t = 0.0
+    for _ in range(30):
+        t += DT
+        events = eng.update(DT, WallWorld(110), now=t)
+        if events:
+            break
+    assert len(events) == 1
+    assert isinstance(events[0], ProjectileDeployment)
+    assert events[0].x < 110.0
+
+
 # --- drill ------------------------------------------------------------------
 
 def test_drill_lifespan_uses_destroyed_blast():
@@ -143,18 +220,43 @@ def test_drill_lifespan_uses_destroyed_blast():
     assert 2.9 <= t <= 3.1
 
 
-def test_drill_contact_uses_normal_blast():
+def test_drill_contact_damages_block_and_keeps_flying():
     eng = ProjectileEngine()
     eng.spawn(int(C.DRILLGUN_TOOL), (100.0, 100.0, 30.0), (20.0, 0.0, 0.0), 0.0, 1, now=0.0)
-    explosions = []
+    events = []
     t = 0.0
     for _ in range(120):
         t += DT
-        explosions = eng.update(DT, WallWorld(110), now=t)
-        if explosions:
+        events = eng.update(DT, WallWorld(110), now=t)
+        if events:
             break
-    assert len(explosions) == 1
-    assert explosions[0].damage == 50
+    assert len(events) == 1
+    assert isinstance(events[0], DrillContact)
+    assert events[0].block[0] == 110
+    assert len(eng.projectiles) == 1
+
+
+def test_drill_explodes_on_player_contact():
+    eng = ProjectileEngine()
+    eng.spawn(
+        int(C.DRILLGUN_TOOL), (100.0, 100.0, 30.0), (20.0, 0.0, 0.0),
+        0.0, 1, now=0.0,
+    )
+    target = SimpleNamespace(
+        id=2, alive=True, spawned=True,
+        x=105.0, y=100.0, z=29.0,
+        input=SimpleNamespace(crouch=False),
+    )
+    events = []
+    t = 0.0
+    for _ in range(60):
+        t += DT
+        events = eng.update(DT, OpenWorld(), now=t, players=[target])
+        if events:
+            break
+    assert len(events) == 1
+    assert events[0].damage == 50
+    assert eng.projectiles == []
 
 
 # --- grenade regression -----------------------------------------------------
@@ -232,3 +334,37 @@ def test_sticky_anchors_on_contact_then_fuse_fires():
     assert stuck_pos is not None, "sticky never stuck"
     assert len(explosions) == 1
     assert 1.9 <= t <= 2.1
+
+
+def test_sticky_attaches_to_and_follows_player_until_stock_fuse():
+    eng = ProjectileEngine()
+    eng.spawn(
+        int(C.STICKY_GRENADE_TOOL),
+        (100.0, 100.0, 30.0), (40.0, 0.0, 0.0),
+        0.0, 1, now=0.0,
+    )
+    target = SimpleNamespace(
+        id=2, alive=True, spawned=True,
+        x=105.0, y=100.0, z=29.0,
+        input=SimpleNamespace(crouch=False),
+    )
+    t = 0.0
+    stuck_at = None
+    events = []
+    for _ in range(60 * 7):
+        t += DT
+        events = eng.update(DT, OpenWorld(), now=t, players=[target])
+        if eng.projectiles and eng.projectiles[0].attached_player_id == target.id:
+            if stuck_at is None:
+                stuck_at = t
+                target.x = 110.0
+            elif not events:
+                assert abs(eng.projectiles[0].x - target.x) < 1e-6
+        if events:
+            break
+
+    assert stuck_at is not None
+    assert len(events) == 1
+    assert events[0].spec.name == "sticky_grenade"
+    assert abs(events[0].x - target.x) < 1e-6
+    assert abs((t - stuck_at) - C.STICKY_GRENADE_STICK_FUSE) < 0.1

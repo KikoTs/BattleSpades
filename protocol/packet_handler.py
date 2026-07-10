@@ -209,6 +209,8 @@ async def handle_shoot(server, player, packet):
     if not player.alive:
         return
 
+    # A disguise is concealment, not armour: firing exposes the Engineer.
+    player.disguised = False
     get_combat_system(server).handle_shot(player, packet)
 
 
@@ -248,6 +250,7 @@ async def handle_oriented_item(server, player, packet):
     block destruction when the fuse expires."""
     if not player.alive or not player.spawned:
         return
+    player.disguised = False
     server.spawn_grenade(player, packet)
 
 
@@ -398,27 +401,36 @@ async def handle_set_class_loadout(server, player, packet):
 
 @register_handler(90)  # PlaceMedPack
 async def handle_place_medpack(server, player, packet):
-    """A medic placed a medpack. Register a server-side heal entity (touch =
-    heal teammates, limited uses). NOT broadcast as a wire entity yet — the
-    medpack's CreateEntity type id is unverified against the compiled client
-    (an unknown type/state crashes it natively)."""
+    """Place the visible Medic pack (25 HP per touch, three uses)."""
     if not player.alive or not player.spawned:
         return
     import shared.constants as C
-    from server.entities.behaviors import MedpackBehavior
-    from server.game_constants import TEAM_NEUTRAL
-
-    x, y, z = float(packet.x), float(packet.y), float(packet.z)
-    # Sanity: must be near the placer (client validates placement radius 5).
-    dx, dy, dz = x - player.x, y - player.y, z - player.z
-    if dx * dx + dy * dy + dz * dz > 100.0:
+    if int(getattr(player, "tool", -1)) != int(C.MEDPACK_TOOL):
         return
-    server.entity_registry.place(
-        int(getattr(C, "HEALTH_DROP_POINT_ENTITY", 19)), x, y, z,
-        state=TEAM_NEUTRAL, kind="medpack",
-        behavior=MedpackBehavior(team=player.team),
+    if int(C.MEDPACK_TOOL) not in [
+        int(tool) for tool in (getattr(player, "loadout", None) or [])
+    ]:
+        return
+    from server.entities.behaviors import MedpackBehavior
+    from server.connection import internal_team_to_wire
+
+    pos = _deploy_pos(
+        player, packet, max_distance=float(getattr(C, "MEDPACK_FAR_RADIUS", 5.0))
     )
-    logger.info("MEDPACK placed by %s at (%.1f,%.1f,%.1f)", player.name, x, y, z)
+    if pos is None:
+        return
+    ent = server.entity_registry.place(
+        int(getattr(C, "MEDPACK_ENTITY", 31)), *pos,
+        state=internal_team_to_wire(player.team), kind="medpack",
+        player_id=player.id, face=int(getattr(packet, "face", 4)),
+        behavior=MedpackBehavior(
+            team=player.team,
+            heal_amount=int(getattr(C, "MEDPACK_HEAL_AMOUNT", 25)),
+            uses=int(getattr(C, "MEDPACK_USES", 3)),
+        ),
+    )
+    server.broadcast_create_entity(ent)
+    logger.info("MEDPACK id=%d placed by %s at %s", ent.entity_id, player.name, pos)
 
 
 def _deploy_pos(player, packet, max_distance: float = 15.0):
@@ -442,16 +454,27 @@ async def handle_place_dynamite(server, player, packet):
     """Miner dynamite: a timed charge that craters + damages on a 7s fuse."""
     if not player.alive or not player.spawned:
         return
-    pos = _deploy_pos(player, packet)
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.DYNAMITE_TOOL):
+        return
+    pos = _deploy_pos(
+        player, packet, max_distance=float(getattr(C, "DYNAMITE_FAR_RADIUS", 5.0))
+    )
     if pos is None:
         return
-    import shared.constants as C
     from server.entities.behaviors import TimedExplosiveBehavior
     from server.connection import internal_team_to_wire
     from server.game_constants import KILL_TYPES
     behavior = TimedExplosiveBehavior(
-        player.id, fuse=7.0, damage=300.0, block_damage=5.0,
-        crater_radius=2, kill_type=KILL_TYPES.get("DYNAMITE_KILL", 15))
+        player.id,
+        fuse=float(getattr(C, "DYNAMITE_EXPLOSION_FUSE", 7.0)),
+        damage=float(getattr(C, "DYNAMITE_EXPLOSION_DAMAGE", 300.0)),
+        block_damage=float(getattr(C, "DYNAMITE_EXPLOSION_BLOCK_DAMAGE", 7.0)),
+        crater_radius=2,
+        kill_type=KILL_TYPES.get("DYNAMITE_KILL", 15),
+        blast_radius=float(getattr(C, "DYNAMITE_EXPLOSION_RADIUS", 5.0)),
+        force_destroy=True,
+    )
     ent = server.entity_registry.place(
         int(getattr(C, "DYNAMITE_ENTITY", 10)), pos[0], pos[1], pos[2],
         state=internal_team_to_wire(player.team), kind="deployable",
@@ -465,23 +488,144 @@ async def handle_place_landmine(server, player, packet):
     """Scout landmine: arms, then detonates when an enemy walks near it."""
     if not player.alive or not player.spawned:
         return
-    pos = _deploy_pos(player, packet)
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.LANDMINE_TOOL):
+        return
+    pos = _deploy_pos(
+        player, packet, max_distance=float(getattr(C, "LANDMINE_FAR_RADIUS", 5.0))
+    )
     if pos is None:
         return
-    import shared.constants as C
     from server.entities.behaviors import ProximityMineBehavior
     from server.connection import internal_team_to_wire
     from server.game_constants import KILL_TYPES
     behavior = ProximityMineBehavior(
-        player.id, player.team, damage=100.0, block_damage=3.0,
+        player.id, player.team,
+        damage=float(getattr(C, "LANDMINE_EXPLOSION_DAMAGE", 100.0)),
+        block_damage=float(getattr(C, "LANDMINE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
         crater_radius=1, kill_type=KILL_TYPES.get("LANDMINE_KILL", 14),
-        trigger_radius=2.5, arm_delay=1.0)
+        trigger_radius=float(getattr(C, "LANDMINE_DETECTION_RANGE", 2.5)),
+        arm_delay=float(getattr(C, "LANDMINE_ACTIVATION_TIMER", 4.0)),
+        blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)),
+        force_destroy=False,
+        detection_layers=int(getattr(C, "LANDMINE_DETECTION_LAYERS", 3)),
+    )
     ent = server.entity_registry.place(
         int(getattr(C, "LANDMINE_ENTITY", 9)), pos[0], pos[1], pos[2],
         state=internal_team_to_wire(player.team), kind="deployable",
         player_id=player.id, behavior=behavior)
     server.broadcast_create_entity(ent)
     logger.info("LANDMINE placed by %s at %s", player.name, pos)
+
+
+@register_handler(92)  # PlaceC4
+async def handle_place_c4(server, player, packet):
+    """Miner remote charge: attach to any valid block face, then persist until
+    this owner sends DetonateC4."""
+    if not player.alive or not player.spawned:
+        return
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.C4_TOOL):
+        return
+    if int(C.C4_TOOL) not in [
+        int(tool) for tool in (getattr(player, "loadout", None) or [])
+    ]:
+        return
+    face = int(getattr(packet, "face", -1))
+    if not 0 <= face <= 5:
+        return
+    pos = _deploy_pos(
+        player, packet, max_distance=float(getattr(C, "C4_FAR_RADIUS", 5.0))
+    )
+    if pos is None:
+        return
+
+    live_ids = []
+    for entity_id in list(getattr(player, "_c4_entity_ids", []) or []):
+        ent = server.entity_registry.get(entity_id)
+        if ent is not None and ent.alive:
+            live_ids.append(entity_id)
+    if len(live_ids) >= int(getattr(C, "C4_STOCK", 2)):
+        return
+
+    from server.connection import internal_team_to_wire
+    from server.entities.behaviors import RemoteChargeBehavior
+    behavior = RemoteChargeBehavior(
+        thrower_id=player.id,
+        damage=float(getattr(C, "C4_EXPLOSION_DAMAGE", 300.0)),
+        block_damage=float(getattr(C, "C4_EXPLOSION_BLOCK_DAMAGE", 7.0)),
+        crater_radius=2,
+        kill_type=int(getattr(C.KILL, "C4_KILL", 36)),
+        blast_radius=float(getattr(C, "C4_EXPLOSION_RADIUS", 8.0)),
+    )
+    ent = server.entity_registry.place(
+        int(getattr(C, "C4_ENTITY", 30)), *pos,
+        state=internal_team_to_wire(player.team), kind="deployable",
+        player_id=player.id, face=face, behavior=behavior,
+    )
+    live_ids.append(ent.entity_id)
+    player._c4_entity_ids = live_ids
+    server.broadcast_create_entity(ent)
+    logger.info("C4 id=%d placed by %s at %s face=%d",
+                ent.entity_id, player.name, pos, face)
+
+
+@register_handler(93)  # DetonateC4
+async def handle_detonate_c4(server, player, packet):
+    """Detonate all live charges owned by this Miner."""
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.C4_TOOL):
+        return
+    from server.entities.behaviors import RemoteChargeBehavior
+    ctx = server._build_entity_ctx()
+    for entity_id in list(getattr(player, "_c4_entity_ids", []) or []):
+        ent = server.entity_registry.get(entity_id)
+        if ent is None or not ent.alive:
+            continue
+        if ent.player_id != player.id or not isinstance(ent.behavior, RemoteChargeBehavior):
+            continue
+        ent.behavior.detonate(ent, ctx)
+    player._c4_entity_ids = []
+
+
+@register_handler(91)  # PlaceRadarStation
+async def handle_place_radar_station(server, player, packet):
+    """Place the Scout radar station and expose enemies to that team until its
+    stock lifetime expires."""
+    if not player.alive or not player.spawned:
+        return
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.RADAR_STATION_TOOL):
+        return
+    if int(C.RADAR_STATION_TOOL) not in [
+        int(tool) for tool in (getattr(player, "loadout", None) or [])
+    ]:
+        return
+    old = server.entity_registry.get(getattr(player, "_radar_entity_id", -1))
+    if old is not None and old.alive:
+        return
+    pos = _deploy_pos(
+        player, packet,
+        max_distance=float(getattr(C, "RADAR_STATION_FAR_RADIUS", 10.0)),
+    )
+    if pos is None:
+        return
+
+    from server.connection import internal_team_to_wire
+    from server.entities.behaviors import RadarStationBehavior
+    ent = server.entity_registry.place(
+        int(getattr(C, "RADAR_STATION_ENTITY", 32)), *pos,
+        state=internal_team_to_wire(player.team), kind="deployable",
+        player_id=player.id,
+        behavior=RadarStationBehavior(
+            player.team,
+            lifetime=float(getattr(C, "RADAR_STATION_LIFETIME", 250.0)),
+        ),
+    )
+    player._radar_entity_id = ent.entity_id
+    server._radar_station_added(player.team)
+    server.broadcast_create_entity(ent)
+    logger.info("RADAR id=%d placed by %s at %s", ent.entity_id, player.name, pos)
 
 
 @register_handler(88)  # PlaceRocketTurret
@@ -514,11 +658,76 @@ async def handle_place_rocket_turret(server, player, packet):
 
 @register_handler(95)  # DisguisePacket
 async def handle_disguise(server, player, packet):
-    """Specialist toggled disguise. Tracked server-side; the visual (rendering
-    as the enemy team on other clients) needs the wire mechanism verified —
-    the packet carries no player_id, so it can't simply be rebroadcast."""
-    player.disguised = bool(getattr(packet, "active", 0))
+    """Activate Engineer disguise; WorldUpdate state bit 0x02 is the verified
+    remote-client visual mechanism."""
+    import shared.constants as C
+    active = bool(getattr(packet, "active", 0))
+    if active:
+        if not player.alive or not player.spawned:
+            return
+        if int(getattr(player, "tool", -1)) != int(C.DISGUISE_TOOL):
+            return
+        if int(C.DISGUISE_TOOL) not in [
+            int(tool) for tool in (getattr(player, "loadout", None) or [])
+        ]:
+            return
+    player.disguised = active
     logger.info("DISGUISE %s -> %s", player.name, player.disguised)
+
+
+@register_handler(94)  # BlockSuckerPacket
+async def handle_block_sucker(server, player, packet):
+    """Relay Blocksucker state and apply its authoritative voxel pull."""
+    import shared.constants as C
+    if not player.alive or not player.spawned:
+        return
+    if int(getattr(player, "tool", -1)) != int(C.BLOCK_SUCKER_TOOL):
+        return
+    if int(C.BLOCK_SUCKER_TOOL) not in [
+        int(tool) for tool in (getattr(player, "loadout", None) or [])
+    ]:
+        return
+
+    state = int(getattr(packet, "state", C.BLOCK_SUCKER_STATE_INACTIVE))
+    if state not in (
+        int(C.BLOCK_SUCKER_STATE_INACTIVE),
+        int(C.BLOCK_SUCKER_STATE_WARMING_UP),
+        int(C.BLOCK_SUCKER_STATE_FULL_POWER),
+    ):
+        return
+    shot = bool(getattr(packet, "shot", 0))
+
+    # Remote clients explicitly consume this packet to animate the warm-up,
+    # loop sound, and debris. Never trust the packet's claimed shooter id.
+    from shared.packet import BlockSuckerPacket
+    out = BlockSuckerPacket()
+    out.loop_count = int(getattr(server, "loop_count", 0))
+    out.shooter_id = player.id
+    out.state = state
+    out.shot = int(shot)
+    server.broadcast(bytes(out.generate()))
+
+    if not shot or state != int(C.BLOCK_SUCKER_STATE_FULL_POWER):
+        return
+    now = time.monotonic()
+    if now < float(getattr(player, "_block_sucker_next_shot", 0.0)):
+        return
+    player._block_sucker_next_shot = now + float(C.BLOCK_SUCKER_SHOOT_INTERVAL)
+
+    direction = player.orientation
+    hit = server.world_manager.raycast(
+        player.eye[0], player.eye[1], player.eye[2],
+        direction[0], direction[1], direction[2],
+        float(C.BLOCK_SUCKER_RANGE),
+    )
+    if hit is None:
+        return
+    was_solid = server.world_manager.get_solid(*hit)
+    get_combat_system(server)._apply_block_damage(
+        player, hit, float(C.BLOCK_SUCKER_BLOCK_DAMAGE)
+    )
+    if was_solid and not server.world_manager.get_solid(*hit):
+        player.add_blocks(1)
 
 
 @register_handler(48)  # InitiateKickMessage — start a kick vote

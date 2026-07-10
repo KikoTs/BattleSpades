@@ -149,7 +149,7 @@ def test_on_tick_called_only_for_overriding_behavior():
 
     reg = EntityRegistry()
     ticker = reg.place(C.AMMO_CRATE, 1, 2, 3, behavior=Ticker())
-    inert = reg.place(C.HEALTH_CRATE, 4, 5, 6, behavior=GraveBehavior())  # no on_tick override
+    inert = reg.place(C.HEALTH_CRATE, 4, 5, 6, behavior=EntityBehavior())
     reg.tick(ctx([]))
     assert ticks == [ticker.entity_id]
     assert inert.alive is True
@@ -157,13 +157,24 @@ def test_on_tick_called_only_for_overriding_behavior():
 
 # --- grave lifecycle -------------------------------------------------------
 
-def test_grave_is_inert_and_explicitly_removable():
+def test_grave_detonates_after_stock_fuse():
     reg = EntityRegistry()
-    g = reg.place(C.GRAVE_ENTITY, 10, 20, 30, kind="grave", behavior=GraveBehavior())
-    reg.tick(ctx([FakePlayer(10, 20, 30)]))   # a player standing on it does nothing
+    srv = FakeServer()
+    srv.entity_registry = reg
+    g = reg.place(
+        C.GRAVE_ENTITY, 10, 20, 30, kind="grave",
+        behavior=GraveBehavior(thrower_id=7),
+    )
+    reg.tick(deploy_ctx(srv, [], now=1000.0))
     assert g.alive is True
-    assert reg.remove(g.entity_id) is g
+    reg.tick(deploy_ctx(srv, [], now=1006.9))
+    assert g.alive is True
+    c = deploy_ctx(srv, [], now=1007.0)
+    reg.tick(c)
+    assert g.alive is False
     assert reg.get(g.entity_id) is None
+    assert srv.blasts == [(10.0, 20.0, 30.0, 25.0, 3.0, 13, 1, False, 3.0)]
+    assert c._destroyed == [g.entity_id]
 
 
 # --- crate separation + block crate ------------------------------------------
@@ -215,9 +226,9 @@ class FakeServer:
         self.blasts = []
 
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
-                     crater_radius=1, force_destroy=True):
+                     crater_radius=1, force_destroy=True, blast_radius=16.0):
         self.blasts.append((gx, gy, gz, damage, block_damage, kill_type,
-                            crater_radius, force_destroy))
+                            crater_radius, force_destroy, blast_radius))
 
 
 def deploy_ctx(server, players, now):
@@ -249,6 +260,54 @@ def test_dynamite_detonates_after_fuse():
     assert c._destroyed == [e.entity_id]
 
 
+def test_c4_waits_for_remote_detonation_and_uses_stock_blast():
+    from server.entities.behaviors import RemoteChargeBehavior
+    reg = EntityRegistry()
+    srv = FakeServer()
+    srv.entity_registry = reg
+    behavior = RemoteChargeBehavior(thrower_id=7)
+    ent = reg.place(C.C4_ENTITY, 10, 20, 30, behavior=behavior)
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    reg.tick(c)
+    assert ent.alive and srv.blasts == []
+    behavior.detonate(ent, c)
+
+    assert not ent.alive
+    assert reg.get(ent.entity_id) is None
+    assert srv.blasts == [(10.0, 20.0, 30.0, 300.0, 7.0, 36, 2, True, 8.0)]
+    assert c._destroyed == [ent.entity_id]
+
+
+def test_radar_station_expires_and_releases_team_visibility():
+    from server.entities.behaviors import RadarStationBehavior
+
+    class RadarServer(FakeServer):
+        def __init__(self):
+            super().__init__()
+            self.removed = []
+
+        def _radar_station_removed(self, team):
+            self.removed.append(team)
+
+    reg = EntityRegistry()
+    srv = RadarServer()
+    srv.entity_registry = reg
+    ent = reg.place(
+        C.RADAR_STATION_ENTITY, 10, 20, 30,
+        behavior=RadarStationBehavior(team=2, lifetime=250.0),
+    )
+    reg.tick(deploy_ctx(srv, [], now=1000.0))
+    reg.tick(deploy_ctx(srv, [], now=1249.9))
+    assert ent.alive
+    c = deploy_ctx(srv, [], now=1250.0)
+    reg.tick(c)
+    assert not ent.alive
+    assert reg.get(ent.entity_id) is None
+    assert srv.removed == [2]
+    assert c._destroyed == [ent.entity_id]
+
+
 def test_landmine_triggers_on_enemy_not_teammate():
     from server.entities.behaviors import ProximityMineBehavior
     reg = EntityRegistry()
@@ -273,6 +332,29 @@ def test_landmine_triggers_on_enemy_not_teammate():
     assert not e.alive
     assert len(srv.blasts) == 1
     assert srv.blasts[0][3] == 100.0
+
+
+def test_landmine_detects_enemy_reburied_two_layers_deep():
+    from server.entities.behaviors import ProximityMineBehavior
+    reg = EntityRegistry()
+    srv = FakeServer()
+    b = ProximityMineBehavior(
+        thrower_id=7, team=2, damage=100.0, block_damage=15.0,
+        crater_radius=1, kill_type=14, trigger_radius=2.5,
+        arm_delay=4.0, blast_radius=3.0, detection_layers=3,
+    )
+    # Mine at z=60. A standing player's position is 2.25 above the ground;
+    # after two blocks are placed over it their feet are at z=58.
+    e = reg.place(C.LANDMINE_ENTITY, 100.0, 100.0, 60.0, behavior=b)
+    enemy = FakePlayer(100.5, 100.0, 55.75)
+    enemy.team = 3
+    enemy.input = SimpleNamespace(crouch=False)
+
+    reg.tick(deploy_ctx(srv, [enemy], now=1000.0))
+    reg.tick(deploy_ctx(srv, [enemy], now=1004.1))
+
+    assert not e.alive
+    assert len(srv.blasts) == 1
 
 
 # --- wire-safety regression guard ------------------------------------------

@@ -1252,14 +1252,14 @@ cdef class PlaceC4(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count
-        int x, y, z
+        float x, y, z
         int face
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.face = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
@@ -1275,14 +1275,14 @@ cdef class PlaceDynamite(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count
-        int x, y, z
+        float x, y, z
         int face
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.face = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
@@ -1298,13 +1298,13 @@ cdef class PlaceFlareBlock(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count
-        int x, y, z
+        float x, y, z
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
@@ -1319,14 +1319,14 @@ cdef class PlaceLandmine(Loader): # Fixed
     cdef public:
         int loop_count
         int player_id
-        int x, y, z
+        float x, y, z
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
@@ -1341,15 +1341,15 @@ cdef class PlaceMG(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count, player_id 
-        int x, y, z
+        float x, y, z
         float yaw
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.yaw = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
@@ -1366,15 +1366,15 @@ cdef class PlaceMedPack(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count, player_id
-        int x, y, z
+        float x, y, z
         int face
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.face = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
@@ -1391,14 +1391,14 @@ cdef class PlaceRadarStation(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count, player_id
-        int x, y, z
+        float x, y, z
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
@@ -1413,15 +1413,15 @@ cdef class PlaceRocketTurret(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count, player_id 
-        int x, y, z
+        float x, y, z
         float yaw
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
         self.player_id = reader.read_byte()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.yaw = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
@@ -1438,14 +1438,14 @@ cdef class PlaceUGC(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count
-        int x, y, z
+        float x, y, z
         int ugc_item_id, placing
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.x = reader.read_short()
-        self.y = reader.read_short()
-        self.z = reader.read_short()
+        self.x = fromfixed(reader.read_short())
+        self.y = fromfixed(reader.read_short())
+        self.z = fromfixed(reader.read_short())
         self.ugc_item_id = reader.read_byte()
         self.placing = reader.read_byte()
 

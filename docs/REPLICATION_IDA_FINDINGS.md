@@ -673,3 +673,47 @@ maps require no runtime z shift. The generated test map deliberately remains a
 high dry plateau at z=62; in a 240-deep coordinate system that is far above the
 waterplane, not immediately above water. The repository suite passes 244 tests;
 isolated ArcticBase TDM and CTF servers both bind and complete mode startup.
+
+### 12.10 Battle Builder equipment, graves, and late entity types
+
+The post-launch client's `gameScene.pyd.i64` supplies the late entity classes
+that the older named `ENTITY_LIST` left as `UNKNOWN_ENTITY1..10`. Class
+registration order and CreateEntity dispatch resolve the first six slots as:
+
+| Entity type | Client class | Core function evidence |
+|---:|---|---|
+| 30 | `C4Entity` | initialize `0x100EAE70`, update `0x100EB640`, on_delete `0x100EBA90` |
+| 31 | `MedPackEntity` | class registration string at `0x10256090` |
+| 32 | `RadarStationEntity` | class registration string at `0x102561AC` |
+| 33 | `AttachedStickyGrenadeEntity` | class registration string at `0x10256658` |
+| 34 | `BlockGooEntity` | class registration string at `0x102569C4` |
+| 35 | `RiotShieldEntity` | class registration string at `0x10256D00` |
+
+`C4Entity` also exposes `disable`, minimap drawing, and a distinct delete path,
+so C4 must be a real CreateEntity/DestroyEntity lifecycle rather than a hidden
+server coordinate. Client send cores are `send_place_c4=0x10173F70` and
+`send_detonate_c4=0x10174540`. Radar placement is `0x10173940`.
+`process_packet_team_map_visibility=0x1019FEB0` indexes the packet-selected team
+and applies its visible boolean, which is the per-recipient radar reveal lever.
+
+The placement decoder had a cross-cutting wire bug: PlaceC4, PlaceDynamite,
+PlaceLandmine, PlaceMG, PlaceMedPack, PlaceRadarStation, PlaceRocketTurret,
+PlaceFlareBlock, and PlaceUGC wrote coordinates through `tofixed()` but read raw
+shorts. Thus coordinate 100 decoded as 3200 and failed every distance check.
+All matching readers now use `fromfixed()` and the native packet extension was
+rebuilt; fixed-point round trips are regression-tested.
+
+Grave client functions are initialize `0x100CC420`, update `0x100CCD80`, and
+on_delete `0x100CDC50`. The retail constants specify a 7-second fuse, radius 3,
+25 player damage, and 3 block damage. `DeathController` has explicit
+`on_mouse_move=0x1003ED20`, proving the intended post-death camera is
+mouse-controlled rather than an unconditional auto-spin; its other anchors are
+activate `0x1003E250`, update `0x1003F270`, and set_killer_info `0x10040B60`.
+
+The later weapon classes are available as recovered Python under
+`G:\AoSRevival\aceofspades_decompiled`, while exact values are readable from
+the retail `shared/constants.pyc` with its bundled Python 2.7. Those sources
+pin C4 (300 damage, radius 8, block 7), sticky grenade (200, radius 5, block 6,
+5-second attached fuse), grenade launcher (100, radius 4, block 6, 3-second
+lifespan), mine launcher (75 speed, deployed landmine), Blocksucker state
+0/1/2 and 0.2-second cadence, radar lifetime 250, and disguise stock/state.

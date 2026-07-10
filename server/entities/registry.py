@@ -52,6 +52,7 @@ class MapEntity:
     color: Optional[Tuple[int, int, int]] = None
     kind: str = "crate"                # ammo | health | block | intel | flag | base
     player_id: int = 0                 # carrier (0 = none)
+    face: int = _FACE_UP               # attachment face (C4/dynamite)
     # Runtime (pickup/respawn) bookkeeping — not all entities use these.
     alive: bool = True
     respawn_at: float = 0.0
@@ -76,7 +77,7 @@ class MapEntity:
         ent.type = int(self.type)
         ent.player_id = int(self.player_id)
         ent.state = int(self.state)
-        ent.face = _FACE_UP
+        ent.face = int(self.face)
         ent.ugc_mode = 0
         ent.float_properties = []
         ent.int_properties = []
@@ -103,11 +104,12 @@ class EntityRegistry:
               state: int = TEAM_NEUTRAL, color=None, kind: str = "crate",
               player_id: int = 0, behavior: Optional[EntityBehavior] = None,
               vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-              radius: float = 0.0) -> MapEntity:
+              radius: float = 0.0, face: int = _FACE_UP) -> MapEntity:
         ent = MapEntity(
             entity_id=self.allocate_id(), type=int(type),
             x=float(x), y=float(y), z=float(z),
             state=int(state), color=color, kind=kind, player_id=int(player_id),
+            face=int(face),
             home=(float(x), float(y), float(z)), behavior=behavior,
             vel=tuple(float(v) for v in vel), radius=float(radius),
         )

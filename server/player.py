@@ -735,6 +735,7 @@ class Player:
             else 0
         )
         self.parachute_active = False
+        self.disguised = False
         self.last_reported_position = (x, y, z)
         self.last_position_drift = 0.0
         self.last_position_drift_vector = (0.0, 0.0, 0.0)
@@ -934,6 +935,7 @@ class Player:
         self.grounded = False
         self.airborne = False
         self.wade = False
+        self.disguised = False
         self.death_time = time.time()
         self.deaths += 1
         self.reloading = False
@@ -963,19 +965,37 @@ class Player:
             packet.isRevengeKill = 0
             server.broadcast(bytes(packet.generate()))
 
-            # Spawn a GRAVE entity where the player died (rendered until the
-            # player respawns). Gated on the same entities_wire_ready flag the
-            # crates use, since a bad Entity field crashes the compiled client.
+            # Spawn the stock team-coloured grave on the supporting surface.
+            # GraveEntity is a moving client object; feeding it the player's
+            # eye/body Z made it fall and tumble while the death camera tracked
+            # it.  A stable surface anchor restores the intended mouse-orbit
+            # camera.  Its delayed explosion is server-authoritative via
+            # GraveBehavior and intentionally outlives the 5s respawn timer.
             reg = getattr(server, "entity_registry", None)
             if reg is not None and getattr(server.config, "entities_wire_ready", False):
                 try:
-                    from server.game_constants import TEAM_NEUTRAL
                     from server.entities.behaviors import GraveBehavior
+                    world = getattr(server, "world_manager", None)
+                    grave_x, grave_y, grave_z = self.x, self.y, self.z
+                    if world is not None:
+                        grave_x, grave_y, grave_z = world.dry_surface_anchor(
+                            self.x, self.y, search=0
+                        )
+                    team = server.teams.get(self.team)
+                    grave_color = tuple(team.color) if team is not None else None
                     grave = reg.place(
                         int(getattr(C, "GRAVE_ENTITY", 11)),
-                        self.x, self.y, self.z,
-                        state=TEAM_NEUTRAL, kind="grave", player_id=self.id,
-                        behavior=GraveBehavior(),
+                        grave_x, grave_y, grave_z,
+                        state=int(self.team), color=grave_color,
+                        kind="grave", player_id=self.id,
+                        behavior=GraveBehavior(
+                            thrower_id=self.id,
+                            fuse=float(getattr(C, "GRAVE_EXPLOSION_FUSE", 7.0)),
+                            damage=float(getattr(C, "GRAVE_EXPLOSION_DAMAGE", 25.0)),
+                            block_damage=float(getattr(C, "GRAVE_EXPLOSION_BLOCK_DAMAGE", 3.0)),
+                            blast_radius=float(getattr(C, "GRAVE_EXPLOSION_RADIUS", 3.0)),
+                            kill_type=int(getattr(C.KILL, "GRAVE_KILL", 13)),
+                        ),
                     )
                     self._grave_entity_id = grave.entity_id
                     server.broadcast_create_entity(grave)
@@ -1180,19 +1200,21 @@ class Player:
                 self.jetpack_fuel = min(max_fuel, self.jetpack_fuel + refill_rate * dt)
 
     def _update_parachute(self) -> None:
-        """Open the selected Commando parachute only during a live descent.
+        """Open the Commando parachute on a second airborne SPACE press.
 
-        The stock client does not locally toggle this state; it consumes the
-        server's WorldUpdate state bit.  Airborne + positive AoS Z velocity
-        distinguishes descent from the upward half of a jump.
+        The December 2015 release note is explicit: "Press SPACE again after
+        jumping to open the Parachute."  The first rising edge launches the
+        jump from the ground; a later rising edge while airborne deploys it.
+        Once open it remains open until landing/water instead of activating
+        automatically at the top of every fall.
         """
-        self.parachute_active = bool(
-            self.alive
-            and self.parachute_id == int(C.A370)
-            and self.airborne
-            and self.vz > 0.0
-            and not self.wade
-        )
+        equipped = self.alive and self.parachute_id == int(C.A370)
+        if not equipped or not self.airborne or self.wade:
+            self.parachute_active = False
+            return
+        jump_pressed = bool(self.jump_held and not self.jump_last_held)
+        if jump_pressed:
+            self.parachute_active = True
 
     def update_input(
         self,
