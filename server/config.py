@@ -3,6 +3,7 @@ Configuration loader for BattleSpades server.
 """
 
 import toml
+import shared.constants as C
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
@@ -70,8 +71,8 @@ class ServerConfig:
     # World settings
     map_size_x: int = 512
     map_size_y: int = 512
-    map_size_z: int = 255
-    water_level: int = 62
+    map_size_z: int = int(C.MAP_Z) if hasattr(C, "MAP_Z") else 240
+    water_level: int = int(C.Z_ABOVE_WATERPLANE)
     water_damage: bool = True
     fog_color_rgb: Tuple[int, int, int] = (12, 13, 11)
     maps_path: str = "maps"

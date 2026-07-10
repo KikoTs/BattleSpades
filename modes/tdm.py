@@ -80,6 +80,9 @@ class TDMMode(BaseMode):
         reg = getattr(self.server, "entity_registry", None)
         if wm is None or reg is None:
             return
+        for ent in reg.all():
+            if getattr(ent, "kind", "") != "projectile":
+                self.server.broadcast_destroy_entity(ent.entity_id)
         reg.clear()
 
         # Three crate types per base + midfield, spaced 8 blocks apart so the
@@ -111,10 +114,18 @@ class TDMMode(BaseMode):
                 lambda p: p.restock_blocks(), respawn_delay=15.0,
                 sound_id=SND_CRATE_BLOCKS)),
         }
+        authored = list(getattr(wm.map_metadata, "entities", []))
+        placements = [
+            (spec.x, spec.y, int(spec.entity_type)) for spec in authored
+            if int(spec.entity_type) in behaviors
+        ]
+        if not placements:
+            placements = [
+                (sx, sy, int(types[i % 3])) for i, (sx, sy) in enumerate(spots)
+            ]
         placed = 0
-        for i, (sx, sy) in enumerate(spots):
-            x, y, z = wm.dry_ground_anchor(sx, sy)
-            etype = int(types[i % 3])
+        for sx, sy, etype in placements:
+            x, y, z = wm.dry_surface_anchor(sx, sy)
             kind, behavior = behaviors[etype]
             ent = reg.place(etype, x, y, z, state=TEAM_NEUTRAL, kind=kind, behavior=behavior)
             # Only put crates on the wire once the Entity format is verified

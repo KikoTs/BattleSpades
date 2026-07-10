@@ -20,6 +20,7 @@ from server.game_constants import (
     TEAM2,
     WATER_LEVEL,
 )
+from server.map_metadata import MapMetadata, MapZone, load_map_metadata
 from server.runtime_vxl import ServerVXL as VXL
 
 logger = logging.getLogger(__name__)
@@ -62,12 +63,10 @@ class WorldManager:
         # Columns modified since map load — what a matched-CRC client is
         # missing relative to its local file. Sent as the MapSync delta.
         self.dirty_columns: set[tuple[int, int]] = set()
-        # Blue/green spawn-zone marker columns the map author placed (the real
-        # team base/spawn locations). Recorded + erased at load to mirror the
-        # client's find_marker_points. {TEAM1: [(x,y,z), ...], TEAM2: [...]}.
-        self.spawn_markers: dict[int, list[tuple[int, int, int]]] = {
-            TEAM1: [],
-            TEAM2: [],
+        self.map_metadata = MapMetadata()
+        self._surface_cache: dict[tuple[int, int], int] = {}
+        self._spawn_candidates: dict[int, list[tuple[int, int]]] = {
+            TEAM1: [], TEAM2: []
         }
     
     def load_map(self, name: str) -> bool:
@@ -93,8 +92,12 @@ class WorldManager:
             self._full_sync_chunks = None
             self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
+            self._surface_cache.clear()
+            self._spawn_candidates = {TEAM1: [], TEAM2: []}
+            self.map_metadata = load_map_metadata(
+                map_path, str(getattr(self.config, "game_mode", "nor"))
+            )
             self._refresh_world()
-            self._scan_spawn_markers()
             logger.info(
                 f"Loaded map: {self.map_name} (file crc32={self.map_file_crc})"
             )
@@ -108,7 +111,9 @@ class WorldManager:
         """Generate a simple flat map."""
         self.map = VXL(-1, b"", 0, 2)
         
-        # Set ground layer at Z=62 (near bottom, leaving water at 63)
+        # A deliberately high, dry debug plateau.  The retail waterplane is
+        # z=238; z=62 is therefore far above water, not adjacent to it as the
+        # old 64-high-world comment incorrectly claimed.
         ground_z = 62
         
         for x in range(MAP_X):
@@ -123,6 +128,9 @@ class WorldManager:
         self._full_sync_chunks = None
         self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
+        self._surface_cache.clear()
+        self._spawn_candidates = {TEAM1: [], TEAM2: []}
+        self.map_metadata = MapMetadata()
         self._refresh_world()
         logger.info("Generated flat map")
 
@@ -160,6 +168,7 @@ class WorldManager:
             self.map.set_point(x, y, z, color)
         else:
             self.map.remove_point(x, y, z)
+        self._surface_cache.pop((x, y), None)
         self.dirty_columns.add((x, y))
         self.clear_block_damage(x, y, z)
 
@@ -179,9 +188,14 @@ class WorldManager:
         if not (0 <= x < MAP_X and 0 <= y < MAP_Y):
             return MAP_Z - 1
 
+        cached = self._surface_cache.get((x, y))
+        if cached is not None:
+            return cached
         for z in range(MAP_Z):
             if self.map.get_solid(x, y, z):
+                self._surface_cache[(x, y)] = z
                 return z
+        self._surface_cache[(x, y)] = MAP_Z - 1
         return MAP_Z - 1
 
     def is_water_column(self, x: int, y: int) -> bool:
@@ -215,6 +229,31 @@ class WorldManager:
         sz = self._get_surface_z(bx, by)
         return (float(x), float(y), float(sz) - PLAYER_STANDING_POS_ABOVE_GROUND)
 
+    def dry_surface_anchor(
+        self, x: float, y: float, search: int = 24
+    ) -> Tuple[float, float, float]:
+        """Return an entity anchor on the nearest dry voxel surface.
+
+        Player positions are 2.25 blocks above the supporting voxel, whereas
+        map entities use the surface coordinate itself.  Keeping these two
+        coordinate spaces separate prevents crates/bases from floating at a
+        player's head height or being placed on the ocean bed.
+        """
+        bx, by = int(x), int(y)
+        for r in range(search + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
+                    cx, cy = bx + dx, by + dy
+                    if not (0 <= cx < MAP_X and 0 <= cy < MAP_Y):
+                        continue
+                    surface_z = self._get_surface_z(cx, cy)
+                    if surface_z <= int(C.Z_ABOVE_WATERPLANE):
+                        return float(cx) + 0.5, float(cy) + 0.5, float(surface_z)
+        surface_z = self._get_surface_z(bx, by)
+        return float(x), float(y), float(surface_z)
+
     def clipbox(self, x: float, y: float, z: float) -> bool:
         """Reference-style player collision probe."""
         if x < 0 or x >= MAP_X or y < 0 or y >= MAP_Y:
@@ -245,120 +284,192 @@ class WorldManager:
             return False
         return self.get_solid(x, y, solid_z)
     
-    def _scan_spawn_markers(self):
-        """Locate, record and ERASE the blue/green spawn-zone markers the map
-        author placed (ugc_spawnblue*/ugc_spawngreen*), mirroring the client's
-        find_marker_points which runs on every load (including the MapSync
-        build path). A marker is a surface block whose RGB high nibbles are pure
-        blue (0x0000F0) -> TEAM1 or pure green (0x00F0_00) -> TEAM2; the live
-        engine deletes them, so the server must too or players collide with
-        invisible blocks at the bases. These columns are the true team
-        base/spawn locations (the old hardcoded rectangles spawned over open
-        ocean on edge-sea maps like ArcticBase)."""
-        self.spawn_markers = {TEAM1: [], TEAM2: []}
-        m = self.map
-        if m is None:
-            return
-        get_z = m.get_z
-        get_ct = m.get_color_tuple
-        erase: list[tuple[int, int, int]] = []
-        for x in range(MAP_X):
-            for y in range(MAP_Y):
-                z = get_z(x, y)
-                if z > MAP_Z - 2:        # ocean bed / empty column
-                    continue
-                r, g, b, _a = get_ct(x, y, z)
-                if (r & 0xF0) == 0 and (g & 0xF0) == 0 and (b & 0xF0) == 0xF0:
-                    self.spawn_markers[TEAM1].append((x, y, z))
-                    erase.append((x, y, z))
-                elif (r & 0xF0) == 0 and (g & 0xF0) == 0xF0 and (b & 0xF0) == 0:
-                    self.spawn_markers[TEAM2].append((x, y, z))
-                    erase.append((x, y, z))
+    def _spawn_region(self, team: int) -> tuple[int, int, int, int]:
+        if team == TEAM1:
+            return 64, 128, 192, 384
+        if team == TEAM2:
+            return 320, 128, 448, 384
+        return 192, 192, 320, 320
 
-        # Safety guard: a real map has a few dozen markers. A flood means our
-        # colour predicate is matching ordinary terrain — abort rather than
-        # gut the map.
-        if len(erase) > 500:
-            logger.warning(
-                "Spawn-marker scan matched %d blocks (too many) — ignoring",
-                len(erase),
-            )
-            self.spawn_markers = {TEAM1: [], TEAM2: []}
-            return
+    def _safe_spawn_column(
+        self,
+        x: int,
+        y: int,
+        *,
+        authored_zone: MapZone | None = None,
+        reject_roofs: bool = True,
+    ) -> bool:
+        """Validate dry, level ground and reject raised building roofs."""
+        if not (1 <= x < MAP_X - 1 and 1 <= y < MAP_Y - 1):
+            return False
+        surface_z = self._get_surface_z(x, y)
+        if surface_z > int(C.Z_ABOVE_WATERPLANE):
+            return False
+        if authored_zone is not None and not authored_zone.contains_surface_z(surface_z):
+            return False
 
-        for (x, y, z) in erase:
-            self.map.remove_point(x, y, z)
-        if erase:
-            logger.info(
-                "Spawn markers: erased %d (TEAM1=%d, TEAM2=%d)",
-                len(erase),
-                len(self.spawn_markers[TEAM1]),
-                len(self.spawn_markers[TEAM2]),
-            )
+        local = [
+            self._get_surface_z(x + dx, y + dy)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+        ]
+        if any(z > int(C.Z_ABOVE_WATERPLANE) for z in local):
+            return False
+        if max(local) - min(local) > 2:
+            return False
+
+        # VXL's z axis points downward.  A roof is therefore significantly
+        # smaller than the ordinary ground sampled around it.
+        if reject_roofs:
+            ring = []
+            for radius in (8, 16):
+                for dx, dy in (
+                    (-radius, 0), (radius, 0), (0, -radius), (0, radius),
+                    (-radius, -radius), (-radius, radius),
+                    (radius, -radius), (radius, radius),
+                ):
+                    rx, ry = x + dx, y + dy
+                    if 0 <= rx < MAP_X and 0 <= ry < MAP_Y:
+                        rz = self._get_surface_z(rx, ry)
+                        if rz <= int(C.Z_ABOVE_WATERPLANE):
+                            ring.append(rz)
+            if ring:
+                ring.sort()
+                ground_reference = ring[(len(ring) * 3) // 4]
+                if ground_reference - surface_z > 4:
+                    return False
+        return True
+
+    def _zone_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
+        candidates: list[tuple[int, int]] = []
+        for zone in self.map_metadata.spawn_zones.get(team, []):
+            x0, x1, y0, y1 = zone.xy_bounds()
+            for x in range(max(1, x0), min(MAP_X - 2, x1) + 1):
+                for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1):
+                    if self._safe_spawn_column(
+                        x, y, authored_zone=zone, reject_roofs=False
+                    ):
+                        candidates.append((x, y))
+        return candidates
+
+    def _fallback_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
+        x0, y0, x1, y1 = self._spawn_region(team)
+        strict = [
+            (x, y)
+            for x in range(x0, x1 + 1, 4)
+            for y in range(y0, y1 + 1, 4)
+            if self._safe_spawn_column(x, y)
+        ]
+        if strict:
+            return strict
+        # Steep maps may have no 3x3-flat cells.  A dry team-region fallback
+        # is still safer than the native random surface (which selects roofs).
+        return [
+            (x, y)
+            for x in range(x0, x1 + 1, 4)
+            for y in range(y0, y1 + 1, 4)
+            if self._get_surface_z(x, y) <= int(C.Z_ABOVE_WATERPLANE)
+        ]
+
+    def _get_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
+        cached = self._spawn_candidates.get(team)
+        if cached:
+            return cached
+        candidates = self._zone_spawn_candidates(team)
+        source = "authored metadata"
+        if not candidates:
+            candidates = self._fallback_spawn_candidates(team)
+            source = "safe terrain fallback"
+        self._spawn_candidates[team] = candidates
+        logger.info("TEAM%d has %d spawn columns from %s", team, len(candidates), source)
+        return candidates
+
+    @staticmethod
+    def _zone_at(zones: list[MapZone], x: int, y: int) -> MapZone | None:
+        for zone in zones:
+            x0, x1, y0, y1 = zone.xy_bounds()
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return zone
+        return None
 
     def team_base_anchor(self, team: int) -> Tuple[float, float, float]:
-        """Feet-anchor for a team's base/intel: the dry ground at the centroid
-        of its spawn markers, or a sensible fallback when the map has none."""
-        markers = self.spawn_markers.get(team) or []
-        if markers:
-            cx = sum(mx for mx, _, _ in markers) / len(markers)
-            cy = sum(my for _, my, _ in markers) / len(markers)
-            return self.dry_ground_anchor(cx, cy)
+        """Player-coordinate anchor for a team's authored or fallback base."""
+        base_zones = self.map_metadata.base_zones.get(team, [])
+        for zone in base_zones:
+            x0, x1, y0, y1 = zone.xy_bounds()
+            candidates = [
+                (x, y)
+                for x in range(max(1, x0), min(MAP_X - 2, x1) + 1)
+                for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1)
+                if self._safe_spawn_column(
+                    x, y, authored_zone=zone, reject_roofs=False
+                )
+            ]
+            if candidates:
+                x, y = min(
+                    candidates,
+                    key=lambda pos: (pos[0] - zone.x) ** 2 + (pos[1] - zone.y) ** 2,
+                )
+                return self.dry_ground_anchor(x, y)
+
+        spawn_zones = self.map_metadata.spawn_zones.get(team, [])
+        if spawn_zones:
+            zone = spawn_zones[0]
+            candidates = self._zone_spawn_candidates(team)
+            if candidates:
+                x, y = min(
+                    candidates,
+                    key=lambda pos: (pos[0] - zone.x) ** 2 + (pos[1] - zone.y) ** 2,
+                )
+                return self.dry_ground_anchor(x, y)
+        candidates = self._get_spawn_candidates(team)
+        if candidates:
+            ordered = sorted(candidates)
+            x, y = ordered[len(ordered) // 2]
+            return self.dry_ground_anchor(x, y)
         nominal = (64.0, 256.0) if team == TEAM1 else (448.0, 256.0)
         return self.dry_ground_anchor(*nominal)
 
     def get_spawn_point(self, team: int) -> Tuple[float, float, float]:
-        """Get a spawn point for the given team."""
+        """Return a dry, level player spawn from authored zones or terrain."""
         if self.map is None:
-            return (256.0, 256.0, 62.0 - PLAYER_STANDING_POS_ABOVE_GROUND)
+            surface_z = float(C.Z_ABOVE_WATERPLANE) - 1.0
+            return (256.0, 256.0, surface_z - PLAYER_STANDING_POS_ABOVE_GROUND)
 
-        # Prefer the map author's spawn-zone markers (the real base) over the
-        # hardcoded rectangles, which on edge-sea maps overlap open ocean.
-        markers = self.spawn_markers.get(team) or []
-        if markers:
-            # Try the marker columns themselves (dry ones first).
-            order = list(markers)
-            random.shuffle(order)
-            for mx, my, _mz in order:
-                surface_z = self._get_surface_z(mx, my)
-                if surface_z <= MAP_Z - 2:
+        if team not in (TEAM1, TEAM2):
+            x0, y0, x1, y1 = self._spawn_region(team)
+            x, y, _native_z = self.map.get_random_pos(x0, y0, x1, y1)
+            surface_z = self._get_surface_z(int(x), int(y))
+            return (
+                float(x) + 0.5,
+                float(y) + 0.5,
+                float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
+            )
+
+        candidates = self._get_spawn_candidates(team)
+        if candidates:
+            authored_zones = self.map_metadata.spawn_zones.get(team, [])
+            for _ in range(min(24, len(candidates))):
+                x, y = random.choice(candidates)
+                authored_zone = self._zone_at(authored_zones, x, y)
+                if self._safe_spawn_column(
+                    x,
+                    y,
+                    authored_zone=authored_zone,
+                    reject_roofs=authored_zone is None,
+                ):
+                    surface_z = self._get_surface_z(x, y)
+                    # Spawn slightly above equilibrium and let physics settle.
                     return (
-                        float(mx) + 0.5,
-                        float(my) + 0.5,
+                        float(x) + 0.5,
+                        float(y) + 0.5,
                         float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
                     )
-            # The markers are floating blocks erased over water, so every marker
-            # column reads as sea. Anchor on the nearest DRY ground to the
-            # team's marker CENTROID instead of dropping into the (wrong-area)
-            # rectangle below — keeps each team on its own side of the map.
-            cx = sum(m[0] for m in markers) / len(markers)
-            cy = sum(m[1] for m in markers) / len(markers)
-            ax, ay, az = self.dry_ground_anchor(cx, cy)
-            return (ax, ay, az - 0.5)
+                candidates.remove((x, y))
 
-        # Team-based spawn areas (only for marker-less maps)
-        if team == TEAM1:
-            x1, y1, x2, y2 = 64, 128, 192, 384
-        elif team == TEAM2:
-            x1, y1, x2, y2 = 320, 128, 448, 384
-        else:
-            x1, y1, x2, y2 = 192, 192, 320, 320
+        x0, y0, x1, y1 = self._spawn_region(team)
+        return self.dry_ground_anchor((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 
-        pos = self.map.get_random_pos(x1, y1, x2, y2)
-        surface_z = self._get_surface_z(int(pos[0]), int(pos[1]))
-
-        # Spawn slightly ABOVE standing height and let the player drop in.
-        # Spawning with feet exactly on the block boundary (surface - 2.25)
-        # is a degenerate equilibrium: the engine micro-bobs on it, and the
-        # client/server sims bob out of phase, producing constant
-        # reconciliation jitter while walking. A natural landing settles
-        # ~0.0004 above the boundary, which is stable.
-        return (
-            float(pos[0]) + 0.5,
-            float(pos[1]) + 0.5,
-            float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
-        )
-    
     def block_line(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
         """Get all blocks along a line."""
         if self.map is None:
@@ -388,6 +499,7 @@ class WorldManager:
                 continue
 
             self.map.remove_point_nochecks(x, y, z)
+            self._surface_cache.pop((x, y), None)
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)
             destroyed.append(pos)
