@@ -284,6 +284,11 @@ class BaseMode(ABC):
             team.reset()
         # on_mode_start clears ended/winner/timeout flags and restarts music.
         await self.on_mode_start()
+        # MapEnded/ShowGameStats put the client into a terminal score scene.
+        # A fresh StateData with has_map_ended=0 is the stock transition back
+        # into an active round. This is deliberately sent only at the round
+        # boundary, never for routine score updates.
+        self.server.broadcast_state_data()
         for team in self.server.teams.values():
             send_team_score(self.server, team)
         # Respawn every connected player into the fresh round.

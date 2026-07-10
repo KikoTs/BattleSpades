@@ -45,6 +45,15 @@ def test_validation_launcher_defaults_are_isolated():
     assert args.map_name == "ArcticBase"
     assert args.mode == "tdm"
     assert args.config == Path("config.toml")
+    assert args.worldupdate_loop_offset is None
+    assert not args.debug_selfrow
+
+
+def test_validation_launcher_accepts_reconciliation_calibration_overrides():
+    args = parse_args(["--worldupdate-loop-offset", "-2", "--debug-selfrow"])
+
+    assert args.worldupdate_loop_offset == -2
+    assert args.debug_selfrow
 
 
 def test_two_client_specs_use_unique_tracer_ports():

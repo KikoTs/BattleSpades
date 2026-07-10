@@ -107,9 +107,9 @@ broadcast_world_updates = true
 worldupdate_include_self = true
 # (Only used when worldupdate_include_self = true.) Constant added to the
 # per-recipient self-row stamp = player.last_applied_input_loop (the consumed
-# input's loop_count). +2 is the measured structural phase between that and the
-# client's movement_history index; calibrate with debug_selfrow + reconcile_sim.
-worldupdate_loop_offset = -1
+# input's loop_count). Stock ClientData flags are latched for the following
+# physics loop, making consumed loop L match movement_history[L] exactly.
+worldupdate_loop_offset = 0
 worldupdate_self_row_interval = 2
 # Log every self-row's (stamp, position) to logs/selfrow_samples.ndjson so the
 # offline simulator (tmp/reconcile_sim.py) can replicate the client's exact
@@ -121,6 +121,5 @@ debug_selfrow = false
 # (under its resync threshold) ??? keep 0; determinism comes from
 # INPUT_DELAY_TICKS=1 in server/player.py instead.
 clock_sync_loop_bias = 0
-
 
 

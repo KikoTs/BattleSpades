@@ -444,3 +444,138 @@ The working-tree changes at handoff are expected to be:
    - both builder and remote client render identical cells/colors;
    - reconnect/full-map sync preserves the same blocks.
 
+## 12. Replication parity implementation findings (2026-07-10)
+
+The sequence above describes the original handoff state. The fixes have now
+been implemented and exercised against an isolated server on UDP 27016 with
+stock clients from `G:\AoSRevival\AceOfSpades_no_steam_new`. The public server
+on 27015 was not restarted or modified.
+
+### 12.1 WorldUpdate tool visibility
+
+The two bytes after the action byte are not two disposable tool fields. The
+first is state and the second is the equipped tool id:
+
+```text
+shared.packet WorldUpdate reader:      0x100429E0
+action bit 0x10 test:                  0x10043688-0x1004368F
+equipped-tool byte read/store:         0x100438CC / 0x100438DF
+returned tuple item 24:                0x10043E2C-0x10043E33
+gameScene WorldUpdate consumer:        0x10182900
+set_can_display_weapon:                0x10184CF4-0x10184D3C
+set_tool(tool, true):                  0x10184E3A-0x10184EA9
+```
+
+`Player.pack_action_flags()` now emits `0x10` for
+`can_display_weapon`, and `WorldUpdate.write()` now writes the actual tool id.
+In a two-client live run the observer followed changes `8 -> 5 -> 2`, with the
+remote equipped tool equal to the sender's tool and display flag equal to one.
+
+The adjacent state byte is packed independently: `0x01` parachute, `0x02`
+disguise, and `0x08` touching-goo/water. The server currently advertises its
+real disguise and wade state; parachute remains clear unless a runtime
+`parachute_active` state exists. This prevents weapon ids from accidentally
+toggling state while restoring observer-visible disguise/water activity.
+
+### 12.2 Movement reconciliation phase
+
+The stock movement core is `world.pyd Player.update` at `0x10012B80`:
+
+```text
+crouch/sneak/sprint acceleration select: 0x10012D65-0x10012D8A
+airborne acceleration multiplier:        0x10012D90-0x10012DCE
+diagonal 0.707106769 multiplier:          0x10012DD6-0x10012DF8
+acceleration integration:                 0x10012DFC-0x10012E79
+friction 1 + 4*dt:                        0x10012F25-0x10012F41
+position scale dt*32:                     0x1001304A-0x10013058
+```
+
+The formulas match `aoslib/world.pyx`. The desync was scheduling, not the
+constants: movement flags reported in client packet loop L are used by client
+physics at L+1, while orientation is used in L. The server now advances at most
+one history frame per tick, delays packet flags by one loop, applies orientation
+in the current loop, predicts only a proven missing frame, rejects stale frames,
+and freezes movement and acknowledgement together on starvation.
+
+The matching WorldUpdate self-row offset is zero. A dry sprint baseline recorded
+24 samples with zero snaps, zero adjustments, and maximum exact history error
+`0.000153` blocks. Dry walk and diagonal motion likewise produced no
+reconciliation corrections.
+
+The pending input latch begins with an explicit idle frame after spawn, so the
+first ClientData packet cannot bypass the recovered L-to-L+1 phase. Peerless
+server bots take one ordinary physics step per tick and do not enter the human
+client-history starvation freeze. After both corrections, another two-client
+dry sprint recorded 18 samples, zero snaps, zero adjustments, and maximum error
+`0.000061` blocks.
+
+Stock terrain routines were also checked:
+
+```text
+_clip:                                   0x10001550
+boxclipmove:                             0x10001710
+```
+
+Their probes and branches match `aoslib/world.pyx`. Stock uses float32 state
+where the server's shared vector uses doubles, but captured terrain and airborne
+paths still matched within approximately `1e-5` to `1e-4` blocks and no branch
+divergence was observed. The larger water readings came from stale pre-correction
+history in the tracer. Do not globally convert `shared.glm.Vector3` to float32
+without a stock-oracle test proving an integer-face branch mismatch.
+
+### 12.3 Hitboxes
+
+The stock common collision wrapper/core are `0x1001F0F0` and `0x10012150`.
+Character crouch wrapper/core are `0x1007B700` and `0x1002A8F0`. The server now
+tests the recovered oriented KV6 bounds for every class in stock priority order:
+torso, head, arms, left leg, right leg. It uses the stock yaw and AoS axis
+mapping, including distinct standing/crouched legs and asymmetric Specialist and
+Medic pivots. The former generic body box omitted much of the legs.
+
+### 12.4 Shooting, spread, and cadence
+
+The ShootPacket flag byte is split as bit zero `affect_shooter` and bit one
+`secondary`; relays preserve both meanings. A shotgun trigger is transmitted as
+one packet per already-spread pellet. The server now validates and traces each
+client pellet once instead of generating a second random pellet cloud from the
+seed. Cadence/ammunition are charged once per bounded pellet group.
+
+The cadence gate now advances from a stable `next_shot_time`; one simulation
+tick of network-arrival grace cannot compound into a faster sustained fire rate.
+The recovered assault-rifle three-packet burst and minigun `0.30 -> 0.10` second
+ramp are handled separately. Pistol values are restored to damage 20/50,
+interval 0.3, reload 0.5, range 800, clip 6, reserve 30.
+
+Assault burst packets must also be separated by the recovered six client loops;
+increasing loop ids in one tick no longer bypass cadence. Shotgun groups retain
+the client's distinct pellet rays but reject an exact duplicate direction, so a
+replayed packet cannot apply one pellet repeatedly for a single shell.
+
+### 12.5 Blocks and collapse
+
+BlockLine now uses the same face-connected `world.cube_line` traversal as the
+client and is validated atomically before mutation. Normal live placement and
+spade removal were observed on both connected clients for block
+`(224, 189, 221)`.
+
+The stock collapse flood uses 18 neighbors (faces plus edges, excluding
+three-axis corners), grounds only at `z > 238`, and has a roughly ten-million
+operation budget rather than a structural block-count cap. The server mirrors
+those rules and uses unchecked point removal. The triggering Damage retains
+`chunk_check=1`, so clients run their native falling animation while the server
+removes the identical component without flooding one Damage packet per voxel.
+
+### 12.6 End-of-round transition
+
+The restart coroutine now broadcasts a fresh per-connection StateData after
+mode reset. Its `has_map_ended=0` clears the client's terminal score scene while
+preserving the correct player id for each connection; team scores and respawns
+then describe the new round.
+
+### 12.7 Verification
+
+The native `shared.packet` extension was rebuilt after the packet-layout change.
+Focused movement, combat, collapse, packet, and end-sequence tests pass, and the
+full repository run passes 220 tests. The live isolated run additionally proves
+dry movement reconciliation, remote tool visibility, and normal block
+placement/removal parity.

@@ -306,9 +306,9 @@ _CATALOG_LIST = [
     _gun(9,  "SHOTGUN",           CAT_SHOTGUN, 20, 30,  1.0,  5, 20,  0.5, 10, 60,    1, spread=0.08),
     _gun(10, "SHOTGUN2",          CAT_SHOTGUN, 40, 50,  1.0,  2, 14,  1.0, 10, 20,    2.5, spread=0.10),
     _gun(15, "MG",                CAT_MG,      30, 20,  0.5,  100, 400, 4.0, 1, 300,   2),
-    # PISTOL: client values are fire 0.4 (A1120), reload 0.6 (A1119),
-    # head 45 (A1125), range 550 (A1118). We had 0.3 / 0.5 / 50 / 800.
-    _gun(17, "PISTOL",            CAT_PISTOL,  20, 45,  0.4,  6, 30,  0.6, 1, 550,   3),
+    # PISTOL named constants loaded by stock pistolWeapon.pyc: damage tuple
+    # (20,50,20,20,20), interval .3, reload .5, range 800, ammo 6/30.
+    _gun(17, "PISTOL",            CAT_PISTOL,  20, 50,  0.3,  6, 30,  0.5, 1, 800,   3),
     _gun(18, "SNIPER",            CAT_SNIPER,  50, 175, 1.0,  1, 7,   2.0, 1, 10000, 5),
     _gun(19, "SNIPER2",           CAT_SNIPER,  34, 85,  1.1,  5, 15,  3.0, 1, 10000, 3),
     _gun(35, "TOMMYGUN",          CAT_SMG,     30, 35,  0.12, 30, 120, 2.0, 1, 500,   1),

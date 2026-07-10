@@ -35,11 +35,8 @@ _GUN_EXPECT = [
     (8,  15, 30,  0.3,   100, 300, 2.0, 1, 2.5),
     (9,  20, 30,  1.0,   5, 20,  0.5, 10, 1),
     (10, 40, 50,  1.0,   2, 14,  1.0, 10, 2.5),
-    # PISTOL re-derived from the CLIENT itself (2026-07-10): pistolWeapon.pyc
-    # maps damage=(A1124 torso, A1125 head, ...), shoot_interval=A1120,
-    # reload_time=A1119, range=A1118 -> 20 / 45 / 0.4 / 0.6 / 550.
-    # CONTENT_TABLES.md §1 (the old source of this row) had 50 / 0.3 / 0.5.
-    (17, 20, 45,  0.4,   6, 30,  0.6,  1, 3),
+    # Stock pistolWeapon.pyc loads the named PISTOL_* constants directly.
+    (17, 20, 50,  0.3,   6, 30,  0.5,  1, 3),
     (18, 50, 175, 1.0,   1, 7,   2.0,  1, 5),
     (19, 34, 85,  1.1,   5, 15,  3.0,  1, 3),
     (35, 30, 35,  0.12,  30, 120, 2.0, 1, 1),
@@ -62,6 +59,17 @@ def test_gun_stats_match_client():
         assert p.block_damage == block, f"tool {tid} block_dmg"
         # guns route through the hit-scan profile table
         assert tid in G.WEAPON_PROFILES
+
+
+def test_pistol_named_constants_match_stock_client():
+    pistol = G.WEAPON_CATALOG[int(C.PISTOL_TOOL)]
+
+    assert pistol.base_damage == 20
+    assert pistol.head_damage == 50
+    assert pistol.fire_interval == 0.3
+    assert pistol.reload_time == 0.5
+    assert pistol.max_range == 800
+    assert (pistol.clip_size, pistol.reserve_ammo) == (6, 30)
 
 
 def test_melee_player_and_block_damage():

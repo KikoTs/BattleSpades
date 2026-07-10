@@ -36,11 +36,18 @@ _matched_error = None
 if _old is not None:
     _hp = _old[0].position
     _matched_error = ((_n[0]-_hp[0])**2 + (_n[1]-_hp[1])**2 + (_n[2]-_hp[2])**2)**0.5
+_candidate_errors = {}
+for _offset in range(-4, 5):
+    _candidate = _c.get_old_movement_data(_c.network_position_loop_count + _offset)
+    if _candidate is not None:
+        _cp = _candidate[0].position
+        _candidate_errors[int(_offset)] = round(float(((_n[0]-_cp[0])**2 + (_n[1]-_cp[1])**2 + (_n[2]-_cp[2])**2)**0.5), 6)
 _ = {'history_length': int(len(_c.movement_history)),
      'lerp_timer': round(float(_c.position_lerp_timer), 6),
      'network_loop': int(_c.network_position_loop_count),
      'client_loop': int(manager.scene.loop_count),
      'matched_loop_error': None if _matched_error is None else round(float(_matched_error), 6),
+     'candidate_loop_errors': _candidate_errors,
      'position': tuple(round(float(_w[i]), 6) for i in range(3)),
      'network_position': tuple(round(float(_n[i]), 6) for i in range(3))}"""
 
@@ -48,6 +55,16 @@ OBSERVER_SAMPLE = """_s = manager.scene
 _ = {'scene': _s.__class__.__name__,
      'client_loop': int(getattr(_s, 'loop_count', 0)),
      'player_count': int(len(getattr(_s, 'players', {})))}"""
+
+MOVEMENT_SEGMENTS = (
+    ("walk", ("W",)),
+    ("diagonal", ("W", "D")),
+    ("sprint", ("W", "LSHIFT")),
+    ("crouch_walk", ("W", "LCTRL")),
+    ("crouch_release", ("W",)),
+    ("jump", ("W", "SPACE")),
+    ("wall_contact", ("W",)),
+)
 
 
 @dataclass(frozen=True)
@@ -150,6 +167,7 @@ def run_scenario(
     *,
     duration: float,
     interval: float,
+    segment_names: tuple[str, ...] | None = None,
 ) -> tuple[ParityArtifact, MovementAnalysis]:
     for console in (console_a, console_b):
         scene = ast.literal_eval(console.run("manager.scene.__class__.__name__"))
@@ -158,15 +176,11 @@ def run_scenario(
 
     artifact = ParityArtifact("movement_baseline")
     all_samples: list[dict] = []
-    segments = (
-        ("walk", ("W",)),
-        ("diagonal", ("W", "D")),
-        ("sprint", ("W", "LSHIFT")),
-        ("crouch_walk", ("W", "LCTRL")),
-        ("crouch_release", ("W",)),
-        ("jump", ("W", "SPACE")),
-        ("wall_contact", ("W",)),
-    )
+    requested = set(segment_names or (name for name, _keys in MOVEMENT_SEGMENTS))
+    segments = [segment for segment in MOVEMENT_SEGMENTS if segment[0] in requested]
+    unknown = requested.difference(name for name, _keys in MOVEMENT_SEGMENTS)
+    if unknown:
+        raise ValueError(f"unknown movement segments: {sorted(unknown)}")
     for name, keys in segments:
         all_samples.extend(
             collect_segment(
@@ -190,6 +204,10 @@ def parse_args(argv=None):
     parser.add_argument("--console-b", type=int, default=32897)
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--interval", type=float, default=0.05)
+    parser.add_argument(
+        "--segments",
+        default=",".join(name for name, _keys in MOVEMENT_SEGMENTS),
+    )
     parser.add_argument("--artifact-dir", type=Path, default=Path("logs/parity"))
     return parser.parse_args(argv)
 
@@ -204,6 +222,9 @@ def main(argv=None) -> int:
             console_b,
             duration=args.duration,
             interval=args.interval,
+            segment_names=tuple(
+                name.strip() for name in args.segments.split(",") if name.strip()
+            ),
         )
     path = artifact.write(args.artifact_dir)
     print(f"artifact: {path}")

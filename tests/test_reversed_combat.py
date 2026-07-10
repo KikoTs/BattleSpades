@@ -8,11 +8,13 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *args, **kwargs: {}))
 
 import shared.constants as C
+import server.combat_runtime as combat_runtime
 from aoslib.vxl import VXL
 from shared.bytes import ByteReader
 from shared.packet import BlockBuild, BlockLiberate, BlockLine, BlockOccupy, KillAction, SetHP, ShootPacket, WeaponReload
 
 from protocol.packet_handler import PacketHandler
+from server.combat_runtime import get_combat_system
 from server.config import ServerConfig
 from server.game_constants import (
     BLOCK_ACTION_BUILD,
@@ -112,6 +114,191 @@ def make_shoot_packet(player, origin=None, orientation=None, seed=1):
     return packet
 
 
+def test_shoot_packet_splits_affect_shooter_and_secondary_flag_bits():
+    for flags in (0x01, 0x02, 0x03):
+        packet = ShootPacket()
+        packet.loop_count = 7
+        packet.shooter_id = 2
+        packet.shot_on_world_update = 0
+        packet.x = packet.y = packet.z = 0.0
+        packet.ori_x, packet.ori_y, packet.ori_z = 1.0, 0.0, 0.0
+        packet.damage = 20
+        packet.penetration = 1
+        packet.affect_shooter = flags & 0x01
+        packet.secondary = (flags >> 1) & 0x01
+        packet.seed = 37
+
+        raw = bytes(packet.generate())
+        parsed = ShootPacket(ByteReader(raw[1:]))
+
+        assert raw[38] == flags
+        assert parsed.affect_shooter == (flags & 0x01)
+        assert parsed.secondary == ((flags >> 1) & 0x01)
+
+
+def test_shotgun_resolves_and_relays_each_client_pellet_but_consumes_once():
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.SHOTGUN_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.SHOTGUN_TOOL)
+    profile = attacker.get_weapon_profile()
+    before_clip = attacker.ammo_clip
+    directions = []
+    combat = get_combat_system(server)
+
+    def record_ray(_attacker, direction, _origin=None):
+        directions.append(direction)
+        return False
+
+    combat._resolve_hitscan = record_ray
+    expected = []
+    for pellet_index in range(profile.pellet_count):
+        direction = normalize((1.0, (pellet_index - 4.5) * 0.01, 0.0))
+        expected.append(direction)
+        packet = make_shoot_packet(
+            attacker,
+            orientation=direction,
+            seed=37,
+        )
+        packet.loop_count = 900
+        combat.handle_shot(attacker, packet)
+
+    assert attacker.ammo_clip == before_clip - 1
+    assert len(server.broadcast_packets) == profile.pellet_count
+    assert len(directions) == profile.pellet_count
+    for actual, wanted in zip(directions, expected):
+        assert all(
+            math.isclose(component, expected_component, abs_tol=1e-6)
+            for component, expected_component in zip(actual, wanted)
+        )
+
+
+def test_shotgun_rejects_duplicate_pellet_ray_within_trigger_group():
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.SHOTGUN_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.SHOTGUN_TOOL)
+    before_clip = attacker.ammo_clip
+    combat = get_combat_system(server)
+    directions = []
+    combat._resolve_hitscan = lambda _attacker, direction, _origin=None: directions.append(direction) or False
+    packet = make_shoot_packet(attacker, orientation=(1.0, 0.01, 0.0), seed=37)
+    packet.loop_count = 900
+
+    for _ in range(attacker.get_weapon_profile().pellet_count):
+        combat.handle_shot(attacker, packet)
+
+    assert attacker.ammo_clip == before_clip - 1
+    assert len(server.broadcast_packets) == 1
+    assert len(directions) == 1
+
+
+def test_fire_rate_grace_does_not_compound_into_a_faster_schedule():
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.SMG_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.SMG_TOOL)
+    interval = attacker.get_weapon_profile().fire_interval
+    early = interval - (1.0 / 60.0) + 1e-5
+
+    assert attacker.consume_shot(10.0)
+    assert attacker.consume_shot(10.0 + early)
+    assert not attacker.consume_shot(10.0 + 2.0 * early)
+    assert attacker.consume_shot(10.0 + 2.0 * interval)
+
+
+def test_assault_rifle_accepts_three_round_burst_but_not_early_fourth(monkeypatch):
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.ASSAULT_RIFLE_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.ASSAULT_RIFLE_TOOL)
+    before_clip = attacker.ammo_clip
+    times = iter((10.0, 10.1, 10.2, 10.3, 10.5))
+    monkeypatch.setattr(combat_runtime.time, "monotonic", lambda: next(times))
+    combat = get_combat_system(server)
+
+    for loop_count in (100, 106, 112, 118, 130):
+        packet = make_shoot_packet(attacker, seed=loop_count)
+        packet.loop_count = loop_count
+        combat.handle_shot(attacker, packet)
+
+    assert len(server.broadcast_packets) == 4
+    assert attacker.ammo_clip == before_clip - 4
+
+
+def test_assault_rifle_rejects_same_tick_fake_burst(monkeypatch):
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.ASSAULT_RIFLE_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.ASSAULT_RIFLE_TOOL)
+    before_clip = attacker.ammo_clip
+    monkeypatch.setattr(combat_runtime.time, "monotonic", lambda: 10.0)
+    combat = get_combat_system(server)
+
+    for loop_count in (100, 101, 102):
+        packet = make_shoot_packet(attacker, seed=loop_count)
+        packet.loop_count = loop_count
+        combat.handle_shot(attacker, packet)
+
+    assert len(server.broadcast_packets) == 1
+    assert attacker.ammo_clip == before_clip - 1
+
+
+def test_minigun_accepts_stock_cadence_ramp(monkeypatch):
+    server = DummyServer()
+    attacker, _ = make_player(
+        server,
+        0,
+        "Attacker",
+        TEAM1,
+        C.MINIGUN_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    attacker.set_tool(C.MINIGUN_TOOL)
+    before_clip = attacker.ammo_clip
+    times = iter((20.0, 20.3, 20.555, 20.78))
+    monkeypatch.setattr(combat_runtime.time, "monotonic", lambda: next(times))
+    combat = get_combat_system(server)
+
+    for loop_count in range(200, 204):
+        packet = make_shoot_packet(attacker, seed=loop_count)
+        packet.loop_count = loop_count
+        combat.handle_shot(attacker, packet)
+
+    assert len(server.broadcast_packets) == 4
+    assert attacker.ammo_clip == before_clip - 4
+
+
 def test_block_occupy_round_trips_with_reference_layout():
     packet = BlockOccupy()
     packet.loop_count = 11
@@ -167,6 +354,66 @@ def test_rifle_headshot_kills_and_broadcasts_kill_action():
     assert kill_packet.kill_type == KILL_HEADSHOT
 
 
+def test_stock_oriented_hitboxes_include_each_leg_and_preserve_the_gap():
+    server = DummyServer()
+    target, _ = make_player(
+        server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0))
+    target.set_orientation_vector(0.0, 1.0, 0.0)
+    combat = get_combat_system(server)
+
+    leg_height = target.z + 2.0
+    left_leg_hit = combat._ray_hits_target(
+        (target.x - 5.0, target.y, leg_height), (1.0, 0.0, 0.0), 10.0, target)
+    between_legs = combat._ray_hits_target(
+        (target.x, target.y - 5.0, leg_height), (0.0, 1.0, 0.0), 10.0, target)
+
+    assert left_leg_hit is not None
+    assert left_leg_hit[2] is False
+    assert between_legs is None
+
+
+def test_stock_hitboxes_rotate_with_player_yaw():
+    server = DummyServer()
+    target, _ = make_player(
+        server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0))
+    target.set_orientation_vector(1.0, 0.0, 0.0)
+    combat = get_combat_system(server)
+
+    hit = combat._ray_hits_target(
+        (target.x - 5.0, target.y + 0.25, target.z + 2.0),
+        (1.0, 0.0, 0.0),
+        10.0,
+        target,
+    )
+    assert hit is not None
+    assert hit[2] is False
+
+
+def test_crouch_uses_two_lowered_leg_models_not_one_center_box():
+    server = DummyServer()
+    target, _ = make_player(
+        server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0))
+    target.set_orientation_vector(0.0, 1.0, 0.0)
+    target.input.crouch = True
+    combat = get_combat_system(server)
+
+    leg_height = target.z + 1.2
+    leg_hit = combat._ray_hits_target(
+        (target.x - 5.0, target.y + 0.3, leg_height),
+        (1.0, 0.0, 0.0),
+        10.0,
+        target,
+    )
+    center_gap = combat._ray_hits_target(
+        (target.x, target.y - 5.0, leg_height),
+        (0.0, 1.0, 0.0),
+        10.0,
+        target,
+    )
+    assert leg_hit is not None
+    assert center_gap is None
+
+
 def test_same_team_shots_do_not_damage_with_friendly_fire_disabled():
     server = DummyServer()
     server.config.friendly_fire = False
@@ -210,6 +457,7 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
     for shot_index in range(3):
         asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker, seed=shot_index + 1).generate())))
         attacker.last_shot_time -= attacker.get_weapon_profile().fire_interval
+        attacker.next_shot_time -= attacker.get_weapon_profile().fire_interval
 
     assert target.health == 100
     assert target_connection.sent_packets == []
@@ -221,8 +469,10 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
     assert [packet[0] for packet in server.broadcast_packets[:6]] == [6, 37, 6, 37, 6, 37]
     from shared.packet import Damage
     last_hit = Damage(ByteReader(server.broadcast_packets[3][1:]))
+    assert last_hit.chunk_check == 1
     assert (int(last_hit.position[0]), int(last_hit.position[1]), int(last_hit.position[2])) == wall
     destroy_packet = Damage(ByteReader(server.broadcast_packets[5][1:]))
+    assert destroy_packet.chunk_check == 1
     assert destroy_packet.damage >= 31.0  # kill-damage guarantees removal
     assert (int(destroy_packet.position[0]), int(destroy_packet.position[1]), int(destroy_packet.position[2])) == wall
 
@@ -230,6 +480,37 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
 
     # One rifle body hit after the wall breaks: 100 - 70 = 30.
     assert target.health == 30
+
+
+def test_server_mirrors_native_collapse_without_per_fallen_voxel_flood():
+    server = DummyServer()
+    player, _ = make_player(
+        server,
+        0,
+        "Digger",
+        TEAM1,
+        C.RIFLE_TOOL,
+        (100.5, 100.5, 60.0),
+    )
+    falling = [(120, 120, 100), (121, 120, 100)]
+    for position in falling:
+        server.world_manager.set_block(*position, solid=True, color=TEST_COLOR)
+
+    calls = 0
+
+    def find_once(_frontier):
+        nonlocal calls
+        calls += 1
+        return [falling] if calls == 1 else []
+
+    server.world_manager.find_unsupported_chunks = find_once
+    combat = get_combat_system(server)
+    before = list(server.broadcast_packets)
+
+    combat._collapse_unsupported(player, [(119, 120, 100)])
+
+    assert all(not server.world_manager.get_solid(*position) for position in falling)
+    assert server.broadcast_packets == before
 
 
 def test_build_damage_flag_disables_weapon_block_damage():
@@ -360,6 +641,21 @@ def test_block_line_replicates_as_one_native_block_line_packet():
     assert replicated.player_id == player.id
     assert (replicated.x1, replicated.y1, replicated.z1) == (101, 100, 60)
     assert (replicated.x2, replicated.y2, replicated.z2) == (103, 100, 60)
+
+
+def test_block_line_uses_stock_face_connected_cube_traversal():
+    server = DummyServer()
+    combat = get_combat_system(server)
+
+    assert combat._block_line_cells(
+        (100, 100, 60),
+        (102, 101, 60),
+    ) == [
+        (100, 100, 60),
+        (101, 100, 60),
+        (101, 101, 60),
+        (102, 101, 60),
+    ]
 
 
 def test_block_line_rejects_unsupported_floating_cells():

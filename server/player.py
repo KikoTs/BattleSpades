@@ -60,18 +60,11 @@ POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
 # invisible under client prediction.
 INPUT_DELAY_TICKS = 1
 INPUT_HISTORY_LIMIT = 128
-# Max buffered input frames to drain in a single server tick. Normal play
-# buffers 1-2 (client ~60.7Hz vs server 60Hz); a jitter burst delivers several
-# at once. Draining them IN ORDER (one physics step each) reproduces the
-# client's exact per-frame path so its reconciliation finds a matching
-# movement_history entry (no ADJUST/SNAP). The cap only bounds a pathological
-# backlog so a flood can't stall the 60Hz loop.
-INPUT_DRAIN_MAX = 8
+IDLE_INPUT_FLAGS = (False, False, False, False, False, False, False, False)
 # Slack on the server-side fire-rate gate: one 60Hz sim tick (~16.7ms).
 FIRE_RATE_GRACE = 1.0 / 60.0
-# Input consumption (see Player.simulate_tick): exactly one physics step per
-# tick, applying the freshest buffered input — paced at real time so the server
-# can never outrun the client (which is what caused the run-off-the-map / snap).
+# Input consumption (see Player.simulate_tick): at most one physics step per
+# tick, paced so the server can never outrun the client.
 POSITION_DRIFT_DEADZONE = 0.6
 POSITION_HARD_SNAP_THRESHOLD = 6.0
 POSITION_SOFT_CORRECTION_RATE = 0.12
@@ -239,6 +232,7 @@ class Player:
         self.ammo_clip: int = 10
         self.ammo_reserve: int = 50
         self.last_shot_time: float = 0.0
+        self.next_shot_time: float = 0.0
         self.reload_end_time: float = 0.0
         self.reloading: bool = False
 
@@ -247,6 +241,7 @@ class Player:
         self.admin: bool = False
         self.muted: bool = False
         self.god_mode: bool = False
+        self.is_bot: bool = False
         # Jetpack (per-class equipment; JETPACK_PROPERTIES keys 66-69).
         # Fuel model mirrors the client's local sim so hover reconciliation
         # stays close (constants extracted from the client 2026-07-07).
@@ -278,6 +273,16 @@ class Player:
         self.input_history: dict[int, tuple] = {}
         # Next client loop_count to consume (strict in-order cursor).
         self._input_cursor: Optional[int] = None
+        # Last state actually stepped by authoritative physics. ClientData is
+        # also applied immediately for combat/tool responsiveness, so
+        # self.input may be newer than the movement cursor and must never be
+        # used to backfill an older missing movement frame.
+        self._applied_input_flags: Optional[tuple] = None
+        self._applied_orientation: Optional[tuple] = None
+        # ClientData exposes flags one loop before the client physics consumes
+        # them. Hold the newest actual packet here and apply it on the next
+        # simulated loop; synthetic transport-gap frames do not advance it.
+        self._pending_packet_flags: tuple = IDLE_INPUT_FLAGS
         # Telemetry: how many buffered input frames the sim threw away, and how
         # many ticks ran with NO input at all (coasting on the previous frame).
         # A nonzero drop rate means the server took fewer physics steps than the
@@ -690,6 +695,9 @@ class Player:
         # this spawn (stale pre-spawn inputs must not drive the new body).
         self.input_history = {}
         self._input_cursor = None
+        self._applied_input_flags = None
+        self._applied_orientation = None
+        self._pending_packet_flags = IDLE_INPUT_FLAGS
         self.last_applied_input_loop = None
         self.blocks = self.movement_profile.starting_blocks
         self.grenades = MAX_GRENADES
@@ -734,6 +742,7 @@ class Player:
         self.last_native_pre_update = {}
         self.last_native_post_update = {}
         self.last_shot_time = 0.0
+        self.next_shot_time = 0.0
         self.reload_end_time = 0.0
         self.reloading = False
 
@@ -783,7 +792,11 @@ class Player:
         self.ammo_clip = profile.clip_size
         self.ammo_reserve = profile.reserve_ammo
 
-    def can_fire(self, now: Optional[float] = None) -> bool:
+    def can_fire(
+        self,
+        now: Optional[float] = None,
+        fire_interval: Optional[float] = None,
+    ) -> bool:
         if not self.alive or not self.spawned:
             return False
 
@@ -791,24 +804,35 @@ class Player:
         current_time = time.monotonic() if now is None else now
         if self.reloading and current_time < self.reload_end_time:
             return False
-        # Grace on the cadence gate. The client fires on ITS clock; by the time
-        # the shot reaches us, jitter routinely compresses the inter-arrival gap
-        # slightly below fire_interval. With a hard compare a steady full-auto
-        # stream loses shots at random — read as "the server's fire rate is
-        # wrong". One sim tick of slack admits legitimate cadence while still
-        # clamping anything meaningfully faster than the weapon allows.
-        if current_time - self.last_shot_time < profile.fire_interval - FIRE_RATE_GRACE:
+        # Admit up to one tick of arrival jitter against a stable cadence
+        # schedule. The grace is never subtracted from every accepted interval,
+        # which would permanently raise the weapon's sustained fire rate.
+        if current_time + FIRE_RATE_GRACE < self.next_shot_time:
             return False
 
         if self.is_spade_tool():
             return True
         return self.is_weapon_tool() and self.ammo_clip > 0
 
-    def consume_shot(self, now: Optional[float] = None) -> bool:
-        if not self.can_fire(now):
+    def consume_shot(
+        self,
+        now: Optional[float] = None,
+        fire_interval: Optional[float] = None,
+    ) -> bool:
+        if not self.can_fire(now, fire_interval=fire_interval):
             return False
 
-        self.last_shot_time = time.monotonic() if now is None else now
+        current_time = time.monotonic() if now is None else now
+        profile = self.get_weapon_profile()
+        interval = profile.fire_interval if fire_interval is None else float(fire_interval)
+        previous_due = self.next_shot_time
+        self.last_shot_time = current_time
+        if previous_due <= 0.0:
+            self.next_shot_time = current_time + interval
+        elif current_time < previous_due:
+            self.next_shot_time = previous_due + interval
+        else:
+            self.next_shot_time = current_time + interval
         if self.is_weapon_tool():
             self.ammo_clip = max(0, self.ammo_clip - 1)
         return True
@@ -1158,63 +1182,95 @@ class Player:
         """Store the movement inputs the client used for its frame
         `loop_count` so the simulation can apply them at the matching
         (delayed) server tick."""
-        self.input_history[int(loop_count)] = (flags, orientation)
+        loop_count = int(loop_count)
+        if (
+            self.last_applied_input_loop is not None
+            and loop_count <= self.last_applied_input_loop
+        ):
+            # Never let a delayed duplicate move the authoritative player a
+            # second time.
+            self.input_frames_dropped += 1
+            return
+        self.input_history[loop_count] = (flags, orientation)
         if len(self.input_history) > INPUT_HISTORY_LIMIT:
-            for key in sorted(self.input_history)[:-INPUT_HISTORY_LIMIT]:
+            overflow = sorted(self.input_history)[:-INPUT_HISTORY_LIMIT]
+            self.input_frames_dropped += len(overflow)
+            for key in overflow:
                 del self.input_history[key]
 
     async def simulate_tick(self, dt: float) -> None:
-        """Advance this player's simulation to catch up with the client.
+        """Advance at most one client-history frame per server tick.
 
-        Drain the buffered client inputs IN loop_count ORDER, one physics step
-        each. The 1.x client's reconciliation
+        Consume at most one buffered client input in loop-count order. The
+        1.x client's reconciliation
         (apply_player_network_correction, RE'd in docs/NETCODE_RECONCILIATION.md)
         looks up its OWN movement_history at the self-row's loop_count and, if
         the server position differs, ADJUSTs (>0.1 block) or SNAPs (>4 blocks,
-        wiping history — the "random rollback"). Stepping every buffered frame
-        in order reproduces the client's exact per-frame path, so the server's
-        position at EVERY loop_count matches the client's history → no
-        correction. (The old "freshest frame only, drop the rest" jumped past
-        the intermediate frames — bigger per-tick steps and missed mid-burst
-        direction changes → divergence → the rollback the user reported.)
+        wiping history — the "random rollback"). Each authoritative position
+        must therefore represent one client-history frame, never several
+        full-dt frames compressed into one server tick.
 
-        This can never outrun the client: it only applies inputs the client
-        already produced and sent. INPUT_DRAIN_MAX caps a pathological backlog.
+        A packet burst remains queued for later server ticks; applying multiple
+        full-dt updates here would make authoritative time outrun the client.
         """
         if not self.alive or not self.spawned:
             return
 
-        if not self.input_history:
-            # Underrun (client stream gap): coast on the currently-held input
-            # and step once so the sim clock stays real-time. Leave the self-row
-            # stamp where it was — never label a coasted tick with a fresh loop.
-            self.input_starved_ticks += 1
+        # Peerless server bots have no ClientData stream or reconciliation
+        # history. Their AI writes input/orientation directly each tick, so
+        # they must take one ordinary physics step instead of entering the
+        # human-client starvation freeze below.
+        if self.is_bot:
             await self.update(dt)
             return
 
-        ordered = sorted(self.input_history)
-        if len(ordered) > INPUT_DRAIN_MAX:
-            # Lost a lot of sync (huge backlog): drop the stalest frames so the
-            # loop can't stall, keep the freshest INPUT_DRAIN_MAX in order.
-            stale = ordered[:-INPUT_DRAIN_MAX]
-            self.input_frames_dropped += len(stale)
+        if self.last_applied_input_loop is not None:
+            stale = [
+                loop
+                for loop in self.input_history
+                if loop <= self.last_applied_input_loop
+            ]
             for loop in stale:
                 del self.input_history[loop]
-            ordered = ordered[-INPUT_DRAIN_MAX:]
+            self.input_frames_dropped += len(stale)
 
-        # POP the frames we are about to consume BEFORE stepping. `update()` is
-        # a coroutine: each await yields to the event loop, which lets incoming
-        # ClientData land in input_history mid-drain. Clearing the dict at the
-        # end would silently discard those fresh frames (client steps the server
-        # never takes -> the divergence this whole fix exists to remove).
-        frames = [(loop, self.input_history.pop(loop)) for loop in ordered]
+        if not self.input_history:
+            # With no later frame proving a missing loop, freeze movement and
+            # its acknowledgement together. Moving under the previous ack
+            # makes the next self-row compare against the wrong client history.
+            self.input_starved_ticks += 1
+            self._tick_idle()
+            return
 
-        for loop, (flags, orientation) in frames:
-            self.last_applied_input_loop = loop
-            self.set_orientation_vector(*orientation)
-            self.update_input(*flags)
-            self.input_frames_applied += 1
-            await self.update(dt)
+        loop = min(self.input_history)
+        packet_flags = None
+        if self._input_cursor is not None and loop > self._input_cursor:
+            # A later loop proves the expected frame will not be consumed in
+            # order. Predict exactly that one missing frame from the held input;
+            # the client has a history entry with this label, and the future
+            # packet stays queued for a later server tick.
+            loop = self._input_cursor
+            future_loop = min(self.input_history)
+            future_flags, future_orientation = self.input_history[future_loop]
+            # A synthetic loop repeats the pending state and never latches the
+            # future packet. Live traces prove packet-visible input changes one
+            # loop before client physics uses them.
+            flags = self._pending_packet_flags or self._applied_input_flags or future_flags
+            orientation = self._applied_orientation or future_orientation
+            self.input_frames_dropped += 1
+        else:
+            packet_flags, orientation = self.input_history.pop(loop)
+            flags = self._pending_packet_flags or packet_flags
+        self.last_applied_input_loop = loop
+        self._input_cursor = loop + 1
+        self.set_orientation_vector(*orientation)
+        self.update_input(*flags)
+        self._applied_input_flags = flags
+        self._applied_orientation = orientation
+        if packet_flags is not None:
+            self._pending_packet_flags = packet_flags
+        self.input_frames_applied += 1
+        await self.update(dt)
 
     def _tick_idle(self) -> None:
         """Per-tick housekeeping on a held frame (no physics step)."""
@@ -1357,16 +1413,8 @@ class Player:
         # MEASURED client-side meaning of this byte: 0x20=is_on_fire, 0x40=zoom,
         # 0x80=is_weapon_deployed (0x01/0x02 = fire/muzzle).
         #
-        # DO NOT set 0x04 / 0x08 / 0x10. PROVEN (decompiled world.pyd +
-        # gameScene, 2026-07-07): the client reads one of these as
-        # jetpack_passive, which makes its physics SKIP GRAVITY entirely — the
-        # player floats at rest, `airborne` latches True forever, and the local
-        # jump impulse (gated on !airborne) can never fire. With self-rows on
-        # (worldupdate_include_self=true) the client's always-on ClientData bits
-        # can_pickup(0x08)/can_display_weapon(0x10) were echoed straight back
-        # into this byte -> the client permanently believed it was jetpacking
-        # -> "jump stuck, thinks we're in air". Re-map 0x04/0x08/0x10 with the
-        # marker-byte replay method before ever emitting them again.
+        # Exact stock mapping distinguishes 0x04 (jetpack active) from 0x10
+        # (can_display_weapon). 0x08 is still unassigned here.
         byte = 0
         if self.input.primary_fire:
             byte |= 0x01
@@ -1385,6 +1433,11 @@ class Player:
         # regression shows up, this bit is the first suspect — revert to 0.)
         if getattr(self, "jetpack_active", False):
             byte |= 0x04
+        # Stock WorldUpdate action bit 0x10 is can_display_weapon.  Remote
+        # clients feed it directly to set_can_display_weapon; dropping it
+        # makes every equipped weapon model invisible to other players.
+        if self.input.can_display_weapon:
+            byte |= 0x10
         if self.input.is_on_fire:
             byte |= 0x20
         if self.input.zoom:
@@ -1399,8 +1452,19 @@ class Player:
     def get_action_byte(self) -> int:
         return self.pack_action_flags()
 
+    def pack_state_flags(self) -> int:
+        """Pack the stock post-action display-state byte for remote clients."""
+        byte = 0
+        if getattr(self, "parachute_active", False):
+            byte |= 0x01
+        if self.disguised:
+            byte |= 0x02
+        if self.wade:
+            byte |= 0x08
+        return byte
+
     def world_update_snapshot(self) -> Tuple[Tuple[float, float, float], ...]:
-        # (pos, orient, vel, ping, pong, hp, inp, action, tool)
+        # (pos, orient, vel, ping, pong, hp, inp, action, state, tool)
         # `pong` carries wu_ack_loop — the client input loop_count this row's
         # position corresponds to. It is what the client pairs against its own
         # movement_history to decide NO-OP / ADJUST / SNAP.
@@ -1413,6 +1477,7 @@ class Player:
             self.health,
             self.pack_input_flags(),
             self.pack_action_flags(),
+            self.pack_state_flags(),
             self.tool,
         )
 

@@ -481,12 +481,14 @@ class BattleSpadesServer:
         """
         from server.builders import build_state_data
 
-        state = build_state_data(self)
-        data = bytes(state.generate())
         for connection in list(self.connections.values()):
             if not connection.in_game:
                 continue  # mid-transition; caught up on first ClientData
             try:
+                player = getattr(connection, "player", None)
+                player_id = int(player.id) if player is not None else -1
+                state = build_state_data(self, player_id=player_id)
+                data = bytes(state.generate())
                 connection.send(data, prefix=0x31)
             except Exception:
                 logger.debug("broadcast_state_data: send failed", exc_info=True)

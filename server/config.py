@@ -110,8 +110,9 @@ class ServerConfig:
     worldupdate_include_self: bool = True
     # Constant added to the per-recipient self-row stamp (the input tick
     # the server actually consumed for that player) — the client's history
-    # indexing convention, latency-invariant. Measured best: -1.
-    worldupdate_loop_offset: int = -1
+    # indexing convention, latency-invariant. Exact after the one-loop
+    # ClientData flag latch: 0 (consumed loop L == movement_history[L]).
+    worldupdate_loop_offset: int = 0
     # Send the recipient's own row every Nth tick (others stream at 60Hz).
     # The original client runs ~58.5fps against our 60Hz ticks and skips a
     # loop ~1.5x/sec to stay clock-aligned; self-rows landing on skipped

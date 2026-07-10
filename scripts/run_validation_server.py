@@ -29,6 +29,8 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=DEFAULT_VALIDATION_PORT)
     parser.add_argument("--map", dest="map_name", default="ArcticBase")
     parser.add_argument("--mode", default="tdm")
+    parser.add_argument("--worldupdate-loop-offset", type=int)
+    parser.add_argument("--debug-selfrow", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -40,6 +42,10 @@ async def run_validation_server(args) -> None:
         map_name=args.map_name,
         mode=args.mode,
     )
+    if args.worldupdate_loop_offset is not None:
+        config.worldupdate_loop_offset = args.worldupdate_loop_offset
+    if args.debug_selfrow:
+        config.debug_selfrow = True
     server = BattleSpadesServer(config)
     loop = asyncio.get_running_loop()
 

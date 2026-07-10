@@ -55,12 +55,16 @@ class _Server:
         self.world_manager = _WorldMgr()
         self.respawned = []
         self.tick_rate = 60
+        self.state_refreshes = 0
 
     def broadcast(self, data):
         self.broadcast_packets.append(data)
 
     def respawn_player(self, player):
         self.respawned.append(player.id)
+
+    def broadcast_state_data(self):
+        self.state_refreshes += 1
 
 
 class _Mode(BaseMode):
@@ -105,6 +109,7 @@ def test_end_sequence_emits_music_stats_and_restarts(monkeypatch):
     # Restart happened: teams reset + everyone respawned; mode revived.
     assert srv.teams[0].reset_called >= 1
     assert srv.respawned == [7]
+    assert srv.state_refreshes == 1
     assert mode.ended is False
 
 
