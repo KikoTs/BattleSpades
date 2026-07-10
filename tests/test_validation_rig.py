@@ -2,8 +2,9 @@ import json
 from pathlib import Path
 
 from scripts.parity_artifact import ParityArtifact
-from scripts.parity_clients import build_client_specs
+from scripts.parity_clients import DEFAULT_CLIENT_DIR, build_client_specs
 from scripts.run_validation_server import parse_args
+from scripts.scenarios.movement_baseline import analyze_movement_samples
 from server.config import ServerConfig
 from server.validation import build_validation_config
 
@@ -55,6 +56,10 @@ def test_two_client_specs_use_unique_tracer_ports():
     assert len({spec.capture_dir for spec in specs}) == 2
 
 
+def test_parity_clients_use_the_working_nonsteam_client_tree():
+    assert DEFAULT_CLIENT_DIR == Path(r"G:\AoSRevival\AceOfSpades_no_steam_new")
+
+
 def test_parity_artifact_preserves_correlated_snapshots(tmp_path):
     artifact = ParityArtifact("movement_walk")
     artifact.record(
@@ -70,3 +75,39 @@ def test_parity_artifact_preserves_correlated_snapshots(tmp_path):
     assert data["scenario"] == "movement_walk"
     assert data["samples"][0]["marker"] == "walk_start"
     assert data["samples"][0]["server"]["loop"] == 10
+
+
+def test_movement_analysis_counts_history_wipe_as_snap():
+    result = analyze_movement_samples(
+        [
+            {"history_length": 12, "lerp_timer": 0.0, "matched_loop_error": 0.01},
+            {"history_length": 0, "lerp_timer": 0.0, "matched_loop_error": 0.01},
+        ]
+    )
+
+    assert result.snap_count == 1
+    assert not result.passed
+
+
+def test_movement_analysis_counts_lerp_rearm_as_adjust():
+    result = analyze_movement_samples(
+        [
+            {"history_length": 12, "lerp_timer": 0.01, "matched_loop_error": 0.01},
+            {"history_length": 13, "lerp_timer": 0.1, "matched_loop_error": 0.09},
+        ]
+    )
+
+    assert result.adjust_count == 1
+    assert not result.passed
+
+
+def test_movement_analysis_rejects_matched_loop_error_over_point_one():
+    result = analyze_movement_samples(
+        [
+            {"history_length": 12, "lerp_timer": 0.0, "matched_loop_error": 0.1},
+            {"history_length": 13, "lerp_timer": 0.0, "matched_loop_error": 0.1001},
+        ]
+    )
+
+    assert result.max_matched_loop_error == 0.1001
+    assert not result.passed
