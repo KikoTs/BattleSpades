@@ -60,6 +60,13 @@ POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
 # invisible under client prediction.
 INPUT_DELAY_TICKS = 1
 INPUT_HISTORY_LIMIT = 128
+# Max buffered input frames to drain in a single server tick. Normal play
+# buffers 1-2 (client ~60.7Hz vs server 60Hz); a jitter burst delivers several
+# at once. Draining them IN ORDER (one physics step each) reproduces the
+# client's exact per-frame path so its reconciliation finds a matching
+# movement_history entry (no ADJUST/SNAP). The cap only bounds a pathological
+# backlog so a flood can't stall the 60Hz loop.
+INPUT_DRAIN_MAX = 8
 # Input consumption (see Player.simulate_tick): exactly one physics step per
 # tick, applying the freshest buffered input — paced at real time so the server
 # can never outrun the client (which is what caused the run-off-the-map / snap).
@@ -269,12 +276,28 @@ class Player:
         self.input_history: dict[int, tuple] = {}
         # Next client loop_count to consume (strict in-order cursor).
         self._input_cursor: Optional[int] = None
+        # Telemetry: how many buffered input frames the sim threw away, and how
+        # many ticks ran with NO input at all (coasting on the previous frame).
+        # A nonzero drop rate means the server took fewer physics steps than the
+        # client predicted -> the server falls behind -> self-row reconciliation
+        # yanks the client backwards ("random rollback while walking").
+        self.input_frames_dropped: int = 0
+        self.input_frames_applied: int = 0
+        self.input_starved_ticks: int = 0
         self.last_reported_position: Optional[Tuple[float, float, float]] = None
         # The client loop_count of the input frame the simulation last
         # consumed — the ONLY correct stamp for this player's WorldUpdate
         # self-row (a fixed loop-derived stamp mislabels packets whenever
         # transit latency isn't exactly the local-machine value).
         self.last_applied_input_loop: Optional[int] = None
+        # The value written into this player's WorldUpdate row `pong` field:
+        # the client loop_count the server has consumed for them (+ the
+        # calibration offset). The 1.x client feeds this to
+        # set_network_position_and_velocity(..., last_loop_count, ...) and looks
+        # its OWN movement_history up by it. Sending 0 (the old behaviour) means
+        # the client's dedupe `network_position_loop_count == last_loop_count`
+        # matches on every packet, so reconciliation never runs at all.
+        self.wu_ack_loop: int = 0
         self.last_position_drift: float = 0.0
         self.last_position_drift_vector: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.last_fall_result: int = 0
@@ -1133,41 +1156,57 @@ class Player:
                 del self.input_history[key]
 
     async def simulate_tick(self, dt: float) -> None:
-        """Advance this player's simulation by exactly ONE physics step.
+        """Advance this player's simulation to catch up with the client.
 
-        Authoritative-server movement, simplest correct form: apply the
-        FRESHEST buffered client input (one physics step), drop the rest,
-        and always step once. One step per tick means the server advances at
-        real time and CANNOT outrun the client; applying the newest input
-        keeps it current with the client's latest direction (intermediate
-        inputs during a continuous walk carry the same direction, so dropping
-        them costs nothing). The self-row is stamped with last_applied_input_loop
-        so the client still pairs it to the matching history frame.
+        Drain the buffered client inputs IN loop_count ORDER, one physics step
+        each. The 1.x client's reconciliation
+        (apply_player_network_correction, RE'd in docs/NETCODE_RECONCILIATION.md)
+        looks up its OWN movement_history at the self-row's loop_count and, if
+        the server position differs, ADJUSTs (>0.1 block) or SNAPs (>4 blocks,
+        wiping history — the "random rollback"). Stepping every buffered frame
+        in order reproduces the client's exact per-frame path, so the server's
+        position at EVERY loop_count matches the client's history → no
+        correction. (The old "freshest frame only, drop the rest" jumped past
+        the intermediate frames — bigger per-tick steps and missed mid-burst
+        direction changes → divergence → the rollback the user reported.)
 
-        (Earlier experiments that consumed multiple inputs per tick made the
-        server sprint multiple-times real-time and run off the map, which is
-        what reconciled the client back toward spawn on every jump.)
+        This can never outrun the client: it only applies inputs the client
+        already produced and sent. INPUT_DRAIN_MAX caps a pathological backlog.
         """
         if not self.alive or not self.spawned:
             return
 
-        if self.input_history:
-            best = max(self.input_history)
-            flags, orientation = self.input_history[best]
-            # Movement direction + orientation come from the FRESHEST frame,
-            # but JUMP is an EDGE (the key is held only ~1-2 client frames).
-            # Picking only the freshest frame drops a jump whose press landed
-            # in an earlier buffered frame — the reason human jumps never
-            # registered server-side while held walk always did. Latch jump
-            # (index 4) if ANY buffered frame this tick had it.
-            if not flags[4] and any(f[0][4] for f in self.input_history.values()):
-                flags = flags[:4] + (True,) + flags[5:]
-            self.last_applied_input_loop = best
+        if not self.input_history:
+            # Underrun (client stream gap): coast on the currently-held input
+            # and step once so the sim clock stays real-time. Leave the self-row
+            # stamp where it was — never label a coasted tick with a fresh loop.
+            self.input_starved_ticks += 1
+            await self.update(dt)
+            return
+
+        ordered = sorted(self.input_history)
+        if len(ordered) > INPUT_DRAIN_MAX:
+            # Lost a lot of sync (huge backlog): drop the stalest frames so the
+            # loop can't stall, keep the freshest INPUT_DRAIN_MAX in order.
+            stale = ordered[:-INPUT_DRAIN_MAX]
+            self.input_frames_dropped += len(stale)
+            for loop in stale:
+                del self.input_history[loop]
+            ordered = ordered[-INPUT_DRAIN_MAX:]
+
+        # POP the frames we are about to consume BEFORE stepping. `update()` is
+        # a coroutine: each await yields to the event loop, which lets incoming
+        # ClientData land in input_history mid-drain. Clearing the dict at the
+        # end would silently discard those fresh frames (client steps the server
+        # never takes -> the divergence this whole fix exists to remove).
+        frames = [(loop, self.input_history.pop(loop)) for loop in ordered]
+
+        for loop, (flags, orientation) in frames:
+            self.last_applied_input_loop = loop
             self.set_orientation_vector(*orientation)
             self.update_input(*flags)
-            self.input_history.clear()
-
-        await self.update(dt)
+            self.input_frames_applied += 1
+            await self.update(dt)
 
     def _tick_idle(self) -> None:
         """Per-tick housekeeping on a held frame (no physics step)."""
@@ -1353,12 +1392,16 @@ class Player:
         return self.pack_action_flags()
 
     def world_update_snapshot(self) -> Tuple[Tuple[float, float, float], ...]:
+        # (pos, orient, vel, ping, pong, hp, inp, action, tool)
+        # `pong` carries wu_ack_loop — the client input loop_count this row's
+        # position corresponds to. It is what the client pairs against its own
+        # movement_history to decide NO-OP / ADJUST / SNAP.
         return (
             self.position,
             self.orientation,
             self.velocity,
             0,
-            0,
+            self.wu_ack_loop,
             self.health,
             self.pack_input_flags(),
             self.pack_action_flags(),

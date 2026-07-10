@@ -393,9 +393,14 @@ class WorldManager:
             destroyed.append(pos)
         return destroyed
 
-    # Chunks bigger than this stay standing (perf guard; matches the classic
-    # behavior where huge terrain sections never collapse).
-    COLLAPSE_MAX_CHUNK = 512
+    # Chunks bigger than this stay standing (perf guard). The old value of 512
+    # was the "building collapses client-side but stays solid server-side" bug:
+    # the CLIENT's flood fill (vxl.pyd sub_10036470) has NO block cap at all —
+    # only a ~10M op budget — so it dropped any real building, while the server
+    # bailed out at 512 cells and kept every block, leaving invisible collision.
+    # We now drive collapse from the server alone (Damage.chunk_check = 0), so
+    # this only bounds our own work; keep it well above any plausible structure.
+    COLLAPSE_MAX_CHUNK = 8192
 
     def find_unsupported_chunks(self, removed_positions):
         """Classic AoS floating-structure detection: after removing cells,
