@@ -10,7 +10,7 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *args, **kwargs: {}))
 import shared.constants as C
 from aoslib.vxl import VXL
 from shared.bytes import ByteReader
-from shared.packet import ClientData, PositionData, WorldUpdate
+from shared.packet import ClientData, PositionData, StateData, WorldUpdate
 
 from protocol.packet_handler import PacketHandler
 from server.config import ServerConfig
@@ -111,12 +111,18 @@ def test_world_update_serializes_reference_layout():
         95,
         0x31,
         0x42,
+        0x0A,
         C.MINIGUN_TOOL,
     )
 
     data = bytes(packet.generate())
     assert len(data) == 67
     assert data[0] == 2
+    row_start = 7
+    assert data[row_start + 46] == 0x42  # action
+    assert data[row_start + 47] == 0x0A  # disguise + touching-goo state
+    assert data[row_start + 48] == C.MINIGUN_TOOL
+    assert data[row_start + 49] == 0xFF  # no pickup
 
     reader = ByteReader(data[1:])
     assert reader.read_int() == 123
@@ -138,9 +144,9 @@ def test_world_update_serializes_reference_layout():
     assert reader.read_byte() == 0x42
     # The byte after the action byte is a per-player STATE bitfield the client
     # bit-splits (parachute/disguise/goo), NOT the tool id — writing the raw
-    # tool id here made weapon switches toggle those states. We write 0.
-    assert reader.read_byte() == 0
-    assert reader.read_byte() == 0
+    # tool id here made weapon switches toggle those states.
+    assert reader.read_byte() == 0x0A
+    assert reader.read_byte() == C.MINIGUN_TOOL
     # Pickup id byte: 0xFF (-1) = "no pickup". Sending 0 crashes the client
     # minimap (PICKUPS[0] KeyError) — measured on the stock Steam client.
     assert reader.read_byte() == 0xFF
@@ -164,12 +170,13 @@ def test_world_update_read_parses_player_updates_and_counts():
         100,
         0x11,
         0x02,
+        0x08,
         C.RIFLE_TOOL,
     )
 
     parsed = WorldUpdate(ByteReader(bytes(packet.generate())[1:]))
     update = parsed.player_updates[1]
-    position, orientation, velocity, movement, ping, health, input_flags, action_flags, state_byte = update
+    position, orientation, velocity, movement, ping, health, input_flags, action_flags, state_flags, tool = update
 
     assert parsed.loop_count == 77
     assert len(parsed.updated_entities) == 0
@@ -182,9 +189,8 @@ def test_world_update_read_parses_player_updates_and_counts():
     assert health == 100
     assert input_flags == 0x11
     assert action_flags == 0x02
-    # write() emits 0 for the post-action STATE byte (not the tool id, which
-    # the client never reads from WorldUpdate), so the round-trip yields 0.
-    assert state_byte == 0
+    assert state_flags == 0x08
+    assert tool == C.RIFLE_TOOL
 
 
 def test_world_update_round_trips_its_serialized_bytes():
@@ -197,6 +203,7 @@ def test_world_update_round_trips_its_serialized_bytes():
         0,
         0,
         100,
+        0,
         0,
         0,
         C.MINIGUN_TOOL,
@@ -294,7 +301,7 @@ def test_client_data_updates_player_state_and_flags():
     # zoom/hover/weapon_deployed vs the ClientData SEND layout. ClientData
     # 0x95 (primary|zoom|can_display_weapon|hover) packs to display 0x55
     # (primary 0x01 | can_display 0x10 | zoom 0x40 | hover→jetpack 0x04).
-    assert player.pack_action_flags() == 0x41
+    assert player.pack_action_flags() == 0x51
 
 
 def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_yaw():
@@ -329,7 +336,18 @@ def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_ya
     assert player.input.jump is True
     assert player.pack_input_flags() == 0x15
     # See note above: 0x95 send-layout -> 0x55 display-layout in pack.
-    assert player.pack_action_flags() == 0x41
+    assert player.pack_action_flags() == 0x51
+
+
+def test_world_update_snapshot_packs_remote_disguise_and_water_state():
+    player, _ = make_player()
+    player.disguised = True
+    player.wade = True
+
+    snapshot = player.world_update_snapshot()
+
+    assert snapshot[-2] == 0x0A
+    assert snapshot[-1] == player.tool
 
 
 def test_repeated_live_client_data_held_jump_launches_on_next_tick():
@@ -544,6 +562,181 @@ def test_position_data_does_not_rollback_flat_ground_walking():
     assert player.last_position_drift > 0.0
 
 
+def test_simulate_tick_consumes_only_one_buffered_frame_per_server_tick():
+    player, _ = make_player()
+    updates = []
+
+    async def record_update(dt):
+        updates.append(dt)
+
+    player.update = record_update
+    flags = (True, False, False, False, False, False, False, False)
+    player.record_input_frame(100, flags, (1.0, 0.0, 0.0))
+    player.record_input_frame(101, flags, (1.0, 0.0, 0.0))
+
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert len(updates) == 1
+    assert player.last_applied_input_loop == 100
+    assert sorted(player.input_history) == [101]
+
+
+def test_simulate_tick_never_reapplies_stale_or_duplicate_input():
+    player, _ = make_player()
+    applied = []
+
+    async def record_update(dt):
+        applied.append((player.last_applied_input_loop, player.input.up))
+
+    player.update = record_update
+    forward = (True, False, False, False, False, False, False, False)
+    idle = (False, False, False, False, False, False, False, False)
+    player.record_input_frame(200, forward, (1.0, 0.0, 0.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    player.record_input_frame(199, idle, (1.0, 0.0, 0.0))
+    player.record_input_frame(200, idle, (1.0, 0.0, 0.0))
+    player.record_input_frame(201, forward, (1.0, 0.0, 0.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert applied == [(200, False), (201, True)]
+    assert player.last_applied_input_loop == 201
+    assert player.input_history == {}
+
+
+def test_starved_tick_never_changes_position_under_same_ack():
+    player, _ = make_player()
+
+    async def move(_dt):
+        player.x += 1.0
+
+    player.update = move
+    flags = (True, False, False, False, False, False, False, False)
+    player.record_input_frame(100, flags, (1.0, 0.0, 0.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    ack_before = player.last_applied_input_loop
+    position_before = player.position
+
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert player.last_applied_input_loop == ack_before
+    assert player.position == position_before
+
+
+def test_bot_without_client_history_still_advances_physics():
+    player, _ = make_player()
+    player.is_bot = True
+    updates = []
+
+    async def record_update(dt):
+        updates.append(dt)
+
+    player.update = record_update
+
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert updates == [1.0 / 60.0]
+    assert player.last_applied_input_loop is None
+
+
+def test_input_gap_synthesizes_only_the_expected_loop_before_future_frame():
+    player, _ = make_player()
+    applied = []
+
+    async def record_update(_dt):
+        applied.append(player.last_applied_input_loop)
+
+    player.update = record_update
+    flags = (True, False, False, False, False, False, False, False)
+    player.record_input_frame(100, flags, (1.0, 0.0, 0.0))
+    player.record_input_frame(102, flags, (1.0, 0.0, 0.0))
+
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert applied == [100, 101]
+    assert player.last_applied_input_loop == 101
+    assert sorted(player.input_history) == [102]
+
+
+def test_packet_transition_is_latched_for_the_next_simulated_loop():
+    player, _ = make_player()
+    simulated_sprint = []
+
+    async def record_update(_dt):
+        simulated_sprint.append(player.input.sprint)
+
+    player.update = record_update
+    walking = (True, False, False, False, False, False, False, False)
+    sprinting = (True, False, False, False, False, False, False, True)
+    orientation = (1.0, 0.0, 0.0)
+    player.record_input_frame(100, walking, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    # The packet handler exposes the newest state immediately to combat/tool
+    # systems before movement reaches this future frame.
+    player.update_input(*sprinting)
+    player.record_input_frame(101, sprinting, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    player.record_input_frame(102, sprinting, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert player.last_applied_input_loop == 102
+    assert simulated_sprint == [False, False, True]
+    assert player.input_history == {}
+
+
+def test_first_post_spawn_packet_is_latched_after_idle_frame():
+    player, _ = make_player()
+    simulated_forward = []
+
+    async def record_update(_dt):
+        simulated_forward.append(player.input.up)
+
+    player.update = record_update
+    forward = (True, False, False, False, False, False, False, False)
+    orientation = (1.0, 0.0, 0.0)
+    player.record_input_frame(100, forward, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    player.record_input_frame(101, forward, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert simulated_forward == [False, True]
+
+
+def test_large_input_gap_does_not_leak_newest_transition_backwards():
+    player, _ = make_player()
+    simulated = []
+
+    async def record_update(_dt):
+        simulated.append((player.input.sprint, player.input.crouch))
+
+    player.update = record_update
+    walking = (True, False, False, False, False, False, False, False)
+    sprinting = (True, False, False, False, False, False, False, True)
+    crouching = (True, False, False, False, False, True, False, False)
+    orientation = (1.0, 0.0, 0.0)
+    player.record_input_frame(100, walking, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    # Packet 102 introduces sprint. Both missing 101 and actual 102 still use
+    # the previous packet state; synthetic loops never advance the latch.
+    player.record_input_frame(102, sprinting, orientation)
+    player.record_input_frame(104, crouching, orientation)
+    player.update_input(*crouching)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert player.last_applied_input_loop == 103
+    assert simulated == [
+        (False, False),
+        (False, False),
+        (False, False),
+        (True, False),
+    ]
+
+
 def test_server_broadcasts_world_update_to_connected_clients():
     server = BattleSpadesServer(ServerConfig())
     server.world_manager = make_world_manager()
@@ -573,12 +766,30 @@ def test_server_broadcasts_world_update_to_connected_clients():
 
     parsed = WorldUpdate(ByteReader(connection_one.sent_packets[0][1:]))
     update = parsed.player_updates[player_one.id]
-    update_position, _, _, _, _, _, update_input_flags, _, update_state_byte = update
-    # The byte after 'action' is a per-player state bitfield (not the tool id):
-    # we write 0 (no parachute/disguise/goo) so weapon switching can't toggle
-    # those states. See shared/packet.pyx WorldUpdate.write.
-    assert update_state_byte == 0
+    update_position, _, _, _, _, _, update_input_flags, _, update_state, update_tool = update
+    assert update_tool == player_one.tool
+    assert update_state == player_one.pack_state_flags()
     assert update_position[0] > player_two.position[0] - 20.0
     assert update_position[0] > player_one.last_reported_position[0] - 0.01
     assert update_input_flags == player_one.pack_input_flags()
+
+
+def test_round_restart_state_preserves_each_clients_player_id():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    player_one, connection_one = make_player(server, cell_x=100, cell_y=100)
+    player_two, connection_two = make_player(server, cell_x=110, cell_y=110)
+    player_two.id = 1
+    connection_two.player = player_two
+    server.players = {0: player_one, 1: player_two}
+    server.connections = {"one": connection_one, "two": connection_two}
+
+    server.broadcast_state_data()
+
+    state_one = StateData(ByteReader(connection_one.sent_packets[-1][1:]))
+    state_two = StateData(ByteReader(connection_two.sent_packets[-1][1:]))
+    assert state_one.player_id == 0
+    assert state_two.player_id == 1
+    assert state_one.has_map_ended == 0
+    assert state_two.has_map_ended == 0
 

@@ -387,31 +387,33 @@ class WorldManager:
                 self.clear_block_damage(x, y, z)
                 continue
 
-            self.map.destroy_point(x, y, z)
+            self.map.remove_point_nochecks(x, y, z)
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)
             destroyed.append(pos)
         return destroyed
 
-    # Chunks bigger than this stay standing (perf guard). The old value of 512
-    # was the "building collapses client-side but stays solid server-side" bug:
-    # the CLIENT's flood fill (vxl.pyd sub_10036470) has NO block cap at all —
-    # only a ~10M op budget — so it dropped any real building, while the server
-    # bailed out at 512 cells and kept every block, leaving invisible collision.
-    # We now drive collapse from the server alone (Damage.chunk_check = 0), so
-    # this only bounds our own work; keep it well above any plausible structure.
-    COLLAPSE_MAX_CHUNK = 8192
+    # Stock flood fill walks face + edge adjacency (18 neighbors, excluding
+    # three-axis corners) and limits work, not component size. The 8000-block
+    # constant elsewhere in the client only samples falling visual particles.
+    COLLAPSE_NEIGHBORS = tuple(
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+        if 1 <= abs(dx) + abs(dy) + abs(dz) <= 2
+    )
+    COLLAPSE_WORK_BUDGET = 10_000_000
 
     def find_unsupported_chunks(self, removed_positions):
         """Classic AoS floating-structure detection: after removing cells,
         flood-fill each solid neighbor's connected component; a component
-        that never reaches the indestructible base plane (z >= MAP_Z-2) is
+        that never reaches the indestructible base plane (z > 238) is
         unsupported and should collapse. Returns a list of cell-lists."""
         if self.map is None or not removed_positions:
             return []
 
-        neighbors = ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
-                     (0, -1, 0), (0, 0, 1), (0, 0, -1))
+        neighbors = self.COLLAPSE_NEIGHBORS
         chunks = []
         visited = set()
         for (sx, sy, sz) in removed_positions:
@@ -423,22 +425,26 @@ class WorldManager:
                 stack = [start]
                 comp_seen = {start}
                 grounded = False
+                exhausted = False
+                work = 0
                 while stack:
                     cx, cy, cz = stack.pop()
-                    if cz >= MAP_Z - 2:
+                    if cz > 238:
                         grounded = True
                         break
                     comp.append((cx, cy, cz))
-                    if len(comp) > self.COLLAPSE_MAX_CHUNK:
-                        grounded = True
-                        break
                     for ddx, ddy, ddz in neighbors:
+                        work += 1
+                        if work > self.COLLAPSE_WORK_BUDGET:
+                            exhausted = True
+                            stack.clear()
+                            break
                         nxt = (cx + ddx, cy + ddy, cz + ddz)
                         if nxt not in comp_seen and self.get_solid(*nxt):
                             comp_seen.add(nxt)
                             stack.append(nxt)
                 visited |= comp_seen
-                if not grounded and comp:
+                if not grounded and not exhausted and comp:
                     chunks.append(comp)
         return chunks
 

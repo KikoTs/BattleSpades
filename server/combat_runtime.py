@@ -6,18 +6,17 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 import time
-from collections import defaultdict
 from typing import Optional
 
+from aoslib.world import cube_line
+import shared.constants as C
 from server.game_constants import (
     BLOCK_ACTION_BUILD,
     BLOCK_ACTION_DESTROY,
     DEFAULT_BLOCK_HEALTH,
     KILL_HEADSHOT,
     MELEE_RANGE,
-    PLAYER_WIDTH_HALF,
 )
 from shared.packet import BlockBuild, BlockLine, ShootPacket
 
@@ -25,9 +24,49 @@ logger = logging.getLogger(__name__)
 
 SHOT_ORIGIN_TOLERANCE = 8.0
 SHOT_ORIENTATION_DOT_TOLERANCE = 0.25
-RAYCAST_STEP = 0.25
-HEADSHOT_HEIGHT = 0.35
-BODY_HEIGHT_PADDING = 1.0
+HITBOX_SCALE = 0.05
+PELLET_GROUP_TIMEOUT = 0.25
+ASSAULT_BURST_SIZE = 3
+ASSAULT_BURST_WINDOW = 0.30
+ASSAULT_BURST_LOOP_INTERVAL = 6
+MINIGUN_INTERVAL_INITIAL = 0.30
+MINIGUN_INTERVAL_MIN = 0.10
+MINIGUN_INTERVAL_RAMP_PER_SECOND = 0.15
+
+# Stock KV6 collision-model bounding boxes. Values are
+# ((size_x, size_y, size_z), (effective_pivot_x, pivot_y, pivot_z)); effective
+# pivots include CLASS_BODY_PARTS_OFFSETS. The client tests these oriented
+# boxes, not a generic player cylinder/AABB and not occupied KV6 voxels.
+_COMMON_ARMS = ((24, 20, 12), (12, 2, 1))
+_ZOMBIE_ARMS = ((24, 20, 12), (12, 10, 6))
+_CROUCH_TORSO = ((16, 16, 14), (8, 14, 2))
+_CROUCH_LEG = ((6, 14, 16), (3, 7, 3))
+
+
+def _part(size, pivot):
+    return (size, pivot)
+
+
+_CLASS_HITBOXES = {
+    C.CLASS_SOLDIER: (_part((14, 16, 15), (7, 8, 13)), _part((16, 9, 19), (7, 6, .5)), _COMMON_ARMS, _part((6, 11, 24), (3, 5.5, 0)), _part((6, 11, 24), (3, 5.5, 0))),
+    C.CLASS_SCOUT: (_part((16, 16, 12), (8, 8, 11.5)), _part((16, 8, 18), (8, 5.5, 0)), _COMMON_ARMS, _part((6, 11, 24), (3, 5.5, 0)), _part((6, 11, 24), (3, 5.5, 0))),
+    C.CLASS_ROCKETEER: (_part((16, 14, 12), (8, 7, 11.5)), _part((16, 10, 18), (8, 5, 0)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_MINER: (_part((16, 17, 12), (8, 8.5, 11.5)), _part((16, 11, 18), (8, 5.5, 0)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_ZOMBIE: (_part((11, 12, 12), (5.5, 6, 11.5)), _part((16, 8, 18), (8, 4, 0)), _ZOMBIE_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_CLASSIC_SOLDIER: (_part((14, 14, 12), (7, 8, 11.5)), _part((18, 12, 20), (8, 7.5, 1)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_GANGSTER_1: (_part((16, 19, 16), (8, 8.5, 13)), _part((16, 8, 19), (7.5, 4.5, 1)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_GANGSTER_2: (_part((12, 16, 12), (6, 6.5, 11.5)), _part((16, 8, 19), (7.5, 4.5, 1)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_GANGSTER_3: (_part((14, 16, 11), (7, 7.5, 10.5)), _part((16, 8, 19), (7.5, 4.5, 1)), _COMMON_ARMS, _part((6, 9, 24), (3, 4, 0)), _part((6, 9, 24), (3, 4, 0))),
+    C.CLASS_GANGSTER_4: (_part((20, 21, 13), (10, 10.5, 12)), _part((16, 8, 19), (7.5, 4.5, 1)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_GANGSTER_VIP_1: (_part((12, 15, 12), (6, 6.5, 11.5)), _part((18, 11, 26), (8.5, 6.5, 1)), _COMMON_ARMS, _part((6, 9, 24), (3, 4, 0)), _part((6, 9, 24), (3, 4, 0))),
+    C.CLASS_GANGSTER_VIP_2: (_part((14, 15, 11), (7, 6.5, 10.5)), _part((16, 8, 19), (7.5, 4.5, 1)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_ENGINEER: (_part((16, 13, 12), (8, 6.5, 11.5)), _part((16, 11, 18), (8, 5.5, 0)), _COMMON_ARMS, _part((6, 11, 24), (3, 5.5, 0)), _part((6, 11, 24), (3, 5.5, 0))),
+    C.CLASS_UGCBUILDER: (_part((16, 17, 12), (8, 8.5, 11.5)), _part((16, 11, 18), (8, 5.5, 0)), _COMMON_ARMS, _part((6, 10, 24), (3, 5, 0)), _part((6, 10, 24), (3, 5, 0))),
+    C.CLASS_SPECIALIST: (_part((14, 15, 13), (7, 8, 12.5)), _part((16, 10, 18), (8, 6.5, -1)), _COMMON_ARMS, _part((8, 11, 24), (4, 5.5, 0)), _part((8, 11, 24), (4, 5.5, 0))),
+    C.CLASS_MEDIC: (_part((14, 13, 13), (7, 7, 11.5)), _part((16, 11, 17), (7, 7, -.5)), _COMMON_ARMS, _part((8, 12, 24), (4, 6, 0)), _part((8, 12, 24), (2, 6, 0))),
+}
+_CLASS_HITBOXES[C.CLASS_FAST_ZOMBIE] = _CLASS_HITBOXES[C.CLASS_ZOMBIE]
+_CLASS_HITBOXES[C.CLASS_JUMP_ZOMBIE] = _CLASS_HITBOXES[C.CLASS_ZOMBIE]
 
 
 def _build_melee_profiles():
@@ -73,6 +112,9 @@ def get_combat_system(server):
 class CombatSystem:
     def __init__(self, server):
         self.server = server
+        self._pellet_groups = {}
+        self._assault_bursts = {}
+        self._minigun_runs = {}
 
     def handle_shot(self, player, packet) -> bool:
         if not player.alive or not player.spawned:
@@ -82,8 +124,18 @@ class CombatSystem:
         if not self._validate_shot_packet(player, packet):
             return False
 
+        profile = player.get_weapon_profile()
         now = time.monotonic()
-        if not player.consume_shot(now):
+        if int(player.tool) == int(getattr(C, "ASSAULT_RIFLE_TOOL", 60)):
+            if not self._accept_assault_burst_packet(player, packet, now):
+                return False
+        elif int(player.tool) == int(getattr(C, "MINIGUN_TOOL", 8)):
+            if not self._accept_minigun_packet(player, now):
+                return False
+        elif profile.pellet_count > 1:
+            if not self._accept_pellet_packet(player, packet, profile, now):
+                return False
+        elif not player.consume_shot(now):
             return False
 
         sanitized = self._build_sanitized_shoot_packet(player, packet)
@@ -108,10 +160,96 @@ class CombatSystem:
             self._resolve_spade_dig(player, origin, direction, packet)
             return self._resolve_melee_hit(player, origin, direction)
 
-        profile = player.get_weapon_profile()
         if profile.pellet_count <= 1:
             return self._resolve_hitscan(player, direction, origin)
-        return self._resolve_shotgun(player, packet.seed, origin)
+        # The stock client transmits one ShootPacket for every pellet, already
+        # carrying that pellet's final spread direction. Resolve exactly this
+        # ray once; never expand the trigger seed into a second server-side
+        # pellet cloud.
+        return self._resolve_hitscan(player, direction, origin)
+
+    def _accept_assault_burst_packet(self, player, packet, now: float) -> bool:
+        """Accept the stock three-round burst at 0.1s internal spacing."""
+        loop_count = int(getattr(packet, "loop_count", 0))
+        burst = self._assault_bursts.get(player.id)
+        if (
+            burst is not None
+            and burst["count"] < ASSAULT_BURST_SIZE
+            and loop_count - burst["last_loop"] >= ASSAULT_BURST_LOOP_INTERVAL
+            and now - burst["started_at"] <= ASSAULT_BURST_WINDOW
+        ):
+            if player.ammo_clip <= 0 or player.reloading:
+                return False
+            player.ammo_clip -= 1
+            burst["count"] += 1
+            burst["last_loop"] = loop_count
+            return True
+
+        if not player.consume_shot(now):
+            return False
+        self._assault_bursts[player.id] = {
+            "count": 1,
+            "last_loop": loop_count,
+            "started_at": now,
+        }
+        return True
+
+    def _accept_minigun_packet(self, player, now: float) -> bool:
+        """Mirror the stock 0.30s -> 0.10s active-fire cadence ramp."""
+        run = self._minigun_runs.get(player.id)
+        if run is None or now - run["last_packet_at"] > MINIGUN_INTERVAL_INITIAL * 2:
+            run = {"started_at": now, "last_packet_at": now}
+            self._minigun_runs[player.id] = run
+        elapsed = max(0.0, now - run["started_at"])
+        interval = max(
+            MINIGUN_INTERVAL_MIN,
+            MINIGUN_INTERVAL_INITIAL - MINIGUN_INTERVAL_RAMP_PER_SECOND * elapsed,
+        )
+        if not player.consume_shot(now, fire_interval=interval):
+            return False
+        run["last_packet_at"] = now
+        return True
+
+    def _accept_pellet_packet(self, player, packet, profile, now: float) -> bool:
+        """Gate one stock-client pellet group while consuming one round.
+
+        Every packet in a trigger shares loop/seed/tool and arrives as a tight
+        burst. Cadence and ammunition apply to the trigger's first packet;
+        subsequent distinct rays are admitted up to the recovered pellet cap.
+        """
+        key = (
+            int(getattr(packet, "loop_count", 0)),
+            int(getattr(packet, "seed", 0)) & 0xFF,
+            int(player.tool),
+            int(getattr(packet, "shot_on_world_update", 0)),
+        )
+        direction_signature = (
+            float(getattr(packet, "ori_x", 0.0)),
+            float(getattr(packet, "ori_y", 0.0)),
+            float(getattr(packet, "ori_z", 0.0)),
+        )
+        group = self._pellet_groups.get(player.id)
+        if group is not None and now > group["expires_at"]:
+            group = None
+
+        if group is None or group["key"] != key:
+            if not player.consume_shot(now):
+                return False
+            self._pellet_groups[player.id] = {
+                "key": key,
+                "count": 1,
+                "directions": {direction_signature},
+                "expires_at": now + PELLET_GROUP_TIMEOUT,
+            }
+            return True
+
+        if group["count"] >= profile.pellet_count:
+            return False
+        if direction_signature in group["directions"]:
+            return False
+        group["count"] += 1
+        group["directions"].add(direction_signature)
+        return True
 
     def handle_weapon_reload(self, player) -> bool:
         if not player.start_reload():
@@ -189,11 +327,9 @@ class CombatSystem:
         x1, y1, z1 = packet.x1, packet.y1, packet.z1
         x2, y2, z2 = packet.x2, packet.y2, packet.z2
 
-        # NOTE: do NOT call world_manager.block_line — the compiled
-        # vxl.cp312.pyd's block_line ACCESS-VIOLATES (stale/broken build,
-        # segfaults on both empty and real maps; reproduced 2026-07-10).
-        # Rasterize in pure Python with the identical algorithm instead.
-        # A single tap has equal endpoints -> 1 cell.
+        # The remote client regenerates this packet through world.cube_line,
+        # whose face-connected path is different from VXL.block_line's rounded
+        # max-axis interpolation. A single tap has equal endpoints -> 1 cell.
         cells = self._block_line_cells((x1, y1, z1), (x2, y2, z2))
         if not cells or len(cells) > self.BLOCK_LINE_MAX_CELLS:
             return False
@@ -227,30 +363,8 @@ class CombatSystem:
         return True
 
     def _block_line_cells(self, a, b):
-        """Integer cells along the segment a..b inclusive.
-
-        Mirrors aoslib/vxl.pyx block_line EXACTLY (same rounding expression,
-        consecutive-only dedupe, NO truncation) because the remote client
-        regenerates the cells from the echoed endpoints with its own
-        generator — any divergence here desyncs server world vs client world.
-        (Pure Python because the compiled pyd's block_line segfaults.)
-        Overlong lines are the CALLER's job to reject, never sparsify.
-        """
-        x1, y1, z1 = a
-        x2, y2, z2 = b
-        steps = max(abs(x2 - x1), abs(y2 - y1), abs(z2 - z1))
-        if steps <= 0:
-            return [(x1, y1, z1)]
-        out = []
-        for i in range(steps + 1):
-            cell = (
-                int(round(x1 + ((x2 - x1) * i) / float(steps))),
-                int(round(y1 + ((y2 - y1) * i) / float(steps))),
-                int(round(z1 + ((z2 - z1) * i) / float(steps))),
-            )
-            if not out or out[-1] != cell:
-                out.append(cell)
-        return out
+        """Stock face-connected traversal used by remote BlockLine handling."""
+        return list(cube_line(*a, *b))
 
     def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
         """Raycast terrain from the CLIENT's reported origin/direction and dig
@@ -371,37 +485,6 @@ class CombatSystem:
             return self._apply_block_damage(attacker, block_pos, attacker.get_weapon_profile().block_damage)
         return False
 
-    def _resolve_shotgun(self, attacker, seed: int, origin=None) -> bool:
-        if origin is None:
-            origin = attacker.eye
-        profile = attacker.get_weapon_profile()
-        rng = random.Random(seed)
-        damages = defaultdict(float)
-        headshots = {}
-        hit_anything = False
-
-        for _ in range(profile.pellet_count):
-            direction = self._spread_direction(attacker, profile.spread, rng)
-            hit = self._trace_player_hit(attacker, origin, direction, profile.max_range)
-            if hit is None:
-                continue
-
-            target, headshot, _, block_pos = hit
-            if target is not None:
-                damages[target] += self._calculate_damage(attacker, profile, headshot=headshot)
-                headshots[target] = headshots.get(target, False) or headshot
-                hit_anything = True
-                continue
-
-            if block_pos is not None and self._apply_block_damage(attacker, block_pos, profile.block_damage):
-                hit_anything = True
-
-        for target, damage in damages.items():
-            kill_type = KILL_HEADSHOT if headshots.get(target, False) else profile.kill_type
-            target.damage(int(round(damage)), source=attacker, kill_type=kill_type)
-
-        return hit_anything or bool(damages)
-
     def _apply_block_damage(self, attacker, block_pos, damage: float) -> bool:
         if not getattr(self.server.config, "build_damage", True):
             return False
@@ -457,20 +540,11 @@ class CombatSystem:
         packet.type = self._damage_type_for(player) if damage_type is None else int(damage_type)
         packet.damage = min(float(damage), self._BLOCK_KILL_DAMAGE)
         packet.face = 0
-        # chunk_check=0 -> the client removes ONLY the exact cell(s) we send and
-        # never runs its own flood-fill. SINGLE AUTHORITY: our
-        # _collapse_unsupported decides every removal and broadcasts each fallen
-        # block, so the client world is a pure mirror of ours.
-        #
-        # chunk_check=1 (the old value) ran a SECOND, DIFFERENT collapse engine
-        # on the client, and the two never agreed — verified against the client's
-        # BFS (vxl.pyd sub_10036470): it has NO block-count cap (only a ~10M op
-        # budget) where we bailed at 512 cells, it grounds on z>238 where we used
-        # z>=238, and it walks ~18-connectivity where we walk 6 faces. Net effect
-        # the user reported: a building collapses client-side while the server
-        # keeps every block -> invisible collision you cannot walk through.
-        # Cost of chunk_check=0: we lose the client's falling-block animation.
-        packet.chunk_check = 0
+        # Checked removal makes the stock client run its native 18-neighbor
+        # collapse and falling-block animation. The server mirrors the exact
+        # same topology/work-budget rules in find_unsupported_chunks, so both
+        # authorities remove the same component without per-fallen-cell floods.
+        packet.chunk_check = 1
         packet.seed = int(seed) & 0xFF
         # causer_id is an ENTITY id the client reads UNSIGNED (measured: -1
         # decodes to 65535 -> entities[65535] lookup aborts the whole damage
@@ -513,21 +587,13 @@ class CombatSystem:
         The classic AoS behavior — without it a streetlamp whose base is dug
         out levitates forever."""
         wm = self.server.world_manager
-        frontier = list(removed_positions)
-        guard = 0
-        while frontier and guard < 8:
-            guard += 1
-            chunks = wm.find_unsupported_chunks(frontier)
-            if not chunks:
-                return
-            frontier = []
-            for chunk in chunks:
-                fell = wm.destroy_blocks(chunk)
-                for pos in fell:
-                    self._broadcast_block_damage(
-                        player, pos, self._BLOCK_KILL_DAMAGE
-                    )
-                frontier.extend(fell)
+        chunks = wm.find_unsupported_chunks(list(removed_positions))
+        for chunk in chunks:
+            # The triggering Damage(chunk_check=1) makes every client remove
+            # and animate this whole component natively. Mirror it server-side
+            # only; broadcasting one reliable Damage per falling voxel causes
+            # effect noise, channel floods, and duplicate collapse work.
+            wm.destroy_blocks(chunk)
 
     def _broadcast_block_mutation(self, player, position, block_type: int):
         """BUILD announcements only — BlockBuild(32) is add-only on the wire;
@@ -559,6 +625,7 @@ class CombatSystem:
         sanitized.ori_x, sanitized.ori_y, sanitized.ori_z = packet.ori_x, packet.ori_y, packet.ori_z
         sanitized.damage = int(round(profile.base_damage))
         sanitized.penetration = 0
+        sanitized.affect_shooter = getattr(packet, "affect_shooter", 0)
         sanitized.secondary = getattr(packet, "secondary", 0)
         sanitized.seed = getattr(packet, "seed", 0)
         return sanitized
@@ -647,55 +714,79 @@ class CombatSystem:
         return closest_target, closest_headshot, closest_distance, closest_position
 
     def _ray_hits_target(self, origin, direction, max_distance: float, target):
-        """Ray vs the target's REAL body box.
+        """Match stock hitscan_player against oriented KV6 model bounds."""
+        profile = _CLASS_HITBOXES.get(target.class_id, _CLASS_HITBOXES[C.CLASS_SOLDIER])
+        if target.input.crouch:
+            parts = (
+                (C.PART_TORSO, _CROUCH_TORSO, (0.0, 0.0, 0.3)),
+                (C.PART_HEAD, profile[C.PART_HEAD], (0.0, 0.0, 0.3)),
+                (C.PART_ARMS, profile[C.PART_ARMS], (0.0, 0.0, C.BODY_PART_ARMS_CROUCH_Z)),
+                (C.PART_LEFT_LEG, _CROUCH_LEG, (0.25, C.BODY_PART_LEG_CROUCH_Y, 0.7)),
+                (C.PART_RIGHT_LEG, _CROUCH_LEG, (-0.25, C.BODY_PART_LEG_CROUCH_Y, 0.7)),
+            )
+        else:
+            parts = (
+                (C.PART_TORSO, profile[C.PART_TORSO], (0.0, 0.0, 0.3)),
+                (C.PART_HEAD, profile[C.PART_HEAD], (0.0, 0.0, 0.3)),
+                (C.PART_ARMS, profile[C.PART_ARMS], (0.0, 0.0, 0.5)),
+                (C.PART_LEFT_LEG, profile[C.PART_LEFT_LEG], (0.25, 0.0, 1.1)),
+                (C.PART_RIGHT_LEG, profile[C.PART_RIGHT_LEG], (-0.25, 0.0, 1.1)),
+            )
 
-        `position` is the HEAD/EYE (z grows DOWNWARD), so the body hangs below
-        it: the head cap sits at `z - PLAYER_WIDTH_HALF` and the feet at
-        `z + contact_offset` (2.25 standing / 1.35 crouched — the same values
-        the physics engine uses, read straight off the player so the two can
-        never drift). Horizontally the collision volume is a SQUARE AABB of
-        ±0.45, not a cylinder.
-
-        The old box was `[z-0.1, z+1.0]` with a cylinder: it ended at the WAIST,
-        so the legs — over half a standing player — had no hitbox at all, the
-        top of the head was 0.35 short, and diagonal corners were rejected.
-        """
-        half = PLAYER_WIDTH_HALF
-        contact = target._current_contact_offset()
-        top_z = target.z - half              # head cap
-        bottom_z = target.z + contact        # feet
-        head_bottom = target.z + half        # head band = one radius around the eye
-
-        steps = max(1, int(max_distance / RAYCAST_STEP))
-        for index in range(steps + 1):
-            distance = index * RAYCAST_STEP
-            px = origin[0] + direction[0] * distance
-            py = origin[1] + direction[1] * distance
-            pz = origin[2] + direction[2] * distance
-
-            if abs(px - target.x) > half or abs(py - target.y) > half:
-                continue
-            if pz < top_z or pz > bottom_z:
-                continue
-
-            return distance, (px, py, pz), pz <= head_bottom
+        for part_id, model_bounds, model_offset in parts:
+            hit = self._ray_hits_model_bounds(
+                origin, direction, max_distance, target, model_offset, model_bounds)
+            if hit is not None:
+                distance, position = hit
+                return distance, position, part_id == C.PART_HEAD
         return None
 
-    def _spread_direction(self, attacker, spread: float, rng: random.Random):
-        if spread <= 0.0:
-            return attacker.orientation
-
-        side_amount = rng.uniform(-spread, spread)
-        head_amount = rng.uniform(-spread, spread)
-        direction = (
-            attacker.o_x + attacker.side_x * side_amount + attacker.head_x * head_amount,
-            attacker.o_y + attacker.side_y * side_amount + attacker.head_y * head_amount,
-            attacker.o_z + attacker.side_z * side_amount + attacker.head_z * head_amount,
+    def _ray_hits_model_bounds(
+        self, origin, direction, max_distance, target, model_offset, model_bounds
+    ):
+        """Ray/slab intersection using the stock hitscan_model transform."""
+        yaw = math.atan2(target.orientation[0], target.orientation[1])
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        model_x, model_y, model_z = model_offset
+        model_position = (
+            target.x - model_x * cosine + model_y * sine,
+            target.y + model_x * sine - model_y * cosine,
+            target.z + model_z,
         )
-        normalized = self._normalize(direction)
-        if normalized is None:
-            return attacker.orientation
-        return normalized
+        axes = (
+            (-cosine * HITBOX_SCALE, sine * HITBOX_SCALE, 0.0),
+            (sine * HITBOX_SCALE, cosine * HITBOX_SCALE, 0.0),
+            (0.0, 0.0, HITBOX_SCALE),
+        )
+        sizes, pivots = model_bounds
+        enter = 0.0
+        leave = max_distance
+        relative = (
+            origin[0] - model_position[0],
+            origin[1] - model_position[1],
+            origin[2] - model_position[2],
+        )
+
+        for axis, size, pivot in zip(axes, sizes, pivots):
+            axis_length_sq = sum(component * component for component in axis)
+            coordinate = sum(relative[i] * axis[i] for i in range(3)) / axis_length_sq + pivot
+            rate = sum(direction[i] * axis[i] for i in range(3)) / axis_length_sq
+            if abs(rate) < 1e-9:
+                if coordinate < 0.0 or coordinate > size:
+                    return None
+                continue
+            first = -coordinate / rate
+            second = (size - coordinate) / rate
+            if first > second:
+                first, second = second, first
+            enter = max(enter, first)
+            leave = min(leave, second)
+            if enter > leave:
+                return None
+
+        position = tuple(origin[i] + direction[i] * enter for i in range(3))
+        return enter, position
 
     def _calculate_damage(self, attacker, profile, headshot: bool) -> int:
         damage = profile.base_damage * attacker.movement_profile.damage_multiplier

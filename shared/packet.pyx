@@ -1902,7 +1902,9 @@ cdef class ShootPacket(Loader): # Fixed
         
         self.damage = reader.read_short()
         self.penetration = reader.read_short()
-        self.secondary = reader.read_byte()
+        flags = reader.read_byte()
+        self.affect_shooter = flags & 0x01
+        self.secondary = (flags >> 1) & 0x01
         self.seed = reader.read_byte()
 
 
@@ -3351,9 +3353,9 @@ cdef class WorldUpdate(Loader): # Fixed
             inp = reader.read_byte()
             # Action (byte)
             action = reader.read_byte()
-            # Tool bytes
-            tool1 = reader.read_byte()
-            tool2 = reader.read_byte()
+            # Post-action state flags followed by the equipped tool id.
+            state_flags = reader.read_byte()
+            tool = reader.read_byte()
             # Pickup id (SIGNED byte): the id of the pickup this player is
             # carrying, or -1 (0xFF) for "no pickup". The client reads this
             # straight into player.pickup_id and the minimap does
@@ -3369,7 +3371,7 @@ cdef class WorldUpdate(Loader): # Fixed
             # Final byte
             final = reader.read_byte()
             
-            self.player_updates[pid] = (pos, orient, vel, ping, pong, hp, inp, action, tool1)
+            self.player_updates[pid] = (pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool)
         
         # Entity updates
         cdef int entity_count = reader.read_short()
@@ -3400,8 +3402,8 @@ cdef class WorldUpdate(Loader): # Fixed
         writer.write_short(len(self.player_updates))
         
         for pid, data in self.player_updates.items():
-            # data: (pos, orient, vel, ping, pong, hp, inp, action, tool)
-            pos, orient, vel, ping, pong, hp, inp, action, tool = data
+            # data: (pos, orient, vel, ping, pong, hp, inp, action, state, tool)
+            pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool = data
             
             writer.write_byte(pid)
             
@@ -3433,10 +3435,11 @@ cdef class WorldUpdate(Loader): # Fixed
             # wrote the raw tool id here, so switching weapons set these bits
             # as a side effect of the id's binary value (tool 1 -> parachute,
             # 2 -> disguise, 8 -> goo) — the reported "weapon switch changes
-            # water/fire/parachute state" bug. Write 0 (no active state); real
-            # parachute/disguise/goo packing is a future enhancement.
-            writer.write_byte(0)
-            writer.write_byte(0)
+            # water/fire/parachute state" bug. Snapshot packing keeps these
+            # state flags independent from the equipped tool.
+            writer.write_byte(state_flags)
+            # Second post-action byte is consumed by remote set_tool(tool, True).
+            writer.write_byte(tool)
 
             # Pickup id: 0xFF (-1) = "no pickup". Sending 0 (or any id not in
             # the client's PICKUPS table) crashes the minimap. See read().
