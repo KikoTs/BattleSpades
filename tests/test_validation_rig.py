@@ -1,5 +1,7 @@
+import json
 from pathlib import Path
 
+from scripts.parity_artifact import ParityArtifact
 from scripts.parity_clients import build_client_specs
 from scripts.run_validation_server import parse_args
 from server.config import ServerConfig
@@ -51,3 +53,20 @@ def test_two_client_specs_use_unique_tracer_ports():
     assert [spec.tracer_port for spec in specs] == [32895, 32898]
     assert all(spec.connect_target == "127.0.0.1:27016" for spec in specs)
     assert len({spec.capture_dir for spec in specs}) == 2
+
+
+def test_parity_artifact_preserves_correlated_snapshots(tmp_path):
+    artifact = ParityArtifact("movement_walk")
+    artifact.record(
+        "walk_start",
+        server={"loop": 10},
+        client_a={"loop": 12},
+        client_b={"tool": 7},
+    )
+
+    path = artifact.write(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    assert data["scenario"] == "movement_walk"
+    assert data["samples"][0]["marker"] == "walk_start"
+    assert data["samples"][0]["server"]["loop"] == 10
