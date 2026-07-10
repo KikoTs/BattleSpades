@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from scripts.run_validation_server import parse_args
 from server.config import ServerConfig
 from server.validation import build_validation_config
 
@@ -29,3 +32,12 @@ def test_validation_config_refuses_public_port():
 
     with pytest.raises(ValueError, match="public server port"):
         build_validation_config(ServerConfig(port=27015), port=27015)
+
+
+def test_validation_launcher_defaults_are_isolated():
+    args = parse_args([])
+
+    assert args.port == 27016
+    assert args.map_name == "ArcticBase"
+    assert args.mode == "tdm"
+    assert args.config == Path("config.toml")
