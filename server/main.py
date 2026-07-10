@@ -91,6 +91,8 @@ class BattleSpadesServer:
         # dict: {x,y,z, vx,vy,vz, explode_at, thrower_id}.
         from server.projectiles import ProjectileEngine
         self.projectile_engine = ProjectileEngine()
+        from server.rocket_turret import RocketTurretController
+        self.rocket_turret_controller = RocketTurretController(self)
         from server.voting import VoteManager
         self.vote_manager = VoteManager(self)
         # In-game packets received since the last simulation tick; drained
@@ -322,10 +324,12 @@ class BattleSpadesServer:
         force_destroy = ex.spec.behavior != "contact"
         self._apply_blast(gx, gy, gz, ex.damage, ex.block_damage,
                           ex.spec.kill_type, thrower, crater_radius=1,
-                          force_destroy=force_destroy)
+                          force_destroy=force_destroy,
+                          blast_radius=float(getattr(ex.spec, "blast_radius", 16.0)))
 
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
-                     crater_radius: int = 1, force_destroy: bool = True) -> None:
+                     crater_radius: int = 1, force_destroy: bool = True,
+                     blast_radius: float = 16.0) -> None:
         """Shared explosion: crater a cube of `crater_radius` and damage nearby
         players with the live-verified falloff. Used by projectiles AND
         deployables (dynamite/landmine/C4)."""
@@ -361,7 +365,7 @@ class BattleSpadesServer:
             dy = target.y - gy
             dz = target.z - gz
             sq = dx * dx + dy * dy + dz * dz
-            if sq >= 256.0:  # 16 blocks
+            if sq >= float(blast_radius) ** 2:
                 continue
             if self._blocked_los(gx, gy, gz, target.x, target.y, target.z):
                 continue
@@ -462,6 +466,39 @@ class BattleSpadesServer:
         pkt = CreateEntity()
         pkt.set_entity(map_entity.to_wire_entity())
         self.broadcast(bytes(pkt.generate()), reliable=True)
+
+    def spawn_projectile_entity(self, projectile, owner, pos, vel) -> None:
+        """Create the visible client entity for a server-owned projectile."""
+        if projectile is None or not projectile.spec.entity_type:
+            return
+        from server.connection import internal_team_to_wire
+        team = getattr(owner, "team", TEAM1)
+        player_id = getattr(owner, "id", 0)
+        ent = self.entity_registry.place(
+            int(projectile.spec.entity_type),
+            float(pos[0]), float(pos[1]), float(pos[2]),
+            state=internal_team_to_wire(team), kind="projectile",
+            player_id=player_id,
+            vel=(float(vel[0]), float(vel[1]), float(vel[2])),
+            radius=0.02,
+        )
+        projectile.entity_id = ent.entity_id
+        self.broadcast_create_entity(ent)
+
+    def broadcast_turret_properties(self, turret) -> None:
+        """Update the stock client's turret lock target and ammo display."""
+        from shared.packet import ChangeEntity
+        target = ChangeEntity()
+        target.entity_id = int(turret.entity_id)
+        target.action = 5  # SET_TARGET
+        target.target_id = -1 if turret.target_id is None else int(turret.target_id)
+        self.broadcast(bytes(target.generate()), reliable=True)
+
+        ammo = ChangeEntity()
+        ammo.entity_id = int(turret.entity_id)
+        ammo.action = 7  # SET_AMMO
+        ammo.ammo = float(turret.ammo)
+        self.broadcast(bytes(ammo.generate()), reliable=True)
 
     def broadcast_destroy_entity(self, entity_id: int) -> None:
         from shared.packet import DestroyEntity
@@ -742,6 +779,10 @@ class BattleSpadesServer:
                 # tickable entities (deployables, capture points, ...).
                 self.entity_registry.tick(self._build_entity_ctx())
 
+                self.rocket_turret_controller.update(
+                    self.tick_interval, time.monotonic()
+                )
+
                 # In-flight grenade fuses / detonation.
                 self._update_grenades(self.tick_interval)
 
@@ -924,7 +965,9 @@ class BattleSpadesServer:
             world_update[pid] = player.world_update_snapshot()
 
         world_update.updated_entities = list(self.entities.values())
-        world_update.rocket_turrets = list(self.rocket_turrets.values())
+        world_update.rocket_turrets = [
+            turret.world_update() for turret in self.rocket_turrets.values()
+        ]
         return world_update
 
     def build_world_update_data(

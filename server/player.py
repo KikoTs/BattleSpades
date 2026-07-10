@@ -231,6 +231,9 @@ class Player:
 
         self.ammo_clip: int = 10
         self.ammo_reserve: int = 50
+        self.rocket_turret_stock: int = int(
+            getattr(C, "ROCKET_TURRET_INITIAL_STOCK", 2)
+        )
         self.last_shot_time: float = 0.0
         self.next_shot_time: float = 0.0
         self.reload_end_time: float = 0.0
@@ -250,6 +253,8 @@ class Player:
         self.jetpack_active: bool = False
         self._hover_since: float = 0.0
         self._last_damage_at: float = 0.0
+        self.parachute_id: int = 0
+        self.parachute_active: bool = False
         self.disguised: bool = False        # specialist disguise toggle
         # Client-chosen loadout + prefab selection (SetClassLoadout / join).
         self.loadout: list = []
@@ -468,6 +473,8 @@ class Player:
         try:
             world_object.jetpack = bool(self.jetpack_id in _JETPACK_PROPERTIES)
             world_object.jetpack_active = bool(self.jetpack_active)
+            world_object.parachute = int(self.parachute_id or 0)
+            world_object.parachute_active = bool(self.parachute_active)
         except Exception:
             pass
         collisions = self._build_player_collision_positions()
@@ -702,6 +709,9 @@ class Player:
         self.blocks = self.movement_profile.starting_blocks
         self.grenades = MAX_GRENADES
         self._reset_ammo()
+        self.rocket_turret_stock = int(
+            getattr(C, "ROCKET_TURRET_INITIAL_STOCK", 2)
+        )
         # Jetpack: the client's chosen loadout may carry a jetpack id (66-69)
         # in the equipment slot; otherwise fall back to the class default.
         jetpack = 0
@@ -719,6 +729,12 @@ class Player:
         self.jetpack_fuel = 100.0
         self.jetpack_active = False
         self._hover_since = 0.0
+        self.parachute_id = (
+            int(C.A370)
+            if int(C.A370) in [int(item) for item in (getattr(self, "loadout", None) or [])]
+            else 0
+        )
+        self.parachute_active = False
         self.last_reported_position = (x, y, z)
         self.last_position_drift = 0.0
         self.last_position_drift_vector = (0.0, 0.0, 0.0)
@@ -1004,6 +1020,11 @@ class Player:
         if not self.alive:
             return
         self._reset_ammo()
+        self.rocket_turret_stock = min(
+            int(getattr(C, "ROCKET_TURRET_STOCK", 4)),
+            int(getattr(self, "rocket_turret_stock", 0))
+            + int(getattr(C, "ROCKET_TURRET_RESTOCK_AMOUNT", 2)),
+        )
         if self.connection:
             from shared.packet import Restock
             pkt = Restock()
@@ -1095,6 +1116,7 @@ class Player:
         )
         pre_position = self.last_native_pre_update.get("position", (self.x, self.y, self.z))
         self._update_jetpack(dt)
+        self._update_parachute()
         self._apply_input_state_to_world(trigger_jump=trigger_jump)
         result = world_object.update(dt, positions)
         self.last_native_result = int(result or 0)
@@ -1110,14 +1132,13 @@ class Player:
         )
 
     def _update_jetpack(self, dt: float) -> None:
-        """Advance the jetpack fuel model one tick (constants from the client's
-        JETPACK_PROPERTIES table, extracted 2026-07-07):
-          - Z held (hover input): after START_DELAY, activate — pay the
-            one-time ACTIVATION_COST, then drain FLYING_CONSUMPTION/s.
-          - Fuel empty or Z released: thrust off.
-          - Idle: regen REFILL_RATE/s, paused REFILL_DELAY_DUE_DAMAGE after
-            taking damage.
-        The active flag feeds the mover's 0.05x-gravity branch."""
+        """Advance the stock jetpack fuel model one simulation tick.
+
+        Packs 66/67/68 use jump for thrust; only UGC Builder pack 69 uses the
+        toggle-hover input. After the per-pack start delay, activation pays its
+        one-time cost and then drains fuel until release or exhaustion. Idle
+        fuel regenerates after the post-damage refill delay.
+        """
         props = _JETPACK_PROPERTIES.get(self.jetpack_id)
         if props is None:
             self.jetpack_active = False
@@ -1129,7 +1150,16 @@ class Player:
         drain = float(props.get(4, 75))
         refill_delay = float(props.get(6, 2.0))
 
-        if self.input.hover:
+        # Stock input split recovered from GameScene/Character: the normal,
+        # Rocketeer, and Engineer packs thrust from jump. Only the UGC Builder
+        # pack (69) accepts the toggle-hover/Z bit.
+        activation_held = (
+            self.input.hover
+            if self.jetpack_id == int(C.JETPACK_UGCBUILDER)
+            else self.input.jump
+        )
+
+        if activation_held:
             # dt-accumulated hold time (deterministic at the sim rate).
             self._hover_since += dt
             if not self.jetpack_active:
@@ -1148,6 +1178,21 @@ class Player:
         if not self.jetpack_active and self.jetpack_fuel < max_fuel:
             if (time.time() - self._last_damage_at) >= refill_delay:
                 self.jetpack_fuel = min(max_fuel, self.jetpack_fuel + refill_rate * dt)
+
+    def _update_parachute(self) -> None:
+        """Open the selected Commando parachute only during a live descent.
+
+        The stock client does not locally toggle this state; it consumes the
+        server's WorldUpdate state bit.  Airborne + positive AoS Z velocity
+        distinguishes descent from the upward half of a jump.
+        """
+        self.parachute_active = bool(
+            self.alive
+            and self.parachute_id == int(C.A370)
+            and self.airborne
+            and self.vz > 0.0
+            and not self.wade
+        )
 
     def update_input(
         self,
@@ -1464,7 +1509,8 @@ class Player:
         return byte
 
     def world_update_snapshot(self) -> Tuple[Tuple[float, float, float], ...]:
-        # (pos, orient, vel, ping, pong, hp, inp, action, state, tool)
+        # (pos, orient, vel, ping, pong, hp, inp, action, state, tool,
+        #  jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw)
         # `pong` carries wu_ack_loop — the client input loop_count this row's
         # position corresponds to. It is what the client pairs against its own
         # movement_history to decide NO-OP / ADJUST / SNAP.
@@ -1479,6 +1525,9 @@ class Player:
             self.pack_action_flags(),
             self.pack_state_flags(),
             self.tool,
+            self.jetpack_fuel,
+            0.0,
+            0.0,
         )
 
     def send(self, data: bytes, reliable: bool = True):

@@ -223,6 +223,59 @@ def test_spawn_uses_cached_loadout_and_sends_hp():
     assert (set_hp.source_x, set_hp.source_y, set_hp.source_z) == (0.0, 0.0, 0.0)
 
 
+def test_engineer_spawn_falls_back_to_a_complete_default_jetpack_loadout():
+    """A missing/reordered SetClassLoadout must not create a split brain where
+    the server equips Engineer jetpack 68 but the client's CreatePlayer carries
+    an empty loadout and therefore renders NO_JETPACK (65)."""
+    server = DummyServer()
+    connection = make_connection(server)
+    sent_packets = []
+    connection.send = lambda data, reliable=True, prefix=0x30: sent_packets.append(data)
+    connection.pending_class_id = int(C.CLASS_ENGINEER)
+    connection.pending_loadout = []
+
+    join_packet = NewPlayerConnection()
+    join_packet.team = TEAM1
+    join_packet.class_id = int(C.CLASS_ENGINEER)
+    join_packet.forced_team = 0
+    join_packet.local_language = 0
+    join_packet.name = "Engineer"
+
+    asyncio.run(connection._on_new_player(join_packet))
+
+    own_create = CreatePlayer(ByteReader(sent_packets[0][1:]))
+    assert int(C.JETPACK_ENGINEER) in own_create.loadout
+    assert own_create.loadout == connection.player.loadout
+    assert connection.player.jetpack_id == int(C.JETPACK_ENGINEER)
+
+
+def test_engineer_spawn_completes_partial_client_loadout_with_jetpack():
+    """The normal class-selection packet can contain tools but omit jetpack 68.
+
+    Complete it before CreatePlayer so the native player initializes the
+    Engineer jetpack model and ability from an explicit loadout item.
+    """
+    server = DummyServer()
+    connection = make_connection(server)
+    sent_packets = []
+    connection.send = lambda data, reliable=True, prefix=0x30: sent_packets.append(data)
+    connection.pending_class_id = int(C.CLASS_ENGINEER)
+    connection.pending_loadout = [int(C.SMG_TOOL), int(C.ROCKET_TURRET_TOOL)]
+
+    join_packet = NewPlayerConnection()
+    join_packet.team = TEAM1
+    join_packet.class_id = int(C.CLASS_ENGINEER)
+    join_packet.forced_team = 0
+    join_packet.local_language = 0
+    join_packet.name = "Engineer"
+
+    asyncio.run(connection._on_new_player(join_packet))
+
+    own_create = CreatePlayer(ByteReader(sent_packets[0][1:]))
+    assert int(C.JETPACK_ENGINEER) in own_create.loadout
+    assert own_create.loadout == connection.player.loadout
+
+
 def test_roster_announced_as_create_player_with_wire_team_ids():
     """The roster is sent as CreatePlayer, NOT ExistingPlayer: the stock
     client stores ExistingPlayer.pickup verbatim as pickup_id (no sentinel

@@ -3365,13 +3365,17 @@ cdef class WorldUpdate(Loader): # Fixed
             # the correct "not carrying" sentinel. (Verified live on the
             # stock Steam client, 2026-07-06.)
             pickup = reader.read_byte()
-            pad1_hi = reader.read_byte()
-            pad2 = reader.read_short()
-            pad3 = reader.read_short()
-            # Final byte
-            final = reader.read_byte()
+            # Three fixed-point player resources. gameScene consumes the
+            # first as character.jetpack_fuel (player tuple element 26).
+            jetpack_fuel = fromfixed(reader.read_short())
+            spawn_protection_timer = fromfixed(reader.read_short())
+            weapon_deployment_yaw = fromfixed(reader.read_short())
             
-            self.player_updates[pid] = (pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool)
+            self.player_updates[pid] = (
+                pos, orient, vel, ping, pong, hp, inp, action,
+                state_flags, tool, jetpack_fuel, spawn_protection_timer,
+                weapon_deployment_yaw,
+            )
         
         # Entity updates
         cdef int entity_count = reader.read_short()
@@ -3387,9 +3391,8 @@ cdef class WorldUpdate(Loader): # Fixed
         for i in range(turret_count):
             turret_data = (
                 reader.read_short(),  # entity_id
-                fromfixed(reader.read_short()),  # x
-                fromfixed(reader.read_short()),  # y
-                fromfixed(reader.read_short()),  # z
+                fromfixed(reader.read_short()),  # yaw
+                fromfixed(reader.read_short()),  # pitch
             )
             self.rocket_turrets.append(turret_data)
 
@@ -3402,8 +3405,13 @@ cdef class WorldUpdate(Loader): # Fixed
         writer.write_short(len(self.player_updates))
         
         for pid, data in self.player_updates.items():
-            # data: (pos, orient, vel, ping, pong, hp, inp, action, state, tool)
-            pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool = data
+            # data: (..., state, tool, jetpack_fuel,
+            #        spawn_protection_timer, weapon_deployment_yaw)
+            pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool = data[:10]
+            if len(data) >= 13:
+                jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw = data[10:13]
+            else:
+                jetpack_fuel = spawn_protection_timer = weapon_deployment_yaw = 0.0
             
             writer.write_byte(pid)
             
@@ -3444,14 +3452,9 @@ cdef class WorldUpdate(Loader): # Fixed
             # Pickup id: 0xFF (-1) = "no pickup". Sending 0 (or any id not in
             # the client's PICKUPS table) crashes the minimap. See read().
             writer.write_byte(0xFF)
-            writer.write_byte(0)
-
-            # Padding shorts
-            writer.write_short(0)
-            writer.write_short(0)
-
-            # Final Byte
-            writer.write_byte(0)
+            writer.write_short(tofixed(jetpack_fuel))
+            writer.write_short(tofixed(spawn_protection_timer))
+            writer.write_short(tofixed(weapon_deployment_yaw))
             
         # Entity Count (Short / 2 bytes)
         writer.write_short(len(self.updated_entities))
@@ -3464,7 +3467,6 @@ cdef class WorldUpdate(Loader): # Fixed
             writer.write_short(turret[0])
             writer.write_short(tofixed(turret[1]))
             writer.write_short(tofixed(turret[2]))
-            writer.write_short(tofixed(turret[3]))
 
 
 cdef class ServerBlockItem: # Fixed
@@ -3689,118 +3691,88 @@ cdef class ChangeEntity(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int entity_id
-        int change_flags
-        # Optional fields (set based on change_flags)
+        int action
         float pos_x, pos_y, pos_z
         float vel_x, vel_y, vel_z
-        float yaw, radius, fuse
-        int type, player_id, state, face, ugc_mode
-        tuple color
-        list float_properties, int_properties
+        float forward_x, forward_y, forward_z
+        float fuse, ammo
+        int player_id, state, target_id
 
     def __init__(self, ByteReader reader=None):
         self.entity_id = 0
-        self.change_flags = 0
+        self.action = 0
         self.pos_x = 0.0
         self.pos_y = 0.0
         self.pos_z = 0.0
         self.vel_x = 0.0
         self.vel_y = 0.0
         self.vel_z = 0.0
-        self.yaw = 0.0
-        self.radius = 0.0
+        self.forward_x = 0.0
+        self.forward_y = 0.0
+        self.forward_z = 0.0
         self.fuse = 0.0
-        self.type = 0
+        self.ammo = 0.0
         self.player_id = 0
         self.state = 0
-        self.face = 0
-        self.ugc_mode = 0
-        self.color = None
-        self.float_properties = []
-        self.int_properties = []
+        self.target_id = -1
         if reader is not None:
             self.read(reader)
 
     cpdef read(self, ByteReader reader):
         self.entity_id = reader.read_short()
-        self.change_flags = reader.read_short()
-        
-        if self.change_flags & 0x0001:  # position
+        self.action = reader.read_byte()
+
+        if self.action == 0:  # SET_STATE
+            self.state = reader.read_byte()
+        elif self.action == 1:  # SET_POSITION
             self.pos_x = fromfixed(reader.read_short())
             self.pos_y = fromfixed(reader.read_short())
             self.pos_z = fromfixed(reader.read_short())
-        if self.change_flags & 0x0002:  # velocity
+        elif self.action == 2:  # SET_VELOCITY
             self.vel_x = fromfixed(reader.read_short())
             self.vel_y = fromfixed(reader.read_short())
             self.vel_z = fromfixed(reader.read_short())
-        if self.change_flags & 0x0004:  # yaw
-            self.yaw = fromfixed(reader.read_short())
-        if self.change_flags & 0x0008:  # radius
-            self.radius = fromfixed(reader.read_short())
-        if self.change_flags & 0x0010:  # fuse
-            self.fuse = fromfixed(reader.read_short())
-        if self.change_flags & 0x0020:  # color
-            self.color = read_color(reader, True)
-        if self.change_flags & 0x0040:  # type
-            self.type = reader.read_byte()
-        if self.change_flags & 0x0080:  # player_id
+        elif self.action == 3:  # SET_PLAYER
             self.player_id = reader.read_byte()
-        if self.change_flags & 0x0100:  # state
-            self.state = reader.read_byte()
-        if self.change_flags & 0x0200:  # face
-            self.face = reader.read_byte()
-        if self.change_flags & 0x0400:  # ugc_mode
-            self.ugc_mode = reader.read_byte()
-        if self.change_flags & 0x0800:  # int_properties
-            count = reader.read_byte()
-            self.int_properties = []
-            for i in range(count):
-                self.int_properties.append(reader.read_int())
-        if self.change_flags & 0x1000:  # float_properties
-            count = reader.read_byte()
-            self.float_properties = []
-            for i in range(count):
-                self.float_properties.append(fromfixed(reader.read_short()))
+        elif self.action == 4:  # SET_FORWARD_VECTOR
+            self.forward_x = fromfixed(reader.read_short())
+            self.forward_y = fromfixed(reader.read_short())
+            self.forward_z = fromfixed(reader.read_short())
+        elif self.action == 5:  # SET_TARGET (signed byte, -1=None)
+            target = reader.read_byte()
+            self.target_id = target if target < 128 else target - 256
+        elif self.action == 6:  # SET_FUSE
+            self.fuse = fromfixed(reader.read_short())
+        elif self.action == 7:  # SET_AMMO
+            self.ammo = fromfixed(reader.read_short())
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_short(self.entity_id)
-        writer.write_short(self.change_flags)
-        
-        if self.change_flags & 0x0001:
+        writer.write_byte(self.action)
+
+        if self.action == 0:
+            writer.write_byte(self.state)
+        elif self.action == 1:
             writer.write_short(tofixed(self.pos_x))
             writer.write_short(tofixed(self.pos_y))
             writer.write_short(tofixed(self.pos_z))
-        if self.change_flags & 0x0002:
+        elif self.action == 2:
             writer.write_short(tofixed(self.vel_x))
             writer.write_short(tofixed(self.vel_y))
             writer.write_short(tofixed(self.vel_z))
-        if self.change_flags & 0x0004:
-            writer.write_short(tofixed(self.yaw))
-        if self.change_flags & 0x0008:
-            writer.write_short(tofixed(self.radius))
-        if self.change_flags & 0x0010:
-            writer.write_short(tofixed(self.fuse))
-        if self.change_flags & 0x0020:
-            write_color(writer, self.color)
-        if self.change_flags & 0x0040:
-            writer.write_byte(self.type)
-        if self.change_flags & 0x0080:
+        elif self.action == 3:
             writer.write_byte(self.player_id)
-        if self.change_flags & 0x0100:
-            writer.write_byte(self.state)
-        if self.change_flags & 0x0200:
-            writer.write_byte(self.face)
-        if self.change_flags & 0x0400:
-            writer.write_byte(self.ugc_mode)
-        if self.change_flags & 0x0800:
-            writer.write_byte(len(self.int_properties))
-            for prop in self.int_properties:
-                writer.write_int(prop)
-        if self.change_flags & 0x1000:
-            writer.write_byte(len(self.float_properties))
-            for prop in self.float_properties:
-                writer.write_short(tofixed(prop))
+        elif self.action == 4:
+            writer.write_short(tofixed(self.forward_x))
+            writer.write_short(tofixed(self.forward_y))
+            writer.write_short(tofixed(self.forward_z))
+        elif self.action == 5:
+            writer.write_byte(self.target_id & 0xFF)
+        elif self.action == 6:
+            writer.write_short(tofixed(self.fuse))
+        elif self.action == 7:
+            writer.write_short(tofixed(self.ammo))
 
 
 cdef class Entity(Loader): # Fixed

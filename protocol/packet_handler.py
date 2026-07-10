@@ -421,7 +421,7 @@ async def handle_place_medpack(server, player, packet):
     logger.info("MEDPACK placed by %s at (%.1f,%.1f,%.1f)", player.name, x, y, z)
 
 
-def _deploy_pos(player, packet):
+def _deploy_pos(player, packet, max_distance: float = 15.0):
     """Common Place* validation: parse block coords, reject NaN/far placements
     (the client already range-checks; this guards against a bad/hostile
     packet). Returns (x, y, z) or None."""
@@ -432,7 +432,7 @@ def _deploy_pos(player, packet):
     if any(v != v or abs(v) > 1e6 for v in (x, y, z)):
         return None
     dx, dy, dz = x - player.x, y - player.y, z - player.z
-    if dx * dx + dy * dy + dz * dz > 225.0:   # 15 blocks
+    if dx * dx + dy * dy + dz * dz > float(max_distance) ** 2:
         return None
     return (x, y, z)
 
@@ -482,6 +482,34 @@ async def handle_place_landmine(server, player, packet):
         player_id=player.id, behavior=behavior)
     server.broadcast_create_entity(ent)
     logger.info("LANDMINE placed by %s at %s", player.name, pos)
+
+
+@register_handler(88)  # PlaceRocketTurret
+async def handle_place_rocket_turret(server, player, packet):
+    """Place a server-owned Engineer/Rocketeer rocket turret."""
+    if not player.alive or not player.spawned:
+        return
+    import shared.constants as C
+    if int(getattr(player, "tool", -1)) != int(C.ROCKET_TURRET_TOOL):
+        return
+    if int(getattr(player, "class_id", -1)) not in (
+        int(C.CLASS_ENGINEER), int(C.CLASS_ROCKETEER)
+    ):
+        return
+    if int(C.ROCKET_TURRET_TOOL) not in list(getattr(player, "loadout", []) or []):
+        return
+    pos = _deploy_pos(
+        player, packet,
+        max_distance=float(getattr(C, "ROCKET_TURRET_FAR_RADIUS", 10.0)),
+    )
+    if pos is None:
+        return
+    turret = server.rocket_turret_controller.place(
+        player, pos, float(getattr(packet, "yaw", 0.0)), now=time.monotonic()
+    )
+    if turret is not None:
+        logger.info("ROCKET TURRET id=%d placed by %s at %s",
+                    turret.entity_id, player.name, pos)
 
 
 @register_handler(95)  # DisguisePacket
