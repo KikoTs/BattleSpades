@@ -150,10 +150,9 @@ def test_world_update_serializes_reference_layout():
     # Pickup id byte: 0xFF (-1) = "no pickup". Sending 0 crashes the client
     # minimap (PICKUPS[0] KeyError) — measured on the stock Steam client.
     assert reader.read_byte() == 0xFF
-    assert reader.read_byte() == 0
     assert reader.read_short() == 0
     assert reader.read_short() == 0
-    assert reader.read_byte() == 0
+    assert reader.read_short() == 0
     assert reader.read_short() == 0
     assert reader.read_short() == 0
 
@@ -172,11 +171,16 @@ def test_world_update_read_parses_player_updates_and_counts():
         0x02,
         0x08,
         C.RIFLE_TOOL,
+        73.5,
+        0.0,
+        0.0,
     )
 
     parsed = WorldUpdate(ByteReader(bytes(packet.generate())[1:]))
     update = parsed.player_updates[1]
-    position, orientation, velocity, movement, ping, health, input_flags, action_flags, state_flags, tool = update
+    (position, orientation, velocity, movement, ping, health, input_flags,
+     action_flags, state_flags, tool, jetpack_fuel, spawn_protection_timer,
+     weapon_deployment_yaw) = update
 
     assert parsed.loop_count == 77
     assert len(parsed.updated_entities) == 0
@@ -191,6 +195,9 @@ def test_world_update_read_parses_player_updates_and_counts():
     assert action_flags == 0x02
     assert state_flags == 0x08
     assert tool == C.RIFLE_TOOL
+    assert jetpack_fuel == 73.5
+    assert spawn_protection_timer == 0.0
+    assert weapon_deployment_yaw == 0.0
 
 
 def test_world_update_round_trips_its_serialized_bytes():
@@ -212,6 +219,27 @@ def test_world_update_round_trips_its_serialized_bytes():
     raw = bytes(packet.generate())
     parsed = WorldUpdate(ByteReader(raw[1:]))
 
+    assert bytes(parsed.generate()) == raw
+
+
+def test_world_update_rocket_turret_wire_is_id_yaw_pitch_only():
+    """Stock packet.pyd reads uint16 id + two fixed floats per turret.
+
+    gameScene.pyx then applies tuple[0] as yaw and tuple[1] as pitch.  The
+    previous four-short id/x/y/z layout shifted every packet that contained a
+    turret and made the client parse past the end of WorldUpdate.
+    """
+    packet = WorldUpdate()
+    packet.loop_count = 5
+    packet.rocket_turrets = [(42, 91.25, 12.5)]
+
+    raw = bytes(packet.generate())
+    parsed = WorldUpdate(ByteReader(raw[1:]))
+
+    entity_id, yaw, pitch = parsed.rocket_turrets[0]
+    assert entity_id == 42
+    assert abs(yaw - 91.25) < 1.0 / 64.0
+    assert abs(pitch - 12.5) <= 1.0 / 64.0
     assert bytes(parsed.generate()) == raw
 
 
@@ -346,8 +374,26 @@ def test_world_update_snapshot_packs_remote_disguise_and_water_state():
 
     snapshot = player.world_update_snapshot()
 
-    assert snapshot[-2] == 0x0A
-    assert snapshot[-1] == player.tool
+    assert snapshot[-5] == 0x0A
+    assert snapshot[-4] == player.tool
+
+
+def test_world_update_snapshot_serializes_authoritative_jetpack_fuel():
+    """The first fixed short after pickup is Character.jetpack_fuel.
+
+    Stock gameScene assigns this value every WorldUpdate, so leaving the six
+    post-pickup bytes zeroed erases locally initialized fuel on every frame.
+    """
+    player, _ = make_player()
+    player.jetpack_fuel = 73.5
+
+    packet = WorldUpdate()
+    packet[player.id] = player.world_update_snapshot()
+    raw = bytes(packet.generate())
+
+    row_start = 1 + 4 + 2
+    fuel_offset = row_start + 50
+    assert raw[fuel_offset:fuel_offset + 2] == struct.pack("<h", int(73.5 * 64 + 0.5))
 
 
 def test_repeated_live_client_data_held_jump_launches_on_next_tick():
@@ -766,9 +812,11 @@ def test_server_broadcasts_world_update_to_connected_clients():
 
     parsed = WorldUpdate(ByteReader(connection_one.sent_packets[0][1:]))
     update = parsed.player_updates[player_one.id]
-    update_position, _, _, _, _, _, update_input_flags, _, update_state, update_tool = update
+    (update_position, _, _, _, _, _, update_input_flags, _, update_state,
+     update_tool, update_fuel, _, _) = update
     assert update_tool == player_one.tool
     assert update_state == player_one.pack_state_flags()
+    assert update_fuel == player_one.jetpack_fuel
     assert update_position[0] > player_two.position[0] - 20.0
     assert update_position[0] > player_one.last_reported_position[0] - 0.01
     assert update_input_flags == player_one.pack_input_flags()

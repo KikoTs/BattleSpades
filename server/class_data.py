@@ -330,7 +330,7 @@ def _build_loadout_table() -> dict[int, ClassLoadout]:
     add(C.CLASS_SOLDIER,
         primary=("MINIGUN_TOOL", "ASSAULT_RIFLE_TOOL"),
         secondary=("RPG_TOOL", "RPG2_TOOL"),
-        equipment=("GRENADE_TOOL", "ANTIPERSONNEL_GRENADE_TOOL"),
+        equipment=("GRENADE_TOOL", "ANTIPERSONNEL_GRENADE_TOOL", "A370"),
         melee=("SPADE_TOOL", "KNIFE_TOOL"))
     add(C.CLASS_SCOUT,
         primary=("SNIPER_TOOL", "SNIPER2_TOOL"),
@@ -403,3 +403,58 @@ def default_loadout(class_id: int) -> dict[str, int]:
         "melee": lo.melee[0] if lo.melee else -1,
         "jetpack": lo.jetpack,
     }
+
+
+def default_client_loadout(class_id: int, disabled_tools=()) -> list[int]:
+    """Build the stock client's concrete default loadout list.
+
+    This mirrors ``GameClass.build_class_loadout``/``set_common_loadout_items``
+    and is used only when the pre-join SetClassLoadout packet is missing or
+    reordered.  Sending an empty CreatePlayer loadout leaves the client with
+    NO_JETPACK even though the authoritative player selected its class default.
+    """
+    class_id = int(class_id)
+    disabled = {int(tool) for tool in disabled_tools}
+    class_items = C.CLASS_ITEMS.get(class_id, {})
+    loadout: list[int] = []
+
+    for index in range(int(C.CLASS_NOOF_SELECTABLE_ITEMS)):
+        if index == int(C.CLASS_PREFABS):
+            continue
+        for item in class_items.get(index, ()):
+            item = int(item)
+            if item not in disabled:
+                loadout.append(item)
+                break
+
+    for item in class_items.get(int(C.CLASS_COMMON), ()):
+        item = int(item)
+        if item in disabled or item == int(C.FLAREBLOCK_TOOL):
+            continue
+        if item == int(C.BLOCK_TOOL):
+            loadout.insert(0, item)
+        else:
+            loadout.append(item)
+
+    for item in (int(C.FLAREBLOCK_TOOL), int(C.PREFAB_TOOL)):
+        if item not in disabled:
+            loadout.append(item)
+    return loadout
+
+
+def complete_client_loadout(class_id: int, selected, disabled_tools=()) -> list[int]:
+    """Return a usable stock-client loadout for the spawn handshake.
+
+    Some client paths send the selectable tools but omit the class jetpack.
+    Preserve a chosen jetpack variant when present; otherwise append the class
+    default so CreatePlayer initializes the correct native model and ability.
+    """
+    loadout = [int(item) for item in (selected or [])]
+    if not loadout:
+        return default_client_loadout(class_id, disabled_tools)
+
+    jetpacks = {int(item) for item in C.JETPACK_PROPERTIES}
+    default_jetpack = int(get_loadout(class_id).jetpack)
+    if default_jetpack in jetpacks and not any(item in jetpacks for item in loadout):
+        loadout.append(default_jetpack)
+    return loadout

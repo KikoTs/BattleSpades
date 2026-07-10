@@ -25,9 +25,12 @@ def make_player(class_id=int(C.CLASS_SOLDIER)):
     return p
 
 
-def hold_hover(p, seconds):
-    """Drive the fuel model with hover held for N seconds."""
-    p.input.hover = True
+def hold_jetpack(p, seconds):
+    """Drive the stock activation input for the equipped jetpack."""
+    if p.jetpack_id == int(C.JETPACK_UGCBUILDER):
+        p.input.hover = True
+    else:
+        p.input.jump = True
     ticks = int(seconds / DT)
     for _ in range(ticks):
         p._update_jetpack(DT)
@@ -43,7 +46,7 @@ def test_properties_table_loaded():
 def test_no_jetpack_never_activates():
     p = make_player()
     p.jetpack_id = 0
-    hold_hover(p, 1.0)
+    hold_jetpack(p, 1.0)
     assert p.jetpack_active is False
 
 
@@ -51,9 +54,9 @@ def test_activation_after_start_delay_and_cost():
     p = make_player()
     p.jetpack_id = 67  # JETPACK2
     p.jetpack_fuel = 100.0
-    hold_hover(p, 0.2)                    # under the 0.25s start delay
+    hold_jetpack(p, 0.2)                  # under the 0.25s start delay
     assert p.jetpack_active is False
-    hold_hover(p, 0.2)                    # crosses the delay
+    hold_jetpack(p, 0.2)                  # crosses the delay
     assert p.jetpack_active is True
     # activation cost 10 was paid + some drain
     assert p.jetpack_fuel < 90.5
@@ -63,7 +66,7 @@ def test_fuel_exhaustion_deactivates():
     p = make_player()
     p.jetpack_id = 66  # NORMAL: drains 75/s -> ~1.2s of flight after cost
     p.jetpack_fuel = 100.0
-    hold_hover(p, 2.5)
+    hold_jetpack(p, 2.5)
     assert p.jetpack_active is False
     assert p.jetpack_fuel <= 25.0  # mostly regen after the burn
 
@@ -73,14 +76,43 @@ def test_release_deactivates_and_regens():
     p.jetpack_id = 67
     p.jetpack_fuel = 100.0
     p._last_damage_at = 0.0
-    hold_hover(p, 1.0)
+    hold_jetpack(p, 1.0)
     assert p.jetpack_active is True
     fuel_after_burn = p.jetpack_fuel
-    p.input.hover = False
+    p.input.jump = False
     for _ in range(60):  # 1s idle
         p._update_jetpack(DT)
     assert p.jetpack_active is False
     assert p.jetpack_fuel > fuel_after_burn  # regenerated (9/s)
+
+
+def test_engineer_uses_jump_not_hover_for_thrust():
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 100.0
+
+    p.input.hover = True
+    for _ in range(30):
+        p._update_jetpack(DT)
+    assert p.jetpack_active is False
+
+    p.input.hover = False
+    p.input.jump = True
+    for _ in range(30):
+        p._update_jetpack(DT)
+    assert p.jetpack_active is True
+
+
+def test_ugc_builder_keeps_toggle_hover_activation():
+    p = make_player(class_id=int(C.CLASS_UGCBUILDER))
+    p.jetpack_id = int(C.JETPACK_UGCBUILDER)
+    p.jetpack_fuel = 100.0
+    p.input.hover = True
+
+    for _ in range(10):
+        p._update_jetpack(DT)
+
+    assert p.jetpack_active is True
 
 
 def test_damage_pauses_regen():

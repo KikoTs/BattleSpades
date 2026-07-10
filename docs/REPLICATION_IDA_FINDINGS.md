@@ -579,3 +579,64 @@ Focused movement, combat, collapse, packet, and end-sequence tests pass, and the
 full repository run passes 220 tests. The live isolated run additionally proves
 dry movement reconciliation, remote tool visibility, and normal block
 placement/removal parity.
+
+### 12.8 Class mobility and Engineer rocket turret
+
+Engineer jetpack behavior was verified in `world.pyd` and the character
+extension. `Character.update_jetpack` is wrapper/core
+`0x100831C0`/`0x1003DFC0`; `set_hover` is
+`0x10079530`/`0x100233D0`. The character routine only updates jetpack effects.
+Actual flight remains in `Player.update`: an active jetpack applies gravity
+`* 0.05` and the high-friction movement branch. The broken Engineer path was a
+spawn-handshake issue: a reordered or missing `SetClassLoadout` produced an
+empty `CreatePlayer.loadout`, so the stock client constructed the class with no
+jetpack. The server now supplies the stock concrete class default in that case.
+
+The live client then exposed a second wire bug: `character.jetpack_fuel` was
+overwritten with zero on every WorldUpdate. After the pickup byte, the player
+row contains three consecutive 1.6 fixed shorts, not padding. Tuple element 26
+is jetpack fuel and is assigned at `0x101852F1-0x1018530C`; element 27 is
+`character.spawn_protection_timer` (`0x10185603-0x1018561E`), and element 28 is
+`character.weapon_deployment_yaw` (`0x10185127-0x1018513E`). The server now
+serializes its authoritative fuel in the first short. A live Engineer spawn
+initializes at 100 fuel; holding jump activated both client and server jetpack
+state, drained the meter to 82.8, and release cleared the active state.
+
+Normal jetpacks do not use Z/hover for thrust. `GameScene.on_key_press`
+(`0x10234610`/`0x1015C9D0`) routes the configured hover key through
+`Character.toggle_hover` (`0x10079520`/`0x100231A0`). `Character.set_hover`
+accepts that state only for A367 / UGC Builder jetpack 69 at
+`0x10023438-0x10023569`, forcing it false for Engineer 68 at
+`0x1002367A-0x100236B6`. Engineer, Rocketeer, and normal packs request thrust
+with the ordinary jump input; the server now mirrors that split.
+
+The Commando A370 parachute is selected by `world.set_parachute` at
+`0x10018BC0` and toggled by `set_parachute_active` at `0x1000B030`. Its movement
+branches are in `Player.update` at `0x10012EB9-0x10012F4C`: active descent uses
+gravity `* 0.75`, high horizontal drag, and reduced landing severity. The stock
+client does not autonomously open it in the observed live fall, so the server
+now selects A370 from the loadout, opens it only while airborne and descending,
+and replicates the existing parachute state flag.
+
+Rocket-turret placement packet 88 is sent by wrapper/core
+`0x102398D0`/`0x10171A30`. The most important corrected wire detail is the
+WorldUpdate turret row: `shared.packet` reads a `uint16 entity_id` followed by
+exactly two fixed-point shorts, `yaw` and `pitch`, at
+`0x10044935` and `0x10044AAA-0x10044BF7`. The former four-short
+`id/x/y/z` layout shifted the rest of the packet. `gameScene` consumes those
+rows at `0x10185789`, resolves the entity at `0x101859D4`, verifies that it is a
+RocketTurret at `0x10185A68`, then applies yaw and pitch at
+`0x10185B0D` and `0x10185BE0`.
+
+`ChangeEntity` packet 16 is action-based, not a flags-and-property-list packet.
+Its common prefix is `entity_id:uint16, action:uint8`. RocketTurret
+`SET_TARGET=5` carries one signed target byte (`0xFF` means no target), while
+`SET_AMMO=7` carries one fixed-point short. The client consumes these paths at
+`0x10198DA1-0x10198E87` and `0x10199146-0x1019916F`; target and ammo therefore
+travel as two distinct packets.
+
+The server now owns turret placement, stock/restock, target acquisition,
+line-of-sight, 180-degree-per-second aiming, 1.5-second cadence, ammunition,
+visible rocket entities, collision, and the recovered 50 damage / 10 block
+damage / 3-block blast. Placement is constrained to the stock 10-block radius.
+Both native extensions were rebuilt, and the repository suite passes 236 tests.

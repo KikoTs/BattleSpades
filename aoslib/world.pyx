@@ -1334,7 +1334,9 @@ cdef class Player(Object):
         gravity_step = dt * _GLOBAL_GRAVITY
         if self._hover:
             gravity_step *= 0.75
-        if self._jetpack_active:
+        if self._parachute_active and self._parachute:
+            gravity_step *= 0.75
+        elif self._jetpack_active:
             gravity_step *= 0.05
         # Oracle-calibrated: gravity applies normally while wading (the
         # airborne bounce frames during a water-floor settle show the full
@@ -1349,7 +1351,7 @@ cdef class Player(Object):
             self._velocity.z += gravity_step
         self._velocity.z /= divisor
 
-        if self._wade or self._hover or self._jetpack_active:
+        if self._wade or self._hover or self._jetpack_active or self._parachute_active:
             horizontal_divisor = (dt * (self._water_friction * _movement_override("water_friction_scale"))) + 1.0
         elif not self._airborne:
             horizontal_divisor = (dt * _movement_override("ground_friction")) + 1.0
@@ -1418,8 +1420,11 @@ cdef class Player(Object):
         if collided_down and landing_speed > _movement_override("fall_slow_down"):
             self._velocity.x *= 0.7
             self._velocity.y *= 0.7
-            if landing_speed > _FALL_DAMAGE_VELOCITY:
-                damage = landing_speed - _FALL_DAMAGE_VELOCITY
+            effective_landing_speed = landing_speed
+            if self._parachute_active and self._parachute:
+                effective_landing_speed *= 0.75
+            if effective_landing_speed > _FALL_DAMAGE_VELOCITY:
+                damage = effective_landing_speed - _FALL_DAMAGE_VELOCITY
                 damage = damage * damage * _FALL_DAMAGE_SCALAR
                 if self._wade:
                     damage *= self._fall_on_water_multiplier

@@ -121,6 +121,7 @@ def main() -> int:
         f"gc = GameClass(manager, {args.class_id}, manager.disabled_tools, "
         f"manager.movement_speed_multipliers[{args.class_id}], manager.config, "
         "manager.enable_fall_on_water_damage)\n"
+        "scene_g.class_selected(gc)\n"
         "scene_g.create_player(gc)\n"
         "from aoslib.scenes.main.gameScene import GameScene\n"
         "manager.set_scene(GameScene)\n"

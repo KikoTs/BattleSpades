@@ -69,6 +69,7 @@ class ProjectileSpec:
     # such projectiles ride the rebroadcast UseOrientedItem instead (grenades,
     # which the client already renders as thrown grenades).
     entity_type: int = 0
+    blast_radius: float = 4.0
 
 
 def _kill(name: str, default: int) -> int:
@@ -199,6 +200,20 @@ class ProjectileEngine:
         elif spec.behavior == "stick" and fuse <= 0.0:
             fuse = None
         p = Projectile(spec, tool, pos, vel, fuse, thrower_id, now)
+        self.projectiles.append(p)
+        return p
+
+    def spawn_spec(self, spec: ProjectileSpec, pos, vel, thrower_id: int,
+                   now: Optional[float] = None) -> Projectile:
+        """Spawn a server-owned projectile not directly tied to a player tool.
+
+        Rocket turrets use the stock Rocket entity/flight model but their own
+        50/10 warhead, so representing the shot as RPG_TOOL would apply the
+        player's 140/5 RPG damage profile.
+        """
+        if now is None:
+            now = time.time()
+        p = Projectile(spec, -1, pos, vel, None, thrower_id, now)
         self.projectiles.append(p)
         return p
 
