@@ -457,17 +457,20 @@ class CombatSystem:
         packet.type = self._damage_type_for(player) if damage_type is None else int(damage_type)
         packet.damage = min(float(damage), self._BLOCK_KILL_DAMAGE)
         packet.face = 0
-        # chunk_check=1 lets the CLIENT flood-fill connectivity after the removal
-        # and ANIMATE any now-disconnected chunk falling (the classic collapse
-        # visual). This is correct as long as both VXLs are GROUNDED: the earlier
-        # whole-map-wipe was NOT caused by chunk_check — it was the floating-map
-        # bug (aoslib/vxl.pyx dropped the underground, so the client's flood-fill
-        # found no ground and declared the whole map unsupported). With the VXL
-        # underground fill in place the map is solid, so chunk_check=1 stays
-        # localized (measured 2026-07-09: a single shot removes 1 block, no wipe)
-        # AND we keep the falling-block animation. The server's own
-        # _collapse_unsupported mirrors the same removals so both worlds agree.
-        packet.chunk_check = 1
+        # chunk_check=0 -> the client removes ONLY the exact cell(s) we send and
+        # never runs its own flood-fill. SINGLE AUTHORITY: our
+        # _collapse_unsupported decides every removal and broadcasts each fallen
+        # block, so the client world is a pure mirror of ours.
+        #
+        # chunk_check=1 (the old value) ran a SECOND, DIFFERENT collapse engine
+        # on the client, and the two never agreed — verified against the client's
+        # BFS (vxl.pyd sub_10036470): it has NO block-count cap (only a ~10M op
+        # budget) where we bailed at 512 cells, it grounds on z>238 where we used
+        # z>=238, and it walks ~18-connectivity where we walk 6 faces. Net effect
+        # the user reported: a building collapses client-side while the server
+        # keeps every block -> invisible collision you cannot walk through.
+        # Cost of chunk_check=0: we lose the client's falling-block animation.
+        packet.chunk_check = 0
         packet.seed = int(seed) & 0xFF
         # causer_id is an ENTITY id the client reads UNSIGNED (measured: -1
         # decodes to 65535 -> entities[65535] lookup aborts the whole damage
@@ -644,10 +647,24 @@ class CombatSystem:
         return closest_target, closest_headshot, closest_distance, closest_position
 
     def _ray_hits_target(self, origin, direction, max_distance: float, target):
-        top_z = min(target.z, target.eye_z) - 0.1
-        bottom_z = max(target.z, target.eye_z) + BODY_HEIGHT_PADDING
-        head_bottom = top_z + HEADSHOT_HEIGHT
-        radius_squared = PLAYER_WIDTH_HALF * PLAYER_WIDTH_HALF
+        """Ray vs the target's REAL body box.
+
+        `position` is the HEAD/EYE (z grows DOWNWARD), so the body hangs below
+        it: the head cap sits at `z - PLAYER_WIDTH_HALF` and the feet at
+        `z + contact_offset` (2.25 standing / 1.35 crouched — the same values
+        the physics engine uses, read straight off the player so the two can
+        never drift). Horizontally the collision volume is a SQUARE AABB of
+        ±0.45, not a cylinder.
+
+        The old box was `[z-0.1, z+1.0]` with a cylinder: it ended at the WAIST,
+        so the legs — over half a standing player — had no hitbox at all, the
+        top of the head was 0.35 short, and diagonal corners were rejected.
+        """
+        half = PLAYER_WIDTH_HALF
+        contact = target._current_contact_offset()
+        top_z = target.z - half              # head cap
+        bottom_z = target.z + contact        # feet
+        head_bottom = target.z + half        # head band = one radius around the eye
 
         steps = max(1, int(max_distance / RAYCAST_STEP))
         for index in range(steps + 1):
@@ -656,9 +673,7 @@ class CombatSystem:
             py = origin[1] + direction[1] * distance
             pz = origin[2] + direction[2] * distance
 
-            dx = px - target.x
-            dy = py - target.y
-            if dx * dx + dy * dy > radius_squared:
+            if abs(px - target.x) > half or abs(py - target.y) > half:
                 continue
             if pz < top_z or pz > bottom_z:
                 continue

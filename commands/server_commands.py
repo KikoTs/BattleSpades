@@ -9,6 +9,58 @@ from .command_handler import register_command, CommandContext, send_message
 
 
 @register_command(
+    name="netcode",
+    aliases=["nc"],
+    admin_only=True,
+    usage="/netcode [selfrow on|off] [offset <n>] [interval <n>]",
+    description="Live-tune WorldUpdate self-row reconciliation (no restart)",
+)
+async def cmd_netcode(ctx: CommandContext):
+    """Adjust the self-row reconciliation knobs at RUNTIME.
+
+    Restarting the server to change these is not an option while calibrating:
+    a restart resets server loop_count while the client's keeps climbing, so
+    every self-row lands on a loop_count the client's movement_history has
+    never seen -> hard SNAP on every packet (see docs/NETCODE_RECONCILIATION.md).
+    The sim loop re-reads these off config each tick, so mutating them here
+    takes effect immediately and the measurement stays valid.
+    """
+    cfg = ctx.server.config
+    args = list(ctx.args)
+    if not args:
+        await send_message(
+            ctx.server, ctx.player,
+            "selfrow=%s offset=%s interval=%s" % (
+                cfg.worldupdate_include_self,
+                cfg.worldupdate_loop_offset,
+                cfg.worldupdate_self_row_interval,
+            ))
+        return
+    try:
+        while args:
+            key = args.pop(0).lower()
+            if key in ("selfrow", "self"):
+                cfg.worldupdate_include_self = args.pop(0).lower() in ("on", "true", "1")
+            elif key == "offset":
+                cfg.worldupdate_loop_offset = int(args.pop(0))
+            elif key == "interval":
+                cfg.worldupdate_self_row_interval = max(1, int(args.pop(0)))
+            else:
+                await send_message(ctx.server, ctx.player, "unknown key: %s" % key)
+                return
+    except (IndexError, ValueError):
+        await send_message(ctx.server, ctx.player, "usage: /netcode selfrow on|off offset <n> interval <n>")
+        return
+    await send_message(
+        ctx.server, ctx.player,
+        "netcode -> selfrow=%s offset=%s interval=%s" % (
+            cfg.worldupdate_include_self,
+            cfg.worldupdate_loop_offset,
+            cfg.worldupdate_self_row_interval,
+        ))
+
+
+@register_command(
     name="map",
     aliases=["changemap"],
     admin_only=True,

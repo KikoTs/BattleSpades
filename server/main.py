@@ -766,9 +766,25 @@ class BattleSpadesServer:
                 if tick_ms > 10.0:
                     stat_slow += 1
                 if stat_ticks >= 600:  # one line every ~10s
+                    # Per-player input accounting: `dropped` frames are physics
+                    # steps the CLIENT took that the server never did, so the
+                    # server falls behind and the self-row yanks the client back.
+                    # `starved` ticks coast on the previous input (harmless).
+                    inputs = []
+                    for p in self.players.values():
+                        applied = getattr(p, "input_frames_applied", 0)
+                        dropped = getattr(p, "input_frames_dropped", 0)
+                        starved = getattr(p, "input_starved_ticks", 0)
+                        if applied or dropped or starved:
+                            inputs.append("%s:appl=%d drop=%d starve=%d" %
+                                          (p.name, applied, dropped, starved))
+                            p.input_frames_applied = 0
+                            p.input_frames_dropped = 0
+                            p.input_starved_ticks = 0
                     logger.info(
-                        "tick stats: avg=%.2fms max=%.2fms slow(>10ms)=%d/%d",
+                        "tick stats: avg=%.2fms max=%.2fms slow(>10ms)=%d/%d%s",
                         stat_sum_ms / stat_ticks, stat_max_ms, stat_slow, stat_ticks,
+                        ("  inputs[" + " | ".join(inputs) + "]") if inputs else "",
                     )
                     stat_ticks = stat_slow = 0
                     stat_max_ms = stat_sum_ms = 0.0
@@ -802,6 +818,17 @@ class BattleSpadesServer:
                     % self.config.worldupdate_self_row_interval == 0
                 )
                 offset = self.config.worldupdate_loop_offset
+                # Stamp EVERY player's row with the client input loop_count the
+                # sim last consumed for them (+ calibration offset). This is the
+                # `pong` field, which the client feeds to
+                # set_network_position_and_velocity as `last_loop_count` and
+                # then looks up in its own movement_history. It must be
+                # per-PLAYER (not per-recipient), so one serialized packet still
+                # reconciles correctly for whoever receives it.
+                for _p in self.players.values():
+                    if _p.last_applied_input_loop is not None:
+                        _p.wu_ack_loop = max(0, _p.last_applied_input_loop + offset)
+
                 for connection in list(self.connections.values()):
                     if not connection.in_game:
                         continue  # not in GameScene yet — no WorldUpdate flood

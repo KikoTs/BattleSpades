@@ -244,7 +244,10 @@ class BaseMode(ABC):
             return
         self._end_sequence_running = True
         import asyncio
-        asyncio.get_event_loop().create_task(self._end_sequence_task(winner))
+        # HOLD A REFERENCE: asyncio keeps only a weak ref to a bare task, so a
+        # GC during the ~17s of awaits below can collect it mid-flight and the
+        # round then never restarts.
+        self._end_task = asyncio.ensure_future(self._end_sequence_task(winner))
 
     async def _end_sequence_task(self, winner: Optional[int]):
         import asyncio
