@@ -69,8 +69,8 @@ grenade_damage = 100
 [world]
 map_size_x = 512
 map_size_y = 512
-map_size_z = 255
-water_level = 62
+map_size_z = 240
+water_level = 238
 water_damage = true
 
 [admin]
@@ -121,5 +121,4 @@ debug_selfrow = false
 # (under its resync threshold) ??? keep 0; determinism comes from
 # INPUT_DELAY_TICKS=1 in server/player.py instead.
 clock_sync_loop_bias = 0
-
 

@@ -7,6 +7,8 @@ import time
 import logging
 from typing import Optional, Tuple, TYPE_CHECKING
 
+import shared.constants as C
+
 from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1, TEAM2
 
 from .base_mode import BaseMode
@@ -82,14 +84,18 @@ class CTFMode(BaseMode):
         # Pickup cooldown (to prevent instant re-grab)
         self.intel_drop_time = {TEAM1: 0.0, TEAM2: 0.0}
         self.pickup_cooldown = 2.0  # Seconds
+        self.intel_home_positions = dict(self.intel_positions)
+        self._intel_entities = {TEAM1: None, TEAM2: None}
+        self._base_entities = {TEAM1: None, TEAM2: None}
     
     async def on_mode_start(self):
         """Initialize intel and base positions."""
         await super().on_mode_start()
+        self.intel_holder = {TEAM1: None, TEAM2: None}
+        self.intel_drop_time = {TEAM1: 0.0, TEAM2: 0.0}
         
-        # Anchor bases on the map author's spawn-zone markers (the true team
-        # bases), falling back to the dry shore near the legacy west/east points
-        # when a map has no markers.
+        # Prefer authored sidecar base/spawn zones, falling back to validated
+        # dry terrain in the legacy west/east team regions on voxel-only maps.
         wm = getattr(self.server, "world_manager", None)
         if wm is not None and hasattr(wm, "team_base_anchor"):
             self.base_positions[TEAM1] = wm.team_base_anchor(TEAM1)
@@ -102,12 +108,59 @@ class CTFMode(BaseMode):
         # dry ground so it never floats over water.
         self.intel_positions[TEAM1] = _intel_near(self.server, self.base_positions[TEAM1], +12.0)
         self.intel_positions[TEAM2] = _intel_near(self.server, self.base_positions[TEAM2], -12.0)
+        self.intel_home_positions = dict(self.intel_positions)
         
         # Update team objects
         for team_id, pos in self.intel_positions.items():
             self.server.teams[team_id].set_intel_position(*pos)
+
+        self._place_objective_entities()
         
         logger.info("CTF mode started")
+
+    def _place_objective_entities(self):
+        """Create the retail base tent and team flag models on dry surfaces."""
+        reg = getattr(self.server, "entity_registry", None)
+        wm = getattr(self.server, "world_manager", None)
+        if reg is None or wm is None:
+            return
+        for ent in reg.all():
+            if getattr(ent, "kind", "") != "projectile":
+                self.server.broadcast_destroy_entity(ent.entity_id)
+        reg.clear()
+        for team in (TEAM1, TEAM2):
+            bx, by, _bz = self.base_positions[team]
+            x, y, z = wm.dry_surface_anchor(bx, by)
+            base = reg.place(int(C.BASE), x, y, z, state=team, kind="base")
+            self._base_entities[team] = base.entity_id
+
+            ix, iy, _iz = self.intel_positions[team]
+            x, y, z = wm.dry_surface_anchor(ix, iy)
+            flag = reg.place(int(C.FLAG), x, y, z, state=team, kind="flag")
+            self._intel_entities[team] = flag.entity_id
+
+            if getattr(self.server.config, "entities_wire_ready", False):
+                self.server.broadcast_create_entity(base)
+                self.server.broadcast_create_entity(flag)
+
+    def _set_intel_entity(self, team: int, visible: bool):
+        reg = getattr(self.server, "entity_registry", None)
+        wm = getattr(self.server, "world_manager", None)
+        if reg is None or wm is None:
+            return
+        old_id = self._intel_entities.get(team)
+        if old_id is not None:
+            if reg.remove(old_id) is not None:
+                self.server.broadcast_destroy_entity(old_id)
+            self._intel_entities[team] = None
+        if not visible:
+            return
+        px, py, _pz = self.intel_positions[team]
+        x, y, z = wm.dry_surface_anchor(px, py)
+        flag = reg.place(int(C.FLAG), x, y, z, state=team, kind="flag")
+        self._intel_entities[team] = flag.entity_id
+        if getattr(self.server.config, "entities_wire_ready", False):
+            self.server.broadcast_create_entity(flag)
     
     async def on_tick(self, tick: int):
         """Check for intel pickups and captures."""
@@ -143,6 +196,7 @@ class CTFMode(BaseMode):
         """Player picks up intel."""
         self.intel_holder[intel_team] = player
         self.server.teams[intel_team].pick_up_intel(player)
+        self._set_intel_entity(intel_team, False)
         
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} has the {team_name} intel!")
@@ -154,9 +208,10 @@ class CTFMode(BaseMode):
         self.intel_holder[intel_team] = None
         
         # Reset intel to base
-        base_pos = self.base_positions[intel_team]
-        self.intel_positions[intel_team] = base_pos
-        self.server.teams[intel_team].return_intel(base_pos)
+        home_pos = self.intel_home_positions[intel_team]
+        self.intel_positions[intel_team] = home_pos
+        self.server.teams[intel_team].return_intel(home_pos)
+        self._set_intel_entity(intel_team, True)
         
         # Add score
         player.captures += 1
@@ -194,6 +249,7 @@ class CTFMode(BaseMode):
         self.intel_drop_time[intel_team] = time.time()
         
         self.server.teams[intel_team].drop_intel(*drop_pos)
+        self._set_intel_entity(intel_team, True)
         
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"{player.name} dropped the {team_name} intel!")

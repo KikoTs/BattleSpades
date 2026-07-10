@@ -1,7 +1,5 @@
-"""Lock the (engine-faithful) marker-based spawn so a future change can't
-silently break TDM/CTF spawns. ArcticBase carries blue(TEAM1)/green(TEAM2)
-spawn markers; both must be found, team1 must be north of team2, and every
-spawn must be on dry, in-bounds ground."""
+"""Stock VXL maps must use safe terrain, never colour-marker mutation."""
+
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,50 +7,50 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 from server.config import ServerConfig  # noqa: E402
-from server.game_constants import TEAM1, TEAM2  # noqa: E402
-from server.world_manager import WorldManager, MAP_X, MAP_Y, MAP_Z  # noqa: E402
+from server.game_constants import (  # noqa: E402
+    PLAYER_STANDING_POS_ABOVE_GROUND as OFF,
+    TEAM1,
+    TEAM2,
+)
+from server.world_manager import MAP_X, MAP_Y, WorldManager  # noqa: E402
 
-ARCTIC = Path("maps/ArcticBase.vxl")
+
+MAPS = sorted(Path("maps").glob("*.vxl"))
 
 
-def _wm():
+def _wm(path: Path) -> WorldManager:
     cfg = ServerConfig()
     wm = WorldManager(cfg)
-    wm.load_map("ArcticBase")
+    assert wm.load_map(path.stem)
     return wm
 
 
-def test_both_teams_have_markers():
-    if not ARCTIC.exists():
-        return  # map not present in this checkout
-    wm = _wm()
-    assert len(wm.spawn_markers[TEAM1]) > 0
-    assert len(wm.spawn_markers[TEAM2]) > 0
+def test_stock_maps_have_safe_spawn_candidates_for_both_teams():
+    for path in MAPS:
+        wm = _wm(path)
+        assert wm.map_metadata.source is None
+        assert wm.dirty_columns == set()
+        for team in (TEAM1, TEAM2):
+            candidates = wm._get_spawn_candidates(team)
+            assert candidates, f"{path.name} team {team} has no dry spawn ground"
+            for _ in range(30):
+                x, y, z = wm.get_spawn_point(team)
+                assert 0.0 <= x < MAP_X and 0.0 <= y < MAP_Y
+                surface = wm._get_surface_z(int(x), int(y))
+                assert surface <= 238
+                assert abs((z + OFF + 0.5) - surface) < 0.001
+                assert wm._safe_spawn_column(int(x), int(y))
 
 
-def test_team1_north_of_team2():
-    if not ARCTIC.exists():
+def test_coloured_vxl_terrain_is_not_deleted_as_spawn_metadata():
+    arctic = Path("maps/ArcticBase.vxl")
+    if not arctic.exists():
         return
-    wm = _wm()
-    m1 = wm.spawn_markers[TEAM1]
-    m2 = wm.spawn_markers[TEAM2]
-    cy1 = sum(y for _, y, _ in m1) / len(m1)
-    cy2 = sum(y for _, y, _ in m2) / len(m2)
-    # Measured on ArcticBase: blue ~197, green ~330 (N/S split).
-    assert cy1 < cy2
-
-
-def test_spawns_are_dry_and_in_bounds():
-    if not ARCTIC.exists():
-        return
-    wm = _wm()
-    from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND as OFF
-    for team in (TEAM1, TEAM2):
-        for _ in range(50):
-            x, y, z = wm.get_spawn_point(team)
-            assert 0.0 <= x < MAP_X and 0.0 <= y < MAP_Y
-            feet = z + OFF
-            # feet must be ABOVE the waterplane (dry), not at/under the seabed.
-            assert feet < 239.0, f"team {team} spawned wet at feet z={feet}"
-            # surface under the spawn column must be land (<=238).
-            assert wm._get_surface_z(int(x), int(y)) <= MAP_Z - 2
+    wm = _wm(arctic)
+    # Pure-blue surface voxels exist in the stock map.  They are terrain, not
+    # UGC metadata, and must remain byte/geometry-identical after loading.
+    x, y, z = 213, 189, 221
+    assert wm.get_solid(x, y, z)
+    r, g, b, _a = wm.map.get_color_tuple(x, y, z)
+    assert (r & 0xF0, g & 0xF0, b & 0xF0) == (0, 0, 0xF0)
+    assert wm.dirty_columns == set()

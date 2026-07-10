@@ -640,3 +640,36 @@ line-of-sight, 180-degree-per-second aiming, 1.5-second cadence, ammunition,
 visible rocket entities, collision, and the recovered 50 damage / 10 block
 damage / 3-block blast. Placement is constrained to the stock 10-block radius.
 Both native extensions were rebuilt, and the repository suite passes 236 tests.
+
+### 12.9 VXL map metadata, spawns, objectives, and water height
+
+The retail `.vxl` payload is voxel data only: exactly 512 x 512 encoded column
+streams. The bundled stock maps have no metadata trailer. Battle Builders UGC
+maps keep authored gameplay data in a same-stem JSON sidecar (`.txt` or `.ugc`)
+under `ugc_entities`; each row carries `position`, `mode`, and an item name such
+as `ugc_spawnblue_small`, `ugc_basegreen_med`, or `ugc_health_drop`.
+`UGC_ZONE_SIZES`, `UGC_ENTITY_TEAMS`, and `UGC_TOOL_IMAGES` in the recovered
+client constants provide the exact zone extents, team mapping, and names.
+
+The former server heuristic treated any pure-blue/pure-green surface voxel as
+a spawn marker and removed it from the server map. That is not a VXL metadata
+encoding and could mutate ordinary buildings while the client retained the raw
+VXL geometry. The destructive scan is removed. Sidecars are authoritative when
+present; voxel-only maps use cached dry, locally level spawn columns with an
+elevation-ring test that rejects building roofs. The four bundled maps retain
+their original voxel/checksum state and produce safe candidates for both teams.
+
+Player and entity z coordinates are distinct. A player ground anchor is the
+surface minus the 2.25-block standing offset; a crate, flag, or base model is
+placed at the voxel surface itself. Reusing the player anchor for crates was why
+map entities appeared vertically displaced. TDM now prefers authored UGC drop
+points and CTF creates the stock `BASE=1` tent and `FLAG=0` entity for each team,
+including flag hide/recreate transitions for pickup, drop, and capture.
+
+The client world is 240 blocks deep (`MAP_Z=240`) and the waterplane constant is
+`Z_ABOVE_WATERPLANE=238`. The server's old `WATER_LEVEL=62` was a stale
+64-height-world assumption and is now 238 in gameplay/config. Loaded bundled
+maps require no runtime z shift. The generated test map deliberately remains a
+high dry plateau at z=62; in a 240-deep coordinate system that is far above the
+waterplane, not immediately above water. The repository suite passes 244 tests;
+isolated ArcticBase TDM and CTF servers both bind and complete mode startup.
