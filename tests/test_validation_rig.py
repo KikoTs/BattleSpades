@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from scripts.parity_clients import build_client_specs
 from scripts.run_validation_server import parse_args
 from server.config import ServerConfig
 from server.validation import build_validation_config
@@ -41,3 +42,12 @@ def test_validation_launcher_defaults_are_isolated():
     assert args.map_name == "ArcticBase"
     assert args.mode == "tdm"
     assert args.config == Path("config.toml")
+
+
+def test_two_client_specs_use_unique_tracer_ports():
+    specs = build_client_specs("127.0.0.1:27016")
+
+    assert [spec.console_port for spec in specs] == [32896, 32897]
+    assert [spec.tracer_port for spec in specs] == [32895, 32898]
+    assert all(spec.connect_target == "127.0.0.1:27016" for spec in specs)
+    assert len({spec.capture_dir for spec in specs}) == 2
