@@ -10,7 +10,7 @@ from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CLIENT_DIR = Path(r"G:\AoSRevival\aceofspades_nonsteam")
+DEFAULT_CLIENT_DIR = Path(r"G:\AoSRevival\AceOfSpades_no_steam_new")
 
 
 @dataclass(frozen=True)
