@@ -1,7 +1,14 @@
 import math
 
 from shared.bytes import ByteReader, ByteWriter
-from shared.packet import BlockOccupy, ClockSync
+from shared.packet import (
+    BlockOccupy,
+    ClockSync,
+    PlaceC4,
+    PlaceDynamite,
+    PlaceLandmine,
+    PlaceRadarStation,
+)
 
 
 def test_byte_writer_and_reader_round_trip():
@@ -67,3 +74,24 @@ def test_block_occupy_packet_round_trip():
     assert parsed.loop_count == 9
     assert parsed.player_id == 4
     assert (parsed.x, parsed.y, parsed.z) == (111, 222, 63)
+
+
+def test_fixed_point_deployable_coordinates_round_trip():
+    """Placement packets encode coordinates as signed fixed-point shorts.
+
+    The former readers returned raw values (100 became 3200), causing every
+    server placement-distance check to reject otherwise valid mines/charges.
+    """
+    for packet_type in (PlaceLandmine, PlaceDynamite, PlaceC4, PlaceRadarStation):
+        packet = packet_type()
+        packet.loop_count = 123
+        packet.x, packet.y, packet.z = 100.5, 200.25, 55.0
+        if hasattr(packet, "player_id"):
+            packet.player_id = 7
+        if hasattr(packet, "face"):
+            packet.face = 4
+
+        raw = bytes(packet.generate())
+        parsed = packet_type(ByteReader(raw[1:]))
+
+        assert (parsed.x, parsed.y, parsed.z) == (100.5, 200.25, 55.0)

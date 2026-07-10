@@ -37,20 +37,37 @@ def test_active_parachute_is_replicated_in_world_update_state():
     assert player.pack_state_flags() & 0x01
 
 
-def test_parachute_opens_only_while_airborne_and_descending():
+def test_parachute_requires_second_airborne_space_press():
     player = make_player()
-    player.airborne = True
-    player.wade = False
-
-    player.vz = -0.2
+    # First SPACE press is the ground jump and must not deploy it.
+    player.airborne = False
+    player.update_input(False, False, False, False, True, False, False, False)
     player._update_parachute()
     assert player.parachute_active is False
 
-    player.vz = 0.2
+    # Release after launch, then press SPACE a second time in the air.
+    player.airborne = True
+    player.update_input(False, False, False, False, False, False, False, False)
+    player._update_parachute()
+    assert player.parachute_active is False
+    player.update_input(False, False, False, False, True, False, False, False)
     player._update_parachute()
     assert player.parachute_active is True
 
+    # Holding SPACE keeps it open without retriggering; landing closes it.
+    player._update_parachute()
+    assert player.parachute_active is True
     player.airborne = False
+    player._update_parachute()
+    assert player.parachute_active is False
+
+
+def test_falling_without_second_press_does_not_auto_deploy():
+    player = make_player()
+    player.airborne = True
+    player.vz = 5.0
+    player.jump_held = False
+    player.jump_last_held = False
     player._update_parachute()
     assert player.parachute_active is False
 

@@ -485,7 +485,9 @@ class CombatSystem:
             return self._apply_block_damage(attacker, block_pos, attacker.get_weapon_profile().block_damage)
         return False
 
-    def _apply_block_damage(self, attacker, block_pos, damage: float) -> bool:
+    def _apply_block_damage(self, attacker, block_pos, damage: float,
+                            damage_type: int = None,
+                            causer_id: int = None) -> bool:
         if not getattr(self.server.config, "build_damage", True):
             return False
 
@@ -500,9 +502,15 @@ class CombatSystem:
             # Kill-damage guarantees client removal even if the client's own
             # ledger drifted from ours (its per-hit crack progression came
             # from the earlier hit broadcasts).
-            self._broadcast_block_destroy(attacker, [block_pos])
+            self._broadcast_block_destroy(
+                attacker, [block_pos], damage_type=damage_type,
+                causer_id=causer_id,
+            )
         elif total > 0.0:
-            self._broadcast_block_hit(attacker, block_pos, damage)
+            self._broadcast_block_damage(
+                attacker, block_pos, damage, damage_type=damage_type,
+                causer_id=causer_id,
+            )
         return total > 0.0
 
     # Block damage/removal wire contract (DECOMPILED from gameScene.pyd,
@@ -533,7 +541,8 @@ class CombatSystem:
         return int(C.WEAPON_DAMAGE)
 
     def _broadcast_block_damage(self, player, block_pos, damage: float,
-                                damage_type: int = None, seed: int = 0):
+                                damage_type: int = None, seed: int = 0,
+                                causer_id: int = None):
         from shared.packet import Damage
         packet = Damage()
         packet.player_id = player.id if player is not None else -1
@@ -551,7 +560,10 @@ class CombatSystem:
         # handler). The reference server sends the shooter's id here; use a
         # small in-range id (0 for no player) so the client's entity lookup
         # resolves safely instead of exploding.
-        packet.causer_id = player.id if player is not None else 0
+        packet.causer_id = (
+            int(causer_id) if causer_id is not None
+            else (player.id if player is not None else 0)
+        )
         # Send the INTEGER cell coords, NOT the block center. MEASURED live
         # (real shot path, 2026-07-07): the client resolves the damaged cell as
         # int(position + 0.5) (round-half-up), so a block-center (cell+0.5)
@@ -572,12 +584,14 @@ class CombatSystem:
             damage = player.get_weapon_profile().block_damage if player is not None else 1.0
         self._broadcast_block_damage(player, block_pos, damage)
 
-    def _broadcast_block_destroy(self, player, positions, damage_type: int = None):
+    def _broadcast_block_destroy(self, player, positions, damage_type: int = None,
+                                 causer_id: int = None):
         """Guaranteed removal on all clients: kill-damage Damage(37) per cell
         (a no-op for cells the client already removed on its own)."""
         for pos in positions:
             self._broadcast_block_damage(
-                player, pos, self._BLOCK_KILL_DAMAGE, damage_type=damage_type
+                player, pos, self._BLOCK_KILL_DAMAGE,
+                damage_type=damage_type, causer_id=causer_id,
             )
         self._collapse_unsupported(player, positions)
 

@@ -44,7 +44,7 @@ BOUNCE_DAMP = 0.36
 CONTACT_STEP = 0.5
 # Sticky grenade: fuse arms when it sticks (client sends value=0; the real
 # post-stick delay lives in compiled code — approximate, calibrate live).
-STICK_ARM_SECONDS = 2.5
+STICK_ARM_SECONDS = float(getattr(C, "STICKY_GRENADE_STICK_FUSE", 5.0))
 # Failsafe: a fuse-less projectile that never contacts anything dies here.
 MAX_FLIGHT_SECONDS = 10.0
 
@@ -52,7 +52,7 @@ MAX_FLIGHT_SECONDS = 10.0
 @dataclass(frozen=True)
 class ProjectileSpec:
     name: str
-    behavior: str                 # 'bounce' | 'contact' | 'stick'
+    behavior: str                 # 'bounce' | 'contact' | 'stick' | 'deploy'
     gravity_mult: float           # x BASE_GRAVITY
     damage: float                 # max player blast damage
     block_damage: float           # per-block damage in the crater cube
@@ -82,13 +82,23 @@ _GRENADE_KILL = _kill("GRENADE_KILL", 3)
 # (handled by the explosion path in main.py); damage listed for reference.
 PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
     int(C.GRENADE_TOOL): ProjectileSpec(
-        "grenade", "bounce", 1.0, 100.0, 4.0, _GRENADE_KILL, 7),
+        "grenade", "bounce", 1.0,
+        float(getattr(C, "GRENADE_EXPLOSION_DAMAGE", 230.0)),
+        float(getattr(C, "GRENADE_EXPLOSION_BLOCK_DAMAGE", 4.0)),
+        _GRENADE_KILL, 7,
+        blast_radius=float(getattr(C, "GRENADE_EXPLOSION_RADIUS", 4.0))),
     int(getattr(C, "CLASSIC_GRENADE_TOOL", 31)): ProjectileSpec(
-        "classic_grenade", "bounce", 1.0, 100.0, 4.0,
-        _kill("CLASSIC_GRENADE_KILL", 22), 22),
+        "classic_grenade", "bounce", 1.0,
+        float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_DAMAGE", 130.0)),
+        float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
+        _kill("CLASSIC_GRENADE_KILL", 22), 22,
+        blast_radius=float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_RADIUS", 2.0))),
     int(getattr(C, "ANTIPERSONNEL_GRENADE_TOOL", 32)): ProjectileSpec(
-        "ap_grenade", "bounce", 1.0, 100.0, 4.0,
-        _kill("ANTIPERSONNEL_GRENADE_KILL", 23), 23),
+        "ap_grenade", "bounce", 1.0,
+        float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_DAMAGE", 500.0)),
+        float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_BLOCK_DAMAGE", 0.5)),
+        _kill("ANTIPERSONNEL_GRENADE_KILL", 23), 23,
+        blast_radius=float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_RADIUS", 2.0))),
     int(getattr(C, "MOLOTOV_TOOL", 33)): ProjectileSpec(
         "molotov", "contact", 1.0, 50.0, 3.0,
         _kill("MOLOTOV_KILL", 24), 24, approximate=True,
@@ -105,14 +115,16 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "ROCKET_EXPLOSION_DAMAGE", 140)),
         float(getattr(C, "ROCKET_EXPLOSION_BLOCK_DAMAGE", 5)),
         _kill("ROCKET_KILL", 4), 8,
-        entity_type=int(getattr(C, "ROCKET_ENTITY", 21))),
+        entity_type=int(getattr(C, "ROCKET_ENTITY", 21)),
+        blast_radius=float(getattr(C, "ROCKET_EXPLOSION_RADIUS", 4.0))),
     int(C.RPG2_TOOL): ProjectileSpec(
         "rocket2", "contact",
         float(getattr(C, "ROCKET2_GRAVITY_MULTIPLIER", 0.025)),
         float(getattr(C, "ROCKET2_EXPLOSION_DAMAGE", 50)),
         float(getattr(C, "ROCKET2_EXPLOSION_BLOCK_DAMAGE", 2)),
         _kill("ROCKET2_KILL", 5), 9,
-        entity_type=int(getattr(C, "ROCKET2_ENTITY", 22))),
+        entity_type=int(getattr(C, "ROCKET2_ENTITY", 22)),
+        blast_radius=float(getattr(C, "ROCKET2_EXPLOSION_RADIUS", 4.0))),
     int(C.DRILLGUN_TOOL): ProjectileSpec(
         "drill", "contact",
         float(getattr(C, "DRILL_GRAVITY_MULTIPLIER", 1.5)),
@@ -122,27 +134,49 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         lifespan=float(getattr(C, "DRILL_LIFESPAN", 3.0)),
         destroyed_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_DAMAGE", 95)),
         destroyed_block_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_BLOCK_DAMAGE", 10.0)),
-        entity_type=int(getattr(C, "DRILL_ENTITY", 23))),
+        entity_type=int(getattr(C, "DRILL_ENTITY", 23)),
+        blast_radius=float(getattr(C, "DRILL_EXPLOSION_RADIUS", 3.0))),
     int(getattr(C, "SNOWBLOWER_TOOL", 29)): ProjectileSpec(
         "snowball", "contact",
         float(getattr(C, "SNOWBALL_GRAVITY_MULTIPLIER", 0.5)),
         float(getattr(C, "SNOWBALL_EXPLOSION_DAMAGE", 10)),
         float(getattr(C, "SNOWBALL_EXPLOSION_BLOCK_DAMAGE", 0)),
         _kill("SNOWBALL_KILL", 21), 20,
-        entity_type=int(getattr(C, "SNOWBALL_ENTITY", 24))),
+        entity_type=int(getattr(C, "SNOWBALL_ENTITY", 24)),
+        blast_radius=float(getattr(C, "SNOWBALL_EXPLOSION_RADIUS", 5.0))),
     int(getattr(C, "STICKY_GRENADE_TOOL", 57)): ProjectileSpec(
-        "sticky_grenade", "stick", 1.0, 100.0, 4.0,
-        _kill("STICKY_GRENADE_KILL", 34), 39, approximate=True),
+        "sticky_grenade", "stick", 1.0,
+        float(getattr(C, "STICKY_GRENADE_EXPLOSION_DAMAGE", 200.0)),
+        float(getattr(C, "STICKY_GRENADE_EXPLOSION_BLOCK_DAMAGE", 6.0)),
+        _kill("STICKY_GRENADE_KILL", 34), 39,
+        blast_radius=float(getattr(C, "STICKY_GRENADE_EXPLOSION_RADIUS", 5.0))),
+    int(getattr(C, "MINE_LAUNCHER_TOOL", 58)): ProjectileSpec(
+        "mine_projectile", "deploy", 1.0,
+        float(getattr(C, "LANDMINE_EXPLOSION_DAMAGE", 100.0)),
+        float(getattr(C, "LANDMINE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
+        _kill("MINE_KILL", 35), 40,
+        blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0))),
     int(getattr(C, "CHEMICALBOMB_TOOL", 54)): ProjectileSpec(
-        "chemical_bomb", "bounce", 1.0, 50.0, 0.0,
-        _kill("CHEMICALBOMB_KILL", 31), 6, approximate=True),
+        "chemical_bomb", "contact", 1.0,
+        float(getattr(C, "CHEMICALBOMB_EXPLOSION_DAMAGE", 50.0)),
+        float(getattr(C, "CHEMICALBOMB_EXPLOSION_BLOCK_DAMAGE", 3.0)),
+        _kill("CHEMICALBOMB_KILL", 31), 6,
+        blast_radius=float(getattr(C, "CHEMICALBOMB_EXPLOSION_RADIUS", 3.0))),
+    int(getattr(C, "GRENADE_LAUNCHER_WEAPON_TOOL", 55)): ProjectileSpec(
+        "gl_grenade", "contact", 1.0,
+        float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_DAMAGE", 100.0)),
+        float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_BLOCK_DAMAGE", 6.0)),
+        _kill("GRENADE_LAUNCHER_KILL", 32), 37,
+        lifespan=float(getattr(C, "GRENADE_LAUNCHER_PROJECTILE_LIFESPAN", 3.0)),
+        blast_radius=float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_RADIUS", 4.0))),
 }
 
 
 class Projectile:
     __slots__ = ("spec", "tool", "x", "y", "z", "vx", "vy", "vz",
                  "explode_at", "thrower_id", "stuck", "spawned_at",
-                 "lifespan_at", "entity_id")
+                 "lifespan_at", "entity_id", "contact_block",
+                 "attached_player_id")
 
     def __init__(self, spec, tool, pos, vel, fuse, thrower_id, now):
         self.spec = spec
@@ -157,6 +191,8 @@ class Projectile:
         self.thrower_id = int(thrower_id)
         self.stuck = False
         self.entity_id = 0     # wire entity id (0 = none), set by the server
+        self.contact_block = None
+        self.attached_player_id = None
 
 
 class Explosion:
@@ -177,6 +213,26 @@ class Explosion:
             self.block_damage = proj.spec.block_damage
 
 
+class ProjectileDeployment:
+    """A launched mine that contacted terrain and becomes a placed entity."""
+    __slots__ = ("x", "y", "z", "thrower_id", "spec", "entity_id")
+
+    def __init__(self, proj: Projectile):
+        self.x, self.y, self.z = proj.x, proj.y, proj.z
+        self.thrower_id = proj.thrower_id
+        self.spec = proj.spec
+        self.entity_id = proj.entity_id
+
+
+class DrillContact:
+    """A drill pressed against a solid voxel; it damages it and remains live."""
+    __slots__ = ("projectile", "block")
+
+    def __init__(self, projectile: Projectile, block):
+        self.projectile = projectile
+        self.block = tuple(int(value) for value in block)
+
+
 class ProjectileEngine:
     """Owns in-flight projectiles; update() advances them one tick and returns
     the explosions the caller must apply (blast + crater + broadcast)."""
@@ -195,7 +251,7 @@ class ProjectileEngine:
         # (drill also dies at its lifespan). Bounce uses the client fuse.
         # Sticky: the client sends value=0 (measured live 2026-07-07) — the
         # fuse ARMS when it sticks (STICK_ARM_SECONDS), not at throw.
-        if spec.behavior == "contact":
+        if spec.behavior in ("contact", "deploy"):
             fuse = None
         elif spec.behavior == "stick" and fuse <= 0.0:
             fuse = None
@@ -217,7 +273,8 @@ class ProjectileEngine:
         self.projectiles.append(p)
         return p
 
-    def update(self, dt: float, world, now: Optional[float] = None) -> list[Explosion]:
+    def update(self, dt: float, world, now: Optional[float] = None,
+               players=()) -> list:
         if not self.projectiles:
             return []
         if now is None:
@@ -234,15 +291,38 @@ class ProjectileEngine:
                 continue
 
             if p.stuck:
+                if p.attached_player_id is not None:
+                    target = next(
+                        (candidate for candidate in players
+                         if int(getattr(candidate, "id", -1)) == p.attached_player_id
+                         and getattr(candidate, "alive", False)
+                         and getattr(candidate, "spawned", False)),
+                        None,
+                    )
+                    if target is not None:
+                        p.x = float(target.x)
+                        p.y = float(target.y)
+                        p.z = float(target.z) + 1.0
                 still.append(p)
                 continue
 
-            if p.spec.behavior == "contact":
-                if self._advance_contact(p, dt, world):
-                    explosions.append(Explosion(p))
+            if p.spec.behavior in ("contact", "deploy"):
+                collision_players = players if p.spec.behavior == "contact" else ()
+                contact = self._advance_contact(p, dt, world, collision_players)
+                if contact:
+                    if p.spec.name == "drill" and contact == "world":
+                        explosions.append(DrillContact(p, p.contact_block))
+                        still.append(p)
+                        continue
+                    if p.spec.behavior == "deploy":
+                        explosions.append(ProjectileDeployment(p))
+                    else:
+                        explosions.append(Explosion(p))
                     continue
             else:
-                hit = self._advance_bounce(p, dt, world)
+                hit = self._advance_bounce(
+                    p, dt, world, players if p.spec.behavior == "stick" else ()
+                )
                 if hit and p.spec.behavior == "stick":
                     p.vx = p.vy = p.vz = 0.0
                     p.stuck = True
@@ -260,7 +340,7 @@ class ProjectileEngine:
 
     # -- movers ----------------------------------------------------------
 
-    def _advance_bounce(self, p: Projectile, dt: float, world) -> bool:
+    def _advance_bounce(self, p: Projectile, dt: float, world, players=()) -> bool:
         """EXACT legacy grenade math (verified vs the compiled client):
         gravity 30*dt on vz, displacement vel*dt, axis-separated reflection,
         whole-velocity x0.36 damp on any hit. Returns True if it hit."""
@@ -291,14 +371,31 @@ class ProjectileEngine:
             p.vy *= BOUNCE_DAMP
             p.vz *= BOUNCE_DAMP
 
+        if not hit and players:
+            contact = self._first_player_contact(
+                (x, y, z), (nx, ny, nz), players, p.thrower_id
+            )
+            if contact is not None:
+                hit_t, target = contact
+                nx = x + (nx - x) * hit_t
+                ny = y + (ny - y) * hit_t
+                nz = z + (nz - z) * hit_t
+                p.attached_player_id = int(target.id)
+                hit = True
+
         p.x, p.y, p.z = nx, ny, nz
         return hit
 
-    def _advance_contact(self, p: Projectile, dt: float, world) -> bool:
-        """Straight flight under scaled gravity; explode on first solid cell.
+    def _advance_contact(self, p: Projectile, dt: float, world, players=()):
+        """Straight flight; explode on the first voxel or player volume.
+
         Sub-stepped so fast rockets can't tunnel through thin walls (max
-        CONTACT_STEP blocks of travel per collision test)."""
+        CONTACT_STEP blocks of travel per collision test). Player collision is
+        swept over every sub-step too, so a fast RPG2 cannot pass completely
+        through a character between two samples.
+        """
         p.vz += BASE_GRAVITY * p.spec.gravity_mult * dt
+        p.contact_block = None
         speed = (p.vx ** 2 + p.vy ** 2 + p.vz ** 2) ** 0.5
         if speed > MAX_SPEED:
             k = MAX_SPEED / speed
@@ -311,14 +408,96 @@ class ProjectileEngine:
         sy = p.vy * dt / steps
         sz = p.vz * dt / steps
         for _ in range(steps):
+            ox, oy, oz = p.x, p.y, p.z
             nx, ny, nz = p.x + sx, p.y + sy, p.z + sz
             if world.get_solid(int(nx), int(ny), int(nz)):
+                p.contact_block = (int(nx), int(ny), int(nz))
                 # Explode AT the cell face we hit — keep the last free position
                 # so the crater centers on the wall surface, not inside it.
-                return True
+                return "world"
+            hit_t = self._first_player_hit(
+                (ox, oy, oz), (nx, ny, nz), players, p.thrower_id
+            )
+            if hit_t is not None:
+                # Place the explosion at the entry point of the character's
+                # swept volume, rather than behind the target.
+                p.x = ox + (nx - ox) * hit_t
+                p.y = oy + (ny - oy) * hit_t
+                p.z = oz + (nz - oz) * hit_t
+                return "player"
             p.x, p.y, p.z = nx, ny, nz
         # Out-of-world safety: kill anything that left the map or fell below
         # the waterline floor so the list can't grow unbounded.
         if not (0.0 <= p.x < 512.0 and 0.0 <= p.y < 512.0 and -64.0 < p.z < 300.0):
-            return True
-        return False
+            return "bounds"
+        return None
+
+    @staticmethod
+    def _first_player_hit(start, end, players, thrower_id: int):
+        contact = ProjectileEngine._first_player_contact(
+            start, end, players, thrower_id
+        )
+        return None if contact is None else contact[0]
+
+    @staticmethod
+    def _first_player_contact(start, end, players, thrower_id: int):
+        """Return the earliest segment/AABB entry among live player bodies.
+
+        The stock character collision radius is 0.45. Contact projectiles use
+        a 0.5 collision range; expanding the body by both values is the
+        Minkowski sum of the body and projectile probe. Z grows downward in
+        AoS, from the player's head position to the supporting ground.
+        """
+        expand = float(getattr(C, "PLAYER_RADIUS", 0.45)) + CONTACT_STEP
+        closest = None
+        closest_target = None
+        for target in players:
+            if int(getattr(target, "id", -1)) == int(thrower_id):
+                continue
+            if not getattr(target, "alive", False) or not getattr(target, "spawned", False):
+                continue
+            crouched = bool(getattr(getattr(target, "input", None), "crouch", False))
+            height = float(getattr(
+                C,
+                "PLAYER_CROUCHING_HEIGHT" if crouched else "PLAYER_STANDING_HEIGHT",
+                1.8 if crouched else 2.7,
+            ))
+            bounds_min = (
+                float(target.x) - expand,
+                float(target.y) - expand,
+                float(target.z) - CONTACT_STEP,
+            )
+            bounds_max = (
+                float(target.x) + expand,
+                float(target.y) + expand,
+                float(target.z) + height + CONTACT_STEP,
+            )
+            entry = ProjectileEngine._segment_aabb_entry(
+                start, end, bounds_min, bounds_max
+            )
+            if entry is not None and (closest is None or entry < closest):
+                closest = entry
+                closest_target = target
+        if closest is None:
+            return None
+        return closest, closest_target
+
+    @staticmethod
+    def _segment_aabb_entry(start, end, bounds_min, bounds_max):
+        """Slab intersection for a finite segment; returns entry t in [0,1]."""
+        enter, leave = 0.0, 1.0
+        for origin, finish, low, high in zip(start, end, bounds_min, bounds_max):
+            delta = finish - origin
+            if abs(delta) < 1e-12:
+                if origin < low or origin > high:
+                    return None
+                continue
+            t0 = (low - origin) / delta
+            t1 = (high - origin) / delta
+            if t0 > t1:
+                t0, t1 = t1, t0
+            enter = max(enter, t0)
+            leave = min(leave, t1)
+            if enter > leave:
+                return None
+        return enter

@@ -79,6 +79,9 @@ class BattleSpadesServer:
         # crates live here and reach clients via StateData (join) + CreateEntity.
         from server.entities.registry import EntityRegistry
         self.entity_registry = EntityRegistry()
+        # Active radar stations per owning team. TeamMapVisibility is sent
+        # only to teammates and reference-counted for overlapping stations.
+        self._radar_station_counts = {TEAM1: 0, TEAM2: 0}
         # Plugin system: loaded at startup, fired at the mode-event + tick
         # dispatch points below. Drop a *.py with a BasePlugin subclass in
         # plugins/ and it's auto-discovered.
@@ -192,13 +195,10 @@ class BattleSpadesServer:
                 continue
             if now - player.death_time < respawn_time:
                 continue
-            # Remove this player's grave (spawned in Player.die) before the
-            # body reappears.
-            grave_id = getattr(player, '_grave_entity_id', None)
-            if grave_id is not None:
-                if self.entity_registry.remove(grave_id) is not None:
-                    self.broadcast_destroy_entity(grave_id)
-                player._grave_entity_id = None
+            # Do not delete the grave here: stock graves explode after 7s,
+            # while the default respawn is 5s. GraveBehavior owns its complete
+            # fuse/destroy lifecycle. Only detach the new player life from it.
+            player._grave_entity_id = None
 
             # Apply a mid-game class/loadout change (SetClassLoadout while
             # alive) at the respawn boundary — original-server semantics.
@@ -299,9 +299,67 @@ class BattleSpadesServer:
 
     def _update_grenades(self, dt: float) -> None:
         """Advance all in-flight projectiles; apply any explosions."""
-        explosions = self.projectile_engine.update(dt, self.world_manager)
-        for ex in explosions:
-            self._explode_projectile(ex)
+        events = self.projectile_engine.update(
+            dt, self.world_manager, players=tuple(self.players.values())
+        )
+        from server.projectiles import DrillContact, ProjectileDeployment
+        for event in events:
+            if isinstance(event, DrillContact):
+                self._apply_drill_contact(event)
+            elif isinstance(event, ProjectileDeployment):
+                self._deploy_launched_mine(event)
+            else:
+                self._explode_projectile(event)
+
+    def _apply_drill_contact(self, event) -> None:
+        """Damage one obstructing voxel while keeping the drill alive."""
+        import shared.constants as C
+        owner = self.players.get(event.projectile.thrower_id)
+        if owner is None:
+            return
+        get_combat_system(self)._apply_block_damage(
+            owner,
+            event.block,
+            float(getattr(C, "DRILL_DRILLING_BLOCK_DAMAGE", 20.0)),
+            damage_type=int(getattr(C, "DRILL_DAMAGE", 10)),
+            causer_id=int(event.projectile.entity_id or owner.id),
+        )
+
+    def _deploy_launched_mine(self, event) -> None:
+        """Turn a Mine Launcher projectile's terrain contact into an armed,
+        replicated landmine. It uses the same behavior and stock constants as
+        a hand-placed Scout mine."""
+        owner = self.players.get(event.thrower_id)
+        if owner is None:
+            return
+        import shared.constants as C
+        from server.connection import internal_team_to_wire
+        from server.entities.behaviors import ProximityMineBehavior
+
+        behavior = ProximityMineBehavior(
+            owner.id,
+            owner.team,
+            damage=float(getattr(C, "LANDMINE_EXPLOSION_DAMAGE", 100.0)),
+            block_damage=float(getattr(C, "LANDMINE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
+            crater_radius=1,
+            kill_type=int(getattr(C.KILL, "MINE_KILL", 35)),
+            trigger_radius=float(getattr(C, "LANDMINE_DETECTION_RANGE", 2.5)),
+            arm_delay=float(getattr(C, "LANDMINE_ACTIVATION_TIMER", 4.0)),
+            blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)),
+            force_destroy=False,
+            detection_layers=int(getattr(C, "LANDMINE_DETECTION_LAYERS", 3)),
+        )
+        ent = self.entity_registry.place(
+            int(getattr(C, "LANDMINE_ENTITY", 9)),
+            event.x, event.y, event.z,
+            state=internal_team_to_wire(owner.team),
+            kind="deployable", player_id=owner.id, behavior=behavior,
+        )
+        self.broadcast_create_entity(ent)
+        logger.info(
+            "MINE LAUNCHER deployed mine id=%d for %s at (%.1f,%.1f,%.1f)",
+            ent.entity_id, owner.name, event.x, event.y, event.z,
+        )
 
     def _explode_projectile(self, ex) -> None:
         """Detonate a projectile: crater a 3x3x3 block cube (damage-gated for
@@ -459,6 +517,37 @@ class BattleSpadesServer:
                 connection.send(bytes(pkt.generate()), reliable=True)
             except Exception:
                 logger.debug("reveal entity send failed", exc_info=True)
+
+        player = getattr(connection, "player", None)
+        if player is not None and self._radar_station_counts.get(player.team, 0) > 0:
+            self._send_radar_visibility(player, True)
+
+    def _send_radar_visibility(self, player, visible: bool) -> None:
+        """Expose the enemy team on one teammate's minimap."""
+        from shared.packet import TeamMapVisibility
+        enemy_team = TEAM2 if player.team == TEAM1 else TEAM1
+        packet = TeamMapVisibility()
+        packet.team_id = int(enemy_team)
+        packet.visible = int(bool(visible))
+        player.send(bytes(packet.generate()), reliable=True)
+
+    def _radar_station_added(self, team: int) -> None:
+        team = int(team)
+        count = int(self._radar_station_counts.get(team, 0)) + 1
+        self._radar_station_counts[team] = count
+        if count == 1:
+            for player in self.players.values():
+                if player.team == team:
+                    self._send_radar_visibility(player, True)
+
+    def _radar_station_removed(self, team: int) -> None:
+        team = int(team)
+        count = max(0, int(self._radar_station_counts.get(team, 0)) - 1)
+        self._radar_station_counts[team] = count
+        if count == 0:
+            for player in self.players.values():
+                if player.team == team:
+                    self._send_radar_visibility(player, False)
 
     def broadcast_create_entity(self, map_entity) -> None:
         """Announce a placed entity (crate/intel/...) to all clients."""

@@ -41,6 +41,15 @@ def test_create_entity_roundtrip():
     assert abs(ent.pos_z - 60.0) < 0.02
 
 
+def test_create_entity_preserves_attachment_face():
+    reg = EntityRegistry()
+    e = reg.place(C.C4_ENTITY, 100.0, 200.0, 60.0, face=2)
+    pkt = CreateEntity()
+    pkt.set_entity(e.to_wire_entity())
+    back = CreateEntity(ByteReader(bytes(pkt.generate())[1:]))
+    assert back.entity.face == 2
+
+
 def test_destroy_entity_roundtrip():
     reg = EntityRegistry()
     e = reg.place(C.AMMO_CRATE, 1, 2, 3)
