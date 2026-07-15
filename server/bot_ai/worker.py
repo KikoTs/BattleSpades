@@ -1021,12 +1021,12 @@ class BotBrain:
             contact=contact is not None,
             stimulus=audible is not None,
         )
-        if branch == "engage" and target is not None:
-            return self._engage(frame, observer, target, state, profile, now)
-
         recovery = self._stuck_recovery(frame, observer, state, now)
         if recovery is not None:
             return recovery
+
+        if branch == "engage" and target is not None:
+            return self._engage(frame, observer, target, state, profile, now)
 
         medic = self._medic_support_intent(frame, observer, state, now)
         if medic is not None:
@@ -2495,12 +2495,28 @@ class BotBrain:
         dy = target.position[1] - observer.position[1]
         distance = math.hypot(dx, dy)
         direct = _normalized_xy(dx, dy)
-        if distance <= 6.0:
+        local_step = None
+        action_planner = getattr(self.world, "action_planner", None)
+        if distance <= 24.0 and action_planner is not None:
+            local_step = action_planner.plan_local(
+                observer.position,
+                target.position,
+                abilities=self._movement_abilities(observer),
+                topology_version=frame.topology_version,
+            )
+        if local_step is not None:
+            movement = local_step.direction
+            state.last_path_direction = movement
+            state.last_affordance = local_step.affordance
+            state.path_goal = target.position
+            state.path_topology_version = int(frame.topology_version)
+        elif distance <= 6.0:
             # Detour correctly ends at the nearest walkable polygon, but a
-            # living target's occupied cell is not itself a path endpoint.
-            # Direct contact steering closes the final body-width gap instead
-            # of idling just outside the hand ray.
+            # same-height living target's occupied cell is not itself a path
+            # endpoint. Direct steering is only the fail-safe after the local
+            # height-aware planner finds no topology action.
             movement = direct
+            state.last_path_direction = movement
             state.last_affordance = MovementAffordance.WALK
         else:
             movement = self._path_direction(
@@ -2573,7 +2589,10 @@ class BotBrain:
             movement=MovementIntent(
                 direction=movement,
                 jump=jump,
-                sprint=True,
+                sprint=(
+                    state.last_affordance is MovementAffordance.WALK
+                    and distance > 3.0
+                ),
                 affordance=state.last_affordance,
             ),
             look=LookIntent(
