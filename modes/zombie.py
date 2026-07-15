@@ -66,13 +66,19 @@ class ZombieMode(BaseMode):
         super().__init__(server)
         md = mode_data.get("zom")
         overlay = getattr(server.config, "mode_settings", {}).get("zom", {})
-        self.score_limit = int(overlay.get("score_limit", md.default_score_limit))
-        self.time_limit = float(overlay.get("time_limit", CG.ZOM_ROUND_TIME))
+        self.score_limit = int(overlay.get(
+            "score_limit",
+            server.config.game_rules.get("RULE_ZOMBIE_NOOF_ROUNDS"),
+        ))
+        self.time_limit = server.config.configured_time_limit(
+            "zom", CG.ZOM_ROUND_TIME
+        )
         self.infection_delay = float(overlay.get(
             "infection_delay", CG.ZOM_TIME_BEFORE_FIRST_INFECTION
         ))
         self.first_infected_count = max(1, int(overlay.get(
-            "first_infected", CG.ZOM_NOOF_FIRST_INFECTION_ZOMBIES
+            "first_infected",
+            server.config.game_rules.get("RULE_NOOF_FIRST_INFECTED_ZOMBIES"),
         )))
         self.minimum_players = max(2, int(overlay.get("minimum_players", 2)))
         self.zombie_respawn_time = max(0.0, float(overlay.get(
@@ -304,6 +310,13 @@ class ZombieMode(BaseMode):
         """Force role-safe combat and leave minimap exposure event-driven."""
         packet.friendly_fire = 0
         packet.exposed_teams_always_on_minimap = 0
+        class_speed = float(
+            self.server.config.game_rules.get("RULE_CLASS_SPEED")
+        )
+        packet.movement_speed_multipliers = [
+            float(value) * class_speed
+            for value in packet.movement_speed_multipliers
+        ]
 
     def reveal_to(self, connection) -> None:
         """Replay the current last-survivor heart/marker to a late client."""

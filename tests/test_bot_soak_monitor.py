@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import shared.constants as C
 
@@ -18,7 +19,14 @@ from .test_bot_architecture import _player_snapshot
 from server.game_constants import TEAM1, TEAM2
 
 
-def _intent(frame_id: int, *, action=BotAction(), role="", jump=False):
+def _intent(
+    frame_id: int,
+    *,
+    action=BotAction(),
+    role="",
+    jump=False,
+    direction=(0.0, 0.0, 0.0),
+):
     return BotIntent(
         bot_id=1,
         bot_generation=1,
@@ -28,7 +36,7 @@ def _intent(frame_id: int, *, action=BotAction(), role="", jump=False):
         topology_version=0,
         created_at=float(frame_id),
         expires_at=float(frame_id) + 1.0,
-        movement=MovementIntent(jump=jump),
+        movement=MovementIntent(direction=direction, jump=jump),
         action=action,
         debug_role=role,
     )
@@ -121,3 +129,68 @@ def test_monitor_flags_zero_motion_resource_navigation_stall_once() -> None:
         )
 
     assert monitor.summary()["navigation_stalls"] == 1
+
+
+def test_monitor_flags_commanded_motion_without_displacement() -> None:
+    monitor = BotSoakMonitor(loop_seconds=1.0)
+    observer = _player_snapshot(1, TEAM1, (10.0, 10.0, 10.0), is_bot=True)
+
+    for index in range(6):
+        monitor.observe(
+            index * 0.5,
+            observer,
+            _intent(
+                index + 1,
+                role="team_assault_enemy_side",
+                direction=(1.0, 0.0, 0.0),
+            ),
+            (observer,),
+        )
+
+    assert monitor.summary()["navigation_stalls"] == 1
+
+
+def test_monitor_flags_small_travel_oscillation_without_route_progress() -> None:
+    monitor = BotSoakMonitor(loop_seconds=1.0)
+    base = _player_snapshot(1, TEAM1, (10.0, 10.0, 10.0), is_bot=True)
+
+    for index in range(15):
+        observer = replace(
+            base,
+            position=(10.0 + float(index % 2), 10.0, 10.0),
+        )
+        monitor.observe(
+            index * 0.5,
+            observer,
+            _intent(
+                index + 1,
+                role="team_assault_enemy_side",
+                direction=(1.0 if index % 2 == 0 else -1.0, 0.0, 0.0),
+            ),
+            (observer,),
+        )
+
+    assert monitor.summary()["navigation_stalls"] == 1
+
+
+def test_accelerated_soak_settles_actor_after_support_collapse() -> None:
+    from scripts.bot_city_soak import CitySoak
+
+    soak = object.__new__(CitySoak)
+    soak.world = SimpleNamespace(
+        solid=lambda x, y, z: (int(x), int(y), int(z)) == (5, 5, 20)
+    )
+    actor = SimpleNamespace(
+        alive=True,
+        wade=False,
+        position=(5.5, 5.5, 10.75),
+        grounded=False,
+        airborne_until=99.0,
+    )
+    soak.actors = [actor]
+
+    soak._settle_falling_actors()
+
+    assert actor.position == (5.5, 5.5, 17.75)
+    assert actor.grounded is True
+    assert actor.airborne_until == 0.0

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from shared.bytes import ByteReader
-from shared.packet import ChatMessage, WorldUpdate
+from shared.packet import ChatMessage, LocalisedMessage, WorldUpdate
 from server.connection import Connection, logger as connection_logger
 from server.config import ServerConfig
 from server.main import BattleSpadesServer
@@ -39,7 +39,7 @@ class _WorldConnection:
         self.sent.append((data, reliable))
 
 
-def test_plugin_system_message_uses_the_stock_chat_packet():
+def test_plugin_broadcast_uses_the_stock_top_screen_lane():
     server = BattleSpadesServer.__new__(BattleSpadesServer)
     sent = []
     server.broadcast = lambda data, **_kwargs: sent.append(data)
@@ -48,8 +48,56 @@ def test_plugin_system_message_uses_the_stock_chat_packet():
 
     packet = ChatMessage(ByteReader(sent[0][1:]))
     assert packet.player_id == 0xFF
-    assert packet.chat_type == 2
+    assert packet.chat_type == 3
     assert packet.value == "KikoTs is on a spree!"
+
+
+def test_freeform_broadcast_resolves_team_localisation_ids():
+    server = BattleSpadesServer.__new__(BattleSpadesServer)
+    sent = []
+    server.broadcast = lambda data, **_kwargs: sent.append(data)
+
+    asyncio.run(
+        server.broadcast_message(
+            "TEAM1_COLOR leads TEAM2_COLOR; TEAM_NEUTRAL is watching"
+        )
+    )
+
+    packet = ChatMessage(ByteReader(sent[0][1:]))
+    assert packet.value == "Blue leads Green; Neutral is watching"
+
+
+def test_freeform_broadcast_does_not_replace_identifier_substrings():
+    server = BattleSpadesServer.__new__(BattleSpadesServer)
+    sent = []
+    server.broadcast = lambda data, **_kwargs: sent.append(data)
+
+    asyncio.run(server.broadcast_message("MY_TEAM1_COLOR_THEME"))
+
+    packet = ChatMessage(ByteReader(sent[0][1:]))
+    assert packet.value == "MY_TEAM1_COLOR_THEME"
+
+
+def test_localised_broadcast_carries_template_parameters_to_top_screen():
+    server = BattleSpadesServer.__new__(BattleSpadesServer)
+    sent = []
+    server.broadcast = lambda data, **_kwargs: sent.append(data)
+
+    asyncio.run(
+        server.broadcast_localised_message(
+            "TEAM_DEFEAT",
+            ("TEAM1_COLOR",),
+            localise_parameters=True,
+            override_previous=True,
+        )
+    )
+
+    packet = LocalisedMessage(ByteReader(sent[0][1:]))
+    assert packet.chat_type == 3
+    assert packet.string_id == "TEAM_DEFEAT"
+    assert packet.parameters == ["TEAM1_COLOR"]
+    assert packet.localise_parameters == 1
+    assert packet.override_previous_message == 1
 
 
 def test_packet_details_are_not_parsed_when_trace_is_disabled():

@@ -901,9 +901,11 @@ def test_direct_block_destroy_refunds_one_block():
     assert builder.blocks == 11
     assert server.world_manager.get_solid(*block) is False
     # Removal rides Damage(37) with kill-damage (BlockBuild is add-only).
-    assert server.broadcast_packets[-1][0] == 37
+    damage_packets = [raw for raw in server.broadcast_packets if raw[0] == 37]
+    assert damage_packets
+    assert any(raw[0] == 23 for raw in server.broadcast_packets)
     from shared.packet import Damage
-    destroy_packet = Damage(ByteReader(server.broadcast_packets[-1][1:]))
+    destroy_packet = Damage(ByteReader(damage_packets[-1][1:]))
     assert destroy_packet.damage >= 31.0
     assert (int(destroy_packet.position[0]), int(destroy_packet.position[1]), int(destroy_packet.position[2])) == block
 
@@ -930,8 +932,10 @@ def test_spade_destroy_breaks_vertical_three_block_column():
     assert server.broadcast_packets
     # Every removal is a kill-damage Damage(37) — the only client destroy path.
     from shared.packet import Damage
-    assert all(packet_bytes[0] == 37 for packet_bytes in server.broadcast_packets)
-    for packet_bytes in server.broadcast_packets:
+    damage_packets = [raw for raw in server.broadcast_packets if raw[0] == 37]
+    assert damage_packets
+    assert any(raw[0] == 23 for raw in server.broadcast_packets)
+    for packet_bytes in damage_packets:
         destroy_packet = Damage(ByteReader(packet_bytes[1:]))
         assert destroy_packet.damage >= 31.0
 
@@ -1094,7 +1098,7 @@ def test_spade_mining_never_emits_crash_unsafe_shoot_feedback():
         make_shoot_packet(player, orientation=(1.0, 0.0, 0.0), seed=29),
     )
 
-    assert [raw[0] for raw in server.broadcast_packets] == [37]
+    assert [raw[0] for raw in server.broadcast_packets] == [37, 23]
 
 
 def test_legacy_superspade_liberate_uses_same_cube_and_one_native_damage():
@@ -1123,8 +1127,10 @@ def test_legacy_superspade_liberate_uses_same_cube_and_one_native_damage():
     assert all(not server.world_manager.get_solid(*pos) for pos in footprint)
     assert player.blocks == 27
     from shared.packet import Damage
-    assert len(server.broadcast_packets) == 1
-    damage = Damage(ByteReader(server.broadcast_packets[0][1:]))
+    damage_packets = [raw for raw in server.broadcast_packets if raw[0] == 37]
+    assert len(damage_packets) == 1
+    assert any(raw[0] == 23 for raw in server.broadcast_packets)
+    damage = Damage(ByteReader(damage_packets[0][1:]))
     assert damage.type == C.SUPERSPADE_DAMAGE
     assert tuple(int(value) for value in damage.position) == center
 
@@ -1659,4 +1665,5 @@ def test_raw_reversed_block_tool_id_can_destroy_blocks():
 
     assert server.world_manager.get_solid(*block) is False
     # Removal broadcast = Damage(37), the only client destroy path.
-    assert server.broadcast_packets[-1][0] == 37
+    assert any(raw[0] == 37 for raw in server.broadcast_packets)
+    assert any(raw[0] == 23 for raw in server.broadcast_packets)

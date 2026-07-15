@@ -27,6 +27,7 @@ from .messages import (
     BotAction,
     BotActionKind,
     BotIntent,
+    BotIntentPriority,
     BotProfile,
     EntitySnapshot,
     MapSnapshot,
@@ -135,6 +136,8 @@ class _RuntimeBot:
     next_perception_at: float = 0.0
     class_lives_remaining: int = 3
     action_primary: bool = False
+    action_secondary: bool = False
+    action_zoom: bool = False
     action_hover: bool = False
     action_primary_until_loop: int = -1
     movement_input: tuple[bool, bool, bool, bool, bool, bool, bool, bool] | None = None
@@ -146,6 +149,9 @@ class _RuntimeBot:
     pending_action_look: tuple[float, float, float] | None = None
     pending_action_visible: bool = False
     pending_action_deadline: float = 0.0
+    pending_action_priority: BotIntentPriority = BotIntentPriority.ROUTINE
+    pending_action_secondary: bool = False
+    pending_action_zoom: bool = False
     # Live target lock (fairness lease) and sustained-fire state.
     lock_player_id: int = -1
     lock_generation: int = 0
@@ -300,8 +306,9 @@ class BotDirector:
             if available_prefabs
             else []
         )
-        selection = normalize_class_selection(
-            selected_class, prefabs=selected_prefabs
+        from server.class_selection import normalize_server_selection
+        selection = normalize_server_selection(
+            self.server.config, selected_class, prefabs=selected_prefabs
         )
         prepare_selection = getattr(self.server.mode, "prepare_join_selection", None)
         if callable(prepare_selection):
@@ -697,6 +704,7 @@ class BotDirector:
                         is not None
                         else None
                     ),
+                    life_id=int(getattr(player, "deaths", 0)),
                 )
             )
         return tuple(snapshots)
@@ -931,6 +939,14 @@ class BotDirector:
                 or intent.frame_id <= runtime.last_intent_frame
             ):
                 continue
+            if (
+                runtime.pending_action is not None
+                and int(intent.priority) > int(runtime.pending_action_priority)
+            ):
+                # A pending dig/breach is allowed a short aim-convergence
+                # grace, but it must never survive a newer combat or survival
+                # interrupt and re-select the old terrain tool afterwards.
+                self._clear_pending_action(runtime)
             runtime.intent = intent
             runtime.last_intent_frame = int(intent.frame_id)
             look = intent.look
@@ -999,7 +1015,19 @@ class BotDirector:
                 <= runtime.action_primary_until_loop
             )
             self._set_action_state(
-                runtime, primary=held_primary, hover=False
+                runtime,
+                primary=held_primary,
+                secondary=(
+                    runtime.pending_action_secondary
+                    if runtime.pending_action is not None
+                    else False
+                ),
+                zoom=(
+                    runtime.pending_action_zoom
+                    if runtime.pending_action is not None
+                    else False
+                ),
+                hover=False,
             )
             return
         action_due = (
@@ -1051,6 +1079,16 @@ class BotDirector:
             )
         elif runtime.pending_action_look is not None:
             self._update_aim(runtime, runtime.pending_action_look, dt)
+        # Scope/secondary state must be authoritative before a converged FIRE
+        # executes below; otherwise the first sniper round is sent as hip fire
+        # and remote clients miss the beam for that shot.
+        self._set_action_state(
+            runtime,
+            primary=runtime.action_primary,
+            secondary=bool(intent.secondary_fire),
+            zoom=bool(intent.zoom),
+            hover=runtime.action_hover,
+        )
         self._try_pending_action(runtime, now)
         direction = intent.movement.direction
         if not self._waypoint_is_live(
@@ -1102,6 +1140,8 @@ class BotDirector:
             runtime,
             primary=jetpack_requested
             or primary_latched,
+            secondary=bool(intent.secondary_fire),
+            zoom=bool(intent.zoom),
             hover=jetpack_requested,
         )
 
@@ -1111,6 +1151,9 @@ class BotDirector:
         runtime.pending_action_look = None
         runtime.pending_action_visible = False
         runtime.pending_action_deadline = 0.0
+        runtime.pending_action_priority = BotIntentPriority.ROUTINE
+        runtime.pending_action_secondary = False
+        runtime.pending_action_zoom = False
 
     @staticmethod
     def _latch_action(runtime: _RuntimeBot, intent: BotIntent) -> None:
@@ -1125,6 +1168,9 @@ class BotDirector:
         runtime.pending_action_deadline = (
             float(intent.expires_at) + _ACTION_CONVERGENCE_GRACE
         )
+        runtime.pending_action_priority = BotIntentPriority(intent.priority)
+        runtime.pending_action_secondary = bool(intent.secondary_fire)
+        runtime.pending_action_zoom = bool(intent.zoom)
 
     @staticmethod
     def _pending_look_goal(
@@ -1432,7 +1478,12 @@ class BotDirector:
 
     @staticmethod
     def _set_action_state(
-        runtime: _RuntimeBot, *, primary: bool, hover: bool
+        runtime: _RuntimeBot,
+        *,
+        primary: bool,
+        secondary: bool = False,
+        zoom: bool = False,
+        hover: bool,
     ) -> None:
         """Update native action flags and the remote held-tool display bit.
 
@@ -1445,15 +1496,20 @@ class BotDirector:
         display = bool(runtime.player.alive and runtime.player.spawned)
         if (
             runtime.action_primary == primary
+            and runtime.action_secondary == secondary
+            and runtime.action_zoom == zoom
             and runtime.action_hover == hover
             and bool(runtime.player.input.can_display_weapon) == display
         ):
             return
         runtime.action_primary = primary
+        runtime.action_secondary = secondary
+        runtime.action_zoom = zoom
         runtime.action_hover = hover
         runtime.player.update_action_input(
             primary,
-            False,
+            secondary,
+            zoom=zoom,
             can_display_weapon=display,
             hover=hover,
         )
@@ -1555,7 +1611,11 @@ class BotDirector:
     ) -> bool:
         """Validate one body-width movement probe against current VXL state."""
 
-        if (
+        # On a two-block JUMP the destination support legitimately intersects
+        # the bot's *current* leg-height probe.  Validate the raised landing's
+        # two clear body cells below instead; treating that support as a wall
+        # erased the worker's correct jump affordance at the final live gate.
+        if affordance is not MovementAffordance.JUMP and (
             world.clipbox(probe_x, probe_y, float(player.z))
             or world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
         ):
@@ -1700,8 +1760,11 @@ class BotDirector:
                     if available
                     else ()
                 )
-                selection = normalize_class_selection(
-                    selected_class, prefabs=selected_prefabs
+                from server.class_selection import normalize_server_selection
+                selection = normalize_server_selection(
+                    self.server.config,
+                    selected_class,
+                    prefabs=selected_prefabs,
                 )
                 mode = getattr(self.server, "mode", None)
                 prepare = getattr(mode, "prepare_join_selection", None)

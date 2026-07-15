@@ -12,6 +12,13 @@ from .tdm import TDMMode
 from .arena import ArenaMode
 from .vip import VIPMode
 from .zombie import ZombieMode
+from .lobby_skeletons import (
+    DemolitionMode,
+    DiamondMineMode,
+    MultiHillMode,
+    OccupationMode,
+    TerritoryControlMode,
+)
 
 
 # Mode registry
@@ -25,6 +32,19 @@ _modes = {
     "vip": VIPMode,
     "zom": ZombieMode,
     "zombie": ZombieMode,
+    "mh": MultiHillMode,
+    "multihill": MultiHillMode,
+    "multi-hill": MultiHillMode,
+    "tc": TerritoryControlMode,
+    "territory_control": TerritoryControlMode,
+    "territory-control": TerritoryControlMode,
+    "dia": DiamondMineMode,
+    "diamond": DiamondMineMode,
+    "diamond_mine": DiamondMineMode,
+    "dem": DemolitionMode,
+    "demolition": DemolitionMode,
+    "oc": OccupationMode,
+    "occupation": OccupationMode,
 }
 
 
@@ -46,6 +66,11 @@ __all__ = [
     "ArenaMode",
     "VIPMode",
     "ZombieMode",
+    "MultiHillMode",
+    "TerritoryControlMode",
+    "DiamondMineMode",
+    "DemolitionMode",
+    "OccupationMode",
     "get_mode_class",
     "register_mode",
 ]

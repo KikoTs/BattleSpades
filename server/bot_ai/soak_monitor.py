@@ -39,8 +39,9 @@ class _BotState:
     jump_started_at: float | None = None
     jump_loop_reported: bool = False
     water_started_at: float | None = None
-    navigation_started_at: float | None = None
     navigation_stall_reported: bool = False
+    travel_anchor: Vector3 | None = None
+    travel_progress_at: float = 0.0
 
 
 class BotSoakMonitor:
@@ -144,27 +145,33 @@ class BotSoakMonitor:
             state.jump_loop_reported = False
 
         travel_role = self._is_travel_role(intent.debug_role)
-        moving = math.hypot(
-            intent.movement.direction[0], intent.movement.direction[1]
-        ) > 0.1
-        if (
-            travel_role
-            and not moving
-            and intent.action.kind is BotActionKind.NONE
-        ):
-            if state.navigation_started_at is None:
-                state.navigation_started_at = timestamp
+        if travel_role and intent.action.kind is BotActionKind.NONE:
+            if state.travel_anchor is None:
+                state.travel_anchor = observer.position
+                state.travel_progress_at = timestamp
+            elif self._distance(
+                state.travel_anchor, observer.position
+            ) >= max(4.0, self.progress_distance):
+                state.travel_anchor = observer.position
+                state.travel_progress_at = timestamp
                 state.navigation_stall_reported = False
-            elif (
-                not state.navigation_stall_reported
-                and timestamp - state.navigation_started_at >= self.loop_seconds
-                and stationary_for >= self.loop_seconds
+            region_stalled = (
+                timestamp - state.travel_progress_at
+                >= max(6.0, self.loop_seconds * 3.0)
+            )
+            physically_stalled = stationary_for >= self.loop_seconds
+            # A non-zero input is not proof of navigation. Check both complete
+            # immobility and bounded oscillation inside the same small region.
+            if (
+                (physically_stalled or region_stalled)
+                and not state.navigation_stall_reported
             ):
                 self._navigation_stalls += 1
                 state.navigation_stall_reported = True
         else:
-            state.navigation_started_at = None
             state.navigation_stall_reported = False
+            state.travel_anchor = None
+            state.travel_progress_at = 0.0
 
         # Position alone cannot distinguish the lowest legal dry surface from
         # the water plane across stock maps.  Production physics already

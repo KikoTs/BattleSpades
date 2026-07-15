@@ -1,10 +1,9 @@
 """Serialized, retail-client-safe match transitions.
 
-The stock client only consumes map and mode identity while constructing a new
-``GameScene``. Sending ``InitialInfo``/``StateData`` into a live scene, or
-replacing the server VXL underneath it, is a native crash hazard. This service
-therefore keeps same-map restarts in the live scene, while map/mode replacement
-gates gameplay and retires the old client session before the next handshake.
+The client only consumes map/mode identity while ``LoadingMenu`` constructs a
+new ``GameScene``.  Full transitions therefore pause the old scene with packet
+52, retain the authenticated ENet peer, and run a fresh loader handshake after
+the client enters that menu.  Same-map round restarts continue in-place.
 """
 
 from __future__ import annotations
@@ -12,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import dataclass
+import inspect
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from shared.constants import DISCONNECT
 from server.game_constants import CHAT_SYSTEM
-from shared.packet import ChatMessage
+from shared.packet import ChatMessage, MapEnded
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -123,6 +123,7 @@ class MatchTransitionService:
                 if mode is None:
                     return TransitionResult(False, "No active game mode")
                 await self._cancel_mode_end(mode)
+                self._reset_vote_state()
                 self._discard_old_timeline_work()
                 await mode._restart_round()
                 return TransitionResult(True, "Match restarted")
@@ -213,7 +214,7 @@ class MatchTransitionService:
         mode_name: str,
         candidate_world,
     ) -> TransitionResult:
-        """Commit one full-scene replacement and retire all old clients."""
+        """Commit one full-scene replacement over retained ENet peers."""
 
         mode_class = self._resolve_mode_class(mode_name)
         if mode_class is None:
@@ -227,24 +228,55 @@ class MatchTransitionService:
             old_world = server.world_manager
             old_map = str(server.config.default_map)
             old_mode_name = str(server.config.default_mode)
+            old_fog_override = getattr(server, "fog_color_override", None)
             try:
                 self._broadcast_notice(
-                    f"Loading {map_name} ({mode_name.upper()}); reconnecting match..."
+                    f"Loading {map_name} ({mode_name.upper()})..."
                 )
+                # Close any old overlay while GameScene can still render the
+                # CLOSED packet, and prevent a selected map leaking into the
+                # replacement round.
+                self._reset_vote_state()
 
-                # This gate is the crash boundary. Mode startup creates
-                # objectives/audio immediately, but none may enter an old
-                # GameScene whose mode tables and VXL belong to the prior match.
+                # MapEnded(52) freezes the compiled GameScene.  BattleSpades'
+                # lightweight client compatibility hook responds by opening
+                # LoadingMenu on the SAME GameClient; it is not a reconnect or
+                # an ENet disconnect packet (verified in gameScene.pyd).
+                server.broadcast(bytes(MapEnded().generate()))
+                host = getattr(server, "host", None)
+                if host is not None:
+                    host.flush()
+
+                # This is the crash boundary.  Detach the old Player objects
+                # immediately so late movement packets cannot be queued against
+                # the retired map while the client changes scenes.
                 for connection in connections:
                     connection.in_game = False
-
                 if old_mode is not None:
                     await self._cancel_mode_end(old_mode)
+                for connection in connections:
+                    await self._detach_transition_player(connection, old_mode)
+                if old_mode is not None:
                     deactivate = getattr(old_mode, "deactivate", None)
                     if callable(deactivate):
                         await deactivate()
-
                 self._discard_old_timeline_work()
+                grace = min(
+                    5.0,
+                    max(
+                        0.0,
+                        float(
+                            getattr(
+                                server.config,
+                                "transition_grace_seconds",
+                                1.25,
+                            )
+                        ),
+                    ),
+                )
+                if grace > 0.0:
+                    await asyncio.sleep(grace)
+
                 server.reset_round_runtime()
                 repair = getattr(server, "terrain_repair", None)
                 if repair is not None:
@@ -256,6 +288,9 @@ class MatchTransitionService:
                 if candidate_world is not None:
                     candidate_world.config = server.config
                     server.world_manager = candidate_world
+                # An admin fog command belongs to the retired map epoch. The
+                # replacement StateData must use its own authored atmosphere.
+                server.fog_color_override = None
 
                 for team in server.teams.values():
                     team.reset()
@@ -263,18 +298,46 @@ class MatchTransitionService:
                 server.mode = mode_class(server)
                 await server.mode.on_mode_start()
 
-                # ERROR_MATCH_ENDED is a defined, non-corruption disconnect.
-                # A new connection receives InitialInfo -> MapSync -> StateData
-                # in the only ordering the retail loader accepts.
-                for connection in connections:
+                # Each retained peer now receives the same loader ordering as
+                # an initial join.  Requiring MapDataValidation is important:
+                # it proves that peer actually entered LoadingMenu.  A clean
+                # stock client without the compatibility hook is retired
+                # individually instead of receiving VXL bytes in GameScene.
+                reloads = await asyncio.gather(
+                    *(connection.reload_scene() for connection in connections),
+                    return_exceptions=True,
+                )
+                failed_connections = []
+                for connection, outcome in zip(connections, reloads):
+                    if outcome is True:
+                        continue
+                    failed_connections.append(connection)
+                    if isinstance(outcome, BaseException):
+                        logger.warning(
+                            "scene reload failed for %s",
+                            getattr(
+                                getattr(connection, "peer", None),
+                                "address",
+                                "unknown",
+                            ),
+                            exc_info=(type(outcome), outcome, outcome.__traceback__),
+                        )
+                    else:
+                        logger.warning(
+                            "scene reload timed out for %s; retiring incompatible peer",
+                            getattr(
+                                getattr(connection, "peer", None),
+                                "address",
+                                "unknown",
+                            ),
+                        )
                     connection.disconnect(reason=int(DISCONNECT.ERROR_MATCH_ENDED))
-                host = getattr(server, "host", None)
                 if host is not None:
                     host.flush()
                 return TransitionResult(
                     True,
                     f"Session changed to {map_name} ({mode_name.upper()})",
-                    reconnect_required=bool(connections),
+                    reconnect_required=bool(failed_connections),
                 )
             except Exception:
                 logger.exception(
@@ -285,6 +348,7 @@ class MatchTransitionService:
                 server.config.default_map = old_map
                 server.config.default_mode = old_mode_name
                 server.world_manager = old_world
+                server.fog_color_override = old_fog_override
                 server.mode = old_mode
                 for connection in connections:
                     connection.in_game = False
@@ -299,6 +363,36 @@ class MatchTransitionService:
                 )
             finally:
                 self.in_progress = False
+
+    async def _detach_transition_player(self, connection, old_mode) -> None:
+        """Retire one old-scene Player while preserving its network peer.
+
+        Mode ownership is released before deactivation; combat/entity credit,
+        team membership, and the global id slot are then removed atomically.
+        No ``PlayerLeft`` is broadcast because every human recipient is gated
+        and about to receive a complete roster in the new map handshake.
+        """
+        player = getattr(connection, "player", None)
+        if player is None:
+            return
+
+        on_leave = getattr(old_mode, "on_player_leave", None)
+        if callable(on_leave):
+            result = on_leave(player)
+            if inspect.isawaitable(result):
+                await result
+
+        lifecycle = getattr(self.server, "round_lifecycle", None)
+        forget = getattr(lifecycle, "forget_player", None)
+        if callable(forget):
+            forget(player)
+        team = self.server.teams.get(getattr(player, "team", None))
+        if team is not None:
+            team.remove_player(player)
+        player_id = getattr(player, "id", None)
+        if self.server.players.get(player_id) is player:
+            self.server.players.pop(player_id, None)
+        connection.player = None
 
     async def _cancel_mode_end(self, mode) -> None:
         """Cancel a delayed victory task before another lifecycle mutates state."""
@@ -323,6 +417,17 @@ class MatchTransitionService:
             queue = getattr(self.server, name, None)
             if queue is not None:
                 queue.clear()
+
+    def _reset_vote_state(self) -> None:
+        """Close the old vote overlay and forget a pending next-map choice."""
+
+        vote_manager = getattr(self.server, "vote_manager", None)
+        cancel = getattr(vote_manager, "cancel", None)
+        if callable(cancel):
+            cancel()
+        consume = getattr(vote_manager, "consume_next_map", None)
+        if callable(consume):
+            consume()
 
     def _reset_map_journal(self) -> None:
         """Forget terrain replay packets belonging to a replaced VXL."""
@@ -400,11 +505,9 @@ class MatchTransitionService:
     def _broadcast_notice(self, message: str) -> None:
         """Send the final old-scene packet before gameplay is gated."""
 
-        packet = ChatMessage()
-        packet.player_id = 255
-        packet.chat_type = CHAT_SYSTEM
-        packet.value = message
-        self.server.broadcast(bytes(packet.generate()))
+        from server.announcements import broadcast_overlay
+
+        broadcast_overlay(self.server, message)
 
     @staticmethod
     def _send_private_notice(player, message: str) -> None:

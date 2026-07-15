@@ -178,6 +178,11 @@ class BattleSpadesServer:
         
         # World
         self.world_manager = WorldManager(config)
+        # /fog is a per-map live override. A full map/mode rollover clears it
+        # so the replacement scene receives its authored atmosphere again.
+        self.fog_color_override = None
+        from server.map_resources import MapResourceService
+        self.map_resources = MapResourceService(self)
         self.terrain_repair = TerrainRepairService(self)
         self.combat = CombatSystem(self)
         self.construction = ConstructionSafetyService(self)
@@ -217,9 +222,14 @@ class BattleSpadesServer:
         from pathlib import Path
         from server.plugin_loader import load_external_plugins
 
+        if not bool(getattr(self.config, "plugins_enabled", True)):
+            logger.info("Plugin loading disabled by configuration")
+            return
         loaded = await load_external_plugins(
             self.plugin_manager,
             Path(self.config.plugins_path),
+            allowlist=getattr(self.config, "plugin_allowlist", ()),
+            denylist=getattr(self.config, "plugin_denylist", ()),
         )
         if loaded:
             logger.info("Loaded %d plugin(s)", loaded)
@@ -774,6 +784,7 @@ class BattleSpadesServer:
             server=self,
             create=self.broadcast_create_entity,
             destroy=self.broadcast_destroy_entity,
+            move=self.broadcast_change_entity_position,
         )
 
     def _broadcast_create_player(self, player, spawn) -> None:
@@ -949,6 +960,23 @@ class BattleSpadesServer:
         pkt = CreateEntity()
         pkt.set_entity(map_entity.to_wire_entity())
         self.broadcast(bytes(pkt.generate()), reliable=True)
+
+    def broadcast_change_entity_position(self, map_entity) -> None:
+        """Move an existing static entity without duplicate create/destroy.
+
+        Packet 16 action 1 is ``SET_POSITION`` in the retail client.  It is
+        reliable because a missed pickup fall would leave different collision
+        targets and bot/resource state on different peers.
+        """
+        from shared.packet import ChangeEntity
+
+        packet = ChangeEntity()
+        packet.entity_id = int(map_entity.entity_id)
+        packet.action = 1
+        packet.pos_x = float(map_entity.x)
+        packet.pos_y = float(map_entity.y)
+        packet.pos_z = float(map_entity.z)
+        self.broadcast(bytes(packet.generate()), reliable=True)
 
     def spawn_projectile_entity(self, projectile, owner, pos, vel) -> None:
         """Create the visible client entity for a server-owned projectile."""
@@ -1422,21 +1450,50 @@ class BattleSpadesServer:
     async def broadcast_message(
         self,
         message: str,
-        chat_type: int = CHAT_SYSTEM,
+        chat_type: int | None = None,
     ) -> None:
-        """Broadcast a plugin/system chat notice on the gameplay thread.
+        """Broadcast a plugin/server notice on the top-screen HUD lane.
 
         Plugin hooks are asynchronous, so this compatibility API remains an
         awaitable even though packet construction and ENet queueing are both
         synchronous and non-blocking. Connecting clients remain gameplay-
         gated to avoid native scene-transition crashes.
+
+        ``chat_type`` remains as an explicit compatibility escape hatch.  A
+        caller that supplies it receives the historical ChatMessage routing;
+        the default is the retail ``CHAT_BIG`` overlay, never system chat.
         """
 
+        if chat_type is None:
+            from server.announcements import broadcast_overlay
+
+            broadcast_overlay(self, message)
+            return
         packet = ChatMessage()
         packet.player_id = 0xFF
         packet.chat_type = int(chat_type)
         packet.value = str(message)
         self.broadcast(bytes(packet.generate()))
+
+    async def broadcast_localised_message(
+        self,
+        string_id: str,
+        parameters=(),
+        *,
+        localise_parameters: bool = False,
+        override_previous: bool = False,
+    ) -> None:
+        """Broadcast a retail-localized top-screen announcement."""
+
+        from server.announcements import broadcast_localised_overlay
+
+        broadcast_localised_overlay(
+            self,
+            string_id,
+            parameters,
+            localise_parameters=localise_parameters,
+            override_previous=override_previous,
+        )
 
     def mark_map_snapshot_complete(self, connection) -> int:
         """Bind a joining connection to the terrain sequence represented by

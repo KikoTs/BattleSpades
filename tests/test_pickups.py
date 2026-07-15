@@ -118,3 +118,16 @@ def test_jetpack_crate_restock_refills_fuel_and_uses_type_six():
     assert player.jetpack_fuel == 100.0
     packet = Restock(ByteReader(connection.sent[-1][1:]))
     assert packet.player_id == player.id and packet.type == C.JETPACK_CRATE
+
+
+def test_physical_ammo_crate_uses_type_three_without_server_health_refill():
+    _server, player, connection = _server_player()
+    player.health = 41
+    connection.sent.clear()
+
+    player.restock_ammo(int(C.AMMO_CRATE))
+
+    packet = Restock(ByteReader(connection.sent[-1][1:]))
+    assert packet.player_id == player.id
+    assert packet.type == C.AMMO_CRATE
+    assert player.health == 41

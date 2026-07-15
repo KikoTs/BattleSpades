@@ -135,6 +135,26 @@ def _build_melee_profiles():
 MELEE_DIG_PROFILES = _build_melee_profiles()
 DEFAULT_MELEE_PROFILE = (2, 5.0, DIG_COLUMN)   # spade fallback
 
+# PlaySound(23) is needed for remote observers. The acting retail client plays
+# its own melee impact immediately, but Damage(37) alone does not consistently
+# produce the matching sample for another player (and bots have no local
+# client at all). Values are the live constants_audio SOUND_MAP ids.
+_BLOCK_HIT_SOUND_BY_DAMAGE = {
+    int(getattr(C, "PICKAXE_DAMAGE", 0)): 36,
+    int(getattr(C, "KNIFE_DAMAGE", 1)): 35,
+    int(getattr(C, "SPADE_DAMAGE", 2)): 33,
+    int(getattr(C, "SUPERSPADE_DAMAGE", 3)): 37,
+    int(getattr(C, "CLASSIC_SPADE_DAMAGE", 4)): 33,
+    int(getattr(C, "ZOMBIE_DAMAGE", 17)): 38,
+    int(getattr(C, "CROWBAR_DAMAGE", 26)): 34,
+    int(getattr(C, "UGC_PICKAXE_DAMAGE", 28)): 36,
+    int(getattr(C, "UGC_SUPERSPADE_DAMAGE", 29)): 37,
+    # Machete has no dedicated entry in this client's 61-id SOUND_MAP. Knife
+    # is the closest safe stock cue; arbitrary sound filenames cannot travel
+    # in PlaySound(23).
+    int(getattr(C, "MACHETE_DAMAGE", 35)): 35,
+}
+
 
 def _melee_dig_positions(block_pos, pattern):
     """Return the exact retail voxel footprint centered on ``block_pos``."""
@@ -204,6 +224,15 @@ class CombatSystem:
 
     def handle_shot(self, player, packet) -> bool:
         if not player.alive or not player.spawned:
+            return False
+        from server.game_rules import get_rules
+        if not get_rules(self.server.config).is_tool_enabled(
+            int(getattr(player, "tool", -1))
+        ):
+            return False
+        if bool(getattr(player, "pickup_burdensome", False)) and not bool(
+            getattr(getattr(self.server, "mode", None), "shoot_with_intel", False)
+        ):
             return False
         if not (player.is_weapon_tool() or player.is_spade_tool()):
             return False
@@ -431,10 +460,12 @@ class CombatSystem:
         )
 
     def handle_block_build(self, player, packet) -> bool:
+        from server.game_rules import get_rules
         if (
             not player.alive
             or not player.spawned
             or not self._ordinary_block_tool_selected(player)
+            or not get_rules(self.server.config).enabled("RULE_ENABLE_BLOCKS")
         ):
             return False
 
@@ -511,10 +542,12 @@ class CombatSystem:
         Explicit colored cells also avoid server SetColor packets changing the
         local player's held-block selection.
         """
+        from server.game_rules import get_rules
         if (
             not player.alive
             or not player.spawned
             or not self._ordinary_block_tool_selected(player)
+            or not get_rules(self.server.config).enabled("RULE_ENABLE_BLOCKS")
         ):
             return False
 
@@ -763,6 +796,11 @@ class CombatSystem:
     def handle_block_destroy(self, player, packet) -> bool:
         if not player.alive or not player.spawned:
             return False
+        from server.game_rules import get_rules
+        if not get_rules(self.server.config).is_tool_enabled(
+            int(getattr(player, "tool", -1))
+        ):
+            return False
 
         if player.is_block_tool():
             position = (int(packet.x), int(packet.y), int(packet.z))
@@ -888,6 +926,13 @@ class CombatSystem:
             return
         player.add_blocks(len(destroyed))
         self._broadcast_block_destroy(player, destroyed)
+        from server.audio import SND_DIG_HIT_BLOCK, play_sound
+        play_sound(
+            self.server,
+            SND_DIG_HIT_BLOCK,
+            position=position,
+            exclude=player,
+        )
 
     def _broadcast_entity_hit(self, entity, position) -> None:
         """Drive the compiled client's per-entity bullet impact path.
@@ -1027,6 +1072,15 @@ class CombatSystem:
             causer_id=causer_id,
         )
         self.server.broadcast(bytes(packet.generate()))
+        sound_id = _BLOCK_HIT_SOUND_BY_DAMAGE.get(int(packet.type))
+        if sound_id is not None:
+            from server.audio import play_sound
+            play_sound(
+                self.server,
+                sound_id,
+                position=block_pos,
+                exclude=player,
+            )
 
     def record_exact_block_destroy_catchup(self, player, positions,
                                            causer_id: int = None) -> None:

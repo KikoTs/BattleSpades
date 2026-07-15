@@ -20,6 +20,7 @@ from server.bot_ai.messages import (
     BotAction,
     BotActionKind,
     BotIntent,
+    BotIntentPriority,
     BotProfile,
     EntitySnapshot,
     LookIntent,
@@ -312,6 +313,81 @@ def test_motor_draws_worker_requested_weapon_before_reaction_finishes() -> None:
     director._apply_motor(runtime, now, 1.0 / 60.0)
 
     assert bot.tool == int(bot.weapon)
+
+
+def test_combat_intent_preempts_a_pending_terrain_swing() -> None:
+    """A recent threat must cancel an old dig before it reselects the spade."""
+
+    server, director, bot, runtime = _facing_fixture()
+    now = time.monotonic()
+    runtime.pending_action = BotAction(
+        BotActionKind.MELEE,
+        tool_id=int(C.SUPERSPADE_TOOL),
+        position=(bot.x + 1.0, bot.y, bot.z),
+    )
+    runtime.pending_action_priority = BotIntentPriority.TRAVERSAL
+    runtime.pending_action_deadline = now + 1.0
+    bot.set_tool(int(C.BLOCK_TOOL), raw=True)
+    combat = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=101,
+        map_epoch=director._map_epoch,
+        mode_epoch=director._mode_epoch,
+        topology_version=director._topology_version,
+        created_at=now,
+        expires_at=now + 0.25,
+        movement=MovementIntent(),
+        tool_id=int(bot.weapon),
+        priority=BotIntentPriority.COMBAT,
+    )
+
+    class _Supervisor:
+        @staticmethod
+        def drain_intents(limit: int = 12):
+            return [combat][:limit]
+
+    director.supervisor = _Supervisor()
+    director._drain_intents(now)
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert runtime.pending_action is None
+    assert bot.tool == int(bot.weapon)
+
+
+def test_scoped_bot_state_replicates_and_marks_shot_secondary() -> None:
+    server, director, bot, runtime = _facing_fixture(
+        class_id=int(C.CLASS_SCOUT)
+    )
+    now = time.monotonic()
+    captured = []
+    server.combat.handle_shot = lambda _player, packet: (
+        captured.append(packet) or True
+    )
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=102,
+        map_epoch=director._map_epoch,
+        mode_epoch=director._mode_epoch,
+        topology_version=director._topology_version,
+        created_at=now,
+        expires_at=now + 0.25,
+        movement=MovementIntent(),
+        look=LookIntent((bot.eye_x + 40.0, bot.eye_y, bot.eye_z), visible=True),
+        tool_id=int(bot.weapon),
+        action=BotAction(BotActionKind.FIRE, tool_id=int(bot.weapon)),
+        priority=BotIntentPriority.COMBAT,
+        secondary_fire=True,
+        zoom=True,
+    )
+
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert bot.input.secondary_fire is True
+    assert bot.input.zoom is True
+    assert bot.pack_action_flags() & 0x42 == 0x42
+    assert captured and captured[0].secondary == 1
 
 
 def test_damage_source_is_published_as_sanctioned_bot_perception() -> None:
@@ -745,6 +821,10 @@ def test_sniper_holds_stationary_in_band_and_backs_off_up_close() -> None:
     assert hold is not None
     assert hold.movement.direction == (0.0, 0.0, 0.0)
     assert hold.movement.crouch is True
+    assert hold.priority is BotIntentPriority.COMBAT
+    assert hold.secondary_fire is True
+    assert hold.zoom is True
+    assert hold.debug_role == "marksman_scoped_engage"
 
     close_enemy = _player_snapshot(2, 3, (15.0, 0.0, 0.0))
     retreat = brain.decide(_frame(3, observer, close_enemy))
@@ -1455,6 +1535,68 @@ def test_low_health_bot_prefers_nearest_live_health_crate() -> None:
     )
 
     assert BotBrain._resource_goal(frame, observer) == (8.0, 0.0, 0.0)
+
+
+def test_bot_abandons_one_uncollectable_pickup_after_three_seconds() -> None:
+    observer = replace(
+        _player_snapshot(1, 2, (0.0, 0.0, 0.0), is_bot=True),
+        health=25,
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=100.0,
+        mode_id="tdm",
+        players=(observer,),
+        entities=(
+            EntitySnapshot(1, int(C.HEALTH_CRATE), -1, -1, (8.0, 0.0, 0.0)),
+            EntitySnapshot(2, int(C.HEALTH_CRATE), -1, -1, (20.0, 0.0, 0.0)),
+        ),
+    )
+    state = _BrainState()
+
+    assert BotBrain._resource_goal(
+        frame, observer, state=state, now=100.0
+    ) == (8.0, 0.0, 0.0)
+    assert BotBrain._resource_goal(
+        frame, observer, state=state, now=102.99
+    ) == (8.0, 0.0, 0.0)
+    assert BotBrain._resource_goal(
+        frame, observer, state=state, now=103.01
+    ) == (20.0, 0.0, 0.0)
+    assert (1, (8.0, 0.0, 0.0)) in state.ignored_resources
+
+
+def test_fallen_pickup_position_is_a_fresh_resource_identity() -> None:
+    observer = replace(
+        _player_snapshot(1, 2, (0.0, 0.0, 0.0), is_bot=True), health=25
+    )
+    state = _BrainState(
+        ignored_resources={(1, (8.0, 0.0, 0.0))}
+    )
+    moved = EntitySnapshot(
+        1, int(C.HEALTH_CRATE), -1, -1, (8.0, 0.0, 12.0)
+    )
+    frame = PerceptionFrame(
+        frame_id=2,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=104.0,
+        mode_id="tdm",
+        players=(observer,),
+        entities=(moved,),
+    )
+
+    assert BotBrain._resource_goal(
+        frame, observer, state=state, now=104.0
+    ) == moved.position
 
 
 def test_entity_snapshot_publishes_live_explosive_hazards() -> None:

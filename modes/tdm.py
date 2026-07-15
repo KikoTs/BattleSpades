@@ -6,11 +6,8 @@ Two teams fight for kills until score or time limit is reached.
 import logging
 from typing import Optional, TYPE_CHECKING
 
-import shared.constants as C
-
 from server import mode_data
-from server.game_constants import KILL_HEADSHOT, MAX_HEALTH, TEAM_NEUTRAL, TEAM1, TEAM2
-from server.entities.behaviors import PickupCrateBehavior
+from server.game_constants import KILL_HEADSHOT, TEAM1, TEAM2
 
 from .base_mode import BaseMode
 
@@ -51,8 +48,12 @@ class TDMMode(BaseMode):
         md = mode_data.get(server.config.game_mode)
         # [modes.tdm] overlay from config.toml wins over the mode-data default.
         overlay = getattr(server.config, "mode_settings", {}).get("tdm", {})
-        self.score_limit = int(overlay.get("score_limit", md.default_score_limit))
-        self.time_limit = float(overlay.get("time_limit", md.default_time_limit))
+        self.score_limit = int(server.config.mode_rule(
+            "tdm", "score_limit", "RULE_TDM_SCORE_TARGET"
+        ))
+        self.time_limit = server.config.configured_time_limit(
+            "tdm", md.default_time_limit
+        )
         self.kill_points = int(overlay.get("kill_points", self.kill_points))
         self.headshot_bonus = int(overlay.get("headshot_bonus", self.headshot_bonus))
 
@@ -64,82 +65,10 @@ class TDMMode(BaseMode):
         for team in self.server.teams.values():
             team.reset()
 
-        self._place_crates()
-
         logger.info(
             "TDM mode started (score_limit=%d, time_limit=%.0fs)",
             self.score_limit, self.time_limit,
         )
-
-    def _place_crates(self):
-        """Spawn the map's ammo/health crates: a pair near each team's base
-        plus a couple at midfield, all on dry ground (reusing the spawn
-        anchoring so they never float over water). Registered + broadcast as
-        neutral entities the client renders and (later) players restock from."""
-        wm = getattr(self.server, "world_manager", None)
-        reg = getattr(self.server, "entity_registry", None)
-        if wm is None or reg is None:
-            return
-        for ent in reg.all():
-            if getattr(ent, "kind", "") != "projectile":
-                self.server.broadcast_destroy_entity(ent.entity_id)
-        reg.clear()
-
-        # Three crate types per base + midfield, spaced 8 blocks apart so the
-        # 2.5-block pickup radii can never overlap (overlap made one
-        # walk-through consume ammo AND health at once).
-        spots = []
-        for team in (TEAM1, TEAM2):
-            bx, by, _bz = wm.team_base_anchor(team)
-            spots.append((bx + 8.0, by))
-            spots.append((bx - 8.0, by))
-            spots.append((bx, by + 8.0))
-        spots.append((248.0, 256.0))
-        spots.append((256.0, 256.0))
-        spots.append((264.0, 256.0))
-
-        # One shared behavior instance per crate type (the entity is passed
-        # into each hook, so instances are reusable). Each crate refills ONLY
-        # its own resource; block crates top up the block inventory.
-        from server.audio import SND_CRATE, SND_HEALTHCRATE, SND_CRATE_BLOCKS
-        types = [C.AMMO_CRATE, C.HEALTH_CRATE, int(getattr(C, "BLOCK_CRATE", 5))]
-        behaviors = {
-            int(C.AMMO_CRATE): ("ammo", PickupCrateBehavior(
-                lambda p: p.restock_ammo(), respawn_delay=15.0,
-                sound_id=SND_CRATE)),
-            int(C.HEALTH_CRATE): ("health", PickupCrateBehavior(
-                lambda p: p.heal(MAX_HEALTH), respawn_delay=15.0,
-                sound_id=SND_HEALTHCRATE)),
-            int(getattr(C, "BLOCK_CRATE", 5)): ("block", PickupCrateBehavior(
-                lambda p: p.restock_blocks(), respawn_delay=15.0,
-                sound_id=SND_CRATE_BLOCKS)),
-            int(C.JETPACK_CRATE): ("jetpack", PickupCrateBehavior(
-                lambda p: p.restock_jetpack(), respawn_delay=15.0,
-                sound_id=SND_CRATE)),
-        }
-        authored = list(getattr(wm.map_metadata, "entities", []))
-        placements = [
-            (spec.x, spec.y, int(spec.entity_type)) for spec in authored
-            if int(spec.entity_type) in behaviors
-        ]
-        if not placements:
-            placements = [
-                (sx, sy, int(types[i % 3])) for i, (sx, sy) in enumerate(spots)
-            ]
-        placed = 0
-        for sx, sy, etype in placements:
-            x, y, z = wm.dry_surface_anchor(sx, sy)
-            kind, behavior = behaviors[etype]
-            ent = reg.place(etype, x, y, z, state=TEAM_NEUTRAL, kind=kind, behavior=behavior)
-            # Only put crates on the wire once the Entity format is verified
-            # against the compiled client (a mismatch crashes it). Registered
-            # server-side either way.
-            if getattr(self.server.config, "entities_wire_ready", False):
-                self.server.broadcast_create_entity(ent)
-            placed += 1
-        logger.info("TDM placed %d map crates%s", placed,
-                    "" if getattr(self.server.config, "entities_wire_ready", False)
-                    else " (not yet on wire — Entity format unverified)")
 
     async def on_player_kill(self, killer: 'Player', victim: 'Player', kill_type: int):
         """Award team + personal points for a cross-team kill and check win."""

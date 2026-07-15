@@ -6,8 +6,6 @@ Provides hooks for game events that modes can override.
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, List, Tuple
 
-from server.game_constants import CHAT_SYSTEM
-from shared.packet import ChatMessage
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -69,10 +67,21 @@ class BaseMode(ABC):
         play_gameplay_music(self.server)
         self._last_music_at = self.start_time
 
+        # Map resources belong to every ruleset, not just TDM. Mode-specific
+        # objectives are created by subclasses after this shared boundary.
+        map_resources = getattr(self.server, "map_resources", None)
+        if map_resources is not None:
+            map_resources.rebuild()
+
     async def on_mode_end(self, winner: Optional[int] = None):
         """Called when the mode ends — run the full end-of-round sequence
         (victory audio → stats screen → restart), not just a chat line."""
         self.ended = True
+        import time
+        vote_manager = getattr(self.server, "vote_manager", None)
+        ensure_vote = getattr(vote_manager, "ensure_map_vote", None)
+        if callable(ensure_vote):
+            ensure_vote(time.time())
         self.winner = winner
         await self._run_end_sequence(winner)
 
@@ -116,6 +125,17 @@ class BaseMode(ABC):
             if self.time_limit - self.elapsed_time <= TIMEOUT_MUSIC_SECONDS:
                 self._timeout_music_played = True
                 play_timeout_music(self.server)
+
+        # F1/F2/F3 are dedicated map-vote bindings in the shipped client.
+        # Present the ballot while the final minute is still playable.
+        if self.time_limit > 0:
+            from server.voting import MAP_VOTE_LEAD_SECONDS
+            remaining = self.time_limit - self.elapsed_time
+            if remaining <= MAP_VOTE_LEAD_SECONDS:
+                vote_manager = getattr(self.server, "vote_manager", None)
+                ensure_vote = getattr(vote_manager, "ensure_map_vote", None)
+                if callable(ensure_vote):
+                    ensure_vote(now)
 
         # Check time limit
         if self.time_limit > 0 and self.elapsed_time >= self.time_limit:
@@ -202,12 +222,29 @@ class BaseMode(ABC):
         return self.server.world_manager.get_spawn_point(player.team)
     
     async def broadcast_message(self, message: str):
-        """Broadcast a system message to all players."""
-        packet = ChatMessage()
-        packet.player_id = 255  # System message
-        packet.chat_type = CHAT_SYSTEM
-        packet.value = message
-        self.server.broadcast(bytes(packet.generate()))
+        """Broadcast a free-form message in the retail top-screen lane."""
+        from server.announcements import broadcast_overlay
+
+        broadcast_overlay(self.server, message)
+
+    async def broadcast_localised_message(
+        self,
+        string_id: str,
+        parameters=(),
+        *,
+        localise_parameters: bool = False,
+        override_previous: bool = False,
+    ):
+        """Broadcast a string-table template in the retail top-screen lane."""
+        from server.announcements import broadcast_localised_overlay
+
+        broadcast_localised_overlay(
+            self.server,
+            string_id,
+            parameters,
+            localise_parameters=localise_parameters,
+            override_previous=override_previous,
+        )
     
     async def check_win_condition(self) -> Optional[int]:
         """
@@ -224,7 +261,9 @@ class BaseMode(ABC):
         if self.ended:
             return
         team = self.server.teams[winner]
-        await self.broadcast_message(f"{team.name} wins!")
+        await self.broadcast_localised_message(
+            "TEAM_DEFEAT", (team.name,), localise_parameters=True
+        )
         await self.on_mode_end(winner)
 
     async def _end_by_time(self):
@@ -244,7 +283,9 @@ class BaseMode(ABC):
         if scores[0][1] > scores[1][1]:
             winner = scores[0][0]
             team = self.server.teams[winner]
-            await self.broadcast_message(f"Time's up! {team.name} wins!")
+            await self.broadcast_localised_message(
+                "TEAM_DEFEAT", (team.name,), localise_parameters=True
+            )
         else:
             await self.broadcast_message("Time's up! It's a draw!")
             winner = None
@@ -294,7 +335,13 @@ class BaseMode(ABC):
             if transition is None:
                 await self._restart_round()
             else:
-                result = await transition.restart_round()
+                vote_manager = getattr(self.server, "vote_manager", None)
+                consume_map = getattr(vote_manager, "consume_next_map", None)
+                next_map = consume_map() if callable(consume_map) else None
+                if next_map:
+                    result = await transition.change_map(next_map)
+                else:
+                    result = await transition.restart_round()
                 if not result.ok:
                     raise RuntimeError(result.message)
         except Exception:

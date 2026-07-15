@@ -30,6 +30,20 @@ complete, some responsibilities remain methods of `BattleSpadesServer`; new
 code should respect these ownership boundaries instead of adding more unrelated
 work to that class.
 
+### Configuration, lobby, and rule catalog
+
+`ServerConfig` is the validated composition input. `server/lobby.py` is the
+descriptive retail Match Lobby catalog (ten modes, selectors, official map
+sets). `server/game_rules.py` owns the 102 recovered `RULE_*` definitions,
+legal values, class/tool mappings, and resolved values. Packet builders and
+gameplay domains receive the same config object; a handler must not carry a
+second hardcoded copy of a rule.
+
+Legacy `[game]` and `[modes.*]` settings are compatibility adapters at config
+load time. New work consumes `config.game_rules`, `config.mode_rule`, and
+`config.configured_time_limit`. Rule validation is startup work and never runs
+inside the 60 Hz tick.
+
 ### SimulationRuntime
 
 Owns the fixed-step clock, ENet event budget, gameplay-packet drain budget,
@@ -243,12 +257,11 @@ without forcing a risky movement rewrite at the same time.
   correct against another client's input history.
 - Prefer short invariant comments in code. Investigation history, rejected
   approaches, and reproduction evidence belong in
-  [ENGINEERING_NOTES.md](ENGINEERING_NOTES.md).
+  [HANDOFF.md](HANDOFF.md).
 
 ## Release gates
 
 An architecture change is incomplete until the full test suite passes, the
 production-config 50-player gate passes, and a clean retail client survives a
 movement plus round-reset scenario. Exact commands and acceptance thresholds
-are in [RUNBOOK.md](RUNBOOK.md) and
-[SERVER_PERFORMANCE.md](SERVER_PERFORMANCE.md).
+are in [RUNBOOK.md](RUNBOOK.md).

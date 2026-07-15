@@ -41,6 +41,7 @@ class EntityContext:
     server: object = None
     create: Optional[Callable] = None              # broadcast_create_entity
     destroy: Optional[Callable] = None             # broadcast_destroy_entity
+    move: Optional[Callable] = None                # ChangeEntity.SET_POSITION
 
 
 @dataclass
@@ -75,6 +76,12 @@ class MapEntity:
     # markers in the registry for mode logic, but never serialize them as a
     # runtime CreateEntity.
     wire_visible: bool = True
+    # Runtime-only terrain attachment for map pickups. Official sidecars may
+    # place a crate one to three voxels above (or at) its support voxel, so we
+    # retain that authored offset when a broken structure makes it fall.
+    terrain_support_z: Optional[int] = None
+    terrain_offset_z: float = 0.0
+    terrain_check_at: float = 0.0
 
     def to_wire_entity(self) -> Entity:
         ent = Entity()

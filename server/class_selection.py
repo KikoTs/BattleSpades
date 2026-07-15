@@ -181,6 +181,37 @@ def normalize_class_selection(
     )
 
 
+def normalize_server_selection(
+    config,
+    class_id: int,
+    loadout: Iterable[int] = (),
+    prefabs: Iterable[str] = (),
+    ugc_tools: Iterable[int] = (),
+    *,
+    fallback_class_id: int | None = None,
+    additionally_disabled: Iterable[int] = (),
+) -> ClassSelection:
+    """Normalize a selection against the active server rule catalog.
+
+    Packet handlers, joins, bots, and modes use this boundary when a concrete
+    server config is available.  The pure ``normalize_class_selection`` stays
+    useful for table tests and offline tooling.
+    """
+
+    from server.game_rules import get_rules
+
+    disabled = set(get_rules(config).selection_disabled_tools())
+    disabled.update(int(tool) for tool in additionally_disabled)
+    return normalize_class_selection(
+        class_id,
+        loadout,
+        prefabs,
+        ugc_tools,
+        fallback_class_id=fallback_class_id,
+        disabled_tools=disabled,
+    )
+
+
 def active_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:
     """Return whether an alive player may act with ``tool_id`` right now.
 
@@ -191,6 +222,12 @@ def active_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:
     """
 
     tool_id = int(tool_id)
+    server = getattr(getattr(player, "connection", None), "server", None)
+    if server is not None:
+        from server.game_rules import get_rules
+
+        if not get_rules(server.config).is_tool_enabled(tool_id):
+            return False
     return (
         bool(getattr(player, "alive", False))
         and bool(getattr(player, "spawned", False))

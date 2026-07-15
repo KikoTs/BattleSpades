@@ -10,7 +10,10 @@ import shared.constants as C
 
 from server.bot_ai.director import BotDirector
 from server.bot_ai.messages import (
+    BotActionKind,
     BotIntent,
+    BotIntentPriority,
+    MapSnapshot,
     MovementAffordance,
     MovementIntent,
     ObjectiveSnapshot,
@@ -22,6 +25,7 @@ from server.bot_ai.worker import BotBrain, WorkerVoxelWorld, _BrainState
 from server.config import ServerConfig
 from server.game_constants import TEAM1
 from server.main import BattleSpadesServer
+from server.world_manager import WorldManager
 
 
 def _solid_columns(
@@ -36,6 +40,93 @@ def test_open_waterbed_is_not_an_ordinary_standing_node() -> None:
     terrain = VoxelTerrain(_solid_columns({(10, 10): {239}}))
 
     assert terrain.standing_node(10, 10, 236.75) is None
+
+
+def test_mayan_base_voxel_replan_turns_through_stair_exit() -> None:
+    canonical = WorldManager(
+        ServerConfig(default_map="MayanJungle", maps_path="maps")
+    )
+    assert canonical.load_map("MayanJungle")
+    world = WorkerVoxelWorld()
+    world.load(
+        MapSnapshot(
+            1,
+            0,
+            bytes(canonical.map_raw_bytes or b""),
+            "tdm",
+            "MayanJungle",
+        )
+    )
+    abilities = frozenset(
+        {
+            MovementAffordance.CROUCH,
+            MovementAffordance.JUMP,
+            MovementAffordance.DROP,
+        }
+    )
+    goal = (447.63, 256.80, 206.75)
+
+    first = world.action_planner.plan_local(
+        (131.84, 233.51, 207.75),
+        goal,
+        abilities=abilities,
+        topology_version=0,
+    )
+    assert first is not None
+    second = world.action_planner.plan_local(
+        first.waypoint,
+        goal,
+        abilities=abilities,
+        topology_version=0,
+    )
+
+    assert first.direction == (1.0, 0.0, 0.0)
+    assert second is not None
+    assert second.direction == (0.0, 1.0, 0.0)
+
+
+def test_castlewars_water_exit_reaches_land_beyond_local_search_radius() -> None:
+    """A bot stranded in CastleWars' outer water must receive an exit step."""
+
+    world = WorldManager(
+        ServerConfig(default_map="CastleWars", maps_path="maps")
+    )
+    assert world.load_map("CastleWars")
+    planner = VoxelActionPlanner(VoxelTerrain(world.get_solid))
+
+    position = (511.5, 0.5, 236.75)
+    for _ in range(200):
+        if not world.is_water_column(int(position[0]), int(position[1])):
+            break
+        step = planner.water_exit(position)
+        assert step is not None
+        assert step.affordance is MovementAffordance.JUMP
+        position = step.waypoint
+    else:
+        raise AssertionError("CastleWars escape flow did not reach dry land")
+
+    assert world.is_water_column(int(position[0]), int(position[1])) is False
+
+
+def test_remote_terrain_delta_does_not_discard_cached_water_escape() -> None:
+    terrain = VoxelTerrain(
+        _solid_columns(
+            {
+                (10, 10): {239},
+                (11, 10): {239},
+                (12, 10): {238},
+            }
+        )
+    )
+    planner = VoxelActionPlanner(terrain)
+    assert planner.water_exit((10.5, 10.5, 236.75)) is not None
+    cached = dict(planner._water_next)
+
+    planner.invalidate_water_routes(frozenset({(400, 400)}))
+    assert planner._water_next == cached
+
+    planner.invalidate_water_routes(frozenset({(11, 10)}))
+    assert planner._water_next == {}
 
 
 class _RecordingNavigator:
@@ -65,6 +156,46 @@ def test_recast_tile_omits_the_universal_waterbed_surface() -> None:
 
     assert navigator.built_vertices is None
     assert navigator.removed is True
+
+
+def test_native_steering_preserves_a_two_block_jump_affordance() -> None:
+    columns = {
+        (5, 5): {10},
+        # z grows downward, so support 8 is a two-block climb from support 10.
+        (6, 5): {8},
+    }
+    world = WorkerVoxelWorld()
+    world._vxl = object()
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    world._native_path_direction = lambda *_args, **_kwargs: (1.0, 0.0, 0.0)
+
+    direction = world.next_path_direction(
+        (5.5, 5.5, 7.75),
+        (20.5, 5.5, 7.75),
+        agent_id=4,
+        abilities=frozenset({MovementAffordance.JUMP}),
+    )
+
+    assert direction == (1.0, 0.0, 0.0)
+    assert world.last_affordance(4) is MovementAffordance.JUMP
+
+
+def test_worker_proposes_one_block_line_across_water_gap() -> None:
+    columns = {
+        (5, 5): {10},
+        (10, 5): {10},
+    }
+    world = WorkerVoxelWorld()
+    world._vxl = object()
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+
+    line = world.water_bridge_line(
+        (5.5, 5.5, 7.75), (1.0, 0.0, 0.0), max_cells=6
+    )
+
+    assert line == ((6, 5, 10), (9, 5, 10))
 
 
 def test_perception_snapshot_publishes_authoritative_wade_state() -> None:
@@ -112,6 +243,35 @@ def test_live_motor_rejects_open_water_ahead_for_a_dry_bot() -> None:
     )
 
     assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
+
+
+def test_live_motor_allows_a_wading_bot_to_follow_its_escape_flow() -> None:
+    world = SimpleNamespace(
+        topology_version=8,
+        clipbox=lambda _x, _y, _z: False,
+        is_water_column=lambda _x, _y: True,
+        get_solid=lambda _x, _y, z: int(z) == 239,
+    )
+    player = SimpleNamespace(
+        x=200.5,
+        y=200.5,
+        z=236.75,
+        wade=True,
+        connection=SimpleNamespace(
+            server=SimpleNamespace(world_manager=world)
+        ),
+    )
+    runtime = SimpleNamespace(
+        player=player,
+        waypoint_probe_key=None,
+        waypoint_probe_result=False,
+    )
+
+    assert BotDirector._waypoint_is_live(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.JUMP,
+    ) is True
 
 
 def test_live_motor_rejects_a_walk_step_over_an_unsafe_drop() -> None:
@@ -162,6 +322,30 @@ def test_live_motor_checks_both_shoulders_near_an_edge() -> None:
     )
 
     assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
+
+
+def test_live_jump_gate_accepts_a_two_block_landing_support() -> None:
+    world = SimpleNamespace(
+        clipbox=lambda x, _y, z: float(x) >= 6.0 and int(z) == 8,
+        is_water_column=lambda _x, _y: False,
+        get_solid=lambda x, _y, z: float(x) >= 6.0 and int(z) == 8,
+    )
+    player = SimpleNamespace(z=7.75, wade=False)
+
+    assert BotDirector._probe_surface_is_live(
+        world,
+        player,
+        6.1,
+        5.5,
+        MovementAffordance.JUMP,
+    ) is True
+    assert BotDirector._probe_surface_is_live(
+        world,
+        player,
+        6.1,
+        5.5,
+        MovementAffordance.WALK,
+    ) is False
 
 
 def test_jump_request_is_a_bounded_pulse_not_a_leased_held_key() -> None:
@@ -244,6 +428,72 @@ def test_sideways_knockback_does_not_hide_a_route_stall() -> None:
     assert state.stuck_attempts == 2
 
 
+def test_short_route_oscillation_does_not_count_as_strategic_progress() -> None:
+    state = _BrainState(
+        last_position=(10.0, 10.0, 20.0),
+        last_progress_at=1.0,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path_goal=(100.0, 10.0, 20.0),
+        strategic_progress_at=1.0,
+        strategic_goal_distance=90.0,
+    )
+
+    for index in range(1, 7):
+        position = (10.0 + float(index % 2), 10.0, 20.0)
+        BotBrain._record_progress(state, position, 1.0 + index)
+    state.next_stuck_recovery_at = 7.5
+    state.stuck_attempts = 2
+    BotBrain._record_progress(state, (12.0, 10.0, 20.0), 8.0)
+
+    assert state.last_progress_at > 1.0
+    assert state.strategic_progress_at == 1.0
+    assert state.strategic_goal_distance == 90.0
+    assert state.next_stuck_recovery_at == 7.5
+    assert state.stuck_attempts == 2
+
+
+def test_respawn_position_discontinuity_clears_previous_life_route() -> None:
+    state = _BrainState(
+        life_id=2,
+        contacts={1: SimpleNamespace()},
+        target_id=1,
+        last_position=(108.0, 108.0, 40.0),
+        last_progress_at=1.0,
+        next_stuck_recovery_at=9.0,
+        stuck_attempts=7,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path=[(310.0, 300.0, 20.0)],
+        path_goal=(400.0, 300.0, 20.0),
+        path_topology_version=5,
+        route_escape_goal=(290.0, 300.0, 20.0),
+        route_escape_until=8.0,
+        route_escape_failures=4,
+        resource_target=(3, (320.0, 300.0, 20.0)),
+        resource_target_since=2.0,
+    )
+
+    teleported = BotBrain._record_progress(
+        state, (100.0, 100.0, 40.0), 10.0, life_id=3
+    )
+
+    assert teleported is True
+    assert state.life_id == 3
+    assert state.contacts == {}
+    assert state.target_id is None
+    assert state.path == []
+    assert state.path_goal is None
+    assert state.path_topology_version == -1
+    assert state.last_path_direction == (0.0, 0.0, 0.0)
+    assert state.last_progress_at == 10.0
+    assert state.next_stuck_recovery_at == 0.0
+    assert state.stuck_attempts == 0
+    assert state.strategic_progress_at == 10.0
+    assert state.strategic_goal_distance is None
+    assert state.route_escape_goal is None
+    assert state.route_escape_failures == 0
+    assert state.resource_target is None
+
+
 def test_water_exit_selects_the_nearest_dry_body_clear_surface() -> None:
     columns = {
         (8, 8): {239},
@@ -259,6 +509,20 @@ def test_water_exit_selects_the_nearest_dry_body_clear_surface() -> None:
     assert step.goal == (11.5, 8.5, 234.75)
     assert step.direction == (1.0, 0.0, 0.0)
     assert step.affordance is MovementAffordance.JUMP
+
+
+def test_emergency_drop_finds_clear_adjacent_lower_surface() -> None:
+    columns = {(5, 5): {10}, (6, 5): {20}}
+    world = WorkerVoxelWorld()
+    world._vxl = object()
+    world.solid = _solid_columns(columns)
+
+    drop = world.emergency_drop((5.5, 5.5, 7.75))
+
+    assert drop is not None
+    direction, landing = drop
+    assert direction == (1.0, 0.0, 0.0)
+    assert landing == (6.5, 5.5, 17.75)
 
 
 def _navigation_player(
@@ -307,6 +571,159 @@ def _navigation_player(
         ),
         wade=wade,
     )
+
+
+def test_deep_hole_escape_jumps_then_builds_under_the_airborne_bot() -> None:
+    world = SimpleNamespace(
+        solid=lambda *_cell: False,
+        overhead_block=lambda _position: None,
+        hole_escape=lambda _position, _direction: ((1.0, 0.0, 0.0), 4),
+        jump_build_cell=lambda _position: (5, 5, 9),
+        blocking_cell=lambda _position, _direction: None,
+        water_bridge_line=lambda _position, _direction, **_kwargs: None,
+        bridge_cell=lambda _position, _direction: None,
+    )
+    brain = BotBrain(world, seed=3)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_ENGINEER),
+            is_bot=True,
+        ),
+        grounded=True,
+        blocks=20,
+        tool=int(C.BLOCK_TOOL),
+        weapon_tool=int(C.SHOTGUN_TOOL),
+        loadout=(int(C.SHOTGUN_TOOL), int(C.SPADE_TOOL), int(C.BLOCK_TOOL)),
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        last_path_direction=(1.0, 0.0, 0.0),
+    )
+
+    launch = brain._stuck_recovery(frame, observer, state, 2.0)
+    airborne = replace(observer, grounded=False, position=(5.5, 5.5, 6.9))
+    place = brain._stuck_recovery(
+        replace(frame, frame_id=2, players=(airborne,)),
+        airborne,
+        state,
+        2.1,
+    )
+
+    assert launch is not None
+    assert launch.debug_role == "hole_jump_build_launch"
+    assert launch.movement.jump is True
+    assert launch.priority is BotIntentPriority.TRAVERSAL
+    assert place is not None
+    assert place.debug_role == "hole_jump_build_place"
+    assert place.action.kind is BotActionKind.BUILD
+    assert place.action.position == (5.0, 5.0, 9.0)
+    assert state.last_progress_at == 1.0
+
+
+def test_stuck_bot_breaks_a_low_ceiling_before_climbing() -> None:
+    world = SimpleNamespace(
+        overhead_block=lambda _position: (5, 5, 5),
+        hole_escape=lambda _position, _direction: ((1.0, 0.0, 0.0), 4),
+        blocking_cell=lambda _position, _direction: None,
+        water_bridge_line=lambda _position, _direction, **_kwargs: None,
+        bridge_cell=lambda _position, _direction: None,
+    )
+    brain = BotBrain(world, seed=5)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_MINER),
+            is_bot=True,
+        ),
+        loadout=(int(C.SUPERSPADE_TOOL), int(C.BLOCK_TOOL)),
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        last_path_direction=(1.0, 0.0, 0.0),
+    )
+
+    intent = brain._stuck_recovery(frame, observer, state, 2.0)
+
+    assert intent is not None
+    assert intent.debug_role == "hole_break_ceiling"
+    assert intent.action.kind is BotActionKind.MELEE
+    assert intent.action.position == (5.5, 5.5, 5.5)
+
+
+def test_failed_ceiling_recovery_is_bounded_and_does_not_fake_progress() -> None:
+    resets: list[int] = []
+    world = SimpleNamespace(
+        overhead_block=lambda _position: (5, 5, 5),
+        hole_escape=lambda _position, _direction: None,
+        blocking_cell=lambda _position, _direction: None,
+        water_bridge_line=lambda _position, _direction, **_kwargs: None,
+        bridge_cell=lambda _position, _direction: None,
+        reset_agent_navigation=resets.append,
+    )
+    brain = BotBrain(world, seed=5)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_MINER),
+            is_bot=True,
+        ),
+        loadout=(int(C.SUPERSPADE_TOOL), int(C.BLOCK_TOOL)),
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        last_path_direction=(1.0, 0.0, 0.0),
+    )
+
+    first = brain._stuck_recovery(frame, observer, state, 2.0)
+    second = brain._stuck_recovery(frame, observer, state, 2.8)
+    exhausted = brain._stuck_recovery(frame, observer, state, 3.6)
+
+    assert first is not None and first.debug_role == "hole_break_ceiling"
+    assert second is not None and second.debug_role == "hole_break_ceiling"
+    assert exhausted is None
+    assert state.last_progress_at == 1.0
+    assert state.stuck_attempts == 0
+    assert resets == [observer.player_id]
 
 
 def test_wading_zombie_recovers_before_engaging_a_visible_survivor() -> None:
@@ -658,6 +1075,112 @@ def test_exhausted_stuck_route_resets_for_a_fresh_replan() -> None:
     assert state.path == []
     assert state.path_goal is None
     assert state.path_topology_version == -1
+
+
+def test_exhausted_route_prefers_voxel_replan_and_resets_crowd() -> None:
+    resets: list[int] = []
+    step = SimpleNamespace(
+        direction=(0.0, 1.0, 0.0),
+        waypoint=(5.5, 6.5, 7.75),
+        affordance=MovementAffordance.WALK,
+    )
+    world = SimpleNamespace(
+        overhead_block=lambda _position: None,
+        hole_escape=lambda _position, _direction: None,
+        blocking_cell=lambda _position, _direction: None,
+        bridge_cell=lambda _position, _direction: None,
+        action_planner=SimpleNamespace(
+            plan_local=lambda *_args, **_kwargs: step
+        ),
+        reset_agent_navigation=resets.append,
+    )
+    brain = BotBrain(world, seed=8)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_ENGINEER),
+            is_bot=True,
+        ),
+        loadout=(int(C.SPADE_TOOL), int(C.BLOCK_TOOL)),
+    )
+    frame = PerceptionFrame(
+        frame_id=7,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        stuck_attempts=2,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path_goal=(20.0, 5.0, 7.75),
+    )
+
+    intent = brain._stuck_recovery(frame, observer, state, 2.0)
+
+    assert intent is not None
+    assert intent.debug_role == "stuck_voxel_replan"
+    assert intent.movement.direction == step.direction
+    assert state.route_escape_goal == (20.0, 5.0, 7.75)
+    assert state.path_goal is None
+    assert state.stuck_attempts == 0
+    assert resets == [observer.player_id]
+
+
+def test_repeated_route_failure_uses_adjacent_emergency_drop() -> None:
+    world = SimpleNamespace(
+        overhead_block=lambda _position: None,
+        hole_escape=lambda _position, _direction: None,
+        blocking_cell=lambda _position, _direction: None,
+        bridge_cell=lambda _position, _direction: None,
+        emergency_drop=lambda _position: (
+            (0.0, 1.0, 0.0),
+            (5.5, 6.5, 27.75),
+        ),
+        reset_agent_navigation=lambda _player_id: None,
+    )
+    brain = BotBrain(world, seed=8)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_MEDIC),
+            is_bot=True,
+        ),
+        loadout=(int(C.SPADE_TOOL),),
+    )
+    frame = PerceptionFrame(
+        frame_id=8,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        stuck_attempts=2,
+        route_escape_failures=2,
+        last_path_direction=(1.0, 0.0, 0.0),
+    )
+
+    intent = brain._stuck_recovery(frame, observer, state, 2.0)
+
+    assert intent is not None
+    assert intent.debug_role == "stuck_emergency_drop"
+    assert intent.movement.affordance is MovementAffordance.DROP
+    assert intent.priority is BotIntentPriority.SURVIVAL
 
 
 def test_local_planner_rejects_a_jump_with_blocked_head_arc() -> None:

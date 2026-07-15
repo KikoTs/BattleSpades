@@ -17,7 +17,13 @@ from __future__ import annotations
 
 import random
 
-from shared.packet import PlaySound, PlayMusic, StopMusic, CreateAmbientSound
+from shared.packet import (
+    CreateAmbientSound,
+    PlayAmbientSound,
+    PlayMusic,
+    PlaySound,
+    StopMusic,
+)
 
 # --- SOUND_ID table (extracted from the live client constants_audio) --------
 SND_EVENT_POSITIVE = 2       # generic "good thing" stinger (score/kill)
@@ -37,6 +43,15 @@ SND_ZOMBIE_TIMER = 29
 SND_TURRET_PLACE = 30
 SND_BUILD_LANDMINE = 31
 SND_PREFAB_BUILD = 32
+SND_DIG_HIT_BLOCK = 33
+SND_CROWBAR_HIT_BLOCK = 34
+SND_KNIFE_HIT_BLOCK = 35
+SND_PICKAXE_HIT_BLOCK = 36
+SND_SUPER_SPADE_HIT_BLOCK = 37
+SND_ZOMBIE_HAND_HIT_BLOCK = 38
+SND_BUILD = 46
+SND_PAINT = 47
+DEFAULT_AMBIENT = "amb_rural"
 
 # Music track names. CRITICAL (reversed + live-verified 2026-07-08):
 #  1. The wire PlayMusic.name must be a SPECIFIC track ("last_man_standing_003")
@@ -79,10 +94,19 @@ def _sound_packet(sound_id: int, volume: float = 1.0,
 
 
 def play_sound(server, sound_id: int, *, volume: float = 1.0,
-               position=None, attenuation: float = 1.0) -> None:
+               position=None, attenuation: float = 1.0, exclude=None) -> None:
     """Broadcast a one-shot sound to every in-game client. With `position`
-    it plays 3D-positioned (distance-attenuated); without, full-volume UI."""
-    server.broadcast(_sound_packet(sound_id, volume, position, attenuation))
+    it plays 3D-positioned (distance-attenuated); without, full-volume UI.
+
+    ``exclude`` is used for sounds the acting retail client already predicts;
+    remote observers still need the authoritative cue, while the actor must
+    not hear a doubled sample.
+    """
+    data = _sound_packet(sound_id, volume, position, attenuation)
+    if exclude is None:
+        server.broadcast(data)
+    else:
+        server.broadcast(data, exclude=exclude)
 
 
 def play_sound_to(player, sound_id: int, *, volume: float = 1.0,
@@ -141,46 +165,12 @@ def play_timeout_music(server) -> None:
 
 
 # --- World ambience (CreateAmbientSound 22) ---------------------------------
-# The client streams ambients/<name>.ogg as a looping positional source and
-# plays it near the registered points. LIVE-VERIFIED: process_packet_create_
-# ambient_sound registers it (scene.ambient_sounds grows, name set).
-#
-# Map display/file name -> ambient track (files in the client ambients/ dir).
-MAP_AMBIENT = {
-    "ArcticBase": "amb_arctic",
-    "CastleWars": "amb_castlewars",
-    "CityOfChicago": "amb_oldchicago",
-    "20thCenturyTown": "amb_city",
-    "London": "amb_city",
-    "Alcatraz": "amb_alcatraz",
-    "Invasion": "amb_invasion",
-    "MayanJungle": "amb_jungle",
-    "LunarBase": "amb_moon",
-}
-DEFAULT_AMBIENT = "amb_rural"   # generic outdoor bed for unmapped maps
-
-# The ambient is heard within HEARING_DISTANCE (~50) of a point, so a grid of
-# points across the 512x512 map keeps it audible everywhere.
-_AMBIENT_GRID_STEP = 64
-_AMBIENT_GRID_Z = 40
-
-
-def _ambient_for_map(server) -> str:
-    wm = getattr(server, "world_manager", None)
-    name = getattr(wm, "map_name", "") if wm is not None else ""
-    return MAP_AMBIENT.get(name, DEFAULT_AMBIENT)
-
-
-def _ambient_grid_points(server) -> list:
-    wm = getattr(server, "world_manager", None)
-    sx = int(getattr(wm, "map_size_x", 512)) if wm is not None else 512
-    sy = int(getattr(wm, "map_size_y", 512)) if wm is not None else 512
-    pts = []
-    half = _AMBIENT_GRID_STEP // 2
-    for x in range(half, sx, _AMBIENT_GRID_STEP):
-        for y in range(half, sy, _AMBIENT_GRID_STEP):
-            pts.append((x, y, _AMBIENT_GRID_Z))
-    return pts
+# Native GameScene constructs AmbientSound(name, points), assigns loop_id, and
+# appends it to scene.ambient_sounds. An EMPTY point list is the stock global
+# bed. A non-empty list is an authored local emitter set (Mayan's river is the
+# canonical example). Never synthesize a map-wide grid: the old z=40 grid sat
+# more than HEARING_DISTANCE below normal terrain and also converted global
+# beds into the wrong positioned-source behavior.
 
 
 def _ambient_packet(name: str, loop_id: int, points: list) -> bytes:
@@ -191,11 +181,89 @@ def _ambient_packet(name: str, loop_id: int, points: list) -> bytes:
     return bytes(pkt.generate())
 
 
-def send_map_ambient(server, player) -> None:
-    """Register the map's ambient bed on one player's client so the world is
-    never silent. A grid of points keeps it audible across the whole map."""
-    name = _ambient_for_map(server)
-    points = _ambient_grid_points(server)
+def _play_ambient_packet(
+    name: str,
+    loop_id: int,
+    *,
+    volume: float,
+    position=None,
+    attenuation: float = 0.0,
+) -> bytes:
+    """Start the stream registered by CreateAmbientSound(22).
+
+    CreateAmbientSound only constructs the native AmbientSound controller; it
+    does not allocate an audio player. PlayAmbientSound(24) is therefore the
+    required second half of the stock sequence.
+    """
+
+    pkt = PlayAmbientSound()
+    pkt.name = str(name)
+    pkt.looping = True
+    pkt.positioned = position is not None
+    pkt.volume = float(volume)
+    pkt.time = 0.0
+    pkt.loop_id = int(loop_id)
+    if position is not None:
+        pkt.x, pkt.y, pkt.z = (float(value) for value in position)
+        pkt.attenuation = float(attenuation)
+    else:
+        pkt.x = pkt.y = pkt.z = 0.0
+        pkt.attenuation = 0.0
+    return bytes(pkt.generate())
+
+
+def _ambient_start_position(player, points):
+    """Return the safe bootstrap position for a local ambient controller.
+
+    The native media manager refuses to allocate a positioned stream when its
+    first position is outside hearing range.  AmbientSound.update can move an
+    allocated loop to the nearest authored point, but it cannot recover a
+    stream which failed to allocate.  Bootstrap local loops at the listener,
+    then let the registered point controller place them on its next update.
+    """
+
     if not points:
-        points = [(256, 256, _AMBIENT_GRID_Z)]
-    player.send(_ambient_packet(name, 1, points))
+        return None
+    return (
+        float(getattr(player, "x", 0.0)),
+        float(getattr(player, "y", 0.0)),
+        float(getattr(player, "z", 0.0)),
+    )
+
+
+def send_map_ambient(server, player) -> None:
+    """Register all validated map ambience definitions on one retail client.
+
+    This runs after the client's world reveal. Loop IDs are scoped to that
+    GameScene and deliberately start at one, matching the live-verified packet
+    used by the previous single-bed implementation.
+    """
+
+    world = getattr(server, "world_manager", None)
+    metadata = getattr(world, "map_metadata", None)
+    definitions = list(getattr(metadata, "ambient_sounds", ()) or ())
+    if not definitions:
+        # Compatibility for focused tests/embedders without MapMetadata.
+        from server.map_metadata import MapAmbientSound, default_ambient_sound
+        definitions = [MapAmbientSound(default_ambient_sound(
+            getattr(world, "map_name", ""),
+            getattr(metadata, "skybox_name", None),
+        ))]
+    for loop_id, definition in enumerate(definitions[:255], start=1):
+        points = list(definition.points)
+        player.send(_ambient_packet(
+            definition.name,
+            loop_id,
+            points,
+        ))
+        # Packet 22 registers the controller; packet 24 creates the streaming
+        # GameSound and binds its loop id. Bootstrap a local stream at the
+        # listener so MediaManager cannot distance-cull it before the native
+        # AmbientSound controller moves it to the closest authored point.
+        player.send(_play_ambient_packet(
+            definition.name,
+            loop_id,
+            volume=definition.volume,
+            position=_ambient_start_position(player, points),
+            attenuation=definition.attenuation,
+        ))

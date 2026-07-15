@@ -321,7 +321,8 @@ def test_fog_persists_for_reconnecting_clients(captured, tmp_path):
 
     run(server_cmds.cmd_fog(ctx(server, adminp, "12", "34", "56")))
 
-    assert server.config.fog_color_rgb == (12, 34, 56)
+    assert server.fog_color_override == (12, 34, 56)
+    assert server.config.fog_color_rgb == (0, 0, 0)
     assert len(server.broadcasts) == 1
 
 

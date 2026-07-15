@@ -1,6 +1,6 @@
 """Measure the live client's reconciliation outcome while it walks.
 
-Ground truth: docs/NETCODE_RECONCILIATION.md (RE'd from character.so).
+Ground truth: docs/PROTOCOL.md (recovered from the native character module).
 Each tick the client runs apply_player_network_correction():
 
     md = get_old_movement_data(network_position_loop_count)   # EXACT loop match

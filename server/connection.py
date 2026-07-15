@@ -40,6 +40,7 @@ from server.game_constants import (
     TEAM_SPECTATOR,
     is_playable_team,
 )
+from server.map_metadata import DEFAULT_SKYBOX_NAME, normalize_skybox_name
 
 # Build packet name mapping
 PACKET_NAMES = {}
@@ -238,9 +239,10 @@ class Connection:
 
     def _cache_pre_join_loadout(self, packet: SetClassLoadout):
         """Normalize and store one complete selection for the first spawn."""
-        from server.class_selection import normalize_class_selection
+        from server.class_selection import normalize_server_selection
 
-        selection = normalize_class_selection(
+        selection = normalize_server_selection(
+            self.server.config,
             packet.class_id,
             packet.loadout,
             packet.prefabs,
@@ -421,9 +423,23 @@ class Connection:
         self.state_sent = True
 
     async def send_skybox(self):
-        """Send skybox data to client."""
+        """Send the active map's validated client environment resource."""
+        world = getattr(self.server, "world_manager", None)
+        metadata = getattr(world, "map_metadata", None)
+        skybox_name = normalize_skybox_name(getattr(metadata, "skybox_name", None))
+        if skybox_name is None:
+            configured_default = getattr(
+                self.server.config, "default_skybox", DEFAULT_SKYBOX_NAME
+            )
+            skybox_name = normalize_skybox_name(configured_default)
+        if skybox_name is None:
+            # Invalid administrator input must never become a native-client
+            # resource path. This final value is a known stock retail asset.
+            skybox_name = DEFAULT_SKYBOX_NAME
+            logger.warning("Invalid default_skybox; using %s", skybox_name)
+
         skybox = SkyboxData()
-        skybox.value = "Chicago.txt"
+        skybox.value = skybox_name
         self.send(bytes(skybox.generate()), prefix=0x30)
     
     async def send_existing_players(self, new_player: 'Player' = None):
@@ -541,15 +557,71 @@ class Connection:
         else:
             logger.debug(f"Unknown pre-join packet ID: {packet_id}")
     
-    async def send_connection_data(self):
-        """Send all initial data to client after authentication."""
+    def reset_for_scene_reload(self) -> None:
+        """Return an authenticated peer to the pre-join handshake state.
+
+        Match transitions own removal of the old :class:`Player`; this method
+        owns only connection-local loader state.  The ENet peer, Steam ticket,
+        and XOR key deliberately survive so a map change can run
+        ``InitialInfo -> MapSync -> StateData`` without a socket disconnect.
+        It runs on the server event-loop thread while gameplay broadcasts are
+        gated for this connection.
+        """
+        if self.player is not None:
+            raise RuntimeError("scene reload requires the old Player to be detached")
+
+        # A waiter belongs to the old scene/map epoch.  Letting its result
+        # satisfy the next MapDataValidation would splice two VXL handshakes.
+        for future in tuple(self._waiters.values()):
+            if not future.done():
+                future.cancel()
+        self._waiters.clear()
+
+        if self.reserved_player_id is not None:
+            self.server.reserved_player_ids.discard(self.reserved_player_id)
+        self.reserved_player_id = None
+        self.map_sent = False
+        self.state_sent = False
+        self.pending_selection = None
+        self.pending_class_id = None
+        self.pending_loadout = []
+        self.pending_prefabs = []
+        self.pending_ugc_tools = []
+        self.in_menu = None
+        self.in_game = False
+        self.map_mutation_watermark = None
+        self.map_mutation_overflow = False
+        self.known_player_lives.clear()
+
+    async def reload_scene(self) -> bool:
+        """Stream the active map/mode into the existing authenticated peer.
+
+        A transition reload is stricter than a first connection: the client
+        must answer the new ``InitialInfo`` with ``MapDataValidation``.  That
+        response proves it entered ``LoadingMenu`` instead of remaining in a
+        stale compiled ``GameScene``.  ``False`` lets the lifecycle retire
+        only that incompatible/timed-out peer without endangering the others.
+        """
+        self.reset_for_scene_reload()
+        return await self.send_connection_data(require_map_validation=True)
+
+    async def send_connection_data(
+        self,
+        *,
+        require_map_validation: bool = False,
+    ) -> bool:
+        """Send the loader handshake and report whether map sync completed."""
         logger.info(f"Sending connection data to {self.peer.address}")
         
         # Send initial info
         await self.send_info()
         
         # Send map data
-        await self.send_map_data()
+        map_ready = await self.send_map_data(
+            require_validation=require_map_validation,
+        )
+        if not map_ready:
+            return False
 
         # Reserve this client's player id NOW: StateData must carry the same
         # id the Player will get at NewPlayerConnection (see __init__ note).
@@ -565,6 +637,7 @@ class Connection:
         )
         await self.send_skybox()
         await self.send_existing_players()
+        return True
 
     async def send_info(self):
         """Send InitialInfo (packet 114) to client.
@@ -581,7 +654,7 @@ class Connection:
         )
 
 
-    async def send_map_data(self):
+    async def send_map_data(self, *, require_validation: bool = False) -> bool:
         """Send map data to client.
 
         Validation contract (measured against the original client + maps):
@@ -607,6 +680,11 @@ class Connection:
             logger.info(f"Client sent map CRC: {client_crc}")
         except asyncio.TimeoutError:
             logger.warning(f"Client {self.peer.address} timed out sending MapDataValidation")
+            if require_validation:
+                # During an in-place scene reload, no reply means the native
+                # client never entered LoadingMenu.  Do not pour VXL packets
+                # into the old GameScene; that is a confirmed crash hazard.
+                return False
 
         # Reply with OUR map file CRC — the truth, never an echo of the
         # client's value (echoing made every client believe its local map
@@ -656,7 +734,7 @@ class Connection:
                 chunker = wm.get_chunker()
                 if chunker is None:
                     logger.warning("No map chunker available for %s", self.peer.address)
-                    return
+                    return False
                 chunk_list = list(chunker.iter())
             if client_crc is not None and not crc_match:
                 logger.warning(
@@ -700,6 +778,7 @@ class Connection:
 
         self.map_sent = True
         logger.info(f"Map data sent to {self.peer.address} ({total_chunks} chunks)")
+        return True
     
     async def _on_new_player(self, packet: NewPlayerConnection):
         """Handle new player joining."""
@@ -735,9 +814,10 @@ class Connection:
             )
         player = Player(player_id, player_name, internal_team, weapon, self)
         player.local_language = int(packet.local_language)
-        from server.class_selection import normalize_class_selection
+        from server.class_selection import normalize_server_selection
 
-        selection = self.pending_selection or normalize_class_selection(
+        selection = self.pending_selection or normalize_server_selection(
+            self.server.config,
             self.pending_class_id
             if self.pending_class_id is not None
             else packet.class_id,

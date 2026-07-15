@@ -1,0 +1,30 @@
+{
+  "skybox_texture": "BranCastle.txt",
+  "fog_color": [50, 59, 61],
+  "ambient_sounds": [["amb_zombieisland", [], 1.0, 0.0]],
+  "light_color": [109, 191, 193],
+  "light_direction": [0.1, 0.4, 0.7],
+  "back_light_direction": [0.3, 0.5, -0.1],
+  "back_light_color": [40, 70, 30],
+  "ambient_light_color": [25, 8, 33],
+  "ambient_light_intensity": 0.2,
+  "static_light_color0": [255, 255, 82],
+  "static_light_color1": [250, 250, 200],
+  "team_one_spawn_area": [[[277, 147, 222], [75, 10, 20]]],
+  "team_two_spawn_area": [
+    [[290, 383, 225], [25, 10, 20]],
+    [[227, 392, 225], [35, 10, 20]]
+  ],
+  "ammo_crate_drop_points": [
+    [245, 418, 235], [182, 317, 229], [232, 173, 226],
+    [359, 202, 229], [271, 342, 229], [305, 253, 191]
+  ],
+  "health_crate_drop_points": [
+    [252, 418, 235], [192, 317, 229], [241, 173, 226],
+    [366, 208, 229], [277, 342, 229], [305, 263, 191]
+  ],
+  "block_crate_drop_points": [
+    [259, 418, 235], [187, 317, 229], [250, 173, 226],
+    [366, 217, 232], [283, 342, 229], [305, 258, 191]
+  ]
+}

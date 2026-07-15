@@ -55,7 +55,10 @@ async def handle_place_flare_block(server, player, packet):
         return
 
     import shared.constants as C
+    from server.game_rules import get_rules
     tool = int(C.FLAREBLOCK_TOOL)
+    if not get_rules(server.config).enabled("RULE_ENABLE_FLARE_BLOCKS"):
+        return
     if int(getattr(player, "tool", -1)) != tool:
         return
     if tool not in [int(value) for value in (getattr(player, "loadout", None) or [])]:

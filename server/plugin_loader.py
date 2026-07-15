@@ -72,11 +72,29 @@ def discover_plugin_classes(directory: Path) -> Iterator[type[BasePlugin]]:
 async def load_external_plugins(
     manager: PluginManager,
     directory: Path,
+    *,
+    allowlist=(),
+    denylist=(),
 ) -> int:
-    """Discover and initialize plugins, returning the successful load count."""
+    """Discover and initialize configured plugins.
+
+    Filters use case-insensitive filename stems.  An empty allowlist permits
+    every discovered plugin; a denylist entry always wins.  Imports remain
+    isolated and failures remain non-fatal to the authoritative server.
+    """
 
     loaded = 0
+    allowed = {str(value).strip().casefold() for value in allowlist if str(value).strip()}
+    denied = {str(value).strip().casefold() for value in denylist if str(value).strip()}
     for plugin_class in discover_plugin_classes(directory):
+        module_file = Path(inspect.getfile(plugin_class)).stem.casefold()
+        plugin_name = str(getattr(plugin_class, "name", "")).strip().casefold()
+        identities = {module_file, plugin_name}
+        if identities & denied:
+            logger.info("Plugin %s disabled by denylist", module_file)
+            continue
+        if allowed and not identities & allowed:
+            continue
         if await manager.load_plugin(plugin_class):
             loaded += 1
     return loaded

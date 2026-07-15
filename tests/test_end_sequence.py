@@ -6,6 +6,7 @@ shrunk to a bare yield so the delays don't actually block.
 """
 import asyncio
 import sys
+import time
 from types import SimpleNamespace
 
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
@@ -143,3 +144,57 @@ def test_end_sequence_runs_once(monkeypatch):
     srv = _run(scenario())
     # Exactly one restart (one reset), not two.
     assert srv.teams[0].reset_called == 1
+
+
+def test_timed_round_opens_map_vote_during_final_minute(monkeypatch):
+    calls = []
+    srv = _Server()
+    srv.vote_manager = SimpleNamespace(
+        ensure_map_vote=lambda now: calls.append(now) or True
+    )
+    mode = _Mode(srv)
+    mode.time_limit = 120
+    mode.started = True
+    mode.start_time = time.time() - 61.0
+    monkeypatch.setattr("server.audio.play_timeout_music", lambda _server: None)
+
+    asyncio.run(mode.on_tick(1))
+
+    assert len(calls) == 1
+
+
+def test_end_sequence_consumes_voted_map_instead_of_same_map_restart(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    class _Transition:
+        def __init__(self):
+            self.maps = []
+            self.restarts = 0
+
+        async def change_map(self, map_name):
+            self.maps.append(map_name)
+            return SimpleNamespace(ok=True, message="ok")
+
+        async def restart_round(self):
+            self.restarts += 1
+            return SimpleNamespace(ok=True, message="ok")
+
+    async def scenario():
+        srv = _Server()
+        transition = _Transition()
+        srv.match_transition = transition
+        srv.vote_manager = SimpleNamespace(
+            ensure_map_vote=lambda _now: False,
+            consume_next_map=lambda: "CastleWars",
+        )
+        mode = _Mode(srv)
+        await mode.on_mode_start()
+        await mode.on_mode_end(0)
+        for _ in range(8):
+            await _REAL_SLEEP(0)
+        return transition
+
+    transition = asyncio.run(scenario())
+
+    assert transition.maps == ["CastleWars"]
+    assert transition.restarts == 0

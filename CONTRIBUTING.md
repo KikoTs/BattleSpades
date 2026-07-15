@@ -13,7 +13,7 @@ cd BattleSpades
 python run_server.py
 ```
 
-See [`docs/BUILDING.md`](docs/BUILDING.md) for toolchain requirements.
+See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for toolchain requirements.
 
 ## Before you open a PR
 
@@ -30,8 +30,7 @@ See [`docs/BUILDING.md`](docs/BUILDING.md) for toolchain requirements.
 The movement model, packet layouts, and reconciliation timing are **reverse-
 engineered measurements**, not guesses. Before changing them, read:
 
-- [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md) — every measured constant + the extraction workflow
-- [`docs/NETCODE_RECONCILIATION.md`](docs/NETCODE_RECONCILIATION.md) — the client's exact correction algorithm
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — packet catalog, measured movement invariants, and extraction workflow
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — how to run the client-as-oracle rig to verify against the real game
 
 If you change a physics constant or a packet field, **verify it against the real

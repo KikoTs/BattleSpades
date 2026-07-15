@@ -18,11 +18,17 @@ Runtime files
 - `maps/`: VXL maps available to `/map` and startup configuration.
 - `prefabs/`: KV6 models required by classes and game modes.
 - `plugins/`: optional trusted Python plugins.
+- `client_patches/`: retail-client compatibility hooks and installation notes.
 - `logs/`: created on first normal server start.
 - `bans.json`: created after the first persistent ban.
 
 Plugins execute arbitrary Python code inside the server process. Install only
 plugins whose source you trust.
+
+Seamless live `/map`, `/mode`, and voted-map transitions require the bundled
+`client_patches/session_transition_patch.py` in each retail client. Follow
+`client_patches/INSTALL.txt`, then restart that client once. The patch retains
+the existing authenticated connection while the normal map loader runs.
 
 macOS alpha builds are not signed or notarized and may trigger Gatekeeper. The
 release page documents this limitation; no archive should be described as an

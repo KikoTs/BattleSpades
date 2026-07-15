@@ -8,7 +8,7 @@ worker from accidentally becoming another gameplay authority.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import TypeAlias
 
 
@@ -43,6 +43,20 @@ class MovementAffordance(str, Enum):
     BUILD_STEP = "build_step"
     BUILD_BRIDGE = "build_bridge"
     PLACE_PREFAB = "place_prefab"
+
+
+class BotIntentPriority(IntEnum):
+    """Worker intent urgency used to preempt stale motor actions.
+
+    The gameplay thread never derives strategy from these values.  It only
+    uses them to cancel an older orientation-dependent action when a newer
+    survival or combat decision must take control immediately.
+    """
+
+    ROUTINE = 10
+    TRAVERSAL = 30
+    COMBAT = 70
+    SURVIVAL = 100
 
 
 class StimulusKind(str, Enum):
@@ -140,6 +154,9 @@ class PlayerSnapshot:
     last_damage_at: float = 0.0
     last_damage_source_id: int = -1
     last_damage_source_position: Vector3 | None = None
+    # Monotonic authoritative death count. Bot connection generation survives
+    # respawns, so workers use this separate value to reset per-life memory.
+    life_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +291,9 @@ class BotIntent:
     look: LookIntent | None = None
     tool_id: int = -1
     action: BotAction = BotAction()
+    priority: BotIntentPriority = BotIntentPriority.ROUTINE
+    secondary_fire: bool = False
+    zoom: bool = False
     debug_goal: Vector3 | None = None
     debug_path: tuple[Vector3, ...] = ()
     debug_role: str = ""

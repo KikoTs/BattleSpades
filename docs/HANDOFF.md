@@ -1,7 +1,25 @@
 # BattleSpades — Session Handoff (2026-07-09, evening)
 
+## Current checkpoint — 2026-07-16
+
+- Match Lobby recovery is centralized in `server/lobby.py` and
+  `server/game_rules.py`: ten public modes, selector presets, official map
+  lists, and 102 visible/hidden rules.
+- `config.toml` exposes every recovered rule. Unknown rules and illegal slider
+  values fail validation. `InitialInfo`, class/loadout normalization, tool
+  gates, combat, movement multipliers, block health/wallets, spawn protection,
+  crates, CTF, VIP, Zombie, and voting consume the shared catalog.
+- Multi-Hill, Territory Control, Diamond Mine, Demolition, and Occupation are
+  registered scene-safe skeletons in `modes/lobby_skeletons.py`. Objective
+  entities/scoring remain intentionally incomplete; do not call them playable.
+- Plugin discovery now has an operator enable switch plus allow/deny lists.
+- Project documentation is consolidated into eight maintained documents:
+  README, CONTRIBUTING, ADMIN_GUIDE, ARCHITECTURE, GAMEPLAY, PROTOCOL, RUNBOOK,
+  and HANDOFF. Vendored upstream notices are not project documentation.
+- Focused Match Lobby/rule/mode/config tests are in `tests/test_game_rules.py`.
+
 > Written for the next engineer/AI picking up mid-work. Read
-> [CLAUDE.md](../CLAUDE.md) first (hard invariants + working agreements),
+> [CONTRIBUTING.md](../CONTRIBUTING.md) first (hard invariants + working agreements),
 > then this file. The project is a Python 3.12 + Cython **1:1 recreation of the
 > Ace of Spades 1.x (Battle Builders) dedicated server**, tested against the
 > **compiled original client**. Ground truth = the live client, never the
@@ -13,6 +31,107 @@
 This addendum supersedes the old performance, WorldUpdate-cadence, test-count,
 and client-path claims below. The remainder of this handoff is retained because
 its packet and map-sync investigation history is still valuable.
+
+### Map-owned skybox checkpoint (updated 2026-07-15)
+
+- `Connection.send_skybox` no longer sends `Chicago.txt` for every map.
+  Packet 51 now reads the active `WorldManager.map_metadata.skybox_name`.
+- The recovered original server format uses a same-stem sidecar assignment
+  named `skybox_texture`; retail UGC JSON uses `skybox_name`. The metadata
+  loader accepts both plus JSON `skybox_texture`, parses legacy assignments
+  with `ast` rather than executing them, and rejects paths/non-`.txt` names.
+- The four shipped VXLs have same-stem JSON sidecars: Arctic Base uses
+  `ArcticBase.txt`, Castle Wars uses `Classic.txt`, City of Chicago uses
+  `Chicago.txt`, and 20th Century Town uses `WW1.txt`. All five relevant
+  resources, including fallback `User_Grassland.txt`, exist in the stock
+  retail client. Missing metadata uses `[world].default_skybox`.
+
+### Map resources, fog, and authored flare lights (updated 2026-07-15)
+
+- `MapResourceService` now owns map crates and static lights for every mode.
+  TDM no longer has a private crate implementation, and CTF objective rebuilds
+  remove only stale `base`/`intel` entities instead of clearing the registry.
+- The original `.txtc` map modules prove that gameplay/environment data is a
+  sidecar, not a VXL trailer. Dragon Island, Mayan Jungle, Spooky Mansion, and
+  Trenches JSON sidecars now preserve their recovered fog, resource points,
+  team spawn volumes, base volumes where present, and static-light colours.
+- Physical ammo crates send `Restock.type=3`. Type 0 is reserved for the
+  spawn/general restock and makes the retail Character refill health as well.
+  Health, block, and jetpack crates call only their matching server path.
+- IDA of `vxl.pyd` recovered the exposed blue/green chroma-marker deletion.
+  Runtime VXL records the marker family while removing its collision voxel;
+  the map service turns metadata-authorized markers into neutral coloured
+  type-13 entities. This is the native `FlareBlockEntity` point-light path and
+  automatically participates in late-join entity reveal.
+- Retail CTF validation on Mayan Jungle joined cleanly with 7 ammo, 7 health,
+  7 block crates, 4 `FlareBlockEntity` lights, both intel pickups, fog
+  `(69, 76, 39)`, and `MayanJungle.txt`. The process remained in `GameScene`
+  and crash dumps stayed 15 -> 15. Focused adjacent coverage: 188 tests plus
+  the 31-test stock-map/resource group passed.
+
+### Stock ambience and mesh-resource checkpoint (updated 2026-07-15)
+
+- `mesh/<name>/<name>.txt` is a client-owned environment manifest. It places
+  sky, cloud, mist, wave, sun, and similar render objects with translation,
+  scale, rotation, and optional UV animation. Packet 51 selects that manifest;
+  the mesh directory is not collision geometry and is not map-sync data.
+- `MapMetadata.official_map` and `STOCK_MAP_SKYBOXES` identify shipped VXL
+  basenames and their bundled presentation aliases. This never changes map
+  transfer behavior. Retail checksum experiments proved that stock maps still
+  require the full canonical VXL stream; empty or delta-only joins produce a
+  hollow/desynchronized world.
+- Original `ambient_sounds` rows are `[name, points, volume, attenuation]`.
+  Empty points mean a global bed; non-empty points are local emitters such as
+  Mayan Jungle's four `em_river` locations. The server accepts only the 21
+  ambient assets present in the retail installation.
+- The native sequence is `CreateAmbientSound(22)` followed by
+  `PlayAmbientSound(24)` with the same loop ID. Packet 22 only registers the
+  `AmbientSound` controller. Packet 24 allocates the streaming `GameSound`.
+  Local loops bootstrap at the listener so the media manager cannot reject a
+  distant initial source; the native controller then moves the loop to the
+  closest authored point.
+- Remote block-tool observers now receive a positioned `PlaySound(23)` cue.
+  The actor is excluded because the retail client predicts its own impact.
+  Spade, pickaxe, knife, Super Spade, zombie hands, crowbar, UGC mining tools,
+  and the safe machete fallback use recovered `SOUND_MAP` IDs.
+- Isolated Mayan Jungle retail validation created two live non-closed media
+  players: a relative global `amb_jungle` bed and an attenuated positioned
+  `em_river` stream. No playback failure, traceback, or new dump appeared;
+  crash dumps remained 15 -> 15. The focused suite passed 92 tests.
+
+### CastleWars water recovery and retail rollover checkpoint (updated 2026-07-15)
+
+- CastleWars contains 72,306 water columns, and its farthest reachable water
+  is 132 columns from shore. The worker's old local search defaulted to 24 and
+  hard-capped at 64, so a genuinely stranded bot could never receive an exit
+  route. `VoxelActionPlanner` now builds a full-map water-to-dry flow in the AI
+  process, caches each next step, and selectively invalidates it only when a
+  terrain delta touches a cached route. Dry bots still reject water entry;
+  already-wading bots may follow the recovery route.
+- `bot_city_soak.py --map CastleWars --mode tdm --bots 2 --sim-seconds 60
+  --report-every 30 --strand-water-bots 2` injected both bots into the farthest
+  water. Both began in `water_recovery`, reached dry terrain by 60 simulated
+  seconds, and finished with `water_remaining=0`, zero action/jump loops,
+  navigation stalls, invalid looks, or priority inversions.
+- Retail packet 52 is the native full-scene boundary. IDA resolves
+  `GameScene.process_packet_map_ended` near `0x101A07F0`, which calls
+  `GameScene.on_map_ended` near `0x101A08C0`. That handler only freezes the
+  scene; reason 18 is terminal and the retail build does not auto-reconnect.
+  Map and mode replacement now preflight first, flush packet 52, retain the
+  authenticated peer, and perform the fresh loader handshake after
+  `client_patches/session_transition_patch.py` opens `LoadingMenu`. Invalid map
+  names do not disturb the current GameScene.
+- `GenericVoteMessage(47)` is also the stock map-vote path. The retail client
+  binds the first three advertised records to F1/F2/F3; IDA places the receive
+  path near `0x1017B780` and the cast sender near `0x1017C6C0`. The server now
+  accepts exact candidate records instead of the former `starts with y`
+  heuristic, stages the winning map, and consumes it only after the end screen.
+  The map catalog is cached at startup, so the 60 Hz tick performs no glob I/O.
+- Focused water/transition/vote/end-sequence checks and the adjacent bot/mode
+  suite pass. A clean retail client live-validated CityOfChicago -> ArcticBase
+  and TDM -> CTF on the same ENet peer, with no disconnect, traceback, crash
+  dump, or map-transfer failure. A clean two-retail-client visual vote remains
+  the final release gate.
 
 ### Remote player/bot desync checkpoint (updated 2026-07-15)
 
@@ -433,7 +552,7 @@ superseded by this checkpoint.
 - The representative 50-player baseline initially **failed** at 15.37 Hz and
   64.9 ms average ticks. The latest 30-second gate passes at 59.966 Hz with
   5.088 ms p99, zero gameplay-packet drops, and zero logging drops. See
-  [SERVER_PERFORMANCE.md](SERVER_PERFORMANCE.md).
+  [RUNBOOK.md](RUNBOOK.md).
 - The full 900-second release soak also passes: 59.999 Hz, 4.915 ms tick p99,
   zero gameplay/logging drops, no pending backlog, and 17.453 MiB memory growth.
 - WorldUpdate now uses a 30 Hz retail cadence, grouped serialization for
@@ -498,15 +617,16 @@ superseded by this checkpoint.
   death screen is now discarded instead of filling the old body's history and
   reporting false overflow before spawn re-anchors the new life.
 - Architecture boundaries, native crash hazards, and rejected approaches are
-  recorded in [ARCHITECTURE.md](ARCHITECTURE.md) and
-  [ENGINEERING_NOTES.md](ENGINEERING_NOTES.md).
+  recorded in [ARCHITECTURE.md](ARCHITECTURE.md) and this handoff.
 
 ### Admin lifecycle and CTF rejoin checkpoint (2026-07-14)
 
 - `/map`, `/mode`, and `/restart` now share `MatchTransitionService`. Invalid
   maps are preflighted off the simulation thread and cannot alter/disconnect the
   live match. Valid map/mode changes gate old gameplay, start a clean epoch,
-  disconnect with reason 18, and rely on a fresh retail handshake.
+  retain the authenticated connection, and run a fresh validated retail loader
+  handshake on that same peer. Packet 52 requires the bundled client hook;
+  reason 18 is only the per-peer failure path for a missing validation reply.
 - Fresh CTF rejoin used to freeze in `GameScene.create_entity` with
   `KeyError: 1`. Live retail inspection proved `BASE=1` is absent from
   `GameScene.ENTITIES` while `INTEL_PICKUP=16` is present. Bases remain
@@ -882,7 +1002,7 @@ Wired up. Load tools with
 - Cython functions = a wrapper + a body; attribute access goes through interned-
   string `dword_XXXX` globals — trace those to resolve field names.
 - See the `reference_ida_netcode_re` memory for the reconciliation contract we
-  already RE'd, and `docs/PHYSICS_CALIBRATION.md` for the physics-oracle workflow
+  already RE'd, and `docs/PROTOCOL.md` for the physics-oracle workflow
   (extract real constants from the live client).
 
 ### Verifying offline (before touching live)
@@ -902,7 +1022,7 @@ is superseded.
 
 ## 6. Key invariants (do not regress) + files
 
-Hard invariants live in [CLAUDE.md](../CLAUDE.md) — read them. Highlights that
+Hard invariants live in [CONTRIBUTING.md](../CONTRIBUTING.md) — read them. Highlights that
 touch the open bugs:
 - WorldUpdate is 30 Hz and **UNRELIABLE**. Production includes every
   recipient's safe self row, including while holding the block tool, stamped
@@ -1266,3 +1386,145 @@ The next acceptance step remains a real-time spawned-worker run followed by
 two clean retail observers. The accelerated adapter approximates collision and
 combat only to evolve policy state quickly; it cannot certify client sound,
 animation, hitbox, terrain packet, or reconciliation behavior.
+
+## 15. Bot combat interrupts, vertical escape, bridges, and marksman scope (2026-07-15)
+
+- `BotIntent` now carries an explicit `ROUTINE < TRAVERSAL < COMBAT < SURVIVAL`
+  priority. `BotDirector` cancels an older latched terrain swing when a newer
+  combat/survival intent arrives. This closes the observed Miner/Engineer case
+  where a pending dig kept aim priority and re-selected blocks or a spade after
+  the worker had already decided to draw the gun.
+- The action motor now preserves secondary-fire and zoom state. Scoped Scout
+  engagements set both bits, `WorldUpdate` exposes `0x02|0x40`, and bot
+  `ShootPacket.secondary` follows the same state. Long-range marksmen therefore
+  use the stock scoped presentation/sniper-beam path instead of permanent hip
+  fire.
+- Native Recast steering is still the global route source, but its immediate
+  voxel edge is classified before reaching Player input. Two-block climbs and
+  short gaps retain `JUMP` instead of being flattened to `WALK`. The gameplay
+  thread's final live gate validates raised landing clearance rather than
+  rejecting the landing support as a current-height wall.
+- Stalled builders can emit a bounded face-connected `BlockLine` across water
+  or a deep gap. Hole recovery probes nearby higher dry ledges, jumps a legal
+  two-block rise, breaks a low ceiling/side obstruction with the selected
+  melee tool, or performs a two-phase self-build: jump until the authoritative
+  grounded bit clears, then place the supported block below. All mutations use
+  `BotActionGateway`; the worker never mutates VXL.
+- Failed jump/build attempts are bounded and fall back to path reset. The
+  accelerated adapter now models a short airborne lease; without it, the test
+  harness falsely reported an endless launch state even though production
+  native physics supplies a real grounded transition.
+
+Validation:
+
+```text
+bot/navigation/policy/monitor suite: 107 passed
+non-bot repository suite: 730 passed
+CityOfChicago TDM, 12 bots, 60 simulated seconds:
+  0 priority/action/jump/navigation/look/water failures;
+  18 BlockLine actions, 2 jump-build launches and 2 matching placements,
+  64 scoped marksman engagement samples
+CastleWars Zombie, 12 bots, 3 fault-injected swimmers, 60 simulated seconds:
+  water_remaining=0; 0 priority/action/jump/navigation/look failures;
+  3 jump-build launches and 3 matching placements
+real spawned-worker runtime, 12 bots x 12 seconds:
+  TDM PID 61460 and Zombie PID 58292; every bot moved, zero restarts,
+  4/2 canonical world mutations respectively
+```
+
+Two clean retail observers remain required to judge the beam visually and to
+feel the native jump/build cadence. The regression tests do prove the exact
+replicated action bits, shot secondary byte, preemption, VXL geometry, and
+authoritative action path.
+
+## Pickup settling, bot resource timeout, and HUD broadcasts (2026-07-15)
+
+- Map pickups retain their official sidecar model offset, verify their support
+  at 10 Hz, and reliably move with ChangeEntity action 1 when that support is
+  destroyed. Water-only fall destinations relocate to a nearby dry surface.
+- A bot spends at most three seconds on one `(entity_id, position)` resource.
+  It then ignores that exact pickup location and chooses another; a pickup that
+  later falls to a new position is eligible again.
+- Global mode/plugin/admin announcements now use retail `CHAT_BIG` top-screen
+  routing. Private command feedback stays in system chat. LocalisedMessage (50)
+  is exposed through a bounded server API; `TEAM1_COLOR`/`TEAM2_COLOR` and all
+  recovered positional variables are in `docs/PROTOCOL.md`.
+- IDA evidence: `gameScene.pyd` session `broadcast_overlay_20260715`, handlers
+  `0x1017CF90`, `0x1017DDA0`, `0x101A0490`, and `0x10166600`.
+- Retail correction: packet 50 with `localise_parameters=1` resolves team IDs,
+  but packet 49 never does. `server.announcements.build_overlay_message` now
+  resolves `TEAM1_COLOR`, `TEAM2_COLOR`, and `TEAM_NEUTRAL` before serializing
+  free-form mode/admin/plugin prose, preventing raw IDs on the HUD.
+
+## Long-session bot liveness and per-life reset (2026-07-16)
+
+- The reported six-minute MayanJungle TDM session was not a worker crash or
+  server overload. The AI child stayed alive and simulation ticks remained
+  healthy; several bots kept submitting non-zero movement while their
+  authoritative positions remained at the same base obstruction.
+- The deterministic 12-bot baseline reproduced the defect: maximum stationary
+  time reached 363.4 seconds, one ceiling-recovery counter reached 400, and the
+  old monitor incorrectly reported zero navigation stalls because it treated a
+  non-zero movement command as proof of movement.
+- Recovery pacing no longer writes `last_progress_at`. Only displacement from
+  a later authoritative player snapshot counts as progress. Ceiling breach is
+  bounded, an exhausted route resets its DetourCrowd proxy, and a two-second
+  voxel-planned side route alternates shoulders instead of immediately asking
+  for the same failed corridor.
+- Immediate displacement and strategic progress are separate invariants. A
+  travel bot must reduce its route-goal distance by three blocks within six
+  seconds; short back-and-forth motion no longer clears recovery attempts.
+- Mayan's TEAM1 exit demonstrates why a non-zero Detour vector is not enough:
+  the native crowd points east into a missing floor, while the layered voxel
+  route is east `(132,233)`, north `(132,234)`, then east `(133,234)`.
+  Exhausted crowd routes now follow that recomputed voxel corridor toward the
+  original goal for three seconds before trying arbitrary side detours.
+- A bot isolated on a tall one-cell support first exhausts jump, breach,
+  bridge, and side-route recovery. It may then take an adjacent clear ledge as
+  an emergency `DROP`; normal server gravity and fall damage remain
+  authoritative. The worker never teleports the bot.
+- `PlayerSnapshot.life_id` carries the authoritative monotonic death count.
+  Brain state is connection-scoped, so each changed life ID clears the old
+  contacts, path, resource target, escape, and stuck counters even when death
+  occurred beside the team's spawn. Large position discontinuities retain the
+  same reset as an admin-teleport fallback.
+- The accelerated soak now applies gravity after its synthetic terrain
+  mutations. Without that adapter, a destroyed support left the harness actor
+  hovering many blocks above the new floor and produced a false navigation
+  stall that native server physics cannot produce.
+
+Validation completed before retail handoff:
+
+```text
+focused bot architecture/policy/soak/voxel suite: 118 passed
+focused traversal/soak subset after Mayan corridor repair: 41 passed
+real spawned-worker runtime, TDM, 12 bots x 12 seconds:
+  PID 39336; every bot moved 24.97-94.99 blocks; zero restarts
+MayanJungle TDM accelerated replay, 12 bots x 420 simulated seconds:
+  886 fire decisions; maximum same-life stationary time 15.2 seconds;
+  no action loop, priority violation, invalid look, or water stall;
+  final two active recoveries were 3.6/3.8 seconds
+broken baseline with the same seed/map/roster:
+  maximum stationary time 363.4 seconds; ceiling attempts reached 400;
+  multiple bots retained the same base coordinates for the full replay
+```
+
+## Bot perception hitch and map-stable anchor cache (2026-07-16)
+
+- A live 12-bot profile found an authoritative-thread regression rather than
+  worker or reaction-timer latency. Every staggered perception batch called
+  `team_base_anchor()` for both teams, and authored spawn zones were rescanned
+  instead of reusing their map-stable result.
+- In the broken 15-second profile, `BotDirector.update()` consumed 16.06
+  seconds cumulatively, perception consumed 13.26 seconds, and 1,314 base
+  lookups consumed 9.90 seconds. Live bot ticks spiked 18-42 ms at roughly the
+  perception cadence, producing visible delayed motion/reaction.
+- `WorldManager` now resolves each team anchor during map prewarm, caches it
+  for the loaded map, and clears the cache only when a map is loaded or the
+  generated flat map is rebuilt. Terrain edits do not move authored strategic
+  base locations; spawn points still revalidate live terrain independently.
+- The same profile now records 1.01 cumulative seconds in 900 director updates
+  and 0.382 seconds in perception. A real 12-bot capacity run held 60.0 Hz,
+  bot p99 0.711 ms, overall tick p99 1.023 ms, zero queue/gameplay drops, and
+  worker usage 0.669 CPU core. Human aim noise and reaction bands were not
+  weakened to conceal this scheduling bug.

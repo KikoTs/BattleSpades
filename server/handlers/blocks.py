@@ -19,7 +19,13 @@ logger = logging.getLogger(__name__)
 async def handle_paint_block(server, player, packet):
     """Authoritatively recolour an existing voxel and relay packet 7."""
 
-    if not player.alive or not player.spawned or not player.is_block_tool():
+    from server.game_rules import get_rules
+    if (
+        not player.alive
+        or not player.spawned
+        or not player.is_block_tool()
+        or not get_rules(server.config).is_tool_enabled(player.tool)
+    ):
         return
     x, y, z = int(packet.x), int(packet.y), int(packet.z)
     world = server.world_manager
@@ -68,6 +74,9 @@ async def handle_block_line(server, player, packet):
 async def handle_build_prefab(server, player, packet):
     """Delegate packet 30 to the shared authoritative prefab service."""
 
+    from server.game_rules import get_rules
+    if not get_rules(server.config).enabled("RULE_ENABLE_PREFABS"):
+        return
     service = getattr(server, "prefab_actions", None)
     if service is None:
         # Compatibility for focused embedders that do not instantiate the
@@ -82,7 +91,12 @@ async def handle_build_prefab(server, player, packet):
 async def handle_erase_prefab(server, player, packet):
     """Erase the packet-selected prefab footprint through block authority."""
 
-    if not player.alive or not player.spawned:
+    from server.game_rules import get_rules
+    if (
+        not player.alive
+        or not player.spawned
+        or not get_rules(server.config).enabled("RULE_ENABLE_PREFABS")
+    ):
         return
     from server import prefabs
 
