@@ -147,7 +147,7 @@ def test_spawned_bot_advertises_real_weapon_and_remote_display_bit() -> None:
     assert snapshot[9] == bot.tool
 
 
-def test_active_zombie_bot_create_player_commits_native_variant_and_prefabs() -> None:
+def test_active_zombie_bot_create_player_defaults_to_validated_base_class() -> None:
     """The first retail announcement must already describe the Zombie body."""
 
     server = BattleSpadesServer(ServerConfig())
@@ -170,11 +170,7 @@ def test_active_zombie_bot_create_player_commits_native_variant_and_prefabs() ->
         C.PREFAB_LISTS[int(C.CLASS_PREFABS_ZOMBIE)]
     )
     assert bot.team == TEAM2
-    assert bot.class_id in {
-        int(C.CLASS_ZOMBIE),
-        int(C.CLASS_FAST_ZOMBIE),
-        int(C.CLASS_JUMP_ZOMBIE),
-    }
+    assert bot.class_id == int(C.CLASS_ZOMBIE)
     assert create.class_id == bot.class_id
     assert tuple(create.loadout) == tuple(bot.loadout)
     assert tuple(create.prefabs) == tuple(bot.prefabs) == zombie_prefabs
@@ -182,6 +178,15 @@ def test_active_zombie_bot_create_player_commits_native_variant_and_prefabs() ->
     assert int(C.ZOMBIE_PREFAB_TOOL) in create.loadout
     assert bot.tool == int(C.ZOMBIEHAND_TOOL)
     assert bot.world_update_snapshot()[9] == int(C.ZOMBIEHAND_TOOL)
+
+
+def test_all_production_bot_ids_default_to_base_zombie() -> None:
+    classes = {
+        ZombieMode._zombie_class_for(SimpleNamespace(is_bot=True, id=player_id))
+        for player_id in range(12)
+    }
+
+    assert classes == {int(C.CLASS_ZOMBIE)}
 
 
 def test_bot_primary_action_pulse_survives_one_replication_interval() -> None:
