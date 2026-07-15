@@ -32,12 +32,6 @@ logger = logging.getLogger(__name__)
 SURVIVOR_TEAM = TEAM1
 ZOMBIE_TEAM = TEAM2
 _ZOMBIE_CLASSES = frozenset((int(C.CLASS_ZOMBIE),))
-_BOT_ZOMBIE_CLASS_CYCLE = (
-    int(C.CLASS_ZOMBIE),
-    int(C.CLASS_FAST_ZOMBIE),
-    int(C.CLASS_ZOMBIE),
-    int(C.CLASS_JUMP_ZOMBIE),
-)
 _ZOMBIE_PREFABS = tuple(
     str(name)
     for name in C.PREFAB_LISTS.get(int(C.CLASS_PREFABS_ZOMBIE), ())
@@ -235,20 +229,16 @@ class ZombieMode(BaseMode):
         *,
         player_id: int,
     ) -> ClassSelection:
-        """Choose a hidden native Zombie variant before bot CreatePlayer.
+        """Commit the validated base Zombie before bot CreatePlayer.
 
-        Fast/Jump Zombie are complete retail character classes but have no
-        class-picker icons, so they remain unavailable to untrusted client
-        selection.  Server-owned bots may use them safely when the choice is
-        committed before spawn and CreatePlayer replication.
+        Fast/Jump remain available to reverse-engineering fixtures, but are
+        not rotated into production until their retail movement and balance
+        have separate acceptance evidence.
         """
 
         if int(team) != ZOMBIE_TEAM:
             return selection
-        class_id = _BOT_ZOMBIE_CLASS_CYCLE[
-            int(player_id) % len(_BOT_ZOMBIE_CLASS_CYCLE)
-        ]
-        return self._zombie_selection(class_id)
+        return self._zombie_selection(int(C.CLASS_ZOMBIE))
 
     def allows_class_selection(self, player: Player, selection: ClassSelection) -> bool:
         """Reject cross-role class packets while allowing legal loadout edits."""
@@ -412,13 +402,9 @@ class ZombieMode(BaseMode):
 
     @staticmethod
     def _zombie_class_for(player: Player) -> int:
-        """Return a deterministic internal variant for server-owned bots."""
+        """Return the production-validated base Zombie for every player."""
 
-        if not bool(getattr(player, "is_bot", False)):
-            return int(C.CLASS_ZOMBIE)
-        return _BOT_ZOMBIE_CLASS_CYCLE[
-            int(player.id) % len(_BOT_ZOMBIE_CLASS_CYCLE)
-        ]
+        return int(C.CLASS_ZOMBIE)
 
     def _move_to_team(self, player: Player, team: int) -> None:
         old_team = int(getattr(player, "team", -1))
