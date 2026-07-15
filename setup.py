@@ -23,7 +23,35 @@ else:
     extra_link_args = ["-O3"]
 
 
+enet_define_macros = [
+    ("HAS_POLL", None),
+    ("HAS_FCNTL", None),
+    ("HAS_MSGHDR_FLAGS", None),
+    ("HAS_SOCKLEN_T", None),
+]
+enet_libraries = []
+if sys.platform == "win32":
+    enet_define_macros.append(("WIN32", None))
+    enet_libraries.extend(["Winmm", "ws2_32"])
+if sys.platform != "darwin":
+    enet_define_macros.extend(
+        [("HAS_GETHOSTBYNAME_R", None), ("HAS_GETHOSTBYADDR_R", None)]
+    )
+
+
 extensions = [
+    Extension(
+        "enet",
+        [
+            "vendor/pyenet/enet.pyx",
+            *glob("vendor/pyenet/enet/*.c"),
+        ],
+        include_dirs=["vendor/pyenet/enet/include"],
+        define_macros=enet_define_macros,
+        libraries=enet_libraries,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
+    ),
     Extension(
         "shared.bytes",
         ["shared/bytes.pyx"],

@@ -63,10 +63,10 @@ For a dedicated server without a Python or compiler installation, use a
 [portable alpha release](#portable-alpha-releases). The source workflow below
 is intended for development and custom server builds.
 
-You need **Python 3.10–3.12** (3.12 is the primary dev target) and a **C compiler** (MSVC
-Build Tools on Windows, `gcc`/`clang` on Linux/macOS — needed to build the Cython extensions
-and `pyenet`). Python 3.13+ can currently fail the `pyenet` build; 3.10–3.12 are the tested
-range. A virtual environment (`venv`) is recommended so the compiled deps stay isolated.
+You need **Python 3.10–3.12** (3.12 is the primary dev target) and a **C/C++ compiler**
+(MSVC Build Tools on Windows, `gcc`/`clang` on Linux/macOS). The compiler builds the
+Cython extensions plus the pinned, vendored pyenet/ENet transport. A virtual environment
+(`venv`) is recommended so compiled dependencies stay isolated.
 
 **One-liner** — clone, install deps, build the Cython core, and launch:
 
@@ -92,7 +92,7 @@ python3.10 -m venv venv
 source venv/bin/activate         # Linux/macOS
 # .\venv\Scripts\Activate.ps1    # Windows (PowerShell)
 
-pip install -r requirements.txt          # deps (pyenet, Cython, toml, pytest)
+pip install -r requirements.txt          # build/runtime Python dependencies
 python setup.py build_ext --inplace      # compile the Cython extensions
 python run_server.py                     # start the server on port 27015
 ```
@@ -221,17 +221,14 @@ See [`docs/BUILDING.md`](docs/BUILDING.md) for cross-compilation notes (the proj
 
 ## ENet networking
 
-BattleSpades uses **[pyenet](https://github.com/piqueserver/pyenet)** (a Python binding for
-the [ENet](http://enet.bespin.org/) reliable-UDP library) — the same transport the original
-game uses (protocol version 168, single channel, range-coder compression).
+BattleSpades uses **[pyenet](https://github.com/piqueserver/pyenet)** and
+[ENet](http://enet.bespin.org/) for reliable UDP—the same transport family used by the
+original game (protocol version 168, single channel, range-coder compression).
 
-`pip install -r requirements.txt` pulls in `pyenet`, which **compiles ENet from source**, so
-the C toolchain above is required. On most Linux/Windows setups this "just works". Gotchas:
-
-- **No prebuilt wheel for your platform?** `pip` builds it from the sdist — make sure the C
-  toolchain and Python headers (`python3-dev`) are installed.
-- **Cross-compiling / uncommon arch (e.g. arm64):** you may need to build ENet + pyenet for
-  that specific target. Notes in [`docs/BUILDING.md`](docs/BUILDING.md).
+The pinned pyenet 1.3.17 wrapper and ENet 1.3.17 C sources live under
+`vendor/pyenet/` and compile as the `enet` extension during `setup.py build_ext`.
+This avoids PyPI's obsolete `Cython<1` dependency and missing macOS/ARM wheels,
+so every release target builds the same source with the pinned Cython 3 toolchain.
 
 ## Configuration
 

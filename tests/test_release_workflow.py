@@ -6,6 +6,9 @@ import re
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
+RELEASE_REQUIREMENTS = PROJECT_ROOT / "requirements-release.txt"
+DEVELOPMENT_REQUIREMENTS = PROJECT_ROOT / "requirements.txt"
+SETUP = PROJECT_ROOT / "setup.py"
 
 
 def _workflow_text() -> str:
@@ -69,3 +72,18 @@ def test_freezer_uses_the_selected_python_interpreter() -> None:
 
     assert "python -m PyInstaller --noconfirm --clean BattleSpades.spec" in text
     assert "run: pyinstaller " not in text.lower()
+
+
+def test_enet_is_built_from_pinned_vendored_sources() -> None:
+    """All six targets avoid pyenet's conflicting/incomplete source package."""
+
+    for requirements_file in (RELEASE_REQUIREMENTS, DEVELOPMENT_REQUIREMENTS):
+        requirements = requirements_file.read_text(encoding="utf-8").splitlines()
+        assert not any(line.strip().lower().startswith("pyenet") for line in requirements)
+
+    setup = SETUP.read_text(encoding="utf-8")
+    assert 'Extension(\n        "enet"' in setup
+    assert '"vendor/pyenet/enet.pyx"' in setup
+    assert 'glob("vendor/pyenet/enet/*.c")' in setup
+    assert (PROJECT_ROOT / "vendor" / "pyenet" / "LICENSE").is_file()
+    assert (PROJECT_ROOT / "vendor" / "pyenet" / "enet" / "LICENSE").is_file()
