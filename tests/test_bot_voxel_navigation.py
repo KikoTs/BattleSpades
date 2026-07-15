@@ -2,11 +2,13 @@
 
 import asyncio
 from collections.abc import Callable
+import time
 from types import SimpleNamespace
 
 import shared.constants as C
 
 from server.bot_ai.director import BotDirector
+from server.bot_ai.messages import BotIntent, MovementAffordance, MovementIntent
 from server.bot_ai.voxel_navigation import VoxelTerrain
 from server.bot_ai.worker import WorkerVoxelWorld
 from server.config import ServerConfig
@@ -78,3 +80,117 @@ def test_perception_snapshot_publishes_authoritative_wade_state() -> None:
     )
 
     assert snapshot.wade is True
+
+
+def test_live_motor_rejects_open_water_ahead_for_a_dry_bot() -> None:
+    world = SimpleNamespace(
+        topology_version=7,
+        clipbox=lambda _x, _y, _z: False,
+        is_water_column=lambda _x, _y: True,
+        get_height=lambda _x, _y: 239,
+    )
+    server = SimpleNamespace(world_manager=world)
+    player = SimpleNamespace(
+        x=10.5,
+        y=10.5,
+        z=20.75,
+        wade=False,
+        connection=SimpleNamespace(server=server),
+    )
+    runtime = SimpleNamespace(
+        player=player,
+        waypoint_probe_key=None,
+        waypoint_probe_result=False,
+    )
+
+    assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
+
+
+def test_live_motor_rejects_a_walk_step_over_an_unsafe_drop() -> None:
+    world = SimpleNamespace(
+        topology_version=8,
+        clipbox=lambda _x, _y, _z: False,
+        is_water_column=lambda _x, _y: False,
+        get_height=lambda _x, _y: 40,
+    )
+    player = SimpleNamespace(
+        x=10.5,
+        y=10.5,
+        z=20.75,
+        wade=False,
+        connection=SimpleNamespace(
+            server=SimpleNamespace(world_manager=world)
+        ),
+    )
+    runtime = SimpleNamespace(
+        player=player,
+        waypoint_probe_key=None,
+        waypoint_probe_result=False,
+    )
+
+    assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
+
+
+def test_live_motor_checks_both_shoulders_near_an_edge() -> None:
+    world = SimpleNamespace(
+        topology_version=9,
+        clipbox=lambda _x, _y, _z: False,
+        is_water_column=lambda _x, _y: False,
+        get_height=lambda _x, y: 40 if int(y) >= 11 else 23,
+    )
+    player = SimpleNamespace(
+        x=10.5,
+        y=10.9,
+        z=20.75,
+        wade=False,
+        connection=SimpleNamespace(
+            server=SimpleNamespace(world_manager=world)
+        ),
+    )
+    runtime = SimpleNamespace(
+        player=player,
+        waypoint_probe_key=None,
+        waypoint_probe_result=False,
+    )
+
+    assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
+
+
+def test_jump_request_is_a_bounded_pulse_not_a_leased_held_key() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="JumpPulseBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=100,
+        map_epoch=0,
+        mode_epoch=0,
+        topology_version=server.world_manager.topology_version,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(
+            jump=True,
+            affordance=MovementAffordance.JUMP,
+        ),
+    )
+
+    server.loop_count = 100
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+    server.loop_count = 104
+    director._apply_motor(runtime, now + 4.0 / 60.0, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is False
