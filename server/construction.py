@@ -157,6 +157,8 @@ class ConstructionSafetyService:
         if not proposed:
             return "empty or oversized footprint"
         self._expire()
+        if self._overlaps_living_player(proposed):
+            return "player body overlap"
         if any(self._protected(cell) for cell in proposed):
             return "spawn or objective zone"
         for reservation in self._reservations.values():
@@ -175,6 +177,38 @@ class ConstructionSafetyService:
         if self._seals_friendly_exit(int(team), proposed):
             return "sole friendly exit"
         return ""
+
+    def _overlaps_living_player(self, proposed: frozenset[Cell]) -> bool:
+        """Reject voxels intersecting any authoritative living body volume."""
+
+        for player in tuple(getattr(self.server, "players", {}).values()):
+            if not bool(getattr(player, "alive", False)) or not bool(
+                getattr(player, "spawned", False)
+            ):
+                continue
+            try:
+                player_x = float(player.x)
+                player_y = float(player.y)
+                body_z = int(math.floor(float(player.z)))
+            except (AttributeError, TypeError, ValueError):
+                # Incomplete player state must not authorize construction.
+                return True
+            x_cells = range(
+                int(math.floor(player_x - 0.45)),
+                int(math.floor(player_x + 0.45)) + 1,
+            )
+            y_cells = range(
+                int(math.floor(player_y - 0.45)),
+                int(math.floor(player_y + 0.45)) + 1,
+            )
+            if any(
+                (x, y, z) in proposed
+                for x in x_cells
+                for y in y_cells
+                for z in (body_z, body_z + 1)
+            ):
+                return True
+        return False
 
     def _store(
         self,

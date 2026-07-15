@@ -7,7 +7,7 @@ import math
 from typing import TYPE_CHECKING
 
 import shared.constants as C
-from shared.packet import BlockBuild, ShootPacket
+from shared.packet import BlockBuild, BlockLine, ShootPacket
 
 from server.game_constants import WEAPON_PROFILES
 
@@ -85,6 +85,8 @@ class BotActionGateway:
             return self.fire(player)
         if action.kind is BotActionKind.BUILD:
             return self.build(player, action)
+        if action.kind is BotActionKind.BUILD_LINE:
+            return self.build_line(player, action)
         if action.kind is BotActionKind.PLACE_PREFAB:
             return self.prefab(player, action)
         if action.kind is BotActionKind.DEPLOY:
@@ -133,6 +135,57 @@ class BotActionGateway:
             construction.release(reservation)
         # Accepted block mutations can commit after physics; the short TTL
         # keeps the cell reserved until the normal mutation service catches up.
+        return accepted
+
+    def build_line(self, player: "Player", action: BotAction) -> bool:
+        """Submit one atomic native BlockLine through the shared combat path."""
+
+        if (
+            action.position is None
+            or action.end_position is None
+            or not self.select_tool(player, int(C.BLOCK_TOOL))
+        ):
+            return False
+        try:
+            start = tuple(int(round(value)) for value in action.position)
+            end = tuple(int(round(value)) for value in action.end_position)
+        except (TypeError, ValueError):
+            return False
+        if len(start) != 3 or len(end) != 3:
+            return False
+        combat = getattr(self.server, "combat", None)
+        cell_provider = getattr(combat, "block_line_cells", None)
+        if combat is None or not callable(cell_provider):
+            return False
+        try:
+            cells = tuple(
+                tuple(int(component) for component in cell)
+                for cell in cell_provider(start, end)
+            )
+        except (TypeError, ValueError):
+            return False
+        if not cells or len(cells) > int(
+            getattr(combat, "BLOCK_LINE_MAX_CELLS", 64)
+        ):
+            return False
+
+        construction = getattr(self.server, "construction", None)
+        reservation = None
+        if construction is not None:
+            reservation, _reason = construction.reserve_construction(
+                int(player.id), int(player.team), cells
+            )
+            if reservation is None:
+                return False
+
+        packet = BlockLine()
+        packet.loop_count = int(getattr(self.server, "loop_count", 0))
+        packet.player_id = int(player.id)
+        packet.x1, packet.y1, packet.z1 = start
+        packet.x2, packet.y2, packet.z2 = end
+        accepted = bool(combat.handle_block_line(player, packet))
+        if not accepted and construction is not None:
+            construction.release(reservation)
         return accepted
 
     def prefab(self, player: "Player", action: BotAction) -> bool:

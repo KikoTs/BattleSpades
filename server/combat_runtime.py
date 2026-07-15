@@ -524,7 +524,7 @@ class CombatSystem:
         # The remote client regenerates this packet through world.cube_line,
         # whose face-connected path is different from VXL.block_line's rounded
         # max-axis interpolation. A single tap has equal endpoints -> 1 cell.
-        cells = self._block_line_cells((x1, y1, z1), (x2, y2, z2))
+        cells = self.block_line_cells((x1, y1, z1), (x2, y2, z2))
         if not cells or len(cells) > self.BLOCK_LINE_MAX_CELLS:
             return False
         # The stock client removes already-solid cells from its preview/cost,
@@ -629,9 +629,15 @@ class CombatSystem:
             echo.color = color
             self.server.broadcast(bytes(echo.generate()), exclude=player)
 
-    def _block_line_cells(self, a, b):
-        """Stock face-connected traversal used by remote BlockLine handling."""
+    def block_line_cells(self, a, b):
+        """Return the stock face-connected cells for public action validation."""
+
         return list(cube_line(*a, *b))
+
+    def _block_line_cells(self, a, b):
+        """Compatibility alias retained for reverse-engineering regressions."""
+
+        return self.block_line_cells(a, b)
 
     def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
         """Raycast terrain from the CLIENT's reported origin/direction and dig

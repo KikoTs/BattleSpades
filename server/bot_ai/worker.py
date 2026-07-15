@@ -512,6 +512,52 @@ class WorkerVoxelWorld:
                 return upper
         return None
 
+    def cover_build_line(
+        self, position: Vector3, threat: Vector3
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+        """Return a supported 3--5 block wall perpendicular to ``threat``.
+
+        A cover suggestion is deliberately a straight native ``BlockLine``:
+        retail observers then see one coherent construction action instead of
+        a bot spraying unrelated single-cell packets.  Every proposed cell is
+        empty and supported; the gameplay-thread construction service still
+        revalidates the exact footprint against live terrain, bodies, spawn
+        zones, objectives, and friendly reservations.
+        """
+
+        direction = _normalized_xy(
+            threat[0] - position[0], threat[1] - position[1]
+        )
+        if math.hypot(direction[0], direction[1]) <= 1e-6:
+            return None
+        support_z = int(round(position[2] + 2.25))
+        # Face the broad side of an axis-aligned wall toward the threat.  AoS
+        # BlockLine rasterization is deterministic for these exact endpoints.
+        wall_along_y = abs(direction[0]) >= abs(direction[1])
+        for distance in (1.85, 1.35):
+            center_x = int(math.floor(position[0] + direction[0] * distance))
+            center_y = int(math.floor(position[1] + direction[1] * distance))
+            for z in (support_z - 1, support_z - 2):
+                for length in (5, 3):
+                    half = length // 2
+                    if wall_along_y:
+                        cells = tuple(
+                            (center_x, center_y + offset, z)
+                            for offset in range(-half, half + 1)
+                        )
+                    else:
+                        cells = tuple(
+                            (center_x + offset, center_y, z)
+                            for offset in range(-half, half + 1)
+                        )
+                    if all(
+                        not self.solid(*cell)
+                        and self.solid(cell[0], cell[1], cell[2] + 1)
+                        for cell in cells
+                    ):
+                        return cells[0], cells[-1]
+        return None
+
     def next_path_direction(
         self,
         start: Vector3,
@@ -2650,23 +2696,43 @@ class BotBrain:
         profile: BotProfile,
         now: float,
     ) -> BotIntent | None:
-        """Build one safe real cover cell/prefab under serious pressure."""
+        """Build replicated line or prefab cover under serious pressure."""
 
         pressured = observer.health <= 35 or (
             observer.health <= 55 and profile.caution >= 0.75
         )
         if not pressured or now < state.next_cover_build_at:
             return None
-        position_reader = getattr(self.world, "cover_build_cell", None)
-        cell = (
-            position_reader(observer.position, target.eye)
-            if callable(position_reader)
+        line_reader = getattr(self.world, "cover_build_line", None)
+        line = (
+            line_reader(observer.position, target.eye)
+            if callable(line_reader)
             else None
         )
-        if cell is None:
+        position_reader = getattr(self.world, "cover_build_cell", None)
+        cell = None
+        if line is None and callable(position_reader):
+            cell = position_reader(observer.position, target.eye)
+        if line is None and cell is None:
             state.next_cover_build_at = now + 1.0
             return None
-        can_block = int(C.BLOCK_TOOL) in observer.loadout and observer.blocks > 0
+        if line is not None:
+            start, end = line
+            block_cost = max(
+                abs(int(end[index]) - int(start[index])) for index in range(3)
+            ) + 1
+            cover_position = tuple(
+                (float(start[index]) + float(end[index])) * 0.5
+                for index in range(3)
+            )
+        else:
+            start = end = None
+            block_cost = 1
+            cover_position = tuple(float(value) for value in cell)
+        can_block = (
+            int(C.BLOCK_TOOL) in observer.loadout
+            and observer.blocks >= block_cost
+        )
         can_prefab = (
             int(C.PREFAB_TOOL) in observer.loadout
             and bool(observer.prefabs)
@@ -2682,13 +2748,13 @@ class BotBrain:
                 and self._rng.random() < 0.35 + profile.creativity * 0.45
             )
         )
-        state.next_cover_build_at = now + self._rng.uniform(6.0, 11.0)
-        position = tuple(float(value) for value in cell)
+        position = cover_position
         yaw = math.atan2(
             target.position[1] - observer.position[1],
             target.position[0] - observer.position[0],
         )
         if use_prefab:
+            state.next_cover_build_at = now + self._rng.uniform(6.0, 9.0)
             name = observer.prefabs[
                 (observer.player_id + frame.frame_id) % len(observer.prefabs)
             ]
@@ -2701,7 +2767,20 @@ class BotBrain:
             )
             tool = int(C.PREFAB_TOOL)
             role = "combat_prefab_cover"
+        elif line is not None:
+            # A short cadence permits a second supported row after the first
+            # line commits, while construction reservations prevent overlap.
+            state.next_cover_build_at = now + self._rng.uniform(1.1, 1.8)
+            action = BotAction(
+                BotActionKind.BUILD_LINE,
+                tool_id=int(C.BLOCK_TOOL),
+                position=tuple(float(value) for value in start),
+                end_position=tuple(float(value) for value in end),
+            )
+            tool = int(C.BLOCK_TOOL)
+            role = "combat_block_line_cover"
         else:
+            state.next_cover_build_at = now + self._rng.uniform(1.1, 1.8)
             action = BotAction(
                 BotActionKind.BUILD,
                 tool_id=int(C.BLOCK_TOOL),
