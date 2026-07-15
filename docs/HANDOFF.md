@@ -1183,9 +1183,10 @@ full suite: 719 passed in 93.84s
 - Tool 28 now reaches the shared prefab service. Zombie hand/bone/head remain
   selected, charged, collision-checked, reserved, committed, and replicated by
   ordinary gameplay services; the worker has no direct VXL authority.
-- Server-owned Zombies receive deterministic native base/Fast/Jump variants
-  before spawn and CreatePlayer. Humans remain base Zombie because the hidden
-  variants have no safe class-picker icons.
+- Production server-owned and human Zombies currently use the native base
+  Zombie. Fast/Jump remain reverse-engineering fixtures only: the hidden
+  variants have no safe class-picker icons and are not enabled in rotation
+  until a retail trace proves their exact selection rule and movement model.
 - Bot spawn-tool selection no longer falls back to rifle 6 for melee-only
   classes. A Zombie's very first WorldUpdate exposes hand 24, matching its
   CreatePlayer loadout, and primary swings remain latched across the 30 Hz
@@ -1217,3 +1218,51 @@ unsandboxed execution now validates the real child-process path. Keep
 `--inline-worker` only as an emergency smoke adapter; release evidence must
 include a real child PID. Two clean retail observers in a full Zombie round
 remain the final visual/feel confirmation.
+
+## 14. City bot priority and navigation soak (2026-07-15)
+
+- Combat and damage urgency now preempt construction/resource work. A visible
+  point-blank enemy draws the normalized firearm immediately; a victim also
+  receives a bounded reaction to the source position exposed by its normal HP
+  packet. Reload precedes low-priority travel/building, and melee is selected
+  only when both firearm clip and reserve are empty.
+- Explosive entity snapshots now use current projectile coordinates and carry
+  blast radius/fuse state. Worker and gameplay-thread gates reject friendly
+  blast overlap, while active hazards preempt combat/building with escape.
+- CityOfChicago exposed a zero-corridor softlock: Recast/fallback could return
+  no direction, `_stuck_recovery` rejected that zero heading, and its saturated
+  attempt counter permanently disabled later breach/build recovery. Every
+  objective now falls through to the bounded voxel action planner. If no local
+  edge exists, the bot remains safely stationary but retains a direct recovery
+  heading; three exhausted attempts clear path state and reopen replanning.
+- Visible Zombie charges use the same progress-gated recovery, so an infected
+  bot separated by destructible terrain escalates to claw breach or a native
+  Zombie prefab instead of returning `zombie_contact_charge` with zero motion
+  forever.
+- `scripts/bot_city_soak.py` is an accelerated real-VXL diagnostic. Its
+  `BotSoakMonitor` detects point-blank construction, repeated actions, jump
+  loops, travel-role zero-motion stalls, invalid looks, and authoritative wade
+  stalls. It deliberately does not claim native movement/packet validation.
+
+Validation:
+
+```text
+focused voxel/monitor suite: 23 passed
+focused bot/voxel/Zombie/construction suite: 129 passed
+CityOfChicago TDM, 12 bots, 60 simulated seconds:
+  207 fire decisions, 70 melee, 44 block actions, 5 oriented actions;
+  0 priority/action/jump/navigation/look/water failures; max stall 4.0 s
+CityOfChicago Zombie, 12 bots, 60 simulated seconds:
+  83 melee, 68 fast breaches, 26 Zombie prefab climbs;
+  0 priority/action/jump/navigation/look/water failures
+bot_worker_smoke.py --restart: real child restarted and returned an intent
+bot_zombie_smoke.py --seconds 15: base class 4, 10.00 -> 2.35 blocks,
+  survivor HP 100 -> 58, hand and swing replicated, real worker PID
+12-bot real-worker runtime: TDM and Zombie moved every bot; zero restarts
+full suite: 795 passed in 129.39s
+```
+
+The next acceptance step remains a real-time spawned-worker run followed by
+two clean retail observers. The accelerated adapter approximates collision and
+combat only to evolve policy state quickly; it cannot certify client sound,
+animation, hitbox, terrain packet, or reconciliation behavior.

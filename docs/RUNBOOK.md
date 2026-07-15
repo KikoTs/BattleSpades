@@ -385,6 +385,8 @@ py scripts\bot_worker_smoke.py --restart
 py scripts\bot_combat_smoke.py
 py scripts\bot_zombie_smoke.py --seconds 15
 py scripts\bot_runtime_smoke.py --seconds 12 --bots 12 --restart-worker-at 2
+py scripts\bot_city_soak.py --mode tdm --bots 12 --sim-seconds 60 --report-every 10
+py scripts\bot_city_soak.py --mode zom --bots 12 --sim-seconds 60 --report-every 10
 py scripts\server_capacity.py --players 12 --seconds 30 --port 27016
 
 # Exercise every implemented mode through the same real worker/native physics.
@@ -400,6 +402,15 @@ equipment use is intentionally probabilistic. The capacity gate must sustain
 58+ Hz, keep overall tick p99 at or below 12 ms and `subsystem_bots_p99_ms` at
 or below the configured 0.75 ms, keep worker memory below 256 MiB and CPU below
 one core, and report zero gameplay/mode/world-mutation drops.
+
+`bot_city_soak.py` loads the real CityOfChicago VXL and advances worker policy
+time without sleeping. It prints each bot's position, role, action, affordance,
+movement direction, health/ammo/tool, stuck attempts, and stationary duration.
+Its exit gate requires zero point-blank construction priority inversions,
+repeated action loops, jump loops, travel-role navigation stalls, invalid look
+targets, and water stalls. This is an accelerated decision/navigation
+diagnostic, not native physics or replication proof; keep the real worker,
+capacity, and two-retail-client gates above.
 
 `bot_combat_smoke.py` is the stricter player-parity gate. It uses a real worker,
 server-owned peerless Players, an authored VXL, and a settled packet observer.

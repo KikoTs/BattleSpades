@@ -1289,3 +1289,26 @@ The `--inline-worker` flag is smoke-only for restricted Windows sandboxes where
 and normal validation omit it and require a real child PID. Scoped unsandboxed
 validation now proves that production path; no in-process production fallback
 was added.
+
+## Accelerated City soak: what the first trace disproved (2026-07-15)
+
+The first CityOfChicago Zombie trace reported 29 seconds of water exposure at
+player z=235.75. That was a diagnostic error: a position at that height can be
+supported by the lowest legal dry voxel. Only the authoritative physics
+`wade` bit distinguishes it from the universal waterbed, so the monitor no
+longer guesses water from position.
+
+The same trace did prove a real worker defect. Several bots retained an
+objective role while emitting a zero movement vector for tens of seconds.
+Global navigation had no corridor; the generic recovery refused a zero heading
+and, after three earlier attempts, never reopened its attempt window. Adding
+more random patrol directions would have hidden the symptom and could steer
+over water. The accepted invariant is layered: global navigation first,
+bounded voxel action planning second, stationary recovery context third, and
+authoritative breach/build as the only topology mutation.
+
+Do not treat an accelerated soak as gameplay acceptance. It uses the exact VXL,
+messages, policies, LOS, local planners, and terrain deltas, but its kinematic
+adapter is intentionally small. A change to native movement, replication,
+combat cadence, sound, or client-facing entity packets still requires the real
+worker smoke and retail observers documented in `docs/RUNBOOK.md`.

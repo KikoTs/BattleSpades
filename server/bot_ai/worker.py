@@ -1084,13 +1084,11 @@ class BotBrain:
             stimulus=audible is not None,
         )
         if branch == "engage" and target is not None:
-            if (
-                int(observer.class_id) in _ZOMBIE_CLASSES
-                and target.position[2] < observer.position[2] - 0.75
-            ):
-                # An elevated visible survivor is still the urgent combat
-                # target, but claws cannot reach it. Permit only the Zombie's
-                # route-recovery climb/breach before resuming direct attacks.
+            if int(observer.class_id) in _ZOMBIE_CLASSES:
+                # Visible survivors remain the urgent target, but a stalled
+                # claw charge still needs topology recovery. Progress tracking
+                # keeps this inert during a successful chase; after 0.75s it
+                # may breach/build rather than returning a zero vector forever.
                 recovery = self._stuck_recovery(
                     frame, observer, state, now
                 )
@@ -1120,6 +1118,10 @@ class BotBrain:
                 velocity=observer.velocity,
                 abilities=self._movement_abilities(observer),
             )
+            if math.hypot(movement[0], movement[1]) <= 0.1:
+                movement = self._local_objective_route(
+                    frame, observer, state, objective
+                )
             breach = self._proactive_breach(
                 frame,
                 observer,
@@ -2418,10 +2420,64 @@ class BotBrain:
             )
         if state.stuck_attempts >= 3:
             # Abandon this local route and let patrol/objective selection pick
-            # a different heading on the next strategic tick.
+            # a different heading on the next strategic tick.  Reset the
+            # attempt window as well: leaving it saturated permanently
+            # disables every later breach/build recovery for the same bot.
             state.last_path_direction = (0.0, 0.0, 0.0)
             state.next_patrol_turn = 0.0
+            state.stuck_attempts = 0
+            state.path.clear()
+            state.path_goal = None
+            state.path_topology_version = -1
         return None
+
+    def _local_objective_route(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        objective: Vector3,
+    ) -> Vector3:
+        """Recover an objective route when the global navmesh has no corridor.
+
+        City maps frequently separate Recast polygons with destructible
+        ledges, thin bridges, or authored vertical layers.  The bounded voxel
+        action planner can still select the best safe immediate walk/jump/drop
+        toward the goal.  If even that search has no exit, retain only the
+        direct heading as recovery context while returning zero locomotion;
+        ``_stuck_recovery`` can then breach, bridge, or place a class prefab
+        without walking blindly over an edge or into water.
+        """
+
+        planner = getattr(self.world, "action_planner", None)
+        step = (
+            planner.plan_local(
+                observer.position,
+                objective,
+                abilities=self._movement_abilities(observer),
+                topology_version=frame.topology_version,
+                search_radius=24,
+                max_expansions=4096,
+            )
+            if planner is not None
+            else None
+        )
+        if step is not None:
+            state.last_path_direction = step.direction
+            state.last_affordance = step.affordance
+            state.path_goal = objective
+            state.path_topology_version = int(frame.topology_version)
+            return step.direction
+
+        direct = _normalized_xy(
+            objective[0] - observer.position[0],
+            objective[1] - observer.position[1],
+        )
+        state.last_path_direction = direct
+        state.last_affordance = MovementAffordance.WALK
+        state.path_goal = objective
+        state.path_topology_version = int(frame.topology_version)
+        return 0.0, 0.0, 0.0
 
     def _class_world_action(
         self,
@@ -2900,6 +2956,14 @@ class BotBrain:
                 velocity=observer.velocity,
                 abilities=self._movement_abilities(observer),
             )
+        if math.hypot(movement[0], movement[1]) <= 0.1 and distance > 6.0:
+            # Preserve a safe zero motor request while giving the next stalled
+            # frame a meaningful breach/build heading.  Never substitute the
+            # direct vector as locomotion here: it may cross water or an edge.
+            state.last_path_direction = direct
+            state.last_affordance = MovementAffordance.WALK
+            state.path_goal = target.position
+            state.path_topology_version = int(frame.topology_version)
 
         class_id = int(observer.class_id)
         if class_id == int(C.CLASS_FAST_ZOMBIE) and 4.0 < distance < 24.0:

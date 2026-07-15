@@ -13,6 +13,7 @@ from server.bot_ai.messages import (
     BotIntent,
     MovementAffordance,
     MovementIntent,
+    ObjectiveSnapshot,
     PerceptionFrame,
     PlayerSnapshot,
 )
@@ -457,6 +458,206 @@ def test_unreachable_elevated_survivor_escalates_to_zombie_climb_prefab() -> Non
     assert second.debug_role == "zombie_build_climb"
     assert second.action.kind.value == "place_prefab"
     assert second.action.argument == "prefab_zombiehand"
+
+
+def test_far_zombie_hunt_uses_local_voxel_route_when_global_path_is_empty() -> None:
+    columns = {(x, 5): {10} for x in range(5, 36)}
+    world = WorkerVoxelWorld()
+    world.map_epoch = 4
+    world.topology_version = 5
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    world.has_line_of_sight = lambda _origin, _target: False
+    world.next_path_direction = lambda *_args, **_kwargs: (0.0, 0.0, 0.0)
+    brain = BotBrain(world, seed=7)
+    zombie = _navigation_player(
+        1,
+        TEAM1,
+        (5.5, 5.5, 7.75),
+        class_id=int(C.CLASS_ZOMBIE),
+        is_bot=True,
+    )
+    survivor = _navigation_player(
+        2,
+        1,
+        (35.5, 5.5, 7.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=5,
+        map_epoch=4,
+        mode_epoch=1,
+        topology_version=5,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=now,
+        mode_id="zom",
+        players=(zombie, survivor),
+        mode_phase="ACTIVE",
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "zombie_hunt_survivor"
+    assert intent.movement.direction[0] > 0.9
+    assert intent.movement.affordance is MovementAffordance.WALK
+
+
+def test_ordinary_objective_uses_local_voxel_route_when_global_path_is_empty() -> None:
+    columns = {(x, 5): {10} for x in range(5, 36)}
+    world = WorkerVoxelWorld()
+    world.map_epoch = 4
+    world.topology_version = 5
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    world.has_line_of_sight = lambda _origin, _target: False
+    world.next_path_direction = lambda *_args, **_kwargs: (0.0, 0.0, 0.0)
+    brain = BotBrain(world, seed=8)
+    soldier = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_SOLDIER),
+            is_bot=True,
+        ),
+        weapon_tool=int(C.RIFLE_TOOL),
+        loadout=(int(C.RIFLE_TOOL), int(C.SPADE_TOOL), int(C.BLOCK_TOOL)),
+        ammo_clip=10,
+        ammo_reserve=50,
+    )
+    enemy = _navigation_player(
+        2,
+        1,
+        (35.5, 5.5, 7.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    objective = ObjectiveSnapshot("team_anchor", 1, enemy.position)
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=6,
+        map_epoch=4,
+        mode_epoch=1,
+        topology_version=5,
+        observer_id=soldier.player_id,
+        observer_generation=soldier.generation,
+        created_at=now,
+        mode_id="tdm",
+        players=(soldier, enemy),
+        objectives=(objective,),
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "team_assault_enemy_side"
+    assert intent.movement.direction[0] > 0.9
+
+
+def test_visible_zombie_stall_escalates_to_topology_action() -> None:
+    columns = {
+        (5, 5): {10},
+        (15, 5): {10},
+    }
+    world = WorkerVoxelWorld()
+    world.map_epoch = 5
+    world.topology_version = 6
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    world.has_line_of_sight = lambda _origin, _target: True
+    world.next_path_direction = lambda *_args, **_kwargs: (0.0, 0.0, 0.0)
+    brain = BotBrain(world, seed=9)
+    zombie = _navigation_player(
+        1,
+        TEAM1,
+        (5.5, 5.5, 7.75),
+        class_id=int(C.CLASS_ZOMBIE),
+        is_bot=True,
+    )
+    survivor = _navigation_player(
+        2,
+        1,
+        (15.5, 5.5, 7.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=7,
+        map_epoch=5,
+        mode_epoch=1,
+        topology_version=6,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=now,
+        mode_id="zom",
+        players=(zombie, survivor),
+        mode_phase="ACTIVE",
+    )
+
+    first = brain.decide(frame)
+    second = brain.decide(replace(frame, frame_id=8, created_at=now + 1.0))
+
+    assert first is not None
+    assert first.debug_role == "zombie_contact_charge"
+    assert first.movement.direction == (0.0, 0.0, 0.0)
+    assert second is not None
+    assert second.debug_role == "zombie_build_climb"
+    assert second.action.kind.value == "place_prefab"
+
+
+def test_exhausted_stuck_route_resets_for_a_fresh_replan() -> None:
+    world = SimpleNamespace(
+        blocking_cell=lambda _position, _direction: None,
+        bridge_cell=lambda _position, _direction: None,
+    )
+    brain = BotBrain(world, seed=8)
+    zombie = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (5.5, 5.5, 7.75),
+            class_id=int(C.CLASS_ZOMBIE),
+            is_bot=True,
+        ),
+        blocks=0,
+        prefabs=(),
+    )
+    frame = PerceptionFrame(
+        frame_id=6,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=2.0,
+        mode_id="zom",
+        players=(zombie,),
+        mode_phase="ACTIVE",
+    )
+    state = _BrainState(
+        last_progress_at=1.0,
+        stuck_attempts=2,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path=[(9.0, 5.0, 7.75)],
+        path_goal=(20.0, 5.0, 7.75),
+        path_topology_version=1,
+    )
+
+    result = brain._stuck_recovery(frame, zombie, state, 2.0)
+
+    assert result is None
+    assert state.stuck_attempts == 0
+    assert state.path == []
+    assert state.path_goal is None
+    assert state.path_topology_version == -1
 
 
 def test_local_planner_rejects_a_jump_with_blocked_head_arc() -> None:
