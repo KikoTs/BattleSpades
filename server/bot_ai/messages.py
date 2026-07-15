@@ -129,6 +129,12 @@ class PlayerSnapshot:
     grounded: bool = True
     wade: bool = False
     reloading: bool = False
+    # Latest authoritative action result for worker-side retry/replan policy.
+    last_action_kind: str = ""
+    last_action_accepted: bool = True
+    last_action_position: Vector3 | None = None
+    last_action_frame: int = -1
+    last_action_at: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +147,12 @@ class EntitySnapshot:
     owner_id: int
     position: Vector3
     alive: bool = True
+    kind: str = ""
+    tool_id: int = -1
+    velocity: Vector3 = (0.0, 0.0, 0.0)
+    blast_radius: float = 0.0
+    detonate_at: float = 0.0
+    hazardous: bool = False
 
 
 @dataclass(frozen=True, slots=True)

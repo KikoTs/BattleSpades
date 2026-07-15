@@ -127,6 +127,11 @@ class _RuntimeBot:
     intent: BotIntent | None = None
     last_intent_frame: int = -1
     last_action_frame: int = -1
+    feedback_action_kind: str = ""
+    feedback_action_accepted: bool = True
+    feedback_action_position: tuple[float, float, float] | None = None
+    feedback_action_frame: int = -1
+    feedback_action_at: float = 0.0
     next_perception_at: float = 0.0
     class_lives_remaining: int = 3
     action_primary: bool = False
@@ -608,6 +613,7 @@ class BotDirector:
         snapshots: list[PlayerSnapshot] = []
         for player in tuple(self.server.players.values()):
             generation = self._player_generation(player)
+            runtime = self._runtime.get(int(player.id))
             snapshots.append(
                 PlayerSnapshot(
                     player_id=int(player.id),
@@ -655,6 +661,25 @@ class BotDirector:
                     grounded=bool(getattr(player, "grounded", False)),
                     wade=bool(getattr(player, "wade", False)),
                     reloading=bool(getattr(player, "reloading", False)),
+                    last_action_kind=(
+                        runtime.feedback_action_kind if runtime is not None else ""
+                    ),
+                    last_action_accepted=(
+                        runtime.feedback_action_accepted
+                        if runtime is not None
+                        else True
+                    ),
+                    last_action_position=(
+                        runtime.feedback_action_position
+                        if runtime is not None
+                        else None
+                    ),
+                    last_action_frame=(
+                        runtime.feedback_action_frame if runtime is not None else -1
+                    ),
+                    last_action_at=(
+                        runtime.feedback_action_at if runtime is not None else 0.0
+                    ),
                 )
             )
         return tuple(snapshots)
@@ -663,8 +688,19 @@ class BotDirector:
         registry = getattr(self.server, "entity_registry", None)
         if registry is None:
             return ()
+        explosive_types = {
+            int(getattr(C, "DYNAMITE_ENTITY", 10)): int(C.DYNAMITE_TOOL),
+            int(getattr(C, "LANDMINE_ENTITY", 9)): int(C.LANDMINE_TOOL),
+            int(getattr(C, "C4_ENTITY", 38)): int(C.C4_TOOL),
+        }
         result: list[EntitySnapshot] = []
         for entity in tuple(registry.all()):
+            kind = str(getattr(entity, "kind", ""))
+            # The projectile engine owns the current moving coordinates.  Its
+            # registry counterpart retains only the spawn transform for wire
+            # replication and would make bots dodge a stale location.
+            if kind == "projectile":
+                continue
             position = getattr(entity, "position", None)
             if position is None:
                 position = (
@@ -672,14 +708,79 @@ class BotDirector:
                     getattr(entity, "y", 0.0),
                     getattr(entity, "z", 0.0),
                 )
+            entity_type = int(
+                getattr(entity, "entity_type", getattr(entity, "type", -1))
+            )
+            behavior = getattr(entity, "behavior", None)
+            blast_radius = float(getattr(behavior, "blast_radius", 0.0) or 0.0)
+            detonate_at = float(
+                getattr(behavior, "_detonate_at", 0.0) or 0.0
+            )
             result.append(
                 EntitySnapshot(
                     entity_id=int(getattr(entity, "entity_id", -1)),
-                    entity_type=int(getattr(entity, "entity_type", -1)),
+                    entity_type=entity_type,
                     team=int(getattr(entity, "team", -1)),
                     owner_id=int(getattr(entity, "player_id", -1)),
                     position=tuple(float(value) for value in position),
                     alive=bool(getattr(entity, "alive", True)),
+                    kind=kind,
+                    tool_id=explosive_types.get(entity_type, -1),
+                    velocity=tuple(
+                        float(value)
+                        for value in getattr(entity, "vel", (0.0, 0.0, 0.0))
+                    ),
+                    blast_radius=blast_radius,
+                    detonate_at=detonate_at,
+                    hazardous=(
+                        bool(getattr(entity, "alive", True))
+                        and entity_type in explosive_types
+                        and blast_radius > 0.0
+                    ),
+                )
+            )
+        engine = getattr(self.server, "projectile_engine", None)
+        projectiles = tuple(getattr(engine, "projectiles", ()) or ())
+        players = getattr(self.server, "players", {})
+        for index, projectile in enumerate(projectiles):
+            spec = getattr(projectile, "spec", None)
+            if spec is None:
+                continue
+            owner_id = int(getattr(projectile, "thrower_id", -1))
+            owner = players.get(owner_id)
+            blast_radius = float(getattr(spec, "blast_radius", 0.0) or 0.0)
+            entity_id = getattr(projectile, "entity_id", None)
+            result.append(
+                EntitySnapshot(
+                    entity_id=(
+                        int(entity_id) if entity_id is not None else -1 - index
+                    ),
+                    entity_type=int(getattr(spec, "entity_type", -1) or -1),
+                    team=int(getattr(owner, "team", -1)),
+                    owner_id=owner_id,
+                    position=(
+                        float(projectile.x),
+                        float(projectile.y),
+                        float(projectile.z),
+                    ),
+                    alive=True,
+                    kind="projectile",
+                    tool_id=int(getattr(projectile, "tool", -1)),
+                    velocity=(
+                        float(projectile.vx),
+                        float(projectile.vy),
+                        float(projectile.vz),
+                    ),
+                    blast_radius=blast_radius,
+                    detonate_at=float(
+                        getattr(projectile, "explode_at", 0.0)
+                        or getattr(projectile, "lifespan_at", 0.0)
+                        or 0.0
+                    ),
+                    hazardous=(
+                        float(getattr(spec, "damage", 0.0) or 0.0) > 0.0
+                        and blast_radius > 0.0
+                    ),
                 )
             )
         return tuple(result)
@@ -903,7 +1004,10 @@ class BotDirector:
             else:
                 # BUILD/PLACE_PREFAB/DEPLOY/RELOAD carry explicit positions
                 # (or need none) and are orientation-independent.
-                self.gateway.execute(player, intent.action)
+                accepted = self.gateway.execute(player, intent.action)
+                self._record_action_result(
+                    runtime, intent.action, accepted, now
+                )
         pending = runtime.pending_action
         if pending is not None and pending.position is not None:
             # A world-cell action keeps aim priority over the newest look so
@@ -1206,6 +1310,7 @@ class BotDirector:
         self, runtime: _RuntimeBot, action: BotAction, now: float
     ) -> None:
         accepted = self.gateway.execute(runtime.player, action)
+        self._record_action_result(runtime, action, accepted, now)
         if accepted and action.kind is BotActionKind.FIRE:
             self._apply_recoil(runtime)
         sustain = (
@@ -1250,6 +1355,25 @@ class BotDirector:
             runtime.action_primary_until_loop,
             int(getattr(self.server, "loop_count", 0)) + 2,
         )
+
+    @staticmethod
+    def _record_action_result(
+        runtime: _RuntimeBot,
+        action: BotAction,
+        accepted: bool,
+        now: float,
+    ) -> None:
+        """Publish one bounded authoritative result to worker perception."""
+
+        runtime.feedback_action_kind = str(action.kind.value)
+        runtime.feedback_action_accepted = bool(accepted)
+        runtime.feedback_action_position = (
+            tuple(float(value) for value in action.position)
+            if action.position is not None
+            else None
+        )
+        runtime.feedback_action_frame = int(runtime.last_action_frame)
+        runtime.feedback_action_at = float(now)
 
     def _apply_recoil(self, runtime: _RuntimeBot) -> None:
         """Kick the aim motor per accepted shot; recoil_control mitigates.

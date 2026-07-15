@@ -234,6 +234,12 @@ class BotActionGateway:
             return bool(service.set_disguise(player, active=True))
         if position is None:
             return False
+        if tool in {
+            int(C.DYNAMITE_TOOL),
+            int(C.LANDMINE_TOOL),
+            int(C.C4_TOOL),
+        } and not self._explosive_deploy_safe(player, position, tool):
+            return False
         if tool == int(C.DYNAMITE_TOOL):
             return bool(service.place_dynamite(player, position))
         if tool == int(C.LANDMINE_TOOL):
@@ -249,6 +255,98 @@ class BotActionGateway:
         if tool == int(C.ROCKET_TURRET_TOOL):
             return bool(service.place_rocket_turret(player, position, yaw=action.yaw))
         return False
+
+    def _explosive_deploy_safe(
+        self, player: "Player", position, tool: int
+    ) -> bool:
+        """Fail closed when a bot charge would overlap friends or live blasts.
+
+        The worker performs tactical planning, but this gameplay-thread gate
+        closes the race where two bots arm charges from the same perception
+        frame.  The owner is exempt because timed dynamite is intentionally
+        placed inside its initial blast volume and must then retreat.
+        """
+
+        from server.projectiles import PROJECTILE_SPECS
+
+        try:
+            target = tuple(float(value) for value in position)
+        except (TypeError, ValueError):
+            return False
+        if len(target) != 3 or not all(math.isfinite(value) for value in target):
+            return False
+        fallback_radii = {
+            int(C.DYNAMITE_TOOL): float(
+                getattr(C, "DYNAMITE_EXPLOSION_RADIUS", 5.0)
+            ),
+            int(C.LANDMINE_TOOL): float(
+                getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)
+            ),
+            int(C.C4_TOOL): float(getattr(C, "C4_EXPLOSION_RADIUS", 8.0)),
+        }
+        spec = PROJECTILE_SPECS.get(int(tool))
+        radius = max(
+            fallback_radii.get(int(tool), 0.0),
+            float(getattr(spec, "blast_radius", 0.0) or 0.0),
+        )
+        if radius <= 0.0:
+            return False
+
+        for teammate in tuple(getattr(self.server, "players", {}).values()):
+            if int(getattr(teammate, "id", -1)) == int(player.id):
+                continue
+            if int(getattr(teammate, "team", -1)) != int(player.team):
+                continue
+            if not bool(getattr(teammate, "alive", False)) or not bool(
+                getattr(teammate, "spawned", False)
+            ):
+                continue
+            try:
+                teammate_position = (
+                    float(teammate.x),
+                    float(teammate.y),
+                    float(teammate.z),
+                )
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if sum(
+                (teammate_position[index] - target[index]) ** 2
+                for index in range(3)
+            ) <= (radius + 1.5) ** 2:
+                return False
+
+        explosive_types = {
+            int(getattr(C, "DYNAMITE_ENTITY", 10)),
+            int(getattr(C, "LANDMINE_ENTITY", 9)),
+            int(getattr(C, "C4_ENTITY", 38)),
+        }
+        registry = getattr(self.server, "entity_registry", None)
+        for entity in tuple(registry.all() if registry is not None else ()):
+            if not bool(getattr(entity, "alive", True)):
+                continue
+            entity_type = int(
+                getattr(entity, "entity_type", getattr(entity, "type", -1))
+            )
+            behavior = getattr(entity, "behavior", None)
+            other_radius = float(
+                getattr(behavior, "blast_radius", 0.0) or 0.0
+            )
+            if entity_type not in explosive_types or other_radius <= 0.0:
+                continue
+            try:
+                entity_position = (
+                    float(entity.x),
+                    float(entity.y),
+                    float(entity.z),
+                )
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if sum(
+                (entity_position[index] - target[index]) ** 2
+                for index in range(3)
+            ) <= (radius + other_radius + 1.0) ** 2:
+                return False
+        return True
 
     def oriented(self, player: "Player", action: BotAction) -> bool:
         """Launch an equipped oriented weapon through its shared action service."""

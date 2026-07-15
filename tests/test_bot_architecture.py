@@ -34,7 +34,14 @@ from server.bot_ai.messages import (
 from server.bot_ai.profiles import ProfileFactory
 from server.bot_ai.supervisor import AIWorkerSupervisor
 from server.bot_ai.stimuli import BotStimulusBus
-from server.bot_ai.worker import BotBrain, WorkerVoxelWorld, _process_worker_batch
+from server.bot_ai.worker import (
+    BotBrain,
+    WorkerVoxelWorld,
+    _BrainState,
+    _process_worker_batch,
+)
+from server.entities.registry import EntityRegistry
+from server.projectiles import PROJECTILE_SPECS
 from server.game_constants import DEFAULT_WEAPON_TOOL
 from server.config import ServerConfig
 from server.main import BattleSpadesServer
@@ -223,6 +230,49 @@ def test_bot_primary_action_pulse_survives_one_replication_interval() -> None:
     server.loop_count = 103
     director._apply_motor(runtime, now + 0.02, 1.0 / 60.0)
     assert not (bot.pack_action_flags() & 0x01)
+
+
+def test_rejected_world_action_is_published_back_to_worker_snapshot() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="FeedbackBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=71,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(),
+        action=BotAction(
+            BotActionKind.BUILD,
+            tool_id=int(C.BLOCK_TOOL),
+            position=(20.0, 20.0, 20.0),
+        ),
+    )
+    director.gateway.execute = lambda _player, _action: False
+
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+    snapshot = next(
+        item for item in director._snapshot_players() if item.player_id == bot.id
+    )
+
+    assert snapshot.last_action_kind == BotActionKind.BUILD.value
+    assert snapshot.last_action_accepted is False
+    assert snapshot.last_action_frame == 71
+    assert snapshot.last_action_position == (20.0, 20.0, 20.0)
 
 
 def _facing_fixture(class_id: int = int(C.CLASS_MINER)):
@@ -1346,6 +1396,139 @@ def test_low_health_bot_prefers_nearest_live_health_crate() -> None:
     assert BotBrain._resource_goal(frame, observer) == (8.0, 0.0, 0.0)
 
 
+def test_entity_snapshot_publishes_live_explosive_hazards() -> None:
+    registry = EntityRegistry()
+    registry.place(
+        int(C.DYNAMITE_ENTITY),
+        4.0,
+        5.0,
+        6.0,
+        state=TEAM1,
+        kind="deployable",
+        player_id=7,
+        behavior=SimpleNamespace(blast_radius=5.0),
+    )
+    grenade = SimpleNamespace(
+        entity_id=None,
+        spec=PROJECTILE_SPECS[int(C.GRENADE_TOOL)],
+        tool=int(C.GRENADE_TOOL),
+        x=11.0,
+        y=12.0,
+        z=13.0,
+        vx=1.0,
+        vy=2.0,
+        vz=3.0,
+        explode_at=123.0,
+        lifespan_at=0.0,
+        thrower_id=8,
+    )
+    server = SimpleNamespace(
+        entity_registry=registry,
+        projectile_engine=SimpleNamespace(projectiles=[grenade]),
+        players={7: SimpleNamespace(team=TEAM1), 8: SimpleNamespace(team=TEAM2)},
+    )
+
+    snapshots = BotDirector._snapshot_entities(SimpleNamespace(server=server))
+
+    dynamite = next(item for item in snapshots if item.owner_id == 7)
+    thrown = next(item for item in snapshots if item.owner_id == 8)
+    assert dynamite.entity_type == int(C.DYNAMITE_ENTITY)
+    assert dynamite.hazardous is True
+    assert dynamite.blast_radius == 5.0
+    assert thrown.tool_id == int(C.GRENADE_TOOL)
+    assert thrown.position == (11.0, 12.0, 13.0)
+    assert thrown.velocity == (1.0, 2.0, 3.0)
+    assert thrown.hazardous is True
+
+
+def test_bot_retreats_from_nearby_live_explosive_before_combat() -> None:
+    world = _SwitchableWorld()
+    brain = BotBrain(world, seed=13)
+    observer = _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+    frame = replace(
+        _frame(1, observer, enemy),
+        entities=(
+            EntitySnapshot(
+                90,
+                int(C.DYNAMITE_ENTITY),
+                TEAM1,
+                3,
+                (2.0, 0.0, 0.0),
+                hazardous=True,
+                blast_radius=5.0,
+            ),
+        ),
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "explosive_hazard_escape"
+    assert intent.movement.direction[0] < -0.9
+    assert intent.action.kind is BotActionKind.NONE
+
+
+def test_generic_miner_fortification_never_arms_dynamite_among_teammates() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=3)
+    now = time.monotonic()
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        class_id=int(C.CLASS_MINER),
+        loadout=(int(C.DYNAMITE_TOOL),),
+    )
+    teammate = _player_snapshot(3, TEAM1, (2.0, 0.0, 0.0))
+    frame = replace(
+        _frame(1, observer, _player_snapshot(2, TEAM2, (40.0, 0.0, 0.0))),
+        players=(observer, teammate),
+        created_at=now,
+    )
+    state = _BrainState(next_world_action_at=now - 1.0)
+
+    action = brain._class_world_action(
+        frame,
+        observer,
+        state,
+        _profile(),
+        now,
+        role="zombie_survivor_defend",
+    )
+
+    assert action is None
+
+
+def test_miner_demolition_requires_a_clear_friendly_blast_volume() -> None:
+    class MiningWorld(_SwitchableWorld):
+        @staticmethod
+        def blocking_cell(_position, _direction):
+            return (2, 0, 0)
+
+    brain = BotBrain(MiningWorld(), seed=4)
+    now = time.monotonic()
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        class_id=int(C.CLASS_MINER),
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.DYNAMITE_TOOL)),
+    )
+    teammate = _player_snapshot(3, TEAM1, (3.0, 0.5, 0.5))
+    frame = replace(
+        _frame(1, observer, _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))),
+        players=(observer, teammate),
+        created_at=now,
+    )
+
+    intent = brain._miner_demolition(
+        frame,
+        observer,
+        _BrainState(),
+        SimpleNamespace(seen_at=now - 3.0),
+        now,
+        (1.0, 0.0, 0.0),
+    )
+
+    assert intent is None
+
+
 class _SwitchableWorld:
     def __init__(self) -> None:
         self.visible = True
@@ -1692,6 +1875,53 @@ def test_critical_bot_builds_replicated_block_line_cover_across_threat() -> None
     assert intent.action.position == (1.0, -2.0, 2.0)
     assert intent.action.end_position == (1.0, 2.0, 2.0)
     assert intent.debug_role == "combat_block_line_cover"
+
+
+def test_rejected_cover_feedback_breaks_the_build_and_aim_loop() -> None:
+    class CoverWorld(_SwitchableWorld):
+        @staticmethod
+        def cover_direction(_position, _threat):
+            return (0.0, 0.0, 0.0)
+
+        @staticmethod
+        def cover_build_line(_position, _threat):
+            return (1, -2, 2), (1, 2, 2)
+
+    brain = BotBrain(CoverWorld(), seed=3)
+    start = time.monotonic()
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        health=28,
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.BLOCK_TOOL)),
+        blocks=50,
+    )
+    enemy = _player_snapshot(2, TEAM2, (18.0, 0.0, 0.0))
+    first = brain.decide(
+        replace(_frame(1, observer, enemy), created_at=start)
+    )
+    assert first is not None
+    assert first.action.kind is BotActionKind.BUILD_LINE
+    rejected = replace(
+        observer,
+        last_action_kind=BotActionKind.BUILD_LINE.value,
+        last_action_accepted=False,
+        last_action_frame=first.frame_id,
+        last_action_position=first.action.position,
+        last_action_at=start + 2.1,
+    )
+
+    recovered = brain.decide(
+        replace(
+            _frame(2, rejected, enemy),
+            created_at=start + 2.1,
+            players=(rejected, enemy),
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.action.kind is not BotActionKind.BUILD_LINE
+    assert recovered.look is not None
+    assert recovered.look.target != first.action.position
 
 
 def test_miner_proactively_breaches_a_hidden_contact_obstruction() -> None:
