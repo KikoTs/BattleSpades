@@ -75,6 +75,7 @@ selfrow_samples.ndjson
 *.obj
 
 # ── Agent / assistant tooling ───────────────────────────────────────
+.worktrees/
 .claude/
 re-agent.yaml
 codex-command-runner.exe
