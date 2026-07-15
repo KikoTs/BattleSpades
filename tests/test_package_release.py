@@ -60,7 +60,7 @@ def test_invalid_release_target_is_rejected() -> None:
 def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> None:
     """Maps/prefabs ship, while unrelated root executables never enter output."""
 
-    target = ReleaseTarget("windows", "x86_64", "0.0.1-alpha.1")
+    target = ReleaseTarget("windows", "x86_64", "0.0.1-alpha.2")
 
     staged = stage_release(
         PROJECT_ROOT,
@@ -154,15 +154,18 @@ def test_checksum_manifest_rejects_partial_matrix(tmp_path: Path) -> None:
         raise AssertionError("partial release matrix was accepted")
 
 
-def test_checksum_cli_runs_as_repository_script(tmp_path: Path) -> None:
-    """The workflow invocation works when Python starts inside scripts/."""
+def test_checksum_cli_runs_without_installed_project_dependencies(
+    tmp_path: Path,
+) -> None:
+    """The publish job can verify assets without installing server packages."""
 
-    for name in expected_archive_names("0.0.1-alpha.1"):
+    for name in expected_archive_names("0.0.1-alpha.2"):
         (tmp_path / name).write_bytes(name.encode("utf-8"))
 
     completed = subprocess.run(
         [
             sys.executable,
+            "-S",
             str(PROJECT_ROOT / "scripts" / "verify_release_assets.py"),
             "--asset-dir",
             str(tmp_path),
