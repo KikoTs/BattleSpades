@@ -58,6 +58,7 @@ _PLAYER_MELEE_ALIGNMENT = 0.72
 # the position of the worker-authorized visible target; when it lapses, aim
 # reverts to the worker-frozen point and sustained fire stops.
 _LOCK_LEASE = 0.45
+_JUMP_PULSE_TICKS = 2
 # Sustained tracking settles a human onto the target: perception lag and aim
 # noise shrink over this many seconds of continuous lock.
 _LOCK_SETTLE_TIME = 1.2
@@ -149,6 +150,8 @@ class _RuntimeBot:
     next_wall_probe_at: float = 0.0
     wall_probe_clear: bool = True
     burst_remaining: int = 0
+    jump_request_active: bool = False
+    jump_until_loop: int = -1
 
 
 class BotDirector:
@@ -860,6 +863,8 @@ class BotDirector:
             or intent is None
             or intent.expires_at <= now
         ):
+            runtime.jump_request_active = False
+            runtime.jump_until_loop = -1
             # A latched action legitimately outlives its intent by the
             # convergence grace window: keep slewing toward its target so a
             # nearly-faced dig or shot still lands before the deadline.
@@ -920,7 +925,9 @@ class BotDirector:
             self._update_aim(runtime, runtime.pending_action_look, dt)
         self._try_pending_action(runtime, now)
         direction = intent.movement.direction
-        if not self._waypoint_is_live(runtime, direction):
+        if not self._waypoint_is_live(
+            runtime, direction, intent.movement.affordance
+        ):
             direction = (0.0, 0.0, 0.0)
         forward = (float(player.o_x), float(player.o_y))
         side = (-forward[1], forward[0])
@@ -936,13 +943,27 @@ class BotDirector:
             int(getattr(self.server, "loop_count", 0))
             <= runtime.action_primary_until_loop
         )
+        jump_requested = (
+            bool(intent.movement.jump)
+            or affordance is MovementAffordance.JUMP
+        )
+        current_loop = int(getattr(self.server, "loop_count", 0))
+        if jump_requested and not runtime.jump_request_active:
+            runtime.jump_request_active = True
+            runtime.jump_until_loop = current_loop + _JUMP_PULSE_TICKS
+        elif not jump_requested:
+            runtime.jump_request_active = False
+            runtime.jump_until_loop = -1
+        jump_held = (
+            runtime.jump_request_active
+            and current_loop <= runtime.jump_until_loop
+        )
         self._set_movement_state(runtime, (
             forward_amount > 0.25,
             forward_amount < -0.25,
             side_amount < -0.25,
             side_amount > 0.25,
-            bool(intent.movement.jump)
-            or affordance is MovementAffordance.JUMP,
+            jump_held,
             bool(intent.movement.crouch)
             or affordance is MovementAffordance.CROUCH,
             bool(intent.movement.sneak),
@@ -1326,35 +1347,103 @@ class BotDirector:
         return frozenset(cells)
 
     @staticmethod
-    def _waypoint_is_live(runtime: _RuntimeBot, direction) -> bool:
+    def _waypoint_is_live(
+        runtime: _RuntimeBot,
+        direction,
+        affordance: MovementAffordance = MovementAffordance.WALK,
+    ) -> bool:
         player = runtime.player
         server = getattr(getattr(player, "connection", None), "server", None)
         world = getattr(server, "world_manager", None)
         if world is None:
             return False
         dx, dy = float(direction[0]), float(direction[1])
-        if dx * dx + dy * dy <= 1e-12:
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
             return True
+        dx, dy = dx / length, dy / length
         probe_key = (
-            math.floor(player.x),
-            math.floor(player.y),
-            math.floor(player.z),
+            int(round(float(player.x) * 4.0)),
+            int(round(float(player.y) * 4.0)),
+            int(round(float(player.z) * 4.0)),
             int(round(dx * 100.0)),
             int(round(dy * 100.0)),
             int(getattr(world, "topology_version", 0)),
+            bool(getattr(player, "wade", False)),
+            affordance.value,
         )
         if runtime.waypoint_probe_key == probe_key:
             return runtime.waypoint_probe_result
-        probe_x = float(player.x) + dx * 0.65
-        probe_y = float(player.y) + dy * 0.65
-        # Cheap live-map validation; no raycast or path search occurs here.
-        result = not (
-            world.clipbox(probe_x, probe_y, float(player.z))
-            or world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
+        center_x = float(player.x) + dx * 0.65
+        center_y = float(player.y) + dy * 0.65
+        shoulder_x, shoulder_y = -dy * 0.45, dx * 0.45
+        probes = (
+            (center_x, center_y),
+            (center_x + shoulder_x, center_y + shoulder_y),
+            (center_x - shoulder_x, center_y - shoulder_y),
+        )
+        result = all(
+            BotDirector._probe_surface_is_live(
+                world,
+                player,
+                probe_x,
+                probe_y,
+                affordance,
+            )
+            for probe_x, probe_y in probes
         )
         runtime.waypoint_probe_key = probe_key
         runtime.waypoint_probe_result = result
         return result
+
+    @staticmethod
+    def _probe_surface_is_live(
+        world,
+        player,
+        probe_x: float,
+        probe_y: float,
+        affordance: MovementAffordance,
+    ) -> bool:
+        """Validate one body-width movement probe against current VXL state."""
+
+        if (
+            world.clipbox(probe_x, probe_y, float(player.z))
+            or world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
+        ):
+            return False
+        cell_x, cell_y = int(math.floor(probe_x)), int(math.floor(probe_y))
+        # A dry plan may never enter the universal water plane. Wading bots
+        # are allowed to traverse it only so recovery can lead them to land.
+        if (
+            not bool(getattr(player, "wade", False))
+            and bool(world.is_water_column(cell_x, cell_y))
+        ):
+            return False
+
+        expected_support = int(round(float(player.z) + 2.25))
+        climb, drop = {
+            MovementAffordance.JUMP: (2, 3),
+            MovementAffordance.DROP: (1, 4),
+            MovementAffordance.JETPACK: (8, 8),
+        }.get(affordance, (1, 1))
+        solid = getattr(world, "get_solid", None)
+        if callable(solid):
+            candidates = range(
+                max(2, expected_support - climb),
+                min(240, expected_support + drop + 1),
+            )
+            return any(
+                bool(solid(cell_x, cell_y, support_z))
+                and not bool(solid(cell_x, cell_y, support_z - 1))
+                and not bool(solid(cell_x, cell_y, support_z - 2))
+                for support_z in sorted(
+                    candidates,
+                    key=lambda value: abs(value - expected_support),
+                )
+            )
+
+        surface_z = int(world.get_height(cell_x, cell_y))
+        return expected_support - climb <= surface_z <= expected_support + drop
 
     @staticmethod
     def _wrap(angle: float) -> float:
