@@ -176,3 +176,14 @@ def test_cancel_reason_closes_vote():
     # last broadcast is a CLOSED message
     pkt = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
     assert pkt.message_type == voting.VOTE_CLOSED
+
+
+def test_disconnect_clears_vote_identity_before_player_id_reuse():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+    vm.start_kick(srv.players[0], srv.players[3], voting.KICK_ABUSE, now=100.0)
+
+    vm.forget_player(0)
+
+    assert not vm.active
+    assert 0 not in vm._last_start

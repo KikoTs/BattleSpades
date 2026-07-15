@@ -10,6 +10,8 @@ from aoslib.vxl import VXL
 from shared.bytes import ByteReader
 from shared.packet import MapDataValidation, MapSyncChunk, MapSyncEnd, MapSyncStart
 from server.connection import Connection
+from server.runtime_vxl import _is_retail_marker_color, _raw_vxl_size
+from server.world_manager import WorldManager, _shift_sync_records
 
 
 MAPS_DIR = Path("maps")
@@ -32,12 +34,15 @@ class DummyWorldManager:
     def get_chunker(self):
         return self.map.get_chunker()
 
-    def serialize_dirty_columns_compressed(self):
+    def serialize_dirty_columns_compressed(self, snapshot_columns=None):
         import zlib
 
-        if not self.dirty_columns:
+        columns = (
+            self.dirty_columns if snapshot_columns is None else snapshot_columns
+        )
+        if not columns:
             return b""
-        raw = self.map.serialize_columns(sorted(self.dirty_columns))
+        raw = self.map.serialize_columns(sorted(columns))
         return zlib.compress(raw, 6) if raw else b""
 
 
@@ -84,6 +89,30 @@ def raw_column_surface_z(data: bytes, target_x: int, target_y: int) -> int:
     raise AssertionError(f"column ({target_x}, {target_y}) not found")
 
 
+def parse_sync_records(data: bytes):
+    """Split a decompressed MapSync stream into (x, y, full-record) rows."""
+    import struct
+
+    records = []
+    pos = 0
+    while pos < len(data):
+        start = pos
+        x, y = struct.unpack_from("<II", data, pos)
+        pos += 8
+        while True:
+            span_words = data[pos]
+            top_start = data[pos + 1]
+            top_end = data[pos + 2]
+            top_len = top_end - top_start + 1 if top_end >= top_start else 0
+            if span_words == 0:
+                pos += 4 + top_len * 4
+                break
+            pos += span_words * 4
+        records.append((x, y, data[start:pos]))
+    assert pos == len(data)
+    return records
+
+
 def test_shipped_map_chunker_restores_old_sync_shape():
     path = fixture_map_path()
     original_bytes = path.read_bytes()
@@ -103,7 +132,7 @@ def test_shipped_map_chunker_restores_old_sync_shape():
     assert world_map.estimated_size >= sum(len(chunk) for chunk in first_chunks)
 
 
-def test_shipped_map_preserves_raw_surface_z_coordinates():
+def test_shipped_map_normalizes_surface_z_to_retail_waterplane_space():
     path = fixture_map_path()
     original_bytes = path.read_bytes()
     world_map = VXL(1, str(path), 3)
@@ -114,8 +143,78 @@ def test_shipped_map_preserves_raw_surface_z_coordinates():
         (256, 256),
     ]
 
+    _columns, max_ref = _raw_vxl_size(original_bytes)
+    z_shift = max(0, 239 - max_ref)
     for x, y in sample_columns:
-        assert world_map.get_z(x, y) == raw_column_surface_z(original_bytes, x, y)
+        assert world_map.get_z(x, y) == raw_column_surface_z(original_bytes, x, y) + z_shift
+
+
+def test_shipped_map_retail_z_shifts_match_measured_formats():
+    expected = {
+        "20thCenturyTown": 176,
+        "CityOfChicago": 39,
+        "ArcticBase": 0,
+        "CastleWars": 0,
+    }
+    for name, shift in expected.items():
+        path = MAPS_DIR / f"{name}.vxl"
+        if not path.exists():
+            continue
+        _columns, max_ref = _raw_vxl_size(path.read_bytes())
+        assert max(0, 239 - max_ref) == shift
+
+
+def test_server_world_removes_retail_blue_green_marker_voxels() -> None:
+    """Server collision must match the stock client's post-load map.
+
+    ArcticBase stores authored marker points as saturated blue/green voxels.
+    The retail loader removes them before gameplay.  A live client reported
+    ``(231, 189, 221)`` empty while the unnormalised server treated it as a
+    one-block step, producing a deterministic 0.177551-block correction at
+    the first walk across that coordinate.
+    """
+    path = MAPS_DIR / "ArcticBase.vxl"
+    if not path.exists():
+        return
+
+    wm = WorldManager(SimpleNamespace(
+        maps_path=str(path.parent), game_mode="tdm"
+    ))
+    assert wm.load_map(path.stem)
+
+    assert _is_retail_marker_color(0xFF0000F0) is True
+    assert _is_retail_marker_color(0xFF0000FA) is True
+    assert _is_retail_marker_color(0xFF05FF05) is True
+    assert _is_retail_marker_color(0xFF0AFF0A) is True
+    assert _is_retail_marker_color(0xFFFC1111) is False
+
+    assert wm.get_solid(231, 189, 221) is False
+    assert wm.get_solid(221, 189, 221) is False
+    # Removing the marker must reveal, not hollow, the real terrain below.
+    assert wm.get_solid(231, 189, 222) is True
+    assert wm.get_solid(221, 189, 222) is True
+    # Bright red terrain is ordinary authored geometry and remains solid.
+    assert wm.get_solid(288, 339, 207) is True
+
+
+def test_legacy_chroma_key_cleanup_requires_native_exposure_guard() -> None:
+    """Colour alone is insufficient; native cleanup requires exposed air.
+
+    20thCenturyTown contains 2,534 blue-family words. A hash-identical stock
+    client removed exactly the 524 with two air cells above and retained the
+    embedded remainder. This gates both the colour mask and exposure direction.
+    """
+    path = MAPS_DIR / "20thCenturyTown.vxl"
+    if not path.exists():
+        return
+    wm = WorldManager(SimpleNamespace(
+        maps_path=str(path.parent), game_mode="tdm"
+    ))
+    assert wm.load_map(path.stem)
+    assert len(wm.map.retail_marker_positions) == 524
+    assert (362, 153, 229) in wm.map.retail_marker_positions
+    assert wm.get_solid(362, 153, 229) is False
+    assert wm.get_solid(362, 153, 230) is True
 
 
 def test_generated_and_edited_maps_use_valid_old_style_chunking():
@@ -150,6 +249,56 @@ def test_get_z_returns_surface_block_not_column_bottom():
     assert world_map.get_z(64, 64) == 120
     assert world_map.get_z(64, 64, 121) == 121
     assert world_map.get_random_pos(64, 64, 65, 65) == (64, 64, 120)
+
+
+def test_runtime_block_colors_are_stored_as_opaque_vxl_colors():
+    wm = WorldManager(SimpleNamespace(maps_path="maps", game_mode="tdm"))
+    wm.map = VXL(-1, b"", 0, 2)
+
+    assert wm.set_block(10, 20, 30, True, 0x123456) is True
+    assert wm.get_color(10, 20, 30) == 0x80123456
+    assert wm.map.get_color_tuple(10, 20, 30) == (0x12, 0x34, 0x56, 0xFF)
+
+
+def test_player_block_delta_serializes_retail_opaque_color_word():
+    """Reconnect MapSync must carry the same 0x80 alpha byte produced by the
+    retail VXL.make_color(r,g,b,255) path, never alpha zero."""
+    import struct
+    import zlib
+
+    wm = WorldManager(SimpleNamespace(maps_path="maps", game_mode="tdm"))
+    wm.map = VXL(-1, b"", 0, 2)
+    assert wm.set_block(10, 20, 30, True, 0x123456)
+
+    raw = zlib.decompress(wm.serialize_dirty_columns_compressed())
+    assert struct.unpack_from("<II", raw, 0) == (10, 20)
+    # A one-voxel floating run is both its top and bottom surface, so the
+    # compact VXL record carries the color twice (header + two color words).
+    assert (raw[8], raw[9], raw[10]) == (3, 30, 30)
+    assert struct.unpack_from("<I", raw, 12)[0] == 0x80123456
+    assert struct.unpack_from("<I", raw, 16)[0] == 0x80123456
+
+
+def test_out_of_world_block_write_is_not_marked_dirty():
+    wm = WorldManager(SimpleNamespace(maps_path="maps", game_mode="tdm"))
+    wm.map = VXL(-1, b"", 0, 2)
+
+    assert wm.set_block(10, 20, 240, True, 0x123456) is False
+    assert (10, 20) not in wm.dirty_columns
+
+
+def test_legacy_map_delta_keeps_player_blocks_above_source_z_range():
+    path = MAPS_DIR / "20thCenturyTown.vxl"
+    if not path.exists():
+        return
+    wm = WorldManager(SimpleNamespace(maps_path=str(path.parent), game_mode="tdm"))
+    assert wm.load_map(path.stem)
+    assert wm.map.source_z_shift == 176
+
+    assert wm.set_block(100, 200, 100, True, 0x123456)
+    record = bytes(wm.map.serialize_columns([(100, 200)]))
+    # u32 x + u32 y, then the first span header's top_start.
+    assert record[9] == 100
 
 
 def _run_send_map_data(server, client_crc):
@@ -265,3 +414,30 @@ def test_send_map_data_matching_crc_streams_dirty_columns():
     x, y = struct.unpack_from("<II", raw, 0)
     assert (x, y) == (150, 250)
     assert raw[8:] == bytes(world_map.serialize_columns([(150, 250)]))[8:]
+
+
+def test_real_full_sync_substitutes_dirty_column_without_duplicate_records():
+    """A mismatched-CRC client has no trusted local base. The optimized full
+    stream starts from raw pristine VXL records, but dirty coordinates must be
+    substituted in place. The strict builder receives exactly one record per
+    map coordinate, including when the edit is deletion-only."""
+    import zlib
+
+    path = fixture_map_path()
+    wm = WorldManager(SimpleNamespace(
+        maps_path=str(path.parent), game_mode="tdm"
+    ))
+    assert wm.load_map(path.stem)
+    x, y = 150, 250
+    surface = wm.map.get_z(x, y)
+    wm.set_block(x, y, surface, False)
+    current_record = bytes(wm.map.serialize_columns([(x, y)]))
+
+    chunks = wm.iter_full_sync_chunks(snapshot_columns={(x, y)})
+    records = parse_sync_records(zlib.decompress(b"".join(chunks)))
+    coordinates = [(rx, ry) for rx, ry, _ in records]
+    by_coordinate = {(rx, ry): record for rx, ry, record in records}
+
+    assert len(records) == 512 * 512
+    assert len(set(coordinates)) == 512 * 512
+    assert by_coordinate[(x, y)] == current_record

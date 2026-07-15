@@ -10,7 +10,7 @@ from server.rocket_turret import (
     ROCKET_TURRET_ROCKET_SPEC,
     RocketTurretController,
 )
-from protocol.packet_handler import _deploy_pos
+from server.handlers.deployables import _deploy_pos
 
 
 class Player:
@@ -29,11 +29,19 @@ class Player:
 class Registry:
     def __init__(self):
         self.next_id = 20
+        self.entities = {}
 
     def place(self, type, x, y, z, **kw):
         result = SimpleNamespace(entity_id=self.next_id, type=type, x=x, y=y, z=z, **kw)
         self.next_id += 1
+        self.entities[result.entity_id] = result
         return result
+
+    def get(self, entity_id):
+        return self.entities.get(entity_id)
+
+    def remove(self, entity_id):
+        return self.entities.pop(entity_id, None)
 
 
 class Projectiles:
@@ -54,6 +62,7 @@ class Server:
         self.rocket_turrets = {}
         self.created = []
         self.changed = []
+        self.destroyed = []
 
     def broadcast_create_entity(self, ent):
         self.created.append(ent)
@@ -63,6 +72,9 @@ class Server:
 
     def spawn_projectile_entity(self, projectile, owner, pos, vel):
         projectile.entity_id = 99
+
+    def broadcast_destroy_entity(self, entity_id):
+        self.destroyed.append(entity_id)
 
 
 def test_engineer_places_visible_turret_and_consumes_stock():
@@ -146,3 +158,31 @@ def test_turret_placement_uses_stock_ten_block_limit():
     assert _deploy_pos(
         player, SimpleNamespace(x=10.01, y=0.0, z=0.0), max_distance=10.0
     ) is None
+
+
+def test_disconnect_removes_owner_turret_before_player_id_reuse():
+    server = Server()
+    owner = Player(1, 2, (10.0, 10.0, 10.0))
+    controller = RocketTurretController(server)
+    turret = controller.place(owner, (10.0, 10.0, 10.0), yaw=0.0, now=0.0)
+
+    controller.remove_by_owner(owner.id)
+
+    assert turret.entity_id not in server.rocket_turrets
+    assert server.entity_registry.get(turret.entity_id) is None
+    assert server.destroyed == [turret.entity_id]
+
+
+def test_disconnect_does_not_destroy_an_already_unregistered_turret():
+    """Never send crash-sensitive DestroyEntity for an unknown client id."""
+    server = Server()
+    owner = Player(1, 2, (10.0, 10.0, 10.0))
+    controller = RocketTurretController(server)
+    turret = controller.place(owner, (10.0, 10.0, 10.0), yaw=0.0, now=0.0)
+    server.entity_registry.remove(turret.entity_id)
+    server.destroyed.clear()
+
+    controller.remove_by_owner(owner.id)
+
+    assert turret.entity_id not in server.rocket_turrets
+    assert server.destroyed == []

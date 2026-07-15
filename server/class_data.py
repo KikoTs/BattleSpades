@@ -308,6 +308,8 @@ class ClassLoadout:
     secondary: tuple[int, ...]
     equipment: tuple[int, ...]
     melee: tuple[int, ...]
+    # Compatibility view of the default pack. The actual selection authority
+    # is ``equipment``/CLASS_ITEMS: Engineer's pack and Disguise share a slot.
     jetpack: int  # NO_JETPACK when the class has none
 
 
@@ -340,6 +342,7 @@ def _build_loadout_table() -> dict[int, ClassLoadout]:
     add(C.CLASS_ROCKETEER,
         primary=("SMG_TOOL",),
         secondary=("ROCKET_TURRET_TOOL", "GRENADE_TOOL"),
+        equipment=("JETPACK2", "JETPACK_NORMAL"),
         melee=("SPADE_TOOL", "PICKAXE_TOOL"),
         jetpack="JETPACK2")
     add(C.CLASS_MINER,
@@ -363,12 +366,13 @@ def _build_loadout_table() -> dict[int, ClassLoadout]:
     add(C.CLASS_ENGINEER,
         primary=("SMG_TOOL",),
         secondary=("ROCKET_TURRET_TOOL", "SNOWBLOWER_TOOL", "MINE_LAUNCHER_TOOL"),
-        equipment=("DISGUISE_TOOL",),
+        equipment=("JETPACK_ENGINEER", "DISGUISE_TOOL"),
         melee=("PICKAXE_TOOL",),
         jetpack="JETPACK_ENGINEER")
     add(C.CLASS_UGCBUILDER,
         primary=("UGC_DRILLGUN_TOOL",),
         secondary=("UGC_SNOWBLOWER_TOOL",),
+        equipment=("JETPACK_UGCBUILDER",),
         melee=("UGC_SUPERSPADE_TOOL",),
         jetpack="JETPACK_UGCBUILDER")
     add(C.CLASS_FAST_ZOMBIE, primary=("ZOMBIEHAND_TOOL",))
@@ -443,18 +447,15 @@ def default_client_loadout(class_id: int, disabled_tools=()) -> list[int]:
 
 
 def complete_client_loadout(class_id: int, selected, disabled_tools=()) -> list[int]:
-    """Return a usable stock-client loadout for the spawn handshake.
+    """Return one normalized loadout for the stock spawn handshake.
 
-    Some client paths send the selectable tools but omit the class jetpack.
-    Preserve a chosen jetpack variant when present; otherwise append the class
-    default so CreatePlayer initializes the correct native model and ability.
+    Equipment is normalized slot-by-slot. In particular, an explicit Engineer
+    Disguise selection must not receive an independently appended jetpack.
     """
-    loadout = [int(item) for item in (selected or [])]
-    if not loadout:
-        return default_client_loadout(class_id, disabled_tools)
+    from server.class_selection import normalize_class_selection
 
-    jetpacks = {int(item) for item in C.JETPACK_PROPERTIES}
-    default_jetpack = int(get_loadout(class_id).jetpack)
-    if default_jetpack in jetpacks and not any(item in jetpacks for item in loadout):
-        loadout.append(default_jetpack)
-    return loadout
+    return list(normalize_class_selection(
+        class_id,
+        selected or (),
+        disabled_tools=disabled_tools,
+    ).loadout)

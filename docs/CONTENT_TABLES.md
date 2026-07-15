@@ -82,7 +82,7 @@ projectile's `*_EXPLOSION_DAMAGE`; the `damage` attr on those weapon classes is
 | 21 | DYNAMITE | deployable-tool | 300 blast | — | 1.0 | 1 (count) | — | — | — | r=5, fuse=7 | — | 16 DYNAMITE_DAMAGE | 0 WEAPON |
 | 22 | FLAREBLOCK | deployable-tool | — | — | 0.5 | — | — | — | — | — | — | — (None) | 0 WEAPON |
 | 23 | PREFAB | deployable-tool | — | — | 0.5 (2nd 0.5) | — | — | — | — | — | — | — (None) | 0 WEAPON |
-| 24 | ZOMBIEHAND | melee | 2 blk / 70 player | — | 0.4 | — | — | — | — | — | — | 17 ZOMBIE_DAMAGE | 0 WEAPON |
+| 24 | ZOMBIEHAND | melee | 2 blk (centered 3x3x3) / 70 player before class multiplier | — | 0.4 | — | — | — | — | — | — | 17 ZOMBIE_DAMAGE | 0 WEAPON |
 | 25 | BOMB | objective | 500 blast | — | 0.0 | — | — | — | — | r=7, fuse=10 | — | 19 BOMB_DAMAGE | 17 BOMB |
 | 26 | DIAMOND | objective | — | — | 0.0 | — | — | — | — | — | — | — (None) | 0 WEAPON |
 | 27 | SHRAPNEL | special | (uses BlockTool) | — | — | — | — | — | — | — | — | 6 WEAPON_DAMAGE | 19 SHRAPNEL |
@@ -108,9 +108,9 @@ projectile's `*_EXPLOSION_DAMAGE`; the `damage` attr on those weapon classes is
 | 47 | UGC_DRILLGUN | launcher (UGC) | 50 blast | — | 0.2 | 1 | 3 | 4.0 | — | r=3 | — | 33 UGC_DRILL_DAMAGE | 28 UGC_DRILL |
 | 48 | UGC_SNOWBLOWER | launcher (UGC) | 10 blast | — | 0.2 | — | — | 3.0 | — | r=5 | — | 32 UGC_SNOWBALL_DAMAGE | 29 UGC_SNOWBALL |
 | 49 | RIOTSTICK | melee | 1.75 blk player | — | 0.5 | — | — | — | — | — | — | 34 RIOTSTICK_DAMAGE | 0 WEAPON |
-| 50 | MACHETE | melee | 2.0 blk player | — | 0.7 | — | — | — | — | — | — | 35 MACHETE_DAMAGE | 0 WEAPON |
+| 50 | MACHETE | melee | 2.0 blk on z,z+1 / 2.0 player | — | 0.7 | — | — | — | — | — | dig | 35 MACHETE_DAMAGE | 0 WEAPON |
 | 51 | MEDPACK | deployable-tool (heal) | — (heals) | — | 1.0 | 2 (count) | — | 1.5 | — | — | — | — (None) | — |
-| 52 | RIOTSHIELD | melee/equipment | 2 blk player | — | 1.0 | — | — | — | — | — | — | 36 RIOTSHIELD_DAMAGE | 0 WEAPON |
+| 52 | RIOTSHIELD | melee/equipment | 2 player; 50% frontal absorption; 0.5 bash knockback | — | 1.0 | — | — | — | — | melee=4 | — | 36 RIOTSHIELD_DAMAGE | 0 WEAPON |
 | 53 | AUTOMATIC_PISTOL | pistol | 15 | 30 | 0.175 | 15 | 50 | 1.0 | 1 | 300 | 2.5 | 6 WEAPON_DAMAGE | 0 WEAPON |
 | 54 | CHEMICALBOMB | grenade | (projectile-set) | — | 1.0 | 4 (start 2) | — | — | — | (projectile) | — | 6 WEAPON_DAMAGE | 31 CHEMICALBOMB |
 | 55 | GRENADE_LAUNCHER_WEAPON | launcher | (projectile-set) | — | 0.35 | 1 | 5 | 2.0 | — | (projectile) | — | 37 GRENADE_LAUNCHER_DAMAGE | 32 GRENADE_LAUNCHER |
@@ -126,10 +126,14 @@ projectile's `*_EXPLOSION_DAMAGE`; the `damage` attr on those weapon classes is
 
 **Notes / caveats**
 
-- **Melee `base_damage`:** first value is the block/entity `damage` attr; the "player"
+- **Melee `base_damage`:** first value is the block/entity `damage` attr; the Machete's
+  native type-35 handler applies that 2.0 amount to the hit voxel and z+1. The "player"
   value is the `*_HITPLAYER_DAMAGE_AMOUNT` constant (SPADE 35, SUPERSPADE 50, PICKAXE 50,
   KNIFE 20, CROWBAR 80, ZOMBIEHAND 70, CLASSIC_SPADE 50). RIOTSTICK/MACHETE/RIOTSHIELD have
   **no** `*_HITPLAYER_DAMAGE_AMOUNT` constant — only the small block `damage` shown.
+  Riot shield's adjacent recovered values are A1883=50 (frontal absorption
+  percent), A1884=0.5 (bash knockback), A1885=0.06 (model size), and arm pitch
+  A1886=-80/A1887=0.
 - **Projectile-set explosives** (CHEMICALBOMB 54, GRENADE_LAUNCHER 55, STICKY_GRENADE 57,
   MINE_LAUNCHER 58, C4 59): the weapon class has `damage=None`; there is **no** top-level
   `*_EXPLOSION_DAMAGE` / `*_RADIUS` constant in constants.py. Those values are supplied by
@@ -208,6 +212,9 @@ selectable set). `DEFAULT_CLASS = CLASS_CLASSIC_SOLDIER` (line 1474).
 
 All classes additionally get `CLASS_COMMON_TOOLS` (block/paintbrush/flareblock/prefab/
 pickups etc.) — see `CLASS_COMMON` / `CLASS_COMMON_TOOLS` in constants.py.
+BattleSpades deliberately advertises `FLAREBLOCK_TOOL (22)` as disabled: the
+retail class menu otherwise injects it as a misleading one-block entry before
+the three real prefab selections. `PREFAB_TOOL (23)` remains enabled.
 
 Team → class groupings (constants.py 266–281): `DEFAULT_TEAM_CLASSES`,
 `CLASSIC_TEAM_CLASSES` (CLASSIC_SOLDIER), `MAFIA_TEAM_CLASSES` (GANGSTER_1..4),

@@ -44,6 +44,7 @@ class BaseMode(ABC):
         self._last_music_at: float = 0.0
         # Guards the async end sequence so it runs exactly once.
         self._end_sequence_running = False
+        self._end_task = None
     
     # =========================================================================
     # Lifecycle Events
@@ -74,6 +75,30 @@ class BaseMode(ABC):
         self.ended = True
         self.winner = winner
         await self._run_end_sequence(winner)
+
+    async def cancel_end_sequence(self):
+        """Cancel a delayed victory restart before an admin transition.
+
+        This runs on the gameplay event loop and emits no packets. Its only job
+        is to ensure an old mode cannot wake later and reset a replacement map
+        or mode underneath connected clients.
+        """
+        import asyncio
+
+        task = self._end_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._end_task = None
+        self._end_sequence_running = False
+
+    async def deactivate(self):
+        """Retire this mode without starting the normal victory sequence."""
+        self.started = False
+        self.ended = True
 
     async def on_tick(self, tick: int):
         """Called every game tick."""
@@ -252,23 +277,26 @@ class BaseMode(ABC):
     async def _end_sequence_task(self, winner: Optional[int]):
         import asyncio
         from server.audio import play_ending_music, TIME_AFTER_WIN_BEFORE_SCORES
-        from server.scoreboard import (broadcast_game_stats, show_game_stats,
-                                        send_map_ended)
+        from server.scoreboard import broadcast_game_stats
         try:
             # 1) Victory sting immediately on the win.
             play_ending_music(self.server)
 
-            # 2) After the measured beat, pop the full-screen scores/credits
-            #    widget (GameStats fills the table data, ShowGameStats + MapEnded
-            #    switch the client to the end screen).
+            # 2) Send final leaderboard data without a terminal UI trigger.
+            # ShowGameStats, MapEnded, and ForceShowScores all destroy the
+            # retail client's GameScene, which makes a same-map restart unsafe.
             await asyncio.sleep(TIME_AFTER_WIN_BEFORE_SCORES)
             broadcast_game_stats(self.server, winner)
-            send_map_ended(self.server)
-            show_game_stats(self.server)
 
-            # 3) Hold the screen, then restart the round on the same map.
+            # 3) Hold the final scores, then rebuild the same live scene.
             await asyncio.sleep(self.SCORES_SCREEN_SECONDS)
-            await self._restart_round()
+            transition = getattr(self.server, "match_transition", None)
+            if transition is None:
+                await self._restart_round()
+            else:
+                result = await transition.restart_round()
+                if not result.ok:
+                    raise RuntimeError(result.message)
         except Exception:
             import logging
             logging.getLogger(__name__).exception("end sequence failed")
@@ -278,20 +306,22 @@ class BaseMode(ABC):
         """Reset scores + respawn everyone + revive the mode for a new round.
         Mirrors the reference server's reset(): stop → start → respawn all →
         reset teams (aosmodes/__init__.py reset())."""
+        # GameScene remains alive. Remove its old transient entities before the
+        # mode re-creates crates/objectives and reuses registry ids.
+        reset_runtime = getattr(self.server, "reset_round_runtime", None)
+        if reset_runtime is not None:
+            reset_runtime()
+
         # Reset team scores and re-broadcast the zeroed bars.
         from server.scoreboard import send_team_score
         for team in self.server.teams.values():
             team.reset()
         # on_mode_start clears ended/winner/timeout flags and restarts music.
         await self.on_mode_start()
-        # MapEnded/ShowGameStats put the client into a terminal score scene.
-        # A fresh StateData with has_map_ended=0 is the stock transition back
-        # into an active round. This is deliberately sent only at the round
-        # boundary, never for routine score updates.
-        self.server.broadcast_state_data()
         for team in self.server.teams.values():
             send_team_score(self.server, team)
-        # Respawn every connected player into the fresh round.
+        # Respawn every connected player through the ordinary CreatePlayer and
+        # restock path while the client is still in its original GameScene.
         for player in list(self.server.players.values()):
             try:
                 if getattr(player, "connection", None) is not None:

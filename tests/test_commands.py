@@ -5,13 +5,17 @@ three formerly-stubbed commands (/god, /ban, /ping) and a couple of core admin
 commands stay working without needing a live client.
 """
 import asyncio
+import logging
+from types import SimpleNamespace
 
 import pytest
 
 import commands.admin as admin
 import commands.player as player_cmds
-from commands.command_handler import CommandContext
+import commands.server_commands as server_cmds
+from commands.command_handler import CommandContext, handle_command
 from server.bans import BanManager, parse_duration
+from server.handlers.social import handle_chat
 
 
 # --- fakes -----------------------------------------------------------------
@@ -74,6 +78,7 @@ def captured(monkeypatch):
 
     monkeypatch.setattr(admin, "send_message", fake_send)
     monkeypatch.setattr(player_cmds, "send_message", fake_send)
+    monkeypatch.setattr(server_cmds, "send_message", fake_send)
     return msgs
 
 
@@ -99,6 +104,18 @@ def test_parse_duration():
 
 
 # --- /god ------------------------------------------------------------------
+
+def test_kick_uses_retail_kicked_disconnect_reason(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    adminp = FakePlayer("Admin", admin=True)
+    target = FakePlayer("Bob")
+    server.players["Bob"] = target
+
+    run(admin.cmd_kick(ctx(server, adminp, "Bob", "command-test")))
+
+    assert target.disconnected == 2
+    assert len(server.broadcasts) == 1
+
 
 def test_god_toggles(captured, tmp_path):
     server = FakeServer(BanManager(str(tmp_path / "bans.json")))
@@ -185,3 +202,219 @@ def test_mute_sets_flag(captured, tmp_path):
     assert target.muted is True
     run(admin.cmd_unmute(ctx(server, adminp, "Bob")))
     assert target.muted is False
+
+
+def test_muted_player_can_still_dispatch_unmute_command(monkeypatch):
+    """Mute applies to conversation, never to the slash-command control path."""
+
+    player = FakePlayer("Admin", admin=True)
+    player.muted = True
+    server = SimpleNamespace()
+    dispatched = []
+
+    async def fake_handle_command(observed_server, observed_player, message):
+        dispatched.append((observed_server, observed_player, message))
+
+    monkeypatch.setattr("commands.handle_command", fake_handle_command)
+    packet = SimpleNamespace(value="/unmute Admin", chat_type=0)
+
+    run(handle_chat(server, player, packet))
+
+    assert dispatched == [(server, player, "unmute Admin")]
+
+
+def test_bots_status_reports_worker_health(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.bots = SimpleNamespace(
+        bots=[SimpleNamespace(), SimpleNamespace()],
+        status=lambda: SimpleNamespace(
+            running=True,
+            process_id=1234,
+            restarts=0,
+            queued_frames=2,
+            queued_intents=1,
+            pending_terrain_cells=7,
+        ),
+    )
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_bots(ctx(server, adminp, "status")))
+
+    assert any("Bots=2 worker=up pid=1234" in message for _, message in captured)
+
+
+def test_bots_difficulty_updates_new_profile_setting(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.config.bots = SimpleNamespace(difficulty="mixed")
+    server.bots = SimpleNamespace(bots=[])
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_bots(ctx(server, adminp, "difficulty", "hard")))
+
+    assert server.config.bots.difficulty == "hard"
+    assert any("difficulty set to hard" in message for _, message in captured)
+
+
+# --- server administration -------------------------------------------------
+
+class _TransitionService:
+    def __init__(self):
+        self.calls = []
+
+    async def change_map(self, name):
+        self.calls.append(("map", name))
+        return type("Result", (), {
+            "ok": True,
+            "message": f"Map changed to {name}",
+            "reconnect_required": True,
+        })()
+
+    async def change_mode(self, name):
+        self.calls.append(("mode", name))
+        return type("Result", (), {
+            "ok": True,
+            "message": f"Mode changed to {name}",
+            "reconnect_required": True,
+        })()
+
+    async def restart_round(self):
+        self.calls.append(("restart", None))
+        return type("Result", (), {
+            "ok": True,
+            "message": "Match restarted",
+            "reconnect_required": False,
+        })()
+
+
+def test_map_mode_and_restart_commands_use_transition_service(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.match_transition = _TransitionService()
+    server.world_manager = type("World", (), {"map_name": "London"})()
+    server.mode = type("Mode", (), {"name": "CTF"})()
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_map(ctx(server, adminp, "HallwayPin")))
+    run(server_cmds.cmd_mode(ctx(server, adminp, "tdm")))
+    run(server_cmds.cmd_restart(ctx(server, adminp)))
+
+    assert server.match_transition.calls == [
+        ("map", "HallwayPin"),
+        ("mode", "tdm"),
+        ("restart", None),
+    ]
+
+
+def test_fog_rejects_out_of_range_without_wrapping(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_fog(ctx(server, adminp, "-1", "256", "20")))
+
+    assert server.broadcasts == []
+    assert any("0-255" in message for _, message in captured)
+
+
+def test_fog_persists_for_reconnecting_clients(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.config.fog_color_rgb = (0, 0, 0)
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_fog(ctx(server, adminp, "12", "34", "56")))
+
+    assert server.config.fog_color_rgb == (12, 34, 56)
+    assert len(server.broadcasts) == 1
+
+
+def test_time_sets_new_remaining_window(captured, tmp_path, monkeypatch):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.mode = type("Mode", (), {
+        "time_limit": 1200,
+        "elapsed_time": 900.0,
+        "start_time": 1.0,
+    })()
+    adminp = FakePlayer("Admin", admin=True)
+    monkeypatch.setattr(server_cmds.time, "time", lambda: 5000.0)
+
+    run(server_cmds.cmd_time(ctx(server, adminp, "300")))
+
+    assert server.mode.time_limit == 300
+    assert server.mode.elapsed_time == 0.0
+    assert server.mode.start_time == 5000.0
+
+
+def test_tp_rejects_non_finite_or_out_of_world_coordinates(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(admin.cmd_teleport(ctx(server, adminp, "nan", "20", "30")))
+    run(admin.cmd_teleport(ctx(server, adminp, "9999", "20", "30")))
+
+    assert (adminp.x, adminp.y, adminp.z) == (0.0, 0.0, 0.0)
+    assert sum("coordinates" in message.lower() for _, message in captured) == 2
+
+
+def test_say_rejects_oversized_announcements(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_say(ctx(server, adminp, "x" * 300)))
+
+    assert server.broadcasts == []
+    assert any("too long" in message.lower() for _, message in captured)
+
+
+def test_balance_moves_and_respawns_players_through_replication_boundary(
+    captured, tmp_path
+):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    large = [FakePlayer(f"P{i}") for i in range(5)]
+    small = [FakePlayer("Other")]
+    team1 = server_cmds.TEAM1
+    team2 = server_cmds.TEAM2
+    server.teams = {
+        team1: SimpleNamespace(
+            name="Blue",
+            players=large,
+            remove_player=lambda player: large.remove(player),
+            add_player=lambda player: large.append(player),
+        ),
+        team2: SimpleNamespace(
+            name="Green",
+            players=small,
+            remove_player=lambda player: small.remove(player),
+            add_player=lambda player: small.append(player),
+        ),
+    }
+    for player in large:
+        player.team = team1
+    small[0].team = team2
+    respawned = []
+    mode_events = []
+    server.respawn_player = lambda player: respawned.append(player.name)
+    server.queue_mode_event = lambda *event: mode_events.append(event)
+    adminp = large[0]
+    expected_moved = [large[-1], large[-2]]
+
+    run(server_cmds.cmd_balance(ctx(server, adminp)))
+
+    assert len(large) == len(small) == 3
+    assert respawned == ["P4", "P3"]
+    assert mode_events == [
+        ("on_player_team_change", expected_moved[0], team1, team2),
+        ("on_player_team_change", expected_moved[1], team1, team2),
+    ]
+
+
+def test_admin_password_is_redacted_from_command_log(
+    captured, tmp_path, caplog
+):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.config.log_commands = True
+    player = FakePlayer("Admin")
+
+    with caplog.at_level(logging.INFO, logger="commands.command_handler"):
+        run(handle_command(server, player, "admin secret"))
+
+    assert player.admin is True
+    assert "secret" not in caplog.text
+    assert "<redacted>" in caplog.text

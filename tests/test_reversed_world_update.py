@@ -200,6 +200,49 @@ def test_world_update_read_parses_player_updates_and_counts():
     assert weapon_deployment_yaw == 0.0
 
 
+def test_engineer_has_one_fuel_short_before_spawn_and_deployment_fields():
+    """The second HUD cylinder is artwork, not another wire resource."""
+
+    player, _connection = make_player()
+    player.class_id = int(C.CLASS_ENGINEER)
+    player.jetpack_id = int(C.JETPACK_ENGINEER)
+    player.jetpack_fuel = 64.25
+
+    packet = WorldUpdate()
+    packet.loop_count = 91
+    packet[player.id] = player.world_update_snapshot()
+    raw = bytes(packet.generate())
+
+    # One 56-byte player row, followed immediately by the two zero entity
+    # counts. Adding a second fuel value would shift and corrupt this trailer.
+    assert len(raw) == 67
+    parsed = WorldUpdate(ByteReader(raw[1:]))
+    update = parsed.player_updates[player.id]
+    assert update[10] == 64.25
+    assert update[11] == 0.0  # spawn protection timer
+    assert update[12] == 0.0  # weapon deployment yaw
+    assert parsed.updated_entities == []
+    assert parsed.rocket_turrets == []
+
+
+def test_riot_shield_remote_state_uses_existing_tool_and_action_fields():
+    player, _ = make_player()
+    player.set_tool(C.RIOTSHIELD_TOOL, raw=True)
+    player.input.can_display_weapon = True
+    player.input.primary_fire = True
+
+    packet = WorldUpdate()
+    packet.loop_count = 9
+    packet[player.id] = player.world_update_snapshot()
+    parsed = WorldUpdate(ByteReader(bytes(packet.generate())[1:]))
+    update = parsed.player_updates[player.id]
+
+    assert update[9] == C.RIOTSHIELD_TOOL
+    assert update[7] & 0x10  # existing can_display_weapon bit: held model
+    assert update[7] & 0x01  # existing primary bit: bash animation
+    assert parsed.updated_entities == []  # no synthetic shield entity/packet
+
+
 def test_world_update_round_trips_its_serialized_bytes():
     packet = WorldUpdate()
     packet.loop_count = 1
@@ -299,6 +342,7 @@ def test_client_data_updates_player_state_and_flags():
         config=SimpleNamespace(log_suppress_packets=set()),
         world_manager=make_world_manager(),
         players={},
+        loop_count=321,
     )
     player, _ = make_player(server)
 
@@ -309,7 +353,7 @@ def test_client_data_updates_player_state_and_flags():
     packet.o_x = 1.0
     packet.o_y = 0.0
     packet.o_z = 0.0
-    packet.ooo = 0
+    packet.ooo = 0x9F
     packet.up = True
     packet.left = True
     packet.jump = True
@@ -324,12 +368,46 @@ def test_client_data_updates_player_state_and_flags():
     assert player.tool == C.MINIGUN_TOOL
     assert player.orientation[0] > 0.99
     assert player.input.jump is True
+    assert player.input_history[1].received_server_tick == 321
+    assert player.input_history[1].wire_unknown_byte == 0x9F
     assert player.pack_input_flags() == 0x15
     # WorldUpdate action byte uses the client's DISPLAY layout, which remaps
     # zoom/hover/weapon_deployed vs the ClientData SEND layout. ClientData
     # 0x95 (primary|zoom|can_display_weapon|hover) packs to display 0x55
     # (primary 0x01 | can_display 0x10 | zoom 0x40 | hover→jetpack 0x04).
     assert player.pack_action_flags() == 0x51
+
+
+def test_client_data_never_treats_fire_state_as_a_jetpack_ack():
+    """The fire bit remains gameplay state and cannot be a hidden handshake."""
+    server = SimpleNamespace(
+        config=SimpleNamespace(log_suppress_packets=set()),
+        world_manager=make_world_manager(),
+        players={},
+    )
+    player, _ = make_player(server)
+    observed = []
+    player._jetpack_activation_marker_pending = True
+    player.note_jetpack_activation_echo = (
+        lambda loop, *, marker_value: observed.append(
+            (int(loop), bool(marker_value))
+        )
+    )
+
+    packet = ClientData()
+    packet.loop_count = 321
+    packet.player_id = player.id
+    packet.tool_id = C.RIFLE_TOOL
+    packet.o_x = 1.0
+    packet.o_y = 0.0
+    packet.o_z = 0.0
+    packet.ooo = 0
+    packet.is_on_fire = True
+    packet.weapon_deployment_yaw = 0.0
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert observed == []
 
 
 def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_yaw():
@@ -374,8 +452,8 @@ def test_world_update_snapshot_packs_remote_disguise_and_water_state():
 
     snapshot = player.world_update_snapshot()
 
-    assert snapshot[-5] == 0x0A
-    assert snapshot[-4] == player.tool
+    assert snapshot[-6] == 0x0A
+    assert snapshot[-5] == player.tool
 
 
 def test_world_update_snapshot_serializes_authoritative_jetpack_fuel():
@@ -428,7 +506,11 @@ def test_repeated_live_client_data_held_jump_launches_on_next_tick():
     advance_player(player, 1.0 / 60.0)
 
     assert player.airborne is True
-    assert player.z < start_z
+    # Retail restores the complete cached network position on its launch
+    # frame.  Airborne/jump_this_frame, rather than a position delta, proves
+    # that the held request was consumed by this direct-update fixture.
+    assert math.isclose(player.z, start_z, abs_tol=1e-6)
+    assert player._world_object.jump_this_frame is True
 
 
 def test_client_data_round_trips_across_quadrants():
@@ -543,7 +625,70 @@ def test_player_movement_is_normalized_and_lands_back_on_ground():
     idle_player, _ = make_player(SimpleNamespace(world_manager=make_world_manager()))
     start = idle_player.position
     advance_player(idle_player, 0.5)
-    assert idle_player.position == start
+    # The float32 native ground probe settles by less than one thousandth of
+    # a block without producing meaningful locomotion.
+    assert all(
+        math.isclose(actual, expected, abs_tol=1e-3)
+        for actual, expected in zip(idle_player.position, start)
+    )
+
+
+def test_player_update_builds_collision_snapshot_once_without_debug_capture():
+    player, _ = make_player(SimpleNamespace(world_manager=make_world_manager()))
+    player.connection.server.config = SimpleNamespace(movement_debug_capture=False)
+    original = player._build_player_collision_positions
+    calls = []
+
+    def counted():
+        calls.append(1)
+        return original()
+
+    player._build_player_collision_positions = counted
+    player._capture_native_debug_state = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(AssertionError("debug capture ran in production tick"))
+    )
+
+    asyncio.run(player.update(1.0 / 60.0))
+
+    assert len(calls) == 1
+
+
+def test_player_collision_snapshot_matches_disabled_same_team_client_rule():
+    """InitialInfo=0 means allies must not affect authoritative movement."""
+
+    server = SimpleNamespace(
+        world_manager=make_world_manager(),
+        players={},
+        config=SimpleNamespace(same_team_collision=False),
+    )
+    player, _ = make_player(server, cell_x=100, cell_y=100)
+    ally_connection = DummyConnection(server)
+    ally = Player(1, "Ally", player.team, C.RIFLE_TOOL, ally_connection)
+    ally_connection.player = ally
+    ally.spawn(player.x + 0.25, player.y, player.z)
+    server.players = {player.id: player, ally.id: ally}
+
+    assert player._build_player_collision_positions() == []
+
+
+def test_player_collision_snapshot_keeps_enemy_collision():
+    """The wire rule only disables same-team collision, not enemy contact."""
+
+    server = SimpleNamespace(
+        world_manager=make_world_manager(),
+        players={},
+        config=SimpleNamespace(same_team_collision=False),
+    )
+    player, _ = make_player(server, cell_x=100, cell_y=100)
+    enemy_connection = DummyConnection(server)
+    enemy = Player(1, "Enemy", 3, C.RIFLE_TOOL, enemy_connection)
+    enemy_connection.player = enemy
+    enemy.spawn(player.x + 0.25, player.y, player.z)
+    server.players = {player.id: player, enemy.id: enemy}
+
+    assert player._build_player_collision_positions() == [
+        (enemy.x, enemy.y, enemy.z, enemy._current_height())
+    ]
 
 
 def test_released_jump_settles_back_to_ground():
@@ -685,7 +830,7 @@ def test_bot_without_client_history_still_advances_physics():
     assert player.last_applied_input_loop is None
 
 
-def test_input_gap_synthesizes_only_the_expected_loop_before_future_frame():
+def test_input_label_gap_consumes_only_observed_client_frames():
     player, _ = make_player()
     applied = []
 
@@ -700,9 +845,12 @@ def test_input_gap_synthesizes_only_the_expected_loop_before_future_frame():
     asyncio.run(player.simulate_tick(1.0 / 60.0))
     asyncio.run(player.simulate_tick(1.0 / 60.0))
 
-    assert applied == [100, 101]
-    assert player.last_applied_input_loop == 101
-    assert sorted(player.input_history) == [102]
+    # Retail loop_count is a clock label and can skip without producing a
+    # movement-history entry. ACKing invented label 101 would make the native
+    # client's exact lookup fail and hard-snap its prediction history.
+    assert applied == [100, 102]
+    assert player.last_applied_input_loop == 102
+    assert player.input_history == {}
 
 
 def test_packet_transition_is_latched_for_the_next_simulated_loop():
@@ -730,6 +878,54 @@ def test_packet_transition_is_latched_for_the_next_simulated_loop():
     assert player.last_applied_input_loop == 102
     assert simulated_sprint == [False, False, True]
     assert player.input_history == {}
+
+
+def test_latched_buttons_retain_the_client_loop_that_authored_them():
+    """A delayed jump must still identify the frame where retail launched.
+
+    ClientData 101 is simulated while packet 102 is consumed because button
+    state has a one-observed-frame latch.  Reconciliation anchors are stamped
+    in the client's clock, so remembering only the consumed packet loop loses
+    the distinction and can select a WorldUpdate row that retail received
+    *after* its launch.
+    """
+    player, _ = make_player()
+    observed_sources = []
+
+    async def record_update(_dt):
+        observed_sources.append(player._applied_input_source_loop)
+
+    player.update = record_update
+    walking = (True, False, False, False, False, False, False, True)
+    jumping = (True, False, False, False, True, False, False, True)
+    orientation = (1.0, 0.0, 0.0)
+
+    player.record_input_frame(100, walking, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    player.record_input_frame(101, jumping, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    player.record_input_frame(102, jumping, orientation)
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert observed_sources == [None, 100, 101]
+
+
+def test_validation_can_apply_packet_buttons_on_the_current_observed_loop():
+    player, _ = make_player()
+    player.connection.server.config = SimpleNamespace(
+        movement_input_latch_frames=0
+    )
+    simulated_sprint = []
+
+    async def record_update(_dt):
+        simulated_sprint.append(player.input.sprint)
+
+    player.update = record_update
+    sprinting = (True, False, False, False, False, False, False, True)
+    player.record_input_frame(100, sprinting, (1.0, 0.0, 0.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
+
+    assert simulated_sprint == [True]
 
 
 def test_first_post_spawn_packet_is_latched_after_idle_frame():
@@ -765,8 +961,9 @@ def test_large_input_gap_does_not_leak_newest_transition_backwards():
     player.record_input_frame(100, walking, orientation)
     asyncio.run(player.simulate_tick(1.0 / 60.0))
 
-    # Packet 102 introduces sprint. Both missing 101 and actual 102 still use
-    # the previous packet state; synthetic loops never advance the latch.
+    # Packet 102 introduces sprint. Actual frame 102 uses the prior walking
+    # state, then actual frame 104 uses sprint. Missing integer labels are not
+    # frames and therefore neither simulate nor advance the input latch.
     player.record_input_frame(102, sprinting, orientation)
     player.record_input_frame(104, crouching, orientation)
     player.update_input(*crouching)
@@ -774,12 +971,13 @@ def test_large_input_gap_does_not_leak_newest_transition_backwards():
     asyncio.run(player.simulate_tick(1.0 / 60.0))
     asyncio.run(player.simulate_tick(1.0 / 60.0))
 
-    assert player.last_applied_input_loop == 103
+    assert player.last_applied_input_loop == 104
     assert simulated == [
         (False, False),
         (False, False),
-        (False, False),
-        (True, False),
+        # Crouch geometry is current-frame in retail even though locomotion
+        # remains one observed ClientData frame latched.
+        (True, True),
     ]
 
 
@@ -820,6 +1018,106 @@ def test_server_broadcasts_world_update_to_connected_clients():
     assert update_position[0] > player_two.position[0] - 20.0
     assert update_position[0] > player_one.last_reported_position[0] - 0.01
     assert update_input_flags == player_one.pack_input_flags()
+
+
+def test_self_world_update_keeps_anchor_but_uses_noop_tool_sentinel():
+    """A local row must not replay a delayed equipped-tool transition.
+
+    Retail applies the row's network position before calling
+    ``Player.set_tool(tool, True)``.  Tool id 0xFF is rejected as an invalid
+    selectable tool, preserving the anchor while observer rows still receive
+    the authoritative real tool.
+    """
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    owner, _owner_connection = make_player(server, cell_x=100, cell_y=100)
+    observer, _observer_connection = make_player(
+        server, cell_x=110, cell_y=110
+    )
+    observer.id = 1
+    owner.set_tool(C.BLOCK_TOOL)
+    observer.set_tool(C.RIFLE_TOOL)
+    server.players = {owner.id: owner, observer.id: observer}
+
+    owner_data = server.build_world_update_data(
+        loop_count_override=123,
+        local_player_id=owner.id,
+    )
+    owner_packet = WorldUpdate(ByteReader(owner_data[1:]))
+
+    assert owner_packet.player_updates[owner.id][9] == 0xFF
+    assert owner_packet.player_updates[observer.id][9] == observer.tool
+
+
+def test_world_header_clock_is_independent_from_each_player_row_pong():
+    """Retail reconciles an owner from row pong, not WorldUpdate.loop_count."""
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    owner, _connection = make_player(server, cell_x=100, cell_y=100)
+    server.players = {owner.id: owner}
+    server.loop_count = 900
+    owner.wu_ack_loop = 812
+
+    data = server.build_world_update_data(local_player_id=owner.id)
+    packet = WorldUpdate(ByteReader(data[1:]))
+
+    assert packet.loop_count == 900
+    assert packet.player_updates[owner.id][4] == 812
+
+
+def test_peerless_bot_rows_advance_their_remote_snapshot_stamp():
+    """Retail must not deduplicate every post-spawn bot WorldUpdate.
+
+    A peerless bot has no ClientData loop to acknowledge.  Reusing the
+    default pong value of zero caused each observer to accept one bot row,
+    extrapolate it independently, and finally see a large teleport on bot
+    respawn.  The global server loop is the bot's remote-only snapshot clock.
+    """
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    observer, observer_connection = make_player(
+        server, cell_x=100, cell_y=100
+    )
+    bot, _bot_connection = make_player(server, cell_x=110, cell_y=110)
+    bot.id = 1
+    bot.is_bot = True
+    bot.last_applied_input_loop = None
+    bot.wu_ack_loop = 0
+    server.players = {observer.id: observer, bot.id: bot}
+    server.connections = {"observer": observer_connection}
+
+    server.loop_count = 120
+    server._broadcast_world_updates()
+    first = WorldUpdate(ByteReader(observer_connection.sent_packets[-1][1:]))
+
+    bot.set_position(bot.x + 1.0, bot.y, bot.z)
+    server.loop_count = 122
+    server._broadcast_world_updates()
+    second = WorldUpdate(ByteReader(observer_connection.sent_packets[-1][1:]))
+
+    assert first.player_updates[bot.id][4] == 120
+    assert second.player_updates[bot.id][4] == 122
+    assert second.player_updates[bot.id][0][0] == first.player_updates[bot.id][0][0] + 1.0
+
+
+def test_block_tool_keeps_a_fresh_self_world_update_anchor():
+    """Building must not disable the local reconciliation anchor.
+
+    A retail stress run with the old exclusion accumulated 1,781 loops of
+    anchor lag and rolled the player back 62.76 blocks while jumping with tool
+    5 equipped. Placement completion still uses the reliable BlockLine echo.
+    """
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    player, _connection = make_player(server, cell_x=100, cell_y=100)
+
+    player.set_tool(C.BLOCK_TOOL)
+    assert server._self_world_update_is_safe(player) is True
+
+
+    player.set_tool(C.RIFLE_TOOL)
+    assert server._self_world_update_is_safe(player) is True
+
 
 
 def test_round_restart_state_preserves_each_clients_player_id():

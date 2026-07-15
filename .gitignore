@@ -15,6 +15,9 @@ aoslib/*.html
 shared/*.c
 shared/*.cpp
 shared/*.html
+# Cython output for the bot navigation wrapper; recast_bridge.cpp is authored.
+server/bot_ai/recast.cpp
+server/bot_ai/recast.html
 # ...but keep any hand-written *_c.cpp helpers
 !aoslib/*_c.cpp
 !shared/*_c.cpp
@@ -22,6 +25,7 @@ shared/*.html
 # ── Packaging / distribution ────────────────────────────────────────
 build/
 dist/
+release-dist/
 develop-eggs/
 downloads/
 eggs/
@@ -71,6 +75,8 @@ selfrow_samples.ndjson
 # ── Agent / assistant tooling ───────────────────────────────────────
 .claude/
 re-agent.yaml
+codex-command-runner.exe
+codex-windows-sandbox-setup.exe
 
 # ── Sibling reference projects (kept outside the repo) ──────────────
 ace.py/

@@ -12,6 +12,7 @@ from shared.packet import InitialInfo
 
 from server import class_data
 from server import mode_data
+from server.class_selection import DEFAULT_DISABLED_TOOLS
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -19,7 +20,6 @@ if TYPE_CHECKING:
 
 # Server-wide defaults that apply to every InitialInfo. Keep these here
 # (not deeper in connection.py) so the build is one trip through one file.
-_DEFAULT_DISABLED_TOOLS: list[int] = []
 _DEFAULT_GROUND_COLORS: list[tuple[int, int, int, int]] = [
     (59, 58, 55, 238),  # default dirt-edge
     (40, 54, 64, 239),
@@ -137,16 +137,21 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     # ---- Game rules / display -------------------------------------------
     pkt.classic = 1 if mode.classic else 0
     pkt.enable_minimap = 0 if mode.classic else 1
-    pkt.same_team_collision = 0
+    # The mover receives nearby player positions separately from terrain.
+    # Keep this flag and Player._build_player_collision_positions identical or
+    # the two simulations apply different contact impulses.
+    pkt.same_team_collision = 1 if cfg.same_team_collision else 0
     pkt.max_draw_distance = 192
     pkt.enable_colour_picker = 1
-    pkt.enable_colour_palette = 0
+    pkt.enable_colour_palette = 1
     pkt.enable_deathcam = 1
     pkt.enable_sniper_beam = 1
     pkt.enable_spectator = 1
     pkt.exposed_teams_always_on_minimap = 0
     pkt.enable_numeric_hp = 1
-    pkt.texture_skin = None
+    # The native InitialInfo field is a null-terminated string. Mafia modes
+    # select the shipped gangster UI skin; an empty string selects default.
+    pkt.texture_skin = 'mafia' if mode.mafia else None
     pkt.beach_z_modifiable = 1
     pkt.enable_minimap_height_icons = 0
     pkt.enable_fall_on_water_damage = 1
@@ -158,11 +163,20 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     pkt.enable_corpse_explosion = 1
 
     # ---- Class / movement / loadouts ------------------------------------
-    pkt.disabled_tools = list(_DEFAULT_DISABLED_TOOLS)
+    # Retail otherwise inserts FLAREBLOCK_TOOL as a fake first prefab tile.
+    # The same tuple is the default for class normalization, keeping the menu
+    # declaration and every CreatePlayer loadout in lockstep.
+    pkt.disabled_tools = list(DEFAULT_DISABLED_TOOLS)
     pkt.disabled_classes = _classes_disabled(server)
     pkt.movement_speed_multipliers = _movement_speed_multipliers(server)
     pkt.ugc_prefab_sets = list(_DEFAULT_UGC_PREFAB_SETS)
     pkt.ground_colors = list(_DEFAULT_GROUND_COLORS)
     pkt.custom_game_rules = []
     pkt.loadout_overrides = {}
+
+    configure = getattr(
+        getattr(server, 'mode', None), 'configure_initial_info', None
+    )
+    if callable(configure):
+        configure(pkt)
     return pkt

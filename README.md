@@ -26,6 +26,7 @@ classic game stays alive and playable — and so it's a solid base for ports to 
 
 - [Status](#status)
 - [Quick start](#quick-start)
+- [Portable alpha releases](#portable-alpha-releases)
 - [What works](#what-works)
 - [Architecture](#architecture)
 - [Building from source](#building-from-source)
@@ -47,13 +48,20 @@ structure collapse, pickups, deaths/respawns, and bots all work and stay in sync
 client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
 what's still on the list.
 
-- **106/106** unit tests pass (`py -m pytest tests/ -q`)
+- **719** unit/regression tests pass (`py -3 -m pytest -q`)
+- The executable 50-player capacity gate sustains ~60 Hz with sub-5 ms tick
+  p99 on the current Windows/Python 3.12 baseline. See
+  [`docs/SERVER_PERFORMANCE.md`](docs/SERVER_PERFORMANCE.md).
 - Movement parity: mean client↔server position delta in the **millimetre** range over
   thousands of frames (`py scripts/replay_parity.py` — must stay `ALL PASS`)
 - Physics ground truth and every measured constant live in
   [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md)
 
 ## Quick start
+
+For a dedicated server without a Python or compiler installation, use a
+[portable alpha release](#portable-alpha-releases). The source workflow below
+is intended for development and custom server builds.
 
 You need **Python 3.10–3.12** (3.12 is the primary dev target) and a **C compiler** (MSVC
 Build Tools on Windows, `gcc`/`clang` on Linux/macOS — needed to build the Cython extensions
@@ -72,9 +80,8 @@ git clone https://github.com/KikoTs/BattleSpades.git && cd BattleSpades && ./scr
 git clone https://github.com/KikoTs/BattleSpades.git; cd BattleSpades; .\scripts\install.ps1; python run_server.py
 ```
 
-Then point any Ace of Spades 1.x client at `your.ip:27015`. The default config spawns a TDM
-match on `ArcticBase` with 2 practice bots so you can connect and see other players moving
-immediately.
+Then point any Ace of Spades 1.x client at `your.ip:27015`. Edit `config.toml`
+to select the startup map, mode, population, and administrative settings.
 
 <details>
 <summary>Manual steps (what the installer does)</summary>
@@ -91,6 +98,41 @@ python run_server.py                     # start the server on port 27015
 ```
 </details>
 
+## Portable alpha releases
+
+`0.0.1-alpha.1` is packaged as six standalone server archives. Each archive
+contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
+KV6 prefabs, plugin directory, and license notices.
+
+| Operating system | Archives |
+|---|---|
+| Windows | `windows-x86_64`, `windows-arm64` |
+| Linux | `linux-x86_64`, `linux-arm64` |
+| macOS | `macos-x86_64`, `macos-arm64` |
+
+Download the archive matching the host from the repository's GitHub Releases
+page, extract the complete directory, and validate it before opening a public
+server:
+
+```powershell
+# Windows
+.\BattleSpades.exe --check
+.\BattleSpades.exe
+```
+
+```bash
+# Linux / macOS
+./BattleSpades --check
+./BattleSpades
+```
+
+No system Python or compiler is needed. Change the default admin password
+`changeme` before exposing UDP port 27015. Verify the downloaded zip against
+the release's `SHA256SUMS.txt`.
+
+The first macOS alpha is unsigned and unnotarized, so Gatekeeper may require an
+explicit operator override. The release does not claim Apple notarization.
+
 ## What works
 
 | Area | State |
@@ -103,8 +145,8 @@ python run_server.py                     # start the server on port 27015
 | **Grenades** | Thrown entity + fuse + bounce physics + blast damage (falloff + line-of-sight) + 3×3×3 block destruction |
 | **Pickups** | Ammo / health crates, restock on spawn |
 | **Combat lifecycle** | Damage, kills, kill feed, death → grave entity → timed respawn |
-| **Game modes** | Team Deathmatch, Capture the Flag, Arena (round-based) |
-| **Bots** | Basic combat AI (aim error/slew, reaction delay, burst fire + reload, strafing, line-of-sight) — handy for solo testing; smarter objective-aware bots are on the roadmap |
+| **Game modes** | Team Deathmatch, CTF, Classic CTF, Arena, gangster VIP, and Zombie infection |
+| **Bots** | Isolated process worker with voxel navigation, fair perception/aim, class actions, and phase-aware CTF/Classic/VIP/Zombie/Arena roles |
 | **Map transfer** | Full VXL streaming with correct CRC validation |
 | **Admin / chat** | Player + admin command set, team management |
 
@@ -133,7 +175,7 @@ BattleSpades/
 │   ├── connection.py   #   ENet peer + handshake
 │   └── bots.py         #   bot AI
 ├── protocol/           # packet dispatch + runtime decoders
-├── modes/              # tdm / ctf / arena
+├── modes/              # tdm / ctf / classic_ctf / arena / vip / zombie
 ├── commands/           # player + admin commands
 ├── plugins/            # optional plugin hooks
 ├── maps/               # stock .vxl maps (shipped)
@@ -148,8 +190,10 @@ BattleSpades/
   the client predicts locally and is reconciled via per-player WorldUpdate self-rows.
 - **Cython where it counts** — physics, map ops, and (de)serialization are compiled; game
   logic stays in readable Python.
-- **Non-blocking** — asyncio event loop; logging is queue-based so handlers never stall the
-  loop.
+- **Bounded hot paths** — asyncio/ENet work and gameplay packet drains have
+  explicit budgets; WorldUpdate serialization is shared by equivalent clients.
+- **Non-blocking logging** — formatting and I/O use a bounded background queue;
+  slow sinks drop records instead of stalling the 60 Hz simulation.
 
 ## Building from source
 
@@ -201,11 +245,24 @@ max_players = 32
 tick_rate = 60          # server simulation rate — keep at 60 (client-paired, physics-calibrated)
 
 [game]
-default_mode = "tdm"    # tdm | ctf | arena
+default_mode = "tdm"    # tdm | ctf | cctf | arena | vip | zombie
 default_map = "ArcticBase"
-bot_count = 2           # dev AI players (0 = none)
 respawn_time = 5.0
 friendly_fire = false
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 12
+max_bots = 12
+reserve_human_slots = 2
+difficulty = "mixed"    # casual | normal | hard | mixed
+worker = "process"
+perception_hz = 10
+decision_hz = 8
+path_requests_per_second = 24
+main_thread_budget_ms = 0.75
+seed = 0
 
 [teams]
 team1_name = "TEAM1_COLOR"   # string-table IDs the client localizes (renders "Blue"/"Green")
@@ -236,13 +293,15 @@ can appear in server browsers that support the 1.x protocol.
 `/pm <player> <msg>`, `/me <action>`, `/stats`, `/ping`
 
 **Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
-`/tp <player>`, `/god`, `/map <name>`, `/mode <ctf|tdm>`, `/restart`, `/say <msg>`,
-`/fog <r> <g> <b>`, `/time`, `/balance`
+`/tp <player>`, `/god`, `/map <name>`, `/mode <ctf|cctf|tdm|arena|vip|zombie>`, `/restart`, `/say <msg>`,
+`/fog <r> <g> <b>`, `/time`, `/balance`, `/bots status`,
+`/bots fill <count>`, `/bots add <count> [team]`,
+`/bots remove <count|name|all>`, `/bots difficulty <casual|normal|hard|mixed>`
 
 ## Testing & tooling
 
 ```bash
-py -m pytest tests/ -q          # unit tests (currently 106 passing)
+py -3 -m pytest tests/ -q       # unit/regression tests (currently 719 passing)
 py scripts/replay_parity.py     # offline movement-parity check (must be ALL PASS)
 ```
 
@@ -276,8 +335,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 - Built for the **Ace of Spades revival** effort. Companion open-source client build:
   [KikoTs/aceofspades_revival](https://github.com/KikoTs/aceofspades_revival).
-- _Ace of Spades_ was created by Ben Aksoy / Jagex. This is an independent, non-commercial
-  server reimplementation for preservation and play; it ships no proprietary game code.
+- _Ace of Spades_ was created by Ben Aksoy / Jagex. This is an independent
+  server reimplementation for preservation and play; it does not ship the
+  original client executable or proprietary game code. Portable server
+  releases include the project's tracked VXL/KV6 gameplay content.
 - Networking via [pyenet](https://github.com/piqueserver/pyenet) / [ENet](http://enet.bespin.org/).
 - Community fixes: build & setup improvements from [@TylerJaacks](https://github.com/TylerJaacks).
 

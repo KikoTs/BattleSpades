@@ -12,6 +12,24 @@ from server.entities.registry import EntityRegistry  # noqa: E402
 from server.game_constants import TEAM_NEUTRAL  # noqa: E402
 
 
+def test_late_battle_builder_entity_ids_match_retail_dispatch_table():
+    """These values index the retail client's GameScene.ENTITIES table.
+
+    They are wire ABI, not an implementation-defined class-registration order.
+    A wrong value can render a different object or crash the native client.
+    """
+    assert C.MEDPACK_ENTITY == 30
+    assert C.BLOCK_GOO_ENTITY == 31
+    assert C.CHEMICAL_BOMB_ENTITY == 32
+    assert C.GL_GRENADE_ENTITY == 33
+    assert C.STICKY_GRENADE_ENTITY == 34
+    assert C.ATTACHED_STICKY_GRENADE_ENTITY == 35
+    assert C.RADAR_STATION_ENTITY == 36
+    assert C.PROJECTILE_MINE_ENTITY == 37
+    assert C.C4_ENTITY == 38
+    assert C.RIOT_SHIELD_ENTITY == 39
+
+
 def test_allocate_id_unique():
     reg = EntityRegistry()
     ids = {reg.place(C.AMMO_CRATE, 10, 20, 30).entity_id for _ in range(200)}

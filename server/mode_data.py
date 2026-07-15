@@ -58,8 +58,16 @@ def _allowed_for(code: str) -> tuple[int, ...]:
         # Deathmatch: every class available (incl. DLC), per user request.
         return _all_classes()
     if code == 'zom':
-        # Survivors get default classes; zombies are a separate team.
-        return tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
+        # Zombie mode has asymmetric class menus.  This union is used by
+        # InitialInfo.disabled_classes; ZombieMode.configure_state_data splits
+        # it into survivor and infected lists for the two teams.  Fast/Jump
+        # Zombie have no ordinary class-picker icons in this retail build, so
+        # exposing them here crashes selectClass.py instead of adding choices.
+        survivors = tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
+        legacy_rocketeer = (int(C.CLASS_ROCKETEER),)
+        return tuple(dict.fromkeys(survivors + legacy_rocketeer + (
+            int(C.CLASS_ZOMBIE),
+        )))
     if code == 'ugc':
         return tuple(int(x) for x in C.UGC_TEAM_CLASSES)
     return tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
@@ -82,7 +90,8 @@ def _mode_data(code: str) -> ModeData:
         # the intel-capture count. Sourced here so wire HUD + rules agree.
         default_score_limit={
             'ctf': 10, 'cctf': 10, 'tdm': 200, 'dem': 5, 'mh': 100,
-            'oc': 100, 'dia': 10, 'tc': 100, 'vip': 5, 'zom': 1,
+            'oc': 100, 'dia': 10, 'tc': 100,
+            'vip': int(MG.VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP), 'zom': 1,
             'ugc': 0,
         }.get(code, 10),
         # Round clock (seconds). Original game lengths from
@@ -107,4 +116,14 @@ MODES: dict[str, ModeData] = {
 
 
 def get(code: str) -> ModeData:
-    return MODES.get(code, MODES['nor'])
+    # Human-facing commands use "zombie" while the retail protocol table uses
+    # the historical short code "zom". Resolve aliases before packet builders
+    # read mode_id/class data, otherwise the rules object is ZombieMode but the
+    # client is incorrectly told MODE_NORMAL.
+    normalized = str(code).strip().lower()
+    normalized = {
+        'zombie': 'zom',
+        'classic_ctf': 'cctf',
+        'classic-ctf': 'cctf',
+    }.get(normalized, normalized)
+    return MODES.get(normalized, MODES['nor'])

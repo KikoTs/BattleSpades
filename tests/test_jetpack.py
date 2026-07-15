@@ -12,6 +12,7 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
+from server.class_selection import normalize_class_selection  # noqa: E402
 from server.player import Player, _JETPACK_PROPERTIES  # noqa: E402
 
 DT = 1.0 / 60.0
@@ -34,6 +35,13 @@ def hold_jetpack(p, seconds):
     ticks = int(seconds / DT)
     for _ in range(ticks):
         p._update_jetpack(DT)
+
+
+def consume_jetpack_frame(p, owner_sequence):
+    """Advance jetpack state for one deterministic consumed ClientData frame."""
+    p._current_input_receive_sequence += 1
+    p._current_input_owner_sequence = owner_sequence
+    p._update_jetpack(DT)
 
 
 def test_properties_table_loaded():
@@ -71,6 +79,79 @@ def test_fuel_exhaustion_deactivates():
     assert p.jetpack_fuel <= 25.0  # mostly regen after the burn
 
 
+def test_engineer_exhaustion_keeps_one_predicted_thrust_recurrence():
+    """Exhaustion finishes this tick plus one measured predicted recurrence."""
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 0.1
+    p.jetpack_active = True
+    p._jetpack_physics_active = True
+    p.input.jump = True
+
+    p._update_jetpack(DT)
+
+    assert p.jetpack_fuel == 0.0
+    assert p.jetpack_active is False
+    assert p._jetpack_physics_active is True
+    assert p._jetpack_exhaustion_tail_remaining == 1
+
+    p._update_jetpack(DT)
+    assert p._jetpack_physics_active is True
+    assert p._jetpack_exhaustion_tail_remaining == 0
+
+    p._update_jetpack(DT)
+    assert p._jetpack_physics_active is False
+
+
+def test_physical_release_cancels_exhaustion_tail_immediately():
+    """SPACE key-up wins over the network handoff and stops thrust now."""
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 0.0
+    p.jetpack_active = False
+    p._jetpack_physics_active = True
+    p._jetpack_requires_release = True
+    p._jetpack_exhaustion_tail_remaining = 3
+    p.input.jump = False
+
+    p._update_jetpack(DT)
+
+    assert p._jetpack_physics_active is False
+    assert p._jetpack_exhaustion_tail_remaining == 0
+
+
+def test_reload_completion_does_not_cancel_active_jetpack_state():
+    """Weapon bookkeeping cannot advance or erase movement state."""
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.reloading = True
+    p.ammo_clip = 0
+    p.ammo_reserve = 10
+    p.jetpack_active = True
+    p._jetpack_physics_active = True
+
+    assert p.finish_reload() is True
+
+    assert p._jetpack_physics_active is True
+    assert p.jetpack_active is True
+
+
+def test_death_clears_all_jetpack_transition_state():
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_active = True
+    p._jetpack_physics_active = True
+    p._jetpack_activation_defer_remaining = 2
+    p._jetpack_exhaustion_tail_remaining = 3
+    p._jetpack_requires_release = True
+
+    p.die()
+
+    assert p.jetpack_active is False
+    assert p._jetpack_physics_active is False
+    assert p._jetpack_activation_defer_remaining == 0
+    assert p._jetpack_exhaustion_tail_remaining == 0
+    assert p._jetpack_requires_release is False
+
+
 def test_release_deactivates_and_regens():
     p = make_player()
     p.jetpack_id = 67
@@ -103,6 +184,79 @@ def test_engineer_uses_jump_not_hover_for_thrust():
     assert p.jetpack_active is True
 
 
+def test_engineer_advertises_activation_two_frames_before_physics():
+    """Grounded-active parity needs two inactive owner recurrences."""
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 100.0
+    p.input.jump = True
+
+    for _ in range(30):
+        p._update_jetpack(DT)
+        if p.jetpack_active:
+            break
+
+    assert p.jetpack_active is True
+    assert p._jetpack_physics_active is False
+    assert p.jetpack_fuel == 90.0
+
+    p.record_owner_anchor(
+        stamp=500,
+        position=p.position,
+        queued_owner_sequence=100,
+    )
+    p.note_jetpack_transition_sent(True, stamp=500)
+
+    consume_jetpack_frame(p, 101)
+    assert p._jetpack_physics_active is False
+    assert p.jetpack_fuel < 90.0
+
+    consume_jetpack_frame(p, 102)
+    assert p._jetpack_physics_active is False
+
+    consume_jetpack_frame(p, 103)
+    assert p.jetpack_active is True
+    assert p._jetpack_physics_active is True
+
+
+def test_engineer_activation_does_not_repurpose_fire_state_as_an_ack():
+    """A protocol handoff must never ignite the retail owner as a marker."""
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 100.0
+    p.input.jump = True
+
+    for _ in range(30):
+        p._update_jetpack(DT)
+        if p.jetpack_active:
+            break
+
+    assert not hasattr(p, "jetpack_activation_marker_pending")
+    assert not hasattr(p, "note_jetpack_activation_echo")
+
+
+def test_jetpack_release_stops_physics_on_the_key_up_frame():
+    """Retail physical SPACE key-up stops thrust before 0x04 is cleared.
+
+    Exact client capture ``hold-release-client-semantics`` kept both advertised
+    active booleans true after key-up while vertical velocity immediately
+    resumed ordinary gravity.  The server must therefore stop native thrust on
+    the consumed release frame; deferring it by one tick creates a phase error.
+    """
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.jetpack_fuel = 50.0
+    p.jetpack_active = True
+    p._jetpack_physics_active = True
+    p.input.jump = False
+
+    p._update_jetpack(DT)
+
+    assert p.jetpack_active is False
+    assert p._jetpack_physics_active is False
+    assert p.jetpack_fuel >= 50.0
+
+
 def test_ugc_builder_keeps_toggle_hover_activation():
     p = make_player(class_id=int(C.CLASS_UGCBUILDER))
     p.jetpack_id = int(C.JETPACK_UGCBUILDER)
@@ -129,11 +283,13 @@ def test_damage_pauses_regen():
 
 def test_spawn_assigns_class_jetpack():
     p = make_player(class_id=int(C.CLASS_ROCKETEER))
+    p.apply_class_selection(normalize_class_selection(C.CLASS_ROCKETEER))
     p.spawn(100.0, 100.0, 30.0)
     assert p.jetpack_id == int(C.JETPACK2)   # rocketeer default equipment
     assert p.jetpack_fuel == 100.0
 
     s = make_player(class_id=int(C.CLASS_SOLDIER))
+    s.apply_class_selection(normalize_class_selection(C.CLASS_SOLDIER))
     s.spawn(100.0, 100.0, 30.0)
     assert s.jetpack_id == 0                 # soldier has no jetpack
 

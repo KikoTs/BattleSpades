@@ -2,6 +2,10 @@
 Admin commands - requires admin permission.
 """
 
+import math
+
+import shared.constants as C
+
 from server.game_constants import CHAT_SYSTEM
 from shared.packet import ChatMessage
 
@@ -160,8 +164,23 @@ async def cmd_teleport(ctx: CommandContext):
             x = float(ctx.args[0])
             y = float(ctx.args[1])
             z = float(ctx.args[2])
+            if (
+                not all(math.isfinite(value) for value in (x, y, z))
+                or not 0.0 <= x < float(C.MAP_X)
+                or not 0.0 <= y < float(C.MAP_Y)
+                or not 0.0 <= z < float(C.MAP_Z)
+            ):
+                await send_message(
+                    ctx.server,
+                    ctx.player,
+                    "Coordinates must be finite and inside the map",
+                )
+                return
             
             ctx.player.set_position(x, y, z)
+            set_velocity = getattr(ctx.player, "set_velocity", None)
+            if callable(set_velocity):
+                set_velocity(0.0, 0.0, 0.0)
             await send_message(ctx.server, ctx.player, f"Teleported to ({x}, {y}, {z})")
             return
         except ValueError:

@@ -531,10 +531,10 @@ cdef class VXL:
         self._overview_transparent = b""
 
         offset = (MAP_SIZE - edge) // 2
-        # Keep loaded map heights in their original coordinate space.
-        # The older working loader/server never normalized standard maps up to
-        # EMPTY_TOP_END, and that synthetic shift breaks spawn/world packet z.
-        z_shift = 0
+        # Retail Battle Builder normalizes legacy/short VXL maps into its
+        # 240-high world. The deepest referenced source z becomes the fixed
+        # z=239 bed, placing dry terrain beside the z=238 waterplane.
+        z_shift = max(0, EMPTY_TOP_END - max_z)
 
         self._source_size = edge
         self._source_max_z = max_z
@@ -678,7 +678,7 @@ cdef class VXL:
         self._overview_transparent = bytes(transparent)
         self._overview_dirty = False
 
-    cdef tuple _column_runs(self, int map_x, int map_y):
+    cdef tuple _column_runs_source(self, int map_x, int map_y):
         cdef list runs = []
         cdef int col = _column_index(map_x, map_y)
         cdef int top_z = self._top_z[col]
@@ -711,8 +711,31 @@ cdef class VXL:
             runs.append((run_start, bottom_z))
         return tuple(runs)
 
-    cdef unsigned int _surface_color(self, int map_x, int map_y, int source_z):
+    cdef unsigned int _surface_color_source(self, int map_x, int map_y, int source_z):
         return self._colors.get(_voxel_index(map_x, map_y, source_z + self._z_shift), 0)
+
+    cdef tuple _column_runs_world(self, int map_x, int map_y):
+        cdef list runs = []
+        cdef int col = _column_index(map_x, map_y)
+        cdef int top_z = self._top_z[col]
+        cdef int bottom_z = self._bottom_z[col]
+        cdef int z
+        cdef int run_start = -1
+        if top_z >= MAP_HEIGHT or bottom_z < top_z:
+            return ()
+        for z in range(max(0, top_z), min(EMPTY_TOP_END, bottom_z) + 1):
+            if self._solid_at(map_x, map_y, z):
+                if run_start < 0:
+                    run_start = z
+            elif run_start >= 0:
+                runs.append((run_start, z - 1))
+                run_start = -1
+        if run_start >= 0:
+            runs.append((run_start, min(EMPTY_TOP_END, bottom_z)))
+        return tuple(runs)
+
+    cdef unsigned int _surface_color_world(self, int map_x, int map_y, int z):
+        return self._colors.get(_voxel_index(map_x, map_y, z), 0)
 
     cdef bytes _serialize_column(self, int map_x, int map_y):
         cdef bytearray out = bytearray()
@@ -731,7 +754,7 @@ cdef class VXL:
         cdef list bottom_colors
         cdef unsigned int color
 
-        runs = self._column_runs(map_x, map_y)
+        runs = self._column_runs_world(map_x, map_y)
         if not runs:
             out.extend((0, EMPTY_TOP_START, EMPTY_TOP_END, 0))
             return bytes(out)
@@ -746,7 +769,7 @@ cdef class VXL:
             if run_index == run_count - 1:
                 out.extend((0, run_start, run_end, prev_air_start))
                 for z in range(run_start, run_end + 1):
-                    color = self._surface_color(map_x, map_y, z)
+                    color = self._surface_color_world(map_x, map_y, z)
                     out.extend((
                         color & 0xFF,
                         (color >> 8) & 0xFF,
@@ -757,23 +780,23 @@ cdef class VXL:
 
             top_end = run_start
             while top_end < run_end:
-                if _voxel_index(map_x, map_y, top_end + 1 + self._z_shift) not in self._colors:
+                if _voxel_index(map_x, map_y, top_end + 1) not in self._colors:
                     break
                 top_end += 1
 
             bottom_start = run_end
             while bottom_start > top_end + 1:
-                if _voxel_index(map_x, map_y, bottom_start - 1 + self._z_shift) not in self._colors:
+                if _voxel_index(map_x, map_y, bottom_start - 1) not in self._colors:
                     break
                 bottom_start -= 1
 
             top_colors = []
             for z in range(run_start, top_end + 1):
-                top_colors.append(self._surface_color(map_x, map_y, z))
+                top_colors.append(self._surface_color_world(map_x, map_y, z))
 
             bottom_colors = []
             for z in range(bottom_start, run_end + 1):
-                bottom_colors.append(self._surface_color(map_x, map_y, z))
+                bottom_colors.append(self._surface_color_world(map_x, map_y, z))
 
             span_words = 1 + len(top_colors) + len(bottom_colors)
             out.extend((span_words, run_start, top_end, prev_air_start))
@@ -823,7 +846,7 @@ cdef class VXL:
             map_y = self._source_offset + src_y
             for src_x in range(self._source_size):
                 map_x = self._source_offset + src_x
-                runs = self._column_runs(map_x, map_y)
+                runs = self._column_runs_source(map_x, map_y)
                 if not runs:
                     out.extend((0, EMPTY_TOP_START, EMPTY_TOP_END, 0))
                     continue
@@ -838,7 +861,7 @@ cdef class VXL:
                     if run_index == run_count - 1:
                         out.extend((0, run_start, run_end, prev_air_start))
                         for z in range(run_start, run_end + 1):
-                            color = self._surface_color(map_x, map_y, z)
+                            color = self._surface_color_source(map_x, map_y, z)
                             out.extend((
                                 color & 0xFF,
                                 (color >> 8) & 0xFF,
@@ -861,11 +884,11 @@ cdef class VXL:
 
                     top_colors = []
                     for z in range(run_start, top_end + 1):
-                        top_colors.append(self._surface_color(map_x, map_y, z))
+                        top_colors.append(self._surface_color_source(map_x, map_y, z))
 
                     bottom_colors = []
                     for z in range(bottom_start, run_end + 1):
-                        bottom_colors.append(self._surface_color(map_x, map_y, z))
+                        bottom_colors.append(self._surface_color_source(map_x, map_y, z))
 
                     span_words = 1 + len(top_colors) + len(bottom_colors)
                     out.extend((span_words, run_start, top_end, prev_air_start))

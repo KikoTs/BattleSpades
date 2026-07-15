@@ -35,6 +35,8 @@ ROCKET_TURRET_ROCKET_SPEC = ProjectileSpec(
     int(getattr(C, "ROCKET_TURRET_ROCKET_DAMAGE", 21)),
     entity_type=int(getattr(C, "ROCKET_ENTITY", 21)),
     blast_radius=float(getattr(C, "ROCKET_TURRET_ROCKET_EXPLOSION_RADIUS", 3.0)),
+    knockback_min=float(getattr(C, "ROCKET_TURRET_ROCKET_EXPLOSION_KNOCKBACK_MIN", 0.1)),
+    knockback_max=float(getattr(C, "ROCKET_TURRET_ROCKET_EXPLOSION_KNOCKBACK_MAX", 0.3)),
 )
 
 
@@ -125,6 +127,31 @@ class RocketTurretController:
             if now < turret.next_shot_at or max(yaw_error, pitch_error) > ROCKET_TURRET_TOLERANCE:
                 continue
             self._fire(turret, target, now)
+
+    def remove_by_owner(self, owner_id: int) -> list[int]:
+        """Remove turrets before their compact owner id can be reused.
+
+        Turrets are autonomous projectile producers.  Leaving one alive after
+        disconnect would transfer rocket collision exclusion and kill credit
+        to an unrelated replacement player with the same wire id.
+        """
+
+        owner_id = int(owner_id)
+        removed = []
+        for entity_id, turret in list(self.server.rocket_turrets.items()):
+            if int(turret.owner_id) != owner_id:
+                continue
+            self.server.rocket_turrets.pop(entity_id, None)
+            entity = self.server.entity_registry.remove(entity_id)
+            # DestroyEntity is crash-sensitive in the retail client: sending
+            # it for an id absent from the client's entity table produces the
+            # native "invalid entity on destroy" path.  A stale controller
+            # row may legitimately outlive registry cleanup during teardown,
+            # so broadcast only for an entity that still existed here.
+            if entity is not None:
+                self.server.broadcast_destroy_entity(entity_id)
+            removed.append(int(entity_id))
+        return removed
 
     def _target_for(self, turret: RocketTurret):
         current = self.server.players.get(turret.target_id) if turret.target_id is not None else None

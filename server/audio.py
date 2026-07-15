@@ -22,6 +22,8 @@ from shared.packet import PlaySound, PlayMusic, StopMusic, CreateAmbientSound
 # --- SOUND_ID table (extracted from the live client constants_audio) --------
 SND_EVENT_POSITIVE = 2       # generic "good thing" stinger (score/kill)
 SND_EVENT_NEGATIVE = 3       # generic "bad thing" stinger (death/loss)
+SND_VIP_YOURS_IS_DEAD = 7    # VIP_yoursisdead
+SND_VIP_KILLED_THEIRS = 8    # VIP_killedtheirs
 SND_AIRSTRIKE_SIREN = 9
 SND_CLASSIC_PICKUP = 12
 SND_CRATE = 13               # ammo crate pickup
@@ -30,6 +32,7 @@ SND_CRATE_BLOCKS = 15        # block crate pickup
 SND_FLAG_RETURNED = 20
 SND_BUILD_DYNAMITE = 21
 SND_TUTORIAL_COMPLETE = 27
+SND_ZOMBIE_BECOME = 28
 SND_ZOMBIE_TIMER = 29
 SND_TURRET_PLACE = 30
 SND_BUILD_LANDMINE = 31

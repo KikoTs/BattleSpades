@@ -14,16 +14,45 @@ playable and hostable, and so it's a clean base others can build on or port.
 
 - **Netcode & physics reverse-engineered from the compiled client** and
   calibrated to millimetre-level movement parity (server-authoritative, 60 Hz,
-  self-row reconciliation).
+  client-predicted locally with authoritative 30 Hz observer replication).
 - **Core gameplay, verified live against the real client:** movement, jump,
   shooting (hit-scan from the client's reported aim), block build/break with
   exact-cell client↔server VXL sync, grenades (bounce physics + blast + block
   destruction), floating-structure collapse, ammo/health crates, damage/kills/
   respawn/grave, map streaming.
-- **Game modes:** TDM, CTF, Arena. **Human-like bots** for solo testing.
-- **One-command install & build**, docs, tests (87 passing).
+- **Game modes:** TDM, CTF, Arena, Gangster VIP, and Zombie Infection.
+  Infection includes the native preparation/outbreak phases, permanent
+  survivor conversion, zero-delay zombie respawns, last-survivor radar, and
+  late-join role enforcement.
+- **Human-like bot foundation:** supervised process isolation, bounded
+  versioned messages, dynamic Recast/Detour terrain, fair LOS/last-seen/sound,
+  delayed team sightings, natural aim/locomotion, TDM combat, basic objective
+  policies, class loadouts, mining/bridge recovery, deployables, oriented
+  projectiles, DetourCrowd steering, movement affordances, shared prefab
+  placement, construction reservations, resource seeking, and cover utility.
+  This is a playable foundation, not the end of the bot roadmap.
+- **Objective pickups and resource crates:** CTF intel carry/drop state is
+  authoritative and late-join safe; ammo, health, block, and authored jetpack
+  crates restock through the retail packet paths.
+- **One-command install & build**, architecture/runbook/engineering docs, and
+  729 automated tests.
+- **Production capacity gate:** a 15-minute, 50-player run holds 59.999 Hz with
+  4.842 ms tick p99 and zero gameplay or telemetry drops.
 
 ## Near term 🔜
+
+- **Bot interaction polish:** richer projectile tactics, statistical aim/hit
+  calibration, glider route tuning, and an operator-facing rendered debug view.
+  Zombie bots now have a dedicated global-survivor/contact motor, native
+  base/Fast/Jump variants, 3x3x3 claw breaching, and authorized Zombie-prefab
+  climb recovery; two-retail-observer feel validation remains open.
+- **Bot objective acceptance:** phase-aware roles now cover CTF/Classic CTF
+  capture, escort and defence; Zombie preparation, regrouping and last-man
+  pursuit; and VIP formation, guard, flank and sudden-death behavior. Headless
+  `cctf`/VIP/Zombie runtime gates pass. Deterministic score contributions and
+  two clean retail observers with no rollback or crash dump remain open. The
+  strict 15-minute 12-bot performance soak and in-match worker-restart gate are
+  complete.
 
 - **End-of-round experience:** final scoreboard / stats screen, per-player
   scoreboard column, and the HUD round-timer countdown (server sends no timer
@@ -51,8 +80,9 @@ Layered plan (`data → systems → modes → presentation`):
    molotov, RPG rockets, drill, snowball, mine-launcher), **deployables** (turrets,
    landmines, C4, dynamite, medpacks, radar), and status effects (fire, disguise,
    jetpack).
-3. **Modes:** Team Deathmatch, Capture the Flag (+ Classic), Territory Control,
-   Multi-Hill, **Zombie**, VIP, Demolition, Occupation, Diamond Mine, Tutorial,
+3. **Modes:** Team Deathmatch, Capture the Flag (+ Classic), **Zombie**, and
+   **VIP** are implemented. Territory Control, Multi-Hill, Demolition,
+   Occupation, Diamond Mine, Tutorial,
    and the UGC map-creator mode — each composing the systems above.
 4. **Presentation:** end-of-round scoreboard, per-player scores, HUD round timer,
    sounds, minimap objectives, and vote-kick.

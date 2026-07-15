@@ -46,14 +46,64 @@ def test_validation_launcher_defaults_are_isolated():
     assert args.mode == "tdm"
     assert args.config == Path("config.toml")
     assert args.worldupdate_loop_offset is None
+    assert args.worldupdate_airborne_self_row_interval is None
+    assert args.jetpack_owner_handoff_input_frames is None
+    assert args.jetpack_owner_release_handoff_input_frames is None
+    assert args.movement_authority is None
+    assert args.worldupdate_include_self is None
+    assert args.fixed_spawn is None
+    assert args.fixed_spawn_step == 0
     assert not args.debug_selfrow
+    assert not args.debug_parity
+    assert not args.packet_trace
 
 
 def test_validation_launcher_accepts_reconciliation_calibration_overrides():
-    args = parse_args(["--worldupdate-loop-offset", "-2", "--debug-selfrow"])
+    args = parse_args([
+        "--worldupdate-loop-offset", "-2",
+        "--worldupdate-airborne-self-row-interval", "6",
+        "--jetpack-owner-handoff-input-frames", "18",
+        "--jetpack-owner-release-handoff-input-frames", "600",
+        "--debug-selfrow",
+    ])
 
     assert args.worldupdate_loop_offset == -2
+    assert args.worldupdate_airborne_self_row_interval == 6
+    assert args.jetpack_owner_handoff_input_frames == 18
+    assert args.jetpack_owner_release_handoff_input_frames == 600
     assert args.debug_selfrow
+
+
+def test_validation_launcher_accepts_authority_and_self_row_ab_overrides():
+    args = parse_args([
+        "--movement-authority", "client",
+        "--worldupdate-include-self", "false",
+    ])
+
+    assert args.movement_authority == "client"
+    assert args.worldupdate_include_self == "false"
+
+
+def test_validation_launcher_accepts_bounded_parity_capture():
+    args = parse_args(["--debug-parity"])
+
+    assert args.debug_parity
+
+
+def test_validation_launcher_accepts_explicit_packet_trace():
+    args = parse_args(["--packet-trace"])
+
+    assert args.packet_trace
+
+
+def test_validation_launcher_accepts_deterministic_spawn_column():
+    args = parse_args([
+        "--fixed-spawn", "256", "256",
+        "--fixed-spawn-step", "12",
+    ])
+
+    assert args.fixed_spawn == [256, 256]
+    assert args.fixed_spawn_step == 12
 
 
 def test_two_client_specs_use_unique_tracer_ports():
@@ -62,6 +112,7 @@ def test_two_client_specs_use_unique_tracer_ports():
     assert [spec.console_port for spec in specs] == [32896, 32897]
     assert [spec.tracer_port for spec in specs] == [32895, 32898]
     assert all(spec.connect_target == "127.0.0.1:27016" for spec in specs)
+    assert all(spec.minimized is True for spec in specs)
     assert len({spec.capture_dir for spec in specs}) == 2
 
 

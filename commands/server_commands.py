@@ -2,6 +2,8 @@
 Server commands - admin commands for server management.
 """
 
+import time
+
 from server.game_constants import CHAT_SYSTEM, TEAM1, TEAM2
 from shared.packet import ChatMessage, FogColor
 
@@ -68,71 +70,54 @@ async def cmd_netcode(ctx: CommandContext):
     description="Change the current map",
 )
 async def cmd_map(ctx: CommandContext):
-    """Change map."""
+    """Change map through a crash-safe full client-session rollover."""
     if not ctx.args:
         await send_message(ctx.server, ctx.player, f"Current map: {ctx.server.world_manager.map_name}")
         await send_message(ctx.server, ctx.player, "Usage: /map <mapname>")
         return
     
-    map_name = ctx.args[0]
-    
-    msg = f"Changing map to {map_name}..."
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = msg
-    ctx.server.broadcast(bytes(packet.generate()))
-    
-    # Load new map
-    if ctx.server.world_manager.load_map(map_name):
-        # Respawn all players
-        for player in ctx.server.players.values():
-            spawn = ctx.server.world_manager.get_spawn_point(player.team)
-            player.spawn(*spawn)
-        
-        await send_message(ctx.server, ctx.player, f"Map changed to {map_name}")
+    transition = ctx.server.match_transition
+    request = getattr(transition, "request_map_change", None)
+    if callable(request):
+        result = request(ctx.raw_args.strip(), requester=ctx.player)
     else:
-        await send_message(ctx.server, ctx.player, f"Failed to load map: {map_name}")
+        # Compatibility for plugins/tests implementing the pre-service API.
+        result = await transition.change_map(ctx.raw_args.strip())
+    if not result.ok:
+        await send_message(ctx.server, ctx.player, result.message)
+    elif not result.reconnect_required:
+        await send_message(ctx.server, ctx.player, result.message)
 
 
 @register_command(
     name="mode",
     aliases=["gamemode"],
     admin_only=True,
-    usage="/mode <ctf|tdm|arena>",
+    usage="/mode <ctf|cctf|tdm|arena|vip|zombie>",
     description="Change the game mode",
 )
 async def cmd_mode(ctx: CommandContext):
-    """Change game mode."""
+    """Change mode through a crash-safe full client-session rollover."""
     if not ctx.args:
         current = ctx.server.mode.name if ctx.server.mode else "None"
         await send_message(ctx.server, ctx.player, f"Current mode: {current}")
-        await send_message(ctx.server, ctx.player, "Usage: /mode <ctf|tdm|arena>")
+        await send_message(
+            ctx.server,
+            ctx.player,
+            "Usage: /mode <ctf|cctf|tdm|arena|vip|zombie>",
+        )
         return
     
-    mode_name = ctx.args[0].lower()
-    
-    from modes import get_mode_class
-    mode_class = get_mode_class(mode_name)
-    
-    if not mode_class:
-        await send_message(ctx.server, ctx.player, f"Unknown mode: {mode_name}")
-        return
-    
-    # End current mode
-    if ctx.server.mode:
-        await ctx.server.mode.on_mode_end()
-    
-    # Start new mode
-    ctx.server.mode = mode_class(ctx.server)
-    await ctx.server.mode.on_mode_start()
-    
-    msg = f"Game mode changed to {ctx.server.mode.name}"
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = msg
-    ctx.server.broadcast(bytes(packet.generate()))
+    transition = ctx.server.match_transition
+    request = getattr(transition, "request_mode_change", None)
+    if callable(request):
+        result = request(ctx.args[0], requester=ctx.player)
+    else:
+        result = await transition.change_mode(ctx.args[0])
+    if not result.ok:
+        await send_message(ctx.server, ctx.player, result.message)
+    elif not result.reconnect_required:
+        await send_message(ctx.server, ctx.player, result.message)
 
 
 @register_command(
@@ -144,11 +129,10 @@ async def cmd_mode(ctx: CommandContext):
 )
 async def cmd_restart(ctx: CommandContext):
     """Restart the round immediately (skips the end-of-round stats screen)."""
-    if ctx.server.mode:
-        # _restart_round resets teams + revives the mode + respawns everyone
-        # and restarts the music bed. Do NOT route through on_mode_end here —
-        # that would kick off the full end sequence (which restarts again).
-        await ctx.server.mode._restart_round()
+    result = await ctx.server.match_transition.restart_round()
+    if not result.ok:
+        await send_message(ctx.server, ctx.player, result.message)
+        return
 
     packet = ChatMessage()
     packet.player_id = 255
@@ -192,11 +176,15 @@ async def cmd_endround(ctx: CommandContext):
 )
 async def cmd_say(ctx: CommandContext):
     """Server announcement."""
-    if not ctx.raw_args:
+    message_text = ctx.raw_args.strip()
+    if not message_text:
         await send_message(ctx.server, ctx.player, "Usage: /say <message>")
         return
+    if len(message_text) > 256:
+        await send_message(ctx.server, ctx.player, "Announcement is too long (max 256 characters)")
+        return
     
-    message = f"[SERVER] {ctx.raw_args}"
+    message = f"[SERVER] {message_text}"
     packet = ChatMessage()
     packet.player_id = 255
     packet.chat_type = CHAT_SYSTEM
@@ -212,16 +200,19 @@ async def cmd_say(ctx: CommandContext):
 )
 async def cmd_fog(ctx: CommandContext):
     """Set fog color."""
-    if len(ctx.args) < 3:
+    if len(ctx.args) != 3:
         await send_message(ctx.server, ctx.player, "Usage: /fog <r> <g> <b>")
         return
     
     try:
-        r = int(ctx.args[0]) & 0xFF
-        g = int(ctx.args[1]) & 0xFF
-        b = int(ctx.args[2]) & 0xFF
+        r = int(ctx.args[0])
+        g = int(ctx.args[1])
+        b = int(ctx.args[2])
     except ValueError:
         await send_message(ctx.server, ctx.player, "Invalid RGB values")
+        return
+    if any(component < 0 or component > 255 for component in (r, g, b)):
+        await send_message(ctx.server, ctx.player, "RGB values must be in range 0-255")
         return
     
     color = (r << 16) | (g << 8) | b
@@ -229,6 +220,8 @@ async def cmd_fog(ctx: CommandContext):
     packet = FogColor()
     packet.color = color
     ctx.server.broadcast(bytes(packet.generate()))
+    # Future StateData must agree with the live fog after a reconnect.
+    ctx.server.config.fog_color_rgb = (r, g, b)
     
     await send_message(ctx.server, ctx.player, f"Fog color set to ({r}, {g}, {b})")
 
@@ -244,13 +237,21 @@ async def cmd_time(ctx: CommandContext):
     if ctx.server.mode:
         if ctx.args:
             try:
-                ctx.server.mode.time_limit = int(ctx.args[0])
+                seconds = int(ctx.args[0])
+                if seconds < 0:
+                    raise ValueError
+                ctx.server.mode.time_limit = seconds
+                ctx.server.mode.start_time = time.time()
+                ctx.server.mode.elapsed_time = 0.0
                 await send_message(ctx.server, ctx.player, 
-                                   f"Time limit set to {ctx.server.mode.time_limit} seconds")
+                                   f"Time remaining set to {seconds} seconds")
             except ValueError:
                 await send_message(ctx.server, ctx.player, "Invalid time value")
         else:
-            remaining = ctx.server.mode.time_limit - ctx.server.mode.elapsed_time
+            remaining = max(
+                0.0,
+                ctx.server.mode.time_limit - ctx.server.mode.elapsed_time,
+            )
             minutes = int(remaining) // 60
             seconds = int(remaining) % 60
             await send_message(ctx.server, ctx.player, 
@@ -284,19 +285,27 @@ async def cmd_balance(ctx: CommandContext):
     
     to_move = diff // 2
     
-    # Move players (last joined first)
+    # Move players (last joined first). A raw ``player.team =`` mutation is
+    # invisible to other clients; KillAction + the ordinary respawn boundary
+    # re-announces class/loadout/team through CreatePlayer.
     moved = 0
-    for player in list(ctx.server.teams[larger_team].players):
+    for player in reversed(list(ctx.server.teams[larger_team].players)):
         if moved >= to_move:
             break
-        
+
+        old_team = player.team
         ctx.server.teams[larger_team].remove_player(player)
         player.team = smaller_team
         ctx.server.teams[smaller_team].add_player(player)
-        
-        if player.alive:
-            spawn = ctx.server.world_manager.get_spawn_point(smaller_team)
-            player.spawn(*spawn)
+
+        die = getattr(player, "die", None)
+        if player.alive and callable(die):
+            from server.game_constants import KILL_TEAM_CHANGE
+            die(kill_type=KILL_TEAM_CHANGE)
+        queue_event = getattr(ctx.server, "queue_mode_event", None)
+        if callable(queue_event):
+            queue_event("on_player_team_change", player, old_team, smaller_team)
+        ctx.server.respawn_player(player)
         
         await send_message(ctx.server, player, 
                            f"You were moved to {ctx.server.teams[smaller_team].name}")
@@ -307,3 +316,186 @@ async def cmd_balance(ctx: CommandContext):
     packet.chat_type = CHAT_SYSTEM
     packet.value = f"Teams balanced ({moved} players moved)"
     ctx.server.broadcast(bytes(packet.generate()))
+
+
+async def _ensure_bot_director(ctx: CommandContext):
+    """Start an empty director for an explicit admin bot command."""
+
+    if ctx.server.bots is not None:
+        return ctx.server.bots
+    from server.bot_ai import BotDirector
+
+    director = BotDirector(ctx.server)
+    ctx.server.bots = director
+    await director.start(initial_count=0)
+    ctx.server.config.bots.enabled = True
+    return director
+
+
+@register_command(
+    name="bots",
+    admin_only=True,
+    usage=(
+        "/bots status|fill <count>|add <count> [team]|"
+        "remove <count|name|all>|difficulty <casual|normal|hard|mixed>|"
+        "debug <on|off|name>"
+    ),
+    description="Manage isolated server-owned bots",
+)
+async def cmd_bots(ctx: CommandContext):
+    """Inspect and manage the bounded bot population."""
+
+    subcommand = ctx.args[0].lower() if ctx.args else "status"
+    if subcommand == "status":
+        director = ctx.server.bots
+        if director is None:
+            await send_message(ctx.server, ctx.player, "Bots disabled (0 active)")
+            return
+        worker = director.status()
+        await send_message(
+            ctx.server,
+            ctx.player,
+            (
+                f"Bots={len(director.bots)} worker={'up' if worker.running else 'down'} "
+                f"pid={worker.process_id or '-'} restarts={worker.restarts} "
+                f"frames={worker.queued_frames} intents={worker.queued_intents} "
+                f"terrain={worker.pending_terrain_cells}"
+            ),
+        )
+        return
+
+    director = await _ensure_bot_director(ctx)
+    config = ctx.server.config.bots
+    if subcommand == "fill":
+        if len(ctx.args) != 2:
+            await send_message(ctx.server, ctx.player, "Usage: /bots fill <count>")
+            return
+        try:
+            target = max(0, min(ctx.server.config.max_players, int(ctx.args[1])))
+        except ValueError:
+            await send_message(ctx.server, ctx.player, "Bot fill count must be an integer")
+            return
+        config.population_mode = "backfill"
+        config.fill_target = target
+        config.max_bots = max(config.max_bots, min(target, ctx.server.config.max_players))
+        director.request_population_refresh()
+        await send_message(ctx.server, ctx.player, f"Bot backfill target set to {target}")
+        return
+
+    if subcommand == "add":
+        if len(ctx.args) < 2:
+            await send_message(ctx.server, ctx.player, "Usage: /bots add <count> [team]")
+            return
+        try:
+            count = max(0, min(12, int(ctx.args[1])))
+        except ValueError:
+            await send_message(ctx.server, ctx.player, "Bot add count must be an integer")
+            return
+        team = None
+        if len(ctx.args) >= 3:
+            token = ctx.args[2].lower()
+            team = {
+                "1": TEAM1,
+                "team1": TEAM1,
+                "blue": TEAM1,
+                "2": TEAM2,
+                "team2": TEAM2,
+                "green": TEAM2,
+            }.get(token)
+            if team is None:
+                await send_message(ctx.server, ctx.player, "Team must be 1/blue or 2/green")
+                return
+        config.population_mode = "admin"
+        config.max_bots = max(config.max_bots, len(director.bots) + count)
+        added = 0
+        for _ in range(count):
+            if await director.add_bot(team=team) is None:
+                break
+            added += 1
+        await send_message(ctx.server, ctx.player, f"Added {added} bot(s)")
+        return
+
+    if subcommand == "remove":
+        if len(ctx.args) != 2:
+            await send_message(
+                ctx.server, ctx.player, "Usage: /bots remove <count|name|all>"
+            )
+            return
+        config.population_mode = "admin"
+        token = ctx.args[1]
+        if token.lower() == "all":
+            candidates = list(director.bots)
+        else:
+            try:
+                count = max(0, int(token))
+            except ValueError:
+                candidates = [
+                    bot for bot in director.bots
+                    if bot.name.lower().startswith(token.lower())
+                ][:1]
+            else:
+                candidates = list(director.bots)[:count]
+        removed = 0
+        for bot in candidates:
+            if await director.remove_bot(bot):
+                removed += 1
+        await send_message(
+            ctx.server,
+            ctx.player,
+            f"Removed {removed} bot(s); objective-protected bots were kept",
+        )
+        return
+
+    if subcommand == "difficulty":
+        if len(ctx.args) != 2 or ctx.args[1].lower() not in (
+            "casual", "normal", "hard", "mixed"
+        ):
+            await send_message(
+                ctx.server,
+                ctx.player,
+                "Usage: /bots difficulty <casual|normal|hard|mixed>",
+            )
+            return
+        config.difficulty = ctx.args[1].lower()
+        await send_message(
+            ctx.server,
+            ctx.player,
+            f"Bot difficulty set to {config.difficulty} for new profiles",
+        )
+        return
+
+    if subcommand == "debug":
+        if len(ctx.args) != 2:
+            await send_message(
+                ctx.server, ctx.player, "Usage: /bots debug <on|off|name>"
+            )
+            return
+        token = ctx.args[1]
+        if token.lower() in ("on", "off"):
+            config.debug_visualization = token.lower() == "on"
+            await send_message(
+                ctx.server,
+                ctx.player,
+                f"Bot debug visualization {'enabled' if config.debug_visualization else 'disabled'}",
+            )
+            return
+        rows = director.debug_snapshot(token)
+        if not rows:
+            await send_message(
+                ctx.server,
+                ctx.player,
+                "Bot debug is disabled or no matching bot exists",
+            )
+            return
+        row = rows[0]
+        await send_message(
+            ctx.server,
+            ctx.player,
+            (
+                f"{row['name']} action={row['action']} edge={row['affordance']} "
+                f"goal={row['goal']} path={row['path']}"
+            )[:240],
+        )
+        return
+
+    await send_message(ctx.server, ctx.player, "Unknown /bots subcommand")

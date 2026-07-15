@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import socket
 import threading
 import time
@@ -33,11 +34,28 @@ class DebugParitySession:
     last_sample_id: int = 0
     capture_path: Path | None = None
     client_addr: tuple[str, int] | None = None
-    capture_handle: object = None
-    records_since_flush: int = 0
+    next_sample_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class _CaptureWorkItem:
+    """One immutable instruction consumed only by the capture writer."""
+
+    kind: str
+    path: Path
+    session_id: str
+    record: dict[str, Any] | None = None
+    text: str | None = None
 
 
 class DebugParityManager:
+    """Own opt-in parity transport without putting disk I/O on game threads.
+
+    UDP messages may arrive faster than disk or antivirus scanning can keep
+    up. Producers therefore use ``put_nowait`` against a bounded queue. Losing
+    diagnostics is preferable to delaying authoritative simulation.
+    """
+
     def __init__(self, server, base_directory: Path | None = None):
         self.server = server
         self.base_directory = Path(base_directory or DEFAULT_LOG_DIR)
@@ -49,7 +67,29 @@ class DebugParityManager:
         self.socket: socket.socket | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self.sample_hz = max(0.1, min(10.0, float(getattr(
+            self.server.config, 'debug_parity_sample_hz', 10.0))))
+        self.flush_interval = max(0.1, float(getattr(
+            self.server.config, 'debug_parity_flush_interval', 1.0)))
+        self.flush_batch = max(1, int(getattr(
+            self.server.config, 'debug_parity_flush_batch', 128)))
+        queue_capacity = max(64, int(getattr(
+            self.server.config, 'debug_parity_queue_capacity', 256)))
+        self._capture_queue: queue.Queue[object] = queue.Queue(
+            maxsize=queue_capacity)
+        self._writer_sentinel = object()
+        self._writer_thread: threading.Thread | None = None
+        self._last_summary_enqueued_at = 0.0
+        self._selfrow_next_at: dict[int, float] = {}
+        self.dropped_records = 0
+        self.rate_limited_samples = 0
+        self.writer_errors = 0
         self.override_state = self._reset_native_overrides()
+        if (
+            getattr(self.server.config, 'debug_parity', False)
+            or getattr(self.server.config, 'debug_selfrow', False)
+        ):
+            self._start_writer()
         if getattr(self.server.config, 'debug_parity', False):
             self._start_transport()
 
@@ -79,7 +119,17 @@ class DebugParityManager:
         self._thread = threading.Thread(target=self._recv_loop, name='debug-parity', daemon=True)
         self._thread.start()
 
+    def _start_writer(self) -> None:
+        """Start the sole owner of capture file handles."""
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name='debug-parity-writer',
+            daemon=True,
+        )
+        self._writer_thread.start()
+
     def close(self) -> None:
+        """Stop transport, drain accepted telemetry, and close capture files."""
         self._stop_event.set()
         if self.socket is not None:
             try:
@@ -90,6 +140,12 @@ class DebugParityManager:
         self.override_state = self._reset_native_overrides()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=0.5)
+        if self._writer_thread is not None:
+            # Shutdown is outside the gameplay hot path, so it may wait for
+            # already-accepted diagnostics to drain cleanly.
+            self._capture_queue.put(self._writer_sentinel)
+            self._writer_thread.join(timeout=5.0)
+            self._writer_thread = None
 
     def on_player_join(self, player) -> None:
         if not getattr(self.server.config, 'debug_parity', False):
@@ -367,6 +423,11 @@ class DebugParityManager:
         if player is None:
             return
         session = self._ensure_session(player, self._requested_session_id(message), addr)
+        now = time.monotonic()
+        if now < session.next_sample_at:
+            self.rate_limited_samples += 1
+            return
+        session.next_sample_at = now + (1.0 / self.sample_hz)
         session.last_sample_id = int(message.get('payload', {}).get('sample_id', 0))
         client_payload = message.get('payload', {}).get('payload', {}) or {}
         server_snapshot = self._build_authoritative_snapshot(player)
@@ -620,19 +681,53 @@ class DebugParityManager:
     def _write_record(self, session: DebugParitySession, record: dict[str, Any]) -> None:
         if session.capture_path is None:
             return
-        # Keep the handle open across records: open/close per sample (30Hz)
-        # costs real milliseconds on Windows (antivirus scans every open)
-        # and stalls whatever thread handles the sample.
-        handle = session.capture_handle
-        if handle is None:
-            handle = session.capture_path.open('a', encoding='utf-8')
-            session.capture_handle = handle
-        handle.write(json.dumps({**record, 'session_id': session.session_id}, sort_keys=True))
-        handle.write('\n')
-        # Flush every record: it's a buffered write (no fsync), so the cost
-        # is negligible, while an unflushed tail loses up to 30 samples on
-        # abnormal exit and breaks any reader tailing the capture live.
-        handle.flush()
+        self._enqueue_capture(_CaptureWorkItem(
+            kind='record',
+            path=session.capture_path,
+            session_id=session.session_id,
+            record=record,
+        ))
+
+    def write_selfrow_sample(self, player, stamp: int) -> None:
+        """Queue one local WorldUpdate reconciliation sample if enabled.
+
+        Called from the gameplay tick after a self-row is serialized.  The
+        method never opens, writes, flushes, or waits on files from that tick;
+        accepted samples go through the bounded writer queue and overflow is
+        counted as dropped diagnostics.
+        """
+        if not getattr(self.server.config, 'debug_selfrow', False):
+            return
+        if self._writer_thread is None:
+            return
+
+        player_id = int(getattr(player, 'id', -1))
+        now = time.monotonic()
+        if now < self._selfrow_next_at.get(player_id, 0.0):
+            self.rate_limited_samples += 1
+            return
+        sample_hz = max(0.1, min(10.0, float(getattr(
+            self.server.config, 'debug_parity_sample_hz', 10.0))))
+        self._selfrow_next_at[player_id] = now + (1.0 / sample_hz)
+
+        record = {
+            'kind': 'selfrow',
+            'timestamp': round(time.time(), 6),
+            'server_tick': int(getattr(self.server, 'loop_count', 0)),
+            'stamp': int(stamp),
+            'input_loop': int(getattr(player, 'last_applied_input_loop', 0) or 0),
+            'player_id': player_id,
+            'player_name': str(getattr(player, 'name', '')),
+            'x': round(float(getattr(player, 'x', 0.0)), 5),
+            'y': round(float(getattr(player, 'y', 0.0)), 5),
+            'z': round(float(getattr(player, 'z', 0.0)), 5),
+        }
+        self._enqueue_capture(_CaptureWorkItem(
+            kind='record',
+            path=self.base_directory / 'selfrow_samples.ndjson',
+            session_id='selfrow',
+            record=record,
+        ))
 
     def _write_latest_summary(self, session: DebugParitySession, record: dict[str, Any]) -> None:
         lines = [
@@ -661,4 +756,83 @@ class DebugParityManager:
             lines.append('override_payload=%s' % record.get('payload'))
         if self.override_state:
             lines.append('overrides=%s' % self.override_state)
-        self.latest_summary_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        now = time.monotonic()
+        if now - self._last_summary_enqueued_at < 1.0:
+            return
+        self._last_summary_enqueued_at = now
+        self._enqueue_capture(_CaptureWorkItem(
+            kind='summary',
+            path=self.latest_summary_path,
+            session_id=session.session_id,
+            text='\n'.join(lines) + '\n',
+        ))
+
+    def _enqueue_capture(self, item: _CaptureWorkItem) -> None:
+        """Accept telemetry without ever waiting for the writer thread."""
+        if self._writer_thread is None:
+            return
+        try:
+            self._capture_queue.put_nowait(item)
+        except queue.Full:
+            self.dropped_records += 1
+
+    def _writer_loop(self) -> None:
+        """Serialize and batch file writes away from simulation/UDP handling."""
+        handles: dict[Path, Any] = {}
+        pending_records = 0
+        last_flush = time.monotonic()
+
+        def flush_handles() -> None:
+            nonlocal pending_records, last_flush
+            for handle in handles.values():
+                try:
+                    handle.flush()
+                except OSError:
+                    self.writer_errors += 1
+            pending_records = 0
+            last_flush = time.monotonic()
+
+        try:
+            while True:
+                timeout = max(0.01, self.flush_interval - (
+                    time.monotonic() - last_flush))
+                try:
+                    item = self._capture_queue.get(timeout=timeout)
+                except queue.Empty:
+                    flush_handles()
+                    continue
+
+                try:
+                    if item is self._writer_sentinel:
+                        break
+                    if not isinstance(item, _CaptureWorkItem):
+                        continue
+                    if item.kind == 'record' and item.record is not None:
+                        handle = handles.get(item.path)
+                        if handle is None:
+                            handle = item.path.open('a', encoding='utf-8')
+                            handles[item.path] = handle
+                        payload = dict(item.record)
+                        payload['session_id'] = item.session_id
+                        handle.write(json.dumps(payload, sort_keys=True))
+                        handle.write('\n')
+                        pending_records += 1
+                    elif item.kind == 'summary' and item.text is not None:
+                        item.path.write_text(item.text, encoding='utf-8')
+                except (OSError, TypeError, ValueError):
+                    # Diagnostics are best effort. A malformed record or full
+                    # disk must not kill the server or its writer permanently.
+                    self.writer_errors += 1
+                finally:
+                    self._capture_queue.task_done()
+
+                if (pending_records >= self.flush_batch
+                        or time.monotonic() - last_flush >= self.flush_interval):
+                    flush_handles()
+        finally:
+            flush_handles()
+            for handle in handles.values():
+                try:
+                    handle.close()
+                except OSError:
+                    self.writer_errors += 1

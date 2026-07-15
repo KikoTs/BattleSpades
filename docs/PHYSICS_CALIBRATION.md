@@ -42,14 +42,18 @@ a *= dt
 if (up or down) and (left or right): a *= sqrt(0.5)         # diagonal
 velocity.xy += direction * a
 
-# 3. gravity + vertical damping (skipped on the jump frame)
-vz += dt * 1.0            # hover *0.75, jetpack *0.05, wade+crouch buoyancy
+# 3. gravity + vertical damping
+#    hover skips the gravity addition entirely; passive pack uses *0.75;
+#    active parachute uses *0.05. The jump impulse still receives gravity in
+#    the same non-hover frame.
+vz += dt * 1.0
 vz /= (1 + dt)
 
 # 4. horizontal friction (divisor form), selected by the PREVIOUS frame's state
-wade:     v /= (1 + water_friction * dt)    # class water_friction, 8.0 soldier
-grounded: v /= (1 + 4.0 * dt)               # NOT 2.0 (reversed repo is wrong)
-airborne: v /= (1 + 2.0 * dt)               # NOT 4.0
+airborne active/passive jetpack: v /= (1 + dt)
+wade:                            v /= (1 + water_friction * dt)
+grounded:                        v /= (1 + 4.0 * dt)
+ordinary airborne/parachute:     v /= (1 + 2.0 * dt)
 
 # 5. move: SINGLE-PASS boxclipmove (NOT substepped) — see the IDA decompile of
 #    aoslib.world.so @0x3e90, ported verbatim into aoslib/world.pyx _move_box and
@@ -94,6 +98,7 @@ wade: written ONLY on a landing frame = (frame-start z > 237.0). Equivalent to t
 | ground friction divisor | `1 + 4·dt` |
 | air friction divisor | `1 + 2·dt` |
 | wade friction divisor | `1 + water_friction·dt` (class, 8.0) |
+| active/passive airborne jetpack drag | `1 + dt` |
 | jump impulse | `-0.36 × jump_multiplier`, replaces gravity that frame |
 | climb/glide velocity | per blocked axis `4·v² + 0.05`, ·dt·32, zeroes vz (both axes -> measured `4·v²+0.1` straight-on) |
 | grounded probe epsilon | 0.00875 (≈ one first-frame gravity step) |

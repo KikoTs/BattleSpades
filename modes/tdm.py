@@ -113,6 +113,9 @@ class TDMMode(BaseMode):
             int(getattr(C, "BLOCK_CRATE", 5)): ("block", PickupCrateBehavior(
                 lambda p: p.restock_blocks(), respawn_delay=15.0,
                 sound_id=SND_CRATE_BLOCKS)),
+            int(C.JETPACK_CRATE): ("jetpack", PickupCrateBehavior(
+                lambda p: p.restock_jetpack(), respawn_delay=15.0,
+                sound_id=SND_CRATE)),
         }
         authored = list(getattr(wm.map_metadata, "entities", []))
         placements = [

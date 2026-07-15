@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
@@ -39,6 +40,11 @@ logger = logging.getLogger(__name__)
 # 4 flying_consumption, 5 burdened_slowdown, 6 refill_delay_due_damage,
 # 7 fall_damage_multiplier, 8 death_acceleration).
 _JETPACK_PROPERTIES: dict = dict(getattr(C, "JETPACK_PROPERTIES", {}) or {})
+# ClientData carries no jetpack-active acknowledgement. Two deferred physics
+# recurrences are the best local-scheduling estimate recovered from retail
+# captures, not a delivery/application proof. ReplicationService owns the
+# bounded no-correction handoff that makes this estimate safe under jitter.
+JETPACK_ACTIVATION_DEFER_FRAMES = 2
 
 JUMP_BUFFER_SECONDS = 0.25
 POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
@@ -60,6 +66,18 @@ POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
 # invisible under client prediction.
 INPUT_DELAY_TICKS = 1
 INPUT_HISTORY_LIMIT = 128
+PENDING_VELOCITY_IMPULSE_LIMIT = 64
+OWNER_ANCHOR_HISTORY_LIMIT = 128
+# The patched retail client keeps its current predicted position when a
+# grounded jump would otherwise restore an owner row more than this distance
+# away.  Character.update_alive's stock restore is useful for small phase
+# corrections, but a stale airborne row can move a buffered re-jump by more
+# than a whole voxel.  Keep this value byte-for-byte in sync with
+# ``aoslib/character_jump_smoothing.py`` in the maintained client.
+JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE = 0.25
+JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE_SQ = (
+    JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE ** 2
+)
 IDLE_INPUT_FLAGS = (False, False, False, False, False, False, False, False)
 # Slack on the server-side fire-rate gate: one 60Hz sim tick (~16.7ms).
 FIRE_RATE_GRACE = 1.0 / 60.0
@@ -179,6 +197,66 @@ class InputState:
     palette_enabled: bool = False
 
 
+@dataclass(frozen=True)
+class BufferedInputFrame:
+    """Complete movement-relevant state carried by one ClientData loop.
+
+    Network draining may receive several ClientData packets before a single
+    physics step.  Keeping action state beside movement prevents a future
+    packet's hover/jetpack bit from leaking into an older replayed frame.
+    Tool selection remains immediate for combat packet authorization, but all
+    state consumed by movement is applied transactionally here.
+    """
+
+    movement_flags: tuple
+    orientation: tuple
+    action_flags: tuple | None = None
+    # Server simulation tick on which ENet delivered this ClientData. This is
+    # transport phase metadata only; physics continues to use fixed 60 Hz dt.
+    received_server_tick: int | None = None
+    # Total order shared with owner WorldUpdate sends on the gameplay thread.
+    # Unlike a 60 Hz tick label, this distinguishes send-before-receive from
+    # receive-before-send when both events happen inside the same tick.
+    received_owner_sequence: int | None = None
+    # Monotonic count of accepted ClientData frames for this player only.
+    # Unlike loop_count it cannot skip, and unlike owner_sequence it excludes
+    # interleaved WorldUpdate sends.  Deferred client-predicted effects use it
+    # as their application witness.
+    received_input_sequence: int = 0
+    # Unnamed ClientData byte between orientation and movement flags. Retained
+    # losslessly for protocol analysis; no gameplay semantics are assumed here.
+    wire_unknown_byte: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingExplosionImpulse:
+    """Explosion parameters waiting for a future observed ClientData frame."""
+
+    target_input_sequence: int
+    origin: tuple[float, float, float]
+    blast_radius: float
+    knockback_min: float
+    knockback_max: float
+
+
+@dataclass(frozen=True)
+class OwnerAnchor:
+    """One exact local WorldUpdate row queued for a retail owner.
+
+    The local-player path calls Character with ``force_update=True``.  Retail
+    therefore accepts repeated ``stamp`` values and replaces both cached
+    position and velocity each time; every send must remain in this history.
+    ``queued_owner_sequence`` gives sends and ClientData receives one causal
+    order even when their coarse server tick is equal.
+    """
+
+    stamp: int
+    position: Tuple[float, float, float]
+    velocity: Tuple[float, float, float]
+    queued_server_tick: int | None
+    queued_owner_sequence: int
+
+
 class Player:
     """
     Represents a player in the game.
@@ -202,6 +280,23 @@ class Player:
         self.x: float = 0.0
         self.y: float = 0.0
         self.z: float = 0.0
+        # Character.update_alive restores all three coordinates to its cached
+        # network_position on a jump_this_frame. This is the newest row queued
+        # by the server, not proof the retail event loop consumed that row.
+        self.last_advertised_owner_position = (0.0, 0.0, 0.0)
+        self._spawn_owner_anchor = (0.0, 0.0, 0.0)
+        # Ordered exact rows queued in that owner's self WorldUpdates.
+        # A launch cannot use a row carrying its own input stamp: the server
+        # can only queue that row after retail has already simulated the frame.
+        # Duplicate stamps are retained: retail force-applies local rows.
+        self._owner_anchor_history: deque[OwnerAnchor] = deque(
+            maxlen=OWNER_ANCHOR_HISTORY_LIMIT
+        )
+        self._owner_timeline_sequence: int = 0
+        self._input_receive_sequence: int = 0
+        self._current_input_receive_sequence: int = 0
+        self._current_input_owner_sequence: Optional[int] = None
+        self.last_jetpack_transition_debug: dict = {}
         self.vx: float = 0.0
         self.vy: float = 0.0
         self.vz: float = 0.0
@@ -227,13 +322,25 @@ class Player:
         self.grenades: int = MAX_GRENADES
         self.tool: int = self.weapon
         self.tool_is_raw: bool = True
-        self.block_color: int = 0x00FFFF
+        # Retail Block.reset() starts at neutral (112,112,112). Cyan was an
+        # accidental server fallback that overrode the held block before the
+        # client palette could publish its actual selection.
+        self.block_color: int = 0x707070
 
         self.ammo_clip: int = 10
         self.ammo_reserve: int = 50
         self.rocket_turret_stock: int = int(
             getattr(C, "ROCKET_TURRET_INITIAL_STOCK", 2)
         )
+        # Oriented items are locally animated and locally decrement their HUD
+        # ammo, but the server must keep an independent wallet.  Otherwise a
+        # duplicated/forged UseOrientedItem can create unlimited rockets or
+        # special grenades even though the retail client is empty.
+        self.oriented_stock: dict[int, int] = {}
+        self._oriented_next_use: dict[int, float] = {}
+        self.disguise_stock: int = 0
+        self._disguise_next_use: float = 0.0
+        self._reset_equipment_state()
         self.last_shot_time: float = 0.0
         self.next_shot_time: float = 0.0
         self.reload_end_time: float = 0.0
@@ -241,6 +348,10 @@ class Player:
 
         self.spawned: bool = False
         self.alive: bool = False
+        # server.roster combines this with Player object identity to identify
+        # one concrete native Character life across gated join transitions.
+        self.replication_generation: int = 0
+        self.last_kill_action_data: bytes | None = None
         self.admin: bool = False
         self.muted: bool = False
         self.god_mode: bool = False
@@ -250,16 +361,35 @@ class Player:
         # stays close (constants extracted from the client 2026-07-07).
         self.jetpack_id: int = 0            # 0 / NO_JETPACK(65) = none
         self.jetpack_fuel: float = 100.0
+        # ``jetpack_active`` is the state advertised to the retail owner in
+        # WorldUpdate action bit 0x04. Native activation uses a two-recurrence
+        # local estimate; retail provides no packet that proves GameScene has
+        # applied the transition.
         self.jetpack_active: bool = False
+        self._jetpack_physics_active: bool = False
+        self._jetpack_activation_defer_remaining: int = 0
+        # Exhaustion finishes the current active recurrence and one already
+        # predicted recurrence before ordinary held-SPACE movement resumes.
+        self._jetpack_exhaustion_tail_remaining: int = 0
+        self._jetpack_requires_release: bool = False
         self._hover_since: float = 0.0
         self._last_damage_at: float = 0.0
         self.parachute_id: int = 0
         self.parachute_active: bool = False
         self.disguised: bool = False        # specialist disguise toggle
+        self.mounted_entity_id = None        # mounted MACHINE_GUN entity, if any
+        self.on_fire: bool = False          # authoritative Molotov burn state
+        self.pickup_id = None               # objective entity type 14/15/16
+        self.pickup_burdensome = False
+        self.pickup_state = None             # owning/team state restored on drop
         # Client-chosen loadout + prefab selection (SetClassLoadout / join).
-        self.loadout: list = []
-        self.prefabs: list = []
-        # Mid-game class/loadout change, applied at the next respawn.
+        self.loadout: list[int] = []
+        self.prefabs: list[str] = []
+        self.ugc_tools: list[int] = []
+        # One complete mid-game selection is the source of truth.  The two
+        # legacy fields remain synchronized temporarily for old modes/tests;
+        # new code must stage/apply through the methods below.
+        self.pending_selection = None
         self.pending_class_id = None
         self.pending_loadout = None
         self.grounded: bool = True
@@ -273,27 +403,44 @@ class Player:
 
         self.last_update: float = time.time()
         self.last_position_update: float = 0.0
+        self.position_reports_received: int = 0
         # loop_count -> (input flags tuple, orientation tuple); see
         # record_input_frame / apply_buffered_input.
-        self.input_history: dict[int, tuple] = {}
-        # Next client loop_count to consume (strict in-order cursor).
-        self._input_cursor: Optional[int] = None
+        self.input_history: dict[int, BufferedInputFrame] = {}
+        # Server-origin impulses are labeled with the retail/client loop they
+        # are predicted to enter. Damage(37) can reach the client several
+        # frames after impact detection; applying knockback to the server's
+        # older consumed input state creates a full-impulse reconciliation.
+        self._pending_velocity_impulses: deque[
+            tuple[int, tuple[float, float, float]]
+        ] = deque()
+        self._pending_explosion_impulses: deque[
+            PendingExplosionImpulse
+        ] = deque()
         # Last state actually stepped by authoritative physics. ClientData is
         # also applied immediately for combat/tool responsiveness, so
         # self.input may be newer than the movement cursor and must never be
         # used to backfill an older missing movement frame.
         self._applied_input_flags: Optional[tuple] = None
         self._applied_orientation: Optional[tuple] = None
-        # ClientData exposes flags one loop before the client physics consumes
-        # them. Hold the newest actual packet here and apply it on the next
-        # simulated loop; synthetic transport-gap frames do not advance it.
+        # ClientData buttons are held for the next observed frame. Foreground
+        # jump A/B testing is slightly quieter with this latch; orientation is
+        # deliberately current because native-yaw capture resolves it earlier.
         self._pending_packet_flags: tuple = IDLE_INPUT_FLAGS
-        # Telemetry: how many buffered input frames the sim threw away, and how
-        # many ticks ran with NO input at all (coasting on the previous frame).
-        # A nonzero drop rate means the server took fewer physics steps than the
-        # client predicted -> the server falls behind -> self-row reconciliation
-        # yanks the client backwards ("random rollback while walking").
+        self._pending_packet_loop: Optional[int] = None
+        self._applied_input_source_loop: Optional[int] = None
+        self._pending_packet_received_server_tick: Optional[int] = None
+        self._applied_input_source_server_tick: Optional[int] = None
+        self._pending_packet_received_owner_sequence: Optional[int] = None
+        self._applied_input_source_owner_sequence: Optional[int] = None
+        self._pending_packet_wire_unknown_byte: Optional[int] = None
+        self._applied_input_source_wire_unknown_byte: Optional[int] = None
+        # Telemetry separates harmless stale/duplicate packets from actual
+        # history-capacity loss.  ``input_frames_dropped`` remains the aggregate
+        # compatibility counter consumed by existing dashboards.
         self.input_frames_dropped: int = 0
+        self.input_frames_stale: int = 0
+        self.input_frames_overflow: int = 0
         self.input_frames_applied: int = 0
         self.input_starved_ticks: int = 0
         self.last_reported_position: Optional[Tuple[float, float, float]] = None
@@ -330,6 +477,10 @@ class Player:
         self.last_native_post_update: dict = {}
 
         self.kills: int = 0
+        # Current-life streak sent in KillAction.kill_count. Scoreboard kills
+        # remain cumulative for the match, but the native multikill HUD resets
+        # this value when the killer dies.
+        self.kill_streak: int = 0
         self.deaths: int = 0
         self.captures: int = 0
         # Personal scoreboard number (the client's per-player column). Driven
@@ -393,6 +544,13 @@ class Player:
         return (forward_x * horizontal, forward_y * horizontal, vertical)
 
     def _build_player_collision_positions(self) -> list[tuple[float, float, float, float]]:
+        """Build the native mover's player-contact snapshot for this tick.
+
+        InitialInfo exposes only a same-team collision switch; enemy collision
+        remains part of stock movement.  Filtering allies here when that switch
+        is disabled is therefore a protocol invariant, not an optimization.
+        This runs on the single gameplay tick before ``WorldPlayer.update``.
+        """
         server = self.connection.server if self.connection else None
         if server is None:
             return []
@@ -401,8 +559,13 @@ class Player:
             return []
 
         positions = []
+        same_team_collision = bool(getattr(
+            getattr(server, "config", None), "same_team_collision", False
+        ))
         for player in players.values():
             if player is self or not player.alive or not player.spawned:
+                continue
+            if player.team == self.team and not same_team_collision:
                 continue
             positions.append((player.x, player.y, player.z, player._current_height()))
         return positions
@@ -450,7 +613,9 @@ class Player:
             self._apply_input_state_to_world(trigger_jump=False, world_object=self._world_object)
         return self._world_object
 
-    def _apply_input_state_to_world(self, trigger_jump: bool, world_object=None):
+    def _apply_input_state_to_world(
+        self, trigger_jump: bool, world_object=None, collisions=None
+    ):
         if world_object is None:
             world_object = self._ensure_world_object()
         if world_object is None:
@@ -462,22 +627,37 @@ class Player:
             self.input.left,
             self.input.right,
         )
-        # Only the server tick may inject a one-frame jump into the native world.
-        world_object.jump = bool(trigger_jump)
+        # Retail writes the held SPACE state every frame.  Ordinary airborne
+        # requests are consumed as no-ops by world.Player, while an active
+        # normal/Rocketeer/Engineer jetpack uses the held request as sustained
+        # thrust.  Gating this to the grounded jump edge breaks flight.
+        world_object.jump = bool(self.input.jump)
         world_object.sneak = self.input.sneak
         world_object.sprint = self.input.sprint
         world_object.hover = self.input.hover
-        # Jetpack: equipped flag + whether thrust is firing this tick (drives
-        # the mover's 0.05x gravity + water-friction branch, same as the
-        # client's local sim).
+        world_object.burdened = bool(self.pickup_burdensome)
+        # Jetpack: concrete pack id + whether thrust is firing this tick.  The
+        # stock mover applies pack-specific SPACE thrust and its high-friction
+        # movement branch; active packs still receive ordinary gravity.  The
+        # separate passive flag is the 0.75-gravity mode.
         try:
-            world_object.jetpack = bool(self.jetpack_id in _JETPACK_PROPERTIES)
-            world_object.jetpack_active = bool(self.jetpack_active)
+            world_object.jetpack = int(
+                self.jetpack_id
+                if self.jetpack_id in _JETPACK_PROPERTIES
+                else C.NO_JETPACK
+            )
+            world_object.jetpack_active = bool(
+                self._jetpack_physics_active
+            )
+            # Passive flight is a separate 0.75-gravity mode.  The stock
+            # Engineer keeps it false while ordinary SPACE thrust is active.
+            world_object.jetpack_passive = False
             world_object.parachute = int(self.parachute_id or 0)
             world_object.parachute_active = bool(self.parachute_active)
         except Exception:
             pass
-        collisions = self._build_player_collision_positions()
+        if collisions is None:
+            collisions = self._build_player_collision_positions()
         world_object.set_crouch(self.input.crouch, collisions, len(collisions))
 
     def _compute_head_vector(self) -> tuple[float, float, float]:
@@ -554,7 +734,75 @@ class Player:
             "fall_result": int(self.last_fall_result),
             "native_result": int(self.last_native_result),
             "dt": round(float(self.last_native_update_dt), 6),
+            # Transition-only causal evidence. These counters are bounded
+            # scalars; full input/anchor histories remain out of telemetry.
+            "input_receive_sequence": int(self._input_receive_sequence),
+            "current_input_receive_sequence": int(
+                self._current_input_receive_sequence
+            ),
+            "current_input_owner_sequence": self._current_input_owner_sequence,
+            "input_history_depth": len(self.input_history),
+            "applied_input_source_loop": self._applied_input_source_loop,
+            "jetpack_active": bool(self.jetpack_active),
+            "jetpack_physics_active": bool(self._jetpack_physics_active),
+            "jetpack_activation_defer_remaining": int(
+                self._jetpack_activation_defer_remaining
+            ),
+            "jetpack_exhaustion_tail_remaining": int(
+                self._jetpack_exhaustion_tail_remaining
+            ),
+            "jetpack_transition": dict(self.last_jetpack_transition_debug),
         }
+
+    def note_jetpack_transition_sent(self, active: bool, stamp: int) -> None:
+        """Record the causal boundary of one owner transition row.
+
+        Called by ``ReplicationService`` only after ``Connection.send`` queued
+        the reliable owner WorldUpdate. Input frames already accepted at this
+        point cannot prove that retail had applied the row. The bounded record
+        is exposed only through opt-in parity snapshots; it performs no I/O.
+        """
+        anchor_sequence = None
+        if self._owner_anchor_history:
+            anchor_sequence = int(
+                self._owner_anchor_history[-1].queued_owner_sequence
+            )
+        self.last_jetpack_transition_debug = {
+            "active": bool(active),
+            "stamp": int(stamp),
+            "sent_input_receive_sequence": int(self._input_receive_sequence),
+            "sent_owner_sequence": anchor_sequence,
+            "buffered_input_count": len(self.input_history),
+            "server_loop": int(getattr(
+                getattr(self.connection, "server", None), "loop_count", 0
+            )),
+        }
+
+    def _note_jetpack_physics_started(self) -> None:
+        """Persist the exact consumed frame that first applied active thrust.
+
+        Parity sampling is intentionally capped at 10 Hz, while the activation
+        handoff lasts only a few 60 Hz recurrences.  Store one bounded scalar
+        event beside the transition metadata so a validation run can recover
+        the exact boundary without per-frame logging or gameplay-thread I/O.
+        """
+        transition = self.last_jetpack_transition_debug
+        if (
+            not transition
+            or not transition.get("active")
+            or "physics_started_input_receive_sequence" in transition
+        ):
+            return
+        transition.update({
+            "physics_started_input_receive_sequence": int(
+                self._current_input_receive_sequence
+            ),
+            "physics_started_owner_sequence": self._current_input_owner_sequence,
+            "physics_started_source_loop": self._applied_input_source_loop,
+            "physics_started_server_loop": int(getattr(
+                getattr(self.connection, "server", None), "loop_count", 0
+            )),
+        })
 
     def _sync_cached_vectors(self):
         if self._world_object is None:
@@ -591,6 +839,62 @@ class Player:
         if world_object is not None:
             self._apply_class_profile_to_world(world_object)
             self._sync_cached_vectors()
+
+    def stage_class_selection(self, selection) -> None:
+        """Stage a validated selection for the next life as one value.
+
+        This method runs on the gameplay thread.  It deliberately does not
+        mutate the active class or inventory, because the current body must
+        remain internally consistent until death/respawn commits the choice.
+        """
+
+        from server.class_selection import ClassSelection
+
+        if not isinstance(selection, ClassSelection):
+            raise TypeError("selection must be a ClassSelection")
+        self.pending_selection = selection
+        # Compatibility mirrors for code being migrated to pending_selection.
+        self.pending_class_id = int(selection.class_id)
+        self.pending_loadout = list(selection.loadout)
+
+    def apply_class_selection(self, selection) -> None:
+        """Commit class, tools, prefab choices, and UGC tools atomically."""
+
+        from server.class_selection import ClassSelection
+
+        if not isinstance(selection, ClassSelection):
+            raise TypeError("selection must be a ClassSelection")
+        self.class_id = int(selection.class_id)
+        self.loadout = list(selection.loadout)
+        self.prefabs = list(selection.prefabs)
+        self.ugc_tools = list(selection.ugc_tools)
+
+    def apply_pending_selection(self) -> bool:
+        """Commit the staged selection at a spawn boundary.
+
+        Returns ``True`` when a selection was applied.  The legacy-field
+        fallback keeps existing game modes safe while RoundLifecycle call
+        sites migrate; it still normalizes the pair before committing it.
+        """
+
+        selection = self.pending_selection
+        if selection is None and self.pending_class_id is not None:
+            from server.class_selection import normalize_class_selection
+
+            selection = normalize_class_selection(
+                self.pending_class_id,
+                self.pending_loadout or (),
+                self.prefabs,
+                self.ugc_tools,
+                fallback_class_id=self.class_id,
+            )
+        if selection is None:
+            return False
+        self.apply_class_selection(selection)
+        self.pending_selection = None
+        self.pending_class_id = None
+        self.pending_loadout = None
+        return True
 
     @property
     def position(self) -> Tuple[float, float, float]:
@@ -694,17 +998,46 @@ class Player:
             self._sync_cached_vectors()
 
     def spawn(self, x: float, y: float, z: float):
+        # A new retail Character must not inherit self-row cadence or jetpack
+        # transition state from its previous life. Player remains a temporary
+        # compatibility facade for legacy mode spawn paths, so reset the
+        # replication service here until every mode delegates to RoundLifecycle.
+        server = self.connection.server if self.connection else None
+        replication = getattr(server, "replication", None)
+        forget_player = getattr(replication, "forget_player", None)
+        if callable(forget_player):
+            forget_player(self.id)
+        self.replication_generation += 1
+        self.last_kill_action_data = None
         self.health = MAX_HEALTH
         self.alive = True
         self.spawned = True
         self.input = InputState()
+        # Retail owners repopulate this from their first ClientData. Peerless
+        # bots have no such packet, so their first post-spawn WorldUpdate must
+        # already expose the equipped model to observers.
+        if self.is_bot:
+            self.input.can_display_weapon = True
         # Re-anchor the input cursor to the next inputs that arrive after
         # this spawn (stale pre-spawn inputs must not drive the new body).
         self.input_history = {}
-        self._input_cursor = None
+        self._pending_velocity_impulses.clear()
+        self._pending_explosion_impulses.clear()
+        self._input_receive_sequence = 0
+        self._current_input_receive_sequence = 0
+        self._current_input_owner_sequence = None
+        self.last_jetpack_transition_debug = {}
         self._applied_input_flags = None
         self._applied_orientation = None
         self._pending_packet_flags = IDLE_INPUT_FLAGS
+        self._pending_packet_loop = None
+        self._applied_input_source_loop = None
+        self._pending_packet_received_server_tick = None
+        self._applied_input_source_server_tick = None
+        self._pending_packet_received_owner_sequence = None
+        self._applied_input_source_owner_sequence = None
+        self._pending_packet_wire_unknown_byte = None
+        self._applied_input_source_wire_unknown_byte = None
         self.last_applied_input_loop = None
         self.blocks = self.movement_profile.starting_blocks
         self.grenades = MAX_GRENADES
@@ -712,22 +1045,22 @@ class Player:
         self.rocket_turret_stock = int(
             getattr(C, "ROCKET_TURRET_INITIAL_STOCK", 2)
         )
-        # Jetpack: the client's chosen loadout may carry a jetpack id (66-69)
-        # in the equipment slot; otherwise fall back to the class default.
+        self._reset_equipment_state()
+        # Jetpacks are concrete equipment-slot choices. Never infer one from
+        # class_id here: Engineer can choose Disguise instead, and appending a
+        # fallback pack would overlap two mutually exclusive native states.
         jetpack = 0
         for item in (getattr(self, "loadout", None) or []):
             if int(item) in _JETPACK_PROPERTIES:
                 jetpack = int(item)
                 break
-        if not jetpack:
-            try:
-                from server.class_data import get_loadout
-                jetpack = int(get_loadout(self.class_id).jetpack)
-            except Exception:
-                jetpack = 0
         self.jetpack_id = jetpack if jetpack in _JETPACK_PROPERTIES else 0
         self.jetpack_fuel = 100.0
         self.jetpack_active = False
+        self._jetpack_physics_active = False
+        self._jetpack_activation_defer_remaining = 0
+        self._jetpack_exhaustion_tail_remaining = 0
+        self._jetpack_requires_release = False
         self._hover_since = 0.0
         self.parachute_id = (
             int(C.A370)
@@ -736,6 +1069,10 @@ class Player:
         )
         self.parachute_active = False
         self.disguised = False
+        self.on_fire = False
+        self.pickup_id = None
+        self.pickup_burdensome = False
+        self.pickup_state = None
         self.last_reported_position = (x, y, z)
         self.last_position_drift = 0.0
         self.last_position_drift_vector = (0.0, 0.0, 0.0)
@@ -766,6 +1103,11 @@ class Player:
         self.x = x
         self.y = y
         self.z = z
+        self.last_advertised_owner_position = (x, y, z)
+        self._spawn_owner_anchor = (x, y, z)
+        self._owner_anchor_history = deque(
+            maxlen=OWNER_ANCHOR_HISTORY_LIMIT
+        )
         self.vx = self.vy = self.vz = 0.0
         self.eye_x = x
         self.eye_y = y
@@ -899,6 +1241,13 @@ class Player:
         if self.god_mode:
             return False
 
+        server = self.connection.server if self.connection else None
+        modify_damage = getattr(
+            getattr(server, "mode", None), "modify_incoming_damage", None
+        )
+        if callable(modify_damage):
+            amount = modify_damage(self, amount, source, kill_type)
+
         # Pauses jetpack fuel regen for the type's refill-delay window.
         self._last_damage_at = time.time()
 
@@ -938,8 +1287,16 @@ class Player:
         self.disguised = False
         self.death_time = time.time()
         self.deaths += 1
+        self.kill_streak = 0
         self.reloading = False
         self.reload_end_time = 0.0
+        self.jetpack_active = False
+        self._jetpack_physics_active = False
+        self._jetpack_activation_defer_remaining = 0
+        self._jetpack_exhaustion_tail_remaining = 0
+        self._jetpack_requires_release = False
+        self._pending_velocity_impulses.clear()
+        self._pending_explosion_impulses.clear()
 
         world_object = self._ensure_world_object()
         if world_object is not None:
@@ -949,7 +1306,8 @@ class Player:
         kill_count = 0
         if killer and killer != self:
             killer.kills += 1
-            kill_count = killer.kills
+            killer.kill_streak = min(255, int(killer.kill_streak) + 1)
+            kill_count = killer.kill_streak
 
         server = self.connection.server if self.connection else None
         if server is not None:
@@ -959,11 +1317,20 @@ class Player:
             packet.player_id = self.id
             packet.killer_id = killer.id if killer is not None else self.id
             packet.kill_type = kill_type
-            packet.respawn_time = int(server.config.respawn_time)
+            respawn_time_for = getattr(
+                getattr(server, "mode", None), "respawn_time_for", None
+            )
+            respawn_time = (
+                respawn_time_for(self)
+                if callable(respawn_time_for)
+                else server.config.respawn_time
+            )
+            packet.respawn_time = max(0, min(255, int(respawn_time)))
             packet.kill_count = kill_count
             packet.isDominationKill = 0
             packet.isRevengeKill = 0
-            server.broadcast(bytes(packet.generate()))
+            self.last_kill_action_data = bytes(packet.generate())
+            server.broadcast(self.last_kill_action_data)
 
             # Spawn the stock team-coloured grave on the supporting surface.
             # GraveEntity is a moving client object; feeding it the player's
@@ -1045,6 +1412,10 @@ class Player:
             int(getattr(self, "rocket_turret_stock", 0))
             + int(getattr(C, "ROCKET_TURRET_RESTOCK_AMOUNT", 2)),
         )
+        # A stock ammo crate calls restock() on every equipped weapon/tool in
+        # the client. Mirror that complete reset, including late Battle Builder
+        # projectile weapons and Disguise, rather than only the primary gun.
+        self._reset_equipment_state()
         if self.connection:
             from shared.packet import Restock
             pkt = Restock()
@@ -1069,11 +1440,119 @@ class Player:
             pkt.type = 5
             self.connection.send(bytes(pkt.generate()))
 
+    def restock_jetpack(self):
+        """Jetpack-crate refill (entity/type 6 through Restock packet 69)."""
+        if not self.alive or self.jetpack_id not in _JETPACK_PROPERTIES:
+            return
+        self.jetpack_fuel = float(_JETPACK_PROPERTIES[self.jetpack_id].get(1, 100.0))
+        if self.connection:
+            from shared.packet import Restock
+            pkt = Restock()
+            pkt.player_id = self.id
+            pkt.type = int(C.JETPACK_CRATE)
+            self.connection.send(bytes(pkt.generate()))
+
     def remove_block(self) -> bool:
         if self.blocks > 0:
             self.blocks -= 1
             return True
         return False
+
+    def _reset_equipment_state(self) -> None:
+        """Reset per-life oriented-tool ammo and cadence.
+
+        Counts below are the retail spawn values: throwable tools expose an
+        ``initial_count``; launcher weapons expose one loaded round plus their
+        initial reserve. Snowblower is deliberately absent because it consumes
+        the player's shared block wallet instead of weapon ammo.
+        """
+        def total(clip_name: str, reserve_name: str, clip_default: int,
+                  reserve_default: int) -> int:
+            return int(getattr(C, clip_name, clip_default)) + int(
+                getattr(C, reserve_name, reserve_default)
+            )
+
+        self.oriented_stock = {
+            int(C.GRENADE_TOOL): int(getattr(C, "GRENADE_INITIAL_STOCK", 2)),
+            int(getattr(C, "CLASSIC_GRENADE_TOOL", 31)): int(
+                getattr(C, "CLASSIC_GRENADE_INITIAL_STOCK", 2)
+            ),
+            int(getattr(C, "ANTIPERSONNEL_GRENADE_TOOL", 32)): int(
+                getattr(C, "ANTIPERSONNEL_GRENADE_INITIAL_STOCK", 2)
+            ),
+            int(getattr(C, "MOLOTOV_TOOL", 33)): int(
+                getattr(C, "MOLOTOV_INITIAL_STOCK", 3)
+            ),
+            int(C.RPG_TOOL): total(
+                "RPG_AMMO_CLIP_SIZE", "RPG_AMMO_INITIAL_STOCK", 1, 3
+            ),
+            int(C.RPG2_TOOL): total(
+                "RPG2_AMMO_CLIP_SIZE", "RPG2_AMMO_INITIAL_STOCK", 3, 3
+            ),
+            int(C.DRILLGUN_TOOL): total(
+                "DRILLGUN_AMMO_CLIP_SIZE", "DRILLGUN_AMMO_INITIAL_STOCK", 1, 1
+            ),
+            int(getattr(C, "CHEMICALBOMB_TOOL", 54)): 2,
+            int(getattr(C, "GRENADE_LAUNCHER_WEAPON_TOOL", 55)): total(
+                "GRENADE_LAUNCHER_AMMO_CLIP_SIZE",
+                "GRENADE_LAUNCHER_AMMO_INITIAL_STOCK",
+                1,
+                3,
+            ),
+            int(getattr(C, "STICKY_GRENADE_TOOL", 57)): 2,
+            int(getattr(C, "MINE_LAUNCHER_TOOL", 58)): total(
+                "MINE_LAUNCHER_AMMO_CLIP_SIZE",
+                "MINE_LAUNCHER_AMMO_INITIAL_STOCK",
+                1,
+                3,
+            ),
+        }
+        self.grenades = self.oriented_stock[int(C.GRENADE_TOOL)]
+        self._oriented_next_use = {}
+        self.disguise_stock = int(getattr(C, "DISGUISE_INITIAL_STOCK", 2))
+        self._disguise_next_use = 0.0
+
+    def can_use_oriented_item(self, tool: int, now: Optional[float] = None) -> bool:
+        """Validate cadence and authoritative ammo for packet 10.
+
+        This is a read-only preflight. The handler consumes inventory only
+        after the projectile has passed framing/float validation and has been
+        registered successfully, so malformed packets cannot eat valid ammo.
+        """
+        tool = int(tool)
+        current_time = time.monotonic() if now is None else float(now)
+        if current_time + FIRE_RATE_GRACE < self._oriented_next_use.get(tool, 0.0):
+            return False
+        if tool in (
+            int(getattr(C, "SNOWBLOWER_TOOL", 29)),
+            int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
+        ):
+            return int(self.blocks) > 0
+        return int(self.oriented_stock.get(tool, 1)) > 0
+
+    def consume_oriented_item(self, tool: int,
+                              now: Optional[float] = None) -> bool:
+        """Commit one successfully spawned oriented projectile."""
+        tool = int(tool)
+        current_time = time.monotonic() if now is None else float(now)
+        if not self.can_use_oriented_item(tool, current_time):
+            return False
+
+        if tool in (
+            int(getattr(C, "SNOWBLOWER_TOOL", 29)),
+            int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
+        ):
+            self.blocks = max(0, int(self.blocks) - 1)
+        elif tool in self.oriented_stock:
+            self.oriented_stock[tool] = max(0, self.oriented_stock[tool] - 1)
+            if tool == int(C.GRENADE_TOOL):
+                self.grenades = self.oriented_stock[tool]
+
+        from server.game_constants import WEAPON_CATALOG
+        profile = WEAPON_CATALOG.get(tool)
+        interval = float(profile.fire_interval) if profile is not None else 0.0
+        self._oriented_next_use[tool] = current_time + max(0.0, interval)
+        return True
 
     def set_tool(self, tool: int, raw: Optional[bool] = None):
         if raw is None:
@@ -1095,6 +1574,129 @@ class Player:
 
     def set_color(self, color: int):
         self.block_color = color
+
+    def record_owner_anchor(
+        self,
+        stamp: int,
+        position: Tuple[float, float, float],
+        velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        *,
+        queued_server_tick: Optional[int] = None,
+        queued_owner_sequence: Optional[int] = None,
+    ) -> None:
+        """Record one self WorldUpdate row after it is queued to this owner.
+
+        ``stamp`` is the row's per-player pong, in the retail client clock.
+        IDA and a live split-clock probe proved the local path force-applies
+        duplicate stamps and does not use the WorldUpdate header loop for this
+        cache. ``queued_server_tick`` is diagnostic only; the monotonic owner
+        sequence is what orders sends against ClientData receives.
+        """
+        stamp = int(stamp)
+        normalized_position = tuple(float(value) for value in position)
+        normalized_velocity = tuple(float(value) for value in velocity)
+        sequence = self._claim_owner_timeline_sequence(
+            queued_owner_sequence
+        )
+        anchor = OwnerAnchor(
+            stamp=stamp,
+            position=normalized_position,
+            velocity=normalized_velocity,
+            queued_server_tick=(
+                None
+                if queued_server_tick is None
+                else int(queued_server_tick)
+            ),
+            queued_owner_sequence=sequence,
+        )
+        self._owner_anchor_history.append(anchor)
+        self.last_advertised_owner_position = anchor.position
+
+    def _claim_owner_timeline_sequence(
+        self, supplied: Optional[int] = None
+    ) -> int:
+        """Allocate/order one owner send or input receive event.
+
+        This is gameplay-thread state; it is not a transport acknowledgement.
+        An optional supplied value exists for deterministic replay tests.
+        """
+        if supplied is None:
+            self._owner_timeline_sequence += 1
+            return self._owner_timeline_sequence
+        sequence = int(supplied)
+        self._owner_timeline_sequence = max(
+            self._owner_timeline_sequence, sequence
+        )
+        return sequence
+
+    def _owner_anchor_entry_before_input(
+        self,
+        source_loop: Optional[int],
+        *,
+        source_received_server_tick: Optional[int] = None,
+        source_received_owner_sequence: Optional[int] = None,
+    ) -> tuple[int, OwnerAnchor] | None:
+        """Return the last server-causally eligible row for one source input.
+
+        A self row stamped ``L`` is constructed only after the server consumes
+        ClientData ``L``.  It therefore cannot have reached retail before
+        retail simulated the input frame that produced that packet. Grounded
+        launch reconciliation therefore requires a strict earlier stamp.
+
+        A row queued after ClientData ``L`` reached the gameplay thread could
+        not have been in retail's cache when it simulated ``L``.  Comparing the
+        event sequence removes that impossible row even when both events share
+        one server tick.  The server tick remains diagnostics only because
+        fixed one/two-tick delivery-age guesses failed foreground captures.
+
+        This necessary ordering is not a delivery acknowledgement: a row sent
+        before the server received ``L`` may still have reached GameScene only
+        after retail simulated ``L``. Raw retail captures, not this sequence,
+        remain the release gate for launch behavior.
+        """
+        if source_loop is None:
+            return None
+        received_sequence = (
+            None
+            if source_received_owner_sequence is None
+            else int(source_received_owner_sequence)
+        )
+        eligible = [
+            anchor
+            for anchor in self._owner_anchor_history
+            if anchor.stamp < int(source_loop)
+            and (
+                received_sequence is None
+                or anchor.queued_owner_sequence < received_sequence
+            )
+        ]
+        if not eligible:
+            return None
+        selected = max(
+            eligible, key=lambda anchor: anchor.queued_owner_sequence
+        )
+        return selected.stamp, selected
+
+    def _owner_anchor_before_input(
+        self,
+        source_loop: Optional[int],
+        *,
+        source_received_server_tick: Optional[int] = None,
+        source_received_owner_sequence: Optional[int] = None,
+    ) -> Tuple[float, float, float]:
+        """Return the newest XYZ not ruled out by server event ordering."""
+        if source_loop is None:
+            return tuple(self.last_advertised_owner_position)
+        selected = self._owner_anchor_entry_before_input(
+            source_loop,
+            source_received_server_tick=source_received_server_tick,
+            source_received_owner_sequence=(
+                source_received_owner_sequence
+            ),
+        )
+        if selected is None:
+            return tuple(self._spawn_owner_anchor)
+        return selected[1].position
 
     async def update(self, dt: float):
         if not self.alive or not self.spawned:
@@ -1118,38 +1720,89 @@ class Player:
         # landing behavior emerges naturally (key still held when landing).
         trigger_jump = bool(self.input.jump) and not bool(world_object.airborne)
         self.last_trigger_jump = bool(trigger_jump)
-        if bool(self.input.jump):
-            logger.info("JUMPDBG %s jump_in=1 airborne=%s trigger=%s z=%.3f vz=%.3f",
-                        self.name, bool(world_object.airborne), trigger_jump,
-                        float(self.z), float(getattr(world_object, 'velocity', type('x',(),{'z':0})).z))
-        self.last_native_update_dt = float(dt)
         positions = self._build_player_collision_positions()
-        self.last_collision_count = len(positions)
-        self.last_collision_preview = [
-            tuple(round(float(value), 4) for value in item[:4])
-            for item in positions[:4]
-        ]
-        self.last_native_pre_update = self._capture_native_debug_state(
-            world_object,
-            "pre_update",
-            positions,
-        )
-        pre_position = self.last_native_pre_update.get("position", (self.x, self.y, self.z))
+        server = self.connection.server if self.connection else None
+        capture_debug = bool(getattr(
+            getattr(server, "config", None), "movement_debug_capture", False
+        ))
+        pre_position = (self.x, self.y, self.z)
+        if capture_debug:
+            if bool(self.input.jump) and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "movement jump %s airborne=%s trigger=%s z=%.3f vz=%.3f",
+                    self.name, bool(world_object.airborne), trigger_jump,
+                    float(self.z), float(world_object.velocity.z),
+                )
+            self.last_native_update_dt = float(dt)
+            self.last_collision_count = len(positions)
+            self.last_collision_preview = [
+                tuple(round(float(value), 4) for value in item[:4])
+                for item in positions[:4]
+            ]
+            self.last_native_pre_update = self._capture_native_debug_state(
+                world_object, "pre_update", positions
+            )
+            pre_position = self.last_native_pre_update.get(
+                "position", pre_position
+            )
         self._update_jetpack(dt)
         self._update_parachute()
-        self._apply_input_state_to_world(trigger_jump=trigger_jump)
+        self._apply_input_state_to_world(
+            trigger_jump=trigger_jump, collisions=positions
+        )
         result = world_object.update(dt, positions)
-        self.last_native_result = int(result or 0)
+        if trigger_jump and not self.is_bot:
+            # Reconciliation is keyed to Character.movement_history[L], which
+            # retail snapshots *before* its native physics call.  ClientData L
+            # arrives afterward. Character.update_alive then unconditionally
+            # restores full XYZ from its cached network_position whenever
+            # jump_this_frame is true (character.pyd 0x100808E5->0x100815AB),
+            # while retaining native launch velocity and airborne state. Using
+            # only pre-physics Z leaves the server one sprint step ahead and
+            # eventually turns a 0.048-block X phase error into a terrain-step
+            # rollback. The event-order gate removes rows definitely sent too
+            # late, but cannot prove client delivery; foreground raw captures
+            # are required after changing this heuristic. Bots have no owner
+            # network anchor and keep full native post-move state.
+            anchor = self._owner_anchor_before_input(
+                self._applied_input_source_loop,
+                source_received_server_tick=(
+                    self._applied_input_source_server_tick
+                ),
+                source_received_owner_sequence=(
+                    self._applied_input_source_owner_sequence
+                ),
+            )
+            anchor_error_sq = sum(
+                (float(anchor[index]) - float(pre_position[index])) ** 2
+                for index in range(3)
+            )
+            # The maintained client has the same guard around Character.update.
+            # Preserve retail's cached-anchor behavior for ordinary sub-voxel
+            # phase correction, but never mirror a stale row into a visible
+            # launch teleport. Velocity/airborne state still come from the
+            # native physics step in either branch.
+            launch_position = (
+                pre_position
+                if anchor_error_sq
+                > JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE_SQ
+                else anchor
+            )
+            world_object.set_position(
+                float(launch_position[0]),
+                float(launch_position[1]),
+                float(launch_position[2]),
+            )
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
         self._apply_client_authority_pin()
         self.last_landed = bool(was_airborne and self.grounded)
         self.last_step_delta = round(float(self.z - pre_position[2]), 4)
-        self.last_native_post_update = self._capture_native_debug_state(
-            world_object,
-            "post_update",
-            positions,
-        )
+        if capture_debug:
+            self.last_native_result = int(result or 0)
+            self.last_native_post_update = self._capture_native_debug_state(
+                world_object, "post_update", positions
+            )
 
     def _update_jetpack(self, dt: float) -> None:
         """Advance the stock jetpack fuel model one simulation tick.
@@ -1159,9 +1812,14 @@ class Player:
         one-time cost and then drains fuel until release or exhaustion. Idle
         fuel regenerates after the post-damage refill delay.
         """
+        physics_was_active = bool(self._jetpack_physics_active)
         props = _JETPACK_PROPERTIES.get(self.jetpack_id)
         if props is None:
             self.jetpack_active = False
+            self._jetpack_physics_active = False
+            self._jetpack_activation_defer_remaining = 0
+            self._jetpack_exhaustion_tail_remaining = 0
+            self._jetpack_requires_release = False
             return
         start_delay = float(props.get(0, 0.25))
         max_fuel = float(props.get(1, 100))
@@ -1179,25 +1837,105 @@ class Player:
             else self.input.jump
         )
 
+        # The inactive/fuel-zero row and the client's ordinary-jump branch do
+        # not take effect on the same consumed input. Preserve exactly the one
+        # in-flight recurrence measured by the strict retail exhaustion gate.
+        # Physical key-up still cancels this immediately below.
+        exhaustion_tail = int(self._jetpack_exhaustion_tail_remaining)
+        if activation_held and self._jetpack_requires_release and exhaustion_tail > 0:
+            self.jetpack_active = False
+            self._jetpack_physics_active = True
+            self._jetpack_activation_defer_remaining = 0
+            self._jetpack_exhaustion_tail_remaining = exhaustion_tail - 1
+            self.jetpack_fuel = 0.0
+            return
+
+        # WorldUpdate is the owner's only source of action bit 0x04; ClientData
+        # does not echo a local jetpack-active state.  Preserve the previously
+        # advertised value as this tick's native state.  A transition is sent
+        # after this simulation step, and native thrust follows on the next
+        # consumed frame.  Applying both in the transition frame makes the
+        # server one thrust recurrence ahead of retail movement_history.
+        previously_advertised = bool(self.jetpack_active)
+        activation_defer = int(self._jetpack_activation_defer_remaining)
+        if previously_advertised and activation_defer > 0:
+            self._jetpack_physics_active = False
+            self._jetpack_activation_defer_remaining = activation_defer - 1
+        else:
+            self._jetpack_physics_active = previously_advertised
+        newly_activated = False
+
         if activation_held:
             # dt-accumulated hold time (deterministic at the sim rate).
             self._hover_since += dt
-            if not self.jetpack_active:
-                if self._hover_since >= start_delay and self.jetpack_fuel >= max(activation_cost, 1.0):
+            if (
+                not previously_advertised
+                and not self._jetpack_requires_release
+            ):
+                if (
+                    self._hover_since >= start_delay
+                    and self.jetpack_fuel >= max(activation_cost, 1.0)
+                ):
                     self.jetpack_active = True
                     self.jetpack_fuel -= activation_cost
-            if self.jetpack_active:
-                self.jetpack_fuel -= drain * dt
-                if self.jetpack_fuel <= 0.0:
-                    self.jetpack_fuel = 0.0
-                    self.jetpack_active = False
+                    # Announce now. The two-recurrence physics delay is a local
+                    # scheduling estimate; the replication handoff prevents
+                    # ordinary owner rows from correcting against it before
+                    # the unobservable GameScene boundary settles.
+                    self._jetpack_physics_active = False
+                    self._jetpack_activation_defer_remaining = (
+                        JETPACK_ACTIVATION_DEFER_FRAMES
+                    )
+                    self._jetpack_exhaustion_tail_remaining = 0
+                    newly_activated = True
         else:
             self._hover_since = 0.0
             self.jetpack_active = False
+            # Retail stops thrust from physical SPACE key-up immediately even
+            # while its last received WorldUpdate still carries action 0x04.
+            # Do not preserve one extra authoritative thrust/drain recurrence
+            # while the reliable inactive owner row travels to GameScene.
+            self._jetpack_physics_active = False
+            self._jetpack_activation_defer_remaining = 0
+            self._jetpack_exhaustion_tail_remaining = 0
+            self._jetpack_requires_release = False
 
-        if not self.jetpack_active and self.jetpack_fuel < max_fuel:
+        if (
+            not newly_activated
+            and (
+                self.jetpack_active
+                or self._jetpack_physics_active
+            )
+        ):
+            # Fuel is a replicated Character resource. Once 0x04 is visible,
+            # the retail owner drains it during the three-frame physics handoff,
+            # even though authoritative native thrust is still deferred.
+            self.jetpack_fuel -= drain * dt
+            if self.jetpack_fuel <= 0.0:
+                self.jetpack_fuel = 0.0
+                # Advertise exhaustion now. This tick already used active
+                # thrust; retain exactly one predicted recurrence before the
+                # held key resumes ordinary jump behavior.
+                self.jetpack_active = False
+                # Holding SPACE through empty fuel must not auto-ignite as
+                # regeneration crosses the activation cost. Retail requires
+                # a release/new press before another start-delay cycle.
+                self._jetpack_requires_release = True
+                self._jetpack_activation_defer_remaining = 0
+                self._jetpack_exhaustion_tail_remaining = (
+                    1 if self._jetpack_physics_active else 0
+                )
+
+        if (
+            not self.jetpack_active
+            and not self._jetpack_physics_active
+            and self.jetpack_fuel < max_fuel
+        ):
             if (time.time() - self._last_damage_at) >= refill_delay:
                 self.jetpack_fuel = min(max_fuel, self.jetpack_fuel + refill_rate * dt)
+
+        if not physics_was_active and self._jetpack_physics_active:
+            self._note_jetpack_physics_started()
 
     def _update_parachute(self) -> None:
         """Open the Commando parachute on a second airborne SPACE press.
@@ -1240,15 +1978,167 @@ class Player:
         # No jump edge-detection or queuing here: the held jump flag is
         # consumed directly each tick in update() (client-pipeline mirror).
 
+    def queue_velocity_impulse(
+        self,
+        apply_loop: int,
+        impulse: tuple[float, float, float],
+    ) -> None:
+        """Apply knockback on the authoritative frame bearing ``apply_loop``.
+
+        Damage(37) is processed by retail before its frame physics, while this
+        server can be several ClientData labels behind when it detects the
+        impact. Labeling the impulse with the current shared loop clock keeps
+        both sides from integrating the same velocity change on different
+        history rows. The bounded queue fails open by applying immediately;
+        gameplay state is never silently dropped under pathological traffic.
+        """
+        vector = tuple(float(component) for component in impulse)
+        apply_loop = int(apply_loop)
+        if (
+            self.is_bot
+            or (
+                self.last_applied_input_loop is not None
+                and self.last_applied_input_loop >= apply_loop
+            )
+        ):
+            self._apply_velocity_impulse(vector)
+            return
+        if len(self._pending_velocity_impulses) >= PENDING_VELOCITY_IMPULSE_LIMIT:
+            self._apply_velocity_impulse(vector)
+            return
+        self._pending_velocity_impulses.append((apply_loop, vector))
+
+    def queue_explosion_impulse(
+        self,
+        after_input_frames: int,
+        origin: tuple[float, float, float],
+        blast_radius: float,
+        knockback_min: float,
+        knockback_max: float,
+    ) -> int | None:
+        """Apply predicted blast physics after observed client input frames.
+
+        Retail calculates the direction when it processes ``Damage(37)``, not
+        when the server detects projectile contact.  Store the origin and
+        falloff parameters so the vector is recomputed from authoritative
+        geometry at the matching frame.  The per-player receive sequence is a
+        dense frame witness; protocol loop labels may legitimately skip.
+
+        Returns the target input sequence, or ``None`` when applied immediately
+        for a bot/overflow fallback.
+        """
+
+        effect = PendingExplosionImpulse(
+            target_input_sequence=(
+                self._input_receive_sequence + max(1, int(after_input_frames))
+            ),
+            origin=tuple(float(component) for component in origin),
+            blast_radius=float(blast_radius),
+            knockback_min=float(knockback_min),
+            knockback_max=float(knockback_max),
+        )
+        if (
+            self.is_bot
+            or len(self._pending_explosion_impulses)
+            >= PENDING_VELOCITY_IMPULSE_LIMIT
+        ):
+            self._apply_pending_explosion_impulse(effect)
+            return None
+        self._pending_explosion_impulses.append(effect)
+        return effect.target_input_sequence
+
+    def _apply_velocity_impulse(
+        self, impulse: tuple[float, float, float]
+    ) -> None:
+        vx, vy, vz = self.velocity
+        self.velocity = (
+            vx + impulse[0],
+            vy + impulse[1],
+            vz + impulse[2],
+        )
+
+    def _apply_velocity_impulses_through(self, loop_count: int) -> None:
+        if not self._pending_velocity_impulses:
+            return
+        remaining = deque()
+        for apply_loop, impulse in self._pending_velocity_impulses:
+            if apply_loop <= int(loop_count):
+                self._apply_velocity_impulse(impulse)
+            else:
+                remaining.append((apply_loop, impulse))
+        self._pending_velocity_impulses = remaining
+
+    def _apply_explosion_impulses_through(self, input_sequence: int) -> None:
+        if not self._pending_explosion_impulses:
+            return
+        remaining = deque()
+        for effect in self._pending_explosion_impulses:
+            if effect.target_input_sequence <= int(input_sequence):
+                self._apply_pending_explosion_impulse(effect)
+            else:
+                remaining.append(effect)
+        self._pending_explosion_impulses = remaining
+
+    def _apply_pending_explosion_impulse(
+        self, effect: PendingExplosionImpulse
+    ) -> None:
+        from server.explosions import explosion_impulse
+
+        impulse = explosion_impulse(
+            effect.origin,
+            self.position,
+            effect.blast_radius,
+            effect.knockback_min,
+            effect.knockback_max,
+            crouched=bool(self.input.crouch),
+        )
+        if impulse is None:
+            return
+        self._apply_velocity_impulse(impulse)
+        server = self.connection.server if self.connection else None
+        if bool(getattr(getattr(server, "config", None), "movement_debug_capture", False)):
+            self.last_applied_explosion_impulse_debug = {
+                "input_sequence": int(self._input_receive_sequence),
+                "target_input_sequence": int(effect.target_input_sequence),
+                "position": tuple(self.position),
+                "impulse": tuple(impulse),
+                "origin": tuple(effect.origin),
+            }
+            logger.info(
+                "BLAST IMPULSE APPLY DEBUG player=%s %r",
+                self.name,
+                self.last_applied_explosion_impulse_debug,
+            )
+
     def record_input_frame(
         self,
         loop_count: int,
         flags: tuple,
         orientation: tuple,
+        received_at: Optional[float] = None,
+        action_flags: tuple | None = None,
+        received_server_tick: Optional[int] = None,
+        received_owner_sequence: Optional[int] = None,
+        wire_unknown_byte: Optional[int] = None,
     ) -> None:
         """Store the movement inputs the client used for its frame
         `loop_count` so the simulation can apply them at the matching
-        (delayed) server tick."""
+        (delayed) server tick.
+
+        ``received_at`` is accepted for diagnostic callers but deliberately
+        does not drive physics. Live foreground A/B tests proved ENet dequeue
+        intervals reflect transport/event-loop scheduling and made previously
+        exact straight movement diverge when used as client frame dt.
+        """
+        if not self.alive or not self.spawned:
+            # The retail client keeps sending ClientData during the class-change
+            # death screen. Those frames describe the old body and spawn()
+            # intentionally re-anchors the new life, so buffering them only
+            # fills the bounded history and reports misleading overflow.
+            return
+        owner_sequence = self._claim_owner_timeline_sequence(
+            received_owner_sequence
+        )
         loop_count = int(loop_count)
         if (
             self.last_applied_input_loop is not None
@@ -1256,17 +2146,44 @@ class Player:
         ):
             # Never let a delayed duplicate move the authoritative player a
             # second time.
+            self.input_frames_stale += 1
             self.input_frames_dropped += 1
             return
-        self.input_history[loop_count] = (flags, orientation)
+        if loop_count in self.input_history:
+            # ENet may surface a duplicate before the original buffered frame
+            # is consumed. Keep the first complete frame and its receive tick;
+            # replacing only that clock would make newer owner rows appear to
+            # have existed when retail produced the input.
+            self.input_frames_stale += 1
+            self.input_frames_dropped += 1
+            return
+        self._input_receive_sequence += 1
+        self.input_history[loop_count] = BufferedInputFrame(
+            movement_flags=tuple(flags),
+            orientation=tuple(orientation),
+            action_flags=None if action_flags is None else tuple(action_flags),
+            received_server_tick=(
+                None
+                if received_server_tick is None
+                else int(received_server_tick)
+            ),
+            received_owner_sequence=owner_sequence,
+            received_input_sequence=self._input_receive_sequence,
+            wire_unknown_byte=(
+                None
+                if wire_unknown_byte is None
+                else int(wire_unknown_byte) & 0xFF
+            ),
+        )
         if len(self.input_history) > INPUT_HISTORY_LIMIT:
             overflow = sorted(self.input_history)[:-INPUT_HISTORY_LIMIT]
+            self.input_frames_overflow += len(overflow)
             self.input_frames_dropped += len(overflow)
             for key in overflow:
                 del self.input_history[key]
 
     async def simulate_tick(self, dt: float) -> None:
-        """Advance at most one client-history frame per server tick.
+        """Advance at most one observed client frame per server tick.
 
         Consume at most one buffered client input in loop-count order. The
         1.x client's reconciliation
@@ -1274,11 +2191,15 @@ class Player:
         looks up its OWN movement_history at the self-row's loop_count and, if
         the server position differs, ADJUSTs (>0.1 block) or SNAPs (>4 blocks,
         wiping history — the "random rollback"). Each authoritative position
-        must therefore represent one client-history frame, never several
-        full-dt frames compressed into one server tick.
+        must therefore represent a loop label received in ClientData. Retail
+        loop labels can skip integers without producing history entries, so a
+        synthetic acknowledgement is an immediate native-client SNAP.
 
-        A packet burst remains queued for later server ticks; applying multiple
-        full-dt updates here would make authoritative time outrun the client.
+        A packet burst remains queued for later server ticks. Empty ticks freeze
+        movement and its acknowledgement.  The next real ClientData always
+        advances exactly one fixed frame: retail loop labels can skip by two in
+        an ordinary 17 ms update, so neither the label gap nor server starvation
+        encodes a client physics duration.
         """
         if not self.alive or not self.spawned:
             return
@@ -1299,44 +2220,89 @@ class Player:
             ]
             for loop in stale:
                 del self.input_history[loop]
+            self.input_frames_stale += len(stale)
             self.input_frames_dropped += len(stale)
 
         if not self.input_history:
-            # With no later frame proving a missing loop, freeze movement and
-            # its acknowledgement together. Moving under the previous ack
-            # makes the next self-row compare against the wrong client history.
+            # Freeze movement and its acknowledgement together.  Never roll
+            # this server-side wait into a later nonlinear physics step.
             self.input_starved_ticks += 1
             self._tick_idle()
             return
 
         loop = min(self.input_history)
-        packet_flags = None
-        if self._input_cursor is not None and loop > self._input_cursor:
-            # A later loop proves the expected frame will not be consumed in
-            # order. Predict exactly that one missing frame from the held input;
-            # the client has a history entry with this label, and the future
-            # packet stays queued for a later server tick.
-            loop = self._input_cursor
-            future_loop = min(self.input_history)
-            future_flags, future_orientation = self.input_history[future_loop]
-            # A synthetic loop repeats the pending state and never latches the
-            # future packet. Live traces prove packet-visible input changes one
-            # loop before client physics uses them.
-            flags = self._pending_packet_flags or self._applied_input_flags or future_flags
-            orientation = self._applied_orientation or future_orientation
-            self.input_frames_dropped += 1
+        frame = self.input_history.pop(loop)
+        self._current_input_receive_sequence = int(
+            frame.received_input_sequence
+        )
+        self._current_input_owner_sequence = frame.received_owner_sequence
+        packet_flags = frame.movement_flags
+        orientation = frame.orientation
+        server = self.connection.server if self.connection else None
+        latch_frames = int(getattr(
+            getattr(server, "config", None), "movement_input_latch_frames", 1
+        ))
+        if latch_frames:
+            # Retail applies crouch geometry before it records history row L,
+            # while locomotion/jump buttons in that row still reflect L-1.
+            # Compose those two input phases so the authoritative ACK anchor
+            # includes the current packet's immediate +/-0.9 eye-Z change.
+            flags = tuple(
+                packet_flags[5] if index == 5 else value
+                for index, value in enumerate(self._pending_packet_flags)
+            )
+            applied_input_source_loop = self._pending_packet_loop
+            applied_input_source_server_tick = (
+                self._pending_packet_received_server_tick
+            )
+            applied_input_source_owner_sequence = (
+                self._pending_packet_received_owner_sequence
+            )
+            applied_input_source_wire_unknown_byte = (
+                self._pending_packet_wire_unknown_byte
+            )
         else:
-            packet_flags, orientation = self.input_history.pop(loop)
-            flags = self._pending_packet_flags or packet_flags
+            flags = packet_flags
+            applied_input_source_loop = loop
+            applied_input_source_server_tick = frame.received_server_tick
+            applied_input_source_owner_sequence = (
+                frame.received_owner_sequence
+            )
+            applied_input_source_wire_unknown_byte = frame.wire_unknown_byte
+        # Buttons are latched by the retail input path, but native-yaw capture
+        # shows aim is already current in the movement history for this label.
+        # Delaying orientation creates a mixed turn state and persistent
+        # correction during ordinary mouse motion.
+        applied_orientation = orientation
         self.last_applied_input_loop = loop
-        self._input_cursor = loop + 1
-        self.set_orientation_vector(*orientation)
+        self.set_orientation_vector(*applied_orientation)
         self.update_input(*flags)
+        if frame.action_flags is not None:
+            self.update_action_input(*frame.action_flags)
         self._applied_input_flags = flags
         self._applied_orientation = orientation
-        if packet_flags is not None:
-            self._pending_packet_flags = packet_flags
+        self._applied_input_source_loop = applied_input_source_loop
+        self._applied_input_source_server_tick = (
+            applied_input_source_server_tick
+        )
+        self._applied_input_source_owner_sequence = (
+            applied_input_source_owner_sequence
+        )
+        self._applied_input_source_wire_unknown_byte = (
+            applied_input_source_wire_unknown_byte
+        )
+        self._pending_packet_flags = packet_flags
+        self._pending_packet_loop = loop
+        self._pending_packet_received_server_tick = frame.received_server_tick
+        self._pending_packet_received_owner_sequence = (
+            frame.received_owner_sequence
+        )
+        self._pending_packet_wire_unknown_byte = frame.wire_unknown_byte
         self.input_frames_applied += 1
+        self._apply_velocity_impulses_through(loop)
+        self._apply_explosion_impulses_through(frame.received_input_sequence)
+        # One packet represents one movement-history record.  ClientData does
+        # not carry dt, and its clock label is deliberately non-contiguous.
         await self.update(dt)
 
     def _tick_idle(self) -> None:
@@ -1487,7 +2453,7 @@ class Player:
             byte |= 0x01
         if self.input.secondary_fire:
             byte |= 0x02
-        # 0x04 = jetpack active (display + reduced-gravity flight on the client).
+        # 0x04 = jetpack active (display + pack-specific flight on the client).
         # SAFE here ONLY because it is gated on jetpack_active: the server's fuel
         # model (driven by the client's hover/Z bit) sets this True only while
         # the player is actually firing the jetpack with fuel, and clears it the
@@ -1505,7 +2471,7 @@ class Player:
         # makes every equipped weapon model invisible to other players.
         if self.input.can_display_weapon:
             byte |= 0x10
-        if self.input.is_on_fire:
+        if self.on_fire:
             byte |= 0x20
         if self.input.zoom:
             byte |= 0x40
@@ -1532,7 +2498,7 @@ class Player:
 
     def world_update_snapshot(self) -> Tuple[Tuple[float, float, float], ...]:
         # (pos, orient, vel, ping, pong, hp, inp, action, state, tool,
-        #  jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw)
+        #  pickup, jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw)
         # `pong` carries wu_ack_loop — the client input loop_count this row's
         # position corresponds to. It is what the client pairs against its own
         # movement_history to decide NO-OP / ADJUST / SNAP.
@@ -1547,6 +2513,7 @@ class Player:
             self.pack_action_flags(),
             self.pack_state_flags(),
             self.tool,
+            0xFF if self.pickup_id is None else int(self.pickup_id),
             self.jetpack_fuel,
             0.0,
             0.0,

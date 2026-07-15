@@ -4,6 +4,7 @@ Plugins can hook into server events to extend functionality.
 """
 
 import logging
+import time
 from abc import ABC
 from typing import Optional, List, Dict, TYPE_CHECKING
 
@@ -119,6 +120,7 @@ class PluginManager:
     def __init__(self, server: 'BattleSpadesServer'):
         self.server = server
         self.plugins: Dict[str, BasePlugin] = {}
+        self._last_budget_warning_at = 0.0
     
     async def load_plugin(self, plugin_class: type) -> bool:
         """Load a plugin class."""
@@ -184,10 +186,42 @@ class PluginManager:
         """Get all loaded plugins."""
         return list(self.plugins.values())
     
-    async def call_event(self, event_name: str, *args, **kwargs):
-        """Call an event on all enabled plugins."""
+    async def call_event(
+        self,
+        event_name: str,
+        *args,
+        budget_ms: float | None = None,
+        **kwargs,
+    ):
+        """Call an event on enabled plugins within an optional time budget.
+
+        Plugin hooks run on the gameplay event loop.  They may extend the
+        server, but they are not allowed to make authoritative simulation miss
+        its 60 Hz budget; when the caller supplies ``budget_ms`` the remaining
+        callbacks are skipped once the budget is exhausted.
+        """
+        start = time.perf_counter()
+        budget_seconds = None if budget_ms is None else max(0.0, budget_ms) / 1000.0
         for plugin in self.plugins.values():
             if not plugin.enabled:
+                continue
+
+            if (
+                budget_seconds is not None
+                and time.perf_counter() - start >= budget_seconds
+            ):
+                metrics = getattr(self.server, "metrics", None)
+                if metrics is not None:
+                    metrics.skipped_plugin_callbacks += 1
+                now = time.monotonic()
+                if now - self._last_budget_warning_at >= 1.0:
+                    self._last_budget_warning_at = now
+                    logger.warning(
+                        "Plugin event %s exceeded %.2fms budget; "
+                        "skipping remaining callbacks",
+                        event_name,
+                        float(budget_ms or 0.0),
+                    )
                 continue
             
             handler = getattr(plugin, event_name, None)

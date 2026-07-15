@@ -6,6 +6,7 @@ Uses ENet for networking with asyncio integration.
 """
 
 import asyncio
+from collections import deque
 import logging
 import sys
 import time
@@ -27,18 +28,44 @@ from shared.packet import (
 
 from .config import ServerConfig
 from .combat_runtime import CombatSystem, get_combat_system
-from .game_constants import TEAM1, TEAM2, MAX_HEALTH, DEFAULT_BLOCK_HEALTH
+from .deployable_actions import DeployableActionService
+from .oriented_actions import OrientedActionService
+from .construction import ConstructionSafetyService
+from .prefab_actions import PrefabActionService
+from .game_constants import (
+    CHAT_SYSTEM,
+    TEAM1,
+    TEAM2,
+    MAX_HEALTH,
+    DEFAULT_BLOCK_HEALTH,
+)
 from .player import Player, set_movement_authority, INPUT_DELAY_TICKS
 from .team import Team
 from .world_manager import WorldManager
 from .connection import Connection
 from .a2s_query import A2SHandler
 from .debug_parity import DebugParityManager
+from .replication import ReplicationService
+from .round_lifecycle import RoundLifecycle
+from .match import MatchTransitionService
+from .simulation_runtime import SimulationRuntime
+from .telemetry import TelemetryService
+from .terrain_repair import TerrainRepairService
+from .world_mutations import WorldMutationService
+from .bot_ai.stimuli import BotStimulusBus
+from .bot_ai.messages import StimulusKind
 
 if TYPE_CHECKING:
     import enet
 
 logger = logging.getLogger(__name__)
+
+# Native Damage processing changes velocity before Character physics. Across
+# six clean retail contacts, the matching authoritative pre-physics state was
+# consistently the third ClientData accepted *after* impact; neither
+# server.loop_count nor the sparse client loop label was a stable clock. This
+# is not a transport ACK. The effect itself is recomputed at that state.
+_SNOWBALL_PREDICTION_OBSERVED_FRAMES = 3
 
 
 class BattleSpadesServer:
@@ -47,7 +74,11 @@ class BattleSpadesServer:
     Manages ENet networking, players, world state, and game logic.
     """
     
-    def __init__(self, config: ServerConfig):
+    def __init__(
+        self,
+        config: ServerConfig,
+        telemetry: TelemetryService | None = None,
+    ):
         self.config = config
         self.running = False
         set_movement_authority(config.movement_authority)
@@ -68,6 +99,13 @@ class BattleSpadesServer:
         # Players and connections
         self.players: Dict[int, Player] = {}
         self.connections: Dict[int, Connection] = {}
+        # Terrain changes that happen after a joiner's MapSync snapshot but
+        # before its first ClientData used to disappear: gameplay broadcasts
+        # are deliberately gated during GameScene construction.  Sequence the
+        # native block packets and retain them only while a joining connection
+        # needs catch-up.
+        self._map_mutation_sequence = 0
+        self._map_mutation_journal = deque()
         self._next_player_id = 0
         # Ids promised to joining clients via StateData.player_id before
         # their Player object exists (see Connection.send_connection_data).
@@ -87,15 +125,22 @@ class BattleSpadesServer:
         # plugins/ and it's auto-discovered.
         from plugins.base_plugin import PluginManager
         self.plugin_manager = PluginManager(self)
+        # Prefabs are operator-owned release content. Bind the lazy registry
+        # before any action service can resolve a model; never consult a
+        # developer-specific client installation as a hidden fallback.
+        from server.prefabs import configure_prefab_search_dirs
+        configure_prefab_search_dirs(config.prefabs_path)
         # Persistent ban list (bans.json), enforced on connect.
         from server.bans import BanManager
-        self.ban_manager = BanManager()
+        self.ban_manager = BanManager(config.bans_path)
         # In-flight thrown grenades (server-authoritative blast). Each is a
         # dict: {x,y,z, vx,vy,vz, explode_at, thrower_id}.
         from server.projectiles import ProjectileEngine
         self.projectile_engine = ProjectileEngine()
         from server.rocket_turret import RocketTurretController
         self.rocket_turret_controller = RocketTurretController(self)
+        from server.fire import FireController
+        self.fire_controller = FireController(self)
         from server.voting import VoteManager
         self.vote_manager = VoteManager(self)
         # In-game packets received since the last simulation tick; drained
@@ -103,14 +148,27 @@ class BattleSpadesServer:
         # before tick N is guaranteed to be APPLIED at tick N (dispatching
         # via create_task could slip past the tick — input timing became a
         # per-packet race no WorldUpdate stamp offset could compensate).
-        self._pending_ingame_packets: list = []
+        self._pending_ingame_packets = deque()
+        self._dropped_ingame_packets = 0
+        self.bot_stimuli = BotStimulusBus()
+        self.telemetry = telemetry or TelemetryService()
+        # Compatibility alias for capacity tools and plugins migrated before
+        # TelemetryService became the composition boundary.
+        self.metrics = self.telemetry.metrics
+        # Focused services own the hot runtime contracts. Compatibility
+        # delegates keep existing plugins and tests stable during migration.
+        self.replication = ReplicationService(self)
+        self.round_lifecycle = RoundLifecycle(self)
+        self.match_transition = MatchTransitionService(self)
+        self.world_mutations = WorldMutationService(self)
+        self.simulation_runtime = SimulationRuntime(self)
         # Game-logic events (kills, deaths, spawns, block edits, team changes)
         # queued SYNCHRONOUSLY from the sim/combat/packet paths and drained
         # once per tick in _game_loop. This is the SINGLE place mode hooks
         # fire — never asyncio.create_task from a sync path (it would slip
         # past the tick and reintroduce the input-timing race main.py warns
         # about above). (name, args) tuples.
-        self._mode_events: list = []
+        self._mode_events = deque()
 
         # Teams
         self.teams = {
@@ -120,7 +178,12 @@ class BattleSpadesServer:
         
         # World
         self.world_manager = WorldManager(config)
+        self.terrain_repair = TerrainRepairService(self)
         self.combat = CombatSystem(self)
+        self.construction = ConstructionSafetyService(self)
+        self.prefab_actions = PrefabActionService(self)
+        self.deployable_actions = DeployableActionService(self)
+        self.oriented_actions = OrientedActionService(self)
         self.debug_parity = DebugParityManager(self)
         
         # A2S Query handler for Steam browser and LAN discovery
@@ -148,28 +211,16 @@ class BattleSpadesServer:
         return -1
 
     async def _load_plugins(self) -> None:
-        """Discover and load every BasePlugin subclass in the plugins/ package
-        (any *.py except the base/dunder files). Failures are logged, never
+        """Discover BasePlugin subclasses in the configured runtime directory.
+        Top-level public Python files are considered. Failures are logged, never
         fatal — a bad plugin can't take the server down."""
-        import importlib
-        import inspect
-        import pkgutil
-        import plugins as plugins_pkg
-        from plugins.base_plugin import BasePlugin
+        from pathlib import Path
+        from server.plugin_loader import load_external_plugins
 
-        loaded = 0
-        for mod_info in pkgutil.iter_modules(plugins_pkg.__path__):
-            if mod_info.name in ("base_plugin",) or mod_info.name.startswith("_"):
-                continue
-            try:
-                module = importlib.import_module(f"plugins.{mod_info.name}")
-            except Exception:
-                logger.error("Failed to import plugin module %s", mod_info.name, exc_info=True)
-                continue
-            for _, obj in inspect.getmembers(module, inspect.isclass):
-                if issubclass(obj, BasePlugin) and obj is not BasePlugin and obj.__module__ == module.__name__:
-                    if await self.plugin_manager.load_plugin(obj):
-                        loaded += 1
+        loaded = await load_external_plugins(
+            self.plugin_manager,
+            Path(self.config.plugins_path),
+        )
         if loaded:
             logger.info("Loaded %d plugin(s)", loaded)
 
@@ -177,84 +228,80 @@ class BattleSpadesServer:
         """Queue a game-logic event for the active mode. Drained once per tick
         in _game_loop (after on_tick). Safe to call from synchronous code
         (Player.die, combat, packet handlers) — never schedules a task."""
+        if len(self._mode_events) >= int(self.config.mode_event_queue_limit):
+            self.metrics.dropped_mode_events += 1
+            return
         self._mode_events.append((name, args))
 
     async def _process_respawns(self) -> None:
-        """Respawn players whose death timer has elapsed. Mode-agnostic — CTF
-        and TDM both rely on it (there was previously NO server respawn, so a
-        killed player stayed dead forever). Reuses the calibrated spawn path
-        (world_manager.get_spawn_point + Player.spawn) and re-broadcasts a
-        CreatePlayer so every client re-renders the body alive at the new
-        position."""
-        if not self.players:
-            return
-        now = time.time()
-        respawn_time = float(self.config.respawn_time)
-        for player in list(self.players.values()):
-            if player.alive or player.spawned or player.death_time <= 0.0:
-                continue
-            if now - player.death_time < respawn_time:
-                continue
-            # Do not delete the grave here: stock graves explode after 7s,
-            # while the default respawn is 5s. GraveBehavior owns its complete
-            # fuse/destroy lifecycle. Only detach the new player life from it.
-            player._grave_entity_id = None
-
-            # Apply a mid-game class/loadout change (SetClassLoadout while
-            # alive) at the respawn boundary — original-server semantics.
-            pending_class = getattr(player, 'pending_class_id', None)
-            if pending_class is not None:
-                player.class_id = int(pending_class)
-                player.pending_class_id = None
-            pending_loadout = getattr(player, 'pending_loadout', None)
-            if pending_loadout is not None:
-                player.loadout = list(pending_loadout)
-                player.pending_loadout = None
-
-            self.respawn_player(player)
+        """Compatibility delegate to the round lifecycle service."""
+        lifecycle = getattr(self, "round_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = RoundLifecycle(self)
+            self.round_lifecycle = lifecycle
+        await lifecycle.process_respawns()
 
     def respawn_player(self, player) -> None:
-        """Spawn (or re-spawn) a player at their team spawn and re-render the
-        live body on every client. Shared by the death-timer respawn loop and
-        the end-of-round restart."""
-        spawn = self.world_manager.get_spawn_point(player.team)
-        player.spawn(spawn[0], spawn[1], spawn[2])
-        player.death_time = 0.0
-        self._broadcast_create_player(player, spawn)
-        # Refill the respawned client's tool counters (grenades included).
-        player.restock_ammo()
-        if self.mode is not None:
-            self.queue_mode_event('on_player_spawn', player)
+        """Compatibility delegate shared by death and round restarts."""
+        lifecycle = getattr(self, "round_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = RoundLifecycle(self)
+            self.round_lifecycle = lifecycle
+        lifecycle.respawn_player(player)
 
-    def spawn_grenade(self, player, packet) -> None:
+    def reset_round_runtime(self) -> None:
+        """Compatibility delegate for same-map transient cleanup."""
+        lifecycle = getattr(self, "round_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = RoundLifecycle(self)
+            self.round_lifecycle = lifecycle
+        lifecycle.reset_round_runtime()
+
+    def spawn_grenade(self, player, packet) -> bool:
         """A player used an oriented item (grenade family, RPG/RPG2 rocket,
         drill, snowball, sticky/chemical). Register the server-authoritative
         projectile + rebroadcast the packet so every other client renders and
         simulates it locally (arc/flight + explosion FX + sound)."""
+        import shared.constants as C
         from server.projectiles import PROJECTILE_SPECS
         tool = int(getattr(packet, "tool", 0))
         if tool not in PROJECTILE_SPECS:
-            return  # not a projectile tool (deployables ride Place* packets)
+            return False  # deployables ride their dedicated Place* packets
 
         pos = getattr(packet, "position", None)
         vel = getattr(packet, "velocity", None)
         if not pos or not vel:
-            return
+            return False
         # Reject NaN/inf (a bad float can wedge the sim).
         vals = list(pos) + list(vel) + [getattr(packet, "value", 0.0)]
         if any(v != v or abs(v) > 1e6 for v in vals):
-            return
+            return False
 
         fuse = max(0.0, min(float(getattr(packet, "value", 3.0)), 10.0))
 
         p = self.projectile_engine.spawn(tool, pos, vel, fuse, player.id)
         if p is None:
-            return
+            return False
+
+        entity_color = None
+        if tool == int(getattr(C, "SNOWBLOWER_TOOL", 29)):
+            # The retail weapon is named Block Cannon in the final strings.
+            # It consumes one ordinary block per shot, and the projectile must
+            # retain the selected palette colour even if the player changes it
+            # before impact.
+            p.block_color = int(getattr(player, "block_color", 0)) & 0xFFFFFF
+            p.source_loop = max(0, int(getattr(packet, "loop_count", 0)))
+            entity_color = (
+                (p.block_color >> 16) & 0xFF,
+                (p.block_color >> 8) & 0xFF,
+                p.block_color & 0xFF,
+            )
 
         if p.spec.entity_type:
-            # Rocket/drill/snowball/molotov: NEITHER the firer nor other clients
-            # spawn these locally (the client's send_rocket sends no local
-            # entity — measured 2026-07-07). The server owns the flying entity:
+            # These client send_* methods do not create a local world object;
+            # the throw/launcher code only computes velocity and calls the
+            # GameScene network sender. The server therefore creates exactly
+            # one entity for every client, including the shooter:
             # spawn a CreateEntity of the right ENTITY type carrying the initial
             # pos+velocity so EVERY client renders + simulates the projectile,
             # and DestroyEntity on explosion plays the blast FX (see _explode).
@@ -264,8 +311,14 @@ class BattleSpadesServer:
                 int(p.spec.entity_type),
                 float(pos[0]), float(pos[1]), float(pos[2]),
                 state=state, kind="projectile", player_id=player.id,
+                color=entity_color,
                 vel=(float(vel[0]), float(vel[1]), float(vel[2])),
                 radius=0.02,
+                fuse=(
+                    float(getattr(C, "STICKY_GRENADE_STICK_FUSE", 5.0))
+                    if tool == int(getattr(C, "STICKY_GRENADE_TOOL", 57))
+                    else fuse
+                ),
             )
             p.entity_id = ent.entity_id
             self.broadcast_create_entity(ent)
@@ -290,8 +343,9 @@ class BattleSpadesServer:
                 except Exception:
                     logger.debug("projectile rebroadcast failed", exc_info=True)
 
-        logger.info("PROJECTILE %s by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f eid=%d",
+        logger.info("PROJECTILE %s by %s tool=%d pos=(%.1f,%.1f,%.1f) fuse=%.2f eid=%s",
                     p.spec.name, player.name, tool, pos[0], pos[1], pos[2], fuse, p.entity_id)
+        return True
 
     # Projectile physics lives in server/projectiles.py (the grenade math is
     # the verified port of the compiled client's mover sub_10011E90; rockets/
@@ -312,18 +366,70 @@ class BattleSpadesServer:
                 self._explode_projectile(event)
 
     def _apply_drill_contact(self, event) -> None:
-        """Damage one obstructing voxel while keeping the drill alive."""
+        """Apply one measured 81-cell Drill bore and replicate it safely.
+
+        A live type-10 packet is compact and drives the retail Drill sound,
+        particles, and exact radius-2 BlockManager footprint.  It requires a
+        still-live projectile entity, however, so reconnect catch-up records
+        type-6 exact cells instead.  If the entity vanished unexpectedly, the
+        live path also falls back to those exact cells rather than triggering
+        the native ``Drill entity ID not valid`` abort.
+        """
         import shared.constants as C
+        from server.projectiles import drill_contact_cells
+        from shared.packet import Damage
+
         owner = self.players.get(event.projectile.thrower_id)
         if owner is None:
             return
-        get_combat_system(self)._apply_block_damage(
-            owner,
-            event.block,
-            float(getattr(C, "DRILL_DRILLING_BLOCK_DAMAGE", 20.0)),
-            damage_type=int(getattr(C, "DRILL_DAMAGE", 10)),
-            causer_id=int(event.projectile.entity_id or owner.id),
+
+        positions = drill_contact_cells(event.block)
+        destroyed = self.world_manager.destroy_blocks(positions)
+        if not destroyed:
+            return
+
+        combat = get_combat_system(self)
+        raw_entity_id = getattr(event.projectile, "entity_id", None)
+        live_entity = (
+            self.entity_registry.get(int(raw_entity_id))
+            if raw_entity_id is not None
+            else None
         )
+        if live_entity is None:
+            combat._broadcast_block_destroy(
+                owner,
+                destroyed,
+                damage_type=int(C.WEAPON_DAMAGE),
+                causer_id=int(owner.id),
+            )
+            return
+
+        packet = Damage()
+        packet.player_id = int(owner.id)
+        packet.type = int(C.DRILL_DAMAGE)
+        packet.damage = float(
+            getattr(C, "DRILL_DRILLING_BLOCK_DAMAGE", 20.0)
+        )
+        packet.face = 0
+        packet.chunk_check = 1
+        packet.seed = 0
+        # Entity id 0 is valid; never use truthiness as the sentinel here.
+        packet.causer_id = int(raw_entity_id)
+        packet.position = tuple(float(value) for value in event.block)
+        self.broadcast(
+            bytes(packet.generate()),
+            reliable=True,
+            record_mutation=False,
+        )
+
+        # A joiner's MapSync snapshot may predate this bore but its replay may
+        # occur after the projectile is gone. Journal stable exact cells only.
+        combat.record_exact_block_destroy_catchup(
+            owner,
+            destroyed,
+            causer_id=int(owner.id),
+        )
+        combat._collapse_unsupported(owner, destroyed)
 
     def _deploy_launched_mine(self, event) -> None:
         """Turn a Mine Launcher projectile's terrain contact into an armed,
@@ -335,6 +441,14 @@ class BattleSpadesServer:
         import shared.constants as C
         from server.connection import internal_team_to_wire
         from server.entities.behaviors import ProximityMineBehavior
+
+        # Flying ProjectileMine (37) and armed Landmine (9) are distinct
+        # retail objects. Remove the first before publishing the second.
+        flight_id = getattr(event, "entity_id", None)
+        if flight_id is not None:
+            flight_id = int(flight_id)
+            if self.entity_registry.remove(flight_id) is not None:
+                self.broadcast_destroy_entity(flight_id)
 
         behavior = ProximityMineBehavior(
             owner.id,
@@ -372,8 +486,51 @@ class BattleSpadesServer:
         # Remove the flying entity on all clients (plays the explosion FX for
         # rocket/drill/snowball/molotov, which the client would otherwise fly
         # forever — stop_on_collision is False on the client's projectile).
-        eid = int(getattr(ex, "entity_id", 0) or 0)
-        if eid:
+        raw_entity_id = getattr(ex, "entity_id", None)
+        if raw_entity_id is not None:
+            eid = int(raw_entity_id)
+            live_entity = self.entity_registry.get(eid)
+        else:
+            live_entity = None
+        prediction_sent = False
+        if raw_entity_id is not None and live_entity is None:
+            # Cleanup/disconnect may have removed the visual before an already
+            # queued engine event reached this method. Never emit Damage with
+            # a causer id the retail client can no longer resolve.
+            logger.debug(
+                "Discarding stale %s explosion for missing entity %s",
+                ex.spec.name,
+                raw_entity_id,
+            )
+            return
+        if live_entity is not None:
+            if ex.spec.name == "snowball":
+                self._place_block_cannon_impact(ex, thrower)
+
+            # DestroyEntity only removes the Snowball visual. Stock retail
+            # applies its predicted blast impulse from Damage(37), so publish
+            # that event while ``causer_id`` still names a live entity. Keep
+            # this Snowball-only until every crater-producing Damage type has
+            # been verified; generalising it can duplicate terrain mutations
+            # in the native BlockManager.
+            if ex.spec.name == "snowball":
+                from shared.packet import Damage
+
+                prediction = Damage()
+                prediction.player_id = int(ex.thrower_id)
+                prediction.type = int(ex.spec.damage_type)
+                prediction.damage = float(ex.block_damage)
+                prediction.face = 0
+                prediction.chunk_check = 0
+                prediction.seed = 0
+                prediction.causer_id = eid
+                prediction.position = (float(gx), float(gy), float(gz))
+                self.broadcast(
+                    bytes(prediction.generate()),
+                    reliable=True,
+                    record_mutation=False,
+                )
+                prediction_sent = True
             if self.entity_registry.remove(eid) is not None:
                 self.broadcast_destroy_entity(eid)
 
@@ -383,14 +540,84 @@ class BattleSpadesServer:
         self._apply_blast(gx, gy, gz, ex.damage, ex.block_damage,
                           ex.spec.kill_type, thrower, crater_radius=1,
                           force_destroy=force_destroy,
-                          blast_radius=float(getattr(ex.spec, "blast_radius", 16.0)))
+                          blast_radius=float(ex.blast_radius),
+                          knockback_min=float(ex.knockback_min),
+                          knockback_max=float(ex.knockback_max),
+                          self_knockback_min=ex.self_knockback_min,
+                          self_knockback_max=ex.self_knockback_max,
+                          prediction_frame_delay=(
+                              _SNOWBALL_PREDICTION_OBSERVED_FRAMES
+                              if prediction_sent
+                              else None
+                          ))
+        if ex.spec.name == "molotov":
+            self.fire_controller.ignite_impact(gx, gy, gz, thrower)
+
+    def _place_block_cannon_impact(self, ex, thrower) -> bool:
+        """Commit one Block Cannon voxel at a terrain impact.
+
+        The Snowball ``Damage`` event is only blast prediction; damage type 20
+        is deliberately absent from the native BlockManager's terrain-damage
+        table.  The server must therefore add the last free voxel itself and
+        publish an explicit-colour packet.  Broadcasting through the normal
+        mutation path also journals the build for clients whose VXL snapshot
+        was already in flight.
+        """
+        if thrower is None or getattr(ex, "contact_block", None) is None:
+            return False
+
+        position = (int(ex.x), int(ex.y), int(ex.z))
+        color = getattr(ex, "block_color", None)
+        if color is None:
+            color = int(getattr(thrower, "block_color", 0)) & 0xFFFFFF
+        else:
+            color = int(color) & 0xFFFFFF
+
+        combat = get_combat_system(self)
+        world = self.world_manager
+        if not world.can_build(*position) or not combat._block_supported(*position):
+            return False
+        if not world.set_block(*position, True, color):
+            return False
+
+        from shared.packet import BlockBuildColored
+
+        packet = BlockBuildColored()
+        source_loop = getattr(ex, "source_loop", None)
+        packet.loop_count = (
+            max(0, int(source_loop))
+            if source_loop is not None
+            else max(0, int(self.loop_count))
+        )
+        packet.player_id = int(thrower.id)
+        packet.x, packet.y, packet.z = position
+        packet.color = color
+        self.broadcast(bytes(packet.generate()), reliable=True)
+        logger.info(
+            "BLOCK CANNON built (%d,%d,%d) color=%06X for %s",
+            position[0], position[1], position[2], color, thrower.name,
+        )
+        return True
 
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
                      crater_radius: int = 1, force_destroy: bool = True,
-                     blast_radius: float = 16.0) -> None:
+                     blast_radius: float = 16.0, knockback_min: float = 0.0,
+                     knockback_max: float = 0.0,
+                     self_knockback_min=None, self_knockback_max=None,
+                     prediction_frame_delay: int | None = None) -> None:
         """Shared explosion: crater a cube of `crater_radius` and damage nearby
         players with the live-verified falloff. Used by projectiles AND
         deployables (dynamite/landmine/C4)."""
+        stimuli = getattr(self, "bot_stimuli", None)
+        if stimuli is not None:
+            stimuli.publish(
+                StimulusKind.EXPLOSION,
+                (float(gx), float(gy), float(gz)),
+                source_id=int(getattr(thrower, "id", -1)),
+                team=int(getattr(thrower, "team", -1)),
+                radius=max(48.0, float(blast_radius) * 5.0),
+                lifetime=2.0,
+            )
         bx, by, bz = int(gx), int(gy), int(gz)
         r = max(1, int(crater_radius))
         positions = [
@@ -427,9 +654,104 @@ class BattleSpadesServer:
                 continue
             if self._blocked_los(gx, gy, gz, target.x, target.y, target.z):
                 continue
+            from server.explosions import explosion_impulse
+            target_knockback_min = float(knockback_min)
+            target_knockback_max = float(knockback_max)
+            if target is thrower:
+                if self_knockback_min is not None:
+                    target_knockback_min = float(self_knockback_min)
+                if self_knockback_max is not None:
+                    target_knockback_max = float(self_knockback_max)
+            crouched = bool(getattr(getattr(target, "input", None), "crouch", False))
+            impulse_preview = explosion_impulse(
+                (gx, gy, gz), target.position, blast_radius,
+                target_knockback_min, target_knockback_max,
+                crouched=crouched,
+            )
+            queue_explosion = getattr(target, "queue_explosion_impulse", None)
+            target_input_sequence = None
+            deferred_prediction = (
+                prediction_frame_delay is not None
+                and callable(queue_explosion)
+                and impulse_preview is not None
+            )
+            if deferred_prediction:
+                target_input_sequence = queue_explosion(
+                    prediction_frame_delay,
+                    (gx, gy, gz),
+                    blast_radius,
+                    target_knockback_min,
+                    target_knockback_max,
+                )
+
+            if impulse_preview is not None:
+                if bool(getattr(self.config, "movement_debug_capture", False)):
+                    target.last_explosion_impulse_debug = {
+                        "server_loop": int(self.loop_count),
+                        "prediction_frame_delay": prediction_frame_delay,
+                        "target_input_sequence": target_input_sequence,
+                        "last_applied_input_loop": target.last_applied_input_loop,
+                        "queued_input_loops": tuple(sorted(target.input_history)),
+                        "position_before": tuple(target.position),
+                        "velocity_before": tuple(target.velocity),
+                        "impulse_preview": tuple(impulse_preview),
+                        "origin": (float(gx), float(gy), float(gz)),
+                    }
+                    logger.info(
+                        "BLAST IMPULSE DEBUG player=%s %r",
+                        target.name,
+                        target.last_explosion_impulse_debug,
+                    )
+                if not deferred_prediction:
+                    vx, vy, vz = target.velocity
+                    target.velocity = (
+                        vx + impulse_preview[0],
+                        vy + impulse_preview[1],
+                        vz + impulse_preview[2],
+                    )
+
+            # The client applies explosion velocity before its ordinary damage
+            # policy. Friendly-fire-off therefore suppresses HP loss but does
+            # not suppress the physical push.
+            if (
+                thrower is not None
+                and target is not thrower
+                and target.team == thrower.team
+                and not getattr(self.config, "friendly_fire", False)
+            ):
+                continue
             dmg = int(round(damage if sq <= 1.0 else min(damage, (4096.0 / sq) * scale)))
             if dmg > 0:
                 target.damage(dmg, source=thrower, kill_type=int(kill_type))
+
+        # Damageable placed entities share the same LOS/radius/falloff as
+        # players. Iterate a snapshot because a one-hit C4/medpack may remove
+        # itself from the registry during on_damage.
+        entity_ctx = self._build_entity_ctx()
+        for entity in list(self.entity_registry.all()):
+            behavior = getattr(entity, "behavior", None)
+            if (
+                not entity.alive
+                or behavior is None
+                or not getattr(behavior, "takes_damage", False)
+            ):
+                continue
+            ex, ey, ez = behavior.get_hit_center(entity)
+            dx, dy, dz = ex - gx, ey - gy, ez - gz
+            sq = dx * dx + dy * dy + dz * dz
+            if sq >= float(blast_radius) ** 2:
+                continue
+            if self._blocked_los(gx, gy, gz, ex, ey, ez):
+                continue
+            entity_damage = (
+                float(damage)
+                if sq <= 1.0
+                else min(float(damage), (4096.0 / sq) * scale)
+            )
+            if entity_damage > 0.0:
+                self.entity_registry.damage_entity(
+                    entity.entity_id, entity_damage, thrower, entity_ctx
+                )
 
     def _blocked_los(self, x0, y0, z0, x1, y1, z1) -> bool:
         dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
@@ -477,6 +799,15 @@ class BattleSpadesServer:
         packet.loadout = list(getattr(player, 'loadout', []) or [])
         packet.prefabs = list(getattr(player, 'prefabs', []) or [])
         self.broadcast(bytes(packet.generate()))
+        from server.roster import remember_player_life
+        for connection in self.connections.values():
+            if getattr(connection, "in_game", False):
+                remember_player_life(connection, player)
+        from shared.packet import SetColor
+        color = SetColor()
+        color.player_id = player.id
+        color.value = int(player.block_color) & 0xFFFFFF
+        self.broadcast(bytes(color.generate()))
 
     def reveal_world_to(self, connection) -> None:
         """Send a now-in-game client the map entities (crates). Called from the
@@ -484,14 +815,48 @@ class BattleSpadesServer:
         flood of entity creates while the client is still building the world /
         mid-GameScene-transition crashes the compiled client natively.
 
-        The player ROSTER is NOT sent here: existing players are already
-        delivered in the handshake via ExistingPlayer (send_existing_players),
-        and new joiners arrive via the gated CreatePlayer broadcast. Re-sending
-        them here would duplicate-create them on the client.
+        The player roster is reconciled by concrete life token here. Two
+        clients can both snapshot an empty roster before either creates its
+        player, then mutually miss their gameplay-gated CreatePlayer packets.
+        Token catch-up sends only lives absent from that client's handshake.
 
-        After this runs, connection.in_game is True so the ongoing gameplay
-        broadcast stream (kills, respawns, scores, WorldUpdate) flows normally.
+        The caller sets connection.in_game only after this complete reveal, so
+        ongoing gameplay broadcasts cannot interleave with catch-up.
         """
+        from server.roster import catch_up_roster
+        catch_up_roster(self, connection)
+
+        # BlockLine/BlockBuild packets carry no RGB. Refresh every sender's
+        # current palette before replaying terrain so late joiners render the
+        # authoritative VXL colours.
+        from shared.packet import SetColor
+        for roster_player in self.players.values():
+            color = SetColor()
+            color.player_id = roster_player.id
+            color.value = int(roster_player.block_color) & 0xFFFFFF
+            connection.send(bytes(color.generate()), reliable=True)
+
+        # CreatePlayer carries a loadout but no current equipped tool/action
+        # state. Do not leave late join initialization to the next unreliable
+        # 30 Hz packet: one reliable remote-only snapshot makes every newly
+        # revealed Character immediately match the authoritative life. The
+        # local row is deliberately excluded, so this cannot reconcile or
+        # move the joining owner on its first input frame.
+        local_player = getattr(connection, "player", None)
+        local_player_id = (
+            int(local_player.id) if local_player is not None else None
+        )
+        roster_snapshot = self.build_world_update_data(
+            exclude_player_id=local_player_id,
+            loop_count_override=int(self.loop_count),
+        )
+        connection.send(roster_snapshot, reliable=True)
+
+        # First close the terrain gap between the MapSync snapshot and this
+        # first ClientData. This is still synchronous on the server event loop,
+        # so no live mutation can interleave between replay and in_game=True.
+        self.replay_map_mutations(connection)
+
         # World ambience + the in-game music bed for this now-settled client
         # (a mid-round joiner must get both directly — the round-start
         # broadcast already fired before they arrived). play_music_to sends
@@ -507,16 +872,41 @@ class BattleSpadesServer:
         except Exception:
             logger.debug("reveal ambient/music send failed", exc_info=True)
 
-        if not getattr(self.config, "entities_wire_ready", False):
-            return
-        from shared.packet import CreateEntity
-        for ent in self.entity_registry.static_entities():
+        # CreatePlayer intentionally has no safe no-pickup sentinel. Genuine
+        # carriers must be announced even when generic entity replication is
+        # disabled, using the dedicated packet that initializes the carried
+        # tool and burden state.
+        from shared.packet import PickPickup
+        for carrier in self.players.values():
+            pickup_id = getattr(carrier, "pickup_id", None)
+            if pickup_id is None:
+                continue
+            packet = PickPickup()
+            packet.player_id = int(carrier.id)
+            packet.pickup_id = int(pickup_id)
+            packet.burdensome = int(bool(carrier.pickup_burdensome))
+            connection.send(bytes(packet.generate()), reliable=True)
+
+        if getattr(self.config, "entities_wire_ready", False):
+            from shared.packet import CreateEntity
+            for ent in self.entity_registry.static_entities():
+                try:
+                    pkt = CreateEntity()
+                    pkt.set_entity(ent.to_wire_entity())
+                    connection.send(bytes(pkt.generate()), reliable=True)
+                except Exception:
+                    logger.debug("reveal entity send failed", exc_info=True)
+
+        # Mode-owned UI/objective state is not part of the static entity
+        # registry. CTF uses this post-GameScene hook for native base zones and
+        # the current carrier marker; it must run even when generic entity
+        # replication is disabled.
+        reveal_mode_state = getattr(self.mode, "reveal_to", None)
+        if reveal_mode_state is not None:
             try:
-                pkt = CreateEntity()
-                pkt.set_entity(ent.to_wire_entity())
-                connection.send(bytes(pkt.generate()), reliable=True)
+                reveal_mode_state(connection)
             except Exception:
-                logger.debug("reveal entity send failed", exc_info=True)
+                logger.debug("mode reveal send failed", exc_info=True)
 
         player = getattr(connection, "player", None)
         if player is not None and self._radar_station_counts.get(player.team, 0) > 0:
@@ -551,6 +941,10 @@ class BattleSpadesServer:
 
     def broadcast_create_entity(self, map_entity) -> None:
         """Announce a placed entity (crate/intel/...) to all clients."""
+        if not getattr(map_entity, "wire_visible", True):
+            # Legacy objective markers can exist for authoritative mode logic
+            # without being legal packet-21 entities in the retail client.
+            return
         from shared.packet import CreateEntity
         pkt = CreateEntity()
         pkt.set_entity(map_entity.to_wire_entity())
@@ -657,7 +1051,7 @@ class BattleSpadesServer:
         address = enet.Address(b"", self.config.port)
         self.host = enet.Host(
             address,
-            peerCount=self.config.max_players,
+            peerCount=self.config.max_connections,
             channelLimit=1,  # Reference uses 1 channel
             incomingBandwidth=0,
             outgoingBandwidth=0,
@@ -683,13 +1077,28 @@ class BattleSpadesServer:
         # Auto-discover + load plugins from the plugins/ package.
         await self._load_plugins()
 
-        # Dev bots: spawn after the mode is up so they join the active match.
-        bot_count = int(getattr(self.config, "bot_count", 0) or 0)
-        if bot_count > 0:
-            from server.bots import BotManager
-            self.bots = BotManager(self)
-            self.bots.spawn_initial(bot_count)
-            logger.info("Spawned %d dev bot(s)", bot_count)
+        # Start bots only after the active map and mode exist. An explicit
+        # [bots] table supersedes legacy game.bot_count; the legacy value keeps
+        # fixed-count behavior for existing deployments.
+        bot_config = getattr(self.config, "bots", None)
+        has_explicit_bots = bool(
+            bot_config is not None
+            and getattr(bot_config, "configured", False)
+        )
+        explicit_bots = bool(
+            has_explicit_bots and getattr(bot_config, "enabled", False)
+        )
+        legacy_bot_count = int(getattr(self.config, "bot_count", 0) or 0)
+        if explicit_bots or (not has_explicit_bots and legacy_bot_count > 0):
+            from server.bot_ai import BotDirector
+
+            self.bots = BotDirector(self)
+            initial_count = None if explicit_bots else legacy_bot_count
+            if not explicit_bots and bot_config is not None:
+                bot_config.population_mode = "fixed"
+                bot_config.max_bots = legacy_bot_count
+            await self.bots.start(initial_count=initial_count)
+            logger.info("Bot runtime started with %d bot(s)", len(self.bots.bots))
 
         self.running = True
         logger.info(f"Server started: {self.config.server_name}")
@@ -709,6 +1118,10 @@ class BattleSpadesServer:
         
         logger.info("Stopping server...")
         self.running = False
+
+        if self.bots is not None:
+            await self.bots.close()
+            self.bots = None
         
         if self.mode:
             await self.mode.on_mode_end()
@@ -735,14 +1148,13 @@ class BattleSpadesServer:
         """Process ENet events - synchronous, called from network loop."""
         import enet
         
-        while True:
+        for _ in range(self.config.network_event_budget):
             if self.host is None:
                 return
             
             try:
                 event = self.host.service(0)
                 event_type = event.type
-                
                 if not event or event_type == enet.EVENT_TYPE_NONE:
                     return
                 
@@ -762,7 +1174,11 @@ class BattleSpadesServer:
                     if connection is not None and connection.player is not None:
                         # In-game traffic: queue for the tick-start drain
                         # (deterministic ordering relative to simulation).
-                        self._pending_ingame_packets.append((connection, data))
+                        if len(self._pending_ingame_packets) < self.config.max_pending_packets:
+                            self._pending_ingame_packets.append((connection, data))
+                        else:
+                            self._dropped_ingame_packets += 1
+                            self.metrics.dropped_ingame_packets += 1
                     else:
                         # Pre-join flows (handshake, map transfer) can be
                         # slow — keep them off the simulation path.
@@ -784,291 +1200,65 @@ class BattleSpadesServer:
             await asyncio.sleep(0.001)
     
     async def _game_loop(self):
-        """Main game tick loop: fixed-dt steps with wall-clock accumulation.
-
-        Physics must advance by exactly tick_interval per step (the client
-        engine integrates with the same fixed dt). The accumulator runs
-        catch-up steps after a stall instead of silently dropping time,
-        capped to avoid spiral-of-death after long hitches.
-        """
-        max_catch_up_steps = 5
-        accumulator = 0.0
-        last_time = time.perf_counter()
-        # Tick health stats: a 60Hz simulation has a 16.7ms budget; any
-        # blocking work on this thread (sync I/O, slow logging) shows up
-        # here as slow ticks => movement lag bursts for every client.
-        stat_ticks = 0
-        stat_slow = 0
-        stat_max_ms = 0.0
-        stat_sum_ms = 0.0
-
-        while self.running:
-            current = time.perf_counter()
-            accumulator += current - last_time
-            last_time = current
-
-            if accumulator > self.tick_interval * max_catch_up_steps:
-                # Long stall (debugger, map load): drop the excess time.
-                accumulator = self.tick_interval * max_catch_up_steps
-
-            ticked = False
-            while accumulator >= self.tick_interval:
-                accumulator -= self.tick_interval
-                self.loop_count += 1
-                ticked = True
-                tick_start = time.perf_counter()
-
-                # Apply everything that arrived since the previous tick
-                # BEFORE simulating — with the client clock one tick ahead
-                # (clock_sync_loop_bias) the input stamped N is already
-                # buffered here when tick N simulates.
-                await self._drain_ingame_packets()
-
-                # Simulate with inputs INPUT_DELAY_TICKS old: the client's
-                # ClientData for frame N arrives 1-2 ticks after our tick N
-                # passed (clocks are ClockSync-aligned), so the delayed tick
-                # is the newest one whose input has reliably arrived.
-                # Drive bot AI BEFORE the sim loop so the shared
-                # simulate_tick steps each bot with the inputs the AI just
-                # chose (bots are normal Players in self.players — no separate
-                # physics step, no double-step).
-                if self.bots is not None:
-                    self.bots.update(self.tick_interval)
-
-                for player in self.players.values():
-                    await player.simulate_tick(self.tick_interval)
-
-                self.a2s_handler.update()
-
-                if self.mode:
-                    await self.mode.on_tick(self.loop_count)
-                    # Drain game-logic events queued this tick (kills, deaths,
-                    # spawns, ...) into the mode, in order, off the sync death
-                    # path. Snapshot + clear first so a handler that queues a
-                    # new event defers it to the next tick.
-                    if self._mode_events:
-                        events = self._mode_events
-                        self._mode_events = []
-                        for name, args in events:
-                            handler = getattr(self.mode, name, None)
-                            if handler is not None:
-                                await handler(*args)
-                            # Fan the same event out to plugins (they hook the
-                            # same names: on_player_spawn/kill/join/leave/...).
-                            await self.plugin_manager.call_event(name, *args)
-                # Per-tick plugin hook.
-                await self.plugin_manager.call_event('on_tick', self.loop_count)
-
-                # Respawn scheduler (mode-agnostic): bring dead players back
-                # after config.respawn_time. snapshot the list — spawn()
-                # doesn't mutate self.players but a handler might.
-                await self._process_respawns()
-
-                # Entity behaviors: crate pickups + respawn, and any future
-                # tickable entities (deployables, capture points, ...).
-                self.entity_registry.tick(self._build_entity_ctx())
-
-                self.rocket_turret_controller.update(
-                    self.tick_interval, time.monotonic()
-                )
-
-                # In-flight grenade fuses / detonation.
-                self._update_grenades(self.tick_interval)
-
-                # HUD round-timer countdown (DisplayCountdown 84) — seconds
-                # REMAINING, sent ~once/sec (not every frame; it's a whole
-                # second display and 60Hz would flood the reliable channel).
-                if (self.mode is not None and self.mode.started
-                        and not self.mode.ended
-                        and getattr(self.mode, "time_limit", 0) > 0
-                        and self.loop_count % self.tick_rate == 0):
-                    from server.scoreboard import send_round_timer
-                    remaining = self.mode.time_limit - self.mode.elapsed_time
-                    send_round_timer(self, remaining)
-
-                # Vote-kick timeout (auto-fail after VOTE_DURATION).
-                if self.vote_manager.active and self.loop_count % self.tick_rate == 0:
-                    self.vote_manager.tick(time.time())
-
-                tick_ms = (time.perf_counter() - tick_start) * 1000.0
-                stat_ticks += 1
-                stat_sum_ms += tick_ms
-                if tick_ms > stat_max_ms:
-                    stat_max_ms = tick_ms
-                if tick_ms > 10.0:
-                    stat_slow += 1
-                if stat_ticks >= 600:  # one line every ~10s
-                    # Per-player input accounting: `dropped` frames are physics
-                    # steps the CLIENT took that the server never did, so the
-                    # server falls behind and the self-row yanks the client back.
-                    # `starved` ticks coast on the previous input (harmless).
-                    inputs = []
-                    for p in self.players.values():
-                        applied = getattr(p, "input_frames_applied", 0)
-                        dropped = getattr(p, "input_frames_dropped", 0)
-                        starved = getattr(p, "input_starved_ticks", 0)
-                        if applied or dropped or starved:
-                            inputs.append("%s:appl=%d drop=%d starve=%d" %
-                                          (p.name, applied, dropped, starved))
-                            p.input_frames_applied = 0
-                            p.input_frames_dropped = 0
-                            p.input_starved_ticks = 0
-                    logger.info(
-                        "tick stats: avg=%.2fms max=%.2fms slow(>10ms)=%d/%d%s",
-                        stat_sum_ms / stat_ticks, stat_max_ms, stat_slow, stat_ticks,
-                        ("  inputs[" + " | ".join(inputs) + "]") if inputs else "",
-                    )
-                    stat_ticks = stat_slow = 0
-                    stat_max_ms = stat_sum_ms = 0.0
-
-            # Send WorldUpdates immediately after simulating so the
-            # positions in the packet are exactly the state of loop_count.
-            #
-            # UNRELIABLE on purpose: a WorldUpdate is superseded 16ms later,
-            # while 60Hz reliable packets on ENet's single channel cause
-            # ACK head-of-line blocking — the send queue backs up and
-            # clients see movement in stale multi-second bursts.
-            #
-            # SELF-ROWS (worldupdate_include_self=True, original behavior):
-            # the client reconciles its own row against its movement history
-            # at the packet's loop_count (replay past POSITION_TOLERANCE,
-            # snap past POSITION_RESET_TOLERANCE) — with parity physics the
-            # diff stays under tolerance and the row only refreshes the
-            # client's network anchor. Without self-rows that anchor stays
-            # at the CreatePlayer spawn forever and the client engine snaps
-            # the player back to it on jump. One serialized packet serves
-            # every connection.
-            #
-            # Legacy exclusion mode (False) kept for A/B: per-connection
-            # packets omitting the recipient's own row (pure prediction
-            # locally; earlier sessions measured self-echo as chunky while
-            # the worlds were still mismatched).
-            if ticked and self.connections and self.config.broadcast_world_updates:
-                include_self = (
-                    self.config.worldupdate_include_self
-                    and self.loop_count
-                    % self.config.worldupdate_self_row_interval == 0
-                )
-                offset = self.config.worldupdate_loop_offset
-                # Stamp EVERY player's row with the client input loop_count the
-                # sim last consumed for them (+ calibration offset). This is the
-                # `pong` field, which the client feeds to
-                # set_network_position_and_velocity as `last_loop_count` and
-                # then looks up in its own movement_history. It must be
-                # per-PLAYER (not per-recipient), so one serialized packet still
-                # reconciles correctly for whoever receives it.
-                for _p in self.players.values():
-                    if _p.last_applied_input_loop is not None:
-                        _p.wu_ack_loop = max(0, _p.last_applied_input_loop + offset)
-
-                for connection in list(self.connections.values()):
-                    if not connection.in_game:
-                        continue  # not in GameScene yet — no WorldUpdate flood
-                    player = connection.player
-                    if (
-                        include_self
-                        and player is not None
-                        and player.last_applied_input_loop is not None
-                    ):
-                        # Per-recipient stamp: the input tick the sim
-                        # actually consumed for THIS player. Latency- and
-                        # jitter-proof pairing with the client's history.
-                        stamp = player.last_applied_input_loop + offset
-                        data = self.build_world_update_data(
-                            loop_count_override=stamp,
-                        )
-                        if self.config.debug_selfrow:
-                            self._log_selfrow(player, stamp)
-                    else:
-                        # No input consumed yet (or self-rows disabled):
-                        # never send a self-row the client could mispair.
-                        exclude_id = player.id if player is not None else None
-                        data = self.build_world_update_data(
-                            exclude_player_id=exclude_id,
-                        )
-                    connection.send(data, reliable=False)
-
-            await asyncio.sleep(0.001)
+        """Compatibility entry point for the fixed-step runtime service."""
+        runtime = getattr(self, "simulation_runtime", None)
+        if runtime is None:
+            runtime = SimulationRuntime(self)
+            self.simulation_runtime = runtime
+        await runtime.run()
     
+    def _broadcast_world_updates(self) -> None:
+        """Compatibility delegate to grouped snapshot replication."""
+        replication = getattr(self, "replication", None)
+        if replication is None:
+            replication = ReplicationService(self)
+            self.replication = replication
+        replication.broadcast_world_updates()
+
     def _log_selfrow(self, player, stamp: int) -> None:
-        """Append one self-row sample (the stamp + position actually sent to
-        this player) for offline reconciliation calibration against the
-        client's per-frame capture. See tmp/reconcile_sim.py."""
-        handle = getattr(self, "_selfrow_handle", None)
-        if handle is None:
-            import os
-            os.makedirs("logs", exist_ok=True)
-            handle = open("logs/selfrow_samples.ndjson", "w", encoding="utf-8")
-            self._selfrow_handle = handle
-        handle.write(
-            '{"server_tick": %d, "stamp": %d, "input_loop": %d, '
-            '"x": %.5f, "y": %.5f, "z": %.5f}\n'
-            % (self.loop_count, stamp, player.last_applied_input_loop,
-               player.x, player.y, player.z)
-        )
-        handle.flush()
-
-    async def _world_update_loop(self):
-        """Send world updates to clients at the authoritative server tick rate."""
-        update_interval = self.tick_interval
-
-        while self.running:
-            data = self.build_world_update_data()
-            if self.connections:
-                self.broadcast(data)
-
-            await asyncio.sleep(update_interval)
+        """Queue one self-row diagnostic sample without gameplay-thread I/O."""
+        manager = getattr(self, "debug_parity", None)
+        writer = getattr(manager, "write_selfrow_sample", None)
+        if callable(writer):
+            writer(player, stamp)
 
     def build_world_update_packet(
         self,
         exclude_player_id: Optional[int] = None,
         loop_count_override: Optional[int] = None,
+        local_player_id: Optional[int] = None,
     ) -> WorldUpdate:
-        """Build the current WorldUpdate snapshot for all active players.
+        """Compatibility delegate for tests and packet tooling."""
+        replication = getattr(self, "replication", None)
+        if replication is None:
+            replication = ReplicationService(self)
+            self.replication = replication
+        return replication.build_world_update_packet(
+            exclude_player_id,
+            loop_count_override,
+            local_player_id,
+        )
 
-        exclude_player_id omits that player's own row — used so a client
-        never receives (and never corrects to) its own server-side state.
-        loop_count_override stamps the packet with the RECIPIENT's own
-        last-consumed input loop (per-connection): the client reconciles
-        its self-row against its movement history at this stamp, and only
-        the actually-consumed input tick pairs correctly at any latency.
-        """
-        world_update = WorldUpdate()
-        if loop_count_override is not None:
-            world_update.loop_count = max(0, loop_count_override)
-        else:
-            # Fallback stamp for packets without a recipient-specific input
-            # tick (no player / no input yet): the inputs of this (delayed)
-            # tick. Only correct when transit latency ~= one tick.
-            world_update.loop_count = max(
-                0,
-                self.loop_count - INPUT_DELAY_TICKS
-                + self.config.worldupdate_loop_offset,
-            )
-
-        for pid, player in self.players.items():
-            if pid == exclude_player_id:
-                continue
-            if not player.alive or not player.spawned:
-                continue
-            world_update[pid] = player.world_update_snapshot()
-
-        world_update.updated_entities = list(self.entities.values())
-        world_update.rocket_turrets = [
-            turret.world_update() for turret in self.rocket_turrets.values()
-        ]
-        return world_update
+    @staticmethod
+    def _self_world_update_is_safe(player) -> bool:
+        """Compatibility wrapper for the native block-tool exception."""
+        return ReplicationService.self_row_is_safe(player)
 
     def build_world_update_data(
         self,
         exclude_player_id: Optional[int] = None,
         loop_count_override: Optional[int] = None,
+        local_player_id: Optional[int] = None,
     ) -> bytes:
-        """Serialize the current WorldUpdate packet."""
-        return bytes(
-            self.build_world_update_packet(
-                exclude_player_id, loop_count_override
-            ).generate()
+        """Compatibility delegate for grouped snapshot serialization."""
+        replication = getattr(self, "replication", None)
+        if replication is None:
+            replication = ReplicationService(self)
+            self.replication = replication
+        return replication.build_world_update_data(
+            exclude_player_id,
+            loop_count_override,
+            local_player_id,
         )
     
     def _on_connect_sync(self, peer, data: int = 0):
@@ -1101,6 +1291,21 @@ class BattleSpadesServer:
         if not connection:
             return
 
+        # RECEIVE and DISCONNECT can be serviced in the same ENet pump.  A
+        # packet queued before the disconnect must not run on the next tick:
+        # player ids are deliberately reused, so a stale deployable packet can
+        # otherwise create an entity owned by a completely different player.
+        if self._pending_ingame_packets:
+            self._pending_ingame_packets = deque(
+                (queued_connection, data)
+                for queued_connection, data in self._pending_ingame_packets
+                if queued_connection is not connection
+            )
+        # A connection may disconnect after taking a MapSync watermark but
+        # before first ClientData. Once it is gone, it must no longer pin the
+        # terrain catch-up journal at an old sequence indefinitely.
+        self._prune_map_mutations()
+
         # Release an id promised to a client that never finished joining.
         reserved = getattr(connection, "reserved_player_id", None)
         if reserved is not None:
@@ -1109,6 +1314,18 @@ class BattleSpadesServer:
         if connection.player:
             player = connection.player
             logger.info(f"Player {player.name} disconnected")
+
+            # Mode state (VIP ownership, CTF intel, etc.) must observe the
+            # departing identity. The event is drained next tick after the
+            # player has been removed from team/player collections.
+            if self.mode is not None:
+                self.queue_mode_event("on_player_leave", player)
+
+            # Numeric player ids are reused from the lowest free slot. Retire
+            # every owner-sensitive producer/cache before exposing this id to
+            # another connection; RoundLifecycle preserves ordinary world
+            # construction while removing deployables and stale credit.
+            self.round_lifecycle.forget_player(player)
             
             # Remove from team
             if player.team in self.teams:
@@ -1141,9 +1358,28 @@ class BattleSpadesServer:
         """
         if not self._pending_ingame_packets:
             return
-        pending = self._pending_ingame_packets
-        self._pending_ingame_packets = []
+        count = min(
+            len(self._pending_ingame_packets),
+            self.config.packet_drain_budget,
+        )
+        pending = [self._pending_ingame_packets.popleft() for _ in range(count)]
         for connection, data in pending:
+            # The disconnect path normally purges these rows.  Recheck at the
+            # consumption boundary after every await as well: an earlier
+            # packet in this local batch can disconnect or replace the same
+            # peer, leaving its FIFO tail outside the shared deque purge.
+            connections = getattr(self, "connections", None)
+            peer = getattr(connection, "peer", None)
+            if connections is not None and connections.get(peer) is not connection:
+                continue
+            player = getattr(connection, "player", None)
+            players = getattr(self, "players", None)
+            if (
+                players is not None
+                and player is not None
+                and players.get(getattr(player, "id", None)) is not player
+            ):
+                continue
             try:
                 await connection.on_receive(data)
             except Exception as e:
@@ -1154,7 +1390,8 @@ class BattleSpadesServer:
         return self.connections.get(peer)
     
     def broadcast(self, data: bytes, exclude: Optional[Player] = None,
-                  reliable: bool = True, gameplay: bool = True):
+                  reliable: bool = True, gameplay: bool = True,
+                  record_mutation: bool = True):
         """Send packet to all connected players.
 
         gameplay=True (default): only clients that are fully in-game receive
@@ -1163,9 +1400,15 @@ class BattleSpadesServer:
         ChatMessage, ...) — that flood crashes the compiled client. Such
         clients are caught up via reveal_world_to on their first ClientData.
         Pass gameplay=False for packets that must reach every connection
-        regardless of state.
+        regardless of state. ``record_mutation=False`` is reserved for
+        ephemeral packets that share a terrain packet id but must never be
+        replayed to a MapSync joiner (for example Snowball Damage(37)).
         """
         packet_id = data[0] if len(data) > 0 else -1
+        # SetColor (11) is player palette state and is snapshotted separately
+        # during reveal; replaying it after MapSync can restore a stale colour.
+        if record_mutation and gameplay and packet_id in (7, 32, 33, 37, 40):
+            self._record_map_mutation(data)
         if packet_id not in self.config.log_suppress_packets:
             logger.debug(f"SEND broadcast packet_id={packet_id} len={len(data)} to {len(self.connections)} clients")
 
@@ -1175,6 +1418,124 @@ class BattleSpadesServer:
             if gameplay and not connection.in_game:
                 continue
             connection.send(data, reliable=reliable)
+
+    async def broadcast_message(
+        self,
+        message: str,
+        chat_type: int = CHAT_SYSTEM,
+    ) -> None:
+        """Broadcast a plugin/system chat notice on the gameplay thread.
+
+        Plugin hooks are asynchronous, so this compatibility API remains an
+        awaitable even though packet construction and ENet queueing are both
+        synchronous and non-blocking. Connecting clients remain gameplay-
+        gated to avoid native scene-transition crashes.
+        """
+
+        packet = ChatMessage()
+        packet.player_id = 0xFF
+        packet.chat_type = int(chat_type)
+        packet.value = str(message)
+        self.broadcast(bytes(packet.generate()))
+
+    def mark_map_snapshot_complete(self, connection) -> int:
+        """Bind a joining connection to the terrain sequence represented by
+        the MapSync payload just serialized for it."""
+        watermark = self._map_mutation_sequence
+        connection.map_mutation_watermark = watermark
+        connection.map_mutation_overflow = False
+        self._prune_map_mutations()
+        return watermark
+
+    def _record_map_mutation(self, data: bytes) -> None:
+        self._map_mutation_sequence += 1
+        pending = any(
+            not getattr(connection, "in_game", False)
+            and getattr(connection, "map_mutation_watermark", None) is not None
+            for connection in self.connections.values()
+        )
+        if pending:
+            self._map_mutation_journal.append(
+                (self._map_mutation_sequence, bytes(data))
+            )
+            self._enforce_map_mutation_journal_limit()
+
+    def _enforce_map_mutation_journal_limit(self) -> None:
+        """Cap pending join catch-up while refusing unsafe partial replays."""
+        limit = max(
+            64,
+            int(getattr(self.config, "max_map_mutation_journal", 8192)),
+        )
+        while len(self._map_mutation_journal) > limit:
+            dropped_sequence, _data = self._map_mutation_journal.popleft()
+            for connection in self.connections.values():
+                watermark = getattr(connection, "map_mutation_watermark", None)
+                if getattr(connection, "in_game", False) or watermark is None:
+                    continue
+                if int(watermark) < int(dropped_sequence):
+                    connection.map_mutation_overflow = True
+                    self.metrics.map_mutation_overflows += 1
+
+    def replay_map_mutations(self, connection) -> None:
+        """Replay every terrain packet newer than this joiner's snapshot.
+
+        Native BlockBuild/BlockLine/Damage packets are replayed rather than a
+        synthetic cell diff so client collapse, colours, and effects follow
+        the same code paths as clients that were already in game.
+        """
+        watermark = getattr(connection, "map_mutation_watermark", None)
+        if watermark is None:
+            return
+        if getattr(connection, "map_mutation_overflow", False):
+            self._fail_map_catchup(connection)
+            return
+        if (
+            self._map_mutation_journal
+            and self._map_mutation_journal[0][0] > int(watermark) + 1
+        ):
+            connection.map_mutation_overflow = True
+            self.metrics.map_mutation_overflows += 1
+            self._fail_map_catchup(connection)
+            return
+        for sequence, data in tuple(self._map_mutation_journal):
+            if sequence > watermark:
+                connection.send(data, reliable=True)
+                # Advance only after a successful enqueue. If a later send
+                # fails, first-ClientData retry resumes here without applying
+                # an earlier Damage packet twice.
+                watermark = sequence
+                connection.map_mutation_watermark = sequence
+        connection.map_mutation_watermark = self._map_mutation_sequence
+        self._prune_map_mutations()
+
+    def _fail_map_catchup(self, connection) -> None:
+        """Reject a join whose terrain catch-up is no longer contiguous."""
+        logger.warning(
+            "Disconnecting %s: map mutation journal overflow during join",
+            getattr(getattr(connection, "peer", None), "address", "<unknown>"),
+        )
+        disconnect = getattr(connection, "disconnect", None)
+        if callable(disconnect):
+            disconnect(reason=13)  # DISCONNECT.ERROR_DATA: safer than desync.
+        raise RuntimeError(
+            "map mutation journal overflow; reconnect required for a "
+            "contiguous terrain snapshot"
+        )
+
+    def _prune_map_mutations(self) -> None:
+        pending_watermarks = [
+            int(connection.map_mutation_watermark)
+            for connection in self.connections.values()
+            if not getattr(connection, "in_game", False)
+            and getattr(connection, "map_mutation_watermark", None) is not None
+        ]
+        if not pending_watermarks:
+            self._map_mutation_journal.clear()
+            return
+        oldest = min(pending_watermarks)
+        while (self._map_mutation_journal
+               and self._map_mutation_journal[0][0] <= oldest):
+            self._map_mutation_journal.popleft()
     
     def broadcast_team(self, team_id: int, data: bytes):
         """Send packet to all players on a team."""

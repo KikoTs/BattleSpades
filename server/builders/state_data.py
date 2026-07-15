@@ -82,6 +82,11 @@ def build_state_data(server: 'BattleSpadesServer',
     pkt.team2_show_score = True
     pkt.team1_show_max_score = True
     pkt.team2_show_max_score = True
+    # VIP bypasses SelectClass. SelectTeam sees the locked-class bit and
+    # immediately creates one of the four gangster classes; the server later
+    # promotes exactly one player per team to its dedicated boss class.
+    pkt.team1_locked_class = mode.code == 'vip'
+    pkt.team2_locked_class = mode.code == 'vip'
 
     # ---- Prefabs / entities --------------------------------------------
     # StateData.prefabs is the MAP-SPECIFIC prefab set (client map_prefabs);
@@ -100,4 +105,11 @@ def build_state_data(server: 'BattleSpadesServer',
     pkt.screenshot_cameras_points = [(0.0, 0.0, 0.0)]
     pkt.screenshot_cameras_rotations = [(0.0, 0.0, 0.0)]
     pkt.has_map_ended = 0
+
+    # Asymmetric modes own their team menu and HUD flags.  Keep the generic
+    # builder wire-safe, then let the active rules object narrow class lists or
+    # team locks without teaching this protocol layer every mode state machine.
+    configure = getattr(getattr(server, 'mode', None), 'configure_state_data', None)
+    if callable(configure):
+        configure(pkt)
     return pkt

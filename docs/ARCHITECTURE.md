@@ -1,0 +1,254 @@
+# BattleSpades server architecture
+
+This document describes the intended server boundaries and the compatibility
+rules that constrain the ongoing refactor. It is a map for maintainers, not a
+claim that every boundary has already been extracted into a separate module.
+The stock Ace of Spades 1.x client and its observed behavior remain the protocol
+oracle.
+
+## Runtime data flow
+
+```text
+ENet peer
+  -> Connection: framing, handshake, identity
+  -> bounded incoming-event queue
+  -> packet decoder and domain handler
+  -> authoritative world/player/entity state
+  -> fixed 60 Hz simulation
+  -> replication snapshots at the retail cadence (30 Hz WorldUpdate)
+  -> grouped serialization and ENet send
+```
+
+Only the simulation thread mutates gameplay state. File and console logging run
+on a listener thread through a bounded queue. Diagnostic capture must follow the
+same rule: it may observe gameplay, but must never make the simulation wait.
+
+## Service boundaries
+
+The refactor is converging on explicit services. Until extraction is
+complete, some responsibilities remain methods of `BattleSpadesServer`; new
+code should respect these ownership boundaries instead of adding more unrelated
+work to that class.
+
+### SimulationRuntime
+
+Owns the fixed-step clock, ENet event budget, gameplay-packet drain budget,
+per-subsystem timing, and overload policy. Its invariants are:
+
+- Physics and gameplay advance at 60 Hz; network bursts do not cause extra
+  simulation steps.
+- Every queue and per-tick work list is bounded. Overload is measured and
+  reported rather than allowed to monopolize the event loop.
+- Authoritative mode events use a bounded FIFO. A per-tick drain budget defers
+  bursts without reordering them; total saturation increments
+  `dropped_mode_events` instead of allowing unbounded memory growth.
+- Plugin callbacks run under a gameplay-thread time budget. If the budget is
+  exhausted, remaining callbacks are skipped and counted in runtime metrics.
+- Entity behavior `on_tick` work is batch-capped and round-robin deferred;
+  proximity deployables still use the spatial index so mines and medpacks do
+  not become an all-entities-by-all-players scan.
+- No synchronous disk or console I/O runs on the tick thread.
+
+### ReplicationService
+
+Owns WorldUpdate construction, reconciliation stamps, entity create/change/
+destroy messages, map mutation journaling, and late-join catch-up.
+
+- WorldUpdates are emitted at 30 Hz and serialized once for recipients sharing
+  the same reconciliation view.
+- A joining player receives a stable base VXL snapshot plus every committed map
+  mutation after that snapshot's watermark. Mutations that occur while the map
+  is streaming must not fall into a gap.
+- The mutation journal is bounded. If it overflows before a joiner reaches
+  first `ClientData`, the server disconnects that join with data-error instead
+  of replaying a partial terrain stream.
+- Entity IDs are server-owned. `CreateEntity`, state changes, and
+  `DestroyEntity` must form one consistent lifetime; sending an unknown or
+  already-destroyed ID can destabilize the native client.
+- Block coordinates on the wire are raw VXL coordinates. Physics coordinates
+  and water-plane conversions stay at the boundary and are never guessed in a
+  domain handler.
+
+### RoundLifecycle
+
+Owns join, death, respawn, class/loadout selection, and end-round reset.
+
+- Class, tools, prefabs, and UGC tools form one selection. They must be
+  normalized and applied atomically before movement profile setup, inventory
+  reset, spawn, and `CreatePlayer` replication.
+- `ChangeClass(78)` and `SetClassLoadout(13)` may arrive in either order. The
+  active life must never combine one class with the previous class's equipment.
+- A round reset destroys or resets runtime entities exactly once, clears stale
+  ownership lists, applies pending selections, and only then respawns players.
+
+### MatchTransitionService
+
+Owns serialized admin and natural match lifecycle changes. A same-map restart
+keeps the current `GameScene`; a map or mode replacement creates a new client
+session because the retail client reads map/mode identity only while building
+that scene.
+
+- A requested map is path-normalized and loaded in a worker thread before any
+  live state changes. Mode change also reloads the current map in that worker,
+  resetting construction and applying target-mode metadata without blocking
+  packet drain. A missing, malformed, or out-of-root map leaves players, mode,
+  and world untouched.
+- Map preparation, mode rollover, and restart are single-flight. Concurrent
+  lifecycle commands fail without partially applying either request.
+- A full rollover gates every old connection (`in_game = False`) before mode
+  startup can emit objective or entity packets, clears old queues/journals,
+  installs the new world/mode, then disconnects the old session with retail
+  reason `ERROR_MATCH_ENDED` (18). Rejoin performs the ordinary InitialInfo ->
+  MapSync -> StateData handshake.
+- New-mode gameplay must never enter an old `GameScene`. If commit fails after
+  the gate, clients remain retired and reconnect instead of being admitted to
+  a partially rebuilt scene.
+- Server-only mode markers may exist in `EntityRegistry` with
+  `wire_visible=False`. Create and destroy paths must honor that flag
+  symmetrically; the retail runtime entity table does not accept every legacy
+  entity constant.
+
+### TelemetryService
+
+Owns structured runtime metrics, ordinary logging, and explicitly enabled
+diagnostics. `BattleSpadesServer` receives it as an explicit constructor
+dependency while retaining `server.metrics` as a compatibility alias.
+
+- Ordinary logs use the bounded non-blocking queue in
+  `server/logging_runtime.py`. Formatting and sink I/O happen on its listener
+  thread. A full queue drops diagnostic records instead of gameplay frames.
+- Packet parsing and hex dumps require both DEBUG logging and
+  `logging.packet_trace=true`.
+- Physics parity, movement snapshots, stack sampling, and self-row capture are
+  development tools. Production defaults must leave them disabled.
+- Diagnostic producers are rate-limited to ten samples/second per session,
+  batch writes at most once/second (or 128 records), and expose a drop counter.
+  Self-row calibration samples use this bounded writer path; they must never
+  reopen or flush files from `ReplicationService`.
+
+### TerrainRepairService
+
+Owns the delayed safety-net replay for clients that are already in GameScene.
+Reliable gameplay mutations and the join snapshot/journal remain the primary
+terrain replication paths.
+
+- `WorldManager` reports completed cell changes without retaining packet data.
+- Recent cells are de-duplicated in a bounded queue and read from canonical VXL
+  state only when sent, so a stale queued color/solid value cannot overwrite a
+  newer edit.
+- Repair starts only after a two-second quiet period and is spread across
+  simulation ticks at eight cells every three ticks (160 cells/second). It
+  uses proven native `BlockBuildColored(33)` for a solid
+  cell and exact, non-collapsing weapon `Damage(37)` for canonical air.
+- Mid-join clients never receive repair packets. Their crash-sensitive world
+  transition is handled exclusively by MapSync and the mutation journal.
+
+### BotDirector and AIWorkerSupervisor
+
+`BotDirector` owns server-created `Player` objects, population policy,
+profiles, lifecycle hooks, staggered perception, expiring intent validation,
+and the cheap 60 Hz look/locomotion motors. Peerless bot connections are
+explicitly active server-owned players, so they pass through ordinary native
+physics, death, respawn, mode, and replication boundaries.
+
+`AIWorkerSupervisor` owns a Windows `spawn` child through a bridge thread.
+Process creation, pickling, queue/pipe operations, Recast tile builds, LOS,
+target search, behavior-tree traversal, and path queries never run on the
+gameplay thread. The server-to-bridge frame queue is capped at 64, the result
+queue at 128, and the director drains at most 12 intents per simulation tick.
+Results carry bot generation, frame, map/mode epoch, topology version, and a
+250 ms expiry; any mismatch is discarded.
+
+The bridge retains a coalesced canonical terrain overlay in addition to the
+immutable base VXL. Worker restart and the 65,536-cell overflow rebase compose
+`base + overlay` on the bridge thread. This prevents a restarted navigator
+from reverting to the original map and avoids calling `generate_vxl` from the
+60 Hz thread. Terrain edits dirty the affected 32x32 Recast tile and its
+neighbors; immediate movement still checks the live authoritative map.
+
+Frames are coalesced by `(player_id, generation)` before crossing the process
+boundary. A slow worker therefore receives the newest perception for every
+concrete bot life instead of making decisions from an obsolete FIFO backlog;
+the 64-entry bound applies to unique bot lives and overflow remains observable.
+
+The worker uses `py_trees` at 8 Hz, perception at 10 Hz per staggered bot, and
+a token bucket capped at 24 path requests/second for the default 12-bot roster.
+Native Recast/Detour v1.6.0 is vendored under its Zlib license. A bounded
+layered A* remains the source-only fallback. The native bridge owns a persistent
+DetourCrowd instance (64-agent cap) and returns obstacle-avoiding desired
+steering only; native `Player` physics still executes every movement input.
+Class-filtered jump, crouch, safe-drop, and fuel-gated jetpack transitions are
+represented by an explicit affordance layer above the ground mesh. Immediate
+waypoints are rechecked against the live VXL whenever the body voxel or
+topology version changes, so an old worker path cannot authorize traversal
+through a newly placed block.
+
+Fairness is explicit: fresh firing requires worker LOS plus a final normal
+`CombatSystem` trace; a hidden enemy becomes a frozen last-seen record; sound
+locations are distance-fuzzed before entering the worker; teammate sightings
+arrive after 0.4-1.0 seconds and never update while hidden. Aim uses a bounded
+second-order yaw/pitch motor with correlated noise rather than direct snaps.
+Combat movement holds human-sized strafes, adds grounded cooldown-bounded
+evasive jumps, and closes with a selected melee tool when ammunition is truly
+exhausted. Reload always preempts equipment selection because changing tools
+would cancel the authoritative reload. Under serious pressure, capable classes
+request one validated block or selected prefab as cover; Miner/Zombie route
+obstructions request ordinary melee mining rather than editing VXL directly.
+
+`BotActionGateway` accepts suggestions but owns no gameplay mutation.
+Shooting/reload/mining/building route through public combat methods. Oriented
+grenades, rockets, drills, block cannon, and specialist launchers route through
+`OrientedActionService`, which owns cadence, stock, projectile registration,
+and normal native replication.
+Deployables route through `DeployableActionService`, which is also used by
+retail packet handlers and repeats alive/spawned, committed class, normalized
+loadout, held tool, range, stock, ownership, and entity-limit checks. Prefab
+placement routes through the shared `PrefabActionService`. It reserves block
+stock up front, validates the normalized selected prefab and construction
+safety, then commits at most the configured number of cells per tick. The
+proven owner/observer packet split is preserved: owner packet 32, observer
+colored packet 33, then owner packet 29 on completion.
+
+`ConstructionSafetyService` protects authored spawn/objective/base zones and
+rejects overlap with friendly active paths or team reservations. Reservations
+are bounded, expire automatically, and are cleared at round reset. Friendly
+paths are read on demand rather than copied every motor tick, keeping this
+policy out of the 60 Hz hot path.
+
+## Domain modules
+
+`protocol/packet_handler.py` owns framing validation and registry dispatch.
+Domain behavior lives under `server/handlers/`: `movement`, `blocks`, `combat`,
+`equipment`, `deployables`, `team`, `social`, `world`, and `diagnostics`. Each
+handler validates the sender and packet, invokes one domain operation, and
+requests replication. Packet decoding itself does not mutate gameplay state.
+
+`Player` remains the compatibility facade used by modes and existing handlers.
+Its internal responsibilities should be extracted behind that facade in this
+order: equipment selection, input buffering, movement simulation, and
+replication snapshot construction. This order isolates the class/loadout bug
+without forcing a risky movement rewrite at the same time.
+
+## Compatibility rules
+
+- Do not change packet IDs, byte layouts, reliable/unreliable flags, or retail
+  coordinate conventions without compiled-client evidence.
+- Do not use `aoslib-reversed` as byte-layout ground truth. It is useful for
+  intent and algorithms; IDA/live captures and `shared/packet.pyx` determine
+  the actual wire contract.
+- Map full sync must stream native column-span records with the required `(x,
+  y)` framing. Sending raw VXL bytes or explicitly expanding implicit
+  underground voxels has crashed stock clients.
+- Reconciliation stamps are per recipient. A global stamp can make one client
+  correct against another client's input history.
+- Prefer short invariant comments in code. Investigation history, rejected
+  approaches, and reproduction evidence belong in
+  [ENGINEERING_NOTES.md](ENGINEERING_NOTES.md).
+
+## Release gates
+
+An architecture change is incomplete until the full test suite passes, the
+production-config 50-player gate passes, and a clean retail client survives a
+movement plus round-reset scenario. Exact commands and acceptance thresholds
+are in [RUNBOOK.md](RUNBOOK.md) and
+[SERVER_PERFORMANCE.md](SERVER_PERFORMANCE.md).

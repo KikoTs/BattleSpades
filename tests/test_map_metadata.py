@@ -82,3 +82,35 @@ def test_safe_terrain_rejects_roofs_and_water():
     assert not wm._safe_spawn_column(100, 100)
     assert not wm._safe_spawn_column(200, 200)
     assert wm._safe_spawn_column(150, 150)
+
+
+def test_voxel_only_map_base_anchor_is_nearest_safe_team_region_center():
+    wm = WorldManager(ServerConfig())
+    wm.map = _Terrain(lambda _x, _y: 230)
+    wm._spawn_candidates[TEAM1] = [
+        (64, 256),
+        (100, 128),
+        (120, 128),  # lexicographic median, but nowhere near team base centre
+        (128, 256),
+        (180, 384),
+    ]
+
+    x, y, _z = wm.team_base_anchor(TEAM1)
+
+    assert (x, y) == (128.5, 256.5)
+
+
+def test_voxel_only_map_spawns_stay_clustered_around_team_base(monkeypatch):
+    wm = WorldManager(ServerConfig())
+    wm.map = _Terrain(lambda _x, _y: 230)
+    wm._spawn_candidates[TEAM1] = [
+        (64, 128),   # old whole-region shuffle could pick this first
+        (128, 256),
+        (140, 256),
+        (160, 256),  # outside the intended fallback base cluster
+    ]
+    monkeypatch.setattr("server.world_manager.random.shuffle", lambda values: None)
+
+    x, y, _z = wm.get_spawn_point(TEAM1)
+
+    assert (x, y) == (128.5, 256.5)

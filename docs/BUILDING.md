@@ -14,7 +14,7 @@ C toolchain and Python development headers.
 | **Alpine** | `apk add build-base python3-dev py3-pip` |
 | **macOS** | `xcode-select --install` |
 
-Python **3.8+** (3.12 is what the project is developed against).
+Python **3.12** is the pinned release-build runtime.
 
 ## The easy path
 
@@ -39,6 +39,35 @@ python setup.py build_ext --inplace      # or: python scripts/build.py
 Re-run `build_ext` after editing any `.pyx`/`.pxd`. **Stop the server first** —
 a running process locks the compiled `.pyd`/`.so`.
 
+## Portable release build
+
+Install the pinned release toolchain, compile the native modules, freeze the
+one-directory launcher, and stage the archive:
+
+```bash
+python -m pip install -r requirements-release.txt
+python setup.py build_ext --inplace
+python -m pytest tests -q
+python -m PyInstaller --noconfirm --clean BattleSpades.spec
+python scripts/package_release.py --platform linux --architecture x86_64
+```
+
+Use `windows`, `linux`, or `macos` for `--platform` and `x86_64` or `arm64`
+for `--architecture`. The labels must match the machine that compiled the
+native modules. The command writes a versioned directory and zip under
+`release-dist/`.
+
+Validate the staged launcher from a working directory outside the release:
+
+```bash
+/absolute/path/to/release-dist/BattleSpades-*/BattleSpades --version
+/absolute/path/to/release-dist/BattleSpades-*/BattleSpades --check
+```
+
+On Windows use `BattleSpades.exe`. `--check` validates configuration, maps,
+prefabs, ENet/Cython/Recast imports, and a real spawned worker without opening
+the gameplay listener.
+
 ## Verifying the build
 
 ```bash
@@ -49,7 +78,7 @@ python run_server.py            # boots on port 27015
 
 ## Multi-platform / cross-compilation
 
-The project currently ships on **Windows x64** and **Linux amd64 / arm64**.
+The release matrix covers **Windows, Linux, and macOS** on **x86_64 and arm64**.
 The Cython extensions cross-compile cleanly with the usual `setup.py` flags; the
 friction is entirely **ENet**.
 

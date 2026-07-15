@@ -88,8 +88,9 @@ def test_world_parachute_matches_stock_gravity():
     normal.update(DT, [])
     chute.update(DT, [])
 
-    # world.pyd Player.update @ 0x10012EB9: type 1 parachute receives
-    # 0.75 * dt * gravity.  (The same branch selects high horizontal drag.)
-    expected_chute_vz = (DT * 1.0 * 0.75) / (1.0 + DT)
+    # world.pyd Player.update @ 0x10012EFB: an active type-1 parachute
+    # receives 0.05 * dt * gravity.  The separate 0.75 branch belongs to
+    # passive jetpack/hover state, not the parachute.
+    expected_chute_vz = (DT * 1.0 * 0.05) / (1.0 + DT)
     assert chute.velocity.z == pytest.approx(expected_chute_vz, abs=1e-6)
     assert chute.velocity.z < normal.velocity.z

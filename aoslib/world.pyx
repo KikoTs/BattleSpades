@@ -33,6 +33,7 @@ _PLAYER_HEIGHT = _PLAYER_STANDING_BODY_HEIGHT
 _PLAYER_CROUCH_HEIGHT = _PLAYER_CROUCHING_BODY_HEIGHT
 _PLAYER_CROUCH_SHIFT = 0.9
 _FALL_SLOW_DOWN = 0.24
+_SEVERE_LANDING_VELOCITY = 0.8
 _FALL_DAMAGE_VELOCITY = 0.58
 _FALL_DAMAGE_SCALAR = 4096.0
 _PLAYER_CENTER_OFFSET_STANDING = 0.9
@@ -56,8 +57,8 @@ _DEBUG_MOVEMENT_DEFAULTS = {
     # ground friction divisor is 1+4*dt, air is 1+2*dt — measured, not the
     # other way around as the aoslib-reversed reimplementation claims.
     # Jump impulse measured live: vz after the jump frame is exactly
-    # (-0.36 * jump_multiplier) / (1 + dt) — base impulse -0.36, and it
-    # REPLACES the gravity step on the jump frame.
+    # (-0.36 * jump_multiplier + gravity * dt) / (1 + dt): retail assigns
+    # the base impulse first, then applies the ordinary gravity step.
     "jump_impulse": -0.36,
     "ground_friction": 4.0,
     "air_friction": 2.0,
@@ -654,13 +655,18 @@ def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
     Mutates position/velocity in place. Returns
     (climbed, landed, airborne, wade_or_None, crouch); wade_or_None is the new
     wade value only on a landing frame (else None -> caller keeps its value)."""
-    cdef double px = position.x, py = position.y, pz = position.z
-    cdef double vx = velocity.x, vy = velocity.y, vz = velocity.z
+    # Retail stores every movebox intermediate as IEEE-754 float32.  Keeping
+    # these in double changes voxel selection at exact contact planes (for
+    # example 223.75 + 0.89999998 + 1.3499999 is 226.0 in float32 but remains
+    # 225.99999988 in double), sending client and server down different
+    # collision branches.
+    cdef float px = position.x, py = position.y, pz = position.z
+    cdef float vx = velocity.x, vy = velocity.y, vz = velocity.z
     cdef bint cr = bool(crouch), hv = bool(hover), sp = bool(sprint)
     cdef bint up = bool(can_uphill), air = bool(airborne), wd = bool(wade)
-    cdef double v35, v6, v32, m, rad, v31, v36, v40, v33, wx, wy
-    cdef double v34, v15, v37, v45, v41, v46, v49, v54, v22, v57
-    cdef double v26, v27, v28
+    cdef float v35, v6, v32, m, rad, v31, v36, v40, v33, wx, wy
+    cdef float v34, v15, v37, v45, v41, v46, v49, v54, v22, v57
+    cdef float v26, v27, v28
     cdef int lp, v10, v12, i14, i17, i18, ii
     cdef bint climbed = False, advanced, hit, overlap
 
@@ -969,7 +975,9 @@ cdef class Player(Object):
     cdef bint _down
     cdef bint _fall
     cdef bint _hover
-    cdef bint _jetpack
+    # Retail stores ``selected_jetpack - NO_JETPACK`` (0..4).  Keeping only a
+    # boolean erases the per-pack thrust branch in Player.update.
+    cdef int _jetpack
     cdef bint _jetpack_active
     cdef bint _jetpack_passive
     cdef bint _jump
@@ -1011,7 +1019,7 @@ cdef class Player(Object):
         self._down = False
         self._fall = False
         self._hover = False
-        self._jetpack = False
+        self._jetpack = 0
         self._jetpack_active = False
         self._jetpack_passive = False
         self._jump = False
@@ -1074,9 +1082,12 @@ cdef class Player(Object):
 
     property jetpack:
         def __get__(self):
-            return bool(self._jetpack)
+            return int(NO_JETPACK) + self._jetpack
         def __set__(self, value):
-            self._jetpack = bool(value)
+            cdef int jetpack_id = int(value)
+            if jetpack_id < int(NO_JETPACK) or jetpack_id >= int(NO_JETPACK) + int(NUM_JETPACK):
+                jetpack_id = int(NO_JETPACK)
+            self._jetpack = jetpack_id - int(NO_JETPACK)
 
     property jetpack_active:
         def __get__(self):
@@ -1291,25 +1302,68 @@ cdef class Player(Object):
         # wade is NOT recomputed here: the live engine holds the previous
         # value while airborne and only re-evaluates it on ground contact
         # (after the move, below). Oracle-calibrated.
-        self._jump_this_frame = bool(self._jump)
+        jump_requested = bool(self._jump)
+        was_airborne = bool(self._airborne)
+        # Retail consumes the one-frame request regardless of whether it can
+        # launch.  An airborne request is a no-op; it must not reassign the
+        # impulse every frame while SPACE remains held.
+        self._jump = False
         jumped_this_frame = False
-        if self._jump:
-            self._jump = False
-            self._velocity.z = _movement_override("jump_impulse") * self._jump_multiplier
-            self._airborne = True
-            jumped_this_frame = True
+        ordinary_jump_this_frame = False
+        if jump_requested:
+            if self._jetpack_active and 1 <= self._jetpack <= 4:
+                # world.pyd Player.update @ 0x10012C2F..0x10012CB1 selects
+                # active pack thrust before it considers the airborne flag.
+                # This ordering matters at ledge contact: held SPACE with an
+                # active Engineer pack gets the small 0.020 thrust even while
+                # the previous frame is grounded.  Falling through to the
+                # ordinary -0.36 jump impulse produces a retail rollback as
+                # soon as client and server disagree by one contact frame.
+                if self._jetpack == 1:
+                    jetpack_thrust = 0.045
+                elif self._jetpack == 2:
+                    jetpack_thrust = 0.0125
+                elif self._jetpack == 3:
+                    jetpack_thrust = 0.020
+                else:
+                    jetpack_thrust = 0.025
+                self._velocity.z -= ((_GLOBAL_GRAVITY + 1.0) * jetpack_thrust) * 0.5
+                self._fall_distance = 0.0
+                # Native +104 is still jump_requested && !was_airborne for an
+                # active pack.  Character uses this flag for its post-physics
+                # network-position restore, so preserve it independently of
+                # which vertical impulse branch ran.
+                jumped_this_frame = not was_airborne
+            elif not was_airborne:
+                self._velocity.z = _movement_override("jump_impulse") * self._jump_multiplier
+                # Native boxclipmove owns the airborne transition.  Keeping
+                # the frame-start value through acceleration/friction gives a
+                # grounded launch one final ground-horizontal step.
+                jumped_this_frame = True
+                ordinary_jump_this_frame = True
+        self._jump_this_frame = jumped_this_frame
 
         # Oracle-calibrated: accel is the selected class multiplier (the
         # crouch/sneak and sprint multipliers REPLACE the base multiplier,
         # they do not stack) scaled by dt — no 3.0 base factor.
-        if (self._crouch and not self._wade) or self._sneak:
+        # Native ``world.pyd`` 0x10012D65 reads the crouch flag at +108 and
+        # the *hover* flag at +124 here.  Wade lives at +156 and only selects
+        # horizontal friction below; excluding wading crouch from this branch
+        # makes the server accelerate 40% faster than retail in shallow water.
+        if (self._crouch and not self._hover) or self._sneak:
             accel = self._crouch_sneak_multiplier * _movement_override("crouch_sneak_multiplier_scale")
         elif self._sprint and not self._burdened:
             accel = self._sprint_multiplier * _movement_override("sprint_multiplier_scale")
         else:
             accel = self._accel_multiplier * _movement_override("accel_multiplier_scale")
         if self._airborne:
-            accel *= 0.5
+            # Engineer/UGC packs trade horizontal control for climb.  Retail
+            # applies 0.1 while they are actively firing; normal/Rocketeer
+            # packs and ordinary airborne movement retain the 0.5 factor.
+            if self._jetpack_active and not self._wade and self._jetpack in (3, 4):
+                accel *= 0.1
+            else:
+                accel *= 0.5
         accel *= dt
 
         if (self._up or self._down) and (self._left or self._right):
@@ -1332,26 +1386,48 @@ cdef class Player(Object):
 
         divisor = dt + 1.0
         gravity_step = dt * _GLOBAL_GRAVITY
-        if self._hover:
+        if self._jetpack_passive:
+            # Atomic retail oracle: Engineer active+passive yields
+            # (-0.020 + dt*0.75)/(1+dt). Passive is a distinct 0.75-gravity
+            # state; normal active thrust leaves it false.
             gravity_step *= 0.75
-        if self._parachute_active and self._parachute:
-            gravity_step *= 0.75
-        elif self._jetpack_active:
+        elif self._parachute_active and self._parachute:
             gravity_step *= 0.05
         # Oracle-calibrated: gravity applies normally while wading (the
         # airborne bounce frames during a water-floor settle show the full
         # gravity step with wade=1). Only the crouch buoyancy differs.
-        # On the jump frame the impulse REPLACES the gravity step entirely
-        # (measured: post-frame vz == impulse / (1 + dt) exactly).
-        if jumped_this_frame:
-            pass
-        elif self._wade and self._crouch:
-            self._velocity.z += ((_GLOBAL_GRAVITY + 1.0) * 0.025) * 0.5
-        else:
-            self._velocity.z += gravity_step
+        # Retail world.pyd applies gravity after assigning the jump impulse in
+        # the same frame.  This ordering is collision-sensitive near voxel
+        # edges: omitting the gravity step changes the first-frame vz enough
+        # for client and server boxclipmove to choose different branches.
+        # Hover (+124) wraps/skips the complete gravity-addition block in
+        # stock world.pyd 0x10012EAD. The adjacent 0.75 multiplier belongs to
+        # passive jetpack state (+180), not hover.
+        if not self._hover:
+            if jumped_this_frame:
+                self._velocity.z += gravity_step
+            elif self._wade and self._crouch:
+                self._velocity.z += ((_GLOBAL_GRAVITY + 1.0) * 0.025) * 0.5
+            else:
+                self._velocity.z += gravity_step
         self._velocity.z /= divisor
 
-        if self._wade or self._hover or self._jetpack_active or self._parachute_active:
+        # A deployed parachute cancels accumulated falling distance every
+        # native update (world.pyd 0x10012CD0). It does not apply the adjacent
+        # 0.75 landing multiplier; that belongs to passive jetpack state.
+        if self._parachute_active:
+            self._fall_distance = 0.0
+
+        # Native world.pyd 0x10012F25-0x10012F7C keeps ``1 + dt`` for an
+        # airborne active *or passive* jetpack.  This is distinct from both
+        # ordinary air drag and class water friction.  Treating active flight
+        # as wading made Engineer's authoritative horizontal velocity decay
+        # roughly eight times too fast, so every owner row pulled W+SPACE
+        # flight backward. Hover and parachute activity do not select this
+        # branch in the stock mover.
+        if self._airborne and (self._jetpack_active or self._jetpack_passive):
+            horizontal_divisor = divisor
+        elif self._wade:
             horizontal_divisor = (dt * (self._water_friction * _movement_override("water_friction_scale"))) + 1.0
         elif not self._airborne:
             horizontal_divisor = (dt * _movement_override("ground_friction")) + 1.0
@@ -1362,6 +1438,7 @@ cdef class Player(Object):
 
         _collide_with_players(self, positions, dt)
         landing_speed = self._velocity.z
+        move_start_z = self._position.z
         # Single-pass boxclipmove port (aoslib.world.so @0x3e90). It owns the
         # airborne/wade flags exactly as the compiled engine does: airborne is
         # set inside the move (cleared on a downward landing or a climb, held
@@ -1380,6 +1457,16 @@ cdef class Player(Object):
         )
         self._crouch = new_crouch
 
+        # Native sub_10007820 accumulates actual downward displacement after
+        # boxclipmove, not pre-impact velocity. Upward step/glide motion beyond
+        # 0.1 blocks clears the fall, which is why the Arctic slope landing is
+        # a slowdown but deals no damage.
+        fall_delta = self._position.z - move_start_z
+        if fall_delta > 0.0:
+            self._fall_distance += fall_delta
+        elif fall_delta < -0.1:
+            self._fall_distance = 0.0
+
         if self._lock_box is not None and len(self._lock_box) == 6:
             x1, y1, z1, x2, y2, z2 = self._lock_box
             self._position.x = min(max(self._position.x, x1), x2)
@@ -1391,7 +1478,12 @@ cdef class Player(Object):
         else:
             self._climb_timer = max(0.0, self._climb_timer - dt)
 
-        if jumped_this_frame:
+        if ordinary_jump_this_frame:
+            # The ported box mover does not expose native's ordinary launch
+            # transition, so preserve the calibrated force for the -0.36
+            # branch.  Do not apply it merely because jump_this_frame is set:
+            # retail also sets that flag for a grounded active jetpack, whose
+            # much smaller thrust remains contact-controlled by boxclipmove.
             self._airborne = True
         else:
             self._airborne = bool(airborne)
@@ -1405,29 +1497,52 @@ cdef class Player(Object):
             self._velocity.z = 0.0
             collided_down = True
 
-        # Idle ledge-lip nudge: when grounded and not pressing a movement key,
-        # the live engine creeps toward a hole centre at the lip. Without this
-        # the server stands still where the client drifts -> the reconciliation
-        # anchor diverges and yanks the player into the cliff ("randomly stuck
-        # on cliffs and edges").
-        if not self._airborne:
+        # world.pyd enters one shared post-box landing branch whenever Z
+        # velocity is zero. This includes X/Y glides that may retain the
+        # airborne flag; checking only ``not airborne`` misses their native
+        # ledge-lip nudge.
+        if self._velocity.z == 0.0:
             _check_for_ground_holes(
                 self._position, self._velocity, dt, map_obj,
                 self._crouch, self._hover,
                 self._up, self._down, self._left, self._right,
             )
 
-        if collided_down and landing_speed > _movement_override("fall_slow_down"):
-            self._velocity.x *= 0.7
-            self._velocity.y *= 0.7
-            effective_landing_speed = landing_speed
-            if self._parachute_active and self._parachute:
-                effective_landing_speed *= 0.75
-            if effective_landing_speed > _FALL_DAMAGE_VELOCITY:
-                damage = effective_landing_speed - _FALL_DAMAGE_VELOCITY
-                damage = damage * damage * _FALL_DAMAGE_SCALAR
-                if self._wade:
-                    damage *= self._fall_on_water_multiplier
+            fall = self._fall_distance * _GLOBAL_GRAVITY
+            if self._jetpack_passive and 1 <= self._jetpack <= 4:
+                fall *= 0.75
+            span = self._fall_max_distance - self._fall_min_distance
+            if span > 0.0:
+                damage_ratio = (
+                    (fall - self._fall_min_distance) / span
+                )
+            else:
+                damage_ratio = 1.0 if fall >= self._fall_max_distance else 0.0
+            damage_ratio = min(1.0, max(0.0, damage_ratio))
+            damage = int(self._fall_max_damage * damage_ratio)
+            if self._position.z > 237.0:
+                damage = int(damage * self._fall_on_water_multiplier)
+            self._fall_distance = 0.0
+
+            if landing_speed <= _movement_override("fall_slow_down"):
+                return damage
+
+            # world.pyd sub_10012B80 @ 0x100130F7 gates this path on post-clip
+            # velocity.z == 0, not on a dedicated downward-collision result.
+            # A terrain-step glide can zero Z while boxclipmove reports a
+            # climb. Excluding that frame left the server at twice retail's
+            # horizontal speed and created a 0.68-block correction six frames
+            # later. Ordinary shallow landings keep XY; the separate >0.8
+            # branch applies the stock severe-fall multiplier of exactly 0.5.
+            severe_threshold = (
+                _SEVERE_LANDING_VELOCITY / _GLOBAL_GRAVITY
+                if _GLOBAL_GRAVITY > 0.0
+                else float("inf")
+            )
+            if landing_speed > severe_threshold:
+                self._velocity.x *= 0.5
+                self._velocity.y *= 0.5
+            if damage:
                 return damage
             return -1
 

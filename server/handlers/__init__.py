@@ -1,30 +1,24 @@
-"""server.handlers — packet-handler placeholder package.
+"""Domain packet-handler boundaries for the incremental server refactor.
 
-Today the active handlers all live in `protocol/packet_handler.py` (one big
-file with @register_handler decorators). As we add support for the rest of
-the ~127 protocol packets, we'll factor groups out into modules here:
+The active decorator registry remains in :mod:`protocol.packet_handler` while
+characterization tests are added. Handlers move here one domain at a time:
 
-    server/handlers/
-        movement.py    # ClientData(4), PositionData(116)
-        combat.py      # ShootPacket(6), Damage(37), KillAction(46)
-        block.py       # BlockBuild(32), BlockBuildColored(33), BlockOccupy(34),
-                       # BlockLiberate(35), BlockLine(40), PaintBlock(7)
-        chat.py        # ChatMessage(49), LocalisedMessage(50), VoiceData(103)
-        world.py       # UseOrientedItem(10) (grenades), Disguise(95)
-        team.py        # ChangeTeam(77), ChangeClass(78), ForceTeamJoin(115)
-        place.py       # PlaceMG(87), PlaceRocketTurret(88), PlaceLandmine(89),
-                       # PlaceMedPack(90), PlaceRadarStation(91), PlaceC4(92),
-                       # DetonateC4(93), PlaceFlareBlock(104), PlaceUGC(97)
-        admin.py       # GenericVoteMessage(47), InstantiateKickMessage(48)
-        ugc.py         # SetUGCEditMode(12), RequestUGCEntities(99),
-                       # UGCMessage(100), InitialUGCBatch(98)
-        auth.py        # SteamSessionTicket(105), Password(111),
-                       # PasswordProvided(113)
+``movement``
+    Client input, position reports, reconciliation, and movement abilities.
+``blocks``
+    Individual/line/prefab build, paint, damage, collapse, and map journaling.
+``combat``
+    Shooting, melee, damage, death, projectiles, and explosions.
+``equipment``
+    Class/loadout selection and deployable authorization/lifecycles.
+``teams``
+    Team changes, spawn selection, and round lifecycle requests.
+``social_admin``
+    Chat, votes, authentication, and administrative commands.
 
-Each module would expose its own @register_handler decorators. The current
-all-in-one `protocol/packet_handler.py` is fine for ~14 handlers; once we
-get past ~30 it becomes worth splitting.
-
-This package exists now so the structure is visible; modules will be
-filled out as part of GOAL.md Phase 1.
+Extraction rule: decoding stays in the protocol layer; a domain handler only
+validates the authenticated sender, invokes one authoritative operation, and
+requests replication. Do not move a handler without characterization tests for
+its accepted packet and rejection paths. Importing this package intentionally
+has no registration side effects until the migration begins.
 """

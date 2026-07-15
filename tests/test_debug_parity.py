@@ -110,6 +110,7 @@ def test_debug_parity_hello_replies_without_game_packet(tmp_path):
     assert hello['enabled'] == 1
     assert hello['session_id'] == 'abc123'
     assert player.sent_packets == []
+    manager.close()
 
 
 def test_debug_parity_sample_generates_diff_and_logs(tmp_path):
@@ -154,6 +155,9 @@ def test_debug_parity_sample_generates_diff_and_logs(tmp_path):
     assert diff_payload['sample_id'] == 9
     assert diff_payload['payload']['diff']['flags'] == []
 
+    # close() drains the bounded writer queue; callers never need to wait for
+    # capture I/O while the server is running.
+    manager.close()
     capture_files = list(Path(tmp_path).glob('physics_parity_server_*.ndjson'))
     assert capture_files
     text = capture_files[0].read_text(encoding='utf-8')
@@ -198,6 +202,7 @@ def test_debug_parity_override_round_trip(tmp_path):
     assert replies[-1]['message_type'] == 'override_state'
     assert replies[-1]['payload']['overrides']['standing_pos_above_ground'] == 2.25
     assert replies[-1]['payload']['overrides']['standing_height'] == 2.7
+    manager.close()
 
 
 def test_debug_parity_reports_wade_mismatch(tmp_path):
@@ -264,3 +269,35 @@ def test_debug_parity_reports_wade_mismatch(tmp_path):
     assert diff_payload['message_type'] == 'diff'
     assert 'wade_mismatch' in diff_payload['payload']['diff']['flags']
     assert diff_payload['payload']['diff']['categories']['wade'] is True
+    manager.close()
+
+
+def test_debug_parity_rate_limits_before_snapshot_work(tmp_path):
+    server, manager = _make_server(tmp_path)
+    player = DummyPlayer(server.world_manager)
+    server.players[player.id] = player
+    replies = []
+    snapshot_calls = []
+    manager._send_message = lambda addr, payload: replies.append(payload)
+    manager._build_authoritative_snapshot = lambda current: (
+        snapshot_calls.append(current) or {'snapshot': True}
+    )
+    manager._build_diff = lambda client, server: {
+        'flags': [],
+        'position_distance': 0.0,
+    }
+    message = {
+        'message_type': 'sample',
+        'session_id': 'rate-limit',
+        'player_id': player.id,
+        'payload': {'sample_id': 1, 'payload': {}},
+    }
+
+    manager.handle_transport_message(message, ('127.0.0.1', 40000))
+    message['payload']['sample_id'] = 2
+    manager.handle_transport_message(message, ('127.0.0.1', 40000))
+
+    assert len(snapshot_calls) == 1
+    assert len(replies) == 1
+    assert manager.rate_limited_samples == 1
+    manager.close()
