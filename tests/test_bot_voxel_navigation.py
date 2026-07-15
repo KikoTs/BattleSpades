@@ -2,15 +2,22 @@
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 import time
 from types import SimpleNamespace
 
 import shared.constants as C
 
 from server.bot_ai.director import BotDirector
-from server.bot_ai.messages import BotIntent, MovementAffordance, MovementIntent
-from server.bot_ai.voxel_navigation import VoxelTerrain
-from server.bot_ai.worker import WorkerVoxelWorld
+from server.bot_ai.messages import (
+    BotIntent,
+    MovementAffordance,
+    MovementIntent,
+    PerceptionFrame,
+    PlayerSnapshot,
+)
+from server.bot_ai.voxel_navigation import VoxelActionPlanner, VoxelTerrain
+from server.bot_ai.worker import BotBrain, WorkerVoxelWorld, _BrainState
 from server.config import ServerConfig
 from server.game_constants import TEAM1
 from server.main import BattleSpadesServer
@@ -194,3 +201,145 @@ def test_jump_request_is_a_bounded_pulse_not_a_leased_held_key() -> None:
     director._apply_motor(runtime, now + 4.0 / 60.0, 1.0 / 60.0)
     assert runtime.movement_input is not None
     assert runtime.movement_input[4] is False
+
+    runtime.intent = replace(
+        runtime.intent,
+        frame_id=101,
+        created_at=now + 8.0 / 60.0,
+        expires_at=now + 1.0,
+    )
+    server.loop_count = 108
+    director._apply_motor(runtime, now + 8.0 / 60.0, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+
+def test_vertical_bobbing_does_not_count_as_route_progress() -> None:
+    state = _BrainState(
+        last_position=(5.0, 5.0, 20.0),
+        last_progress_at=1.0,
+        stuck_attempts=2,
+        last_path_direction=(1.0, 0.0, 0.0),
+    )
+
+    BotBrain._record_progress(state, (5.0, 5.0, 18.8), 2.0)
+
+    assert state.last_progress_at == 1.0
+    assert state.stuck_attempts == 2
+
+
+def test_sideways_knockback_does_not_hide_a_route_stall() -> None:
+    state = _BrainState(
+        last_position=(5.0, 5.0, 20.0),
+        last_progress_at=1.0,
+        stuck_attempts=2,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path_goal=(20.0, 5.0, 20.0),
+    )
+
+    BotBrain._record_progress(state, (5.0, 6.0, 20.0), 2.0)
+
+    assert state.last_progress_at == 1.0
+    assert state.stuck_attempts == 2
+
+
+def test_water_exit_selects_the_nearest_dry_body_clear_surface() -> None:
+    columns = {
+        (8, 8): {239},
+        (9, 8): {239},
+        (10, 8): {239},
+        (11, 8): {237},
+    }
+    planner = VoxelActionPlanner(VoxelTerrain(_solid_columns(columns)))
+
+    step = planner.water_exit((8.5, 8.5, 236.75))
+
+    assert step is not None
+    assert step.goal == (11.5, 8.5, 234.75)
+    assert step.direction == (1.0, 0.0, 0.0)
+    assert step.affordance is MovementAffordance.JUMP
+
+
+def _navigation_player(
+    player_id: int,
+    team: int,
+    position: tuple[float, float, float],
+    *,
+    class_id: int,
+    wade: bool = False,
+    is_bot: bool = False,
+) -> PlayerSnapshot:
+    """Build a complete immutable player view for worker behavior tests."""
+
+    return PlayerSnapshot(
+        player_id=player_id,
+        generation=1,
+        team=team,
+        class_id=class_id,
+        alive=True,
+        spawned=True,
+        position=position,
+        eye=(position[0], position[1], position[2] - 1.0),
+        orientation=(1.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.0),
+        health=100,
+        tool=int(C.ZOMBIEHAND_TOOL),
+        blocks=100,
+        ammo_clip=0,
+        ammo_reserve=0,
+        is_bot=is_bot,
+        weapon_tool=int(C.ZOMBIEHAND_TOOL),
+        loadout=(int(C.ZOMBIEHAND_TOOL), int(C.ZOMBIE_PREFAB_TOOL)),
+        wade=wade,
+    )
+
+
+def test_wading_zombie_recovers_before_engaging_a_visible_survivor() -> None:
+    columns = {
+        (8, 8): {239},
+        (9, 8): {239},
+        (10, 8): {239},
+        (11, 8): {237},
+    }
+    world = WorkerVoxelWorld()
+    world.map_epoch = 1
+    world.topology_version = 1
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    brain = BotBrain(world, seed=4)
+    zombie = _navigation_player(
+        1,
+        TEAM1,
+        (8.5, 8.5, 236.75),
+        class_id=int(C.CLASS_ZOMBIE),
+        wade=True,
+        is_bot=True,
+    )
+    survivor = _navigation_player(
+        2,
+        1,
+        (20.5, 8.5, 234.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=now,
+        mode_id="zom",
+        players=(zombie, survivor),
+        mode_phase="ACTIVE",
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "water_recovery"
+    assert intent.movement.direction == (1.0, 0.0, 0.0)
+    assert intent.movement.affordance is MovementAffordance.JUMP
