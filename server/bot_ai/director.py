@@ -680,6 +680,23 @@ class BotDirector:
                     last_action_at=(
                         runtime.feedback_action_at if runtime is not None else 0.0
                     ),
+                    last_damage_at=float(
+                        getattr(player, "_last_combat_damage_at", 0.0)
+                    ),
+                    last_damage_source_id=int(
+                        getattr(player, "_last_damage_source_id", -1)
+                    ),
+                    last_damage_source_position=(
+                        tuple(
+                            float(value)
+                            for value in player._last_damage_source_position
+                        )
+                        if getattr(
+                            player, "_last_damage_source_position", None
+                        )
+                        is not None
+                        else None
+                    ),
                 )
             )
         return tuple(snapshots)
@@ -989,6 +1006,12 @@ class BotDirector:
             intent.action.kind is not BotActionKind.NONE
             and runtime.last_action_frame != intent.frame_id
         )
+        requested_tool = int(getattr(intent, "tool_id", -1))
+        if requested_tool >= 0 and int(getattr(player, "tool", -1)) != requested_tool:
+            # Tool choice is part of the worker intention, not only an action
+            # side effect. A threatened bot must visibly draw its gun during
+            # reaction time instead of standing with blocks/prefabs equipped.
+            self.gateway.select_tool(player, requested_tool)
         if action_due:
             runtime.last_action_frame = int(intent.frame_id)
             if intent.action.kind in (
