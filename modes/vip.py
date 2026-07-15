@@ -64,10 +64,12 @@ class VIPMode(BaseMode):
         super().__init__(server)
         md = mode_data.get("vip")
         overlay = getattr(server.config, "mode_settings", {}).get("vip", {})
-        self.score_limit = int(overlay.get(
-            "score_limit", int(CG.VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP)
+        self.score_limit = int(server.config.mode_rule(
+            "vip", "score_limit", "RULE_VIP_NOOF_ROUNDS"
         ))
-        self.time_limit = float(overlay.get("time_limit", md.default_time_limit))
+        self.time_limit = server.config.configured_time_limit(
+            "vip", md.default_time_limit
+        )
         self.selection_delay = float(overlay.get(
             "selection_delay", CG.VIP_SELECTION_DELAY
         ))
@@ -75,7 +77,12 @@ class VIPMode(BaseMode):
         self.minimum_team_size = int(overlay.get(
             "minimum_team_size", CG.VIP_MINIMUM_TEAM_SIZE_TO_START
         ))
-        self.sudden_death_enabled = bool(overlay.get("sudden_death", True))
+        self.sudden_death_enabled = bool(server.config.mode_rule(
+            "vip", "sudden_death", "RULE_ENABLE_SUDDEN_DEATH"
+        ))
+        self.vip_health_multiplier = float(server.config.mode_rule(
+            "vip", "vip_health_multiplier", "RULE_VIP_HEALTH"
+        ))
 
         self.phase = VIPPhase.WAITING
         self.vips: dict[int, Player | None] = {TEAM1: None, TEAM2: None}
@@ -327,6 +334,20 @@ class VIPMode(BaseMode):
             vip_class = int(C.MAFIA_VIPS[team])
             vip.apply_class_selection(normalize_class_selection(vip_class))
             self.server.respawn_player(vip)
+            from server.game_constants import MAX_HEALTH
+            from shared.packet import SetHP
+
+            vip.health = max(1, int(round(
+                MAX_HEALTH * self.vip_health_multiplier
+            )))
+            if vip.connection is not None:
+                packet = SetHP()
+                packet.hp = vip.health
+                packet.damage_type = 0
+                packet.source_x, packet.source_y, packet.source_z = getattr(
+                    vip, "position", (0.0, 0.0, 0.0)
+                )
+                vip.connection.send(bytes(packet.generate()))
             self._set_vip_marker(vip, True)
             await self.broadcast_message(
                 f"{vip.name} is the {self.server.teams[team].name} VIP!"

@@ -1,0 +1,18 @@
+Retail session-transition compatibility patch
+=============================================
+
+The stock retail MapEnded(52) handler freezes GameScene, but it does not open
+the map loader and disconnect reason 18 does not reconnect this client build.
+BattleSpades reloads maps and modes over the existing authenticated connection.
+The included session_transition_patch.py moves the frozen scene into
+LoadingMenu so the normal InitialInfo and VXL validation handshake can run.
+
+Install in each retail client:
+
+1. Copy session_transition_patch.py beside the client's launcher.
+2. In aoslib/run.py, import session_transition_patch before BootClass() creates
+   the game manager.
+3. Restart the retail client once.
+
+The hook is Python 2 compatible and only wraps GameManager.update. It creates
+no thread, performs no update-loop file I/O, and opens no second connection.

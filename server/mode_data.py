@@ -97,7 +97,7 @@ def _mode_data(code: str) -> ModeData:
         # Round clock (seconds). Original game lengths from
         # constants_gamemode.DEFAULT_MODE_GAME_LENGTH (TDM = 900 = 15 min).
         default_time_limit={
-            'ctf': 2400.0, 'cctf': 5400.0, 'tdm': 900.0, 'dem': 900.0,
+            'ctf': 1800.0, 'cctf': 5400.0, 'tdm': 900.0, 'dem': 900.0,
             'mh': 1500.0, 'oc': 900.0, 'dia': 900.0, 'tc': 1500.0,
             'vip': 900.0, 'zom': 600.0, 'ugc': 0.0,
         }.get(code, 900.0),

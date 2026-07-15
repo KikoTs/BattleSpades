@@ -97,13 +97,17 @@ class BotActionGateway:
         # into a public domain service as well.
         return False
 
-    @staticmethod
-    def select_tool(player: "Player", tool_id: int) -> bool:
+    def select_tool(self, player: "Player", tool_id: int) -> bool:
         """Select an item only when it belongs to the normalized active loadout."""
 
         tool_id = int(tool_id)
         loadout = {int(value) for value in (getattr(player, "loadout", ()) or ())}
-        if tool_id not in loadout:
+        from server.game_rules import get_rules
+        config = getattr(self.server, "config", None)
+        if (
+            tool_id not in loadout
+            or not get_rules(config).is_tool_enabled(tool_id)
+        ):
             return False
         player.set_tool(tool_id, raw=True)
         return int(getattr(player, "tool", -1)) == tool_id
@@ -411,7 +415,12 @@ class BotActionGateway:
         packet.damage = 0.0
         packet.penetration = 0
         packet.affect_shooter = 0
-        packet.secondary = 0
+        # Bots use the same right-button/zoom state as a retail player.  This
+        # is required for remote sniper presentation (including the beam) and
+        # keeps packet semantics aligned with the replicated action flags.
+        packet.secondary = int(
+            bool(getattr(getattr(player, "input", None), "secondary_fire", False))
+        )
         # Stable seed keeps shotgun pellet expansion deterministic for a fixed
         # server loop and bot identity while still varying successive shots.
         packet.seed = (

@@ -12,7 +12,7 @@ from shared.packet import InitialInfo
 
 from server import class_data
 from server import mode_data
-from server.class_selection import DEFAULT_DISABLED_TOOLS
+from server.game_rules import get_rules
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -89,7 +89,11 @@ def _map_checksum(server: 'BattleSpadesServer') -> int:
 
 
 def _movement_speed_multipliers(server: 'BattleSpadesServer') -> list[float]:
-    return class_data.initial_info_movement_multipliers()
+    multiplier = float(get_rules(server.config).get("RULE_CHARACTER_SPEED"))
+    return [
+        float(value) * multiplier
+        for value in class_data.initial_info_movement_multipliers()
+    ]
 
 
 def _classes_disabled(server: 'BattleSpadesServer') -> list[int]:
@@ -100,13 +104,16 @@ def _classes_disabled(server: 'BattleSpadesServer') -> list[int]:
     if not allowed:
         return []
     all_class_ids = set(class_data.CLASS_IDS)
-    return sorted(all_class_ids - allowed)
+    disabled = all_class_ids - allowed
+    disabled.update(get_rules(server.config).disabled_classes())
+    return sorted(disabled)
 
 
 def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     """Construct an InitialInfo packet matching the active server state."""
     cfg = server.config
     mode = mode_data.get(cfg.game_mode)
+    rules = get_rules(cfg)
 
     pkt = InitialInfo()
 
@@ -136,17 +143,17 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
 
     # ---- Game rules / display -------------------------------------------
     pkt.classic = 1 if mode.classic else 0
-    pkt.enable_minimap = 0 if mode.classic else 1
+    pkt.enable_minimap = int(rules.enabled("RULE_ENABLE_MINI_MAP") and not mode.classic)
     # The mover receives nearby player positions separately from terrain.
     # Keep this flag and Player._build_player_collision_positions identical or
     # the two simulations apply different contact impulses.
     pkt.same_team_collision = 1 if cfg.same_team_collision else 0
     pkt.max_draw_distance = 192
-    pkt.enable_colour_picker = 1
-    pkt.enable_colour_palette = 1
-    pkt.enable_deathcam = 1
-    pkt.enable_sniper_beam = 1
-    pkt.enable_spectator = 1
+    pkt.enable_colour_picker = int(rules.enabled("RULE_ENABLE_COLOUR_PICKER"))
+    pkt.enable_colour_palette = pkt.enable_colour_picker
+    pkt.enable_deathcam = int(rules.enabled("RULE_ENABLE_DEATH_CAM"))
+    pkt.enable_sniper_beam = int(rules.enabled("RULE_ENABLE_SNIPER_BEAM"))
+    pkt.enable_spectator = int(rules.enabled("RULE_ENABLE_SPECTATORS"))
     pkt.exposed_teams_always_on_minimap = 0
     pkt.enable_numeric_hp = 1
     # The native InitialInfo field is a null-terminated string. Mafia modes
@@ -154,19 +161,30 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     pkt.texture_skin = 'mafia' if mode.mafia else None
     pkt.beach_z_modifiable = 1
     pkt.enable_minimap_height_icons = 0
-    pkt.enable_fall_on_water_damage = 1
-    pkt.block_wallet_multiplier = 1.0
-    pkt.block_health_multiplier = 1.0
+    pkt.enable_fall_on_water_damage = int(
+        rules.enabled("RULE_ENABLE_FALL_ON_WATER_DAMAGE")
+    )
+    pkt.block_wallet_multiplier = float(
+        rules.get("RULE_CHARACTER_BLOCK_WALLETS")
+    )
+    pkt.block_health_multiplier = float(rules.get("RULE_BLOCK_HEALTH"))
     pkt.enable_player_score = 1
-    pkt.allow_shooting_holding_intel = 1
+    pkt.allow_shooting_holding_intel = int(
+        rules.enabled("RULE_CTF_ENABLE_SHOOT_WITH_INTEL")
+    )
     pkt.friendly_fire = 1 if cfg.friendly_fire else 0
-    pkt.enable_corpse_explosion = 1
+    pkt.enable_corpse_explosion = int(
+        rules.enabled("RULE_ENABLE_CORPSE_EXPLOSION")
+    )
 
     # ---- Class / movement / loadouts ------------------------------------
     # Retail otherwise inserts FLAREBLOCK_TOOL as a fake first prefab tile.
     # The same tuple is the default for class normalization, keeping the menu
     # declaration and every CreatePlayer loadout in lockstep.
-    pkt.disabled_tools = list(DEFAULT_DISABLED_TOOLS)
+    # Disabled tool IDs are both a menu declaration and an authorization
+    # invariant. Config's server defaults retain the flare-tool compatibility
+    # suppression that DEFAULT_DISABLED_TOOLS historically provided.
+    pkt.disabled_tools = list(rules.selection_disabled_tools())
     pkt.disabled_classes = _classes_disabled(server)
     pkt.movement_speed_multipliers = _movement_speed_multipliers(server)
     pkt.ugc_prefab_sets = list(_DEFAULT_UGC_PREFAB_SETS)

@@ -228,3 +228,20 @@ def test_ctf_round_restart_replaces_objectives_without_duplicates():
     assert len(server.entity_registry.all()) == 4
     assert old_wire_ids.issubset(set(server.destroyed))
     assert mode.intel_holder == {TEAM1: None, TEAM2: None}
+
+
+def test_ctf_objective_rebuild_preserves_shared_map_resources():
+    server = _Server()
+    resource = server.entity_registry.place(
+        int(C.AMMO_CRATE), 10.0, 20.0, 30.0, kind="map_ammo",
+    )
+    mode = CTFMode(server)
+    # Simulate an allocator-reset collision with an id remembered by the old
+    # round. The live kind, not this stale id, must decide what gets removed.
+    mode._intel_entities[TEAM1] = resource.entity_id
+
+    asyncio.run(mode.on_mode_start())
+
+    assert server.entity_registry.get(resource.entity_id) is resource
+    assert resource.entity_id not in server.destroyed
+    assert len(server.entity_registry.all()) == 5

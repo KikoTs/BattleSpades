@@ -1,0 +1,29 @@
+{
+  "skybox_texture": "SecretBase.txt",
+  "fog_color": [55, 99, 199],
+  "ambient_sounds": [["amb_doomwind", [], 1.0, 0.0]],
+  "light_color": [255, 245, 245],
+  "light_direction": [-0.6, 0.4, 0.1],
+  "back_light_direction": [0.6, -0.1, -0.1],
+  "back_light_color": [69, 66, 45],
+  "ambient_light_color": [60, 56, 52],
+  "ambient_light_intensity": 0.2,
+  "static_light_color0": [237, 230, 148],
+  "team_one_spawn_area": [[[226, 189, 176], [30, 30, 50]]],
+  "team_two_spawn_area": [[[193, 420, 176], [30, 30, 50]]],
+  "team_one_base_point": [210, 174, 168],
+  "team_one_base_w_h_d": [35, 29, 31],
+  "team_two_base_point": [179, 403, 168],
+  "team_two_base_w_h_d": [29, 35, 31],
+  "ammo_crate_drop_points": [
+    [206, 411, 195], [172, 269, 181], [183, 298, 202],
+    [295, 291, 191], [210, 185, 195]
+  ],
+  "health_crate_drop_points": [
+    [181, 409, 195], [198, 314, 202], [187, 274, 186],
+    [295, 287, 191], [214, 176, 195]
+  ],
+  "block_crate_drop_points": [
+    [289, 279, 193], [177, 293, 205]
+  ]
+}

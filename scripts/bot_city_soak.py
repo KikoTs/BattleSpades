@@ -14,7 +14,7 @@ Examples::
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 import json
 import math
@@ -76,6 +76,8 @@ class _Actor:
     respawn_at: float = 0.0
     velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
     wade: bool = False
+    grounded: bool = True
+    airborne_until: float = 0.0
     last_action_kind: str = ""
     last_action_accepted: bool = True
     last_action_position: tuple[float, float, float] | None = None
@@ -84,6 +86,7 @@ class _Actor:
     last_damage_at: float = 0.0
     last_damage_source_id: int = -1
     last_damage_source_position: tuple[float, float, float] | None = None
+    life_id: int = 0
 
     def snapshot(self) -> PlayerSnapshot:
         """Publish exactly the fields available to the production worker."""
@@ -114,7 +117,7 @@ class _Actor:
             loadout=self.loadout,
             prefabs=self.prefabs,
             oriented_stock=stock,
-            grounded=not self.wade,
+            grounded=bool(self.grounded and not self.wade),
             wade=self.wade,
             last_action_kind=self.last_action_kind,
             last_action_accepted=self.last_action_accepted,
@@ -124,6 +127,7 @@ class _Actor:
             last_damage_at=self.last_damage_at,
             last_damage_source_id=self.last_damage_source_id,
             last_damage_source_position=self.last_damage_source_position,
+            life_id=self.life_id,
         )
 
 
@@ -158,7 +162,15 @@ class _Hazard:
 class CitySoak:
     """Run one deterministic accelerated match-shaped policy simulation."""
 
-    def __init__(self, *, map_name: str, mode: str, bots: int, seed: int) -> None:
+    def __init__(
+        self,
+        *,
+        map_name: str,
+        mode: str,
+        bots: int,
+        seed: int,
+        stranded_water_bots: int = 0,
+    ) -> None:
         self.map_name = map_name
         self.mode = "zom" if mode.lower() in {"zom", "zombie"} else "tdm"
         self.bot_count = max(2, min(32, int(bots)))
@@ -199,11 +211,70 @@ class CitySoak:
             TEAM2: self.canonical.team_base_anchor(TEAM2),
         }
         self.actors = self._make_actors()
+        self.stranded_water_bots = self._strand_bots_in_deep_water(
+            max(0, min(self.bot_count, int(stranded_water_bots)))
+        )
         self.profiles = {
             actor.player_id: self.profile_factory.create("mixed")
             for actor in self.actors
         }
         self.resources = self._make_resources()
+
+    def _strand_bots_in_deep_water(self, count: int) -> int:
+        """Place selected actors at the farthest real-map water columns.
+
+        This is an explicit soak fault injection, never a production spawn
+        policy. A multi-source shore distance field makes CastleWars choose its
+        true 132-cell outer sea instead of a convenient one-cell puddle.
+        """
+
+        if count <= 0:
+            return 0
+        water = {
+            (x, y)
+            for x in range(512)
+            for y in range(512)
+            if self.canonical.is_water_column(x, y)
+        }
+        frontier: deque[tuple[int, int]] = deque()
+        distance: dict[tuple[int, int], int] = {}
+        offsets = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        for cell in water:
+            if any(
+                0 <= cell[0] + dx < 512
+                and 0 <= cell[1] + dy < 512
+                and (cell[0] + dx, cell[1] + dy) not in water
+                for dx, dy in offsets
+            ):
+                frontier.append(cell)
+                distance[cell] = 1
+        while frontier:
+            cell = frontier.popleft()
+            for dx, dy in offsets:
+                neighbor = cell[0] + dx, cell[1] + dy
+                if neighbor in water and neighbor not in distance:
+                    distance[neighbor] = distance[cell] + 1
+                    frontier.append(neighbor)
+        candidates = sorted(
+            distance,
+            key=lambda cell: distance[cell],
+            reverse=True,
+        )
+        selected: list[tuple[int, int]] = []
+        for cell in candidates:
+            if all(math.dist(cell, previous) >= 32.0 for previous in selected):
+                selected.append(cell)
+            if len(selected) >= count:
+                break
+        for actor, (x, y) in zip(self.actors, selected):
+            actor.position = (
+                float(x) + 0.5,
+                float(y) + 0.5,
+                float(C.Z_ABOVE_WATERPLANE) - 1.25,
+            )
+            actor.velocity = (0.0, 0.0, 0.0)
+            actor.wade = True
+        return len(selected)
 
     def _make_actors(self) -> list[_Actor]:
         actors: list[_Actor] = []
@@ -311,6 +382,7 @@ class CitySoak:
             elapsed = step * DECISION_DT
             now = base + elapsed
             self._respawn_due(now)
+            self._settle_falling_actors()
             self.hazards = [item for item in self.hazards if item.expires_at > now]
             snapshots = tuple(actor.snapshot() for actor in self.actors)
             entities = self.resources + tuple(item.snapshot() for item in self.hazards)
@@ -364,6 +436,7 @@ class CitySoak:
                 "acceleration": round((steps * DECISION_DT) / max(wall_seconds, 1e-6), 2),
                 "native_nav_tiles": self.world.native_tile_count,
                 "alive": sum(actor.alive for actor in self.actors),
+                "water_remaining": sum(actor.wade for actor in self.actors),
                 "positions": {
                     str(actor.player_id): tuple(round(value, 2) for value in actor.position)
                     for actor in self.actors
@@ -372,7 +445,52 @@ class CitySoak:
         )
         return summary
 
+    def _settle_falling_actors(self) -> None:
+        """Apply accelerated gravity after terrain beneath an actor is lost.
+
+        The soak has no 60 Hz vertical integrator. Without this adapter, a bot
+        left above a mined/collapsed column remains suspended at its old z and
+        every legal horizontal candidate appears too far below to traverse.
+        Production uses native player gravity; this method only keeps the
+        offline diagnostic from reporting that harness artifact as an AI
+        navigation stall.
+        """
+
+        for actor in self.actors:
+            if not actor.alive or actor.wade:
+                continue
+            x = int(math.floor(actor.position[0]))
+            y = int(math.floor(actor.position[1]))
+            expected_support = int(round(actor.position[2] + 2.25))
+            landing = None
+            for support_z in range(max(2, expected_support), 239):
+                if not self.world.solid(x, y, support_z):
+                    continue
+                if self.world.solid(x, y, support_z - 1) or self.world.solid(
+                    x, y, support_z - 2
+                ):
+                    continue
+                landing = support_z
+                break
+            if landing is None or landing <= expected_support + 1:
+                continue
+            actor.position = (
+                actor.position[0],
+                actor.position[1],
+                float(landing) - 2.25,
+            )
+            actor.grounded = True
+            actor.airborne_until = 0.0
+
     def _apply_intent(self, actor: _Actor, intent, now: float) -> None:
+        if now >= actor.airborne_until:
+            actor.grounded = not actor.wade
+        if intent.movement.jump and actor.grounded and not actor.wade:
+            # The accelerated adapter has no 60 Hz vertical integrator. Keep a
+            # short airborne lease so two-phase jump/build recovery observes
+            # the same grounded transition the native Player physics emits.
+            actor.grounded = False
+            actor.airborne_until = now + 0.35
         old = actor.position
         direction = intent.movement.direction
         magnitude = math.hypot(direction[0], direction[1])
@@ -387,11 +505,17 @@ class CitySoak:
                 int(math.floor(candidate_x)),
                 int(math.floor(candidate_y)),
                 old[2],
-                allow_water=False,
+                # Dry actors must never enter water. A stranded actor must be
+                # able to traverse its cached water-only route toward shore.
+                allow_water=bool(actor.wade),
                 vertical_span=(8 if intent.movement.jump else 3),
             )
             if surface is not None:
                 actor.position = candidate_x, candidate_y, surface.support_z - 2.25
+            elif intent.debug_role == "stuck_emergency_drop":
+                # Native physics permits walking off an unsupported ledge.
+                # Gravity settles the actor on the next accelerated frame.
+                actor.position = candidate_x, candidate_y, old[2]
         actor.velocity = (
             (actor.position[0] - old[0]) / DECISION_DT,
             (actor.position[1] - old[1]) / DECISION_DT,
@@ -400,6 +524,8 @@ class CitySoak:
         # The forced waterbed supports a body at z=waterbed-2.25.  A solid at
         # the water-plane coordinate itself is still legal dry terrain.
         actor.wade = actor.position[2] >= float(C.Z_ABOVE_WATERPLANE) - 1.25
+        if actor.wade:
+            actor.grounded = False
         if intent.look is not None:
             lx = intent.look.target[0] - actor.position[0]
             ly = intent.look.target[1] - actor.position[1]
@@ -457,7 +583,14 @@ class CitySoak:
             return True
         if not self.world.has_line_of_sight(actor.position, target.position):
             return not melee
-        damage = 45 if melee else max(8, int(get_weapon_profile(actor.weapon_tool).base_damage * 0.45))
+        damage = (
+            45
+            if melee
+            else max(
+                8,
+                int(get_weapon_profile(actor.weapon_tool).base_damage * 0.45),
+            )
+        )
         target.health -= damage
         target.last_damage_at = now
         target.last_damage_source_id = actor.player_id
@@ -465,6 +598,7 @@ class CitySoak:
         if target.health <= 0:
             target.alive = False
             target.health = 0
+            target.life_id += 1
             target.respawn_at = now + 3.0
         return True
 
@@ -574,12 +708,20 @@ class CitySoak:
             actor.ammo_reserve = int(profile.reserve_ammo) if profile is not None else 0
             actor.tool = actor.weapon_tool if actor.weapon_tool >= 0 else actor.tool
             actor.blocks = int(C.CLASS_BLOCKS.get(actor.class_id, (50, 50))[0])
+            actor.grounded = True
+            actor.airborne_until = 0.0
 
     def _print_status(self, elapsed: float, now: float) -> None:
         rows = []
         for actor in self.actors:
             state = self.brain._states.get((actor.player_id, 1))
             intent = self.latest_intents.get(actor.player_id)
+            surface = self.world.action_planner.terrain.classify(
+                int(math.floor(actor.position[0])),
+                int(math.floor(actor.position[1])),
+                actor.position[2],
+                vertical_span=5,
+            )
             stationary = (
                 max(0.0, now - state.last_progress_at)
                 if state is not None
@@ -595,7 +737,23 @@ class CitySoak:
                     "ammo": [actor.ammo_clip, actor.ammo_reserve],
                     "tool": actor.tool,
                     "stuck_attempts": int(state.stuck_attempts) if state is not None else 0,
+                    "route_failures": (
+                        int(state.route_escape_failures)
+                        if state is not None else 0
+                    ),
+                    "strategic_stall": (
+                        round(max(0.0, now - state.strategic_progress_at), 1)
+                        if state is not None
+                        and state.strategic_progress_at > 0.0
+                        else 0.0
+                    ),
                     "stationary": round(stationary, 1),
+                    "support": (
+                        int(surface.support_z) if surface is not None else None
+                    ),
+                    "emergency_drop": bool(
+                        self.world.emergency_drop(actor.position)
+                    ),
                     "role": getattr(intent, "debug_role", "idle") or "idle",
                     "action": (
                         intent.action.kind.value if intent is not None else "none"
@@ -631,9 +789,21 @@ def main() -> int:
     parser.add_argument("--sim-seconds", type=float, default=120.0)
     parser.add_argument("--report-every", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--strand-water-bots",
+        type=int,
+        default=0,
+        help="fault-inject N bots into the real map's farthest water columns",
+    )
     args = parser.parse_args()
 
-    soak = CitySoak(map_name=args.map, mode=args.mode, bots=args.bots, seed=args.seed)
+    soak = CitySoak(
+        map_name=args.map,
+        mode=args.mode,
+        bots=args.bots,
+        seed=args.seed,
+        stranded_water_bots=args.strand_water_bots,
+    )
     summary = soak.run(seconds=args.sim_seconds, report_every=args.report_every)
     print("FINAL " + json.dumps(summary, sort_keys=True), flush=True)
     # These are correctness invariants, not tuning preferences.
@@ -646,7 +816,11 @@ def main() -> int:
             "navigation_stalls",
             "invalid_looks",
         )
-    ) or float(summary["max_water_seconds"]) > 3.0
+    ) or (
+        int(summary["water_remaining"]) > 0
+        if args.strand_water_bots > 0
+        else float(summary["max_water_seconds"]) > 3.0
+    )
     return 1 if failed else 0
 
 

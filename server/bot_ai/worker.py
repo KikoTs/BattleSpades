@@ -22,6 +22,7 @@ from .messages import (
     BotAction,
     BotActionKind,
     BotIntent,
+    BotIntentPriority,
     BotProfile,
     LookIntent,
     MapSnapshot,
@@ -89,6 +90,9 @@ _ZOMBIE_CLASSES = frozenset({
     int(C.CLASS_FAST_ZOMBIE),
     int(C.CLASS_JUMP_ZOMBIE),
 })
+_SNIPER_TOOLS = frozenset(
+    {int(C.SNIPER_TOOL), int(C.SNIPER2_TOOL)}
+)
 
 
 def _distance_squared(a: Vector3, b: Vector3) -> float:
@@ -135,6 +139,7 @@ class _TeamReport:
 
 @dataclass(slots=True)
 class _BrainState:
+    life_id: int = -1
     contacts: dict[int, LastSeenContact] = field(default_factory=dict)
     target_id: int | None = None
     acquired_at: float = 0.0
@@ -149,7 +154,15 @@ class _BrainState:
     last_path_direction: Vector3 = (0.0, 0.0, 0.0)
     last_position: Vector3 | None = None
     last_progress_at: float = 0.0
+    # Recovery pacing is deliberately separate from real displacement.
+    # Writing recovery attempts into ``last_progress_at`` used to let a bot
+    # push against the same base wall forever while appearing healthy.
+    next_stuck_recovery_at: float = 0.0
     stuck_attempts: int = 0
+    # Long-horizon strategic progress catches short oscillations that produce
+    # valid per-frame displacement without ever leaving a base bottleneck.
+    strategic_progress_at: float = 0.0
+    strategic_goal_distance: float | None = None
     aim_head: bool = False
     delayed_target_velocity: Vector3 = (0.0, 0.0, 0.0)
     next_oriented_at: float = 0.0
@@ -176,6 +189,24 @@ class _BrainState:
     peek_until: float = 0.0
     hold_until: float = 0.0
     last_action_feedback_frame: int = -1
+    # Two-phase self-build escape: jump first so the authoritative body-cell
+    # validator permits the block below, then place it while airborne.
+    escape_build_cell: tuple[int, int, int] | None = None
+    escape_build_until: float = 0.0
+    escape_direction: Vector3 = (0.0, 0.0, 0.0)
+    # After bounded dig/jump/build attempts fail, leave the failed Detour
+    # corridor briefly through a safe local voxel route before asking for the
+    # strategic objective again. This prevents immediate selection of the
+    # identical blocked corridor.
+    route_escape_goal: Vector3 | None = None
+    route_escape_until: float = 0.0
+    route_escape_failures: int = 0
+    # Resource pursuit is bounded: malformed/embedded official-map pickups
+    # must not capture a bot forever. Position is part of the key so a crate
+    # that falls with terrain can be considered again at its reachable spot.
+    resource_target: tuple[int, Vector3] | None = None
+    resource_target_since: float = 0.0
+    ignored_resources: set[tuple[int, Vector3]] = field(default_factory=set)
 
 
 class _DecisionComposer:
@@ -308,6 +339,7 @@ class WorkerVoxelWorld:
 
         self.map_epoch = int(snapshot.map_epoch)
         self.topology_version = int(snapshot.topology_version)
+        self.action_planner.invalidate_water_routes()
         self._vxl = None
         self._native_nav = None
         self._built_tiles.clear()
@@ -357,6 +389,13 @@ class WorkerVoxelWorld:
             return
         if int(delta.topology_version) <= self.topology_version:
             return
+        # A bridge can create a shore and a collapse can remove the next
+        # escape cell. Invalidate only routes whose columns were touched so a
+        # remote bullet hole cannot repeat a full-sea search for every swimmer.
+        changed_columns = frozenset(
+            (int(change.x), int(change.y)) for change in delta.changed_cells
+        )
+        self.action_planner.invalidate_water_routes(changed_columns)
         if self._vxl is None:
             self.topology_version = int(delta.topology_version)
             return
@@ -452,6 +491,186 @@ class WorkerVoxelWorld:
         if self.solid(x, y, support_z - 1) or self.solid(x, y, support_z - 2):
             return None
         return x, y, support_z
+
+    def water_bridge_line(
+        self,
+        position: Vector3,
+        direction: Vector3,
+        *,
+        max_cells: int = 6,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+        """Return a face-connected floor line across an immediate open gap.
+
+        Dry navigation never treats the stock waterbed as walkable.  When a
+        route reaches the shore (or another deep gap), this bounded probe lets
+        a builder extend the current floor with one native ``BlockLine``.  The
+        gameplay thread still validates stock, protected zones, bodies, and
+        current terrain before committing it.
+        """
+
+        dx, dy, _ = direction
+        if math.hypot(dx, dy) <= 1e-6:
+            return None
+        step_x, step_y = (
+            (1 if dx > 0.0 else -1, 0)
+            if abs(dx) >= abs(dy)
+            else (0, 1 if dy > 0.0 else -1)
+        )
+        start_x = int(math.floor(position[0]))
+        start_y = int(math.floor(position[1]))
+        support_z = int(round(position[2] + 2.25))
+        if not self.solid(start_x, start_y, support_z):
+            return None
+        cells: list[tuple[int, int, int]] = []
+        for distance in range(1, max(1, min(8, int(max_cells))) + 1):
+            x = start_x + step_x * distance
+            y = start_y + step_y * distance
+            if not (0 <= x < 512 and 0 <= y < 512):
+                break
+            if self.solid(x, y, support_z):
+                # Reached the far bank.  A single-cell hole is handled by the
+                # ordinary bridge action; reserve BlockLine for real spans.
+                break
+            if self.solid(x, y, support_z - 1) or self.solid(
+                x, y, support_z - 2
+            ):
+                break
+            cells.append((x, y, support_z))
+        if len(cells) < 2:
+            return None
+        return cells[0], cells[-1]
+
+    def overhead_block(self, position: Vector3) -> tuple[int, int, int] | None:
+        """Return the closest solid cell trapping the bot above its head."""
+
+        x = int(math.floor(position[0]))
+        y = int(math.floor(position[1]))
+        support_z = int(round(position[2] + 2.25))
+        for z in range(support_z - 3, max(-1, support_z - 7), -1):
+            if self.solid(x, y, z):
+                return x, y, z
+        return None
+
+    def emergency_drop(
+        self,
+        position: Vector3,
+        *,
+        max_drop: int = 32,
+    ) -> tuple[Vector3, Vector3] | None:
+        """Find an adjacent clear ledge exit after all safe routes fail.
+
+        Ordinary navigation permits drops of at most four voxels. A collapse
+        can nevertheless isolate a non-builder on a tall one-cell pillar. The
+        worker may choose this edge only after repeated recovery failures; the
+        gameplay process still applies normal gravity and fall damage.
+        """
+
+        current = self._terrain.classify(
+            int(math.floor(position[0])),
+            int(math.floor(position[1])),
+            position[2],
+            vertical_span=5,
+        )
+        if current is None:
+            return None
+        candidates: list[tuple[float, Vector3, Vector3]] = []
+        for dx, dy in (
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (1, -1),
+            (-1, 1),
+            (-1, -1),
+        ):
+            x, y = current.x + dx, current.y + dy
+            if not (1 <= x < 511 and 1 <= y < 511):
+                continue
+            # The body must be able to cross the ledge at its current height.
+            if self.solid(x, y, current.support_z - 1) or self.solid(
+                x, y, current.support_z - 2
+            ):
+                continue
+            limit = min(WATERBED_SUPPORT_Z, current.support_z + max_drop + 1)
+            for support_z in range(current.support_z + 5, limit):
+                if not self.solid(x, y, support_z):
+                    continue
+                if self.solid(x, y, support_z - 1) or self.solid(
+                    x, y, support_z - 2
+                ):
+                    continue
+                fall = float(support_z - current.support_z)
+                direction = _normalized_xy(float(dx), float(dy))
+                landing = (
+                    float(x) + 0.5,
+                    float(y) + 0.5,
+                    float(support_z) - 2.25,
+                )
+                candidates.append((fall, direction, landing))
+                break
+        if not candidates:
+            return None
+        _fall, direction, landing = min(candidates, key=lambda row: row[0])
+        return direction, landing
+
+    def hole_escape(
+        self, position: Vector3, preferred: Vector3
+    ) -> tuple[Vector3, int] | None:
+        """Find a nearby dry ledge above the bot and report its climb height."""
+
+        current = self._terrain.classify(
+            int(math.floor(position[0])),
+            int(math.floor(position[1])),
+            position[2],
+            vertical_span=5,
+        )
+        if current is None:
+            return None
+        preferred_xy = _normalized_xy(preferred[0], preferred[1])
+        candidates: list[tuple[float, Vector3, int]] = []
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            alignment = dx * preferred_xy[0] + dy * preferred_xy[1]
+            for distance in (1, 2):
+                sample = self._terrain.classify(
+                    current.x + dx * distance,
+                    current.y + dy * distance,
+                    position[2],
+                    vertical_span=16,
+                )
+                if sample is None or sample.water:
+                    continue
+                rise = current.support_z - sample.support_z
+                if rise <= 0:
+                    continue
+                candidates.append(
+                    (
+                        distance + rise * 0.15 - alignment * 0.35,
+                        (float(dx), float(dy), 0.0),
+                        rise,
+                    )
+                )
+        if not candidates:
+            return None
+        _score, direction, rise = min(candidates, key=lambda item: item[0])
+        return direction, rise
+
+    def jump_build_cell(
+        self, position: Vector3
+    ) -> tuple[int, int, int] | None:
+        """Return the empty face-supported cell directly below a jump."""
+
+        x = int(math.floor(position[0]))
+        y = int(math.floor(position[1]))
+        support_z = int(round(position[2] + 2.25))
+        target = (x, y, support_z - 1)
+        if (
+            support_z <= 2
+            or not self.solid(x, y, support_z)
+            or self.solid(*target)
+        ):
+            return None
+        return target
 
     def cover_direction(
         self, position: Vector3, threat: Vector3
@@ -584,7 +803,9 @@ class WorkerVoxelWorld:
             start, goal, agent_id=agent_id, velocity=velocity
         )
         if math.hypot(native_direction[0], native_direction[1]) > 1e-6:
-            self._last_affordance[agent_id] = MovementAffordance.WALK
+            self._last_affordance[agent_id] = self._immediate_affordance(
+                start, native_direction, abilities
+            )
             return native_direction
         path, affordance = self._a_star(start, goal, abilities=abilities)
         if not path:
@@ -598,6 +819,72 @@ class WorkerVoxelWorld:
         """Return the immediate topology edge selected for one crowd agent."""
 
         return self._last_affordance.get(int(agent_id), MovementAffordance.WALK)
+
+    def reset_agent_navigation(self, agent_id: int) -> None:
+        """Discard one failed worker-side crowd corridor.
+
+        Called only by the worker's bounded stuck recovery. The authoritative
+        player remains untouched; the next path query creates a fresh Detour
+        proxy re-anchored at the latest server position.
+        """
+
+        normalized = int(agent_id)
+        self._last_affordance.pop(normalized, None)
+        if self._native_nav is None:
+            return
+        try:
+            self._native_nav.remove_crowd_agent(normalized)
+        except (RuntimeError, TypeError, ValueError):
+            logger.exception(
+                "Native Recast crowd reset failed for bot %s", normalized
+            )
+
+    def _immediate_affordance(
+        self,
+        start: Vector3,
+        direction: Vector3,
+        abilities: frozenset[MovementAffordance],
+    ) -> MovementAffordance:
+        """Classify the first Recast steering edge using live voxel heights.
+
+        Detour returns a direction, not the off-mesh action needed by native
+        player physics.  Without this bridge a valid two-block climb is
+        flattened to WALK and bots repeatedly run into its face.
+        """
+
+        current = self._terrain.classify(
+            int(math.floor(start[0])),
+            int(math.floor(start[1])),
+            start[2],
+            vertical_span=5,
+        )
+        if current is None:
+            return MovementAffordance.WALK
+        tested: set[tuple[int, int]] = set()
+        for distance in (1.05, 2.05):
+            x = int(math.floor(start[0] + direction[0] * distance))
+            y = int(math.floor(start[1] + direction[1] * distance))
+            if (x, y) in tested or (x, y) == (current.x, current.y):
+                continue
+            tested.add((x, y))
+            sample = self._terrain.classify(
+                x, y, start[2], vertical_span=8, clearance=2
+            )
+            if sample is None:
+                continue
+            delta_z = sample.support_z - current.support_z
+            if (
+                MovementAffordance.JUMP in abilities
+                and (
+                    -2 <= delta_z < -1
+                    or (distance > 1.5 and abs(delta_z) <= 2)
+                )
+            ):
+                return MovementAffordance.JUMP
+            if delta_z > 1 and MovementAffordance.DROP in abilities:
+                return MovementAffordance.DROP
+            return MovementAffordance.WALK
+        return MovementAffordance.WALK
 
     @property
     def native_tile_count(self) -> int:
@@ -942,7 +1229,18 @@ class BotBrain:
         now = max(time.monotonic(), float(frame.created_at))
         profile = frame.profile or _fallback_profile(observer.player_id)
         self._consume_action_feedback(observer, state, now)
-        self._record_progress(state, observer.position, now)
+        teleported = self._record_progress(
+            state,
+            observer.position,
+            now,
+            life_id=observer.life_id,
+        )
+        if teleported:
+            reset_navigation = getattr(
+                self.world, "reset_agent_navigation", None
+            )
+            if callable(reset_navigation):
+                reset_navigation(observer.player_id)
         water_recovery = self._water_recovery(
             frame, observer, state, now
         )
@@ -1063,7 +1361,11 @@ class BotBrain:
         zombie_hunt = str(
             mode_decision.role if mode_decision is not None else ""
         ).startswith("zombie_hunt_")
-        resource = None if zombie_hunt else self._resource_goal(frame, observer)
+        resource = (
+            None
+            if zombie_hunt or target is not None
+            else self._resource_goal(frame, observer, state=state, now=now)
+        )
         if observer.carried_entity_id >= 0:
             objective = mode_objective
             objective_role = mode_decision.role if mode_decision is not None else ""
@@ -1313,20 +1615,66 @@ class BotBrain:
         )
 
     @staticmethod
-    def _record_progress(state: _BrainState, position: Vector3, now: float) -> None:
+    def _record_progress(
+        state: _BrainState,
+        position: Vector3,
+        now: float,
+        *,
+        life_id: int | None = None,
+    ) -> bool:
         """Track horizontal progress toward the requested route or goal.
 
         Vertical jump/water motion and sideways knockback are deliberately not
         progress; otherwise a bot can bob forever without entering recovery.
+        Returns true when a respawn/teleport discontinuity invalidates all
+        life-local navigation and perception memory.
         """
 
+        previous_life = state.life_id
+        life_changed = (
+            life_id is not None
+            and previous_life >= 0
+            and int(life_id) != previous_life
+        )
+        if life_id is not None:
+            state.life_id = int(life_id)
         previous = state.last_position
         state.last_position = position
         if previous is None:
             state.last_progress_at = now
-            return
+            return False
         move_x = float(position[0]) - float(previous[0])
         move_y = float(position[1]) - float(previous[1])
+        move_z = float(position[2]) - float(previous[2])
+        if (
+            life_changed
+            or math.hypot(move_x, move_y) >= 16.0
+            or abs(move_z) >= 16.0
+        ):
+            # Bot generation identifies the server-owned connection, not an
+            # individual life. Respawn and admin teleport must not carry a
+            # failed corridor/escape or last-seen target into the new body.
+            state.contacts.clear()
+            state.target_id = None
+            state.acquired_at = 0.0
+            state.path.clear()
+            state.path_goal = None
+            state.path_topology_version = -1
+            state.last_path_direction = (0.0, 0.0, 0.0)
+            state.last_affordance = MovementAffordance.WALK
+            state.last_progress_at = now
+            state.next_stuck_recovery_at = 0.0
+            state.stuck_attempts = 0
+            state.strategic_progress_at = now
+            state.strategic_goal_distance = None
+            state.escape_build_cell = None
+            state.escape_build_until = 0.0
+            state.route_escape_goal = None
+            state.route_escape_until = 0.0
+            state.route_escape_failures = 0
+            state.resource_target = None
+            state.resource_target_since = 0.0
+            return True
         route_x = float(state.last_path_direction[0])
         route_y = float(state.last_path_direction[1])
         route_length = math.hypot(route_x, route_y)
@@ -1353,13 +1701,35 @@ class BotBrain:
             and state.path_goal is None
             and math.hypot(move_x, move_y) >= 0.35
         )
+        if state.path_goal is not None:
+            strategic_distance = math.hypot(
+                float(state.path_goal[0]) - float(position[0]),
+                float(state.path_goal[1]) - float(position[1]),
+            )
+            if state.strategic_goal_distance is None:
+                state.strategic_goal_distance = strategic_distance
+                state.strategic_progress_at = now
+            elif strategic_distance <= state.strategic_goal_distance - 3.0:
+                state.strategic_goal_distance = strategic_distance
+                state.strategic_progress_at = now
+
         if (
             forward_progress >= 0.2
             or goal_progress >= 0.2
             or uncommitted_motion
         ):
             state.last_progress_at = now
-            state.stuck_attempts = 0
+            strategic_stalled = (
+                state.path_goal is not None
+                and state.strategic_progress_at > 0.0
+                and now - state.strategic_progress_at >= 6.0
+            )
+            if not strategic_stalled:
+                state.next_stuck_recovery_at = 0.0
+                state.stuck_attempts = 0
+                if state.route_escape_goal is None:
+                    state.route_escape_failures = 0
+        return False
 
     @staticmethod
     def _consume_action_feedback(
@@ -1394,6 +1764,8 @@ class BotBrain:
         state.path.clear()
         state.path_goal = None
         state.path_topology_version = -1
+        state.escape_build_cell = None
+        state.escape_build_until = 0.0
         state.stuck_attempts = min(8, state.stuck_attempts + 1)
 
     def _water_recovery(
@@ -1424,6 +1796,7 @@ class BotBrain:
                 affordance=step.affordance,
             ),
             look=LookIntent(step.waypoint, visible=False),
+            priority=BotIntentPriority.SURVIVAL,
             debug_role="water_recovery",
         )
 
@@ -1809,6 +2182,7 @@ class BotBrain:
                 now,
                 movement=MovementIntent(crouch=True),
                 look=LookIntent(source, visible=False),
+                priority=BotIntentPriority.SURVIVAL,
                 debug_role="blast_overwatch",
             )
         away = _normalized_xy(
@@ -1826,6 +2200,7 @@ class BotBrain:
             now,
             movement=MovementIntent(direction=away, sprint=True),
             look=LookIntent(source, visible=False),
+            priority=BotIntentPriority.SURVIVAL,
             debug_role="blast_retreat",
         )
 
@@ -1897,6 +2272,7 @@ class BotBrain:
                 affordance=state.last_affordance,
             ),
             look=LookIntent(nearest.position, visible=False),
+            priority=BotIntentPriority.SURVIVAL,
             debug_role="explosive_hazard_escape",
         )
 
@@ -1973,6 +2349,7 @@ class BotBrain:
             look=LookIntent(source, visible=False),
             tool_id=weapon_tool,
             action=action,
+            priority=BotIntentPriority.COMBAT,
             debug_role="damage_reaction",
         )
 
@@ -2315,19 +2692,188 @@ class BotBrain:
         state: _BrainState,
         now: float,
     ) -> BotIntent | None:
-        """Try one bounded breach or bridge edge after 0.75s without progress."""
+        """Escape local topology stalls with bounded physical affordances.
 
-        direction = state.last_path_direction
-        if (
-            state.last_progress_at <= 0.0
-            or now - state.last_progress_at < 0.75
-            or math.hypot(direction[0], direction[1]) <= 0.1
-        ):
+        Recovery uses the same legal actions as a client: two-block jumps,
+        spade breaches, BlockLine bridges, and a two-phase jump/build under the
+        bot.  It never mutates worker VXL directly; accepted actions return as
+        canonical world deltas before the next climb step is planned.
+        """
+
+        block_tool = int(C.BLOCK_TOOL)
+        has_blocks = block_tool in observer.loadout and observer.blocks > 0
+        pending_build = state.escape_build_cell
+        solid_reader = getattr(self.world, "solid", None)
+        if pending_build is not None:
+            expired = now > state.escape_build_until
+            committed = callable(solid_reader) and solid_reader(*pending_build)
+            if expired or committed or not has_blocks:
+                state.escape_build_cell = None
+                state.escape_build_until = 0.0
+            elif not observer.grounded:
+                target = tuple(float(value) for value in pending_build)
+                direction = state.escape_direction
+                state.escape_build_cell = None
+                state.escape_build_until = 0.0
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        direction=direction,
+                        jump=True,
+                        affordance=MovementAffordance.BUILD_STEP,
+                    ),
+                    look=LookIntent(target, visible=False),
+                    tool_id=block_tool,
+                    action=BotAction(
+                        BotActionKind.BUILD,
+                        tool_id=block_tool,
+                        position=target,
+                    ),
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="hole_jump_build_place",
+                )
+            else:
+                # Keep the jump phase coherent across worker frames until the
+                # native grounded bit confirms that the body cleared the cell.
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        direction=state.escape_direction,
+                        jump=True,
+                        affordance=MovementAffordance.JUMP,
+                    ),
+                    look=None,
+                    tool_id=block_tool,
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="hole_jump_build_launch",
+                )
+
+        active_escape = self._active_route_escape(
+            frame, observer, state, now
+        )
+        if active_escape is not None:
+            return active_escape
+
+        raw_direction = state.last_path_direction
+        stalled = (
+            (
+                state.last_progress_at > 0.0
+                and now - state.last_progress_at >= 0.75
+            )
+            or (
+                state.path_goal is not None
+                and state.strategic_progress_at > 0.0
+                and now - state.strategic_progress_at >= 6.0
+            )
+        ) and now >= state.next_stuck_recovery_at
+        if not stalled:
             return None
-        state.last_progress_at = now
+        direction = raw_direction
+        if math.hypot(direction[0], direction[1]) <= 0.1:
+            direction = (
+                math.cos(state.patrol_heading),
+                math.sin(state.patrol_heading),
+                0.0,
+            )
+
+        overhead_reader = getattr(self.world, "overhead_block", None)
+        hole_reader = getattr(self.world, "hole_escape", None)
+        overhead = (
+            overhead_reader(observer.position)
+            if callable(overhead_reader)
+            else None
+        )
+        hole = (
+            hole_reader(observer.position, direction)
+            if callable(hole_reader)
+            else None
+        )
+        if (
+            math.hypot(raw_direction[0], raw_direction[1]) <= 0.1
+            and overhead is None
+            and hole is None
+        ):
+            # A marksman intentionally holding a position is not "stuck".
+            return None
+
+        # Pace attempts without claiming that an attempted jump/dig/build was
+        # actual locomotion. Real progress is written only by
+        # ``_record_progress`` from the next authoritative player snapshot.
+        state.next_stuck_recovery_at = now + 0.75
         state.stuck_attempts += 1
-        blocking = self.world.blocking_cell(observer.position, direction)
         preferred = self._preferred_melee_tool(observer)
+        if (
+            overhead is not None
+            and preferred is not None
+            and state.stuck_attempts <= 2
+        ):
+            target = tuple(float(value) + 0.5 for value in overhead)
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(affordance=MovementAffordance.BREACH),
+                look=LookIntent(target, visible=False),
+                tool_id=preferred,
+                action=BotAction(
+                    BotActionKind.MELEE,
+                    tool_id=preferred,
+                    position=target,
+                ),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_role="hole_break_ceiling",
+            )
+
+        if hole is not None:
+            escape_direction, rise = hole
+            direction = escape_direction
+            if rise <= 2 and state.stuck_attempts <= 2:
+                state.last_affordance = MovementAffordance.JUMP
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        direction=direction,
+                        jump=True,
+                        sprint=True,
+                        affordance=MovementAffordance.JUMP,
+                    ),
+                    look=None,
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="hole_two_block_jump",
+                )
+            jump_cell_reader = getattr(self.world, "jump_build_cell", None)
+            jump_cell = (
+                jump_cell_reader(observer.position)
+                if has_blocks and callable(jump_cell_reader)
+                else None
+            )
+            if jump_cell is not None and state.stuck_attempts <= 3:
+                state.escape_build_cell = jump_cell
+                state.escape_build_until = now + 1.25
+                state.escape_direction = direction
+                state.last_affordance = MovementAffordance.JUMP
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        direction=direction,
+                        jump=True,
+                        affordance=MovementAffordance.JUMP,
+                    ),
+                    look=None,
+                    tool_id=block_tool,
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="hole_jump_build_launch",
+                )
+
+        blocking_reader = getattr(self.world, "blocking_cell", None)
+        blocking = (
+            blocking_reader(observer.position, direction)
+            if callable(blocking_reader)
+            else None
+        )
         if blocking is not None and preferred is not None and state.stuck_attempts <= 3:
             target = tuple(float(value) + 0.5 for value in blocking)
             return self._intent(
@@ -2343,12 +2889,54 @@ class BotBrain:
                     tool_id=preferred,
                     position=target,
                 ),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_role="stuck_side_breach",
             )
-        bridge = self.world.bridge_cell(observer.position, direction)
+
+        line_reader = getattr(self.world, "water_bridge_line", None)
+        line = (
+            line_reader(
+                observer.position,
+                direction,
+                max_cells=min(6, max(1, int(observer.blocks))),
+            )
+            if has_blocks and callable(line_reader)
+            else None
+        )
+        if line is not None and state.stuck_attempts <= 3:
+            start, end = line
+            cost = max(
+                abs(int(end[index]) - int(start[index])) for index in range(3)
+            ) + 1
+            if observer.blocks >= cost:
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        crouch=True,
+                        affordance=MovementAffordance.BUILD_BRIDGE,
+                    ),
+                    look=LookIntent(tuple(float(value) for value in end), visible=False),
+                    tool_id=block_tool,
+                    action=BotAction(
+                        BotActionKind.BUILD_LINE,
+                        tool_id=block_tool,
+                        position=tuple(float(value) for value in start),
+                        end_position=tuple(float(value) for value in end),
+                    ),
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="water_gap_block_line",
+                )
+
+        bridge_reader = getattr(self.world, "bridge_cell", None)
+        bridge = (
+            bridge_reader(observer.position, direction)
+            if callable(bridge_reader)
+            else None
+        )
         if (
             bridge is not None
-            and int(C.BLOCK_TOOL) in observer.loadout
-            and observer.blocks > 0
+            and has_blocks
             and state.stuck_attempts <= 3
         ):
             target = tuple(float(value) for value in bridge)
@@ -2359,12 +2947,14 @@ class BotBrain:
                     crouch=True, affordance=MovementAffordance.BUILD_BRIDGE
                 ),
                 look=LookIntent(target, visible=False),
-                tool_id=int(C.BLOCK_TOOL),
+                tool_id=block_tool,
                 action=BotAction(
                     BotActionKind.BUILD,
-                    tool_id=int(C.BLOCK_TOOL),
+                    tool_id=block_tool,
                     position=target,
                 ),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_role="single_gap_bridge",
             )
         zombie_prefabs = tuple(
             name for name in observer.prefabs if "zombie" in name.lower()
@@ -2416,19 +3006,221 @@ class BotBrain:
                     argument=str(zombie_prefab),
                     yaw=math.atan2(direction[1], direction[0]),
                 ),
+                priority=BotIntentPriority.TRAVERSAL,
                 debug_role="zombie_build_climb",
             )
         if state.stuck_attempts >= 3:
-            # Abandon this local route and let patrol/objective selection pick
-            # a different heading on the next strategic tick.  Reset the
-            # attempt window as well: leaving it saturated permanently
-            # disables every later breach/build recovery for the same bot.
-            state.last_path_direction = (0.0, 0.0, 0.0)
+            # A fresh query for the same strategic point can recreate the
+            # identical failed crowd corridor. First leave it through a safe
+            # local voxel edge, then let ordinary objective routing resume.
+            return self._begin_route_escape(
+                frame, observer, state, now, direction
+            )
+        return None
+
+    def _active_route_escape(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Continue a short safe detour selected after a failed corridor."""
+
+        goal = state.route_escape_goal
+        if goal is None:
+            return None
+        if now >= state.route_escape_until:
+            state.route_escape_goal = None
+            state.route_escape_until = 0.0
+            return None
+        planner = getattr(self.world, "action_planner", None)
+        step = (
+            planner.plan_local(
+                observer.position,
+                goal,
+                abilities=self._movement_abilities(observer),
+                topology_version=frame.topology_version,
+                search_radius=16,
+                max_expansions=2048,
+            )
+            if planner is not None
+            else None
+        )
+        if step is None:
+            state.route_escape_goal = None
+            state.route_escape_until = 0.0
+            return None
+        state.last_path_direction = step.direction
+        state.last_affordance = step.affordance
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=step.direction,
+                jump=step.affordance is MovementAffordance.JUMP,
+                sprint=True,
+                affordance=step.affordance,
+            ),
+            look=LookIntent(step.waypoint, visible=False),
+            priority=BotIntentPriority.TRAVERSAL,
+            debug_role="stuck_route_escape",
+        )
+
+    def _begin_route_escape(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+        failed_direction: Vector3,
+    ) -> BotIntent | None:
+        """Invalidate a failed crowd route and choose a bounded side detour."""
+
+        failed_goal = state.path_goal
+        reset_navigation = getattr(self.world, "reset_agent_navigation", None)
+        if callable(reset_navigation):
+            reset_navigation(observer.player_id)
+        state.path.clear()
+        state.path_goal = None
+        state.path_topology_version = -1
+        state.strategic_progress_at = now
+        state.strategic_goal_distance = None
+        state.escape_build_cell = None
+        state.escape_build_until = 0.0
+        state.stuck_attempts = 0
+        state.route_escape_failures += 1
+
+        planner = getattr(self.world, "action_planner", None)
+        direct_step = (
+            planner.plan_local(
+                observer.position,
+                failed_goal,
+                abilities=self._movement_abilities(observer),
+                topology_version=frame.topology_version,
+                search_radius=24,
+                max_expansions=4096,
+            )
+            if failed_goal is not None
+            and state.route_escape_failures <= 2
+            and planner is not None
+            else None
+        )
+        if direct_step is not None:
+            # DetourCrowd can return a non-zero velocity into a dead-end face
+            # when the real voxel exit begins with a short staircase/turn.
+            # Temporarily follow the layered voxel route toward the original
+            # strategic goal, recomputing its immediate edge each frame.
+            state.route_escape_goal = failed_goal
+            state.route_escape_until = now + 3.0
+            state.last_path_direction = direct_step.direction
+            state.last_affordance = direct_step.affordance
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=direct_step.direction,
+                    jump=direct_step.affordance is MovementAffordance.JUMP,
+                    sprint=True,
+                    affordance=direct_step.affordance,
+                ),
+                look=LookIntent(direct_step.waypoint, visible=False),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_role="stuck_voxel_replan",
+            )
+
+        emergency_drop = getattr(self.world, "emergency_drop", None)
+        drop = (
+            emergency_drop(observer.position)
+            if state.route_escape_failures >= 3
+            and callable(emergency_drop)
+            else None
+        )
+        if drop is not None:
+            direction, landing = drop
+            state.last_path_direction = direction
+            state.last_affordance = MovementAffordance.DROP
             state.next_patrol_turn = 0.0
-            state.stuck_attempts = 0
-            state.path.clear()
-            state.path_goal = None
-            state.path_topology_version = -1
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=direction,
+                    sprint=True,
+                    affordance=MovementAffordance.DROP,
+                ),
+                look=LookIntent(landing, visible=False),
+                priority=BotIntentPriority.SURVIVAL,
+                debug_role="stuck_emergency_drop",
+            )
+
+        forward = _normalized_xy(failed_direction[0], failed_direction[1])
+        if math.hypot(forward[0], forward[1]) <= 1e-6:
+            forward = (
+                math.cos(state.patrol_heading),
+                math.sin(state.patrol_heading),
+                0.0,
+            )
+        # Alternate sides on consecutive failures so an asymmetric doorway or
+        # ledge cannot keep every bot probing the same blocked shoulder.
+        side_sign = (
+            1.0
+            if (observer.player_id + state.route_escape_failures) % 2 == 0
+            else -1.0
+        )
+        left = (-forward[1] * side_sign, forward[0] * side_sign, 0.0)
+        candidates = (
+            _normalized_xy(left[0] + forward[0] * 0.35, left[1] + forward[1] * 0.35),
+            _normalized_xy(-left[0] + forward[0] * 0.20, -left[1] + forward[1] * 0.20),
+            _normalized_xy(left[0] - forward[0] * 0.45, left[1] - forward[1] * 0.45),
+            (-forward[0], -forward[1], 0.0),
+        )
+        distance = 6.0 + min(3, state.route_escape_failures) * 2.0
+        for candidate in candidates:
+            goal = (
+                observer.position[0] + candidate[0] * distance,
+                observer.position[1] + candidate[1] * distance,
+                observer.position[2],
+            )
+            # A detour is allowed to move away from the objective briefly,
+            # but never uses the outer map boundary as an escape corridor.
+            if not (8.0 <= goal[0] < 504.0 and 8.0 <= goal[1] < 504.0):
+                continue
+            step = (
+                planner.plan_local(
+                    observer.position,
+                    goal,
+                    abilities=self._movement_abilities(observer),
+                    topology_version=frame.topology_version,
+                    search_radius=16,
+                    max_expansions=2048,
+                )
+                if planner is not None
+                else None
+            )
+            if step is None:
+                continue
+            state.route_escape_goal = goal
+            state.route_escape_until = now + 2.0
+            state.last_path_direction = step.direction
+            state.last_affordance = step.affordance
+            state.next_patrol_turn = 0.0
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=step.direction,
+                    jump=step.affordance is MovementAffordance.JUMP,
+                    sprint=True,
+                    affordance=step.affordance,
+                ),
+                look=LookIntent(step.waypoint, visible=False),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_role="stuck_route_escape",
+            )
+
+        state.last_path_direction = (0.0, 0.0, 0.0)
+        state.next_patrol_turn = 0.0
         return None
 
     def _local_objective_route(
@@ -2621,9 +3413,19 @@ class BotBrain:
 
     @staticmethod
     def _resource_goal(
-        frame: PerceptionFrame, observer: PlayerSnapshot
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        *,
+        state: _BrainState | None = None,
+        now: float | None = None,
     ) -> Vector3 | None:
-        """Choose a visible world resource only when current stock is critical."""
+        """Choose a critical resource, abandoning one pickup after 3 seconds.
+
+        The abandonment is per bot and per entity-position pair.  Other bots
+        can still collect the pickup, and a terrain-settled pickup receives a
+        fresh key at its new position.  Calls without state retain the pure
+        nearest-resource behavior used by characterization tests/tools.
+        """
 
         desired_types: set[int] = set()
         if observer.health < 50:
@@ -2633,6 +3435,9 @@ class BotBrain:
         if observer.blocks < 12 and int(C.BLOCK_TOOL) in observer.loadout:
             desired_types.add(int(C.BLOCK_CRATE))
         if not desired_types:
+            if state is not None:
+                state.resource_target = None
+                state.resource_target_since = 0.0
             return None
         candidates = [
             entity
@@ -2641,13 +3446,52 @@ class BotBrain:
             and entity.entity_type in desired_types
             and entity.team in (-1, int(C.TEAM_NEUTRAL), observer.team)
             and _distance_squared(observer.position, entity.position) <= 160.0**2
+            and (
+                state is None
+                or (int(entity.entity_id), entity.position)
+                not in state.ignored_resources
+            )
         ]
         if not candidates:
+            if state is not None:
+                state.resource_target = None
+                state.resource_target_since = 0.0
             return None
-        return min(
+        selected = min(
             candidates,
             key=lambda entity: _distance_squared(observer.position, entity.position),
-        ).position
+        )
+        if state is None or now is None:
+            return selected.position
+
+        key = (int(selected.entity_id), selected.position)
+        if state.resource_target != key:
+            state.resource_target = key
+            state.resource_target_since = float(now)
+            return selected.position
+        if float(now) - float(state.resource_target_since) < 3.0:
+            return selected.position
+
+        state.ignored_resources.add(key)
+        state.resource_target = None
+        state.resource_target_since = 0.0
+        # Try the next reachable resource immediately rather than idling for
+        # another behavior-tree period at the rejected crate.
+        remaining = [
+            entity for entity in candidates
+            if (int(entity.entity_id), entity.position) != key
+        ]
+        if not remaining:
+            return None
+        selected = min(
+            remaining,
+            key=lambda entity: _distance_squared(
+                observer.position, entity.position
+            ),
+        )
+        state.resource_target = (int(selected.entity_id), selected.position)
+        state.resource_target_since = float(now)
+        return selected.position
 
     def _engage(
         self,
@@ -2876,6 +3720,11 @@ class BotBrain:
             + state.delayed_target_velocity[2] * lead_time
             + aim_offset_z,
         )
+        scoped = (
+            int(weapon_tool) in _SNIPER_TOOLS
+            and distance >= 18.0
+            and not dry_weapon
+        )
         return self._intent(
             frame,
             now,
@@ -2900,6 +3749,10 @@ class BotBrain:
             ),
             tool_id=weapon_tool,
             action=action,
+            priority=BotIntentPriority.COMBAT,
+            secondary_fire=scoped,
+            zoom=scoped,
+            debug_role=("marksman_scoped_engage" if scoped else "combat_engage"),
         )
 
     def _engage_zombie(
@@ -3040,6 +3893,7 @@ class BotBrain:
             ),
             tool_id=int(C.ZOMBIEHAND_TOOL),
             action=action,
+            priority=BotIntentPriority.COMBAT,
             debug_role=(
                 "zombie_contact_strike"
                 if action.kind is BotActionKind.MELEE
@@ -3192,6 +4046,7 @@ class BotBrain:
             look=LookIntent(position, visible=False),
             tool_id=tool,
             action=action,
+            priority=BotIntentPriority.COMBAT,
             debug_role=role,
         )
 
@@ -3236,6 +4091,28 @@ class BotBrain:
         velocity: Vector3,
         abilities: frozenset[MovementAffordance],
     ) -> Vector3:
+        # Retain the strategic goal for progress projection. Previously only
+        # fallback voxel routes populated this field, so successful native
+        # Recast routes could not measure whether they approached their goal.
+        previous_goal = state.path_goal
+        if (
+            previous_goal is None
+            or math.hypot(
+                float(previous_goal[0]) - float(goal[0]),
+                float(previous_goal[1]) - float(goal[1]),
+            )
+            >= 6.0
+            or state.strategic_progress_at <= 0.0
+        ):
+            state.strategic_progress_at = now
+            state.strategic_goal_distance = math.hypot(
+                float(goal[0]) - float(start[0]),
+                float(goal[1]) - float(start[1]),
+            )
+        state.path_goal = goal
+        state.path_topology_version = int(
+            getattr(self.world, "topology_version", -1)
+        )
         elapsed = max(0.0, now - self._path_refill_at)
         self._path_refill_at = now
         self._path_tokens = min(
@@ -3388,6 +4265,9 @@ class BotBrain:
         look: LookIntent | None,
         tool_id: int = -1,
         action: BotAction = BotAction(),
+        priority: BotIntentPriority = BotIntentPriority.ROUTINE,
+        secondary_fire: bool = False,
+        zoom: bool = False,
         debug_role: str = "",
     ) -> BotIntent:
         direction = movement.direction
@@ -3423,6 +4303,9 @@ class BotBrain:
             look=look,
             tool_id=tool_id,
             action=action,
+            priority=priority,
+            secondary_fire=bool(secondary_fire),
+            zoom=bool(zoom),
             debug_goal=look.target if look is not None else None,
             debug_path=debug_path,
             debug_role=str(debug_role),

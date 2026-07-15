@@ -14,7 +14,12 @@ async def handle_initiate_kick(server, player, packet) -> None:
 
     reason = int(getattr(packet, "reason", 0))
     if reason == KICK_CANCEL:
-        server.vote_manager.cancel()
+        vote_manager = server.vote_manager
+        if (
+            getattr(vote_manager, "kind", None) == "kick"
+            and getattr(vote_manager, "starter_id", None) == int(player.id)
+        ):
+            vote_manager.cancel()
         return
     target = server.players.get(int(getattr(packet, "target_id", -1)))
     if target is not None:
@@ -29,12 +34,13 @@ async def handle_generic_vote(server, player, packet) -> None:
     if int(getattr(packet, "message_type", -1)) != VOTE_CAST:
         return
     candidates = getattr(packet, "candidates", None) or []
-    choice_yes = True
-    if candidates and isinstance(candidates[0], dict):
-        choice_yes = str(
-            candidates[0].get("name", "Yes")
-        ).lower().startswith("y")
-    server.vote_manager.cast(player, choice_yes)
+    if not candidates or not isinstance(candidates[0], dict):
+        return
+    # GameScene sends the selected candidate record, not a generic Yes/No
+    # bit. Exact-name matching supports the same packet for kick and F1/F2/F3
+    # map ballots and rejects forged candidates not present in the overlay.
+    selected = candidates[0].get("name", "")
+    server.vote_manager.cast_candidate(player, selected)
 
 
 @register_handler(49)  # ChatMessage

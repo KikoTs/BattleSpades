@@ -60,7 +60,7 @@ def test_invalid_release_target_is_rejected() -> None:
 def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> None:
     """Maps/prefabs ship, while unrelated root executables never enter output."""
 
-    target = ReleaseTarget("windows", "x86_64", "0.0.1-alpha.2")
+    target = ReleaseTarget("windows", "x86_64", "0.0.2-alpha.1")
 
     staged = stage_release(
         PROJECT_ROOT,
@@ -77,6 +77,8 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert sorted(path.name for path in (staged / "maps").glob("*.vxl")) == TRACKED_MAPS
     assert sorted(path.name for path in (staged / "prefabs").glob("*.kv6")) == TRACKED_PREFABS
     assert (staged / "plugins" / "README.txt").is_file()
+    assert (staged / "client_patches" / "INSTALL.txt").is_file()
+    assert (staged / "client_patches" / "session_transition_patch.py").is_file()
     assert not (staged / "codex-command-runner.exe").exists()
     assert not (staged / "tests").exists()
 
@@ -159,7 +161,7 @@ def test_checksum_cli_runs_without_installed_project_dependencies(
 ) -> None:
     """The publish job can verify assets without installing server packages."""
 
-    for name in expected_archive_names("0.0.1-alpha.2"):
+    for name in expected_archive_names("0.0.2-alpha.1"):
         (tmp_path / name).write_bytes(name.encode("utf-8"))
 
     completed = subprocess.run(

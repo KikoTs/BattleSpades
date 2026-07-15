@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 
 from protocol.handler_registry import register_handler
-from server.class_selection import normalize_class_selection
+from server.class_selection import normalize_server_selection
+from server.game_rules import get_rules
 from server.game_constants import KILL_CLASS_CHANGE
 
 logger = logging.getLogger(__name__)
@@ -18,13 +19,17 @@ logger = logging.getLogger(__name__)
 @register_handler(13)  # SetClassLoadout
 async def handle_set_class_loadout(server, player, packet) -> None:
     """Normalize and atomically stage or commit a client menu selection."""
-    selection = normalize_class_selection(
+    selection = normalize_server_selection(
+        server.config,
         getattr(packet, "class_id", player.class_id),
         getattr(packet, "loadout", ()) or (),
         getattr(packet, "prefabs", ()) or (),
         getattr(packet, "ugc_tools", ()) or (),
         fallback_class_id=player.class_id,
     )
+    if not get_rules(server.config).is_class_enabled(selection.class_id):
+        logger.debug("Ignoring disabled class/loadout from %s", player.name)
+        return
     mode = getattr(server, "mode", None)
     allows_selection = getattr(mode, "allows_class_selection", None)
     if callable(allows_selection) and not allows_selection(player, selection):
@@ -62,10 +67,14 @@ async def handle_change_class(server, player, packet) -> None:
     if pending is not None and int(pending.class_id) == requested_class:
         selection = pending
     else:
-        selection = normalize_class_selection(
+        selection = normalize_server_selection(
+            server.config,
             requested_class,
             fallback_class_id=player.class_id,
         )
+    if not get_rules(server.config).is_class_enabled(selection.class_id):
+        logger.debug("Ignoring disabled class change from %s", player.name)
+        return
     mode = getattr(server, "mode", None)
     allows_selection = getattr(mode, "allows_class_selection", None)
     if callable(allows_selection) and not allows_selection(player, selection):

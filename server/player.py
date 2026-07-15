@@ -401,6 +401,7 @@ class Player:
 
         self.respawn_time: float = 0.0
         self.death_time: float = 0.0
+        self.spawned_at: float = 0.0
 
         self.input = InputState()
 
@@ -489,6 +490,7 @@ class Player:
         # Personal scoreboard number (the client's per-player column). Driven
         # by the mode via scoreboard.send_player_score on each scoring event.
         self.score: int = 0
+        self._teabagged_deaths: set[tuple[int, float]] = set()
 
         self._class_id: int = int(C.CLASS.SOLDIER)
         self.movement_profile = get_movement_profile(self._class_id)
@@ -579,6 +581,17 @@ class Player:
         # use identical effective values or prediction drifts (rubber-band).
         from server.class_data import speed_scale
         scale = speed_scale(self._class_id)
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is not None:
+            from server.game_rules import get_rules
+
+            rules = get_rules(config)
+            scale *= float(rules.get("RULE_CHARACTER_SPEED"))
+            if str(getattr(config, "default_mode", "")).lower() in (
+                "zom", "zombie"
+            ):
+                scale *= float(rules.get("RULE_CLASS_SPEED"))
         world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier * scale)
         world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier * scale)
         world_object.set_class_jump_multiplier(self.movement_profile.jump_multiplier)
@@ -837,7 +850,7 @@ class Player:
     def class_id(self, value: int):
         self._class_id = int(value)
         self.movement_profile = get_movement_profile(self._class_id)
-        self.blocks = min(self.blocks, self.movement_profile.max_blocks)
+        self.blocks = min(self.blocks, self._block_wallet_max())
         world_object = self._ensure_world_object()
         if world_object is not None:
             self._apply_class_profile_to_world(world_object)
@@ -868,8 +881,24 @@ class Player:
         if not isinstance(selection, ClassSelection):
             raise TypeError("selection must be a ClassSelection")
         self.class_id = int(selection.class_id)
-        self.loadout = list(selection.loadout)
-        self.prefabs = list(selection.prefabs)
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is None:
+            self.loadout = list(selection.loadout)
+            self.prefabs = list(selection.prefabs)
+        else:
+            from server.game_rules import get_rules
+
+            rules = get_rules(config)
+            self.loadout = [
+                int(tool) for tool in selection.loadout
+                if rules.is_tool_enabled(int(tool))
+            ]
+            self.prefabs = (
+                list(selection.prefabs)
+                if rules.enabled("RULE_ENABLE_PREFABS")
+                else []
+            )
         self.ugc_tools = list(selection.ugc_tools)
 
     def apply_pending_selection(self) -> bool:
@@ -1012,7 +1041,9 @@ class Player:
             forget_player(self.id)
         self.replication_generation += 1
         self.last_kill_action_data = None
+        self._teabagged_deaths.clear()
         self.health = MAX_HEALTH
+        self.spawned_at = time.monotonic()
         self.alive = True
         self.spawned = True
         self.input = InputState()
@@ -1042,7 +1073,7 @@ class Player:
         self._pending_packet_wire_unknown_byte = None
         self._applied_input_source_wire_unknown_byte = None
         self.last_applied_input_loop = None
-        self.blocks = self.movement_profile.starting_blocks
+        self.blocks = self._block_wallet_start()
         self.grenades = MAX_GRENADES
         self._reset_ammo()
         self.rocket_turret_stock = int(
@@ -1245,11 +1276,39 @@ class Player:
             return False
 
         server = self.connection.server if self.connection else None
+        rules = None
+        config = getattr(server, "config", None)
+        if config is not None:
+            from server.game_rules import get_rules
+
+            rules = get_rules(config)
+            protection = float(rules.get("RULE_SPAWN_PROTECTION_TIME"))
+            if (
+                source is not None
+                and source is not self
+                and protection > 0.0
+                and time.monotonic() - self.spawned_at < protection
+            ):
+                return False
         modify_damage = getattr(
             getattr(server, "mode", None), "modify_incoming_damage", None
         )
         if callable(modify_damage):
             amount = modify_damage(self, amount, source, kill_type)
+
+        if rules is not None and source is not None and source is not self:
+            amount = float(amount) * float(rules.get("RULE_WEAPON_DAMAGE"))
+            mode_code = str(getattr(config, "default_mode", "")).lower()
+            if mode_code in ("zom", "zombie") and int(
+                getattr(source, "class_id", -1)
+            ) in {
+                int(C.CLASS_ZOMBIE),
+                int(C.CLASS_FAST_ZOMBIE),
+                int(C.CLASS_JUMP_ZOMBIE),
+            }:
+                amount *= float(rules.get("RULE_ZOMBIE_CLASS_DAMAGE"))
+            if rules.enabled("RULE_ONE_HIT_KILL"):
+                amount = max(float(amount), float(self.health))
 
         # Pauses jetpack fuel regen for the type's refill-delay window.
         self._last_damage_at = time.time()
@@ -1349,7 +1408,15 @@ class Player:
             # camera.  Its delayed explosion is server-authoritative via
             # GraveBehavior and intentionally outlives the 5s respawn timer.
             reg = getattr(server, "entity_registry", None)
-            if reg is not None and getattr(server.config, "entities_wire_ready", False):
+            from server.game_rules import get_rules
+            grave_enabled = get_rules(server.config).enabled(
+                "RULE_ENABLE_GRAVESTONES"
+            )
+            if (
+                grave_enabled
+                and reg is not None
+                and getattr(server.config, "entities_wire_ready", False)
+            ):
                 try:
                     from server.entities.behaviors import GraveBehavior
                     world = getattr(server, "world_manager", None)
@@ -1360,6 +1427,9 @@ class Player:
                         )
                     team = server.teams.get(self.team)
                     grave_color = tuple(team.color) if team is not None else None
+                    corpse_explosion = get_rules(server.config).enabled(
+                        "RULE_ENABLE_CORPSE_EXPLOSION"
+                    )
                     grave = reg.place(
                         int(getattr(C, "GRAVE_ENTITY", 11)),
                         grave_x, grave_y, grave_z,
@@ -1368,9 +1438,18 @@ class Player:
                         behavior=GraveBehavior(
                             thrower_id=self.id,
                             fuse=float(getattr(C, "GRAVE_EXPLOSION_FUSE", 7.0)),
-                            damage=float(getattr(C, "GRAVE_EXPLOSION_DAMAGE", 25.0)),
-                            block_damage=float(getattr(C, "GRAVE_EXPLOSION_BLOCK_DAMAGE", 3.0)),
-                            blast_radius=float(getattr(C, "GRAVE_EXPLOSION_RADIUS", 3.0)),
+                            damage=(
+                                float(getattr(C, "GRAVE_EXPLOSION_DAMAGE", 25.0))
+                                if corpse_explosion else 0.0
+                            ),
+                            block_damage=(
+                                float(getattr(C, "GRAVE_EXPLOSION_BLOCK_DAMAGE", 3.0))
+                                if corpse_explosion else 0.0
+                            ),
+                            blast_radius=(
+                                float(getattr(C, "GRAVE_EXPLOSION_RADIUS", 3.0))
+                                if corpse_explosion else 0.0
+                            ),
                             kill_type=int(getattr(C.KILL, "GRAVE_KILL", 13)),
                         ),
                     )
@@ -1412,8 +1491,12 @@ class Player:
 
     def restock_ammo(self, restock_type: int = 0):
         """Refill ammo reserve+clip (server-side) and tell the client to
-        refill its own ammo counters/play the pickup sound via Restock(69).
-        Ammo is client-authoritative for display, so the packet is required."""
+        refill its own ammo counters via Restock(69).
+
+        ``type=0`` is the full spawn restock used by RoundLifecycle. A physical
+        ammo crate must pass ``AMMO_CRATE`` (3); the retail Character receiver
+        treats zero as a general restock and also restores health.
+        """
         if not self.alive:
             return
         self._reset_ammo()
@@ -1434,7 +1517,28 @@ class Player:
             self.connection.send(bytes(pkt.generate()))
 
     def add_blocks(self, count: int = 1):
-        self.blocks = min(self.movement_profile.max_blocks, self.blocks + count)
+        self.blocks = min(self._block_wallet_max(), self.blocks + count)
+
+    def _block_wallet_multiplier(self) -> float:
+        """Return the Match Lobby wallet scale for this authoritative body."""
+
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is None:
+            return 1.0
+        from server.game_rules import get_rules
+
+        return float(get_rules(config).get("RULE_CHARACTER_BLOCK_WALLETS"))
+
+    def _block_wallet_max(self) -> int:
+        return max(0, int(round(
+            self.movement_profile.max_blocks * self._block_wallet_multiplier()
+        )))
+
+    def _block_wallet_start(self) -> int:
+        return min(self._block_wallet_max(), max(0, int(round(
+            self.movement_profile.starting_blocks * self._block_wallet_multiplier()
+        ))))
 
     def restock_blocks(self):
         """Block-crate pickup: refill the block wallet to the class max and
@@ -1442,7 +1546,7 @@ class Player:
         sets its local block_count to max; measured live 2026-07-07)."""
         if not self.alive:
             return
-        self.add_blocks(self.movement_profile.max_blocks)
+        self.add_blocks(self._block_wallet_max())
         if self.connection:
             from shared.packet import Restock
             pkt = Restock()
@@ -1805,6 +1909,24 @@ class Player:
             )
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
+        if self.last_fall_result > 0:
+            server = self.connection.server if self.connection else None
+            config = getattr(server, "config", None)
+            if config is not None and bool(getattr(config, "fall_damage", True)):
+                from server.game_rules import get_rules
+
+                is_water_landing = self.z > 237.0
+                if (
+                    not is_water_landing
+                    or get_rules(config).enabled(
+                        "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
+                    )
+                ):
+                    self.damage(
+                        self.last_fall_result,
+                        source=None,
+                        kill_type=int(C.KILL.FALL_KILL),
+                    )
         self._apply_client_authority_pin()
         self.last_landed = bool(was_airborne and self.grounded)
         self.last_step_delta = round(float(self.z - pre_position[2]), 4)
@@ -1975,6 +2097,7 @@ class Player:
         sneak: bool,
         sprint: bool,
     ):
+        crouch_pressed = bool(crouch and not self.input.crouch)
         self.input.up = up
         self.input.down = down
         self.input.left = left
@@ -1985,8 +2108,40 @@ class Player:
         self.input.crouch = crouch
         self.input.sneak = sneak
         self.input.sprint = sprint
+        if crouch_pressed:
+            self._award_teabag_point()
         # No jump edge-detection or queuing here: the held jump flag is
         # consumed directly each tick in update() (client-pipeline mirror).
+
+    def _award_teabag_point(self) -> None:
+        """Award one configured point per enemy death on a crouch edge."""
+
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is None or not self.alive:
+            return
+        from server.game_rules import get_rules
+
+        if not get_rules(config).enabled("RULE_POINTS_FROM_TEABAGGING"):
+            return
+        for victim in server.players.values():
+            if victim is self or victim.alive or victim.team == self.team:
+                continue
+            death_key = (int(victim.id), float(victim.death_time))
+            if death_key in self._teabagged_deaths or victim.death_time <= 0.0:
+                continue
+            distance_sq = sum(
+                (float(self.position[index]) - float(victim.position[index])) ** 2
+                for index in range(3)
+            )
+            if distance_sq > 2.5 ** 2:
+                continue
+            self._teabagged_deaths.add(death_key)
+            self.score += 1
+            from server.scoreboard import send_player_score
+
+            send_player_score(server, self)
+            break
 
     def queue_velocity_impulse(
         self,
@@ -2512,6 +2667,18 @@ class Player:
         # `pong` carries wu_ack_loop — the client input loop_count this row's
         # position corresponds to. It is what the client pairs against its own
         # movement_history to decide NO-OP / ADJUST / SNAP.
+        spawn_protection = 0.0
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is not None and self.alive:
+            from server.game_rules import get_rules
+
+            duration = float(get_rules(config).get(
+                "RULE_SPAWN_PROTECTION_TIME"
+            ))
+            spawn_protection = max(
+                0.0, duration - (time.monotonic() - self.spawned_at)
+            )
         return (
             self.position,
             self.orientation,
@@ -2525,7 +2692,7 @@ class Player:
             self.tool,
             0xFF if self.pickup_id is None else int(self.pickup_id),
             self.jetpack_fuel,
-            0.0,
+            spawn_protection,
             0.0,
         )
 

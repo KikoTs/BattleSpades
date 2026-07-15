@@ -10,7 +10,7 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import CreateEntity  # noqa: E402
+from shared.packet import ChangeEntity, CreateEntity  # noqa: E402
 from server.entities.registry import EntityRegistry, EntityContext  # noqa: E402
 from server.entities.behaviors import (  # noqa: E402
     EntityBehavior, PickupCrateBehavior, GraveBehavior,
@@ -32,12 +32,14 @@ class FakePlayer:
         self.healed += 1
 
 
-def ctx(players, now=1000.0, dt=1 / 60):
-    created, destroyed = [], []
+def ctx(players, now=1000.0, dt=1 / 60, world=None):
+    created, destroyed, moved = [], [], []
     c = EntityContext(dt=dt, now=now, players=players,
-                      create=created.append, destroy=destroyed.append)
+                      world=world, create=created.append,
+                      destroy=destroyed.append, move=moved.append)
     c._created = created
     c._destroyed = destroyed
+    c._moved = moved
     return c
 
 
@@ -250,6 +252,52 @@ def test_block_crate_refills_blocks_only():
     assert p.blocks == 1000          # blocks topped up
     assert p.restocked == 0          # ammo untouched
     assert p.healed == 0             # health untouched
+
+
+def test_pickup_follows_its_support_when_a_structure_breaks():
+    class VoxelColumn:
+        def __init__(self):
+            self.solid = {(100, 100, 61), (100, 100, 70)}
+
+        def get_solid(self, x, y, z):
+            return (x, y, z) in self.solid
+
+    world = VoxelColumn()
+    reg = EntityRegistry()
+    pickup = ammo_crate(reg, 100.5, 100.5, 60.0)
+
+    # First check remembers the official-map one-voxel model offset.
+    first = ctx([], now=1000.0, world=world)
+    reg.tick(first)
+    assert pickup.terrain_support_z == 61
+    assert first._moved == []
+
+    world.solid.remove((100, 100, 61))
+    fallen = ctx([], now=1000.11, world=world)
+    reg.tick(fallen)
+
+    assert pickup.terrain_support_z == 70
+    assert pickup.z == 69.0
+    assert pickup.home == (100.5, 100.5, 69.0)
+    assert fallen._moved == [pickup]
+
+
+def test_pickup_position_change_uses_reliable_change_entity_shape():
+    from server.main import BattleSpadesServer
+
+    server = BattleSpadesServer.__new__(BattleSpadesServer)
+    sent = []
+    server.broadcast = lambda data, **kwargs: sent.append((bytes(data), kwargs))
+    pickup = SimpleNamespace(entity_id=42, x=11.5, y=22.5, z=70.0)
+
+    server.broadcast_change_entity_position(pickup)
+
+    raw, kwargs = sent[0]
+    packet = ChangeEntity(ByteReader(raw[1:]))
+    assert packet.entity_id == 42
+    assert packet.action == 1
+    assert (packet.pos_x, packet.pos_y, packet.pos_z) == (11.5, 22.5, 70.0)
+    assert kwargs == {"reliable": True}
 
 
 # --- deployables: dynamite (timed) + landmine (proximity) --------------------

@@ -69,6 +69,7 @@ class CTFMode(BaseMode):
     time_limit = 1200  # 20 minutes
     mode_code = "ctf"
     intel_auto_return_default = True
+    shoot_with_intel_default = False
     
     def __init__(self, server):
         super().__init__(server)
@@ -77,14 +78,37 @@ class CTFMode(BaseMode):
         overlay = getattr(server.config, "mode_settings", {}).get(
             self.mode_code, {}
         )
+        from server.game_rules import get_rules
+        rules = get_rules(server.config)
         self.score_limit = int(overlay.get(
-            "score_limit", data.default_score_limit
+            "score_limit", rules.get("RULE_CTF_SCORE_TARGET")
         ))
-        self.time_limit = float(overlay.get(
-            "time_limit", data.default_time_limit
-        ))
+        resolve_time = getattr(server.config, "configured_time_limit", None)
+        self.time_limit = (
+            resolve_time(self.mode_code, data.default_time_limit)
+            if callable(resolve_time)
+            else float(overlay.get("time_limit", data.default_time_limit))
+        )
+        explicit = getattr(rules, "explicit", set())
         self.intel_auto_return = bool(overlay.get(
-            "intel_auto_return", self.intel_auto_return_default
+            "intel_auto_return",
+            rules.get("RULE_CTF_ENABLE_INTEL_AUTO_RETURN")
+            if "RULE_CTF_ENABLE_INTEL_AUTO_RETURN" in explicit
+            else self.intel_auto_return_default,
+        ))
+        self.intel_return_on_touch = bool(overlay.get(
+            "intel_return_on_touch",
+            rules.get("RULE_CTF_ENABLE_INTEL_RETURN_ON_TOUCH"),
+        ))
+        self.intel_in_own_base_to_score = bool(overlay.get(
+            "intel_in_own_base_to_score",
+            rules.get("RULE_CTF_ENABLE_INTEL_IN_OWN_BASE_TO_SCORE"),
+        ))
+        self.shoot_with_intel = bool(overlay.get(
+            "shoot_with_intel",
+            self.shoot_with_intel_default
+            if "RULE_CTF_ENABLE_SHOOT_WITH_INTEL" not in explicit
+            else rules.get("RULE_CTF_ENABLE_SHOOT_WITH_INTEL"),
         ))
         
         # Intel positions (set during on_mode_start)
@@ -172,11 +196,25 @@ class CTFMode(BaseMode):
         wm = getattr(self.server, "world_manager", None)
         if reg is None or wm is None:
             return
+
+        # BaseMode has already rebuilt the map-owned crates/lights.  Remove
+        # only stale CTF markers here: clearing the registry used to erase all
+        # shared resources in CTF.  Do not trust the remembered ids alone;
+        # RoundLifecycle resets the allocator and a new crate can legitimately
+        # reuse an old intel id before this method runs.
         for ent in reg.all():
-            if getattr(ent, "kind", "") != "projectile":
-                if getattr(ent, "wire_visible", True):
-                    self.server.broadcast_destroy_entity(ent.entity_id)
-        reg.clear()
+            if getattr(ent, "kind", "") not in ("base", "intel"):
+                continue
+            removed = reg.remove(ent.entity_id)
+            if (
+                removed is not None
+                and removed.alive
+                and getattr(removed, "wire_visible", True)
+            ):
+                self.server.broadcast_destroy_entity(removed.entity_id)
+        self._base_entities = {TEAM1: None, TEAM2: None}
+        self._intel_entities = {TEAM1: None, TEAM2: None}
+
         for team in (TEAM1, TEAM2):
             bx, by, _bz = self.base_positions[team]
             x, y, z = wm.dry_surface_anchor(bx, by)
@@ -327,6 +365,18 @@ class CTFMode(BaseMode):
             
             if player.team not in (TEAM1, TEAM2):
                 continue
+
+            if (
+                self.intel_return_on_touch
+                and self.intel_holder[player.team] is None
+                and self.intel_drop_time[player.team] > 0.0
+                and self._is_near(
+                    player,
+                    self.intel_positions[player.team],
+                    radius=float(C.PICKUP_DISTANCE),
+                )
+            ):
+                await self._return_intel(player.team)
             
             # Check intel pickup
             enemy_team = TEAM2 if player.team == TEAM1 else TEAM1
@@ -341,8 +391,19 @@ class CTFMode(BaseMode):
             # Check intel capture
             if self.intel_holder[enemy_team] == player:
                 # Player is holding enemy intel
-                if self._is_at_base(player, player.team):
+                own_intel_home = (
+                    self.intel_holder[player.team] is None
+                    and self.intel_drop_time[player.team] <= 0.0
+                )
+                if self._is_at_base(player, player.team) and (
+                    not self.intel_in_own_base_to_score or own_intel_home
+                ):
                     await self._capture_intel(player, enemy_team)
+
+    def configure_initial_info(self, packet) -> None:
+        """Keep the client carrier weapon gate equal to server authority."""
+
+        packet.allow_shooting_holding_intel = int(self.shoot_with_intel)
     
     async def _pickup_intel(self, player: 'Player', intel_team: int):
         """Player picks up intel."""

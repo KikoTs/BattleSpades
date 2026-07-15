@@ -2,13 +2,13 @@
 
 How to start everything, control the live game programmatically, and run
 the measurement workflows. This is the operational handoff doc; the physics
-ground truth lives in [PHYSICS_CALIBRATION.md](PHYSICS_CALIBRATION.md).
+ground truth and reverse-engineering workflow live in [PROTOCOL.md](PROTOCOL.md).
 
 > **2026-07-11 operational note:** sections marked as historical later in this
 > file describe the old always-on tracing rig. Production launches must keep
 > parity capture and packet/movement tracing disabled. Current architecture and
-> investigation context live in [ARCHITECTURE.md](ARCHITECTURE.md) and
-> [ENGINEERING_NOTES.md](ENGINEERING_NOTES.md).
+> investigation context lives in [ARCHITECTURE.md](ARCHITECTURE.md) and
+> [HANDOFF.md](HANDOFF.md).
 
 ## Components & ports
 
@@ -291,6 +291,57 @@ dynamite placement observed by a second client, reconnect/map mutation catch-up,
 and one complete end-round transition. The client must remain in `GameScene`
 and the dump count must not increase.
 
+## Map resources, fog, and static-light validation
+
+Use a map with recovered stock metadata; Mayan Jungle exercises all three
+crate families and green static-light markers in one join:
+
+```powershell
+py scripts/run_validation_server.py --config logs/nonexistent-validation.toml `
+  --port 27023 --map MayanJungle --mode ctf
+```
+
+Join a clean client and query the instrumented scene. Expected Mayan values are
+7 `AmmoCrate`, 7 `HealthCrate`, 7 `BlockCrate`, 4 `FlareBlockEntity`, fog
+`(69, 76, 39)`, and skybox `MayanJungle.txt`; CTF additionally has two
+`IntelPickup` entities. Reconnect once to prove the same static entities are
+revealed after spawn. Touch an ammo crate while injured and verify ammo changes
+but health does not; then touch the health crate and verify only health changes.
+
+Repeat a mode start for TDM, CTF, Classic CTF, Arena, VIP, and Zombie. Resource
+counts must be identical across modes. CTF must retain its map resources while
+replacing only stale base/intel markers. Reject the build for a new dump,
+`invalid entity on destroy`, missing flare lights, default fog, or a crate that
+refills more than its own resource.
+
+### Ambience and official presentation validation
+
+Use Mayan Jungle because it has both a global bed and a localized river:
+
+```powershell
+py scripts/run_validation_server.py --config logs/nonexistent-validation.toml `
+  --port 27023 --map MayanJungle --mode tdm
+
+py scripts/auto_join.py --server 127.0.0.1:27023 --team 2 --class-id 0 `
+  --console-port 32906
+
+py scripts/game_console.py --port 32906 `
+  "[(a.name, a.positions, a.loop_id) for a in manager.scene.ambient_sounds]"
+py scripts/game_console.py --port 32906 `
+  "[(type(p).__name__, p.relative, p.volume, p.closed) for p in manager.media.players]"
+```
+
+Expect controllers `amb_jungle` with no points and `em_river` with exactly
+four authored points. Expect two non-closed `GameSound` players: the jungle
+bed is relative/global, while the river is non-relative and attenuated. The
+client log must not contain `Failed to play sound`.
+
+Also confirm the log selects `mesh/MayanJungle/MayanJungle.txt`. That manifest
+is presentation only. The server log must still say `mode=full` and send a
+non-empty canonical VXL stream for official maps; checksum-only or delta-only
+stock-map joins are a release blocker because they create hollow/desynchronized
+worlds. Compare `aos_crash_*.dmp` counts before and after the join.
+
 ## CTF objective and minimap validation
 
 Use an isolated CTF server and a clean retail client. Do not validate packet 43
@@ -361,12 +412,23 @@ each scene boundary:
 1. `/restart`: the client stays responsive in `GameScene` with a live player.
 2. `/map DefinitelyMissingMap_7391`: the current scene/world stays intact and
    the admin receives `Map not found`; no disconnect is allowed.
-3. `/map ArcticBase`: the client reaches `MenuScene` with reason 18, then
-   `auto_join.py` completes a fresh join on ArcticBase.
-4. `/mode ctf`: clean reason-18 disconnect, fresh CTF join, visible intel, no
-   `KeyError`, traceback, or `invalid entity on destroy` output.
-5. Run `/restart` once in CTF, then `/mode tdm`, rejoin, and finally `/kick`
-   the test player. All transitions must remain responsive.
+3. `/map ArcticBase`: the client processes native `MapEnded(52)`, enters
+   `LoadingMenu`, receives `InitialInfo` and the validated VXL transfer on the
+   same authenticated peer, then returns to `GameScene` on ArcticBase. The
+   client must never report `disconnected=True` and the server log must not
+   contain an ENet disconnect for that peer.
+4. `/mode ctf`: the same retained-peer loader sequence produces a fresh CTF
+   scene with visible intel and no `KeyError`, traceback, or
+   `invalid entity on destroy` output.
+5. Run `/restart` once in CTF, then `/mode tdm`, and finally `/kick` the test
+   player. Only the explicit kick may disconnect the peer.
+
+Before this test, install `client_patches/session_transition_patch.py` as
+documented in `client_patches/INSTALL.txt` and restart the client once. The stock
+packet-52 handler only freezes `GameScene`; disconnect reason 18 is terminal
+and is not a reconnect mechanism. The server requires the client's
+`MapDataValidation` reply before sending VXL bytes, so an unpatched client is
+retired individually instead of receiving loader packets in an old scene.
 
 Reject a lifecycle patch if a new `aos_crash_*.dmp` appears, the client log
 contains a traceback/invalid entity warning, or a transition tick exceeds the
@@ -374,6 +436,14 @@ contains a traceback/invalid entity warning, or a transition tick exceeds the
 CreateEntity(21) or DestroyEntity(19). A deployed production process must be
 restarted once in coordination with players to load changed Python modules;
 editing files does not hot-reload the running server.
+
+To validate retail map voting, lower the round time on the isolated server or
+wait until its final minute. The localized next-map overlay must expose one to
+three candidates on F1/F2/F3. Cast from two clients, confirm the chosen map is
+announced in chat, and let the end sequence finish. The winner must be consumed
+only at that boundary and use the same retained-peer packet-52 loader
+transition.
+An unadvertised candidate packet must not affect the tally.
 
 ## Bot runtime validation
 
@@ -387,6 +457,7 @@ py scripts\bot_zombie_smoke.py --seconds 15
 py scripts\bot_runtime_smoke.py --seconds 12 --bots 12 --restart-worker-at 2
 py scripts\bot_city_soak.py --mode tdm --bots 12 --sim-seconds 60 --report-every 10
 py scripts\bot_city_soak.py --mode zom --bots 12 --sim-seconds 60 --report-every 10
+py scripts\bot_city_soak.py --map CastleWars --mode zom --bots 2 --sim-seconds 60 --report-every 30 --strand-water-bots 2
 py scripts\server_capacity.py --players 12 --seconds 30 --port 27016
 
 # Exercise every implemented mode through the same real worker/native physics.
@@ -411,6 +482,12 @@ repeated action loops, jump loops, travel-role navigation stalls, invalid look
 targets, and water stalls. This is an accelerated decision/navigation
 diagnostic, not native physics or replication proof; keep the real worker,
 capacity, and two-retail-client gates above.
+
+The CastleWars fault-injection command places bots in the two water columns
+farthest from dry terrain. Both must report `water_recovery`, eventually reach
+dry land, and finish with `water_remaining=0`. Dry bots must still refuse to
+enter water. The test exercises the full-map cached voxel escape flow; it is
+specifically intended to catch regressions to the old 24/64-column search cap.
 
 `bot_combat_smoke.py` is the stricter player-parity gate. It uses a real worker,
 server-owned peerless Players, an authored VXL, and a settled packet observer.
@@ -469,7 +546,7 @@ either unbounded to accelerate large models.
 
 ## Historical status (2026-06-12, evening — post map-sync fix)
 
-DONE: physics parity (replay suite ALL PASS, see PHYSICS_CALIBRATION.md),
+DONE: physics parity (replay suite ALL PASS, see PROTOCOL.md),
 wade threshold (feet >= 239), unreliable WorldUpdates, non-blocking logs,
 input buffering, jump mirror, spawn drop-in, InitialInfo speed-scale
 alignment (class_data.speed_scale).

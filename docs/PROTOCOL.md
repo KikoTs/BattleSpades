@@ -59,15 +59,15 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 13 | SetClassLoadout | C→S | Handled | Normalized atomically at life boundaries. Retail may omit the trailing zero UGC-count byte; the bounded decoder accepts only that optional empty tail. Stock-LZF regression coverage proves three prefab strings survive compression in their selected order. |
 | 14 | ExistingPlayer | — | Planned | Roster entry format; imported but NOT sent — roster goes out as CreatePlayer(28) on purpose (client stores ExistingPlayer.pickup verbatim as pickup_id, no 0xFF sentinel). |
 | 15 | NewPlayerConnection | C→S | Handled | Client's join announcement (name/team/class), parsed in handshake. Before CreatePlayer, names are normalized to a case-insensitively unique 15-byte wire value; duplicate names can steal the native client's local-player association. |
-| 16 | ChangeEntity | S→C | Sent | Server-owned turret/MG target, carrier, ammo, and state properties. |
+| 16 | ChangeEntity | S→C | Sent | Server-owned turret/MG target, carrier, ammo, state, and map-pickup position. Action 1 (`SET_POSITION`) reliably settles a pickup after its supporting structure breaks. |
 | 17 | ChangePlayer | S→C | Sent | Existing-player state changes. Action `SET_HIGH_MINIMAP_VISIBILITY` (8) exposes the CTF intel carrier, both VIP bosses, or ZOM's final survivor through terrain; each mode owns marker cleanup and late-join replay. |
 | 18 | POIFocus | — | Planned | Point-of-interest focus marker (minimap/UI). |
 | 19 | DestroyEntity | S→C | Sent | Removes an entity previously announced to that GameScene. Server-only objective markers must never receive a destroy packet. For Snowball it removes the visual/effect only; it does not apply blast impulse. |
 | 20 | HitEntity | S→C | Sent | Visual impact callback for server-authoritative damageable-entity hits. |
-| 21 | Entity / CreateEntity | S→C | Sent | Entity wire format + create; used for crates, deployables, persistent ground intel 16, and moving projectile types including chemical 32, GL 33, sticky 34, and launched mine 37. The retail runtime table does **not** contain legacy FLAG=0 or BASE=1; sending BASE here freezes `GameScene.create_entity` with `KeyError: 1`. Both Entity and CreateEntity share id 21. |
-| 22 | CreateAmbientSound | — | Planned | Register a looping ambient sound source (sounds). |
-| 23 | PlaySound | S→C | Sent | One-shot positional/UI sound (server/audio.py — crate pickups, kill/death stingers). LIVE-VERIFIED. |
-| 24 | PlayAmbientSound | — | Planned | Start an ambient loop (sounds). |
+| 21 | Entity / CreateEntity | S→C | Sent | Entity wire format + create; used for map crates, type-13 static/player flare lights, deployables, persistent ground intel 16, and moving projectile types including chemical 32, GL 33, sticky 34, and launched mine 37. The retail runtime table does **not** contain legacy FLAG=0 or BASE=1; sending BASE here freezes `GameScene.create_entity` with `KeyError: 1`. Both Entity and CreateEntity share id 21. |
+| 22 | CreateAmbientSound | S→C | Sent | Registers a map-owned ambient controller. Empty points are a global bed; authored points define local emitters. Must precede packet 24 with the same loop ID. LIVE-VERIFIED. |
+| 23 | PlaySound | S→C | Sent | One-shot positional/UI sound: pickups, round/kill cues, and observer-only block-tool impacts. The actor predicts its own mining sound and is excluded. LIVE-VERIFIED. |
+| 24 | PlayAmbientSound | S→C | Sent | Allocates the streaming ambient `GameSound` registered by packet 22. Global beds are unpositioned; local loops bootstrap at the listener and are moved by the native point controller. LIVE-VERIFIED. |
 | 25 | StopSound | — | Planned | Stop a playing sound (sounds). |
 | 26 | PlayMusic | S→C | Sent | Music track (server/audio.py — last-minute game_ending track at 61s remaining). |
 | 27 | StopMusic | S→C | Sent | Stop the current music track (server/audio.py). |
@@ -90,12 +90,12 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 44 | MinimapZoneClear | — | Planned | Clear minimap zones (minimap). |
 | 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). VIP sends gangster classes with both `locked_class` bits. ZOM sends survivor classes on team 2, only base Zombie on team 3, and phase-aware team locks. |
 | 46 | KillAction | S→C | Sent | Broadcast kill/death event. `kill_count` is the killer's current-life streak for the retail multikill HUD; it resets on death/round transition and is not the cumulative scoreboard kill total. |
-| 47 | GenericVoteMessage | both | Handled+Sent | Vote overlay open/update/close (server/voting.py) + client CAST. Title/description is a repr'd localized-string tuple (client ast.literal_evals it). |
+| 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact candidate records; the retail client binds the first three to F1/F2/F3. Title/description is a repr'd localized-string tuple (client ast.literal_evals it). |
 | 48 | InitiateKickMessage | C→S | Handled | Client starts a kick vote → VoteManager (server/voting.py). |
-| 49 | ChatMessage | both | Handled+Sent | Chat; handled on receive, broadcast by server + commands. |
-| 50 | LocalisedMessage | — | Planned | String-table localized message (UI/chat). |
-| 51 | SkyboxData | S→C | Sent | Skybox visuals (sent at join, prefix 0x30). |
-| 52 | MapEnded | S→C | Sent | End-of-round signal, sent with the stats screen (server/scoreboard.py). |
+| 49 | ChatMessage | both | Handled+Sent | Player chat uses types 0/1; private system replies use type 2. Global server/mode announcements use `CHAT_BIG` type 3 and render at the top of every retail HUD. |
+| 50 | LocalisedMessage | S→C | Sent | Top-screen string-table announcement. Resolves `string_id`, optionally resolves every positional parameter as another localization ID (for example `TEAM1_COLOR`), formats `{0}`/`{1}`/`{2}`, and supports replace-previous behavior. See Broadcast templates below. |
+| 51 | SkyboxData | S→C | Sent | Null-terminated retail mesh-environment filename (sent at join, prefix 0x30). It comes from the active VXL's validated sidecar `skybox_texture`/`skybox_name`; `[world].default_skybox` is the missing-metadata fallback. |
+| 52 | MapEnded | S→C | Sent | Native full-scene rollover trigger. It freezes the compiled `GameScene`; the compatibility hook opens `LoadingMenu`, then the server sends a fresh validated loader handshake over the same authenticated peer. Same-map score presentation deliberately omits it. |
 | 53 | ShowGameStats | S→C | Sent | Opens the full-screen end-of-round scores/credits screen (base_mode end sequence). LIVE-VERIFIED. |
 | 54 | MapDataStart | — | Planned | Legacy map-data transfer start (map-sync-legacy). |
 | 55 | MapSyncStart | S→C | Sent | Bare-id map sync start (prefix 0x32). |
@@ -112,12 +112,12 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 66 | RankUps | — | Planned | XP/rank changes at map end (match lifecycle/progression). |
 | 67 | GameStats | S→C | Sent | End-of-round scoreboard widget (server/scoreboard.py, on_mode_end). |
 | 68 | UGCObjectives | — | Planned | UGC-defined objectives (UGC). |
-| 69 | Restock | S→C | Sent | Refill ammo/health/blocks at a restock zone. |
+| 69 | Restock | S→C | Sent | Resource-specific refill. Type 0 is the full-life spawn/general restock; a physical ammo crate must send type 3. Health (4), block (5), and jetpack (6) crates use their own paths. Sending type 0 for an ammo crate also restores client health. |
 | 70 | PickPickup | S→C | Sent | Authoritative objective pickup; initializes carried tool and burden state. CTF removes the type-16 ground entity and enables the carrier's high-visibility minimap marker. |
 | 71 | DropPickup | both | Handled+Sent | Client drop request validated against sender/current pickup, then relayed with authoritative identity, type, position, and capped throw velocity. DropPickup clears the carried tool but does not persist ground intel, so CTF follows it with a type-16 CreateEntity at the settled dry-ground position. |
 | 72 | ForceShowScores | — | Planned | Force the scoreboard open (match lifecycle). |
-| 73 | ShowTextMessage | — | Planned | On-screen text message (UI). |
-| 74 | FogColor | S→C | Sent | Set fog color (sent via admin/server command). |
+| 73 | ShowTextMessage | S→C | Reversed/unused | Selects one of nine hard-coded end/mode messages plus a duration; it is not an arbitrary text overlay. Free-form/localized broadcasts use packets 49/50 with `CHAT_BIG`. |
+| 74 | FogColor | S→C | Sent | Live fog override from the admin command. Initial fog comes from the active map sidecar in StateData; the runtime override also persists into later spawn/rejoin snapshots. |
 | 75 | TimeScale | — | Planned | Game time-scale multiplier (mode rules). |
 | 76 | WeaponReload | both | Handled+Sent | Reload request handled; also sent as reload confirmation. |
 | 77 | ChangeTeam | C→S | Handled | Client team switch request. |
@@ -210,6 +210,36 @@ the selected tool must be established from the packet/tool state, not its hand
 model. Normalized default loadouts preserve the stock carousel with block first
 and flare last.
 
+### Stock map resources and static flare markers
+
+VXL contains voxel spans, not crate or atmosphere metadata. The original
+feature server supplied those fields in a same-stem compiled sidecar. The safe
+server representation accepts JSON or literal assignment syntax and imports
+`fog_color`, `static_light_color0/1`, the three `*_crate_drop_points` arrays,
+and team spawn/base volumes without executing map code.
+
+The native VXL loader removes exposed chroma markers before gameplay. Green
+markers select static-light colour slot 0 and blue markers select slot 1. The
+server mirrors that collision removal and creates neutral type-13 entities at
+the removed marker positions only when the map metadata defines that colour
+slot. `FlareBlockEntity` owns the retail point light; the ordinary entity
+snapshot path reproduces the same lights for late joiners.
+
+### Stock presentation assets and ambience
+
+Packet 51 names a bundled mesh-environment manifest. Its render list contains
+client-side sky/cloud/mist/wave/sun objects, transforms, and UV animation; it
+does not contain voxel collision. `STOCK_MAP_SKYBOXES` maps shipped VXL names
+to these presentation aliases, but stock and UGC maps both receive a full VXL
+stream. The client's local CRC is validation, not permission to omit map data.
+
+Map ambience uses paired packets. `CreateAmbientSound(22)` carries a validated
+asset name, loop ID, and zero or more signed-short XYZ points. It only creates
+the controller. `PlayAmbientSound(24)` with the same loop ID starts the stream
+and supplies looping/positioned flags, volume, position, and attenuation.
+Original metadata rows are `[name, points, volume, attenuation]`; empty points
+are global, while non-empty point lists are local effects.
+
 ### Non-standard / server-internal packets
 
 These are BattleSpades-specific debug packets, not part of the original 1.x
@@ -248,9 +278,9 @@ planned.**
 What lighting up each feature area unlocks (all ids below are already defined in
 `packet.pyx`, just not yet wired):
 
-### Sounds (planned)
-CreateAmbientSound (22), PlaySound (23), PlayAmbientSound (24), StopSound (25),
-PlayMusic (26), StopMusic (27).
+### Sounds
+CreateAmbientSound (22), PlaySound (23), PlayAmbientSound (24), PlayMusic (26),
+and StopMusic (27) are sent. StopSound (25) remains planned.
 
 ### Minimap / POI
 
@@ -258,8 +288,33 @@ CTF base zones use MinimapZone (43), and radar uses TeamMapVisibility (83).
 POIFocus (18), standalone MinimapBillboard (41), MinimapBillboardClear (42),
 and MinimapZoneClear (44) remain planned.
 
-### Voting / kick (planned)
-GenericVoteMessage (47), InitiateKickMessage (48).
+### Voting / kick
+
+`GenericVoteMessage(47)` drives both majority kick ballots and the stock
+next-map overlay. Candidate text is an identity field, not a yes/no string:
+the server accepts only an exact advertised candidate and rejects forged or
+missing records. The map catalog is captured at startup, and the final-minute
+vote offers at most three maps in deterministic rotation order. A vote merely
+stages `VoteManager.next_map`; the round lifecycle consumes it at the safe
+scene boundary. `InitiateKickMessage(48)` remains the kick start/cancel path.
+
+### Map and mode scene rollover
+
+IDA confirms that the retail receiver dispatches packet 52 through
+`GameScene.process_packet_map_ended` and then `GameScene.on_map_ended`.
+`on_map_ended` only sets the three scene pause flags and stops movement; it does
+not select `LoadingMenu`, disconnect, or reconnect. Disconnect reason 18 is
+terminal in the tested retail build.
+
+Replacing the VXL or mode therefore follows this order: preflight the target,
+send and flush `MapEnded(52)`, detach the old server-side `Player`, commit the
+new runtime, and retain the authenticated ENet peer. The client compatibility
+hook selects `LoadingMenu(identifier=None)`, which deliberately reuses the
+current `GameClient`. The server then sends `InitialInfo`; only after receiving
+the matching `MapDataValidation` response does it stream the VXL and finish the
+normal `MapSync`/`StateData`/roster sequence. A peer that does not enter the
+loader is retired with reason 18 without affecting compatible peers. Invalid
+targets fail before packet 52 and leave the active scene untouched.
 
 ### Deployables / Place*
 PlaceDynamite (1), UseCommand (86), PlaceMG (87), PlaceRocketTurret (88),
@@ -344,6 +399,13 @@ PickPickup (70) is server-to-client only. DropPickup (71) is handled and
 relayed; objective pickup state is also carried by WorldUpdate and replayed to
 late joiners.
 
+Map crates remember their authored vertical offset from the first solid voxel
+beneath them. At 10 Hz they verify only that remembered support cell. If it is
+destroyed, the server finds the next support in AoS's +Z-down column, updates
+the authoritative entity/home position, and reliably emits ChangeEntity (16)
+action 1. A fall into a water-only column is redirected to the nearest dry
+surface so a permanent map resource cannot become unreachable.
+
 ### Classic CTF scene contract
 
 Classic CTF is not sent as a separate retail scene. `StateData.mode_type` and
@@ -426,8 +488,13 @@ join-time rollback. Ordinary 30 Hz WorldUpdates remain unreliable. ChangePlayer
 ### Auth (planned)
 Password (111), PasswordNeeded (112), PasswordProvided (113).
 
-### UI / messaging (planned)
-LocalisedMessage (50), ShowTextMessage (73), HelpMessage (109).
+### UI / messaging
+ChatMessage (49) and LocalisedMessage (50) are active for retail top-screen
+broadcasts. Because packet 49 never performs localization, its shared builder
+resolves `TEAM1_COLOR`, `TEAM2_COLOR`, and `TEAM_NEUTRAL` to canonical display
+text before serialization. ShowTextMessage (73) is fully reversed but intentionally unused for
+free-form text because its byte is a fixed message enum. HelpMessage (109)
+remains planned. The formatter contract and variables are documented below.
 
 ### Voice (planned)
 VoiceData (103).
@@ -437,3 +504,63 @@ SetGroundColors (118).
 
 ### Dev tooling (planned)
 DebugDraw (107).
+
+## Retail Match Lobby recovery
+
+The lobby schema was recovered from the shipped Python 2 constant pool rather
+than inferred from UI screenshots:
+
+- `aoslib/scenes/frontend/matchSettingsPanel.pyc` supplies max-player and
+  match-length selectors.
+- `gameRulesPanel.pyc` consumes `shared.constants_matchmaking.A2667` (visible
+  categories), `A2688` (defaults/legal values), `A2711` (rule-to-tool), and
+  `A2712` (rule-to-class).
+- `shared.constants_gamemode.A2448` contains the ten public rows and `A2662`
+  contains their default clocks.
+- `playlists/*.txt` contains official map compatibility and playlist defaults.
+
+The public modes are `tdm`, `ctf`, `cctf`, `zom`, `vip`, `mh`, `tc`, `dia`,
+`dem`, and `oc`. Tutorial and UGC creator entries are not public match rows.
+Selectors and map sets are normalized in `server/lobby.py`; all 102 visible
+and hidden rules live in `server/game_rules.py`. Hidden recovered controls are
+vote threshold, own-intel-at-base scoring, riot shield, and normal parachute.
+Do not duplicate these tables in handlers.
+
+## Broadcast templates
+
+Free-form text uses packet 49. Localized templates use packet 50 with a string
+ID, positional parameters, a `localise_parameters` flag, and an
+`override_previous` flag. Packet 73 is a fixed enum, not arbitrary text.
+
+Before packet 49 serialization the server resolves `TEAM1_COLOR`,
+`TEAM2_COLOR`, and `TEAM_NEUTRAL` into readable names. Packet 50 may pass those
+identifiers as localized parameters. Construct both through
+`server.announcements`; never interpolate untrusted tuple syntax into a native
+client field.
+
+## Reverse-engineering workflow and evidence navigation
+
+Use evidence in this order:
+
+1. A clean retail client observed live.
+2. IDA/decompiler control flow and the shipped Python 2 `.pyc` constant pool.
+3. Packet read/write layouts in `shared/packet.pyx`.
+4. Maintained characterization tests and raw captures.
+5. Reversed Python/Cython ports only as hypotheses.
+
+For lobby data, import the constant module with the client's bundled 32-bit
+Python 2 executable and print the obfuscated table directly. For native code,
+record image base, function address, caller/callee, field offsets, packet
+direction, and exact reproduction. A claim without a static path and a retail
+observation remains provisional.
+
+Movement evidence must preserve the 60 Hz clock, input label, receipt tick,
+owner send sequence, WorldUpdate stamp, and pre/post native state. Owner rows
+are reconciliation events; observer rows are replication. Never tune both
+sides simultaneously. Terrain evidence must record the originating input loop
+and verify owner, observer, late join, and join-during-mutation views.
+
+Crash-sensitive invariants include `InitialInfo` list shapes, compact player
+IDs, entity create/destroy symmetry, map display names used for screenshots,
+scene-terminal packets, localized-string tuple fields, and entity IDs used by
+projectile effects. Change one only with a focused test and two clean clients.

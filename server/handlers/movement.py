@@ -91,7 +91,9 @@ async def handle_client_data(server, player, packet) -> None:
         packet.hover,
         packet.palette_enabled,
     )
-    player.set_tool(packet.tool_id, raw=True)
+    from server.game_rules import get_rules
+    if get_rules(server.config).is_tool_enabled(packet.tool_id):
+        player.set_tool(packet.tool_id, raw=True)
 
     capture = bool(getattr(server.config, "movement_debug_capture", False))
     if capture and logger.isEnabledFor(logging.DEBUG):

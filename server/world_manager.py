@@ -129,6 +129,11 @@ class WorldManager:
         self._spawn_candidates: dict[int, list[tuple[int, int]]] = {
             TEAM1: [], TEAM2: []
         }
+        # Team anchors describe authored/fallback map locations, not moving
+        # gameplay state. Bot perception reads them many times per second, so
+        # resolving large authored zones on every frame would put a full spawn
+        # scan back on the authoritative 60 Hz thread.
+        self._team_base_anchors: dict[int, tuple[float, float, float]] = {}
         # Canonical terrain-version stream consumed by off-thread navigation.
         # Listeners receive only primitive values and must remain non-blocking.
         self.topology_version: int = 0
@@ -162,6 +167,7 @@ class WorldManager:
             self.topology_version = 0
             self._surface_cache.clear()
             self._spawn_candidates = {TEAM1: [], TEAM2: []}
+            self._team_base_anchors.clear()
             self.map_metadata = load_map_metadata(
                 map_path, str(getattr(self.config, "game_mode", "nor"))
             )
@@ -205,6 +211,7 @@ class WorldManager:
         self.topology_version = 0
         self._surface_cache.clear()
         self._spawn_candidates = {TEAM1: [], TEAM2: []}
+        self._team_base_anchors.clear()
         self.map_metadata = MapMetadata()
         self._refresh_world()
         self.prewarm_spawn_candidates()
@@ -533,6 +540,7 @@ class WorldManager:
         """
         for team in (TEAM1, TEAM2):
             self._get_spawn_candidates(team)
+            self.team_base_anchor(team)
 
     @staticmethod
     def _zone_at(zones: list[MapZone], x: int, y: int) -> MapZone | None:
@@ -562,6 +570,17 @@ class WorldManager:
 
     def team_base_anchor(self, team: int) -> Tuple[float, float, float]:
         """Player-coordinate anchor for a team's authored or fallback base."""
+        team = int(team)
+        cached = self._team_base_anchors.get(team)
+        if cached is not None:
+            return cached
+
+        anchor = self._resolve_team_base_anchor(team)
+        self._team_base_anchors[team] = anchor
+        return anchor
+
+    def _resolve_team_base_anchor(self, team: int) -> Tuple[float, float, float]:
+        """Resolve one map-stable team anchor outside the gameplay tick."""
         base_zones = self.map_metadata.base_zones.get(team, [])
         for zone in base_zones:
             x0, x1, y0, y1 = zone.xy_bounds()
@@ -778,6 +797,10 @@ class WorldManager:
             self.clear_block_damage(x, y, z)
             return 0.0, False
 
+        from server.game_rules import get_rules
+        threshold = float(threshold) * float(
+            get_rules(self.config).get("RULE_BLOCK_HEALTH")
+        )
         pos = (x, y, z)
         total = self.block_damage.get(pos, 0.0) + damage
         if total >= threshold:

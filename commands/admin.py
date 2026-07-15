@@ -6,9 +6,6 @@ import math
 
 import shared.constants as C
 
-from server.game_constants import CHAT_SYSTEM
-from shared.packet import ChatMessage
-
 from .command_handler import register_command, CommandContext, send_message
 
 
@@ -33,12 +30,9 @@ async def cmd_kick(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, f"Player not found: {target_name}")
         return
     
-    msg = f"{target.name} was kicked: {reason}"
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = msg
-    ctx.server.broadcast(bytes(packet.generate()))
+    from server.announcements import broadcast_overlay
+
+    broadcast_overlay(ctx.server, f"{target.name} was kicked: {reason}")
     
     target.disconnect(reason=2)  # DISCONNECT_KICKED
 
@@ -87,12 +81,11 @@ async def cmd_ban(ctx: CommandContext):
         ctx.server.ban_manager.add(ip, target.name, reason, duration)
 
     when = "permanently" if duration <= 0 else f"for {ctx.args[1]}"
-    msg = f"{target.name} was banned {when}: {reason}"
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = msg
-    ctx.server.broadcast(bytes(packet.generate()))
+    from server.announcements import broadcast_overlay
+
+    broadcast_overlay(
+        ctx.server, f"{target.name} was banned {when}: {reason}"
+    )
 
     target.disconnect(reason=1)  # DISCONNECT_BANNED
 

@@ -41,6 +41,7 @@ class ClassicCTFMode(CTFMode):
     description = "Classic Deuce CTF: capture the enemy intel!"
     mode_code = "cctf"
     intel_auto_return_default = False
+    shoot_with_intel_default = True
 
     def prepare_join_selection(
         self,
@@ -86,7 +87,7 @@ class ClassicCTFMode(CTFMode):
         # id remains ordinary CTF so the stock executable builds a valid scene.
         packet.classic = 1
         packet.enable_minimap = 0
-        packet.allow_shooting_holding_intel = 1
+        packet.allow_shooting_holding_intel = int(self.shoot_with_intel)
         disabled = list(packet.disabled_tools)
         for tool in _CLASSIC_DISABLED_TOOLS:
             if int(tool) not in disabled:

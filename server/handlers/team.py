@@ -50,6 +50,8 @@ async def handle_set_color(server, player, packet) -> None:
     packet to its sender races self WorldUpdate processing and visibly flickers
     the held block, while dead/non-palette-tool updates are invalid state.
     """
+    from server.game_rules import get_rules
+    config = getattr(server, "config", None)
     if (
         not player.alive
         or not player.spawned
@@ -57,6 +59,7 @@ async def handle_set_color(server, player, packet) -> None:
         # share Character.block_color. The retail Snowblower.on_set explicitly
         # activates the same palette, so its SetColor is gameplay state too.
         or int(player.tool) not in PALETTE_TOOL_IDS
+        or not get_rules(config).enabled("RULE_ENABLE_COLOUR_PICKER")
     ):
         return
     value = int(packet.value) & 0xFFFFFF

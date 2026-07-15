@@ -111,7 +111,11 @@ def stage_release(
         root / "LICENSE": "LICENSE",
         root / "VERSION": "VERSION",
         root / "release" / "README.txt": "README.txt",
-        root / "release" / "THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+        root / "release" / "THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
+        root / "client_patches" / "INSTALL.txt": "client_patches/INSTALL.txt",
+        root / "client_patches" / "session_transition_patch.py": (
+            "client_patches/session_transition_patch.py"
+        ),
     }
     missing = [str(path) for path in required_files if not path.is_file()]
     if missing:
@@ -121,7 +125,9 @@ def stage_release(
     shutil.copytree(frozen, destination)
     try:
         for source, relative_name in required_files.items():
-            shutil.copy2(source, destination / relative_name)
+            target_path = destination / relative_name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target_path)
 
         map_count = _copy_files(root / "maps", destination / "maps", "*.vxl")
         _copy_files(root / "maps", destination / "maps", "*.json")

@@ -55,6 +55,7 @@ class DummyServer:
     def __init__(self):
         self.loop_count = 42
         self.players = {}
+        self.reserved_player_ids = set()
         self.connections = {}
         self.teams = {
             TEAM1: Team(TEAM1, "TEAM1_COLOR", (44, 117, 179)),
@@ -81,6 +82,48 @@ class DummyServer:
 
 def make_connection(server):
     return Connection(DummyPeer(), server)
+
+
+def test_scene_reload_reset_preserves_authentication_and_clears_old_epoch() -> None:
+    async def scenario():
+        server = DummyServer()
+        connection = make_connection(server)
+        connection.authenticated = True
+        connection.steam_key = b"secret"
+        connection.reserved_player_id = 7
+        server.reserved_player_ids.add(7)
+        connection.map_sent = connection.state_sent = True
+        connection.in_game = True
+        connection.in_menu = False
+        connection.pending_class_id = 3
+        connection.pending_loadout = [1, 2]
+        connection.pending_prefabs = ["wall"]
+        connection.pending_ugc_tools = [9]
+        connection.map_mutation_watermark = 12
+        connection.map_mutation_overflow = True
+        connection.known_player_lives[4] = (10, 20)
+        waiter = asyncio.get_running_loop().create_future()
+        connection._waiters[60] = waiter
+
+        connection.reset_for_scene_reload()
+        return server, connection, waiter
+
+    server, connection, waiter = asyncio.run(scenario())
+
+    assert waiter.cancelled()
+    assert connection.authenticated is True
+    assert connection.steam_key == b"secret"
+    assert connection.reserved_player_id is None
+    assert 7 not in server.reserved_player_ids
+    assert connection.map_sent is connection.state_sent is False
+    assert connection.in_game is False
+    assert connection.pending_class_id is None
+    assert connection.pending_loadout == []
+    assert connection.pending_prefabs == []
+    assert connection.pending_ugc_tools == []
+    assert connection.map_mutation_watermark is None
+    assert connection.map_mutation_overflow is False
+    assert connection.known_player_lives == {}
 
 
 def test_team_mapping_helpers():

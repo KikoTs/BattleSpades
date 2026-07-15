@@ -48,14 +48,14 @@ structure collapse, pickups, deaths/respawns, and bots all work and stay in sync
 client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
 what's still on the list.
 
-- **719** unit/regression tests pass (`py -3 -m pytest -q`)
+- **866** unit/regression tests pass (`py -3 -m pytest -q`)
 - The executable 50-player capacity gate sustains ~60 Hz with sub-5 ms tick
   p99 on the current Windows/Python 3.12 baseline. See
-  [`docs/SERVER_PERFORMANCE.md`](docs/SERVER_PERFORMANCE.md).
+  [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - Movement parity: mean client↔server position delta in the **millimetre** range over
   thousands of frames (`py scripts/replay_parity.py` — must stay `ALL PASS`)
 - Physics ground truth and every measured constant live in
-  [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md)
+  [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 
 ## Quick start
 
@@ -100,7 +100,7 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.1-alpha.2` is packaged as six standalone server archives. Each archive
+`0.0.2-alpha.1` is packaged as six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 
@@ -181,7 +181,7 @@ BattleSpades/
 ├── maps/               # stock .vxl maps (shipped)
 ├── scripts/            # build + reverse-engineering / verification tooling
 ├── tests/              # pytest suite
-└── docs/               # calibration, netcode, runbook, roadmap
+└── docs/               # six focused server/operator/reversal references
 ```
 
 **Design principles**
@@ -216,7 +216,7 @@ Requires a working C toolchain:
 | **Fedora/RHEL** | `sudo dnf install gcc python3-devel` |
 | **macOS** | `xcode-select --install` |
 
-See [`docs/BUILDING.md`](docs/BUILDING.md) for cross-compilation notes (the project ships on
+See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for cross-compilation notes (the project ships on
 **Windows x64** and **Linux amd64/arm64**).
 
 ## ENet networking
@@ -290,7 +290,7 @@ can appear in server browsers that support the 1.x protocol.
 `/pm <player> <msg>`, `/me <action>`, `/stats`, `/ping`
 
 **Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
-`/tp <player>`, `/god`, `/map <name>`, `/mode <ctf|cctf|tdm|arena|vip|zombie>`, `/restart`, `/say <msg>`,
+`/tp <player>`, `/god`, `/map <name>`, `/mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>`, `/restart`, `/say <msg>`,
 `/fog <r> <g> <b>`, `/time`, `/balance`, `/bots status`,
 `/bots fill <count>`, `/bots add <count> [team]`,
 `/bots remove <count|name|all>`, `/bots difficulty <casual|normal|hard|mixed>`
@@ -298,7 +298,7 @@ can appear in server browsers that support the 1.x protocol.
 ## Testing & tooling
 
 ```bash
-py -3 -m pytest tests/ -q       # unit/regression tests (currently 719 passing)
+py -3 -m pytest tests/ -q       # unit/regression tests (currently 866 passing)
 py scripts/replay_parity.py     # offline movement-parity check (must be ALL PASS)
 ```
 
@@ -306,10 +306,25 @@ The `scripts/` directory also holds the reverse-engineering rig used to build th
 an in-game **physics oracle / console** (`game_console.py`, `auto_join.py`,
 `oracle_experiments.py`) that drives the real client to extract ground-truth physics and
 replay it through the Python engine. Details in [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+Retail top-screen announcement packets, localization parameters, team-color
+IDs, and the recovered template variables are documented in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+## Documentation
+
+- [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md): every config option, rule,
+  command, and plugin hook.
+- [`docs/GAMEPLAY.md`](docs/GAMEPLAY.md): modes, official map sets, gameplay
+  invariants, and bots.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): service ownership and data flow.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md): packets, retail evidence, and the
+  reverse-engineering workflow.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release.
+- [`docs/HANDOFF.md`](docs/HANDOFF.md): current state, known gaps, and evidence.
 
 ## Roadmap
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full list. In short:
+See [`docs/HANDOFF.md`](docs/HANDOFF.md) for the live backlog. In short:
 
 - **Near term** — end-of-round scoreboard screen, per-player scoreboard column, HUD round
   timer; polish grenade/collapse visuals; reconnect-lifecycle hardening.
@@ -323,7 +338,7 @@ Contributions welcome — especially maps, game modes, and platform build report
 
 1. Keep `py -m pytest tests/ -q` and `py scripts/replay_parity.py` green.
 2. Rebuild Cython (`python setup.py build_ext --inplace`) after editing any `.pyx`.
-3. Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`docs/PHYSICS_CALIBRATION.md`](docs/PHYSICS_CALIBRATION.md)
+3. Read [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
    before touching netcode or physics — those values are hard-won measurements.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).

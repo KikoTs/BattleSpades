@@ -5,7 +5,12 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import PlaySound, PlayMusic, GenericVoteMessage  # noqa: E402
+from shared.packet import (  # noqa: E402
+    GenericVoteMessage,
+    PlayAmbientSound,
+    PlayMusic,
+    PlaySound,
+)
 from server import audio, voting  # noqa: E402
 
 
@@ -73,7 +78,7 @@ def test_map_ambient_packet_matches_client_wire():
     assert ca == expected
 
 
-def test_send_map_ambient_picks_map_track_and_grid():
+def test_send_map_ambient_picks_global_map_bed_without_fake_grid():
     # Parse the raw wire bytes directly (id, name\0, loop_id byte, count byte)
     # — the compiled CreateAmbientSound.read still has a loop_id read bug the
     # .pyx source fixes on next rebuild; the WRITE is what ships and is correct.
@@ -82,7 +87,7 @@ def test_send_map_ambient_picks_map_track_and_grid():
                                         map_size_x=512, map_size_y=512)
     player = FakePlayer(1)
     audio.send_map_ambient(srv, player)
-    assert len(player.sent) == 1
+    assert len(player.sent) == 2
     data = player.sent[0]
     assert data[0] == 22                    # CreateAmbientSound id
     assert b"amb_arctic\x00" in data[:16]   # null-terminated map ambient name
@@ -90,7 +95,15 @@ def test_send_map_ambient_picks_map_track_and_grid():
     loop_id = data[nul + 1]
     count = data[nul + 2]
     assert loop_id == 1
-    assert count == 64                      # 8x8 grid over 512x512 @ step 64
+    # Empty points are the native global-bed form. The removed z=40 grid sat
+    # far below normal terrain and made the client distance-cull the ambience.
+    assert count == 0
+    play = PlayAmbientSound(ByteReader(player.sent[1][1:]))
+    assert play.name == "amb_arctic"
+    assert play.looping
+    assert not play.positioned
+    assert play.loop_id == 1
+    assert abs(play.volume - 1.0) < 0.01
 
 
 def test_send_map_ambient_falls_back_for_unknown_map():
@@ -100,6 +113,47 @@ def test_send_map_ambient_falls_back_for_unknown_map():
     player = FakePlayer(1)
     audio.send_map_ambient(srv, player)
     assert audio.DEFAULT_AMBIENT.encode() + b"\x00" in player.sent[0][:16]
+    play = PlayAmbientSound(ByteReader(player.sent[1][1:]))
+    assert play.name == audio.DEFAULT_AMBIENT
+    assert not play.positioned
+
+
+def test_send_map_ambient_preserves_authored_local_emitters():
+    from server.map_metadata import MapAmbientSound, MapMetadata
+
+    srv = FakeServer()
+    srv.world_manager = SimpleNamespace(
+        map_name="MayanJungle",
+        map_metadata=MapMetadata(ambient_sounds=[
+            MapAmbientSound("amb_jungle"),
+            MapAmbientSound(
+                "em_river",
+                ((250, 232, 237), (365, 319, 237)),
+                1.0,
+                1.0,
+            ),
+        ]),
+    )
+    player = FakePlayer(1)
+    player.x, player.y, player.z = 360.0, 315.0, 235.0
+
+    audio.send_map_ambient(srv, player)
+
+    assert len(player.sent) == 4
+    assert b"amb_jungle\x00\x01\x00" in player.sent[0]
+    assert player.sent[1][0] == 24
+    assert b"em_river\x00\x02\x02" in player.sent[2]
+    river = PlayAmbientSound(ByteReader(player.sent[3][1:]))
+    assert river.name == "em_river"
+    assert river.looping and river.positioned
+    assert river.loop_id == 2
+    # A positioned source is bootstrapped at the listener. The native
+    # AmbientSound controller then moves its allocated loop to the nearest
+    # authored point; starting at a far emitter would be rejected outright.
+    assert abs(river.x - 360.0) < 0.1
+    assert abs(river.y - 315.0) < 0.1
+    assert abs(river.z - 235.0) < 0.1
+    assert abs(river.attenuation - 1.0) < 0.01
 
 
 def test_play_gameplay_music_sends_stop_then_specific_track():
@@ -187,3 +241,44 @@ def test_disconnect_clears_vote_identity_before_player_id_reuse():
 
     assert not vm.active
     assert 0 not in vm._last_start
+
+
+def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+
+    assert vm.start_map_vote(
+        ("ArcticBase", "CastleWars", "CityOfChicago"),
+        now=100.0,
+    )
+    start = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    assert start.message_type == voting.VOTE_START
+    assert [candidate["name"] for candidate in start.candidates] == [
+        "ArcticBase",
+        "CastleWars",
+        "CityOfChicago",
+    ]
+    assert start.title == repr(("VOTE_MAP_TITLE",))
+    assert start.description == repr(("VOTE_MAP_DESCRIPTION",))
+
+    vm.cast_candidate(srv.players[0], "CastleWars")
+    vm.cast_candidate(srv.players[1], "CastleWars")
+    vm.cast_candidate(srv.players[2], "ArcticBase")
+    vm.tick(100.0 + voting.MAP_VOTE_DURATION + 0.1)
+
+    assert vm.active is False
+    assert vm.next_map == "CastleWars"
+    closed = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    assert closed.message_type == voting.VOTE_CLOSED
+    assert closed.can_vote == 0
+
+
+def test_generic_candidate_cast_maps_kick_choice_by_exact_candidate_name():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+    vm.start_kick(srv.players[0], srv.players[3], voting.KICK_ABUSE, now=100.0)
+
+    vm.cast_candidate(srv.players[1], "Kick P3")
+
+    assert vm.active is False
+    assert srv.players[3].disconnected == 2

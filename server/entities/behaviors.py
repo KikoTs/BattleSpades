@@ -16,6 +16,8 @@ needs no behavior at all):
 """
 from __future__ import annotations
 
+import math
+
 
 class EntityBehavior:
     """Base behavior — inert. Subclass and override the hooks you need."""
@@ -81,12 +83,90 @@ class PickupCrateBehavior(EntityBehavior):
     # radius + closely spaced crates let one walk-through consume BOTH the
     # ammo and health crate at once ("everything replenishes everything").
     touch_radius = 2.5
+    support_check_interval = 0.10
 
     def __init__(self, refill, respawn_delay: float = 15.0, sound_id: int = None):
         self.refill = refill
         self.respawn_delay = float(respawn_delay)
         # Client SOUND_ID for the pickup cue (ammo 13 / health 14 / blocks 15).
         self.sound_id = sound_id
+
+    def on_tick(self, ent, dt, ctx) -> None:
+        """Keep a map pickup attached to the live voxel column beneath it.
+
+        The retail entity is static after packet 21 creation.  When players
+        remove its supporting structure the authoritative server therefore
+        has to settle it and emit ``ChangeEntity.SET_POSITION``.  Checks are
+        throttled to 10 Hz and only scan a column after the remembered support
+        voxel actually disappears.
+        """
+
+        from shared import constants as C
+
+        world = getattr(ctx, "world", None)
+        if world is None or not callable(getattr(world, "get_solid", None)):
+            return
+        if ctx.now < float(getattr(ent, "terrain_check_at", 0.0)):
+            return
+        ent.terrain_check_at = ctx.now + self.support_check_interval
+
+        x = int(math.floor(ent.x))
+        y = int(math.floor(ent.y))
+        if not (0 <= x < int(C.MAP_X) and 0 <= y < int(C.MAP_Y)):
+            return
+
+        support_z = ent.terrain_support_z
+        if support_z is None:
+            support_z = self._find_support(world, x, y, int(math.floor(ent.z)))
+            if support_z is None:
+                return
+            ent.terrain_support_z = support_z
+            ent.terrain_offset_z = float(ent.z) - float(support_z)
+            return
+        if world.get_solid(x, y, int(support_z)):
+            return
+
+        new_support = self._find_support(world, x, y, int(support_z) + 1)
+        water_limit = int(getattr(C, "Z_ABOVE_WATERPLANE", 238))
+        if new_support is not None and new_support <= water_limit:
+            new_position = (
+                float(ent.x),
+                float(ent.y),
+                float(new_support) + float(ent.terrain_offset_z),
+            )
+        else:
+            # A collapsed bridge can leave no dry support in this column. Move
+            # the pickup to the nearest dry surface instead of marooning a
+            # permanent objective below the water plane.
+            anchor = getattr(world, "dry_surface_anchor", None)
+            if not callable(anchor):
+                return
+            try:
+                new_position = anchor(ent.x, ent.y, search=64)
+            except TypeError:
+                new_position = anchor(ent.x, ent.y)
+            new_support = int(math.floor(new_position[2]))
+            if new_support > water_limit:
+                return
+            ent.terrain_offset_z = float(new_position[2]) - float(new_support)
+
+        old_position = (float(ent.x), float(ent.y), float(ent.z))
+        ent.x, ent.y, ent.z = (float(value) for value in new_position)
+        ent.terrain_support_z = int(new_support)
+        ent.home = (ent.x, ent.y, ent.z)
+        if old_position != ent.home and ctx.move is not None:
+            ctx.move(ent)
+
+    @staticmethod
+    def _find_support(world, x: int, y: int, start_z: int):
+        """Return the first solid at/below ``start_z`` in AoS +Z-down space."""
+
+        from shared import constants as C
+
+        for z in range(max(0, int(start_z)), int(C.MAP_Z)):
+            if world.get_solid(x, y, z):
+                return z
+        return None
 
     def on_touch(self, ent, player, ctx) -> bool:
         self.refill(player)

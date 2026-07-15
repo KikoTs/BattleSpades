@@ -79,8 +79,17 @@ def _is_retail_marker_color(color: int) -> bool:
     only the first half of the rule: the caller must also require two air
     voxels immediately above the candidate before removing it.
     """
+    return _retail_marker_family(color) is not None
+
+
+def _retail_marker_family(color: int) -> int | None:
+    """Map a native chroma voxel to its stock static-light colour slot."""
     masked = int(color) & 0x00F0F0F0
-    return masked in (0x000000F0, 0x0000F000)
+    if masked == 0x0000F000:
+        return 0
+    if masked == 0x000000F0:
+        return 1
+    return None
 
 
 def _iter_explicit_voxels(data: bytes):
@@ -198,6 +207,7 @@ class ServerVXL(VXL):
         )
         super().__init__(state, source, size_or_detail, detail_level)
         self.retail_marker_positions = ()
+        self.retail_marker_families = ()
         # Battle Builder maps can embed blue/green chroma-key voxels as ordinary
         # VXL words. The compiled client deletes an eligible voxel only when it
         # and both immediately higher cells form an exposed marker. Retaining
@@ -207,16 +217,19 @@ class ServerVXL(VXL):
         # exposed during this pass.
         if raw_data:
             markers = tuple(
-                (x, y, z + self.source_z_shift)
+                (x, y, z + self.source_z_shift, _retail_marker_family(color))
                 for x, y, z, color in _iter_explicit_voxels(raw_data)
                 if _is_retail_marker_color(color)
                 and self.get_solid(x, y, z + self.source_z_shift)
                 and not self.get_solid(x, y, z + self.source_z_shift - 1)
                 and not self.get_solid(x, y, z + self.source_z_shift - 2)
             )
-            for x, y, z in markers:
+            for x, y, z, _family in markers:
                 self.remove_point_nochecks(x, y, z)
-            self.retail_marker_positions = markers
+            self.retail_marker_families = markers
+            self.retail_marker_positions = tuple(
+                (x, y, z) for x, y, z, _family in markers
+            )
             if markers:
                 logger.info(
                     "Removed %s retail marker voxels from server collision map",

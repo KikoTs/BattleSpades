@@ -4,8 +4,9 @@
 [server]
 name = "BattleSpades Server"
 port = 27015
-max_players = 50
+max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
+steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 
 [network]
 timeout_ms = 10000
@@ -38,16 +39,19 @@ terrain_repair_queue_limit = 8192
 terrain_repair_batch_limit = 8
 terrain_repair_interval_ticks = 3
 terrain_repair_delay_ticks = 120
+# Let MapEnded(52) move retail clients into the terminal/reconnect scene before
+# the old ENet session closes with MATCH_ENDED(18).
+transition_grace_seconds = 1.25
 
 [game]
 same_team_collision = false
-default_mode = "zombie"
+default_mode = "tdm"
 # Server-side dev AI players (0 = none). Bots fight autonomously (TDM
 # kill->score->respawn). The old "client crashes rendering non-local
 # players" was an IDENTITY bug (StateData.player_id was always 0) — fixed
 # 2026-07-06 via per-connection id reservation; bots are safe for live play.
 bot_count = 0
-default_map = "CityOfChicago"
+default_map = "MayanJungle"
 # "client" = echo client-reported positions (fallback while physics parity work
 # is in progress); "server" = authoritative server simulation (the server's
 # physics engine is oracle-calibrated to match the client's compiled engine).
@@ -58,10 +62,141 @@ movement_authority = "server"
 # Keep "full". ("auto" sends only changed columns on CRC match ??? broken
 # until the client-side world-base question is solved.)
 map_sync_mode = "full"
-respawn_time = 5.0
 friendly_fire = false
 fall_damage = true
 build_damage = true
+
+[lobby]
+# Stock Match Lobby choices are 2,4,...24 players. Dedicated servers accept
+# 1..255 through server.max_players; 24 is the retail-tested ceiling.
+# Uncomment to replace every mode's native clock. Allowed values are exactly:
+# 5,10,15,20,25,30,35,40,45,50,55,60,90. A [modes.<code>].time_limit wins.
+# match_length_minutes = 15
+# Empty discovers every .vxl in world.maps_path. Otherwise this exact order is
+# used for the F1/F2/F3 map vote; missing files are logged and skipped.
+map_rotation = []
+
+# Exact Match Lobby rule names recovered from gameRulesPanel.pyc. Values are
+# validated at startup; unknown names and unsupported slider values are fatal
+# configuration errors instead of silently producing client/server split-brain.
+[game_rules]
+# General world/UI rules.
+RULE_ENABLE_BLOCKS = true
+# BattleSpades defaults this OFF because this retail build injects tool 22 as a
+# fake first prefab tile when enabled. Turn it on only when flare tools are wanted.
+RULE_ENABLE_FLARE_BLOCKS = false
+RULE_ENABLE_PREFABS = true
+RULE_ONE_HIT_KILL = false
+RULE_ENABLE_GRAVESTONES = true
+RULE_ENABLE_CORPSE_EXPLOSION = true
+RULE_ENABLE_SNIPER_BEAM = true
+RULE_ENABLE_DEATH_CAM = true
+RULE_ENABLE_MINI_MAP = true
+RULE_ENABLE_SPECTATORS = true
+RULE_ENABLE_FALL_ON_WATER_DAMAGE = true
+RULE_RESPAWN_TIMES = 5                 # 0..60 in five-second steps
+RULE_BLOCK_HEALTH = "100%"             # 50%, 100%, 200%
+RULE_WEAPON_DAMAGE = "100%"            # 50%, 100%, 200%
+RULE_SPAWN_PROTECTION_TIME = "OFF"     # OFF, 1, 2, 3 seconds
+RULE_CHARACTER_BLOCK_WALLETS = "100%" # 50%, 100%, 200%
+RULE_CHARACTER_SPEED = "100%"          # 50%, 100%, 150%, 200%
+RULE_POINTS_FROM_TEABAGGING = false
+RULE_CRATES_SPAWN_TIME = 15            # 10..60 in five-second steps
+RULE_ENABLE_COLOUR_PICKER = true
+# Recovered hidden lobby rule used by the server's GenericVote majority gate.
+RULE_VOTES_REQUIRED_FOR_KICK = "50%"   # 25%, 50%, 75%
+
+# Selectable classes.
+RULE_ENABLE_CLASS_COMMANDO = true
+RULE_ENABLE_CLASS_MARKSMAN = true
+RULE_ENABLE_CLASS_MINER = true
+RULE_ENABLE_CLASS_ENGINEER = true
+RULE_ENABLE_CLASS_ROCKETEER = true
+RULE_ENABLE_CLASS_SPECIALIST = true
+RULE_ENABLE_CLASS_MEDIC = true
+
+# Equipment. Disabled tools are removed from InitialInfo and rejected by the
+# authoritative action gates even if a modified client still sends packets.
+RULE_ENABLE_EQUIPMENT_CLASSIC_SPADE = true
+RULE_ENABLE_EQUIPMENT_CLASSIC_GRENADE = true
+RULE_ENABLE_EQUIPMENT_SPADE = true
+RULE_ENABLE_EQUIPMENT_GRENADE = true
+RULE_ENABLE_EQUIPMENT_ANTIPERSONNEL_GRENADE = true
+RULE_ENABLE_EQUIPMENT_SNOWBLOWER = true
+RULE_ENABLE_EQUIPMENT_PICKAXE = true
+RULE_ENABLE_EQUIPMENT_LANDMINE = true
+RULE_ENABLE_EQUIPMENT_ROCKET_TURRET = true
+RULE_ENABLE_EQUIPMENT_GLIDE_JETPACK = true
+RULE_ENABLE_EQUIPMENT_JUMP_JETPACK = true
+RULE_ENABLE_EQUIPMENT_JETPACK = true
+RULE_ENABLE_EQUIPMENT_SUPER_SPADE = true
+RULE_ENABLE_EQUIPMENT_DRILL_CANNON = true
+RULE_ENABLE_EQUIPMENT_DYNAMITE = true
+RULE_ENABLE_EQUIPMENT_MEDPACK = true
+RULE_ENABLE_EQUIPMENT_CHEMICALBOMB = true
+RULE_ENABLE_EQUIPMENT_RADAR_STATION = true
+RULE_ENABLE_EQUIPMENT_C4 = true
+RULE_ENABLE_EQUIPMENT_DISGUISE = true
+# Hidden mapping recovered from the client constants table.
+RULE_ENABLE_EQUIPMENT_PARACHUTE_NORMAL = true
+
+# Weapons. Classic Shotgun/SMG match the retail OFF defaults.
+RULE_ENABLE_WEAPON_KNIFE = true
+RULE_ENABLE_WEAPON_MINIGUN = true
+RULE_ENABLE_WEAPON_RPG = true
+RULE_ENABLE_WEAPON_TRIPLE_BARREL_RPG = true
+RULE_ENABLE_WEAPON_PISTOL = true
+RULE_ENABLE_WEAPON_SNIPER_RIFLE = true
+RULE_ENABLE_WEAPON_SNIPER_RIFLE2 = true
+RULE_ENABLE_WEAPON_RIFLE = true
+RULE_ENABLE_WEAPON_DOUBLE_BARREL_SHOTGUN = true
+RULE_ENABLE_WEAPON_PUMP_ACTION_SHOTGUN = true
+RULE_ENABLE_WEAPON_SMG = true
+RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN = false
+RULE_ENABLE_WEAPON_CLASSIC_SMG = false
+RULE_ENABLE_WEAPON_TOMMYGUN = true
+RULE_ENABLE_WEAPON_SNUB_PISTOL = true
+RULE_ENABLE_WEAPON_CROWBAR = true
+RULE_ENABLE_WEAPON_MOLOTOV = true
+RULE_ENABLE_WEAPON_RIOTSTICK = true
+RULE_ENABLE_WEAPON_RIOTSHIELD = true # hidden in this build's visible rule rows
+RULE_ENABLE_WEAPON_MACHETE = true
+RULE_ENABLE_WEAPON_AUTOPISTOL = true
+RULE_ENABLE_WEAPON_GRENADE_LAUNCHER = true
+RULE_ENABLE_WEAPON_STICKY_GRENADE = true
+RULE_ENABLE_WEAPON_MINE_LAUNCHER = true
+RULE_ENABLE_WEAPON_ASSAULTRIFLE = true
+RULE_ENABLE_WEAPON_LIGHTMACHINEGUN = true
+RULE_ENABLE_WEAPON_AUTOSHOTGUN = true
+RULE_ENABLE_WEAPON_BLOCKSUCKER = true
+
+# Mode rules. These apply to the active playlist; [modes.<code>] compatibility
+# aliases below can override a rule for one dedicated-server mode.
+RULE_TDM_SCORE_TARGET = 200
+RULE_CTF_ENABLE_SHOOT_WITH_INTEL = false
+RULE_CTF_ENABLE_INTEL_RETURN_ON_TOUCH = false
+RULE_CTF_SCORE_TARGET = 10
+RULE_CTF_ENABLE_INTEL_AUTO_RETURN = true
+RULE_CTF_ENABLE_INTEL_IN_OWN_BASE_TO_SCORE = false # recovered hidden rule
+RULE_ZOMBIE_NOOF_ROUNDS = 3
+RULE_NOOF_FIRST_INFECTED_ZOMBIES = 2
+RULE_CLASS_SPEED = "100%"
+RULE_ZOMBIE_CLASS_DAMAGE = "100%"
+RULE_VIP_NOOF_ROUNDS = 3
+RULE_VIP_HEALTH = "100%"
+RULE_ENABLE_SUDDEN_DEATH = true
+RULE_MULTIHILL_MAX_ACTIVE_BASES = 1
+RULE_BASE_ACTIVE_TIME = 240
+RULE_TC_MAX_ACTIVE_BASES = 5
+RULE_CAPTURE_RATE = "100%"
+RULE_DIAMOND_MAX_ACTIVE_BASES = 1
+RULE_DIA_SCORE_TARGET = 15
+RULE_MAX_ACTIVE_DIAMONDS = 2
+RULE_DIAMOND_LIFETIME = 60
+RULE_BUILD_STATE_LENGTH = 30
+RULE_OCC_SCORE_TARGET = 30
+RULE_MAX_ACTIVE_BOMBS = 1
+RULE_BOMB_FUSE_TIME = 10
 
 [bots]
 # Advanced server-owned bots run decisions/pathfinding in a supervised child
@@ -86,26 +221,46 @@ debug_visualization = false
 #   score_limit  — win threshold (TDM: team kills; CTF: intel captures)
 #   time_limit   — round length in seconds (0 = no clock)
 [modes.tdm]
-score_limit = 200      # play to 200 team kills
 time_limit = 900       # 15-minute round clock
 kill_points = 1        # team points per kill
 headshot_bonus = 1     # extra team point for a headshot kill
 
 [modes.ctf]
-score_limit = 10       # intel captures to win
-time_limit = 2400      # 40-minute round clock
+time_limit = 1800      # shipped CTF clock (30 minutes)
 
 [modes.cctf]
-score_limit = 10       # classic intel captures to win
-time_limit = 5400      # shipped Classic CTF length (45 minutes per side)
+time_limit = 5400      # shipped Classic CTF clock (90 minutes)
 intel_auto_return = false
+shoot_with_intel = true
 
 [modes.vip]
-score_limit = 3        # gangster sub-rounds needed to win the match
 time_limit = 900       # 15-minute full-match clock
 selection_delay = 10.0 # retail delay before one boss per team is selected
 round_intermission = 7.0
-sudden_death = true    # dead VIP team loses respawns until eliminated
+
+[modes.zom]
+time_limit = 600
+infection_delay = 30.0
+minimum_players = 2
+zombie_respawn_time = 0.0
+
+# The following five modes are registered scene-safe skeletons. Their clocks,
+# map resources, client mode IDs, and recovered settings work; their objective
+# scoring state machines remain explicit future implementation work.
+[modes.mh]
+time_limit = 1500
+
+[modes.tc]
+time_limit = 1500
+
+[modes.dia]
+time_limit = 900
+
+[modes.dem]
+time_limit = 900
+
+[modes.oc]
+time_limit = 900
 
 [teams]
 # Team names are STRING-TABLE IDS the client localizes (TEAM1_COLOR -> "Blue"),
@@ -125,15 +280,30 @@ spade_damage = 50
 grenade_damage = 100
 
 [world]
+default_skybox = "User_Grassland.txt" # fallback for maps without a sidecar
+maps_path = "maps"
+prefabs_path = "prefabs"
 map_size_x = 512
 map_size_y = 512
 map_size_z = 240
 water_level = 238
 water_damage = true
+fog_color_rgb = [12, 13, 11] # fallback; authored map metadata wins
+entities_wire_ready = true
+
+[plugins]
+# Plugins are trusted local Python code. Public top-level *.py files containing
+# a BasePlugin subclass are discovered at startup. Empty allowlist = all;
+# denylist always wins. Values may be a filename stem or BasePlugin.name.
+enabled = true
+path = "plugins"
+allowlist = []
+denylist = []
 
 [admin]
 password = "changeme"
 log_commands = true
+bans_path = "bans.json"
 
 [logging]
 level = "INFO"

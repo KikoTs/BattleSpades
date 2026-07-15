@@ -2,8 +2,14 @@
 Configuration loader for BattleSpades server.
 """
 
+try:
+    import tomllib
+except ImportError:  # Python 3.10 release fallback
+    tomllib = None
 import toml
 import shared.constants as C
+from server.game_rules import GameRules
+from server.lobby import LOBBY_MATCH_LENGTH_OPTIONS
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
@@ -38,6 +44,8 @@ class ServerConfig:
     port: int = 32887
     max_players: int = 50
     tick_rate: int = 60
+    # Stable uint64 identity used by InitialInfo for non-Steam dedicated hosts.
+    steam_id: int = 90087911866072064
 
     # Network settings
     timeout_ms: int = 10000
@@ -84,6 +92,10 @@ class ServerConfig:
     terrain_repair_batch_limit: int = 8
     terrain_repair_interval_ticks: int = 3
     terrain_repair_delay_ticks: int = 120
+    # Packet 52 gives the retail GameScene time to enter its terminal map
+    # state before ENet reason 18 closes the old session. Zero is useful only
+    # for deterministic tests; production should retain a visible grace.
+    transition_grace_seconds: float = 1.25
 
     # Game settings
     default_mode: str = "ctf"
@@ -107,6 +119,15 @@ class ServerConfig:
     # stream, so an empty delta leaves the client world hollow).
     # "auto": changed-columns delta for matching CRCs — experimental.
     map_sync_mode: str = "full"
+
+    # Match Lobby settings recovered from matchSettingsPanel.pyc. ``None``
+    # keeps each playlist's retail default duration; a value applies globally
+    # unless [modes.<code>].time_limit provides a mode-specific override.
+    match_length_minutes: Optional[int] = None
+    # Empty means discover every .vxl in maps_path. A non-empty list is the
+    # ordered catalog used by map voting and future lobby hosting.
+    map_rotation: List[str] = field(default_factory=list)
+    game_rules: GameRules = field(default_factory=GameRules.server_defaults)
 
     # Team settings
     team1_name: str = "TEAM1_COLOR"
@@ -143,10 +164,19 @@ class ServerConfig:
     water_level: int = int(C.Z_ABOVE_WATERPLANE)
     water_damage: bool = True
     fog_color_rgb: Tuple[int, int, int] = (12, 13, 11)
+    # Used only when a VXL has no map-owned skybox sidecar. Packet 51 must
+    # name a stock client mesh environment; map sidecars override this.
+    default_skybox: str = "User_Grassland.txt"
     maps_path: str = "maps"
     prefabs_path: str = "prefabs"
     plugins_path: str = "plugins"
     bans_path: str = "bans.json"
+
+    # Trusted local plugin discovery. Names are filename stems; an allowlist
+    # limits loading when non-empty and the denylist always wins.
+    plugins_enabled: bool = True
+    plugin_allowlist: List[str] = field(default_factory=list)
+    plugin_denylist: List[str] = field(default_factory=list)
 
     # Admin settings
     admin_password: str = "changeme"
@@ -246,6 +276,29 @@ class ServerConfig:
     def fog_color(self) -> Tuple[int, int, int]:
         return self.fog_color_rgb
 
+    def configured_time_limit(self, mode_code: str, default: float) -> float:
+        """Resolve one mode clock with narrow-to-broad precedence."""
+
+        overlay = self.mode_settings.get(str(mode_code), {})
+        if "time_limit" in overlay:
+            return max(0.0, float(overlay["time_limit"]))
+        if self.match_length_minutes is not None:
+            return float(self.match_length_minutes * 60)
+        return max(0.0, float(default))
+
+    def mode_rule(
+        self,
+        mode_code: str,
+        overlay_key: str,
+        rule_key: str,
+    ):
+        """Resolve a mode rule while preserving legacy [modes.*] overlays."""
+
+        overlay = self.mode_settings.get(str(mode_code), {})
+        if overlay_key in overlay:
+            return overlay[overlay_key]
+        return self.game_rules.get(rule_key)
+
 
 def load_config(path: Optional[Path] = None) -> ServerConfig:
     """
@@ -261,7 +314,16 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         return config
 
     try:
-        data = toml.load(path)
+        # Use the installed ``toml`` package in production and honor focused
+        # tests/plugins that instrument its loader. Some legacy movement tests
+        # install a file-less SimpleNamespace stub before importing config; in
+        # that one case the standard-library parser prevents collection order
+        # from silently turning every config into an empty mapping.
+        if tomllib is not None and getattr(toml, "__file__", None) is None:
+            with path.open("rb") as stream:
+                data = tomllib.load(stream)
+        else:
+            data = toml.load(path)
     except Exception as e:
         print(f"Warning: Failed to load config from {path}: {e}")
         return config
@@ -270,8 +332,44 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         s = data["server"]
         config.name = s.get("name", config.name)
         config.port = s.get("port", config.port)
-        config.max_players = s.get("max_players", config.max_players)
-        config.tick_rate = s.get("tick_rate", config.tick_rate)
+        config.max_players = min(255, max(1, int(
+            s.get("max_players", config.max_players)
+        )))
+        config.tick_rate = min(240, max(10, int(
+            s.get("tick_rate", config.tick_rate)
+        )))
+        config.steam_id = max(0, int(s.get("steam_id", config.steam_id)))
+
+    if "lobby" in data:
+        lobby = data["lobby"]
+        if "match_length_minutes" in lobby:
+            minutes = int(lobby["match_length_minutes"])
+            if minutes not in LOBBY_MATCH_LENGTH_OPTIONS:
+                raise ValueError(
+                    "lobby.match_length_minutes must be one of "
+                    "5,10,15,20,25,30,35,40,45,50,55,60,90"
+                )
+            config.match_length_minutes = minutes
+        rotation = lobby.get("map_rotation", config.map_rotation)
+        if not isinstance(rotation, list):
+            raise ValueError("lobby.map_rotation must be a TOML array")
+        normalized_rotation: list[str] = []
+        seen_maps: set[str] = set()
+        for value in rotation:
+            name = Path(str(value).strip()).stem
+            if not name or Path(name).name != name:
+                raise ValueError(f"Unsafe map name in lobby.map_rotation: {value!r}")
+            folded = name.casefold()
+            if folded not in seen_maps:
+                seen_maps.add(folded)
+                normalized_rotation.append(name)
+        config.map_rotation = normalized_rotation
+
+    game_rule_data = data.get("game_rules", {})
+    if game_rule_data:
+        if not isinstance(game_rule_data, dict):
+            raise ValueError("game_rules must be a TOML table")
+        config.game_rules.apply(game_rule_data)
 
     if "network" in data:
         n = data["network"]
@@ -316,6 +414,8 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "terrain_repair_interval_ticks", config.terrain_repair_interval_ticks)))
         config.terrain_repair_delay_ticks = max(1, int(n.get(
             "terrain_repair_delay_ticks", config.terrain_repair_delay_ticks)))
+        config.transition_grace_seconds = min(5.0, max(0.0, float(n.get(
+            "transition_grace_seconds", config.transition_grace_seconds))))
 
     if "game" in data:
         g = data["game"]
@@ -325,6 +425,7 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.friendly_fire = g.get("friendly_fire", config.friendly_fire)
         config.fall_damage = g.get("fall_damage", config.fall_damage)
         config.build_damage = g.get("build_damage", config.build_damage)
+        config.score_limit = max(0, int(g.get("score_limit", config.score_limit)))
         config.same_team_collision = bool(g.get(
             "same_team_collision", config.same_team_collision
         ))
@@ -335,6 +436,22 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         sync_mode = str(g.get("map_sync_mode", config.map_sync_mode)).lower()
         if sync_mode in ("auto", "full"):
             config.map_sync_mode = sync_mode
+
+    # New retail-named rules take precedence over compatibility fields. When
+    # omitted, keep old configs authoritative and mirror their value into the
+    # rule service so InitialInfo and runtime logic still agree.
+    if "RULE_RESPAWN_TIMES" in config.game_rules.explicit:
+        config.respawn_time = float(config.game_rules.get("RULE_RESPAWN_TIMES"))
+    else:
+        config.game_rules.values["RULE_RESPAWN_TIMES"] = config.respawn_time
+    if "RULE_ENABLE_FALL_ON_WATER_DAMAGE" in config.game_rules.explicit:
+        config.fall_damage = config.game_rules.enabled(
+            "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
+        )
+    else:
+        config.game_rules.values[
+            "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
+        ] = bool(config.fall_damage)
 
     if "bots" in data and isinstance(data["bots"], dict):
         b = data["bots"]
@@ -396,9 +513,15 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.team1_name = t.get("team1_name", config.team1_name)
         config.team2_name = t.get("team2_name", config.team2_name)
         if "team1_color" in t:
-            config.team1_color = tuple(t["team1_color"])
+            color = tuple(int(value) for value in t["team1_color"])
+            if len(color) != 3 or any(not 0 <= value <= 255 for value in color):
+                raise ValueError("teams.team1_color must be three bytes")
+            config.team1_color = color
         if "team2_color" in t:
-            config.team2_color = tuple(t["team2_color"])
+            color = tuple(int(value) for value in t["team2_color"])
+            if len(color) != 3 or any(not 0 <= value <= 255 for value in color):
+                raise ValueError("teams.team2_color must be three bytes")
+            config.team2_color = color
         config.auto_balance = t.get("auto_balance", config.auto_balance)
         config.balance_threshold = t.get("balance_threshold", config.balance_threshold)
 
@@ -417,7 +540,28 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.map_size_z = w.get("map_size_z", config.map_size_z)
         config.water_level = w.get("water_level", config.water_level)
         config.water_damage = w.get("water_damage", config.water_damage)
+        config.default_skybox = w.get("default_skybox", config.default_skybox)
         config.maps_path = w.get("maps_path", config.maps_path)
+        config.prefabs_path = w.get("prefabs_path", config.prefabs_path)
+        config.entities_wire_ready = bool(w.get(
+            "entities_wire_ready", config.entities_wire_ready
+        ))
+        if "fog_color_rgb" in w:
+            color = tuple(int(value) for value in w["fog_color_rgb"])
+            if len(color) != 3 or any(not 0 <= value <= 255 for value in color):
+                raise ValueError("world.fog_color_rgb must be three bytes")
+            config.fog_color_rgb = color
+
+    if "plugins" in data:
+        p = data["plugins"]
+        config.plugins_enabled = bool(p.get("enabled", config.plugins_enabled))
+        config.plugins_path = str(p.get("path", config.plugins_path))
+        allowlist = p.get("allowlist", config.plugin_allowlist)
+        denylist = p.get("denylist", config.plugin_denylist)
+        if not isinstance(allowlist, list) or not isinstance(denylist, list):
+            raise ValueError("plugins.allowlist and plugins.denylist must be arrays")
+        config.plugin_allowlist = [str(value).strip() for value in allowlist if str(value).strip()]
+        config.plugin_denylist = [str(value).strip() for value in denylist if str(value).strip()]
 
     # Per-mode overlays: [modes.tdm], [modes.ctf], ... Each table's keys
     # override that mode's defaults (score_limit, time_limit, kill_points...).
@@ -430,6 +574,7 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         a = data["admin"]
         config.admin_password = a.get("password", config.admin_password)
         config.log_commands = a.get("log_commands", config.log_commands)
+        config.bans_path = str(a.get("bans_path", config.bans_path))
 
     if "logging" in data:
         lg = data["logging"]

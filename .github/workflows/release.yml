@@ -170,5 +170,5 @@ jobs:
           release-assets/*.zip release-assets/SHA256SUMS.txt
           --verify-tag
           --prerelease
-          --title "BattleSpades 0.0.1 Alpha"
+          --title "BattleSpades ${GITHUB_REF_NAME#v}"
           --notes "Unsigned alpha server builds for Windows, Linux, and macOS on x86_64 and arm64. macOS archives are not notarized. Verify downloads with SHA256SUMS.txt."

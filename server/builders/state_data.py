@@ -42,14 +42,37 @@ def build_state_data(server: 'BattleSpadesServer',
     pkt.player_id = player_id if player_id >= 0 else 0
 
     # ---- World lighting / skybox visuals -------------------------------
-    pkt.fog_color = cfg.fog_color
+    metadata = getattr(getattr(server, "world_manager", None), "map_metadata", None)
+    map_fog = getattr(metadata, "fog_color", None)
+    pkt.fog_color = (
+        getattr(server, "fog_color_override", None)
+        or map_fog
+        or cfg.fog_color
+    )
     pkt.gravity = 1.0
-    pkt.light_color = _DEFAULT_LIGHT_COLOR
-    pkt.light_direction = _DEFAULT_LIGHT_DIR
-    pkt.back_light_color = _DEFAULT_BACK_LIGHT_COLOR
-    pkt.back_light_direction = _DEFAULT_BACK_LIGHT_DIR
-    pkt.ambient_light_color = _DEFAULT_AMBIENT_COLOR
-    pkt.ambient_light_intensity = _DEFAULT_AMBIENT_INTENSITY
+    pkt.light_color = (
+        getattr(metadata, "light_color", None) or _DEFAULT_LIGHT_COLOR
+    )
+    pkt.light_direction = (
+        getattr(metadata, "light_direction", None) or _DEFAULT_LIGHT_DIR
+    )
+    pkt.back_light_color = (
+        getattr(metadata, "back_light_color", None) or _DEFAULT_BACK_LIGHT_COLOR
+    )
+    pkt.back_light_direction = (
+        getattr(metadata, "back_light_direction", None)
+        or _DEFAULT_BACK_LIGHT_DIR
+    )
+    pkt.ambient_light_color = (
+        getattr(metadata, "ambient_light_color", None)
+        or _DEFAULT_AMBIENT_COLOR
+    )
+    ambient_intensity = getattr(metadata, "ambient_light_intensity", None)
+    pkt.ambient_light_intensity = (
+        _DEFAULT_AMBIENT_INTENSITY
+        if ambient_intensity is None
+        else float(ambient_intensity)
+    )
     pkt.time_scale = 1.0
 
     # ---- Mode metadata --------------------------------------------------
@@ -112,4 +135,15 @@ def build_state_data(server: 'BattleSpadesServer',
     configure = getattr(getattr(server, 'mode', None), 'configure_state_data', None)
     if callable(configure):
         configure(pkt)
+    from server.game_rules import get_rules
+
+    rules = get_rules(server.config)
+    pkt.team1_classes = [
+        int(class_id) for class_id in pkt.team1_classes
+        if rules.is_class_enabled(int(class_id))
+    ]
+    pkt.team2_classes = [
+        int(class_id) for class_id in pkt.team2_classes
+        if rules.is_class_enabled(int(class_id))
+    ]
     return pkt

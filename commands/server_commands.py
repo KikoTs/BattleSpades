@@ -4,8 +4,8 @@ Server commands - admin commands for server management.
 
 import time
 
-from server.game_constants import CHAT_SYSTEM, TEAM1, TEAM2
-from shared.packet import ChatMessage, FogColor
+from server.game_constants import TEAM1, TEAM2
+from shared.packet import FogColor
 
 from .command_handler import register_command, CommandContext, send_message
 
@@ -93,7 +93,7 @@ async def cmd_map(ctx: CommandContext):
     name="mode",
     aliases=["gamemode"],
     admin_only=True,
-    usage="/mode <ctf|cctf|tdm|arena|vip|zombie>",
+    usage="/mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>",
     description="Change the game mode",
 )
 async def cmd_mode(ctx: CommandContext):
@@ -104,7 +104,7 @@ async def cmd_mode(ctx: CommandContext):
         await send_message(
             ctx.server,
             ctx.player,
-            "Usage: /mode <ctf|cctf|tdm|arena|vip|zombie>",
+            "Usage: /mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>",
         )
         return
     
@@ -134,11 +134,9 @@ async def cmd_restart(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, result.message)
         return
 
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = "Match restarted!"
-    ctx.server.broadcast(bytes(packet.generate()))
+    from server.announcements import broadcast_overlay
+
+    broadcast_overlay(ctx.server, "Match restarted!")
 
 
 @register_command(
@@ -184,12 +182,9 @@ async def cmd_say(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "Announcement is too long (max 256 characters)")
         return
     
-    message = f"[SERVER] {message_text}"
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = message
-    ctx.server.broadcast(bytes(packet.generate()))
+    from server.announcements import broadcast_overlay
+
+    broadcast_overlay(ctx.server, f"[SERVER] {message_text}")
 
 
 @register_command(
@@ -220,8 +215,9 @@ async def cmd_fog(ctx: CommandContext):
     packet = FogColor()
     packet.color = color
     ctx.server.broadcast(bytes(packet.generate()))
-    # Future StateData must agree with the live fog after a reconnect.
-    ctx.server.config.fog_color_rgb = (r, g, b)
+    # Future StateData on this map must agree with the live fog after a
+    # reconnect. MatchTransitionService clears the map-epoch override.
+    ctx.server.fog_color_override = (r, g, b)
     
     await send_message(ctx.server, ctx.player, f"Fog color set to ({r}, {g}, {b})")
 
@@ -311,11 +307,9 @@ async def cmd_balance(ctx: CommandContext):
                            f"You were moved to {ctx.server.teams[smaller_team].name}")
         moved += 1
     
-    packet = ChatMessage()
-    packet.player_id = 255
-    packet.chat_type = CHAT_SYSTEM
-    packet.value = f"Teams balanced ({moved} players moved)"
-    ctx.server.broadcast(bytes(packet.generate()))
+    from server.announcements import broadcast_overlay
+
+    broadcast_overlay(ctx.server, f"Teams balanced ({moved} players moved)")
 
 
 async def _ensure_bot_director(ctx: CommandContext):

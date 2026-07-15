@@ -149,19 +149,53 @@ class VoxelActionPlanner:
 
     def __init__(self, terrain: VoxelTerrain) -> None:
         self.terrain = terrain
+        # Water recovery is intentionally global, unlike ordinary local
+        # action planning. Large authored seas (CastleWars reaches 132 cells
+        # from shore) make a fixed 24/64-cell search strand valid players.
+        # Successful routes are memoized as a flow toward one dry goal so a
+        # swimming bot does not repeat the wide search every decision tick.
+        self._water_next: dict[tuple[int, int], tuple[int, int]] = {}
+        self._water_goal: dict[tuple[int, int], SurfaceSample] = {}
+        self._water_dead_ends: set[tuple[int, int]] = set()
+        self._water_route_columns: set[tuple[int, int]] = set()
+
+    def invalidate_water_routes(
+        self,
+        changed_columns: (
+            set[tuple[int, int]] | frozenset[tuple[int, int]] | None
+        ) = None,
+    ) -> None:
+        """Drop escape flow affected by an authoritative terrain change.
+
+        A remote bullet hole should not force a stranded bot to repeat a
+        70,000-column sea search. Existing routes remain valid unless the
+        delta touches one of their columns; failed searches are always retried
+        because any newly built shore may make them recoverable.
+        """
+
+        self._water_dead_ends.clear()
+        if (
+            changed_columns is not None
+            and self._water_route_columns.isdisjoint(changed_columns)
+        ):
+            return
+        self._water_next.clear()
+        self._water_goal.clear()
+        self._water_route_columns.clear()
 
     def water_exit(
         self,
         position: Vector3,
         *,
-        search_radius: int = 24,
+        search_radius: int = MAP_X,
     ) -> VoxelActionStep | None:
         """Return the first recovery step toward the nearest dry surface.
 
         Water nodes are legal only inside this recovery search.  The search is
-        bounded to a square radius and accepts at most a two-voxel shore climb,
-        matching the base jump affordance.  A blocked or taller shore returns
-        no step so the worker can escalate to breach or construction.
+        bounded to the map and accepts at most a two-voxel shore climb,
+        matching the base jump affordance. Successful paths seed a cached
+        flow field for their water cells. A blocked or taller shore returns no
+        step so the worker can escalate to breach or construction.
         """
 
         start = self.terrain.classify(
@@ -175,39 +209,51 @@ class VoxelActionPlanner:
             return None
 
         start_key = start.x, start.y
+        cached_next = self._water_next.get(start_key)
+        cached_goal = self._water_goal.get(start_key)
+        if cached_next is not None and cached_goal is not None:
+            cached_sample = self.terrain.classify(
+                cached_next[0],
+                cached_next[1],
+                start.player_position[2],
+                allow_water=True,
+                vertical_span=3,
+            )
+            if cached_sample is not None:
+                return self._water_step(start, cached_sample, cached_goal)
+            # A caller using a mutable terrain without explicit invalidation
+            # still fails closed instead of steering into a newly blocked cell.
+            self.invalidate_water_routes()
+        if start_key in self._water_dead_ends:
+            return None
+
         frontier: deque[tuple[int, int]] = deque((start_key,))
         came_from: dict[tuple[int, int], tuple[int, int] | None] = {
             start_key: None
         }
         samples: dict[tuple[int, int], SurfaceSample] = {start_key: start}
-        radius = max(1, min(64, int(search_radius)))
+        radius = max(1, min(MAP_X, int(search_radius)))
 
         while frontier:
             current_key = frontier.popleft()
             current = samples[current_key]
             if not current.water:
-                first_key = current_key
-                while came_from[first_key] not in (None, start_key):
-                    previous = came_from[first_key]
+                path = [current_key]
+                while path[-1] != start_key:
+                    previous = came_from[path[-1]]
                     if previous is None:
                         break
-                    first_key = previous
-                first = samples[first_key]
-                dx = float(first.x - start.x)
-                dy = float(first.y - start.y)
-                length = math.hypot(dx, dy)
-                if length <= 1e-6:
+                    path.append(previous)
+                path.reverse()
+                if len(path) < 2:
                     return None
-                return VoxelActionStep(
-                    direction=(dx / length, dy / length, 0.0),
-                    waypoint=first.player_position,
-                    goal=current.player_position,
-                    affordance=MovementAffordance.JUMP,
-                    cells=(
-                        (first.x, first.y, first.support_z),
-                        (current.x, current.y, current.support_z),
-                    ),
-                )
+                for index, water_key in enumerate(path[:-1]):
+                    self._water_next[water_key] = path[index + 1]
+                    self._water_goal[water_key] = current
+                    self._water_route_columns.add(water_key)
+                    self._water_route_columns.add(path[index + 1])
+                self._water_route_columns.add((current.x, current.y))
+                return self._water_step(start, samples[path[1]], current)
 
             for offset_x, offset_y in (
                 (1, 0),
@@ -240,7 +286,32 @@ class VoxelActionPlanner:
                 came_from[neighbor_key] = current_key
                 samples[neighbor_key] = neighbor
                 frontier.append(neighbor_key)
+        self._water_dead_ends.add(start_key)
         return None
+
+    @staticmethod
+    def _water_step(
+        start: SurfaceSample,
+        first: SurfaceSample,
+        goal: SurfaceSample,
+    ) -> VoxelActionStep | None:
+        """Encode one adjacent swim/jump step from a cached escape route."""
+
+        dx = float(first.x - start.x)
+        dy = float(first.y - start.y)
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return None
+        return VoxelActionStep(
+            direction=(dx / length, dy / length, 0.0),
+            waypoint=first.player_position,
+            goal=goal.player_position,
+            affordance=MovementAffordance.JUMP,
+            cells=(
+                (first.x, first.y, first.support_z),
+                (goal.x, goal.y, goal.support_z),
+            ),
+        )
 
     def plan_local(
         self,

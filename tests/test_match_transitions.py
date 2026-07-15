@@ -13,7 +13,14 @@ from server.match import MatchTransitionService
 class _Connection:
     def __init__(self) -> None:
         self.in_game = True
+        self.player = None
+        self.reload_calls = 0
+        self.reload_result = True
         self.disconnect_reasons: list[int] = []
+
+    async def reload_scene(self) -> bool:
+        self.reload_calls += 1
+        return self.reload_result
 
     def disconnect(self, reason: int = 0) -> None:
         self.disconnect_reasons.append(reason)
@@ -56,9 +63,11 @@ class _Server:
             default_map="London",
             default_mode="ctf",
             maps_path="maps",
+            transition_grace_seconds=0.0,
         )
         self.mode = _Mode()
         self.world_manager = SimpleNamespace(map_name="London")
+        self.fog_color_override = (1, 2, 3)
         self.connections = {object(): _Connection(), object(): _Connection()}
         self.players = {}
         self.teams = {
@@ -72,12 +81,13 @@ class _Server:
         self.runtime_resets = 0
         self.terrain_repair = SimpleNamespace(reset=lambda: None)
         self.host = SimpleNamespace(flush=lambda: None)
+        self.broadcast_packets: list[bytes] = []
 
     def reset_round_runtime(self) -> None:
         self.runtime_resets += 1
 
-    def broadcast(self, _data: bytes, **_kwargs) -> None:
-        pass
+    def broadcast(self, data: bytes, **_kwargs) -> None:
+        self.broadcast_packets.append(bytes(data))
 
 
 def test_restart_is_serialized_and_cancels_delayed_end_sequence() -> None:
@@ -107,7 +117,7 @@ def test_restart_is_serialized_and_cancels_delayed_end_sequence() -> None:
     assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
 
 
-def test_mode_change_gates_old_scene_before_start_and_requests_clean_reconnect(
+def test_mode_change_gates_old_scene_and_reloads_the_retained_peers(
     monkeypatch,
 ) -> None:
     _NewMode.starts = 0
@@ -128,7 +138,7 @@ def test_mode_change_gates_old_scene_before_start_and_requests_clean_reconnect(
     result = asyncio.run(service.change_mode("tdm"))
 
     assert result.ok is True
-    assert result.reconnect_required is True
+    assert result.reconnect_required is False
     assert server.config.default_mode == "tdm"
     assert server.world_manager is candidate
     assert isinstance(server.mode, _NewMode)
@@ -139,7 +149,9 @@ def test_mode_change_gates_old_scene_before_start_and_requests_clean_reconnect(
     assert list(server._map_mutation_journal) == []
     assert server._map_mutation_sequence == 0
     assert all(conn.in_game is False for conn in server.connections.values())
-    assert all(conn.disconnect_reasons == [18] for conn in server.connections.values())
+    assert 52 in [packet[0] for packet in server.broadcast_packets if packet]
+    assert all(conn.reload_calls == 1 for conn in server.connections.values())
+    assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
 
 
 def test_map_change_prepares_world_before_gating_clients(monkeypatch) -> None:
@@ -164,7 +176,56 @@ def test_map_change_prepares_world_before_gating_clients(monkeypatch) -> None:
     assert prepared_while_live == [True]
     assert server.world_manager is candidate
     assert server.config.default_map == "HallwayPin"
-    assert all(conn.disconnect_reasons == [18] for conn in server.connections.values())
+    assert server.fog_color_override is None
+    assert 52 in [packet[0] for packet in server.broadcast_packets if packet]
+    assert all(conn.reload_calls == 1 for conn in server.connections.values())
+    assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
+
+
+def test_scene_transition_holds_reload_until_after_mapended_grace(
+    monkeypatch,
+) -> None:
+    server = _Server()
+    server.config.transition_grace_seconds = 0.75
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    sleeps: list[float] = []
+
+    async def observed_sleep(seconds: float) -> None:
+        assert 52 in [
+            packet[0] for packet in server.broadcast_packets if packet
+        ]
+        assert all(connection.reload_calls == 0 for connection in server.connections.values())
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
+
+    result = asyncio.run(service.change_map("HallwayPin"))
+
+    assert result.ok is True
+    assert sleeps == [0.75]
+    assert all(connection.reload_calls == 1 for connection in server.connections.values())
+    assert all(connection.disconnect_reasons == [] for connection in server.connections.values())
+
+
+def test_scene_reload_failure_retires_only_the_incompatible_peer(monkeypatch) -> None:
+    server = _Server()
+    connections = list(server.connections.values())
+    connections[0].reload_result = False
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+
+    result = asyncio.run(service.change_map("HallwayPin"))
+
+    assert result.ok is True
+    assert result.reconnect_required is True
+    assert connections[0].disconnect_reasons == [18]
+    assert connections[1].disconnect_reasons == []
+    assert connections[0].reload_calls == connections[1].reload_calls == 1
 
 
 def test_failed_map_preflight_keeps_current_match_and_clients_untouched(
@@ -183,6 +244,7 @@ def test_failed_map_preflight_keeps_current_match_and_clients_untouched(
     assert result.ok is False
     assert server.config.default_map == "London"
     assert server.world_manager.map_name == "London"
+    assert server.fog_color_override == (1, 2, 3)
     assert all(conn.in_game is True for conn in server.connections.values())
     assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
 
