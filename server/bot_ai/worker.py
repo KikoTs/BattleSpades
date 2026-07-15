@@ -35,7 +35,7 @@ from .messages import (
 )
 from .combat_profiles import envelope_for
 from .policies import ModeBotDecision, _formation_point, objective_decision_for
-from .voxel_navigation import VoxelTerrain, WATERBED_SUPPORT_Z
+from .voxel_navigation import VoxelActionPlanner, VoxelTerrain, WATERBED_SUPPORT_Z
 from server.projectiles import PROJECTILE_SPECS
 
 # Position-holding/assault roles whose goals may shift onto commanding
@@ -290,6 +290,7 @@ class WorkerVoxelWorld:
         # Resolve ``self.solid`` at call time so source-only fixtures and live
         # VXL reloads share exactly the same surface semantics.
         self._terrain = VoxelTerrain(lambda x, y, z: self.solid(x, y, z))
+        self.action_planner = VoxelActionPlanner(self._terrain)
         from .tactical_map import TacticalMap
 
         self.tactical = TacticalMap()
@@ -891,6 +892,11 @@ class BotBrain:
         now = max(time.monotonic(), float(frame.created_at))
         profile = frame.profile or _fallback_profile(observer.player_id)
         self._record_progress(state, observer.position, now)
+        water_recovery = self._water_recovery(
+            frame, observer, state, now
+        )
+        if water_recovery is not None:
+            return water_recovery
         self._deliver_team_reports(observer, state, now)
         self._expire_contacts(state, now)
         visible = self._visible_enemies(observer, frame.players, state)
@@ -1228,16 +1234,83 @@ class BotBrain:
 
     @staticmethod
     def _record_progress(state: _BrainState, position: Vector3, now: float) -> None:
-        """Track locomotion progress from staggered perception samples."""
+        """Track horizontal progress toward the requested route or goal.
+
+        Vertical jump/water motion and sideways knockback are deliberately not
+        progress; otherwise a bot can bob forever without entering recovery.
+        """
 
         previous = state.last_position
         state.last_position = position
         if previous is None:
             state.last_progress_at = now
             return
-        if math.dist(previous, position) >= 0.35:
+        move_x = float(position[0]) - float(previous[0])
+        move_y = float(position[1]) - float(previous[1])
+        route_x = float(state.last_path_direction[0])
+        route_y = float(state.last_path_direction[1])
+        route_length = math.hypot(route_x, route_y)
+        forward_progress = 0.0
+        if route_length > 1e-6:
+            forward_progress = (
+                move_x * route_x + move_y * route_y
+            ) / route_length
+
+        goal_progress = 0.0
+        if state.path_goal is not None:
+            previous_distance = math.hypot(
+                float(state.path_goal[0]) - float(previous[0]),
+                float(state.path_goal[1]) - float(previous[1]),
+            )
+            current_distance = math.hypot(
+                float(state.path_goal[0]) - float(position[0]),
+                float(state.path_goal[1]) - float(position[1]),
+            )
+            goal_progress = previous_distance - current_distance
+
+        uncommitted_motion = (
+            route_length <= 1e-6
+            and state.path_goal is None
+            and math.hypot(move_x, move_y) >= 0.35
+        )
+        if (
+            forward_progress >= 0.2
+            or goal_progress >= 0.2
+            or uncommitted_motion
+        ):
             state.last_progress_at = now
             state.stuck_attempts = 0
+
+    def _water_recovery(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Prioritize a bounded dry exit whenever native physics reports wade."""
+
+        if not observer.wade:
+            return None
+        step = self.world.action_planner.water_exit(observer.position)
+        if step is None:
+            return None
+        state.last_path_direction = step.direction
+        state.last_affordance = step.affordance
+        state.path_goal = step.goal
+        state.path_topology_version = int(frame.topology_version)
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=step.direction,
+                jump=True,
+                sprint=False,
+                affordance=step.affordance,
+            ),
+            look=LookIntent(step.waypoint, visible=False),
+            debug_role="water_recovery",
+        )
 
     @staticmethod
     def _preferred_melee_tool(observer: PlayerSnapshot) -> int | None:

@@ -150,8 +150,9 @@ class _RuntimeBot:
     next_wall_probe_at: float = 0.0
     wall_probe_clear: bool = True
     burst_remaining: int = 0
-    jump_request_active: bool = False
+    last_jump_frame: int = -1
     jump_until_loop: int = -1
+    jump_rearm_loop: int = -1
 
 
 class BotDirector:
@@ -863,8 +864,8 @@ class BotDirector:
             or intent is None
             or intent.expires_at <= now
         ):
-            runtime.jump_request_active = False
             runtime.jump_until_loop = -1
+            runtime.jump_rearm_loop = -1
             # A latched action legitimately outlives its intent by the
             # convergence grace window: keep slewing toward its target so a
             # nearly-faced dig or shot still lands before the deadline.
@@ -948,16 +949,17 @@ class BotDirector:
             or affordance is MovementAffordance.JUMP
         )
         current_loop = int(getattr(self.server, "loop_count", 0))
-        if jump_requested and not runtime.jump_request_active:
-            runtime.jump_request_active = True
+        if (
+            jump_requested
+            and int(intent.frame_id) != runtime.last_jump_frame
+            and current_loop >= runtime.jump_rearm_loop
+        ):
+            runtime.last_jump_frame = int(intent.frame_id)
             runtime.jump_until_loop = current_loop + _JUMP_PULSE_TICKS
-        elif not jump_requested:
-            runtime.jump_request_active = False
-            runtime.jump_until_loop = -1
-        jump_held = (
-            runtime.jump_request_active
-            and current_loop <= runtime.jump_until_loop
-        )
+            # A release window prevents adjacent worker frames from merging
+            # into one native held-key interval.
+            runtime.jump_rearm_loop = runtime.jump_until_loop + 2
+        jump_held = current_loop <= runtime.jump_until_loop
         self._set_movement_state(runtime, (
             forward_amount > 0.25,
             forward_amount < -0.25,
