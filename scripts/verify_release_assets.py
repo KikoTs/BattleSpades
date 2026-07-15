@@ -5,15 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 from pathlib import Path
-import sys
+import re
 from typing import Sequence
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from server.runtime_paths import read_version
 
 
 _TARGETS = (
@@ -24,6 +17,24 @@ _TARGETS = (
     ("macos", "x86_64"),
     ("macos", "arm64"),
 )
+_VERSION_PATTERN = re.compile(
+    r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?"
+)
+
+
+def read_release_version(project_root: Path) -> str:
+    """Read the canonical version without importing runtime dependencies."""
+
+    version_file = Path(project_root).resolve() / "VERSION"
+    try:
+        version = version_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read release version: {version_file}") from exc
+    if not _VERSION_PATTERN.fullmatch(version):
+        raise RuntimeError(
+            f"invalid release version in {version_file}: {version!r}"
+        )
+    return version
 
 
 def expected_archive_names(version: str) -> tuple[str, ...]:
@@ -70,7 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     manifest = write_checksum_manifest(
         arguments.asset_dir,
-        read_version(arguments.project_root),
+        read_release_version(arguments.project_root),
     )
     print(manifest)
     return 0

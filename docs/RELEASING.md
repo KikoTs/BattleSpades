@@ -6,7 +6,7 @@ This runbook publishes the six portable dedicated-server archives defined by
 ## Release contract
 
 - Canonical version: root `VERSION` file.
-- First prerelease: `0.0.1-alpha.1` / tag `v0.0.1-alpha.1`.
+- Current prerelease: `0.0.1-alpha.2` / tag `v0.0.1-alpha.2`.
 - Targets: Windows, Linux, and macOS on x86_64 and arm64.
 - Payload: PyInstaller `onedir` runtime, `config.toml`, maps, prefabs, plugins,
   `LICENSE`, third-party notices, quick start, and `VERSION`.
@@ -39,8 +39,8 @@ After the changes intended for release are reviewed and pushed, create and push
 an annotated tag matching `v` plus the exact `VERSION` value:
 
 ```bash
-git tag -a v0.0.1-alpha.1 -m "BattleSpades 0.0.1 alpha 1"
-git push origin v0.0.1-alpha.1
+git tag -a v0.0.1-alpha.2 -m "BattleSpades 0.0.1 alpha 2"
+git push origin v0.0.1-alpha.2
 ```
 
 The tag workflow:
