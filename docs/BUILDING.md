@@ -1,8 +1,8 @@
 # Building BattleSpades
 
-BattleSpades has two compiled pieces: its own **Cython extensions** and the
-**pyenet** networking binding. Both build from source, so every target needs a
-C toolchain and Python development headers.
+BattleSpades compiles its Cython gameplay extensions, Recast/Detour wrapper,
+and vendored **pyenet/ENet** networking binding from source. Every target needs
+a C/C++ toolchain and Python development headers.
 
 ## Prerequisites
 
@@ -26,8 +26,9 @@ Python **3.12** is the pinned release-build runtime.
 .\scripts\install.ps1
 ```
 
-This runs `pip install -r requirements.txt` (which compiles `pyenet`) and then
-`python setup.py build_ext --inplace` (which compiles the Cython core).
+This installs the Python dependencies and then runs
+`python setup.py build_ext --inplace`, which builds every native module,
+including the vendored ENet transport.
 
 ## Manual build
 
@@ -71,7 +72,7 @@ the gameplay listener.
 ## Verifying the build
 
 ```bash
-py -m pytest tests/ -q          # 87 tests should pass
+py -m pytest tests/ -q          # complete suite must pass
 py scripts/replay_parity.py     # movement parity — must print ALL PASS
 python run_server.py            # boots on port 27015
 ```
@@ -79,27 +80,13 @@ python run_server.py            # boots on port 27015
 ## Multi-platform / cross-compilation
 
 The release matrix covers **Windows, Linux, and macOS** on **x86_64 and arm64**.
-The Cython extensions cross-compile cleanly with the usual `setup.py` flags; the
-friction is entirely **ENet**.
+Each GitHub-hosted runner compiles natively for its declared architecture. The
+repository vendors pyenet 1.3.17 and ENet 1.3.17, so no target depends on PyPI
+having a compatible prebuilt `pyenet` wheel or source-build environment.
 
-### The ENet problem
-
-`pyenet` bundles the ENet C source and builds it per target. On mainstream
-`x86_64` Linux/Windows with a wheel or a local compiler this is painless. For
-other targets you may have to build ENet + pyenet for that architecture:
-
-- **arm64 Linux** (e.g. a Raspberry Pi or an ARM VPS): install the toolchain
-  (`build-essential python3-dev`) and let `pip install pyenet` compile natively
-  *on the target*, or use a matching manylinux/ARM build environment
-  (e.g. `cibuildwheel`, or a QEMU-backed container) to produce a wheel.
-- **Static / portable builds**: because ENet is a native C dependency, a fully
-  static single-file distribution requires bundling the compiled binding for
-  each OS/arch combination.
-
-This per-architecture ENet dance is exactly why the [roadmap](ROADMAP.md) calls
-for replacing the C `pyenet` dependency with a **native Go ENet** implementation
-— that would collapse "build ENet three times" into one portable binary per
-platform.
+Do not cross-label an artifact built on another architecture. Use the native
+runner from `.github/workflows/release.yml`, or reproduce that toolchain on the
+actual target architecture.
 
 ### Producing wheels
 
@@ -110,4 +97,5 @@ pip install build
 python -m build --wheel
 ```
 
-(You still need `pyenet` available for that platform at runtime.)
+The resulting wheel contains the locally compiled `enet` extension; a separate
+PyPI `pyenet` installation is not required at runtime.

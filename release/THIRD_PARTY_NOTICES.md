@@ -6,8 +6,8 @@ third-party software. Upstream projects remain subject to their own licenses.
 - CPython — Python Software Foundation License, <https://www.python.org/psf/license/>.
 - PyInstaller and its bootloader — GPL-2.0-or-later with the PyInstaller
   bootloader exception, <https://pyinstaller.org/en/stable/license.html>.
-- pyenet and ENet — MIT license, <https://github.com/piqueserver/pyenet> and
-  <https://github.com/lsalzman/enet>.
+- pyenet — BSD 3-Clause license, <https://github.com/piqueserver/pyenet>.
+- ENet — MIT license, <https://github.com/lsalzman/enet>.
 - Cython — Apache License 2.0, <https://github.com/cython/cython>.
 - toml — MIT license, <https://github.com/uiri/toml>.
 - py_trees — BSD 3-Clause license, <https://github.com/splintered-reality/py_trees>.

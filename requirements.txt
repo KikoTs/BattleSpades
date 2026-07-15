@@ -1,11 +1,10 @@
 # BattleSpades server dependencies.
 #   pip install -r requirements.txt
 #
-# NOTE: pyenet and the Cython extensions compile from source, so a C toolchain
-# is required (see README -> Building from source).
+# NOTE: the vendored ENet/pyenet binding and Cython extensions compile from
+# source, so a C/C++ toolchain is required (see README -> Building from source).
 
-# Reliable-UDP networking (ENet binding) — the game transport.
-pyenet>=1.3.17
+# The reliable-UDP ENet binding is built by setup.py from vendor/pyenet.
 
 # Cython — builds the compiled physics / VXL / packet core.
 Cython>=3.0.0
