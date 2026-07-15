@@ -649,6 +649,7 @@ class BotDirector:
                     jetpack_id=int(getattr(player, "jetpack_id", 0)),
                     jetpack_fuel=float(getattr(player, "jetpack_fuel", 0.0)),
                     grounded=bool(getattr(player, "grounded", False)),
+                    wade=bool(getattr(player, "wade", False)),
                     reloading=bool(getattr(player, "reloading", False)),
                 )
             )

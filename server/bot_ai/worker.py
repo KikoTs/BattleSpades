@@ -35,6 +35,7 @@ from .messages import (
 )
 from .combat_profiles import envelope_for
 from .policies import ModeBotDecision, _formation_point, objective_decision_for
+from .voxel_navigation import VoxelTerrain, WATERBED_SUPPORT_Z
 from server.projectiles import PROJECTILE_SPECS
 
 # Position-holding/assault roles whose goals may shift onto commanding
@@ -286,6 +287,9 @@ class WorkerVoxelWorld:
         self._built_tiles: set[tuple[int, int]] = set()
         self._dirty_tiles: set[tuple[int, int]] = set()
         self._last_affordance: dict[int, MovementAffordance] = {}
+        # Resolve ``self.solid`` at call time so source-only fixtures and live
+        # VXL reloads share exactly the same surface semantics.
+        self._terrain = VoxelTerrain(lambda x, y, z: self.solid(x, y, z))
         from .tactical_map import TacticalMap
 
         self.tactical = TacticalMap()
@@ -634,6 +638,12 @@ class WorkerVoxelWorld:
                     if not occupied:
                         air_run += 1
                         continue
+                    # The stock map guarantees a solid waterbed at z=239.
+                    # It is collision support for swimming, not dry terrain,
+                    # and must never become an ordinary Recast polygon.
+                    if z >= WATERBED_SUPPORT_Z:
+                        air_run = 0
+                        continue
                     if air_run >= 2:
                         base = len(vertices) // 3
                         height = -float(z)
@@ -750,21 +760,13 @@ class WorkerVoxelWorld:
         vertical_span: int = 3,
         clearance: int = 2,
     ) -> tuple[int, int, int] | None:
-        expected_support = int(round(float(current_player_z) + 2.25))
-        candidates = range(
-            max(2, expected_support - vertical_span),
-            min(239, expected_support + vertical_span + 1),
+        return self._terrain.standing_node(
+            x,
+            y,
+            current_player_z,
+            vertical_span=vertical_span,
+            clearance=clearance,
         )
-        for support_z in sorted(candidates, key=lambda value: abs(value - expected_support)):
-            if (
-                self.solid(x, y, support_z)
-                and all(
-                    not self.solid(x, y, support_z - offset)
-                    for offset in range(1, clearance + 1)
-                )
-            ):
-                return x, y, support_z
-        return None
 
     def _neighbors(
         self,

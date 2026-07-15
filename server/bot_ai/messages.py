@@ -126,6 +126,7 @@ class PlayerSnapshot:
     jetpack_id: int = 0
     jetpack_fuel: float = 0.0
     grounded: bool = True
+    wade: bool = False
     reloading: bool = False
 
 
