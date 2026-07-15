@@ -1662,15 +1662,15 @@ def test_skilled_grounded_bot_uses_bounded_combat_jump() -> None:
     assert second is not None and second.movement.jump is False
 
 
-def test_critical_bot_builds_real_cover_between_itself_and_threat() -> None:
+def test_critical_bot_builds_replicated_block_line_cover_across_threat() -> None:
     class CoverWorld(_SwitchableWorld):
         @staticmethod
         def cover_direction(_position, _threat):
             return (0.0, 0.0, 0.0)
 
         @staticmethod
-        def cover_build_cell(_position, _threat):
-            return (1, 0, 2)
+        def cover_build_line(_position, _threat):
+            return (1, -2, 2), (1, 2, 2)
 
     brain = BotBrain(CoverWorld(), seed=3)
     observer = replace(
@@ -1688,8 +1688,10 @@ def test_critical_bot_builds_real_cover_between_itself_and_threat() -> None:
     intent = brain.decide(frame)
 
     assert intent is not None
-    assert intent.action.kind is BotActionKind.BUILD
-    assert intent.action.position == (1.0, 0.0, 2.0)
+    assert intent.action.kind is BotActionKind.BUILD_LINE
+    assert intent.action.position == (1.0, -2.0, 2.0)
+    assert intent.action.end_position == (1.0, 2.0, 2.0)
+    assert intent.debug_role == "combat_block_line_cover"
 
 
 def test_miner_proactively_breaches_a_hidden_contact_obstruction() -> None:

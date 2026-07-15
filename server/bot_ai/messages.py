@@ -24,6 +24,7 @@ class BotActionKind(str, Enum):
     RELOAD = "reload"
     MELEE = "melee"
     BUILD = "build"
+    BUILD_LINE = "build_line"
     MINE = "mine"
     PLACE_PREFAB = "place_prefab"
     DEPLOY = "deploy"
@@ -230,6 +231,7 @@ class BotAction:
     kind: BotActionKind = BotActionKind.NONE
     tool_id: int = -1
     position: Vector3 | None = None
+    end_position: Vector3 | None = None
     argument: str = ""
     face: int = -1
     yaw: float = 0.0

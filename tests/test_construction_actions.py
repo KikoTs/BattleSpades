@@ -84,6 +84,29 @@ def test_reservations_expire_without_background_work():
     assert service.active_count == 0
 
 
+def test_construction_rejects_a_living_player_body_overlap():
+    server = _server()
+    builder = SimpleNamespace(
+        id=12,
+        team=TEAM1,
+        alive=True,
+        spawned=True,
+        x=20.5,
+        y=20.5,
+        z=20.0,
+    )
+    server.players[builder.id] = builder
+
+    token, reason = server.construction.reserve_construction(
+        builder.id,
+        builder.team,
+        ((20, 20, 20),),
+    )
+
+    assert token is None
+    assert reason == "player body overlap"
+
+
 def test_ctf_capture_bounds_are_protected_from_construction():
     server = _server()
     server.mode = SimpleNamespace(
@@ -176,6 +199,57 @@ def test_bot_gateway_routes_prefab_to_shared_service():
     assert calls[0][1]["name"] == "prefab_fort_wall"
     assert calls[0][1]["yaw"] == 1
     assert calls[0][1]["snap_to_surface"] is True
+
+
+def test_bot_block_line_uses_shared_combat_service_and_exact_reservation():
+    packets = []
+    reservations = []
+    cells = [(10, 10, 20), (11, 10, 20), (12, 10, 20), (13, 10, 20)]
+    combat = SimpleNamespace(
+        block_line_cells=lambda _start, _end: list(cells),
+        handle_block_line=lambda _player, packet: packets.append(packet) or True,
+    )
+    construction = SimpleNamespace(
+        reserve_construction=lambda owner, team, footprint: (
+            reservations.append((owner, team, tuple(footprint))) or (41, "")
+        ),
+        release=lambda _token: None,
+    )
+    server = SimpleNamespace(
+        loop_count=88,
+        combat=combat,
+        construction=construction,
+    )
+
+    class _BlockBot:
+        id = 9
+        team = TEAM1
+        is_bot = True
+        alive = True
+        spawned = True
+        loadout = [int(C.BLOCK_TOOL)]
+        tool = -1
+
+        def set_tool(self, tool, raw=True):
+            self.tool = int(tool)
+            self.tool_is_raw = bool(raw)
+
+    bot = _BlockBot()
+    action = BotAction(
+        BotActionKind.BUILD_LINE,
+        tool_id=int(C.BLOCK_TOOL),
+        position=(10.0, 10.0, 20.0),
+        end_position=(13.0, 10.0, 20.0),
+    )
+
+    assert BotActionGateway(server).execute(bot, action) is True
+    assert reservations == [(bot.id, bot.team, tuple(cells))]
+    assert len(packets) == 1
+    packet = packets[0]
+    assert packet.loop_count == 88
+    assert packet.player_id == bot.id
+    assert (packet.x1, packet.y1, packet.z1) == (10, 10, 20)
+    assert (packet.x2, packet.y2, packet.z2) == (13, 10, 20)
 
 
 def test_zombie_prefab_tool_routes_through_the_same_authoritative_service():
