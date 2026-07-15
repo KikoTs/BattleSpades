@@ -7,15 +7,24 @@ from typing import Optional, Type
 
 from .base_mode import BaseMode
 from .ctf import CTFMode
+from .classic_ctf import ClassicCTFMode
 from .tdm import TDMMode
 from .arena import ArenaMode
+from .vip import VIPMode
+from .zombie import ZombieMode
 
 
 # Mode registry
 _modes = {
     "ctf": CTFMode,
+    "cctf": ClassicCTFMode,
+    "classic_ctf": ClassicCTFMode,
+    "classic-ctf": ClassicCTFMode,
     "tdm": TDMMode,
     "arena": ArenaMode,
+    "vip": VIPMode,
+    "zom": ZombieMode,
+    "zombie": ZombieMode,
 }
 
 
@@ -32,8 +41,11 @@ def register_mode(name: str, mode_class: Type[BaseMode]):
 __all__ = [
     "BaseMode",
     "CTFMode",
+    "ClassicCTFMode",
     "TDMMode", 
     "ArenaMode",
+    "VIPMode",
+    "ZombieMode",
     "get_mode_class",
     "register_mode",
 ]

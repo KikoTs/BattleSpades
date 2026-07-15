@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
 from .game_constants import TEAM1, TEAM2
+from .mode_data import get as get_mode_data
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -306,7 +307,10 @@ class A2SHandler:
         # Player counts
         packet.append(len(self.server.players))
         packet.append(config.max_players)
-        packet.append(0)  # Bots
+        packet.append(sum(
+            1 for player in self.server.players.values()
+            if bool(getattr(player, "is_bot", False))
+        ))
         
         # Server type: 'd' = dedicated
         packet.append(ord('d'))
@@ -334,7 +338,15 @@ class A2SHandler:
         packet.extend(struct.pack("<q", 224540))
         
         # Keywords (EDF_KEYWORDS)
-        keywords = f"v168;playlist=8;mode=0008;classic"
+        active_mode = get_mode_data(config.game_mode)
+        tags = [
+            "v168",
+            "playlist=8",
+            f"mode={int(active_mode.mode_id):04d}",
+        ]
+        if active_mode.classic:
+            tags.append("classic")
+        keywords = ";".join(tags)
         packet.extend(keywords.encode('utf-8', 'replace') + b'\0')
         
         # Game ID (EDF_GAME_ID) - 64-bit

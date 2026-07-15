@@ -22,6 +22,12 @@ class ClientSpec:
     console_port: int
     tracer_port: int
     capture_dir: Path
+    capture_enabled: bool = True
+    stack_sampler_enabled: bool = False
+    # Preserve the historical two-client parity behavior by default. Movement
+    # stress overrides this because the retail game throttles a minimized
+    # window heavily and no longer approximates foreground player pacing.
+    minimized: bool = True
 
 
 def build_client_specs(
@@ -51,7 +57,18 @@ def build_client_specs(
 
 
 def launch_client(spec: ClientSpec) -> subprocess.Popen:
-    """Start one dev client with a private console/tracer endpoint."""
+    """Start one retail client with explicitly enabled instrumentation.
+
+    The retail tree loads ``physics_tracer`` only when
+    ``PHYSICS_TRACER_ENABLED=1``.  Keeping that switch here is important:
+    setting only the console/capture ports silently launches an ordinary
+    client and leaves automation waiting for a console that will never open.
+
+    Full frame capture is optional because synchronous NDJSON writes can
+    perturb the timing that a movement stress test is trying to measure.  A
+    stress scenario normally samples through the console and leaves capture
+    disabled; parity/replay jobs can still opt in explicitly.
+    """
     if not spec.python_path.is_file():
         raise FileNotFoundError(f"client Python not found: {spec.python_path}")
     if not (spec.client_dir / "run.py").is_file():
@@ -64,16 +81,21 @@ def launch_client(spec: ClientSpec) -> subprocess.Popen:
         errors="replace",
     )
     env = os.environ.copy()
+    env["PHYSICS_TRACER_ENABLED"] = "1"
     env["PHYSICS_TRACER_CONSOLE_PORT"] = str(spec.console_port)
     env["PHYSICS_TRACER_PORT"] = str(spec.tracer_port)
-    env["PHYSICS_TRACER_CAPTURE"] = "1"
+    env["PHYSICS_TRACER_CAPTURE"] = "1" if spec.capture_enabled else "0"
+    env["PHYSICS_TRACER_STACK_SAMPLER"] = (
+        "1" if spec.stack_sampler_enabled else "0"
+    )
 
     startupinfo = None
     creationflags = 0
     if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 6  # SW_SHOWMINIMIZED
+        if spec.minimized:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 6  # SW_SHOWMINIMIZED
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
     try:

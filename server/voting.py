@@ -105,6 +105,23 @@ class VoteManager:
         if self.active:
             self._resolve(passed=False)
 
+    def forget_player(self, player_id: int) -> None:
+        """Remove vote state before the compact player id is reassigned."""
+
+        player_id = int(player_id)
+        self._last_start.pop(player_id, None)
+        if self.active and player_id in (self.target_id, self.starter_id):
+            self.cancel()
+            return
+        removed = player_id in self.yes or player_id in self.no
+        self.yes.discard(player_id)
+        self.no.discard(player_id)
+        if removed and self.active:
+            self._broadcast(
+                VOTE_UPDATE,
+                self.server.players.get(self.target_id),
+            )
+
     # -- internals ------------------------------------------------------
 
     def _resolve(self, passed: bool) -> None:

@@ -12,6 +12,7 @@ from typing import Optional, TYPE_CHECKING, Dict, Type
 import shared.packet as shared_packet
 from protocol.runtime_packets import decode_runtime_packet
 from shared.bytes import ByteReader
+from shared.constants import ERROR_DATA
 from shared.packet import (
     ClientInMenu,
     ClockSync,
@@ -24,6 +25,7 @@ from shared.packet import (
     MapSyncStart,
     NewPlayerConnection,
     SetClassLoadout,
+    SetColor,
     SetHP,
     SkyboxData,
     StateData,
@@ -146,6 +148,10 @@ class Connection:
         self.map_sent = False
         self.state_sent = False
         self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
+        self.pending_selection = None
+        # Compatibility mirrors for callers still constructing the old
+        # handshake fields independently. Runtime join logic consumes the
+        # atomic selection above (or normalizes these mirrors once).
         self.pending_class_id: Optional[int] = None
         self.pending_loadout: list[int] = []
         self.pending_prefabs: list[str] = []
@@ -157,6 +163,13 @@ class Connection:
         # ChatMessage/StateData/WorldUpdate) — a flood during the async world
         # build / GameScene transition crashes the compiled client natively.
         self.in_game = False
+        # Terrain sequence serialized into this connection's MapSync. Native
+        # block packets after this watermark are replayed at first ClientData.
+        self.map_mutation_watermark: Optional[int] = None
+        self.map_mutation_overflow: bool = False
+        # player_id -> concrete Player object/life token. The roster sent
+        # before map loading can change while gameplay broadcasts are gated.
+        self.known_player_lives: dict[int, tuple[int, int]] = {}
 
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
@@ -168,8 +181,13 @@ class Connection:
         # Log raw packet (unless suppressed)
         packet_id = data[0] if len(data) > 0 else -1
         suppressed = packet_id in self.server.config.log_suppress_packets
+        trace_packet = (
+            not suppressed
+            and bool(getattr(self.server.config, "packet_trace", False))
+            and logger.isEnabledFor(logging.DEBUG)
+        )
         
-        if not suppressed:
+        if trace_packet:
             hex_data = ' '.join(f'{b:02X}' for b in data)
             packet_name = get_packet_name(packet_id)
             parsed_fields = try_parse_packet_for_logging(packet_id, data)
@@ -182,7 +200,7 @@ class Connection:
         prefixed_data = bytes([prefix]) + compressed
         
         # Log compressed packet
-        if not suppressed:
+        if trace_packet:
              comp_hex = ' '.join(f'{b:02X}' for b in prefixed_data)
              logger.debug(f"Compressed Hex Data: {comp_hex}")
         
@@ -219,17 +237,29 @@ class Connection:
         self.send(bytes(packet.generate()))
 
     def _cache_pre_join_loadout(self, packet: SetClassLoadout):
-        """Store pre-join loadout state for the first spawn."""
-        self.pending_class_id = packet.class_id
-        self.pending_loadout = list(packet.loadout)
-        self.pending_prefabs = list(packet.prefabs)
-        self.pending_ugc_tools = list(packet.ugc_tools)
+        """Normalize and store one complete selection for the first spawn."""
+        from server.class_selection import normalize_class_selection
+
+        selection = normalize_class_selection(
+            packet.class_id,
+            packet.loadout,
+            packet.prefabs,
+            packet.ugc_tools,
+        )
+        self.pending_selection = selection
+        self.pending_class_id = selection.class_id
+        self.pending_loadout = list(selection.loadout)
+        self.pending_prefabs = list(selection.prefabs)
+        self.pending_ugc_tools = list(selection.ugc_tools)
 
     def _resolve_join_team(self, wire_team: int) -> tuple[int, int]:
         """Resolve the initial playable team from the client's wire team ID."""
         internal_team = wire_team_to_internal(wire_team)
         if internal_team is not None:
-            return internal_team, wire_team
+            prepare_team = getattr(self.server.mode, "prepare_join_team", None)
+            if callable(prepare_team):
+                internal_team = int(prepare_team(internal_team))
+            return internal_team, internal_team_to_wire(internal_team)
 
         fallback_internal = wire_team_to_internal(DEFAULT_WIRE_TEAM)
         if is_non_playable_wire_team(wire_team):
@@ -244,6 +274,9 @@ class Connection:
                 wire_team,
                 DEFAULT_WIRE_TEAM,
             )
+        prepare_team = getattr(self.server.mode, "prepare_join_team", None)
+        if callable(prepare_team):
+            fallback_internal = int(prepare_team(fallback_internal))
         return fallback_internal, internal_team_to_wire(fallback_internal)
 
     def _send_spawn_hp(self, hp: int = 100):
@@ -281,7 +314,18 @@ class Connection:
         # Handle compression prefix
         if data[0] == 0x31:
             # LZF compressed
-            data = lzf_decompress(data[1:])
+            try:
+                data = lzf_decompress(data[1:])
+            except ValueError as exc:
+                # A malformed stream is peer-local input. Reject it before a
+                # packet decoder or the pre-join task can fail asynchronously.
+                logger.warning(
+                    "Rejected malformed LZF packet from %s: %s",
+                    self.peer.address,
+                    exc,
+                )
+                self.disconnect(reason=int(ERROR_DATA))
+                return
         else:
             # Skip prefix byte
             data = data[1:]
@@ -296,7 +340,12 @@ class Connection:
         #packet_name = get_packet_name(packet_id) # Using this here might spam console if on_receive is called a lot. Use sparingly? No user asked for it.
         # Check suppression for receive too? Assuming yes.
         suppressed = packet_id in self.server.config.log_suppress_packets
-        if not suppressed:
+        trace_packet = (
+            not suppressed
+            and bool(getattr(self.server.config, "packet_trace", False))
+            and logger.isEnabledFor(logging.DEBUG)
+        )
+        if trace_packet:
              packet_name = get_packet_name(packet_id)
              hex_data = ' '.join(f'{b:02X}' for b in data)
              parsed_fields = try_parse_packet_for_logging(packet_id, data)
@@ -314,12 +363,23 @@ class Connection:
         # First ClientData (4) means the client has entered the GameScene and
         # started its input loop. NOW it can safely receive the live roster +
         # entities and the ongoing gameplay broadcast stream — never before.
-        if packet_id == 4 and self.player is not None and not self.in_game:
-            self.in_game = True
+        if (
+            packet_id == 4
+            and self.player is not None
+            and not self.in_game
+        ):
             try:
                 self.server.reveal_world_to(self)
+                self.in_game = True
+                prune = getattr(self.server, "_prune_map_mutations", None)
+                if prune is not None:
+                    prune()
             except Exception:
-                logger.debug("reveal_world_to failed", exc_info=True)
+                # Keep the connection gated so the next ClientData retries the
+                # complete reveal instead of admitting a partially synced
+                # client into the live broadcast stream.
+                logger.exception("reveal_world_to failed")
+                return
 
         # Route to handler
         if self.player:
@@ -407,6 +467,12 @@ class Connection:
             packet.prefabs = list(getattr(player, 'prefabs', []) or [])
 
             self.send(bytes(packet.generate()))
+            from server.roster import remember_player_life
+            remember_player_life(self, player)
+            color = SetColor()
+            color.player_id = player.id
+            color.value = int(player.block_color) & 0xFFFFFF
+            self.send(bytes(color.generate()))
     
     async def handle_pre_join_packet(self, data: bytes):
         """Handle packets before player is fully joined."""
@@ -444,7 +510,9 @@ class Connection:
             packet = NewPlayerConnection(reader)
             await self._on_new_player(packet)
         elif packet_id == SetClassLoadout.id:
-            packet = SetClassLoadout(reader)
+            packet = decode_runtime_packet(packet_id, data[1:])
+            if packet is None:  # Defensive fallback; packet 13 has a runtime decoder.
+                packet = SetClassLoadout(reader)
             self._cache_pre_join_loadout(packet)
             logger.debug(
                 "Cached pre-join loadout: class_id=%s loadout=%s prefabs=%s ugc_tools=%s",
@@ -452,6 +520,16 @@ class Connection:
                 packet.loadout,
                 packet.prefabs,
                 packet.ugc_tools,
+            )
+        elif packet_id == SetColor.id:
+            packet = SetColor(reader)
+            # Retail constructs every colour-using tool before joining and
+            # emits their defaults (observed: grey, red, then yellow).  These
+            # packets are not user palette input.  The recovered server also
+            # ignores SetColor until an alive player holds BLOCK_TOOL.
+            logger.debug(
+                "Ignored pre-join tool-constructor color: %#06x",
+                int(packet.value) & 0xFFFFFF,
             )
         elif packet_id == ClockSync.id:
             packet = ClockSync(reader)
@@ -487,7 +565,6 @@ class Connection:
         )
         await self.send_skybox()
         await self.send_existing_players()
-
 
     async def send_info(self):
         """Send InitialInfo (packet 114) to client.
@@ -548,8 +625,13 @@ class Connection:
         sync_mode = str(getattr(self.server.config, "map_sync_mode", "auto")).lower()
         use_delta = crc_match and sync_mode != "full"
 
+        # Capture one immutable column set. World mutation and packet handling
+        # share this event loop, and there is no await until the complete sync
+        # is sent, so the following watermark is exactly contiguous with it.
+        snapshot_columns = set(getattr(wm, "dirty_columns", ()) or ())
+
         if use_delta:
-            payload = wm.serialize_dirty_columns_compressed()
+            payload = wm.serialize_dirty_columns_compressed(snapshot_columns)
             chunk_list = [
                 payload[i:i + 1024] for i in range(0, len(payload), 1024)
             ]
@@ -557,7 +639,7 @@ class Connection:
                 "Map CRC match for %s (crc=%s): delta sync, %s dirty columns, %s bytes",
                 self.peer.address,
                 server_crc,
-                len(getattr(wm, "dirty_columns", ()) or ()),
+                len(snapshot_columns),
                 len(payload),
             )
         else:
@@ -566,7 +648,10 @@ class Connection:
             # grid, which explicitly writes every underground voxel into a 36 MB
             # stream the strict client rejects (Steam join crash 2026-07-09).
             _iter_full = getattr(wm, "iter_full_sync_chunks", None)
-            chunk_list = _iter_full() if _iter_full is not None else None
+            chunk_list = (
+                _iter_full(snapshot_columns=snapshot_columns)
+                if _iter_full is not None else None
+            )
             if chunk_list is None:
                 chunker = wm.get_chunker()
                 if chunker is None:
@@ -581,6 +666,10 @@ class Connection:
                     client_crc,
                     server_crc,
                 )
+
+        mark_snapshot = getattr(self.server, "mark_map_snapshot_complete", None)
+        if mark_snapshot is not None:
+            mark_snapshot(self)
 
         total_chunks = len(chunk_list)
         total_size = sum(len(chunk) for chunk in chunk_list)
@@ -632,10 +721,37 @@ class Connection:
         # NewPlayerConnection does not carry a concrete tool, so start with the default weapon tool.
         weapon = DEFAULT_WEAPON_TOOL
         internal_team, wire_team = self._resolve_join_team(packet.team)
-        player = Player(player_id, packet.name, internal_team, weapon, self)
-        player.class_id = (
-            self.pending_class_id if self.pending_class_id is not None else packet.class_id
+        from server.player_names import allocate_unique_player_name
+
+        player_name = allocate_unique_player_name(
+            packet.name,
+            self.server.players.values(),
         )
+        if player_name != packet.name:
+            logger.info(
+                "Renamed duplicate/unsafe player %r to %r",
+                packet.name,
+                player_name,
+            )
+        player = Player(player_id, player_name, internal_team, weapon, self)
+        player.local_language = int(packet.local_language)
+        from server.class_selection import normalize_class_selection
+
+        selection = self.pending_selection or normalize_class_selection(
+            self.pending_class_id
+            if self.pending_class_id is not None
+            else packet.class_id,
+            self.pending_loadout,
+            self.pending_prefabs,
+            self.pending_ugc_tools,
+            fallback_class_id=packet.class_id,
+        )
+        prepare_selection = getattr(
+            self.server.mode, "prepare_join_selection", None
+        )
+        if callable(prepare_selection):
+            selection = prepare_selection(internal_team, selection)
+        player.apply_class_selection(selection)
         
         self.player = player
         self.server.players[player_id] = player
@@ -664,7 +780,16 @@ class Connection:
         create_packet.local_language = packet.local_language
         
         # Spawn position
-        spawn = self.server.world_manager.get_spawn_point(player.team)
+        # Modes own their spawn policy. VIP in particular must enter directly
+        # at the authored team base; bypassing this hook on the first life
+        # made joins use the generic random terrain spawn while later lives
+        # correctly used RoundLifecycle's mode-aware resolver.
+        spawn_resolver = getattr(self.server.mode, "get_spawn_point", None)
+        spawn = (
+            spawn_resolver(player)
+            if callable(spawn_resolver)
+            else self.server.world_manager.get_spawn_point(player.team)
+        )
         create_packet.x = spawn[0]
         create_packet.y = spawn[1]
         create_packet.z = spawn[2]
@@ -677,16 +802,8 @@ class Connection:
         create_packet.ori_y = player.o_y
         create_packet.ori_z = player.o_z
         create_packet.name = player.name
-        from server.class_data import complete_client_loadout
-        selected_loadout = complete_client_loadout(
-            player.class_id, self.pending_loadout
-        )
-        create_packet.loadout = selected_loadout
-        create_packet.prefabs = list(self.pending_prefabs)
-        # Persist the choices on the player: loadout drives jetpack/ammo at
-        # spawn; prefabs feed the prefab allow-list (BuildPrefabAction).
-        player.loadout = list(selected_loadout)
-        player.prefabs = list(self.pending_prefabs)
+        create_packet.loadout = list(selection.loadout)
+        create_packet.prefabs = list(selection.prefabs)
 
         # The joiner needs its OWN CreatePlayer to bind its local player to the
         # server id — deliver it directly (one packet is safe mid-transition).
@@ -695,9 +812,29 @@ class Connection:
         create_bytes = bytes(create_packet.generate())
         self.send(create_bytes)
         self.server.broadcast(create_bytes, exclude=player)
+
+        # CreatePlayer carries no block palette. Publish it immediately after
+        # character creation to both the joining client and settled peers;
+        # otherwise their first remote BlockLine resolves through a default
+        # colour that can differ from the authoritative Player state.
+        color_packet = SetColor()
+        color_packet.player_id = player.id
+        color_packet.value = int(player.block_color) & 0xFFFFFF
+        color_bytes = bytes(color_packet.generate())
+        self.send(color_bytes)
+        self.server.broadcast(color_bytes, exclude=player)
         
         # Spawn player
         player.spawn(spawn[0], spawn[1], spawn[2])
+        from server.roster import remember_player_life
+        remember_player_life(self, player)
+        # broadcast() delivered CreatePlayer only to settled connections.
+        # Record exactly those recipients so first-frame catch-up can identify
+        # clients that were still gated and therefore missed this new life.
+        for other in self.server.connections.values():
+            if other is self or not getattr(other, "in_game", False):
+                continue
+            remember_player_life(other, player)
         self._send_spawn_hp()
         if getattr(self.server, 'debug_parity', None) is not None:
             self.server.debug_parity.on_player_join(player)

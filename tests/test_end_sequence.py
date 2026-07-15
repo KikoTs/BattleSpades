@@ -56,6 +56,8 @@ class _Server:
         self.respawned = []
         self.tick_rate = 60
         self.state_refreshes = 0
+        self.runtime_resets = 0
+        self.client_rejoins = 0
 
     def broadcast(self, data):
         self.broadcast_packets.append(data)
@@ -65,6 +67,12 @@ class _Server:
 
     def broadcast_state_data(self):
         self.state_refreshes += 1
+
+    def reset_round_runtime(self):
+        self.runtime_resets += 1
+
+    async def restart_connected_clients(self):
+        self.client_rejoins += 1
 
 
 class _Mode(BaseMode):
@@ -103,13 +111,19 @@ def test_end_sequence_emits_music_stats_and_restarts(monkeypatch):
     from server import audio as _audio
     first_music = next(d for d in srv.broadcast_packets if d and d[0] == 26)
     assert PlayMusic(ByteReader(first_music[1:])).name in _audio.GAME_ENDING_TRACKS
-    # Stats screen packets present, GameStats(67) before ShowGameStats(53); MapEnded(52) too.
-    assert 67 in ids and 53 in ids and 52 in ids
-    assert ids.index(67) < ids.index(53)
+    # GameStats data is safe in the live GameScene.  The terminal
+    # ShowGameStats/MapEnded packets must never be used for a same-map restart:
+    # both tear down GameScene in the retail client.
+    assert 67 in ids
+    assert 53 not in ids
+    assert 52 not in ids
+    assert 72 not in ids
     # Restart happened: teams reset + everyone respawned; mode revived.
     assert srv.teams[0].reset_called >= 1
     assert srv.respawned == [7]
-    assert srv.state_refreshes == 1
+    assert srv.state_refreshes == 0
+    assert srv.runtime_resets == 1
+    assert srv.client_rejoins == 0
     assert mode.ended is False
 
 

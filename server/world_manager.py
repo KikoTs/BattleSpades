@@ -8,7 +8,7 @@ import os
 import random
 import struct
 import zlib
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import shared.constants as C
 from aoslib.world import World
@@ -28,6 +28,67 @@ logger = logging.getLogger(__name__)
 MAP_X = int(C.MAP_X)
 MAP_Y = int(C.MAP_Y)
 MAP_Z = int(C.MAP_Z)
+
+
+def _shift_vxl_spans(data: bytes, z_shift: int) -> bytes:
+    """Translate one column's compact VXL span headers into client-world Z."""
+    if not z_shift:
+        return bytes(data)
+    out = bytearray(data)
+    pos = 0
+    limit = len(out)
+    while pos < limit:
+        if pos + 4 > limit:
+            raise ValueError("truncated VXL span header")
+        span_words = out[pos]
+        top_start = out[pos + 1]
+        top_end = out[pos + 2]
+        previous_air = out[pos + 3]
+        shifted_start = top_start + z_shift
+        shifted_end = top_end + z_shift
+        if shifted_start > 255 or shifted_end > 255:
+            raise ValueError("shifted VXL coordinate exceeds byte range")
+        out[pos + 1] = shifted_start
+        out[pos + 2] = shifted_end
+        if previous_air:
+            shifted_air = previous_air + z_shift
+            if shifted_air > 255:
+                raise ValueError("shifted VXL air coordinate exceeds byte range")
+            out[pos + 3] = shifted_air
+        top_len = top_end - top_start + 1 if top_end >= top_start else 0
+        if span_words == 0:
+            pos += 4 + top_len * 4
+            break
+        pos += span_words * 4
+    if pos != limit:
+        raise ValueError("invalid VXL span length")
+    return bytes(out)
+
+
+def _shift_sync_records(data: bytes, z_shift: int) -> bytes:
+    """Translate `(u32 x,u32 y,column)` records without changing their size."""
+    if not z_shift:
+        return bytes(data)
+    out = bytearray()
+    pos = 0
+    while pos < len(data):
+        if pos + 8 > len(data):
+            raise ValueError("truncated map-sync coordinate")
+        out.extend(data[pos:pos + 8])
+        pos += 8
+        start = pos
+        while True:
+            if pos + 4 > len(data):
+                raise ValueError("truncated map-sync span")
+            span_words = data[pos]
+            top_start, top_end = data[pos + 1], data[pos + 2]
+            top_len = top_end - top_start + 1 if top_end >= top_start else 0
+            if span_words == 0:
+                pos += 4 + top_len * 4
+                break
+            pos += span_words * 4
+        out.extend(_shift_vxl_spans(data[start:pos], z_shift))
+    return bytes(out)
 
 
 class WorldManager:
@@ -68,7 +129,13 @@ class WorldManager:
         self._spawn_candidates: dict[int, list[tuple[int, int]]] = {
             TEAM1: [], TEAM2: []
         }
-    
+        # Canonical terrain-version stream consumed by off-thread navigation.
+        # Listeners receive only primitive values and must remain non-blocking.
+        self.topology_version: int = 0
+        self._mutation_listeners: dict[
+            int, Callable[[int, int, int, bool, int, int], None]
+        ] = {}
+        self._next_mutation_listener_id: int = 1
     def load_map(self, name: str) -> bool:
         """Load a VXL map file."""
         # Try with and without extension
@@ -92,12 +159,19 @@ class WorldManager:
             self._full_sync_chunks = None
             self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
+            self.topology_version = 0
             self._surface_cache.clear()
             self._spawn_candidates = {TEAM1: [], TEAM2: []}
             self.map_metadata = load_map_metadata(
                 map_path, str(getattr(self.config, "game_mode", "nor"))
             )
             self._refresh_world()
+            # Candidate discovery performs thousands of terrain probes on
+            # voxel-only maps. Do it while the map is loading (startup or the
+            # transition service's worker thread), never on the first live
+            # respawn tick. Zombie Patient Zero is often the first TEAM2 body
+            # and previously paid a visible ~268 ms lazy-cache hitch.
+            self.prewarm_spawn_candidates()
             logger.info(
                 f"Loaded map: {self.map_name} (file crc32={self.map_file_crc})"
             )
@@ -128,10 +202,12 @@ class WorldManager:
         self._full_sync_chunks = None
         self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
+        self.topology_version = 0
         self._surface_cache.clear()
         self._spawn_candidates = {TEAM1: [], TEAM2: []}
         self.map_metadata = MapMetadata()
         self._refresh_world()
+        self.prewarm_spawn_candidates()
         logger.info("Generated flat map")
 
     def _refresh_world(self):
@@ -160,17 +236,73 @@ class WorldManager:
             return False
         return self.map.can_build(x, y, z)
     
-    def set_block(self, x: int, y: int, z: int, solid: bool, color: int = 0):
-        """Set block at position."""
-        if self.map is None:
-            return
+    @staticmethod
+    def _canonical_vxl_color(color) -> int:
+        """Pack runtime RGB as an opaque Battle Builder VXL colour."""
+        if isinstance(color, (tuple, list)):
+            r, g, b = (int(component) & 0xFF for component in color[:3])
+            rgb = (r << 16) | (g << 8) | b
+        else:
+            rgb = int(color) & 0xFFFFFF
+        # Dynamic blocks use the codec's RGBA alpha encoding: byte 0x80
+        # decodes to client alpha 255. This is also what tuple-coloured
+        # prefabs already use, so live and rejoined blocks shade identically.
+        return 0x80000000 | rgb
+
+    def set_block(self, x: int, y: int, z: int, solid: bool, color: int = 0) -> bool:
+        """Set one block and publish the committed canonical mutation."""
+        x, y, z = int(x), int(y), int(z)
+        if self.map is None or not self._valid_block_position(x, y, z):
+            return False
         if solid:
-            self.map.set_point(x, y, z, color)
+            self.map.set_point(x, y, z, self._canonical_vxl_color(color))
         else:
             self.map.remove_point(x, y, z)
         self._surface_cache.pop((x, y), None)
         self.dirty_columns.add((x, y))
         self.clear_block_damage(x, y, z)
+        published_color = self._canonical_vxl_color(color) & 0xFFFFFF
+        self._publish_mutations(((x, y, z, bool(solid), published_color),))
+        return True
+
+    def subscribe_mutations(
+        self,
+        callback: Callable[[int, int, int, bool, int, int], None],
+    ) -> int:
+        """Register a non-blocking canonical terrain listener.
+
+        Returns a numeric token used by :meth:`unsubscribe_mutations`. Listener
+        exceptions are isolated so navigation/telemetry can never roll back an
+        already-committed gameplay mutation.
+        """
+
+        if not callable(callback):
+            raise TypeError("mutation callback must be callable")
+        token = self._next_mutation_listener_id
+        self._next_mutation_listener_id += 1
+        self._mutation_listeners[token] = callback
+        return token
+
+    def unsubscribe_mutations(self, token: int) -> None:
+        """Remove a listener previously returned by ``subscribe_mutations``."""
+
+        self._mutation_listeners.pop(int(token), None)
+
+    def _publish_mutations(
+        self, changes: tuple[tuple[int, int, int, bool, int], ...]
+    ) -> None:
+        """Advance topology once and notify listeners after a commit."""
+
+        if not changes:
+            return
+        self.topology_version += 1
+        version = self.topology_version
+        for callback in tuple(self._mutation_listeners.values()):
+            for x, y, z, solid, color in changes:
+                try:
+                    callback(x, y, z, solid, color, version)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    logger.exception("Terrain mutation listener failed")
 
     def destroy_block(self, x: int, y: int, z: int):
         """Destroy block at position."""
@@ -318,6 +450,13 @@ class WorldManager:
         if max(local) - min(local) > 2:
             return False
 
+        # Never treat a roof, bridge, or player platform as terrain. VXL land
+        # is solid beneath its surface; air shortly below the chosen surface
+        # proves that this is an elevated structure/cave ceiling.
+        support_end = min(MAP_Z, surface_z + 9)
+        if any(not self.get_solid(x, y, z) for z in range(surface_z + 1, support_end)):
+            return False
+
         # VXL's z axis points downward.  A roof is therefore significantly
         # smaller than the ordinary ground sampled around it.
         if reject_roofs:
@@ -384,6 +523,17 @@ class WorldManager:
         logger.info("TEAM%d has %d spawn columns from %s", team, len(candidates), source)
         return candidates
 
+    def prewarm_spawn_candidates(self) -> None:
+        """Build both team spawn caches outside the gameplay tick.
+
+        This method is synchronous by design. ``load_map`` runs before the
+        startup loops begin and map transitions call it in their existing
+        background preflight worker. Later ``get_spawn_point`` calls still
+        revalidate the selected cell against live block edits.
+        """
+        for team in (TEAM1, TEAM2):
+            self._get_spawn_candidates(team)
+
     @staticmethod
     def _zone_at(zones: list[MapZone], x: int, y: int) -> MapZone | None:
         for zone in zones:
@@ -391,6 +541,24 @@ class WorldManager:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return zone
         return None
+
+    def _fallback_base_candidate(
+        self, team: int, candidates: list[tuple[int, int]]
+    ) -> tuple[int, int] | None:
+        """Choose one stable base centre for a voxel-only stock map."""
+        if not candidates:
+            return None
+        x0, y0, x1, y1 = self._spawn_region(team)
+        center_x = (x0 + x1) / 2.0
+        center_y = (y0 + y1) / 2.0
+        return min(
+            candidates,
+            key=lambda pos: (
+                (pos[0] - center_x) ** 2 + (pos[1] - center_y) ** 2,
+                pos[0],
+                pos[1],
+            ),
+        )
 
     def team_base_anchor(self, team: int) -> Tuple[float, float, float]:
         """Player-coordinate anchor for a team's authored or fallback base."""
@@ -424,8 +592,7 @@ class WorldManager:
                 return self.dry_ground_anchor(x, y)
         candidates = self._get_spawn_candidates(team)
         if candidates:
-            ordered = sorted(candidates)
-            x, y = ordered[len(ordered) // 2]
+            x, y = self._fallback_base_candidate(team, candidates)
             return self.dry_ground_anchor(x, y)
         nominal = (64.0, 256.0) if team == TEAM1 else (448.0, 256.0)
         return self.dry_ground_anchor(*nominal)
@@ -449,8 +616,23 @@ class WorldManager:
         candidates = self._get_spawn_candidates(team)
         if candidates:
             authored_zones = self.map_metadata.spawn_zones.get(team, [])
-            for _ in range(min(24, len(candidates))):
-                x, y = random.choice(candidates)
+            choices = list(candidates)
+            if not authored_zones:
+                base = self._fallback_base_candidate(team, choices)
+                if base is not None:
+                    # Official stock-map coordinates are unavailable, but a
+                    # team still needs one coherent fallback base rather than
+                    # spawning anywhere in a 128x256 region. Keep random spawn
+                    # variation inside a compact 24-block base perimeter.
+                    bx, by = base
+                    clustered = [
+                        (x, y) for x, y in choices
+                        if (x - bx) ** 2 + (y - by) ** 2 <= 24 ** 2
+                    ]
+                    if clustered:
+                        choices = clustered
+            random.shuffle(choices)
+            for x, y in choices:
                 authored_zone = self._zone_at(authored_zones, x, y)
                 if self._safe_spawn_column(
                     x,
@@ -465,10 +647,28 @@ class WorldManager:
                         float(y) + 0.5,
                         float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
                     )
-                candidates.remove((x, y))
+                if (x, y) in candidates:
+                    candidates.remove((x, y))
 
         x0, y0, x1, y1 = self._spawn_region(team)
-        return self.dry_ground_anchor((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        center_x, center_y = (x0 + x1) // 2, (y0 + y1) // 2
+        max_radius = max(x1 - x0, y1 - y0)
+        for radius in range(max_radius + 1):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    x, y = center_x + dx, center_y + dy
+                    if x0 <= x <= x1 and y0 <= y <= y1 and self._safe_spawn_column(x, y):
+                        surface_z = self._get_surface_z(x, y)
+                        return (
+                            float(x) + 0.5,
+                            float(y) + 0.5,
+                            float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
+                        )
+        # A completely invalid team region should be exceptional; retain a
+        # bounded dry anchor as a final availability fallback.
+        return self.dry_ground_anchor(center_x, center_y)
 
     def block_line(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
         """Get all blocks along a line."""
@@ -503,6 +703,9 @@ class WorldManager:
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)
             destroyed.append(pos)
+        self._publish_mutations(
+            tuple((x, y, z, False, 0) for x, y, z in destroyed)
+        )
         return destroyed
 
     # Stock flood fill walks face + edge adjacency (18 neighbors, excluding
@@ -590,7 +793,7 @@ class WorldManager:
             return None
         return self.map.get_chunker()
 
-    def iter_full_sync_chunks(self):
+    def iter_full_sync_chunks(self, snapshot_columns=None):
         """Full-map MapSync payload as MAP_PACKET_SIZE (1024-byte) chunks.
 
         The client's stream-builder consumes ``(u32 x, u32 y, column-spans)``
@@ -613,7 +816,8 @@ class WorldManager:
         or the file can't be walked cleanly (caller falls back to
         get_chunker()).
         """
-        if self._full_sync_chunks is not None:
+        snapshot_columns = set(snapshot_columns or ())
+        if not snapshot_columns and self._full_sync_chunks is not None:
             return self._full_sync_chunks
         raw = self.map_raw_bytes
         if not raw:
@@ -622,6 +826,42 @@ class WorldManager:
         MAP_PACKET_SIZE = 1024  # matches aoslib/vxl.pyx DEF MAP_PACKET_SIZE
         n = len(raw)
         out = bytearray()
+        overlays = {}
+        z_shift = int(getattr(self.map, "source_z_shift", 0)) if self.map is not None else 0
+        if snapshot_columns and self.map is not None:
+            overlay_data = bytes(self.map.serialize_columns(sorted(snapshot_columns)))
+            overlay_pos = 0
+            while overlay_pos < len(overlay_data):
+                record_start = overlay_pos
+                if overlay_pos + 8 > len(overlay_data):
+                    logger.warning("Truncated dirty-column coordinate record")
+                    return None
+                ox, oy = struct.unpack_from("<II", overlay_data, overlay_pos)
+                overlay_pos += 8
+                while True:
+                    if overlay_pos + 4 > len(overlay_data):
+                        logger.warning("Truncated dirty-column span record")
+                        return None
+                    span_words = overlay_data[overlay_pos]
+                    top_start = overlay_data[overlay_pos + 1]
+                    top_end = overlay_data[overlay_pos + 2]
+                    top_len = (
+                        top_end - top_start + 1
+                        if top_end >= top_start else 0
+                    )
+                    if span_words == 0:
+                        record_size = 4 + top_len * 4
+                        if overlay_pos + record_size > len(overlay_data):
+                            logger.warning("Truncated dirty-column final span")
+                            return None
+                        overlay_pos += record_size
+                        break
+                    record_size = span_words * 4
+                    if overlay_pos + record_size > len(overlay_data):
+                        logger.warning("Truncated dirty-column span payload")
+                        return None
+                    overlay_pos += record_size
+                overlays[(ox, oy)] = overlay_data[record_start:overlay_pos]
         pos = 0
         for y in range(MAP_SIZE):
             for x in range(MAP_SIZE):
@@ -640,13 +880,28 @@ class WorldManager:
                         pos += 4 + top_len * 4   # header + top-run colours; last span
                         break
                     pos += span_words * 4        # whole span is span_words 4-byte words
-                out += struct.pack("<II", x, y)
-                out += raw[start:pos]
+                current = overlays.pop((x, y), None)
+                if current is not None:
+                    out += current
+                else:
+                    out += struct.pack("<II", x, y)
+                    out += _shift_vxl_spans(raw[start:pos], z_shift)
         if pos != n:
             logger.warning("Map walker consumed %d/%d bytes of %s — falling back "
                            "to chunker", pos, n, self.map_name)
             return None
+        if overlays:
+            logger.warning(
+                "Dirty-column overlay contained out-of-map coordinates: %s",
+                sorted(overlays)[:8],
+            )
+            return None
         compressed = zlib.compress(bytes(out), 6)
+        if snapshot_columns:
+            return [
+                compressed[i:i + MAP_PACKET_SIZE]
+                for i in range(0, len(compressed), MAP_PACKET_SIZE)
+            ]
         self._full_sync_chunks = [
             compressed[i:i + MAP_PACKET_SIZE]
             for i in range(0, len(compressed), MAP_PACKET_SIZE)
@@ -656,13 +911,17 @@ class WorldManager:
                     len(out), len(compressed), len(self._full_sync_chunks))
         return self._full_sync_chunks
 
-    def serialize_dirty_columns_compressed(self) -> bytes:
+    def serialize_dirty_columns_compressed(self, snapshot_columns=None) -> bytes:
         """Serialize the columns changed since map load, zlib-compressed in
         the same stream format the full-map chunker produces (the client
         applies (x, y, column-spans) records onto its world base)."""
-        if self.map is None or not self.dirty_columns:
+        columns = (
+            set(self.dirty_columns)
+            if snapshot_columns is None else set(snapshot_columns)
+        )
+        if self.map is None or not columns:
             return b""
-        raw = self.map.serialize_columns(sorted(self.dirty_columns))
+        raw = bytes(self.map.serialize_columns(sorted(columns)))
         if not raw:
             return b""
         return zlib.compress(raw, 6)

@@ -10,19 +10,80 @@ from typing import List, Tuple, Optional
 
 
 @dataclass
+class BotConfig:
+    """Bounded isolated bot-runtime configuration."""
+
+    enabled: bool = False
+    population_mode: str = "backfill"
+    fill_target: int = 12
+    max_bots: int = 12
+    reserve_human_slots: int = 2
+    difficulty: str = "mixed"
+    worker: str = "process"
+    perception_hz: float = 10.0
+    decision_hz: float = 8.0
+    path_requests_per_second: int = 24
+    main_thread_budget_ms: float = 0.75
+    seed: int = 0
+    debug_visualization: bool = False
+    configured: bool = False
+
+
+@dataclass
 class ServerConfig:
     """Server configuration container."""
 
     # Server settings
     name: str = "BattleSpades Server"
     port: int = 32887
-    max_players: int = 32
+    max_players: int = 50
     tick_rate: int = 60
 
     # Network settings
     timeout_ms: int = 10000
     max_connections: int = 64
     bandwidth_limit: int = 0
+    network_event_budget: int = 512
+    max_pending_packets: int = 4096
+    packet_drain_budget: int = 4096
+    # Time budget for plugin event callbacks executed from the gameplay tick.
+    # Exceeding the budget skips remaining callbacks for that event; plugin
+    # work is optional and must not steal a 60 Hz frame from authoritative sim.
+    plugin_event_budget_ms: float = 2.0
+    # Terrain packets retained for a joining client between its MapSync
+    # snapshot and first ClientData. Overflow marks the join as unsafe instead
+    # of admitting a desynced player.
+    max_map_mutation_journal: int = 8192
+    # Upper bound for per-frame behavior on_tick calls. Touch/proximity uses a
+    # spatial index and still checks all relevant entities; this prevents a
+    # pathological pile of ticking effects from monopolizing one frame.
+    entity_tick_batch_limit: int = 8192
+    # Synchronous gameplay events are authoritative but still bounded. A large
+    # burst is deferred across ticks; only a completely saturated queue drops
+    # new mode callbacks and increments an operational counter.
+    mode_event_queue_limit: int = 8192
+    mode_event_drain_budget: int = 512
+    # Client-origin terrain edits wait until the movement frame that emitted
+    # them has been simulated.  Bound both retained requests and commit work.
+    world_mutation_queue_limit: int = 2048
+    world_mutation_batch_limit: int = 256
+    world_mutation_cell_budget: int = 4096
+    world_mutation_timeout_ticks: int = 180
+    # Prefab expansion is an authoritative world mutation, but a large KV6
+    # model is deliberately committed over multiple simulation frames. These
+    # limits bound both retained placements and per-tick cell/packet work.
+    prefab_queue_limit: int = 32
+    prefab_cell_batch_limit: int = 16
+    # Reliable mutation packets are primary. This delayed, bounded canonical
+    # replay repairs rare native BlockManager rejection/prediction divergence.
+    terrain_repair_enabled: bool = True
+    terrain_repair_queue_limit: int = 8192
+    # Eight cells every three 60 Hz ticks drains 160 cells/second: enough for
+    # several sustained 27-cell Super Spade footprints while retaining a hard
+    # per-tick/per-recipient send bound.
+    terrain_repair_batch_limit: int = 8
+    terrain_repair_interval_ticks: int = 3
+    terrain_repair_delay_ticks: int = 120
 
     # Game settings
     default_mode: str = "ctf"
@@ -32,6 +93,10 @@ class ServerConfig:
     fall_damage: bool = True
     build_damage: bool = True
     score_limit: int = 10
+    # This value is sent in InitialInfo and must also govern the authoritative
+    # collision list.  A mismatch makes the native client predict through an
+    # ally while the server injects a collision impulse, producing rollback.
+    same_team_collision: bool = False
     # "server": positions come from the server's own physics simulation.
     # "client": echo the client-reported position back (interim mode while
     # the physics engine is being brought to parity with the original game).
@@ -53,6 +118,9 @@ class ServerConfig:
 
     # Dev bots: server-side AI players spawned at startup (0 = none).
     bot_count: int = 0
+    # New isolated runtime. ``configured`` distinguishes an explicit [bots]
+    # table from legacy game.bot_count fixed-population behavior.
+    bots: BotConfig = field(default_factory=BotConfig)
 
     # Map-entity (crate/intel) wire emission. The Entity byte layout was
     # RE-verified against the compiled client (shared/packet.pyx Entity.read/
@@ -76,6 +144,9 @@ class ServerConfig:
     water_damage: bool = True
     fog_color_rgb: Tuple[int, int, int] = (12, 13, 11)
     maps_path: str = "maps"
+    prefabs_path: str = "prefabs"
+    plugins_path: str = "plugins"
+    bans_path: str = "bans.json"
 
     # Admin settings
     admin_password: str = "changeme"
@@ -91,46 +162,73 @@ class ServerConfig:
     log_file: str = "server.log"
     log_console: bool = True
     log_suppress_packets: List[int] = field(default_factory=lambda: [2, 4, 11])
+    # Full packet parsing + hex dumps are reverse-engineering diagnostics, not
+    # ordinary DEBUG logging. Keep them explicitly opt-in so debug messages do
+    # not add serialization work to the gameplay thread.
+    packet_trace: bool = False
+    log_queue_capacity: int = 8192
 
     # Debug
-    debug_parity: bool = True
+    # Physics parity capture is an invasive reverse-engineering tool.  It owns
+    # a UDP socket and can produce large captures, so production must opt in.
+    debug_parity: bool = False
     debug_parity_host: str = "127.0.0.1"
     debug_parity_port: int = 32895
+    # Records contain full movement snapshots; 256 bounds worst-case memory
+    # while leaving ample headroom for short disk stalls.
+    debug_parity_queue_capacity: int = 256
+    debug_parity_sample_hz: float = 10.0
+    debug_parity_flush_interval: float = 1.0
+    debug_parity_flush_batch: int = 128
     # A/B isolation switch: with WorldUpdate broadcasting off, the local
     # player runs on pure client prediction (no server corrections at all).
     # If walking is smooth with this off and chunky with it on, the jank
     # lives in the WorldUpdate/correction loop, not the movement engine.
     broadcast_world_updates: bool = True
-    # Include each client's own row in the WorldUpdates it receives (the
-    # original server did; the client reconciles self-rows against its
-    # movement history at the packet's loop_count). Without self-rows the
-    # client's network anchor never moves past CreatePlayer, and its engine
-    # snaps the player back to spawn on jump (measured 6/6 jumps, two
-    # sessions). Also lets one serialized packet serve every connection.
-    # False = legacy per-connection exclusion.
+    # Retail network cadence: send WorldUpdate every 2 simulation ticks (30 Hz).
+    worldupdate_broadcast_interval: int = 2
+    # The stock client needs a fresh self row. If the recipient's own row is
+    # omitted, its CreatePlayer network_position can stay at spawn and the next
+    # jump may visibly correct back to that stale anchor.
     worldupdate_include_self: bool = True
     # Constant added to the per-recipient self-row stamp (the input tick
     # the server actually consumed for that player) — the client's history
     # indexing convention, latency-invariant. Exact after the one-loop
     # ClientData flag latch: 0 (consumed loop L == movement_history[L]).
     worldupdate_loop_offset: int = 0
-    # Send the recipient's own row every Nth tick (others stream at 60Hz).
-    # The original client runs ~58.5fps against our 60Hz ticks and skips a
-    # loop ~1.5x/sec to stay clock-aligned; self-rows landing on skipped
-    # loops mispair by one frame regardless of stamp, so fewer self-rows =
-    # fewer residual micro-corrections. 2 == the original NETWORK_FPS=30.
+    # Refresh grounded owner anchors at ordinary observer cadence.
     worldupdate_self_row_interval: int = 2
+    # Airborne vertical phase differs slightly across independent client/server
+    # frame clocks. Six ticks was the highest measured cadence that reduced
+    # correction chatter without approaching the 60-entry retail history cap.
+    worldupdate_airborne_self_row_interval: int = 6
+    # WorldUpdate is the retail owner's only jetpack-active signal.  Because
+    # ClientData has no application acknowledgement, ordinary position rows
+    # are withheld after the reliable transition row while GameScene crosses
+    # that asynchronous boundary. Active thrust remains owner-row-free until
+    # release; this frame count is the inactive-transition safety fallback.
+    # Observer rows remain unaffected.
+    jetpack_owner_handoff_input_frames: int = 30
+    # Fuel exhaustion while SPACE remains held changes the native client back
+    # to ballistic movement asynchronously. Keep the owner row quiet through
+    # release, settle, and landing, with this accepted-input safety bound.
+    jetpack_owner_release_handoff_input_frames: int = 600
     # When true, append every self-row's (stamp, position) to
     # logs/selfrow_samples.ndjson for offline reconciliation calibration
     # (join with the client capture via tmp/reconcile_sim.py). Debug only.
     debug_selfrow: bool = False
+    movement_debug_capture: bool = False
+    # Retail ClientData is emitted after the local frame but its movement
+    # buttons may describe the preceding native step. Kept as an explicit A/B
+    # switch until the transition chronology is fully certified (0 or 1).
+    movement_input_latch_frames: int = 1
     # Added to the loop_count we report in ClockSync replies. The client
     # paces its clock from this, so +1 makes it run one tick AHEAD of us:
     # ClientData stamped N then arrives while we are still at N-1 and is
     # guaranteed to be buffered before tick N simulates — without margin,
     # input application is a per-packet race (applied at N or N+1), which
     # no fixed WorldUpdate stamp offset can compensate.
-    clock_sync_loop_bias: int = 1
+    clock_sync_loop_bias: int = 0
 
     @property
     def map_name(self) -> str:
@@ -180,6 +278,44 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.timeout_ms = n.get("timeout_ms", config.timeout_ms)
         config.max_connections = n.get("max_connections", config.max_connections)
         config.bandwidth_limit = n.get("bandwidth_limit", config.bandwidth_limit)
+        config.network_event_budget = max(32, int(n.get(
+            "event_budget", config.network_event_budget)))
+        config.max_pending_packets = max(256, int(n.get(
+            "max_pending_packets", config.max_pending_packets)))
+        config.packet_drain_budget = max(64, int(n.get(
+            "packet_drain_budget", config.packet_drain_budget)))
+        config.plugin_event_budget_ms = max(0.1, float(n.get(
+            "plugin_event_budget_ms", config.plugin_event_budget_ms)))
+        config.max_map_mutation_journal = max(64, int(n.get(
+            "max_map_mutation_journal", config.max_map_mutation_journal)))
+        config.entity_tick_batch_limit = max(64, int(n.get(
+            "entity_tick_batch_limit", config.entity_tick_batch_limit)))
+        config.mode_event_queue_limit = max(64, int(n.get(
+            "mode_event_queue_limit", config.mode_event_queue_limit)))
+        config.mode_event_drain_budget = max(1, int(n.get(
+            "mode_event_drain_budget", config.mode_event_drain_budget)))
+        config.world_mutation_queue_limit = max(64, int(n.get(
+            "world_mutation_queue_limit", config.world_mutation_queue_limit)))
+        config.world_mutation_batch_limit = max(1, int(n.get(
+            "world_mutation_batch_limit", config.world_mutation_batch_limit)))
+        config.world_mutation_cell_budget = max(64, int(n.get(
+            "world_mutation_cell_budget", config.world_mutation_cell_budget)))
+        config.world_mutation_timeout_ticks = max(30, int(n.get(
+            "world_mutation_timeout_ticks", config.world_mutation_timeout_ticks)))
+        config.prefab_queue_limit = min(128, max(1, int(n.get(
+            "prefab_queue_limit", config.prefab_queue_limit))))
+        config.prefab_cell_batch_limit = min(128, max(1, int(n.get(
+            "prefab_cell_batch_limit", config.prefab_cell_batch_limit))))
+        config.terrain_repair_enabled = bool(n.get(
+            "terrain_repair_enabled", config.terrain_repair_enabled))
+        config.terrain_repair_queue_limit = max(64, int(n.get(
+            "terrain_repair_queue_limit", config.terrain_repair_queue_limit)))
+        config.terrain_repair_batch_limit = max(1, int(n.get(
+            "terrain_repair_batch_limit", config.terrain_repair_batch_limit)))
+        config.terrain_repair_interval_ticks = max(1, int(n.get(
+            "terrain_repair_interval_ticks", config.terrain_repair_interval_ticks)))
+        config.terrain_repair_delay_ticks = max(1, int(n.get(
+            "terrain_repair_delay_ticks", config.terrain_repair_delay_ticks)))
 
     if "game" in data:
         g = data["game"]
@@ -189,6 +325,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.friendly_fire = g.get("friendly_fire", config.friendly_fire)
         config.fall_damage = g.get("fall_damage", config.fall_damage)
         config.build_damage = g.get("build_damage", config.build_damage)
+        config.same_team_collision = bool(g.get(
+            "same_team_collision", config.same_team_collision
+        ))
         config.bot_count = int(g.get("bot_count", config.bot_count))
         authority = str(g.get("movement_authority", config.movement_authority)).lower()
         if authority in ("server", "client"):
@@ -196,6 +335,61 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         sync_mode = str(g.get("map_sync_mode", config.map_sync_mode)).lower()
         if sync_mode in ("auto", "full"):
             config.map_sync_mode = sync_mode
+
+    if "bots" in data and isinstance(data["bots"], dict):
+        b = data["bots"]
+        config.bots.configured = True
+        config.bots.enabled = bool(b.get("enabled", config.bots.enabled))
+        population_mode = str(
+            b.get("population_mode", config.bots.population_mode)
+        ).lower()
+        if population_mode in ("backfill", "fixed", "admin"):
+            config.bots.population_mode = population_mode
+        config.bots.fill_target = max(
+            0, int(b.get("fill_target", config.bots.fill_target))
+        )
+        config.bots.max_bots = max(
+            0, int(b.get("max_bots", config.bots.max_bots))
+        )
+        config.bots.reserve_human_slots = max(
+            0,
+            int(b.get("reserve_human_slots", config.bots.reserve_human_slots)),
+        )
+        difficulty = str(b.get("difficulty", config.bots.difficulty)).lower()
+        if difficulty in ("casual", "normal", "hard", "mixed"):
+            config.bots.difficulty = difficulty
+        # The architecture intentionally supports only an isolated process.
+        config.bots.worker = "process"
+        config.bots.perception_hz = min(
+            30.0,
+            max(1.0, float(b.get("perception_hz", config.bots.perception_hz))),
+        )
+        config.bots.decision_hz = min(
+            config.bots.perception_hz,
+            max(1.0, float(b.get("decision_hz", config.bots.decision_hz))),
+        )
+        config.bots.path_requests_per_second = max(
+            1,
+            int(
+                b.get(
+                    "path_requests_per_second",
+                    config.bots.path_requests_per_second,
+                )
+            ),
+        )
+        config.bots.main_thread_budget_ms = max(
+            0.1,
+            float(
+                b.get(
+                    "main_thread_budget_ms",
+                    config.bots.main_thread_budget_ms,
+                )
+            ),
+        )
+        config.bots.seed = int(b.get("seed", config.bots.seed))
+        config.bots.debug_visualization = bool(
+            b.get("debug_visualization", config.bots.debug_visualization)
+        )
 
     if "teams" in data:
         t = data["teams"]
@@ -223,6 +417,7 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.map_size_z = w.get("map_size_z", config.map_size_z)
         config.water_level = w.get("water_level", config.water_level)
         config.water_damage = w.get("water_damage", config.water_damage)
+        config.maps_path = w.get("maps_path", config.maps_path)
 
     # Per-mode overlays: [modes.tdm], [modes.ctf], ... Each table's keys
     # override that mode's defaults (score_limit, time_limit, kill_points...).
@@ -241,6 +436,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.log_level = lg.get("level", config.log_level)
         config.log_file = lg.get("file", config.log_file)
         config.log_console = lg.get("console", config.log_console)
+        config.packet_trace = bool(lg.get("packet_trace", config.packet_trace))
+        config.log_queue_capacity = max(256, int(lg.get(
+            "queue_capacity", config.log_queue_capacity)))
         if "suppress_packets" in lg:
             config.log_suppress_packets = lg["suppress_packets"]
 
@@ -249,15 +447,46 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.debug_parity = dbg.get("debug_parity", config.debug_parity)
         config.debug_parity_host = dbg.get("debug_parity_host", config.debug_parity_host)
         config.debug_parity_port = dbg.get("debug_parity_port", config.debug_parity_port)
+        config.debug_parity_queue_capacity = max(64, int(dbg.get(
+            "debug_parity_queue_capacity", config.debug_parity_queue_capacity)))
+        config.debug_parity_sample_hz = max(0.1, min(10.0, float(dbg.get(
+            "debug_parity_sample_hz", config.debug_parity_sample_hz))))
+        config.debug_parity_flush_interval = max(0.1, float(dbg.get(
+            "debug_parity_flush_interval", config.debug_parity_flush_interval)))
+        config.debug_parity_flush_batch = max(1, int(dbg.get(
+            "debug_parity_flush_batch", config.debug_parity_flush_batch)))
         config.broadcast_world_updates = dbg.get(
             "broadcast_world_updates", config.broadcast_world_updates)
+        config.worldupdate_broadcast_interval = max(1, int(dbg.get(
+            "worldupdate_broadcast_interval", config.worldupdate_broadcast_interval)))
         config.worldupdate_include_self = dbg.get(
             "worldupdate_include_self", config.worldupdate_include_self)
         config.worldupdate_loop_offset = int(dbg.get(
             "worldupdate_loop_offset", config.worldupdate_loop_offset))
         config.worldupdate_self_row_interval = max(1, int(dbg.get(
             "worldupdate_self_row_interval", config.worldupdate_self_row_interval)))
+        config.worldupdate_airborne_self_row_interval = max(1, int(dbg.get(
+            "worldupdate_airborne_self_row_interval",
+            config.worldupdate_airborne_self_row_interval,
+        )))
+        config.jetpack_owner_handoff_input_frames = max(0, min(120, int(
+            dbg.get(
+                "jetpack_owner_handoff_input_frames",
+                config.jetpack_owner_handoff_input_frames,
+            )
+        )))
+        config.jetpack_owner_release_handoff_input_frames = max(0, min(1200, int(
+            dbg.get(
+                "jetpack_owner_release_handoff_input_frames",
+                config.jetpack_owner_release_handoff_input_frames,
+            )
+        )))
         config.debug_selfrow = bool(dbg.get("debug_selfrow", config.debug_selfrow))
+        config.movement_debug_capture = bool(dbg.get(
+            "movement_debug_capture", config.movement_debug_capture))
+        config.movement_input_latch_frames = max(0, min(1, int(dbg.get(
+            "movement_input_latch_frames", config.movement_input_latch_frames
+        ))))
         config.clock_sync_loop_bias = int(dbg.get(
             "clock_sync_loop_bias", config.clock_sync_loop_bias))
 

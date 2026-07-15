@@ -22,6 +22,8 @@ class EntityBehavior:
 
     touch_radius: float = 0.0     # 0 => registry skips the proximity test
     takes_damage: bool = False    # gate for on_damage routing
+    hit_radius: float = 0.0       # 0 => not considered by authoritative hitscan
+    hit_center_offset = (0.0, 0.0, 0.0)
 
     def on_tick(self, ent, dt, ctx) -> None:
         pass
@@ -31,6 +33,38 @@ class EntityBehavior:
 
     def on_damage(self, ent, amount, source, ctx) -> None:
         pass
+
+    def get_hit_center(self, ent):
+        """World-space center used by hitscan and explosion damage."""
+        ox, oy, oz = self.hit_center_offset
+        return (float(ent.x) + ox, float(ent.y) + oy, float(ent.z) + oz)
+
+
+class DamageableEntityBehavior(EntityBehavior):
+    """Reusable health/despawn lifecycle for placed client entities.
+
+    Health lives on the behavior because ``MapEntity`` is deliberately the
+    byte-stable wire DTO.  Each placed damageable receives its own behavior
+    instance, so health can never leak between entities.
+    """
+
+    takes_damage = True
+    hit_radius = 0.75
+    hit_center_offset = (0.0, 0.0, 0.5)
+
+    def __init__(self, health: float):
+        self.health = max(0.0, float(health))
+
+    def on_damage(self, ent, amount, source, ctx) -> None:
+        damage = max(0.0, float(amount))
+        if damage <= 0.0 or not ent.alive:
+            return
+        self.health = max(0.0, self.health - damage)
+        if self.health <= 0.0:
+            self.on_destroyed(ent, source, ctx)
+
+    def on_destroyed(self, ent, source, ctx) -> None:
+        _remove_entity(ent, ctx)
 
 
 class PickupCrateBehavior(EntityBehavior):
@@ -85,6 +119,9 @@ class GraveBehavior(EntityBehavior):
         self.crater_radius = 1
         self.kill_type = int(kill_type)
         self.force_destroy = False
+        import shared.constants as C
+        self.knockback_min = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MIN", 0.5))
+        self.knockback_max = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MAX", 1.0))
         self._detonate_at = None
 
     def on_tick(self, ent, dt, ctx) -> None:
@@ -95,7 +132,7 @@ class GraveBehavior(EntityBehavior):
             _detonate_deployable(self, ent, ctx)
 
 
-class MedpackBehavior(EntityBehavior):
+class MedpackBehavior(DamageableEntityBehavior):
     """A medic's placed medpack: heals teammates who step on it, for a limited
     number of uses, then despawns.
 
@@ -106,7 +143,12 @@ class MedpackBehavior(EntityBehavior):
 
     touch_radius = 3.0
 
-    def __init__(self, team: int, heal_amount: int = 100, uses: int = 3):
+    hit_radius = 0.75
+    hit_center_offset = (0.0, 0.0, 0.5)
+
+    def __init__(self, team: int, heal_amount: int = 100, uses: int = 3,
+                 health: float = 1.0):
+        super().__init__(health)
         self.team = int(team)
         self.heal_amount = int(heal_amount)
         self.uses = int(uses)
@@ -119,9 +161,7 @@ class MedpackBehavior(EntityBehavior):
         player.heal(self.heal_amount)
         self.uses -= 1
         if self.uses <= 0:
-            ent.alive = False
-            if ctx.destroy is not None:
-                ctx.destroy(ent.entity_id)
+            _remove_entity(ent, ctx)
         return True
 
 
@@ -131,7 +171,8 @@ class TimedExplosiveBehavior(EntityBehavior):
     (crater + player damage)."""
 
     def __init__(self, thrower_id, fuse, damage, block_damage, crater_radius,
-                 kill_type, blast_radius=16.0, force_destroy=True):
+                 kill_type, blast_radius=16.0, force_destroy=True,
+                 knockback_min=None, knockback_max=None):
         self.thrower_id = int(thrower_id)
         self.fuse = float(fuse)
         self.damage = float(damage)
@@ -140,6 +181,15 @@ class TimedExplosiveBehavior(EntityBehavior):
         self.blast_radius = float(blast_radius)
         self.force_destroy = bool(force_destroy)
         self.kill_type = int(kill_type)
+        import shared.constants as C
+        self.knockback_min = float(
+            getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MIN", 0.1)
+            if knockback_min is None else knockback_min
+        )
+        self.knockback_max = float(
+            getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MAX", 0.15)
+            if knockback_max is None else knockback_max
+        )
         self._detonate_at = None
 
     def on_tick(self, ent, dt, ctx) -> None:
@@ -156,7 +206,8 @@ class ProximityMineBehavior(EntityBehavior):
 
     def __init__(self, thrower_id, team, damage, block_damage, crater_radius,
                  kill_type, trigger_radius=2.5, arm_delay=1.0,
-                 blast_radius=16.0, force_destroy=True, detection_layers=3):
+                 blast_radius=16.0, force_destroy=True, detection_layers=3,
+                 knockback_min=None, knockback_max=None):
         self.thrower_id = int(thrower_id)
         self.team = int(team)
         self.damage = float(damage)
@@ -168,6 +219,15 @@ class ProximityMineBehavior(EntityBehavior):
         self.trigger_radius = float(trigger_radius)
         self.arm_delay = float(arm_delay)
         self.detection_layers = int(detection_layers)
+        import shared.constants as C
+        self.knockback_min = float(
+            getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MIN", 0.75)
+            if knockback_min is None else knockback_min
+        )
+        self.knockback_max = float(
+            getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MAX", 0.75)
+            if knockback_max is None else knockback_max
+        )
         self._armed_at = None
 
     def on_tick(self, ent, dt, ctx) -> None:
@@ -203,11 +263,15 @@ class ProximityMineBehavior(EntityBehavior):
                 return
 
 
-class RemoteChargeBehavior(EntityBehavior):
+class RemoteChargeBehavior(DamageableEntityBehavior):
     """Placed C4: inert until its owner sends DetonateC4."""
 
+    hit_radius = 0.65
+
     def __init__(self, thrower_id, damage=300.0, block_damage=7.0,
-                 crater_radius=2, kill_type=36, blast_radius=8.0):
+                 crater_radius=2, kill_type=36, blast_radius=8.0,
+                 health=1.0):
+        super().__init__(health)
         self.thrower_id = int(thrower_id)
         self.damage = float(damage)
         self.block_damage = float(block_damage)
@@ -215,20 +279,52 @@ class RemoteChargeBehavior(EntityBehavior):
         self.kill_type = int(kill_type)
         self.blast_radius = float(blast_radius)
         self.force_destroy = True
+        import shared.constants as C
+        self.knockback_min = float(getattr(C, "C4_EXPLOSION_KNOCKBACK_MIN", 0.1))
+        self.knockback_max = float(getattr(C, "C4_EXPLOSION_KNOCKBACK_MAX", 0.15))
 
     def detonate(self, ent, ctx) -> None:
         if ent.alive:
             _detonate_deployable(self, ent, ctx)
 
+    def get_hit_center(self, ent):
+        # PlaceC4 coordinates name the supporting voxel.  ``face`` selects the
+        # exposed face on which the model is centered (client C4Weapon ghost
+        # transform, recovered Python source).
+        offsets = {
+            0: (0.0, 0.5, 0.5),
+            1: (1.0, 0.5, 0.5),
+            2: (0.5, 0.0, 0.5),
+            3: (0.5, 1.0, 0.5),
+            4: (0.5, 0.5, 0.0),
+            5: (0.5, 0.5, 1.0),
+        }
+        ox, oy, oz = offsets.get(int(ent.face), (0.5, 0.5, 0.5))
+        return (float(ent.x) + ox, float(ent.y) + oy, float(ent.z) + oz)
 
-class RadarStationBehavior(EntityBehavior):
+    def on_destroyed(self, ent, source, ctx) -> None:
+        owner = ctx.server.players.get(ent.player_id) if ctx.server else None
+        if owner is not None:
+            owner._c4_entity_ids = [
+                entity_id for entity_id in
+                list(getattr(owner, "_c4_entity_ids", []) or [])
+                if int(entity_id) != int(ent.entity_id)
+            ]
+        super().on_destroyed(ent, source, ctx)
+
+
+class RadarStationBehavior(DamageableEntityBehavior):
     """Short-lived Scout radar station.
 
     Visibility is reference-counted by the server so overlapping stations do
     not hide the enemy team when only one of them expires.
     """
 
-    def __init__(self, team, lifetime=250.0):
+    hit_radius = 0.9
+    hit_center_offset = (0.5, 0.5, 0.55)
+
+    def __init__(self, team, lifetime=250.0, health=45.0):
+        super().__init__(health)
         self.team = int(team)
         self.lifetime = float(lifetime)
         self._expires_at = None
@@ -239,20 +335,25 @@ class RadarStationBehavior(EntityBehavior):
             return
         if ctx.now < self._expires_at:
             return
+        self.on_destroyed(ent, None, ctx)
+
+    def on_destroyed(self, ent, source, ctx) -> None:
         if ctx.server is not None:
             ctx.server._radar_station_removed(self.team)
-        ent.alive = False
-        if ctx.destroy is not None:
-            ctx.destroy(ent.entity_id)
-        registry = getattr(ctx.server, "entity_registry", None) if ctx.server else None
-        if registry is not None:
-            registry.remove(ent.entity_id)
+            owner = ctx.server.players.get(ent.player_id)
+            if (owner is not None
+                    and int(getattr(owner, "_radar_entity_id", -1)) == int(ent.entity_id)):
+                owner._radar_entity_id = None
+        super().on_destroyed(ent, source, ctx)
 
 
 def _detonate_deployable(behavior, ent, ctx) -> None:
     """Shared detonation for timed/proximity deployables: run the server blast,
     despawn the entity, and tell clients (removes the model + FX)."""
     thrower = ctx.server.players.get(behavior.thrower_id) if ctx.server else None
+    # Mark dead before applying blast damage so the source charge cannot route
+    # its own explosion back through on_damage and recursively destroy itself.
+    ent.alive = False
     if ctx.server is not None:
         ctx.server._apply_blast(
             ent.x, ent.y, ent.z, behavior.damage, behavior.block_damage,
@@ -260,13 +361,26 @@ def _detonate_deployable(behavior, ent, ctx) -> None:
             crater_radius=behavior.crater_radius,
             force_destroy=getattr(behavior, "force_destroy", True),
             blast_radius=getattr(behavior, "blast_radius", 16.0),
+            knockback_min=getattr(behavior, "knockback_min", 0.0),
+            knockback_max=getattr(behavior, "knockback_max", 0.0),
         )
-    ent.alive = False
     if ctx.destroy is not None:
         ctx.destroy(ent.entity_id)
     # One-shot entities must leave the registry as well as the clients.  A
     # dead entry with no respawn_at otherwise leaks forever and eventually
     # exhausts the uint16 entity id space.
+    registry = getattr(ctx.server, "entity_registry", None) if ctx.server else None
+    if registry is not None:
+        registry.remove(ent.entity_id)
+
+
+def _remove_entity(ent, ctx) -> None:
+    """Idempotently remove a one-shot placed entity from server and clients."""
+    if not ent.alive:
+        return
+    ent.alive = False
+    if ctx.destroy is not None:
+        ctx.destroy(ent.entity_id)
     registry = getattr(ctx.server, "entity_registry", None) if ctx.server else None
     if registry is not None:
         registry.remove(ent.entity_id)

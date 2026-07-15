@@ -4,16 +4,44 @@
 [server]
 name = "BattleSpades Server"
 port = 27015
-max_players = 32
+max_players = 50
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 
 [network]
 timeout_ms = 10000
 max_connections = 64
 bandwidth_limit = 0  # 0 = unlimited
+event_budget = 512
+max_pending_packets = 4096
+packet_drain_budget = 4096
+plugin_event_budget_ms = 2.0
+max_map_mutation_journal = 8192
+entity_tick_batch_limit = 8192
+mode_event_queue_limit = 8192
+mode_event_drain_budget = 512
+# Client block edits commit after the matching movement frame, never during
+# tick-start packet draining. These caps keep malicious/flooded edits bounded.
+world_mutation_queue_limit = 2048
+world_mutation_batch_limit = 256
+world_mutation_cell_budget = 4096
+world_mutation_timeout_ticks = 180
+# Large KV6 prefabs reserve their stock immediately, then commit through this
+# bounded queue so model expansion cannot monopolize a 60 Hz simulation tick.
+prefab_queue_limit = 32
+prefab_cell_batch_limit = 16
+# Delayed canonical reassertion of rejected or cancelled client predictions.
+# Successful builds, prefabs, digs, and collapses already have one reliable
+# gameplay packet and must not be enrolled here: replaying them runs native
+# placement/damage particle callbacks twice.
+terrain_repair_enabled = true
+terrain_repair_queue_limit = 8192
+terrain_repair_batch_limit = 8
+terrain_repair_interval_ticks = 3
+terrain_repair_delay_ticks = 120
 
 [game]
-default_mode = "tdm"
+same_team_collision = false
+default_mode = "zombie"
 # Server-side dev AI players (0 = none). Bots fight autonomously (TDM
 # kill->score->respawn). The old "client crashes rendering non-local
 # players" was an IDENTITY bug (StateData.player_id was always 0) — fixed
@@ -35,6 +63,24 @@ friendly_fire = false
 fall_damage = true
 build_damage = true
 
+[bots]
+# Advanced server-owned bots run decisions/pathfinding in a supervised child
+# process. The authoritative 60 Hz server only snapshots state and applies
+# validated, expiring intentions.
+enabled = true
+population_mode = "backfill"
+fill_target = 12
+max_bots = 12
+reserve_human_slots = 2
+difficulty = "mixed"
+worker = "process"
+perception_hz = 10
+decision_hz = 8
+path_requests_per_second = 24
+main_thread_budget_ms = 0.75
+seed = 0
+debug_visualization = false
+
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.
 #   score_limit  — win threshold (TDM: team kills; CTF: intel captures)
@@ -48,6 +94,18 @@ headshot_bonus = 1     # extra team point for a headshot kill
 [modes.ctf]
 score_limit = 10       # intel captures to win
 time_limit = 2400      # 40-minute round clock
+
+[modes.cctf]
+score_limit = 10       # classic intel captures to win
+time_limit = 5400      # shipped Classic CTF length (45 minutes per side)
+intel_auto_return = false
+
+[modes.vip]
+score_limit = 3        # gangster sub-rounds needed to win the match
+time_limit = 900       # 15-minute full-match clock
+selection_delay = 10.0 # retail delay before one boss per team is selected
+round_intermission = 7.0
+sudden_death = true    # dead VIP team loses respawns until eliminated
 
 [teams]
 # Team names are STRING-TABLE IDS the client localizes (TEAM1_COLOR -> "Blue"),
@@ -78,47 +136,66 @@ password = "changeme"
 log_commands = true
 
 [logging]
-level = "DEBUG"
+level = "INFO"
 file = "server.log"
 console = true
+packet_trace = false
+queue_capacity = 8192
 suppress_packets = [2, 4, 11, 56, 57]  # Packet IDs to hide in debug logs (2 = WorldUpdate, 4 = ClientData, 11 = SetColor)
 
 [debug]
-debug_parity = true
+# One-frame retail button chronology currently used by production. Validation
+# can override this with --movement-input-latch 0 for controlled A/B runs.
+movement_input_latch_frames = 1
+# Reverse-engineering capture is intentionally OFF in production. It owns a
+# localhost UDP transport and writes large physics snapshots when enabled.
+debug_parity = false
 debug_parity_host = "127.0.0.1"
 debug_parity_port = 32895
+debug_parity_queue_capacity = 256
+debug_parity_sample_hz = 10.0
+debug_parity_flush_interval = 1.0
+debug_parity_flush_batch = 128
 # A/B test: false = no WorldUpdate broadcasts (pure client-side prediction,
 # no corrections). If walking is smooth with false and chunky with true,
 # the jank is in the WorldUpdate/correction loop.
 broadcast_world_updates = true
-# Self-row policy. MUST be true (measured 6/6, then re-reproduced 2026-06-13):
-#   true (REQUIRED): the client receives its own row each tick, which keeps its
-#     reconciliation anchor (network_position / network_position_loop_count)
-#     fresh and tracking the server. Walking has a minor residual ~0.13-block
-#     ADJUST chop from the client's game-loop rate (~60.7Hz) vs our 60Hz, but
-#     movement is correct.
-#   false (BROKEN ??? do not use): with no self-row the anchor stays at the
-#     CreatePlayer spawn with loop_count 0. The client then predicts forward,
-#     but the first jump fires apply_player_network_correction, which looks up
-#     movement_history[0], finds nothing, and HARD-SNAPS to network_position =
-#     spawn. Reproduced cleanly: walk 18 blocks, jump -> teleport to spawn.
-#     (The contract's "no network_position_updated -> no correction" reading
-#     missed that spawn/CreatePlayer arms the anchor; empirical wins.)
+# Retail WorldUpdate cadence: 2 ticks at 60 Hz = 30 Hz observer replication.
+worldupdate_broadcast_interval = 2
+# Local-player rows are required. Without a fresh self row, the compiled client
+# keeps its CreatePlayer network_position at spawn; pressing jump can then run
+# its correction path against that stale anchor and visibly roll the player back
+# even when the native SNAP/ADJUST counters stay quiet.
 worldupdate_include_self = true
 # (Only used when worldupdate_include_self = true.) Constant added to the
 # per-recipient self-row stamp = player.last_applied_input_loop (the consumed
-# input's loop_count). Stock ClientData flags are latched for the following
-# physics loop, making consumed loop L match movement_history[L] exactly.
+# input's loop_count). Stock ClientData buttons use the observed-frame latch,
+# while native yaw capture shows orientation already belongs to the current
+# movement-history label. Keep the stamp itself unshifted.
 worldupdate_loop_offset = 0
+# Refresh the local correction anchor with every 30 Hz WorldUpdate. Wider
+# intervals reduced soft correction chatter but intermittently let jump reuse a
+# stale anchor and visibly roll back.
 worldupdate_self_row_interval = 2
+# Airborne anchors stay within the retail 60-entry history while avoiding the
+# correction replay that a 30 Hz vertical phase mismatch causes.
+worldupdate_airborne_self_row_interval = 6
+# Retail never acknowledges applying the jetpack-active WorldUpdate. Suppress
+# only the owner's ordinary correction row while thrust is active; observers
+# and authoritative hitboxes keep receiving the server snapshot at 30 Hz.
+# This accepted-ClientData bound remains the inactive-transition fallback.
+jetpack_owner_handoff_input_frames = 30
+# Exhaustion can leave SPACE held while the owner falls. Resume after release,
+# settle, and ground contact; this cap prevents an indefinite local-row holdoff.
+jetpack_owner_release_handoff_input_frames = 600
 # Log every self-row's (stamp, position) to logs/selfrow_samples.ndjson so the
 # offline simulator (tmp/reconcile_sim.py) can replicate the client's exact
 # reconciliation and report the snap/adjust/no-op distribution. Turn ON for one
 # 12s walk to deterministically calibrate worldupdate_loop_offset on a given
 # client, then OFF for normal play.
 debug_selfrow = false
+movement_debug_capture = false
 # Client clock margin knob. MEASURED: +1 is silently ignored by the client
 # (under its resync threshold) ??? keep 0; determinism comes from
 # INPUT_DELAY_TICKS=1 in server/player.py instead.
 clock_sync_loop_bias = 0
-

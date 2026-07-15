@@ -115,10 +115,18 @@ async def handle_command(server: 'BattleSpadesServer', player: 'Player', message
         await command.handler(context)
         
         if server.config.log_commands:
-            logger.info(f"Command: {player.name} used /{cmd_name} {raw_args}")
+            # Never write credentials to the operational log. Use the
+            # canonical command name so the /login alias is redacted too.
+            logged_args = "<redacted>" if command.name == "admin" else raw_args
+            logger.info(
+                "Command: %s used /%s %s",
+                player.name,
+                cmd_name,
+                logged_args,
+            )
     except Exception as e:
-        logger.error(f"Command error: {cmd_name} - {e}", exc_info=True)
-        await send_message(server, player, f"Command error: {e}")
+        logger.error("Command error: %s - %s", cmd_name, e, exc_info=True)
+        await send_message(server, player, "Command failed; see server log")
 
 
 async def send_message(server: 'BattleSpadesServer', player: 'Player', message: str):

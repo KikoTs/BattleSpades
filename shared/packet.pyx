@@ -2409,9 +2409,9 @@ cdef class PaintBlockPacket(Loader): # Fixed
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
         write_color(writer, self.color)
 
 cdef class LocalisedMessage(Loader): # Fixed
@@ -2722,7 +2722,12 @@ cdef class ClientData(Loader): # Fixed
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.player_id = reader.read_byte()
+        # Retail overloads bit 7 of this byte as palette-open state.  Player
+        # identifiers occupy only the low seven bits (confirmed against the
+        # stock Python 2 shared.packet.pyd with raw byte 0x83 -> player 3).
+        cdef int raw_player_id = reader.read_byte()
+        self.palette_enabled = (raw_player_id & 0x80) != 0
+        self.player_id = raw_player_id & 0x7F
         self.tool_id = reader.read_byte()
         # NEARLY LIKE ORIGINAL, BUT NOT EXACTLY
         # Use special orientation conversion for 16-bit values
@@ -2875,7 +2880,7 @@ cdef class InitialInfo(Loader): # Should be working :D
         self.enable_spectator = reader.read_byte()
         self.exposed_teams_always_on_minimap = reader.read_byte()
         self.enable_numeric_hp = reader.read_byte()
-        reader.read_byte()  # texture_skin placeholder/padding
+        self.texture_skin = reader.read_string()
         self.beach_z_modifiable = reader.read_byte()
         self.enable_minimap_height_icons = reader.read_byte()
         self.enable_fall_on_water_damage = reader.read_byte()
@@ -2952,7 +2957,7 @@ cdef class InitialInfo(Loader): # Should be working :D
         writer.write_byte(self.enable_spectator)
         writer.write_byte(self.exposed_teams_always_on_minimap)
         writer.write_byte(self.enable_numeric_hp)
-        writer.write_byte(0x00)  # texture_skin placeholder/padding
+        writer.write_string(self.texture_skin)
         writer.write_byte(self.beach_z_modifiable)
         writer.write_byte(self.enable_minimap_height_icons)
         writer.write_byte(self.enable_fall_on_water_damage)
@@ -3405,12 +3410,17 @@ cdef class WorldUpdate(Loader): # Fixed
         writer.write_short(len(self.player_updates))
         
         for pid, data in self.player_updates.items():
-            # data: (..., state, tool, jetpack_fuel,
+            # data: (..., state, tool, pickup, jetpack_fuel,
             #        spawn_protection_timer, weapon_deployment_yaw)
             pos, orient, vel, ping, pong, hp, inp, action, state_flags, tool = data[:10]
-            if len(data) >= 13:
+            if len(data) >= 14:
+                pickup = int(data[10])
+                jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw = data[11:14]
+            elif len(data) >= 13:
+                pickup = 0xFF
                 jetpack_fuel, spawn_protection_timer, weapon_deployment_yaw = data[10:13]
             else:
+                pickup = 0xFF
                 jetpack_fuel = spawn_protection_timer = weapon_deployment_yaw = 0.0
             
             writer.write_byte(pid)
@@ -3451,7 +3461,7 @@ cdef class WorldUpdate(Loader): # Fixed
 
             # Pickup id: 0xFF (-1) = "no pickup". Sending 0 (or any id not in
             # the client's PICKUPS table) crashes the minimap. See read().
-            writer.write_byte(0xFF)
+            writer.write_byte(pickup)
             writer.write_short(tofixed(jetpack_fuel))
             writer.write_short(tofixed(spawn_protection_timer))
             writer.write_short(tofixed(weapon_deployment_yaw))

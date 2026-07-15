@@ -22,8 +22,10 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from game_console import GameConsole, ConsoleError  # noqa: E402
+import shared.constants as C  # noqa: E402
 
 TEAM1 = 2
 TEAM2 = 3
@@ -50,6 +52,16 @@ def main() -> int:
     ap.add_argument("--server", default="127.0.0.1:27015")
     ap.add_argument("--team", type=int, default=TEAM1, help="2=team1 3=team2")
     ap.add_argument("--class-id", type=int, default=0)
+    ap.add_argument(
+        "--loadout-tool",
+        type=int,
+        action="append",
+        default=[],
+        help=(
+            "select this allowed tool in its class slot before spawning; may "
+            "be repeated"
+        ),
+    )
     ap.add_argument("--wait", type=float, default=120.0,
                     help="seconds to wait for the game console to come up")
     ap.add_argument("--console-port", type=int, default=32896,
@@ -68,7 +80,8 @@ def main() -> int:
     print("checking connection state")
 
     connected = console.run(
-        "bool(manager.client) and not manager.client.disconnected")
+        "bool(getattr(manager, 'client', None)) and "
+        "not manager.client.disconnected")
     if connected != "True":
         print(f"not connected (client={connected}); starting connect to {args.server}")
         console.run(
@@ -79,7 +92,8 @@ def main() -> int:
 
     print("waiting for map transfer to finish...")
     wait_for(console,
-             "bool(manager.client) and manager.client.map_percentage >= 1.0",
+             "bool(getattr(manager, 'client', None)) and "
+             "manager.client.map_percentage >= 1.0",
              timeout=90.0, what="map transfer")
 
     # The transfer percentage covers the NETWORK stream only; the client
@@ -113,6 +127,14 @@ def main() -> int:
              timeout=60.0, what="prefab loading", interval=0.05)
 
     print(f"selecting team {args.team} and class {args.class_id}; creating player")
+    loadout_tools = tuple(dict.fromkeys(int(tool) for tool in args.loadout_tool))
+    class_items = C.CLASS_ITEMS.get(int(args.class_id), {})
+    loadout_replacements = tuple(
+        (tuple(int(option) for option in options), requested)
+        for requested in loadout_tools
+        for options in class_items.values()
+        if requested in options
+    )
     spawn_code = (
         "scene_g = manager.game_scene\n"
         f"team = scene_g.teams[{args.team}]\n"
@@ -121,6 +143,12 @@ def main() -> int:
         f"gc = GameClass(manager, {args.class_id}, manager.disabled_tools, "
         f"manager.movement_speed_multipliers[{args.class_id}], manager.config, "
         "manager.enable_fall_on_water_damage)\n"
+        f"_join_replacements = {loadout_replacements!r}\n"
+        "for _join_options, _join_tool in _join_replacements:\n"
+        "        for _join_old in _join_options:\n"
+        "            if _join_old in gc.loadout:\n"
+        "                gc.loadout[gc.loadout.index(_join_old)] = _join_tool\n"
+        "                break\n"
         "scene_g.class_selected(gc)\n"
         "scene_g.create_player(gc)\n"
         "from aoslib.scenes.main.gameScene import GameScene\n"

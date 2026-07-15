@@ -13,6 +13,7 @@ from shared.packet import (
     ExistingPlayer,
     NewPlayerConnection,
     SetClassLoadout,
+    SetColor,
     SetHP,
 )
 
@@ -93,6 +94,11 @@ def test_team_mapping_helpers():
     assert internal_team_to_wire(99) == DEFAULT_WIRE_TEAM
 
 
+def test_player_default_block_color_matches_retail_neutral_gray():
+    player = Player(0, "Builder", TEAM1, C.RIFLE_TOOL, None)
+    assert player.block_color == 0x707070
+
+
 def test_pre_join_loadout_is_cached():
     server = DummyServer()
     connection = make_connection(server)
@@ -107,13 +113,84 @@ def test_pre_join_loadout_is_cached():
 
     asyncio.run(connection.handle_pre_join_packet(bytes(packet.generate())))
 
+    from server.class_selection import normalize_class_selection
+
+    expected = normalize_class_selection(
+        packet.class_id, packet.loadout, packet.prefabs, packet.ugc_tools
+    )
     assert connection.pending_class_id == 0
-    assert connection.pending_loadout == [5, 1, 8, 13]
+    assert connection.pending_loadout == list(expected.loadout)
+    assert connection.pending_prefabs == list(expected.prefabs)
+    assert connection.pending_ugc_tools == list(expected.ugc_tools)
+
+
+def test_pre_join_loadout_accepts_retail_omitted_zero_ugc_tail():
+    server = DummyServer()
+    connection = make_connection(server)
+    # id, player, class, instant, loadout count/items, prefab count.  The
+    # retail build intentionally ends here instead of writing ugc_count=0.
+    data = bytes([SetClassLoadout.id, 255, 12, 0, 4, 5, 0, 7, 29, 0])
+
+    asyncio.run(connection.handle_pre_join_packet(data))
+
+    assert connection.pending_class_id == int(C.CLASS_ENGINEER)
+    assert int(C.SNOWBLOWER_TOOL) in connection.pending_loadout
+    assert connection.pending_ugc_tools == []
+
+
+def test_compressed_retail_loadout_reaches_spawn_with_three_prefabs_intact():
+    """Exercise prefix handling, stock LZF decoding, and packet-13 caching."""
+
+    server = DummyServer()
+    connection = make_connection(server)
+    compressed = bytes.fromhex(
+        "1f0dff0c000c0500073a40171e191a1e1617037072656661625f63616c74726f70"
+        "0000a00e097375706572746f776572c0110075201f0961626172726965720000"
+    )
+
+    asyncio.run(connection.on_receive(b"\x31" + compressed))
+
     assert connection.pending_prefabs == [
+        "prefab_caltrop",
+        "prefab_supertower",
         "prefab_ultrabarrier",
-        "prefab_superbarrier",
     ]
-    assert connection.pending_ugc_tools == [23, 30]
+
+
+def test_malformed_lzf_disconnects_only_the_sending_peer():
+    server = DummyServer()
+    connection = make_connection(server)
+
+    asyncio.run(connection.on_receive(b"\x31\xe0"))
+
+    assert connection.peer.disconnected_reason == int(C.ERROR_DATA)
+    assert connection.pending_selection is None
+
+
+def test_pre_join_constructor_palette_noise_is_ignored():
+    server = DummyServer()
+    connection = make_connection(server)
+    connection.send = lambda data, reliable=True, prefix=0x30: None
+
+    # Captured retail startup sequence.  Constructing the colour-using tools
+    # emits their defaults before NewPlayerConnection; none represents a user
+    # palette choice.  The recovered server rejects SetColor until a live
+    # BlockTool is selected, so the new player's colour stays neutral grey.
+    for value in (0x707070, 0xFF0000, 0xFFFF00):
+        color = SetColor()
+        color.player_id = 0
+        color.value = value
+        asyncio.run(connection.handle_pre_join_packet(bytes(color.generate())))
+
+    join = NewPlayerConnection()
+    join.team = TEAM1
+    join.class_id = 0
+    join.forced_team = 0
+    join.local_language = 0
+    join.name = "Painter"
+    asyncio.run(connection._on_new_player(join))
+
+    assert connection.player.block_color == 0x707070
 
 
 def test_world_manager_height_scans_surface_from_solids():
@@ -203,11 +280,25 @@ def test_spawn_uses_cached_loadout_and_sends_hp():
     assert create_player.dead == 0
     assert create_player.class_id == 0
     assert (create_player.x, create_player.y, create_player.z) == connection.player.position
-    assert create_player.loadout == [5, 1, 8, 13]
+    from server.class_selection import normalize_class_selection
+
+    expected = normalize_class_selection(
+        0,
+        [5, 1, 8, 13],
+        ["prefab_ultrabarrier", "prefab_superbarrier"],
+    )
+    assert create_player.loadout == list(expected.loadout)
     assert create_player.prefabs == [
         "prefab_ultrabarrier",
         "prefab_superbarrier",
     ]
+
+    # Existing clients must learn the new character's palette immediately.
+    # CreatePlayer has no color field, and remote BlockLine rendering otherwise
+    # uses the client's default/uninitialized block color.
+    announced_color = SetColor(ByteReader(server.broadcast_packets[1][1:]))
+    assert announced_color.player_id == connection.player.id
+    assert announced_color.value == connection.player.block_color
 
     # The joiner also receives its OWN CreatePlayer directly (gameplay
     # broadcasts are gated until it's in-game, so the spawn echo can't ride
@@ -306,6 +397,14 @@ def test_roster_announced_as_create_player_with_wire_team_ids():
     assert packet.player_id == 7
     assert packet.team == TEAM2
     assert packet.name == "Other"
+
+    # CreatePlayer has no block-colour field. A separate SetColor must follow
+    # so subsequent BlockBuild/BlockLine packets render with the same colour
+    # as the authoritative VXL, including for late joiners.
+    assert sent_packets[1][0] == SetColor.id
+    color = SetColor(ByteReader(sent_packets[1][1:]))
+    assert color.player_id == 7
+    assert color.value == 0x123456
 
 
 def test_joined_clock_sync_replies_with_server_loop_count():

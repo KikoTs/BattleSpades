@@ -86,13 +86,16 @@ def crouch_on(p):
 # Scenario programs (must mirror scripts/oracle_experiments.py exactly)
 # ---------------------------------------------------------------------------
 
-def replay(fix: dict) -> list[list]:
+def replay(fix: dict, map_name: str = "ArcticBase") -> list[list]:
     name = fix["name"]
     dt = fix["dt"]
     cfg = load_config(ROOT / "config.toml")
     wm = WorldManager(cfg)
-    if not wm.load_map(cfg.map_name):
-        raise RuntimeError(f"failed to load map {cfg.map_name!r}")
+    # The committed oracle fixtures were captured on ArcticBase. Replaying on
+    # the production map changes every floor/collision query and creates a
+    # convincing but meaningless physics divergence.
+    if not wm.load_map(map_name):
+        raise RuntimeError(f"failed to load map {map_name!r}")
     p = make_player(wm.world, fix["class_setup"])
     setup = fix["setup"]
 
@@ -209,6 +212,11 @@ def main() -> int:
                          "and single-frame landing transients)")
     ap.add_argument("--show", type=int, default=3,
                     help="frames of context to print at first divergence")
+    ap.add_argument(
+        "--map",
+        default="ArcticBase",
+        help="map used by the fixtures (default: ArcticBase)",
+    )
     args = ap.parse_args()
 
     fixtures = sorted(FIXTURE_DIR.glob("*.json"))
@@ -225,7 +233,7 @@ def main() -> int:
             continue  # not a scenario fixture (e.g. raw probe dumps)
         name = fix["name"]
         try:
-            ours = replay(fix)
+            ours = replay(fix, args.map)
         except Exception as exc:
             print(f"{name:<18} ERROR during replay: {exc!r}")
             all_pass = False

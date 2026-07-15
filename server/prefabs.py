@@ -37,7 +37,6 @@ DEFAULT_PREFAB_HEALTH = float(getattr(C, "DEFAULT_PREFAB_HEALTH", 9))
 # Directories searched for <name>.kv6, in order.
 PREFAB_SEARCH_DIRS = (
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prefabs"),
-    r"G:\AoSRevival\aceofspades_nonsteam\kv6",  # dev fallback: full client install
 )
 
 
@@ -120,6 +119,23 @@ class PrefabRegistry:
 
 
 _registry: Optional[PrefabRegistry] = None
+
+
+def configure_prefab_search_dirs(*search_dirs: os.PathLike | str) -> None:
+    """Replace prefab lookup roots and discard the previous lazy cache.
+
+    Release startup calls this once with the directory beside the executable.
+    Resetting the registry prevents models or missing-file results discovered
+    under an earlier test/source layout from leaking into the new runtime.
+    """
+
+    global _registry
+    normalized = tuple(
+        os.path.abspath(os.fspath(directory)) for directory in search_dirs
+    )
+    if not normalized:
+        raise ValueError("at least one prefab search directory is required")
+    _registry = PrefabRegistry(normalized)
 
 
 def get_registry() -> PrefabRegistry:

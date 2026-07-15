@@ -48,6 +48,28 @@ STICK_ARM_SECONDS = float(getattr(C, "STICKY_GRENADE_STICK_FUSE", 5.0))
 # Failsafe: a fuse-less projectile that never contacts anything dies here.
 MAX_FLIGHT_SECONDS = 10.0
 
+# LIVE-MEASURED 2026-07-15 against the retail BlockManager.  Both drill
+# handlers delegate to handle_radius_damage(radius=2).  With the ordinary
+# in-flight DRILL_DRILLING_BLOCK_DAMAGE=20, a fresh solid volume loses these
+# 81 cells exactly (stable across seeds 0, 1, 123, and 255).  This is wider
+# than the projectile's one-cell collision trace: the trace chooses the
+# centre, while this footprint is the actual boring operation.
+DRILL_CONTACT_OFFSETS = tuple(
+    (dx, dy, dz)
+    for dx in range(-2, 3)
+    for dy in range(-2, 3)
+    for dz in range(-2, 3)
+    if dx * dx + dy * dy + dz * dz <= 6
+)
+
+
+def drill_contact_cells(block) -> tuple[tuple[int, int, int], ...]:
+    """Return the retail Drill Gun's authoritative 81-voxel bore footprint."""
+
+    x, y, z = (int(value) for value in block)
+    return tuple((x + dx, y + dy, z + dz)
+                 for dx, dy, dz in DRILL_CONTACT_OFFSETS)
+
 
 @dataclass(frozen=True)
 class ProjectileSpec:
@@ -70,6 +92,13 @@ class ProjectileSpec:
     # which the client already renders as thrown grenades).
     entity_type: int = 0
     blast_radius: float = 4.0
+    knockback_min: float = 0.0
+    knockback_max: float = 0.0
+    self_knockback_min: Optional[float] = None
+    self_knockback_max: Optional[float] = None
+    destroyed_blast_radius: float = 0.0
+    destroyed_knockback_min: float = 0.0
+    destroyed_knockback_max: float = 0.0
 
 
 def _kill(name: str, default: int) -> int:
@@ -86,29 +115,44 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "GRENADE_EXPLOSION_DAMAGE", 230.0)),
         float(getattr(C, "GRENADE_EXPLOSION_BLOCK_DAMAGE", 4.0)),
         _GRENADE_KILL, 7,
-        blast_radius=float(getattr(C, "GRENADE_EXPLOSION_RADIUS", 4.0))),
+        blast_radius=4.0,
+        knockback_min=float(getattr(C, "GRENADE_EXPLOSION_KNOCKBACK_MIN", 0.5)),
+        knockback_max=float(getattr(C, "GRENADE_EXPLOSION_KNOCKBACK_MAX", 1.0))),
     int(getattr(C, "CLASSIC_GRENADE_TOOL", 31)): ProjectileSpec(
         "classic_grenade", "bounce", 1.0,
         float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_DAMAGE", 130.0)),
         float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
         _kill("CLASSIC_GRENADE_KILL", 22), 22,
-        blast_radius=float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_RADIUS", 2.0))),
+        blast_radius=float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_BLAST_WAVE_RADIUS", 9.0)),
+        knockback_min=float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_KNOCKBACK_MIN", 0.1)),
+        knockback_max=float(getattr(C, "CLASSIC_GRENADE_EXPLOSION_KNOCKBACK_MAX", 0.1))),
     int(getattr(C, "ANTIPERSONNEL_GRENADE_TOOL", 32)): ProjectileSpec(
         "ap_grenade", "bounce", 1.0,
         float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_DAMAGE", 500.0)),
         float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_BLOCK_DAMAGE", 0.5)),
         _kill("ANTIPERSONNEL_GRENADE_KILL", 23), 23,
-        blast_radius=float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_RADIUS", 2.0))),
+        blast_radius=float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_BLAST_WAVE_RADIUS", 6.0)),
+        knockback_min=float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_KNOCKBACK_MIN", 0.25)),
+        knockback_max=float(getattr(C, "ANTIPERSONNEL_GRENADE_EXPLOSION_KNOCKBACK_MAX", 0.5))),
     int(getattr(C, "MOLOTOV_TOOL", 33)): ProjectileSpec(
         "molotov", "contact", 1.0, 50.0, 3.0,
         _kill("MOLOTOV_KILL", 24), 24, approximate=True,
-        entity_type=int(getattr(C, "MOLOTOV_ENTITY", 27))),
+        entity_type=int(getattr(C, "MOLOTOV_ENTITY", 27)),
+        blast_radius=4.0,
+        knockback_min=float(getattr(C, "MOLOTOV_EXPLOSION_KNOCKBACK_MIN", 0.0)),
+        knockback_max=float(getattr(C, "MOLOTOV_EXPLOSION_KNOCKBACK_MAX", 0.1))),
     int(getattr(C, "DYNAMITE_TOOL", 21)): ProjectileSpec(
         "dynamite", "bounce", 1.0, 100.0, 5.0,
-        _kill("DYNAMITE_KILL", 15), 16),
+        _kill("DYNAMITE_KILL", 15), 16,
+        blast_radius=8.0,
+        knockback_min=float(getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MIN", 0.1)),
+        knockback_max=float(getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MAX", 0.15))),
     int(getattr(C, "LANDMINE_TOOL", 20)): ProjectileSpec(
         "landmine", "bounce", 1.0, 100.0, 3.0,
-        _kill("LANDMINE_KILL", 14), 15, approximate=True),
+        _kill("LANDMINE_KILL", 14), 15, approximate=True,
+        blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_BLAST_WAVE_RADIUS", 6.0)),
+        knockback_min=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MIN", 0.75)),
+        knockback_max=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MAX", 0.75))),
     int(C.RPG_TOOL): ProjectileSpec(
         "rocket", "contact",
         float(getattr(C, "ROCKET_GRAVITY_MULTIPLIER", 0.05)),
@@ -116,7 +160,9 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "ROCKET_EXPLOSION_BLOCK_DAMAGE", 5)),
         _kill("ROCKET_KILL", 4), 8,
         entity_type=int(getattr(C, "ROCKET_ENTITY", 21)),
-        blast_radius=float(getattr(C, "ROCKET_EXPLOSION_RADIUS", 4.0))),
+        blast_radius=float(getattr(C, "ROCKET_EXPLOSION_BLAST_WAVE_RADIUS", 6.0)),
+        knockback_min=float(getattr(C, "ROCKET_EXPLOSION_KNOCKBACK_MIN", 0.0)),
+        knockback_max=float(getattr(C, "ROCKET_EXPLOSION_KNOCKBACK_MAX", 0.25))),
     int(C.RPG2_TOOL): ProjectileSpec(
         "rocket2", "contact",
         float(getattr(C, "ROCKET2_GRAVITY_MULTIPLIER", 0.025)),
@@ -124,7 +170,11 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "ROCKET2_EXPLOSION_BLOCK_DAMAGE", 2)),
         _kill("ROCKET2_KILL", 5), 9,
         entity_type=int(getattr(C, "ROCKET2_ENTITY", 22)),
-        blast_radius=float(getattr(C, "ROCKET2_EXPLOSION_RADIUS", 4.0))),
+        blast_radius=6.0,
+        knockback_min=float(getattr(C, "ROCKET2_EXPLOSION_KNOCKBACK_MIN", 0.0)),
+        knockback_max=float(getattr(C, "ROCKET2_EXPLOSION_KNOCKBACK_MAX", 0.25)),
+        self_knockback_min=float(getattr(C, "ROCKET2_EXPLOSION_SELF_KNOCKBACK_MIN", 1.0)),
+        self_knockback_max=float(getattr(C, "ROCKET2_EXPLOSION_SELF_KNOCKBACK_MAX", 1.5))),
     int(C.DRILLGUN_TOOL): ProjectileSpec(
         "drill", "contact",
         float(getattr(C, "DRILL_GRAVITY_MULTIPLIER", 1.5)),
@@ -135,7 +185,12 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         destroyed_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_DAMAGE", 95)),
         destroyed_block_damage=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_BLOCK_DAMAGE", 10.0)),
         entity_type=int(getattr(C, "DRILL_ENTITY", 23)),
-        blast_radius=float(getattr(C, "DRILL_EXPLOSION_RADIUS", 3.0))),
+        blast_radius=float(getattr(C, "DRILL_EXPLOSION_RADIUS", 3.0)),
+        knockback_min=float(getattr(C, "DRILL_EXPLOSION_KNOCKBACK_MIN", 0.01)),
+        knockback_max=float(getattr(C, "DRILL_EXPLOSION_KNOCKBACK_MAX", 0.1)),
+        destroyed_blast_radius=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_RADIUS", 3.5)),
+        destroyed_knockback_min=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_KNOCKBACK_MIN", 0.1)),
+        destroyed_knockback_max=float(getattr(C, "DRILL_DESTROYED_EXPLOSION_KNOCKBACK_MAX", 0.2))),
     int(getattr(C, "SNOWBLOWER_TOOL", 29)): ProjectileSpec(
         "snowball", "contact",
         float(getattr(C, "SNOWBALL_GRAVITY_MULTIPLIER", 0.5)),
@@ -143,24 +198,33 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "SNOWBALL_EXPLOSION_BLOCK_DAMAGE", 0)),
         _kill("SNOWBALL_KILL", 21), 20,
         entity_type=int(getattr(C, "SNOWBALL_ENTITY", 24)),
-        blast_radius=float(getattr(C, "SNOWBALL_EXPLOSION_RADIUS", 5.0))),
+        blast_radius=float(getattr(C, "SNOWBALL_EXPLOSION_RADIUS", 5.0)),
+        knockback_min=float(getattr(C, "SNOWBALL_EXPLOSION_KNOCKBACK_MIN", 0.3)),
+        knockback_max=float(getattr(C, "SNOWBALL_EXPLOSION_KNOCKBACK_MAX", 0.3))),
     int(getattr(C, "STICKY_GRENADE_TOOL", 57)): ProjectileSpec(
         "sticky_grenade", "stick", 1.0,
         float(getattr(C, "STICKY_GRENADE_EXPLOSION_DAMAGE", 200.0)),
         float(getattr(C, "STICKY_GRENADE_EXPLOSION_BLOCK_DAMAGE", 6.0)),
         _kill("STICKY_GRENADE_KILL", 34), 39,
-        blast_radius=float(getattr(C, "STICKY_GRENADE_EXPLOSION_RADIUS", 5.0))),
+        entity_type=int(getattr(C, "STICKY_GRENADE_ENTITY", 34)),
+        blast_radius=float(getattr(C, "STICKY_GRENADE_EXPLOSION_RADIUS", 5.0)),
+        # Recovered wrapper order is intentionally inverted: near=.1, edge=.75.
+        knockback_min=0.75, knockback_max=0.1),
     int(getattr(C, "MINE_LAUNCHER_TOOL", 58)): ProjectileSpec(
         "mine_projectile", "deploy", 1.0,
         float(getattr(C, "LANDMINE_EXPLOSION_DAMAGE", 100.0)),
         float(getattr(C, "LANDMINE_EXPLOSION_BLOCK_DAMAGE", 15.0)),
         _kill("MINE_KILL", 35), 40,
-        blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0))),
+        entity_type=int(getattr(C, "PROJECTILE_MINE_ENTITY", 37)),
+        blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_BLAST_WAVE_RADIUS", 6.0)),
+        knockback_min=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MIN", 0.75)),
+        knockback_max=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MAX", 0.75))),
     int(getattr(C, "CHEMICALBOMB_TOOL", 54)): ProjectileSpec(
         "chemical_bomb", "contact", 1.0,
         float(getattr(C, "CHEMICALBOMB_EXPLOSION_DAMAGE", 50.0)),
         float(getattr(C, "CHEMICALBOMB_EXPLOSION_BLOCK_DAMAGE", 3.0)),
         _kill("CHEMICALBOMB_KILL", 31), 6,
+        entity_type=int(getattr(C, "CHEMICALBOMB_ENTITY", 32)),
         blast_radius=float(getattr(C, "CHEMICALBOMB_EXPLOSION_RADIUS", 3.0))),
     int(getattr(C, "GRENADE_LAUNCHER_WEAPON_TOOL", 55)): ProjectileSpec(
         "gl_grenade", "contact", 1.0,
@@ -168,7 +232,9 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_BLOCK_DAMAGE", 6.0)),
         _kill("GRENADE_LAUNCHER_KILL", 32), 37,
         lifespan=float(getattr(C, "GRENADE_LAUNCHER_PROJECTILE_LIFESPAN", 3.0)),
-        blast_radius=float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_RADIUS", 4.0))),
+        entity_type=int(getattr(C, "GRENADE_LAUNCHER_ENTITY", 33)),
+        blast_radius=float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_RADIUS", 4.0)),
+        knockback_min=0.0, knockback_max=0.25),
 }
 
 
@@ -176,7 +242,7 @@ class Projectile:
     __slots__ = ("spec", "tool", "x", "y", "z", "vx", "vy", "vz",
                  "explode_at", "thrower_id", "stuck", "spawned_at",
                  "lifespan_at", "entity_id", "contact_block",
-                 "attached_player_id")
+                 "attached_player_id", "block_color", "source_loop")
 
     def __init__(self, spec, tool, pos, vel, fuse, thrower_id, now):
         self.spec = spec
@@ -190,27 +256,50 @@ class Projectile:
         self.lifespan_at = now + spec.lifespan if spec.lifespan > 0.0 else 0.0
         self.thrower_id = int(thrower_id)
         self.stuck = False
-        self.entity_id = 0     # wire entity id (0 = none), set by the server
+        # ``0`` is a valid uint16 entity id. ``None`` is the only safe
+        # sentinel for projectile families rendered without CreateEntity.
+        self.entity_id = None
         self.contact_block = None
         self.attached_player_id = None
+        # Block Cannon/Snowblower shots use the ordinary block wallet and
+        # palette.  Snapshot both values at admission time: changing colour
+        # while a projectile is in flight must not recolour its impact block,
+        # and the source loop is the only client timeline label for the shot.
+        self.block_color = None
+        self.source_loop = None
 
 
 class Explosion:
     """What the engine hands back to the server for damage application."""
     __slots__ = ("x", "y", "z", "thrower_id", "spec", "damage", "block_damage",
-                 "entity_id")
+                 "entity_id", "blast_radius", "knockback_min", "knockback_max",
+                 "self_knockback_min", "self_knockback_max", "contact_block",
+                 "block_color", "source_loop")
 
     def __init__(self, proj: Projectile, destroyed: bool = False):
         self.x, self.y, self.z = proj.x, proj.y, proj.z
         self.thrower_id = proj.thrower_id
         self.spec = proj.spec
         self.entity_id = proj.entity_id
+        self.contact_block = proj.contact_block
+        self.block_color = proj.block_color
+        self.source_loop = proj.source_loop
         if destroyed and proj.spec.destroyed_damage > 0.0:
             self.damage = proj.spec.destroyed_damage
             self.block_damage = proj.spec.destroyed_block_damage
+            self.blast_radius = (
+                proj.spec.destroyed_blast_radius or proj.spec.blast_radius
+            )
+            self.knockback_min = proj.spec.destroyed_knockback_min
+            self.knockback_max = proj.spec.destroyed_knockback_max
         else:
             self.damage = proj.spec.damage
             self.block_damage = proj.spec.block_damage
+            self.blast_radius = proj.spec.blast_radius
+            self.knockback_min = proj.spec.knockback_min
+            self.knockback_max = proj.spec.knockback_max
+        self.self_knockback_min = proj.spec.self_knockback_min
+        self.self_knockback_max = proj.spec.self_knockback_max
 
 
 class ProjectileDeployment:
@@ -272,6 +361,29 @@ class ProjectileEngine:
         p = Projectile(spec, -1, pos, vel, None, thrower_id, now)
         self.projectiles.append(p)
         return p
+
+    def remove_by_thrower(self, thrower_id: int) -> list[Projectile]:
+        """Cancel every in-flight projectile owned by one departing player.
+
+        Player ids are reused immediately. Retaining only the numeric id past
+        disconnect would transfer collision exclusion, team policy, and kill
+        credit to the replacement player. The server owns DestroyEntity for
+        the returned visible projectiles; grenade-family entries have no
+        entity id and simply disappear from authoritative simulation.
+        """
+        thrower_id = int(thrower_id)
+        removed = [
+            projectile
+            for projectile in self.projectiles
+            if projectile.thrower_id == thrower_id
+        ]
+        if removed:
+            self.projectiles = [
+                projectile
+                for projectile in self.projectiles
+                if projectile.thrower_id != thrower_id
+            ]
+        return removed
 
     def update(self, dt: float, world, now: Optional[float] = None,
                players=()) -> list:

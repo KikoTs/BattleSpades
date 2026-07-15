@@ -8,9 +8,9 @@ Three wire pieces the client uses to show scores/time:
   kill count only shows up if we send a PLAYER SetScore when they score.
 - DisplayCountdown(84): the on-screen round-timer countdown (a float of
   seconds REMAINING). Broadcast each frame so it ticks smoothly.
-- GameStats(67): the end-of-round full-screen stats widget. Carries a list
-  of (player_id, stat_type) rows; the client renders the leaderboard from
-  its own accumulated per-player scores.
+- GameStats(67): final leaderboard data. Carries a list of
+  (player_id, stat_type) rows; a separate terminal UI packet renders the
+  full-screen leaderboard, but same-map restarts must not use that transition.
 
 Constants (from shared.constants, verified live):
   SCORE.TEAM=0, SCORE.PLAYER=1
@@ -59,10 +59,10 @@ def send_round_timer(server, seconds_remaining: float) -> None:
 
 
 def broadcast_game_stats(server, winner: int | None = None) -> None:
-    """Broadcast the end-of-round GameStats(67) leaderboard widget to all
+    """Broadcast the end-of-round GameStats(67) leaderboard data to all
     in-game clients. The client already knows each player's score (from the
-    per-player SetScore stream) and renders the table itself; this packet is
-    the trigger that pops the widget up."""
+    per-player SetScore stream). This packet alone is safe in GameScene; do not
+    pair it with a terminal screen packet during a same-map restart."""
     players = [p for p in server.players.values() if getattr(p, "spawned", False) or True]
 
     pkt = GameStats()
@@ -80,11 +80,13 @@ def show_game_stats(server) -> None:
     """Trigger the client's full-screen end-of-round stats screen
     (ShowGameStats 53). LIVE-VERIFIED: this is the packet that pops the
     scores/credits screen (the client renders it from the accumulated
-    per-player SetScore stream + the level screenshot)."""
+    per-player SetScore stream + the level screenshot). This destroys the
+    active GameScene and is only suitable when play will not resume in it."""
     server.broadcast(bytes(ShowGameStats().generate()))
 
 
 def send_map_ended(server) -> None:
     """Signal the map has ended (MapEnded 52). Sent alongside the stats
-    screen so the client's has_map_ended state matches the StateData flag."""
+    screen so the client's has_map_ended state matches the StateData flag.
+    This is terminal for the active GameScene."""
     server.broadcast(bytes(MapEnded().generate()))

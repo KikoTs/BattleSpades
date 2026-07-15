@@ -155,6 +155,40 @@ def test_on_tick_called_only_for_overriding_behavior():
     assert inert.alive is True
 
 
+def test_on_tick_batch_cap_round_robins_overloaded_behaviors():
+    ticks = []
+
+    class Ticker(EntityBehavior):
+        def on_tick(self, ent, dt, c):
+            ticks.append(ent.entity_id)
+
+    reg = EntityRegistry()
+    entities = [
+        reg.place(C.AMMO_CRATE, index, 0, 0, behavior=Ticker())
+        for index in range(3)
+    ]
+
+    assert reg.tick(ctx([]), max_on_tick=2) == 1
+    assert ticks == [entities[0].entity_id, entities[1].entity_id]
+
+    assert reg.tick(ctx([]), max_on_tick=2) == 1
+    assert ticks[-2:] == [entities[2].entity_id, entities[0].entity_id]
+
+
+def test_touch_spatial_index_excludes_distant_entity_buckets():
+    """Large deployable counts must not become players × entities work."""
+    reg = EntityRegistry()
+    nearby = reg.place(C.HEALTH_CRATE, 4, 4, 4, behavior=EntityBehavior())
+    distant = reg.place(C.HEALTH_CRATE, 400, 400, 4, behavior=EntityBehavior())
+    nearby.behavior.touch_radius = 3.0
+    distant.behavior.touch_radius = 3.0
+
+    buckets = reg._bucket_touchers([nearby, distant])
+    candidates = list(reg._nearby_touchers(buckets, 4, 4, 1))
+
+    assert candidates == [nearby]
+
+
 # --- grave lifecycle -------------------------------------------------------
 
 def test_grave_detonates_after_stock_fuse():
@@ -226,7 +260,8 @@ class FakeServer:
         self.blasts = []
 
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
-                     crater_radius=1, force_destroy=True, blast_radius=16.0):
+                     crater_radius=1, force_destroy=True, blast_radius=16.0,
+                     **kwargs):
         self.blasts.append((gx, gy, gz, damage, block_damage, kill_type,
                             crater_radius, force_destroy, blast_radius))
 
@@ -306,6 +341,111 @@ def test_radar_station_expires_and_releases_team_visibility():
     assert reg.get(ent.entity_id) is None
     assert srv.removed == [2]
     assert c._destroyed == [ent.entity_id]
+
+
+def test_medpack_health_is_server_authoritative_and_one_hit_destroys_it():
+    from server.entities.behaviors import MedpackBehavior
+
+    reg = EntityRegistry()
+    srv = FakeServer()
+    srv.entity_registry = reg
+    ent = reg.place(
+        C.MEDPACK_ENTITY, 10, 20, 30, player_id=7,
+        behavior=MedpackBehavior(team=2, heal_amount=25, uses=3, health=1.0),
+    )
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    reg.damage_entity(ent.entity_id, 1.0, None, c)
+
+    assert not ent.alive
+    assert reg.get(ent.entity_id) is None
+    assert c._destroyed == [ent.entity_id]
+
+
+def test_radar_station_uses_recovered_45_health_and_releases_visibility_once():
+    from server.entities.behaviors import RadarStationBehavior
+
+    class RadarServer(FakeServer):
+        def __init__(self):
+            super().__init__()
+            self.removed = []
+
+        def _radar_station_removed(self, team):
+            self.removed.append(team)
+
+    reg = EntityRegistry()
+    srv = RadarServer()
+    srv.entity_registry = reg
+    ent = reg.place(
+        C.RADAR_STATION_ENTITY, 10, 20, 30, player_id=7,
+        behavior=RadarStationBehavior(team=2, lifetime=250.0, health=45.0),
+    )
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    reg.damage_entity(ent.entity_id, 44.0, None, c)
+    assert ent.alive
+    assert ent.behavior.health == 1.0
+    reg.damage_entity(ent.entity_id, 1.0, None, c)
+
+    assert not ent.alive
+    assert reg.get(ent.entity_id) is None
+    assert srv.removed == [2]
+    assert c._destroyed == [ent.entity_id]
+
+
+def test_shooting_c4_removes_charge_without_remote_detonation():
+    from server.entities.behaviors import RemoteChargeBehavior
+
+    reg = EntityRegistry()
+    srv = FakeServer()
+    owner = SimpleNamespace(_c4_entity_ids=[])
+    srv.players[7] = owner
+    srv.entity_registry = reg
+    ent = reg.place(
+        C.C4_ENTITY, 10, 20, 30, player_id=7, face=4,
+        behavior=RemoteChargeBehavior(thrower_id=7, health=1.0),
+    )
+    owner._c4_entity_ids = [ent.entity_id]
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    reg.damage_entity(ent.entity_id, 1.0, None, c)
+
+    assert reg.get(ent.entity_id) is None
+    assert owner._c4_entity_ids == []
+    assert srv.blasts == []
+    assert c._destroyed == [ent.entity_id]
+
+
+def test_explosion_damage_routes_through_entity_health_and_los():
+    from server.main import BattleSpadesServer
+    from server.entities.behaviors import MedpackBehavior
+
+    reg = EntityRegistry()
+    destroyed = []
+    server = SimpleNamespace(
+        config=SimpleNamespace(build_damage=False),
+        players={},
+        entity_registry=reg,
+        world_manager=None,
+        _blocked_los=lambda *args: False,
+    )
+    server._build_entity_ctx = lambda: EntityContext(
+        dt=1 / 60, now=1000.0, players=[], server=server,
+        destroy=destroyed.append,
+    )
+    entity = reg.place(
+        C.MEDPACK_ENTITY, 10.0, 10.0, 10.0,
+        behavior=MedpackBehavior(team=2, health=1.0),
+    )
+
+    BattleSpadesServer._apply_blast(
+        server, 10.0, 10.0, 10.5,
+        damage=25.0, block_damage=0.0, kill_type=3, thrower=None,
+        blast_radius=3.0,
+    )
+
+    assert reg.get(entity.entity_id) is None
+    assert destroyed == [entity.entity_id]
 
 
 def test_landmine_triggers_on_enemy_not_teammate():

@@ -1,0 +1,2971 @@
+"""Isolated strategic bot worker.
+
+Target searches, visibility tests, behavior selection, and path queries run in
+this process.  The server receives only expiring intentions; all authoritative
+movement and actions remain in the gameplay process.
+"""
+
+from __future__ import annotations
+
+import heapq
+import logging
+import math
+import queue
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Iterable
+
+import shared.constants as C
+
+from .messages import (
+    BotAction,
+    BotActionKind,
+    BotIntent,
+    BotProfile,
+    LookIntent,
+    MapSnapshot,
+    MovementAffordance,
+    MovementIntent,
+    PerceptionFrame,
+    PlayerSnapshot,
+    Vector3,
+    WorkerShutdown,
+    WorldDelta,
+)
+from .combat_profiles import envelope_for
+from .policies import ModeBotDecision, _formation_point, objective_decision_for
+from server.projectiles import PROJECTILE_SPECS
+
+# Position-holding/assault roles whose goals may shift onto commanding
+# terrain; carriers, hunters, and escorts always keep their exact goals.
+_TACTICAL_REFINE_ROLES = frozenset(
+    {
+        "team_assault_enemy_side",
+        "ctf_defend",
+        "classic_ctf_defend",
+        "vip_guard_formation",
+    }
+)
+
+try:
+    import py_trees
+except ImportError:  # pragma: no cover - dependency failure is operational
+    py_trees = None
+
+
+logger = logging.getLogger(__name__)
+
+_VISUAL_RANGE = 160.0
+_UNALERTED_FOV_COS = math.cos(math.radians(120.0 / 2.0))
+_ALERTED_FOV_COS = math.cos(math.radians(180.0 / 2.0))
+_CONTACT_LIFETIME = 5.0
+_MAX_PATH_EXPANSIONS = 2048
+_MAX_PATH_RADIUS = 64
+_DEPLOYABLE_TOOLS = frozenset(
+    int(tool)
+    for tool in (
+        C.DYNAMITE_TOOL,
+        C.LANDMINE_TOOL,
+        C.C4_TOOL,
+        C.RADAR_STATION_TOOL,
+        C.MEDPACK_TOOL,
+        C.MG_TOOL,
+        C.ROCKET_TURRET_TOOL,
+        C.DISGUISE_TOOL,
+    )
+)
+_ORIENTED_TOOLS = frozenset(int(tool) for tool in PROJECTILE_SPECS) - {
+    int(C.DYNAMITE_TOOL),
+    int(C.LANDMINE_TOOL),
+    int(C.C4_TOOL),
+}
+_ZOMBIE_CLASSES = frozenset({
+    int(C.CLASS_ZOMBIE),
+    int(C.CLASS_FAST_ZOMBIE),
+    int(C.CLASS_JUMP_ZOMBIE),
+})
+
+
+def _distance_squared(a: Vector3, b: Vector3) -> float:
+    return sum((a[index] - b[index]) ** 2 for index in range(3))
+
+
+def _normalized_xy(dx: float, dy: float) -> Vector3:
+    length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        return 0.0, 0.0, 0.0
+    return dx / length, dy / length, 0.0
+
+
+@dataclass(slots=True)
+class LastSeenContact:
+    """Frozen hidden-enemy knowledge with growing uncertainty."""
+
+    player_id: int
+    generation: int
+    position: Vector3
+    velocity: Vector3
+    seen_at: float
+    uncertainty: float = 0.0
+
+    def age(self, now: float) -> float:
+        """Return non-negative seconds since the last visible sample."""
+
+        return max(0.0, now - self.seen_at)
+
+
+@dataclass(frozen=True, slots=True)
+class _TeamReport:
+    """Delayed frozen sighting shared with teammates, never live tracking."""
+
+    team: int
+    reporter_id: int
+    target_id: int
+    target_generation: int
+    position: Vector3
+    velocity: Vector3
+    deliver_at: float
+    expires_at: float
+
+
+@dataclass(slots=True)
+class _BrainState:
+    contacts: dict[int, LastSeenContact] = field(default_factory=dict)
+    target_id: int | None = None
+    acquired_at: float = 0.0
+    path: list[Vector3] = field(default_factory=list)
+    path_goal: Vector3 | None = None
+    path_topology_version: int = -1
+    patrol_heading: float = 0.0
+    next_patrol_turn: float = 0.0
+    next_decision_at: float = 0.0
+    next_world_action_at: float = 0.0
+    last_world_action: dict[int, float] = field(default_factory=dict)
+    last_path_direction: Vector3 = (0.0, 0.0, 0.0)
+    last_position: Vector3 | None = None
+    last_progress_at: float = 0.0
+    stuck_attempts: int = 0
+    aim_head: bool = False
+    delayed_target_velocity: Vector3 = (0.0, 0.0, 0.0)
+    next_oriented_at: float = 0.0
+    last_affordance: MovementAffordance = MovementAffordance.WALK
+    next_combat_jump_at: float = 0.0
+    next_strafe_switch_at: float = 0.0
+    strafe_sign: float = 1.0
+    next_cover_build_at: float = 0.0
+    next_breach_at: float = 0.0
+    next_zombie_build_at: float = 0.0
+    # Stationary-weapon hold/reposition rhythm (snipers, machine guns).
+    next_reposition_at: float = 0.0
+    reposition_until: float = 0.0
+    # Class-behavior cooldowns and own-explosive avoidance.
+    next_medic_support_at: float = 0.0
+    next_dynamite_at: float = 0.0
+    retreat_from: Vector3 | None = None
+    retreat_until: float = 0.0
+    next_fortify_build_at: float = 0.0
+    tactical_goal: Vector3 | None = None
+    tactical_goal_until: float = 0.0
+    # Humanization: per-acquisition hesitation and cover peek rhythm.
+    reaction_bonus: float = 0.0
+    peek_until: float = 0.0
+    hold_until: float = 0.0
+
+
+class _DecisionComposer:
+    """Small inspectable behavior tree selecting the TDM decision branch."""
+
+    def __init__(self) -> None:
+        self.visible = False
+        self.contact = False
+        self.objective = False
+        self.stimulus = False
+        self.result = "patrol"
+        self.tree = None
+        if py_trees is None:
+            return
+
+        composer = self
+
+        class _Condition(py_trees.behaviour.Behaviour):
+            def __init__(self, name: str, attribute: str) -> None:
+                super().__init__(name=name)
+                self.attribute = attribute
+
+            def update(self):
+                return (
+                    py_trees.common.Status.SUCCESS
+                    if bool(getattr(composer, self.attribute))
+                    else py_trees.common.Status.FAILURE
+                )
+
+        class _Select(py_trees.behaviour.Behaviour):
+            def __init__(self, name: str, value: str) -> None:
+                super().__init__(name=name)
+                self.value = value
+
+            def update(self):
+                composer.result = self.value
+                return py_trees.common.Status.SUCCESS
+
+        root = py_trees.composites.Selector(name="TDM Utility", memory=False)
+        root.add_children(
+            [
+                py_trees.composites.Sequence(
+                    name="Engage Visible Enemy",
+                    memory=False,
+                    children=[
+                        _Condition("Has Fresh Visibility", "visible"),
+                        _Select("Select Engage", "engage"),
+                    ],
+                ),
+                py_trees.composites.Sequence(
+                    name="Pursue Mode Objective",
+                    memory=False,
+                    children=[
+                        _Condition("Has Mode Objective", "objective"),
+                        _Select("Select Objective", "objective"),
+                    ],
+                ),
+                py_trees.composites.Sequence(
+                    name="Investigate Last Seen",
+                    memory=False,
+                    children=[
+                        _Condition("Has Last Seen Contact", "contact"),
+                        _Select("Select Investigate", "investigate"),
+                    ],
+                ),
+                py_trees.composites.Sequence(
+                    name="Investigate Sound",
+                    memory=False,
+                    children=[
+                        _Condition("Has Audible Stimulus", "stimulus"),
+                        _Select("Select Sound", "sound"),
+                    ],
+                ),
+                _Select("Select Patrol", "patrol"),
+            ]
+        )
+        self.tree = py_trees.trees.BehaviourTree(root)
+
+    def choose(
+        self,
+        *,
+        visible: bool,
+        objective: bool,
+        contact: bool,
+        stimulus: bool = False,
+    ) -> str:
+        """Tick one non-blocking tree and return its selected branch."""
+
+        self.visible = bool(visible)
+        self.objective = bool(objective)
+        self.contact = bool(contact)
+        self.stimulus = bool(stimulus)
+        if self.tree is None:
+            if visible:
+                return "engage"
+            if objective:
+                return "objective"
+            if contact:
+                return "investigate"
+            return "sound" if stimulus else "patrol"
+        self.tree.tick()
+        return self.result
+
+
+class WorkerVoxelWorld:
+    """Worker-owned VXL used for LOS and bounded layered path queries."""
+
+    def __init__(self) -> None:
+        self.map_epoch = -1
+        self.topology_version = -1
+        self._vxl = None
+        self._native_nav = None
+        self._built_tiles: set[tuple[int, int]] = set()
+        self._dirty_tiles: set[tuple[int, int]] = set()
+        self._last_affordance: dict[int, MovementAffordance] = {}
+        from .tactical_map import TacticalMap
+
+        self.tactical = TacticalMap()
+
+    @property
+    def ready(self) -> bool:
+        return self._vxl is not None
+
+    def load(self, snapshot: MapSnapshot) -> None:
+        """Build a private native VXL from immutable snapshot bytes."""
+
+        self.map_epoch = int(snapshot.map_epoch)
+        self.topology_version = int(snapshot.topology_version)
+        self._vxl = None
+        self._native_nav = None
+        self._built_tiles.clear()
+        self._dirty_tiles.clear()
+        self._last_affordance.clear()
+        if not snapshot.raw_vxl:
+            return
+        try:
+            from server.bot_ai.compact_vxl import CompactVoxelMap
+
+            self._vxl = CompactVoxelMap(snapshot.raw_vxl)
+            # The bridge retains a canonical overlay for worker restarts and
+            # overflow rebases. Applying it while loading yields one coherent
+            # current navigation snapshot without serializing VXL on the game
+            # thread.
+            for change in snapshot.changed_cells:
+                if change.solid:
+                    self._vxl.set_point(
+                        int(change.x),
+                        int(change.y),
+                        int(change.z),
+                        0x80000000 | (int(change.color) & 0xFFFFFF),
+                    )
+                else:
+                    self._vxl.remove_point_nochecks(
+                        int(change.x), int(change.y), int(change.z)
+                    )
+            try:
+                from server.bot_ai.recast import RecastNavigator
+
+                native = RecastNavigator()
+                self._native_nav = native if native.ready else None
+            except (ImportError, OSError, RuntimeError):
+                # Source-only deployments retain the bounded layered A* below.
+                logger.warning("Native Recast extension unavailable; using fallback")
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            # Fail closed: a worker with no collision world may patrol, but it
+            # must not claim visual contact or request a shot.
+            logger.exception("AI worker could not load navigation VXL")
+            self._vxl = None
+        self.tactical.attach(self._vxl)
+
+    def apply(self, delta: WorldDelta) -> None:
+        """Apply a monotonically newer canonical terrain delta."""
+
+        if int(delta.map_epoch) != self.map_epoch:
+            return
+        if int(delta.topology_version) <= self.topology_version:
+            return
+        if self._vxl is None:
+            self.topology_version = int(delta.topology_version)
+            return
+        for change in delta.changed_cells:
+            if change.solid:
+                self._vxl.set_point(
+                    int(change.x),
+                    int(change.y),
+                    int(change.z),
+                    0x80000000 | (int(change.color) & 0xFFFFFF),
+                )
+            else:
+                self._vxl.remove_point_nochecks(
+                    int(change.x), int(change.y), int(change.z)
+                )
+            tile_x, tile_y = int(change.x) // 32, int(change.y) // 32
+            for offset_x in (-1, 0, 1):
+                for offset_y in (-1, 0, 1):
+                    neighbor = tile_x + offset_x, tile_y + offset_y
+                    if 0 <= neighbor[0] < 16 and 0 <= neighbor[1] < 16:
+                        self._dirty_tiles.add(neighbor)
+            self.tactical.mark_dirty(int(change.x), int(change.y))
+        self.topology_version = int(delta.topology_version)
+
+    def solid(self, x: int, y: int, z: int) -> bool:
+        """Return collision occupancy, treating invalid worker state as solid."""
+
+        if self._vxl is None:
+            return True
+        if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z < 240):
+            return True
+        try:
+            return bool(self._vxl.get_solid(x, y, z))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return True
+
+    def has_line_of_sight(self, origin: Vector3, target: Vector3) -> bool:
+        """DDA eye ray that reveals nothing when collision queries fail."""
+
+        if self._vxl is None:
+            return False
+        dx = target[0] - origin[0]
+        dy = target[1] - origin[1]
+        dz = target[2] - origin[2]
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if distance <= 1e-6:
+            return True
+        # Half-block sampling is sufficient for a voxel field and remains
+        # bounded to 320 probes at the maximum visual consideration distance.
+        steps = max(1, min(320, int(math.ceil(distance * 2.0))))
+        for index in range(1, steps):
+            fraction = index / steps
+            x = int(math.floor(origin[0] + dx * fraction))
+            y = int(math.floor(origin[1] + dy * fraction))
+            z = int(math.floor(origin[2] + dz * fraction))
+            if self.solid(x, y, z):
+                return False
+        return True
+
+    def blocking_cell(
+        self, position: Vector3, direction: Vector3
+    ) -> tuple[int, int, int] | None:
+        """Return the immediate body-height obstruction in ``direction``."""
+
+        dx, dy, _ = direction
+        if math.hypot(dx, dy) <= 1e-6:
+            return None
+        x = int(math.floor(position[0] + dx * 0.9))
+        y = int(math.floor(position[1] + dy * 0.9))
+        support_z = int(round(position[2] + 2.25))
+        for z in (support_z - 2, support_z - 1):
+            if self.solid(x, y, z):
+                return x, y, z
+        return None
+
+    def bridge_cell(
+        self, position: Vector3, direction: Vector3
+    ) -> tuple[int, int, int] | None:
+        """Return one face-supported missing floor cell directly ahead."""
+
+        dx, dy, _ = direction
+        if math.hypot(dx, dy) <= 1e-6:
+            return None
+        current_x = int(math.floor(position[0]))
+        current_y = int(math.floor(position[1]))
+        x = int(math.floor(position[0] + dx * 1.05))
+        y = int(math.floor(position[1] + dy * 1.05))
+        support_z = int(round(position[2] + 2.25))
+        if not self.solid(current_x, current_y, support_z):
+            return None
+        if self.solid(x, y, support_z):
+            return None
+        if self.solid(x, y, support_z - 1) or self.solid(x, y, support_z - 2):
+            return None
+        return x, y, support_z
+
+    def cover_direction(
+        self, position: Vector3, threat: Vector3
+    ) -> Vector3:
+        """Choose a nearby standable point occluded from ``threat``.
+
+        This bounded eight-direction probe runs only in the worker. It never
+        exposes the selected hidden position as target knowledge and performs
+        no server-thread raycasts.
+        """
+
+        candidates: list[tuple[float, Vector3]] = []
+        for radius in (3.0, 5.0):
+            for index in range(8):
+                angle = index * (math.pi / 4.0)
+                x = int(math.floor(position[0] + math.cos(angle) * radius))
+                y = int(math.floor(position[1] + math.sin(angle) * radius))
+                node = self._standing_node(x, y, position[2], vertical_span=2)
+                if node is None:
+                    continue
+                cover = (
+                    float(node[0]) + 0.5,
+                    float(node[1]) + 0.5,
+                    float(node[2]) - 2.25,
+                )
+                cover_eye = cover[0], cover[1], cover[2]
+                if self.has_line_of_sight(cover_eye, threat):
+                    continue
+                travel = math.hypot(cover[0] - position[0], cover[1] - position[1])
+                separation = math.hypot(cover[0] - threat[0], cover[1] - threat[1])
+                candidates.append((travel - separation * 0.05, cover))
+        if not candidates:
+            return 0.0, 0.0, 0.0
+        _score, best = min(candidates, key=lambda item: item[0])
+        return _normalized_xy(best[0] - position[0], best[1] - position[1])
+
+    def cover_build_cell(
+        self, position: Vector3, threat: Vector3
+    ) -> tuple[int, int, int] | None:
+        """Return one supported empty wall cell between bot and threat.
+
+        The probe is deliberately local and bounded. Construction safety and
+        authoritative VXL checks run again on the gameplay thread, so this is
+        only a tactical suggestion and can never place through a player,
+        objective zone, or teammate corridor.
+        """
+
+        direction = _normalized_xy(
+            threat[0] - position[0], threat[1] - position[1]
+        )
+        if math.hypot(direction[0], direction[1]) <= 1e-6:
+            return None
+        support_z = int(round(position[2] + 2.25))
+        for distance in (1.35, 1.85):
+            x = int(math.floor(position[0] + direction[0] * distance))
+            y = int(math.floor(position[1] + direction[1] * distance))
+            lower = (x, y, support_z - 1)
+            upper = (x, y, support_z - 2)
+            if not self.solid(*lower) and self.solid(x, y, support_z):
+                return lower
+            if self.solid(*lower) and not self.solid(*upper):
+                return upper
+        return None
+
+    def next_path_direction(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        *,
+        agent_id: int = -1,
+        velocity: Vector3 = (0.0, 0.0, 0.0),
+        abilities: frozenset[MovementAffordance] = frozenset(),
+    ) -> Vector3:
+        """Return a bounded layered-grid step toward ``goal``.
+
+        Recast/Detour replaces this compatibility navigator when the native
+        extension is available.  The fallback still keeps A* outside the game
+        thread and respects live voxel occupancy, caves, and local elevation.
+        """
+
+        if self._vxl is None:
+            return 0.0, 0.0, 0.0
+        native_direction = self._native_path_direction(
+            start, goal, agent_id=agent_id, velocity=velocity
+        )
+        if math.hypot(native_direction[0], native_direction[1]) > 1e-6:
+            self._last_affordance[agent_id] = MovementAffordance.WALK
+            return native_direction
+        path, affordance = self._a_star(start, goal, abilities=abilities)
+        if not path:
+            self._last_affordance[agent_id] = MovementAffordance.WALK
+            return 0.0, 0.0, 0.0
+        self._last_affordance[agent_id] = affordance
+        waypoint = path[min(1, len(path) - 1)]
+        return _normalized_xy(waypoint[0] - start[0], waypoint[1] - start[1])
+
+    def last_affordance(self, agent_id: int) -> MovementAffordance:
+        """Return the immediate topology edge selected for one crowd agent."""
+
+        return self._last_affordance.get(int(agent_id), MovementAffordance.WALK)
+
+    @property
+    def native_tile_count(self) -> int:
+        """Return built Recast tiles for diagnostics and smoke fixtures."""
+
+        if self._native_nav is None:
+            return 0
+        return int(self._native_nav.tile_count)
+
+    def _native_path_direction(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        *,
+        agent_id: int,
+        velocity: Vector3,
+    ) -> Vector3:
+        if self._native_nav is None:
+            return 0.0, 0.0, 0.0
+        tiles = self._tile_corridor(start, goal)
+        for tile in tiles:
+            if tile not in self._built_tiles or tile in self._dirty_tiles:
+                self._rebuild_native_tile(*tile)
+        native_start = (start[0], -(start[2] + 2.25), start[1])
+        native_end = (goal[0], -(goal[2] + 2.25), goal[1])
+        try:
+            if agent_id >= 0:
+                steering = self._native_nav.crowd_steer(
+                    int(agent_id),
+                    native_start,
+                    native_end,
+                    (velocity[0], -velocity[2], velocity[1]),
+                    4.5,
+                    12.0,
+                    0.2,
+                )
+                if len(steering) == 3:
+                    crowd_direction = _normalized_xy(
+                        float(steering[0]), float(steering[2])
+                    )
+                    if math.hypot(crowd_direction[0], crowd_direction[1]) > 1e-6:
+                        return crowd_direction
+            path = self._native_nav.find_path(native_start, native_end)
+        except (RuntimeError, TypeError, ValueError):
+            logger.exception("Native Recast path query failed")
+            return 0.0, 0.0, 0.0
+        if len(path) < 3:
+            return 0.0, 0.0, 0.0
+        waypoint_offset = 3 if len(path) >= 6 else 0
+        waypoint_x = float(path[waypoint_offset])
+        waypoint_y = float(path[waypoint_offset + 2])
+        return _normalized_xy(waypoint_x - start[0], waypoint_y - start[1])
+
+    @staticmethod
+    def _tile_corridor(start: Vector3, goal: Vector3) -> tuple[tuple[int, int], ...]:
+        start_tile = int(start[0]) // 32, int(start[1]) // 32
+        goal_tile = int(goal[0]) // 32, int(goal[1]) // 32
+        dx = goal_tile[0] - start_tile[0]
+        dy = goal_tile[1] - start_tile[1]
+        steps = max(1, abs(dx), abs(dy))
+        result: list[tuple[int, int]] = []
+        for index in range(steps + 1):
+            fraction = index / steps
+            tile = (
+                max(0, min(15, int(round(start_tile[0] + dx * fraction)))),
+                max(0, min(15, int(round(start_tile[1] + dy * fraction)))),
+            )
+            if tile not in result:
+                result.append(tile)
+        return tuple(result)
+
+    def _rebuild_native_tile(self, tile_x: int, tile_y: int) -> None:
+        """Extract exposed layered voxel floors and rebuild one 32x32 tile."""
+
+        if self._native_nav is None:
+            return
+        vertices: list[float] = []
+        triangles: list[int] = []
+        border = 2
+        x0 = max(0, tile_x * 32 - border)
+        x1 = min(512, (tile_x + 1) * 32 + border)
+        y0 = max(0, tile_y * 32 - border)
+        y1 = min(512, (tile_y + 1) * 32 + border)
+        for x in range(x0, x1):
+            for y in range(y0, y1):
+                air_run = 2
+                for z in range(2, 240):
+                    occupied = self.solid(x, y, z)
+                    if not occupied:
+                        air_run += 1
+                        continue
+                    if air_run >= 2:
+                        base = len(vertices) // 3
+                        height = -float(z)
+                        # AoS (x,y,z-down) -> Recast (x,-z,y). Winding points
+                        # toward +Y, the native library's walkable-up axis.
+                        vertices.extend(
+                            (
+                                float(x), height, float(y),
+                                float(x + 1), height, float(y),
+                                float(x + 1), height, float(y + 1),
+                                float(x), height, float(y + 1),
+                            )
+                        )
+                        triangles.extend(
+                            (base, base + 2, base + 1, base, base + 3, base + 2)
+                        )
+                    air_run = 0
+        try:
+            if vertices:
+                built = self._native_nav.build_tile(
+                    tile_x,
+                    tile_y,
+                    vertices,
+                    triangles,
+                    (float(tile_x * 32), -240.0, float(tile_y * 32)),
+                    (float((tile_x + 1) * 32), 0.0, float((tile_y + 1) * 32)),
+                )
+            else:
+                built = self._native_nav.remove_tile(tile_x, tile_y)
+        except (RuntimeError, TypeError, ValueError):
+            logger.exception("Native Recast tile build failed at (%s,%s)", tile_x, tile_y)
+            built = False
+        if built:
+            self._built_tiles.add((tile_x, tile_y))
+            self._dirty_tiles.discard((tile_x, tile_y))
+
+    def _a_star(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        *,
+        abilities: frozenset[MovementAffordance],
+    ) -> tuple[list[Vector3], MovementAffordance]:
+        """Search bounded local topology including class-filtered ability edges."""
+
+        start_node = self._standing_node(int(start[0]), int(start[1]), start[2])
+        if start_node is None:
+            return [], MovementAffordance.WALK
+        goal_x = max(
+            start_node[0] - _MAX_PATH_RADIUS,
+            min(start_node[0] + _MAX_PATH_RADIUS, int(goal[0])),
+        )
+        goal_y = max(
+            start_node[1] - _MAX_PATH_RADIUS,
+            min(start_node[1] + _MAX_PATH_RADIUS, int(goal[1])),
+        )
+        frontier: list[tuple[float, int, tuple[int, int, int]]] = []
+        sequence = 0
+        heapq.heappush(frontier, (0.0, sequence, start_node))
+        came_from: dict[tuple[int, int, int], tuple[int, int, int] | None] = {
+            start_node: None
+        }
+        came_affordance: dict[tuple[int, int, int], MovementAffordance] = {
+            start_node: MovementAffordance.WALK
+        }
+        cost = {start_node: 0.0}
+        best = start_node
+        best_distance = math.hypot(start_node[0] - goal_x, start_node[1] - goal_y)
+
+        while frontier and len(came_from) <= _MAX_PATH_EXPANSIONS:
+            _priority, _sequence, current = heapq.heappop(frontier)
+            distance = math.hypot(current[0] - goal_x, current[1] - goal_y)
+            if distance < best_distance:
+                best, best_distance = current, distance
+            if distance <= 0.25:
+                best = current
+                break
+            for neighbor, affordance, edge_cost in self._neighbors(
+                current, abilities=abilities
+            ):
+                new_cost = cost[current] + edge_cost
+                if new_cost >= cost.get(neighbor, math.inf):
+                    continue
+                cost[neighbor] = new_cost
+                sequence += 1
+                heuristic = math.hypot(neighbor[0] - goal_x, neighbor[1] - goal_y)
+                heapq.heappush(frontier, (new_cost + heuristic, sequence, neighbor))
+                came_from[neighbor] = current
+                came_affordance[neighbor] = affordance
+
+        nodes: list[tuple[int, int, int]] = []
+        cursor: tuple[int, int, int] | None = best
+        while cursor is not None:
+            nodes.append(cursor)
+            cursor = came_from[cursor]
+        nodes.reverse()
+        path = [
+            (float(x) + 0.5, float(y) + 0.5, float(support_z) - 2.25)
+            for x, y, support_z in nodes
+        ]
+        first_affordance = (
+            came_affordance.get(nodes[1], MovementAffordance.WALK)
+            if len(nodes) > 1
+            else MovementAffordance.WALK
+        )
+        return path, first_affordance
+
+    def _standing_node(
+        self,
+        x: int,
+        y: int,
+        current_player_z: float,
+        *,
+        vertical_span: int = 3,
+        clearance: int = 2,
+    ) -> tuple[int, int, int] | None:
+        expected_support = int(round(float(current_player_z) + 2.25))
+        candidates = range(
+            max(2, expected_support - vertical_span),
+            min(239, expected_support + vertical_span + 1),
+        )
+        for support_z in sorted(candidates, key=lambda value: abs(value - expected_support)):
+            if (
+                self.solid(x, y, support_z)
+                and all(
+                    not self.solid(x, y, support_z - offset)
+                    for offset in range(1, clearance + 1)
+                )
+            ):
+                return x, y, support_z
+        return None
+
+    def _neighbors(
+        self,
+        node: tuple[int, int, int],
+        *,
+        abilities: frozenset[MovementAffordance],
+    ) -> Iterable[tuple[tuple[int, int, int], MovementAffordance, float]]:
+        """Yield walk plus bounded crouch/jump/drop/jetpack off-mesh edges."""
+
+        x, y, support_z = node
+        player_z = float(support_z) - 2.25
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < 512 and 0 <= ny < 512):
+                continue
+            neighbor = self._standing_node(
+                nx, ny, player_z, vertical_span=8, clearance=2
+            )
+            if neighbor is not None:
+                delta_z = neighbor[2] - support_z
+                if abs(delta_z) <= 1:
+                    yield neighbor, MovementAffordance.WALK, 1.0 + abs(delta_z) * 0.25
+                    continue
+                if (
+                    delta_z < 0
+                    and -delta_z <= 2
+                    and MovementAffordance.JUMP in abilities
+                ):
+                    yield neighbor, MovementAffordance.JUMP, 1.8 + -delta_z * 0.35
+                    continue
+                if (
+                    1 < delta_z <= 4
+                    and MovementAffordance.DROP in abilities
+                ):
+                    yield neighbor, MovementAffordance.DROP, 1.2 + delta_z * 0.15
+                    continue
+                if (
+                    abs(delta_z) <= 8
+                    and MovementAffordance.JETPACK in abilities
+                ):
+                    yield neighbor, MovementAffordance.JETPACK, 3.0 + abs(delta_z) * 0.2
+                    continue
+
+            if MovementAffordance.CROUCH in abilities:
+                crouched = self._standing_node(
+                    nx, ny, player_z, vertical_span=1, clearance=1
+                )
+                if crouched is not None and abs(crouched[2] - support_z) <= 1:
+                    yield crouched, MovementAffordance.CROUCH, 1.4
+                    continue
+
+            # Explicit off-mesh gaps are deliberately local. Arbitrary voxel
+            # combinations belong to the breach/build affordance layer.
+            max_distance = 4 if MovementAffordance.JETPACK in abilities else 2
+            for distance in range(2, max_distance + 1):
+                tx, ty = x + dx * distance, y + dy * distance
+                if not (0 <= tx < 512 and 0 <= ty < 512):
+                    break
+                landing = self._standing_node(
+                    tx, ty, player_z, vertical_span=8, clearance=2
+                )
+                if landing is None:
+                    continue
+                delta_z = landing[2] - support_z
+                if (
+                    distance == 2
+                    and abs(delta_z) <= 2
+                    and MovementAffordance.JUMP in abilities
+                ):
+                    yield landing, MovementAffordance.JUMP, 2.6 + abs(delta_z) * 0.3
+                    break
+                if (
+                    abs(delta_z) <= 8
+                    and MovementAffordance.JETPACK in abilities
+                ):
+                    yield landing, MovementAffordance.JETPACK, 3.5 + distance * 0.5
+                    break
+
+
+class BotBrain:
+    """Fair perception memory and deterministic TDM utility decisions."""
+
+    def __init__(
+        self,
+        world: WorkerVoxelWorld,
+        seed: int = 0,
+        *,
+        decision_hz: float = 0.0,
+        path_requests_per_second: float = 24.0,
+    ) -> None:
+        self.world = world
+        self._rng = random.Random(int(seed))
+        self._states: dict[tuple[int, int], _BrainState] = {}
+        # Shared fortify sites keyed (map_epoch, team) -> (site, computed_at).
+        self._fortify_sites: dict[tuple[int, int], tuple[Vector3, float]] = {}
+        self._decision_interval = (
+            1.0 / max(1.0, float(decision_hz)) if decision_hz > 0.0 else 0.0
+        )
+        self._path_rate = max(1.0, float(path_requests_per_second))
+        self._path_tokens = self._path_rate
+        self._path_refill_at = time.monotonic()
+        self._composer = _DecisionComposer()
+        self._team_reports: list[_TeamReport] = []
+        self._last_team_report: dict[tuple[int, int], float] = {}
+
+    def decide(self, frame: PerceptionFrame) -> BotIntent | None:
+        """Produce one expiring intention for a valid observer frame."""
+
+        observer = next(
+            (
+                player
+                for player in frame.players
+                if player.player_id == frame.observer_id
+                and player.generation == frame.observer_generation
+            ),
+            None,
+        )
+        if observer is None or not observer.alive or not observer.spawned:
+            return None
+        key = observer.player_id, observer.generation
+        state = self._states.setdefault(key, _BrainState())
+        now = max(time.monotonic(), float(frame.created_at))
+        profile = frame.profile or _fallback_profile(observer.player_id)
+        self._record_progress(state, observer.position, now)
+        self._deliver_team_reports(observer, state, now)
+        self._expire_contacts(state, now)
+        visible = self._visible_enemies(observer, frame.players, state)
+
+        target: PlayerSnapshot | None = None
+        if visible:
+            target = min(
+                visible,
+                key=lambda candidate: _distance_squared(observer.position, candidate.position),
+            )
+            if state.target_id != target.player_id:
+                state.target_id = target.player_id
+                state.acquired_at = now
+                # Intentional head targeting stays below 20%; ordinary aim is
+                # center mass and natural error may still create incidental
+                # head hits.
+                state.aim_head = self._rng.random() < min(
+                    0.18, 0.04 + float(profile.skill) * 0.14
+                )
+                # Occasional double-take: lower-skill players sometimes need
+                # an extra beat to commit to a new target.
+                state.reaction_bonus = (
+                    self._rng.uniform(0.15, 0.4)
+                    if self._rng.random()
+                    < (1.0 - float(profile.skill)) * 0.35
+                    else 0.0
+                )
+            previous_contact = state.contacts.get(target.player_id)
+            state.delayed_target_velocity = (
+                previous_contact.velocity
+                if previous_contact is not None
+                and previous_contact.generation == target.generation
+                else (0.0, 0.0, 0.0)
+            )
+            state.contacts[target.player_id] = LastSeenContact(
+                player_id=target.player_id,
+                generation=target.generation,
+                position=target.position,
+                velocity=target.velocity,
+                seen_at=now,
+            )
+            self._queue_team_report(observer, target, now)
+
+        if now < state.next_decision_at:
+            return None
+        state.next_decision_at = now + self._decision_interval
+
+        # Own-explosive avoidance outranks everything, including a visible
+        # enemy: running from your own lit dynamite is the human move.
+        retreat = self._blast_retreat(frame, observer, state, now)
+        if retreat is not None:
+            return retreat
+
+        contact = self._best_contact(observer, state, now)
+        mode_decision = self._objective_decision(frame, observer)
+        mode_objective = (
+            mode_decision.position if mode_decision is not None else None
+        )
+        if (
+            mode_decision is not None
+            and not str(mode_decision.role).startswith("zombie_hunt_")
+            and _distance_squared(observer.position, mode_decision.position)
+            <= float(mode_decision.arrival_radius) ** 2
+        ):
+            # At a role station, allow class actions (fortification, mines,
+            # turrets, healing) to run instead of endlessly pathing in place.
+            mode_objective = None
+        fortify_site = None
+        if (
+            mode_decision is not None
+            and str(getattr(mode_decision, "directive", "")) == "fortify"
+        ):
+            # A fortify directive overrides the loose formation point with a
+            # scored defensible team site; near the site the bot builds.
+            fortify_site = self._fortify_site(frame, observer, now)
+            if fortify_site is not None:
+                station = _formation_point(
+                    fortify_site, observer.player_id, 3.5
+                )
+                # Arrival is judged in the horizontal plane with a loose
+                # height tolerance: exact z convergence on slopes would keep
+                # a stationed builder pathing forever.
+                planar = math.hypot(
+                    observer.position[0] - station[0],
+                    observer.position[1] - station[1],
+                )
+                if planar > 2.5 or abs(observer.position[2] - station[2]) > 3.0:
+                    mode_objective = station
+                else:
+                    mode_objective = None
+        elif (
+            mode_decision is not None
+            and mode_objective is not None
+            and str(mode_decision.role) in _TACTICAL_REFINE_ROLES
+        ):
+            refined = self._tactical_goal(observer, state, mode_decision, now)
+            if refined is not None:
+                mode_objective = refined
+        # Active infected never abandon a living survivor for a generic ammo
+        # or health crate. Their exact pursuit target is sanctioned mode state,
+        # and their hand/prefab loadout cannot consume firearm ammunition.
+        zombie_hunt = str(
+            mode_decision.role if mode_decision is not None else ""
+        ).startswith("zombie_hunt_")
+        resource = None if zombie_hunt else self._resource_goal(frame, observer)
+        if observer.carried_entity_id >= 0:
+            objective = mode_objective
+            objective_role = mode_decision.role if mode_decision is not None else ""
+            objective_sprint = bool(mode_decision.sprint) if mode_decision else False
+        elif resource is not None:
+            objective = resource
+            objective_role = "resource"
+            objective_sprint = False
+        else:
+            objective = mode_objective
+            objective_role = mode_decision.role if mode_decision is not None else ""
+            objective_sprint = bool(mode_decision.sprint) if mode_decision else False
+        audible = self._best_stimulus(frame, observer, now)
+        branch = self._composer.choose(
+            visible=target is not None,
+            objective=objective is not None,
+            contact=contact is not None,
+            stimulus=audible is not None,
+        )
+        if branch == "engage" and target is not None:
+            return self._engage(frame, observer, target, state, profile, now)
+
+        recovery = self._stuck_recovery(frame, observer, state, now)
+        if recovery is not None:
+            return recovery
+
+        medic = self._medic_support_intent(frame, observer, state, now)
+        if medic is not None:
+            return medic
+
+        if branch == "objective" and objective is not None:
+            movement = self._path_direction(
+                observer.position,
+                objective,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+            breach = self._proactive_breach(
+                frame,
+                observer,
+                state,
+                now,
+                movement,
+            )
+            if breach is None and str(objective_role).startswith(
+                "zombie_hunt_"
+            ):
+                # Navmesh steering happily orbits a rock that hides the prey
+                # forever. A real zombie digs straight through it.
+                breach = self._zombie_hunt_breach(
+                    frame, observer, state, objective, now
+                )
+            if breach is not None:
+                return breach
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=movement,
+                    sprint=objective_sprint,
+                    affordance=state.last_affordance,
+                ),
+                look=LookIntent(objective, visible=False),
+                debug_role=objective_role,
+            )
+
+        if branch == "investigate" and contact is not None:
+            # Hidden target position is frozen at the last visible sample.
+            movement = self._path_direction(
+                observer.position,
+                contact.position,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+            demolition = self._miner_demolition(
+                frame,
+                observer,
+                state,
+                contact,
+                now,
+                movement,
+            )
+            if demolition is not None:
+                return demolition
+            breach = self._proactive_breach(
+                frame,
+                observer,
+                state,
+                now,
+                movement,
+            )
+            if breach is not None:
+                return breach
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=movement,
+                    sprint=True,
+                    affordance=state.last_affordance,
+                ),
+                look=LookIntent(contact.position, visible=False),
+            )
+
+        if branch == "sound" and audible is not None:
+            movement = self._path_direction(
+                observer.position,
+                audible.position,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=movement,
+                    sprint=False,
+                    affordance=state.last_affordance,
+                ),
+                look=LookIntent(audible.position, visible=False),
+            )
+
+        if fortify_site is not None and mode_objective is None:
+            fortification = self._fortify_build_intent(
+                frame, observer, state, fortify_site, now
+            )
+            if fortification is not None:
+                return fortification
+
+        world_action = self._class_world_action(
+            frame,
+            observer,
+            state,
+            profile,
+            now,
+            role=objective_role,
+        )
+        if world_action is not None:
+            return world_action
+
+        if fortify_site is not None and mode_objective is None:
+            # Stationed and nothing left to build: hold the fort and scan the
+            # open approaches instead of wandering off on patrol.
+            return self._fortify_hold_intent(frame, observer, fortify_site, now)
+
+        return self._patrol(frame, observer, state, now)
+
+    def _queue_team_report(
+        self,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        now: float,
+    ) -> None:
+        """Schedule one 0.4-1.0s delayed sighting from a visible sample."""
+
+        key = int(observer.player_id), int(target.player_id)
+        if now - self._last_team_report.get(key, -math.inf) < 1.0:
+            return
+        self._last_team_report[key] = now
+        delay = self._rng.uniform(0.4, 1.0)
+        self._team_reports.append(
+            _TeamReport(
+                team=int(observer.team),
+                reporter_id=int(observer.player_id),
+                target_id=int(target.player_id),
+                target_generation=int(target.generation),
+                position=target.position,
+                velocity=target.velocity,
+                deliver_at=now + delay,
+                expires_at=now + delay + _CONTACT_LIFETIME,
+            )
+        )
+        if len(self._team_reports) > 256:
+            del self._team_reports[: len(self._team_reports) - 256]
+
+    def _deliver_team_reports(
+        self, observer: PlayerSnapshot, state: _BrainState, now: float
+    ) -> None:
+        """Copy due teammate samples into frozen last-seen memory."""
+
+        self._team_reports = [
+            report for report in self._team_reports if report.expires_at > now
+        ]
+        for report in self._team_reports:
+            if (
+                report.team != int(observer.team)
+                or report.reporter_id == int(observer.player_id)
+                or report.deliver_at > now
+            ):
+                continue
+            existing = state.contacts.get(report.target_id)
+            if existing is not None and existing.seen_at >= report.deliver_at:
+                continue
+            state.contacts[report.target_id] = LastSeenContact(
+                player_id=report.target_id,
+                generation=report.target_generation,
+                position=report.position,
+                velocity=report.velocity,
+                seen_at=report.deliver_at,
+                uncertainty=max(1.0, (now - report.deliver_at) * 3.0),
+            )
+
+    @staticmethod
+    def _best_stimulus(frame: PerceptionFrame, observer: PlayerSnapshot, now: float):
+        """Choose an active approximate cue without promoting it to visibility."""
+
+        candidates = [
+            stimulus
+            for stimulus in frame.stimuli
+            if stimulus.expires_at > now and stimulus.source_id != observer.player_id
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda stimulus: (
+                _distance_squared(observer.position, stimulus.position),
+                -stimulus.created_at,
+            ),
+        )
+
+    @staticmethod
+    def _record_progress(state: _BrainState, position: Vector3, now: float) -> None:
+        """Track locomotion progress from staggered perception samples."""
+
+        previous = state.last_position
+        state.last_position = position
+        if previous is None:
+            state.last_progress_at = now
+            return
+        if math.dist(previous, position) >= 0.35:
+            state.last_progress_at = now
+            state.stuck_attempts = 0
+
+    @staticmethod
+    def _preferred_melee_tool(observer: PlayerSnapshot) -> int | None:
+        """Choose the strongest selected terrain/melee fallback."""
+
+        selected = {
+            int(tool)
+            for tool in observer.loadout
+            if int(tool) in {int(value) for value in C.ALL_MELEE_WEAPONS}
+        }
+        for preferred in (
+            int(C.SUPERSPADE_TOOL),
+            int(getattr(C, "UGC_SUPERSPADE_TOOL", -1)),
+            int(C.ZOMBIEHAND_TOOL),
+            int(C.SPADE_TOOL),
+            int(getattr(C, "MACHETE_TOOL", -1)),
+            int(getattr(C, "PICKAXE_TOOL", -1)),
+        ):
+            if preferred in selected:
+                return preferred
+        return min(selected) if selected else None
+
+    def _tactical_goal(
+        self,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        decision: ModeBotDecision,
+        now: float,
+    ) -> Vector3 | None:
+        """Shift a holding/assault goal onto nearby commanding terrain.
+
+        Only replaces the policy goal when a neighborhood cell is at least
+        two blocks higher than the goal's own cell, snaps to a real standing
+        node, and is reachable through bounded walk/jump topology.  Cached
+        per bot for several seconds so goals stay steady.
+        """
+
+        if now < state.tactical_goal_until:
+            return state.tactical_goal
+        state.tactical_goal_until = now + self._rng.uniform(6.0, 10.0)
+        state.tactical_goal = None
+        tactical = getattr(self.world, "tactical", None)
+        if tactical is None:
+            return None
+        candidate = tactical.high_ground_near(decision.position, radius_cells=2)
+        if candidate is None:
+            return None
+        goal_cell = tactical.cell_at(decision.position)
+        goal_mean = float(goal_cell[0]) if goal_cell is not None else 240.0
+        if candidate[2] + 2.25 > goal_mean - 2.0:
+            # Not meaningfully higher than the terrain already at the goal.
+            return None
+        node = self.world._standing_node(
+            int(candidate[0]), int(candidate[1]), candidate[2], vertical_span=8
+        )
+        if node is None:
+            return None
+        site = (float(node[0]), float(node[1]), float(node[2]) - 2.25)
+        if not self._fortify_reachable(observer.position, site, node[2]):
+            return None
+        state.tactical_goal = _formation_point(
+            (site[0] + 0.5, site[1] + 0.5, site[2]),
+            observer.player_id,
+            3.0,
+        )
+        return state.tactical_goal
+
+    # --- fortification -----------------------------------------------------
+
+    _FORTIFY_RING = 3
+    _FORTIFY_BEARINGS = tuple(
+        index * math.tau / 8.0 for index in range(8)
+    )
+
+    def _fortify_site(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        now: float,
+    ) -> Vector3 | None:
+        """Score one shared defensible site per team near its anchor.
+
+        Elevation (z-down: smaller support = higher ground), few walkable
+        approaches, and teammate proximity score up; distance from the
+        anchor scores mildly down.  Bounded: 48 candidates on a ring grid,
+        recomputed at most every five seconds per team.
+        """
+
+        anchor = next(
+            (
+                item
+                for item in frame.objectives
+                if item.kind == "team_anchor" and item.team == observer.team
+            ),
+            None,
+        )
+        if anchor is None:
+            return None
+        key = (int(frame.map_epoch), int(observer.team))
+        cached = self._fortify_sites.get(key)
+        if cached is not None and now - cached[1] < 5.0:
+            return cached[0]
+        base = anchor.position
+        base_node = self.world._standing_node(
+            int(round(base[0])), int(round(base[1])), base[2], vertical_span=8
+        )
+        if base_node is None:
+            return None
+        base_support = base_node[2]
+        teammates = [
+            player
+            for player in frame.players
+            if player.team == observer.team and player.alive and player.spawned
+        ]
+        candidates: list[tuple[float, Vector3, int]] = []
+        for radius in (4.0, 8.0, 12.0, 16.0, 20.0, 24.0):
+            for angle in self._FORTIFY_BEARINGS:
+                x = int(round(base[0] + math.cos(angle) * radius))
+                y = int(round(base[1] + math.sin(angle) * radius))
+                if not (8 <= x < 504 and 8 <= y < 504):
+                    continue
+                node = self.world._standing_node(
+                    x, y, base[2], vertical_span=8
+                )
+                if node is None:
+                    continue
+                support = node[2]
+                player_z = float(support) - 2.25
+                elevation = max(0.0, min(8.0, float(base_support - support)))
+                open_count = len(self._open_approaches(node))
+                nearby = sum(
+                    1
+                    for player in teammates
+                    if _distance_squared(
+                        player.position, (float(x), float(y), player_z)
+                    )
+                    <= 8.0 ** 2
+                )
+                score = (
+                    2.0 * elevation
+                    + 3.0 * (8.0 - float(open_count))
+                    + 1.0 * nearby
+                    - 0.15 * radius
+                )
+                candidates.append(
+                    (score, (float(x), float(y), player_z), support)
+                )
+        # Unreachable spires otherwise dominate (max elevation, zero
+        # approaches): accept the best candidate the team can actually walk
+        # to from its anchor, checking only a bounded few.
+        candidates.sort(key=lambda row: row[0], reverse=True)
+        anchor_start = (base[0], base[1], float(base_support) - 2.25)
+        best: Vector3 | None = None
+        for score, position, support in candidates[:6]:
+            if self._fortify_reachable(anchor_start, position, support):
+                best = position
+                break
+        if best is None:
+            best = tuple(float(value) for value in base)
+        self._fortify_sites[key] = (best, now)
+        return best
+
+    def _fortify_reachable(
+        self, from_position: Vector3, site: Vector3, support: int
+    ) -> bool:
+        """True when bounded walk/jump topology actually reaches the site."""
+
+        astar = getattr(self.world, "_a_star", None)
+        if not callable(astar):
+            return True
+        path, _affordance = astar(
+            from_position,
+            site,
+            abilities=frozenset(
+                {MovementAffordance.WALK, MovementAffordance.JUMP}
+            ),
+        )
+        if not path:
+            return False
+        end = path[-1]
+        return (
+            math.hypot(end[0] - (site[0] + 0.5), end[1] - (site[1] + 0.5))
+            <= 1.6
+            and abs((end[2] + 2.25) - float(support)) <= 1.5
+        )
+
+    def _wall_segment_cells(
+        self, x: int, y: int, angle: float
+    ) -> list[tuple[int, int]]:
+        """Return the three ring columns sealing one compass approach."""
+
+        center_x = x + int(round(math.cos(angle) * self._FORTIFY_RING))
+        center_y = y + int(round(math.sin(angle) * self._FORTIFY_RING))
+        perp_x, perp_y = -math.sin(angle), math.cos(angle)
+        cells: list[tuple[int, int]] = []
+        for offset in (-1, 0, 1):
+            wx = center_x + int(round(perp_x * offset))
+            wy = center_y + int(round(perp_y * offset))
+            if (wx, wy) not in cells and 1 <= wx < 511 and 1 <= wy < 511:
+                cells.append((wx, wy))
+        return cells
+
+    def _open_approaches(
+        self, site_node: tuple[int, int, int]
+    ) -> list[float]:
+        """Bearings whose wall segment is still walkable into the site."""
+
+        x, y, support = site_node
+        player_z = float(support) - 2.25
+        open_bearings: list[float] = []
+        for angle in self._FORTIFY_BEARINGS:
+            for wx, wy in self._wall_segment_cells(x, y, angle):
+                node = self.world._standing_node(
+                    wx, wy, player_z, vertical_span=2
+                )
+                if node is not None and abs(node[2] - support) <= 1:
+                    open_bearings.append(angle)
+                    break
+        return open_bearings
+
+    @staticmethod
+    def _sealable_approaches(
+        open_angles: list[float], keep_door: bool
+    ) -> list[float]:
+        """Apply the door rule: never seal the last way in while it matters."""
+
+        if not keep_door:
+            return list(open_angles)
+        if len(open_angles) <= 1:
+            return []
+        return list(open_angles[:-1])
+
+    def _fortify_floor(self, wx: int, wy: int, support: int) -> int | None:
+        """Topmost solid z of a wall column near the site plane (z-down)."""
+
+        for wz in range(max(2, support - 4), min(238, support + 5)):
+            if self.world.solid(wx, wy, wz):
+                return wz
+        return None
+
+    @staticmethod
+    def _column_occupied_by_team(
+        frame: PerceptionFrame, observer: PlayerSnapshot, wx: int, wy: int
+    ) -> bool:
+        for player in frame.players:
+            if player.team != observer.team or not player.alive:
+                continue
+            if (
+                int(math.floor(player.position[0])) == wx
+                and int(math.floor(player.position[1])) == wy
+            ):
+                return True
+        return False
+
+    def _fortify_build_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        site: Vector3,
+        now: float,
+    ) -> BotIntent | None:
+        """Place the next missing barricade block around the fortify site.
+
+        One block per decision at a human cadence.  Wall height converges to
+        two blocks above the site plane; construction reservations and
+        can_build/_block_supported re-validate everything authoritatively.
+        """
+
+        if now < state.next_fortify_build_at:
+            return None
+        if int(C.BLOCK_TOOL) not in observer.loadout or observer.blocks <= 8:
+            return None
+        x, y = int(round(site[0])), int(round(site[1]))
+        site_node = self.world._standing_node(x, y, site[2], vertical_span=8)
+        if site_node is None:
+            return None
+        support = site_node[2]
+        open_angles = self._open_approaches(site_node)
+        phase = str(frame.mode_phase).lower()
+        keep_door = phase in ("", "waiting") and any(
+            player.team == observer.team
+            and player.alive
+            and player.player_id != observer.player_id
+            and _distance_squared(player.position, site) > 6.0 ** 2
+            for player in frame.players
+        )
+        sealable = self._sealable_approaches(open_angles, keep_door)
+        # Wall the approach nearest to this builder first.
+        sealable.sort(
+            key=lambda angle: (
+                (x + math.cos(angle) * self._FORTIFY_RING - observer.position[0]) ** 2
+                + (y + math.sin(angle) * self._FORTIFY_RING - observer.position[1]) ** 2
+            )
+        )
+        for angle in sealable:
+            for wx, wy in self._wall_segment_cells(x, y, angle):
+                floor = self._fortify_floor(wx, wy, support)
+                if floor is None or floor <= support - 2:
+                    # No reachable floor, or nature already walls this cell.
+                    continue
+                if self._column_occupied_by_team(frame, observer, wx, wy):
+                    continue
+                for wz in (floor - 1, floor - 2):
+                    if wz < max(2, support - 2) or wz > 237:
+                        continue
+                    if self.world.solid(wx, wy, wz):
+                        continue
+                    state.next_fortify_build_at = now + self._rng.uniform(
+                        0.6, 1.0
+                    )
+                    return self._intent(
+                        frame,
+                        now,
+                        movement=MovementIntent(crouch=True),
+                        look=LookIntent(
+                            (wx + 0.5, wy + 0.5, wz + 0.5), visible=False
+                        ),
+                        tool_id=int(C.BLOCK_TOOL),
+                        action=BotAction(
+                            BotActionKind.BUILD,
+                            tool_id=int(C.BLOCK_TOOL),
+                            position=(float(wx), float(wy), float(wz)),
+                        ),
+                        debug_role="fortify_build",
+                    )
+        return None
+
+    def _fortify_hold_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        site: Vector3,
+        now: float,
+    ) -> BotIntent:
+        """Hold the fort, slowly scanning across the open approaches."""
+
+        x, y = int(round(site[0])), int(round(site[1]))
+        site_node = self.world._standing_node(x, y, site[2], vertical_span=8)
+        open_angles = (
+            self._open_approaches(site_node) if site_node is not None else []
+        )
+        if open_angles:
+            angle = open_angles[
+                int(now * 0.35 + observer.player_id) % len(open_angles)
+            ]
+        else:
+            angle = (
+                float(observer.player_id) * (math.tau / 8.0) + now * 0.2
+            ) % math.tau
+        look = (
+            site[0] + math.cos(angle) * 12.0,
+            site[1] + math.sin(angle) * 12.0,
+            site[2],
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(crouch=True),
+            look=LookIntent(look, visible=False),
+            debug_role="fortify_hold",
+        )
+
+    def _blast_retreat(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Keep clear of an explosive this bot armed until it detonates."""
+
+        if state.retreat_until <= now or state.retreat_from is None:
+            state.retreat_from = None
+            return None
+        source = state.retreat_from
+        if _distance_squared(observer.position, source) >= 12.0 ** 2:
+            # Far enough: hold and watch the charge instead of wandering back.
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(crouch=True),
+                look=LookIntent(source, visible=False),
+                debug_role="blast_overwatch",
+            )
+        away = _normalized_xy(
+            observer.position[0] - source[0],
+            observer.position[1] - source[1],
+        )
+        if math.hypot(away[0], away[1]) <= 0.1:
+            away = (
+                math.cos(state.patrol_heading),
+                math.sin(state.patrol_heading),
+                0.0,
+            )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(direction=away, sprint=True),
+            look=LookIntent(source, visible=False),
+            debug_role="blast_retreat",
+        )
+
+    def _medic_support_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Move to the nearest wounded teammate and drop a medpack.
+
+        Own-roster health is sanctioned team knowledge; no enemy state is
+        read here.  The deployable service re-validates stock and placement.
+        """
+
+        if int(observer.class_id) != int(C.CLASS_MEDIC):
+            return None
+        if int(C.MEDPACK_TOOL) not in observer.loadout:
+            return None
+        if now < state.next_medic_support_at:
+            return None
+        wounded = [
+            player
+            for player in frame.players
+            if player.team == observer.team
+            and player.player_id != observer.player_id
+            and player.alive
+            and player.spawned
+            and player.health < 60
+            and _distance_squared(observer.position, player.position)
+            <= 30.0 ** 2
+        ]
+        if not wounded:
+            return None
+        patient = min(
+            wounded,
+            key=lambda player: (
+                player.health,
+                _distance_squared(observer.position, player.position),
+            ),
+        )
+        if _distance_squared(observer.position, patient.position) <= 4.0 ** 2:
+            state.next_medic_support_at = now + 6.0
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(crouch=True),
+                look=LookIntent(patient.position, visible=False),
+                tool_id=int(C.MEDPACK_TOOL),
+                action=BotAction(
+                    BotActionKind.DEPLOY,
+                    tool_id=int(C.MEDPACK_TOOL),
+                    position=patient.position,
+                ),
+                debug_role="medic_support",
+            )
+        movement = self._path_direction(
+            observer.position,
+            patient.position,
+            state,
+            now,
+            agent_id=observer.player_id,
+            velocity=observer.velocity,
+            abilities=self._movement_abilities(observer),
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=movement,
+                sprint=True,
+                affordance=state.last_affordance,
+            ),
+            look=LookIntent(patient.position, visible=False),
+            debug_role="medic_support",
+        )
+
+    def _miner_demolition(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        contact,
+        now: float,
+        direction: Vector3,
+    ) -> BotIntent | None:
+        """Blow a wall between a Miner and a stale contact, then retreat."""
+
+        if int(observer.class_id) != int(C.CLASS_MINER):
+            return None
+        if int(C.DYNAMITE_TOOL) not in observer.loadout:
+            return None
+        if now < state.next_dynamite_at or now - contact.seen_at < 2.0:
+            return None
+        if math.hypot(direction[0], direction[1]) <= 0.1:
+            return None
+        blocking_reader = getattr(self.world, "blocking_cell", None)
+        blocking = (
+            blocking_reader(observer.position, direction)
+            if callable(blocking_reader)
+            else None
+        )
+        if blocking is None:
+            return None
+        state.next_dynamite_at = now + 15.0
+        target = tuple(float(value) + 0.5 for value in blocking)
+        fuse = float(getattr(C, "DYNAMITE_FUSE_TIME", 7.0))
+        state.retreat_from = target
+        state.retreat_until = now + fuse + 1.0
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True, affordance=MovementAffordance.BREACH
+            ),
+            look=LookIntent(target, visible=False),
+            tool_id=int(C.DYNAMITE_TOOL),
+            action=BotAction(
+                BotActionKind.DEPLOY,
+                tool_id=int(C.DYNAMITE_TOOL),
+                position=target,
+            ),
+            debug_role="miner_demolition",
+        )
+
+    def _proactive_breach(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+        direction: Vector3,
+    ) -> BotIntent | None:
+        """Let mining classes attack an immediate route obstruction early."""
+
+        breach_classes = {
+            int(C.CLASS_MINER),
+            int(C.CLASS_ZOMBIE),
+            int(C.CLASS_FAST_ZOMBIE),
+            int(C.CLASS_JUMP_ZOMBIE),
+        }
+        if (
+            int(observer.class_id) not in breach_classes
+            or now < state.next_breach_at
+            or math.hypot(direction[0], direction[1]) <= 0.1
+        ):
+            return None
+        blocking_reader = getattr(self.world, "blocking_cell", None)
+        blocking = (
+            blocking_reader(observer.position, direction)
+            if callable(blocking_reader)
+            else None
+        )
+        melee = self._preferred_melee_tool(observer)
+        if blocking is None or melee is None:
+            return None
+        interval = (
+            float(getattr(C, "ZOMBIEHAND_SHOOT_INTERVAL", 0.4))
+            if int(observer.class_id) in _ZOMBIE_CLASSES
+            else 0.55
+        )
+        state.next_breach_at = now + interval
+        target = tuple(float(value) + 0.5 for value in blocking)
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True,
+                affordance=MovementAffordance.BREACH,
+            ),
+            look=LookIntent(target, visible=False),
+            tool_id=melee,
+            action=BotAction(
+                BotActionKind.MELEE,
+                tool_id=melee,
+                position=target,
+            ),
+            debug_role=(
+                "zombie_fast_breach"
+                if int(observer.class_id) in _ZOMBIE_CLASSES
+                else "proactive_breach"
+            ),
+        )
+
+    def _zombie_hunt_breach(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        objective: Vector3,
+        now: float,
+    ) -> BotIntent | None:
+        """Claw the terrain hiding a nearby hunt marker from an infected bot.
+
+        Fires only near the sanctioned marker: the first solid cell along the
+        eye line within claw range becomes the dig target, so the horde eats
+        through cover instead of orbiting it blindly.
+        """
+
+        if int(observer.class_id) not in _ZOMBIE_CLASSES:
+            return None
+        if now < state.next_breach_at:
+            return None
+        melee = self._preferred_melee_tool(observer)
+        if melee is None:
+            return None
+        planar = math.hypot(
+            objective[0] - observer.position[0],
+            objective[1] - observer.position[1],
+        )
+        if planar > 8.0 or planar <= 1e-6:
+            return None
+        origin = observer.eye
+        dx = objective[0] - origin[0]
+        dy = objective[1] - origin[1]
+        dz = objective[2] - origin[2]
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if distance <= 1e-6:
+            return None
+        reach = min(3.5, distance)
+        steps = max(2, int(math.ceil(reach * 2.0)))
+        cell = None
+        for index in range(1, steps + 1):
+            fraction = (index / steps) * (reach / distance)
+            x = int(math.floor(origin[0] + dx * fraction))
+            y = int(math.floor(origin[1] + dy * fraction))
+            z = int(math.floor(origin[2] + dz * fraction))
+            if self.world.solid(x, y, z):
+                cell = (x, y, z)
+                break
+        if cell is None:
+            return None
+        interval = (
+            float(getattr(C, "ZOMBIEHAND_SHOOT_INTERVAL", 0.4))
+            if int(observer.class_id) in _ZOMBIE_CLASSES
+            else 0.55
+        )
+        state.next_breach_at = now + interval
+        target = tuple(float(value) + 0.5 for value in cell)
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True, affordance=MovementAffordance.BREACH
+            ),
+            look=LookIntent(target, visible=False),
+            tool_id=melee,
+            action=BotAction(
+                BotActionKind.MELEE,
+                tool_id=melee,
+                position=target,
+            ),
+            debug_role="zombie_hunt_breach",
+        )
+
+    def _stuck_recovery(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Try one bounded breach or bridge edge after 0.75s without progress."""
+
+        direction = state.last_path_direction
+        if (
+            state.last_progress_at <= 0.0
+            or now - state.last_progress_at < 0.75
+            or math.hypot(direction[0], direction[1]) <= 0.1
+        ):
+            return None
+        state.last_progress_at = now
+        state.stuck_attempts += 1
+        blocking = self.world.blocking_cell(observer.position, direction)
+        preferred = self._preferred_melee_tool(observer)
+        if blocking is not None and preferred is not None and state.stuck_attempts <= 3:
+            target = tuple(float(value) + 0.5 for value in blocking)
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    crouch=True, affordance=MovementAffordance.BREACH
+                ),
+                look=LookIntent(target, visible=False),
+                tool_id=preferred,
+                action=BotAction(
+                    BotActionKind.MELEE,
+                    tool_id=preferred,
+                    position=target,
+                ),
+            )
+        bridge = self.world.bridge_cell(observer.position, direction)
+        if (
+            bridge is not None
+            and int(C.BLOCK_TOOL) in observer.loadout
+            and observer.blocks > 0
+            and state.stuck_attempts <= 3
+        ):
+            target = tuple(float(value) for value in bridge)
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    crouch=True, affordance=MovementAffordance.BUILD_BRIDGE
+                ),
+                look=LookIntent(target, visible=False),
+                tool_id=int(C.BLOCK_TOOL),
+                action=BotAction(
+                    BotActionKind.BUILD,
+                    tool_id=int(C.BLOCK_TOOL),
+                    position=target,
+                ),
+            )
+        zombie_prefabs = tuple(
+            name for name in observer.prefabs if "zombie" in name.lower()
+        )
+        if (
+            int(observer.class_id) in _ZOMBIE_CLASSES
+            and zombie_prefabs
+            and int(C.ZOMBIE_PREFAB_TOOL) in observer.loadout
+            and observer.blocks >= 100
+            and state.stuck_attempts <= 3
+            and now >= state.next_zombie_build_at
+        ):
+            # Zombie classes do not own the ordinary block tool. Their native
+            # construction affordance is tool 28 plus hand/bone/head prefabs.
+            # The upright hand is the first climbing step; after another
+            # failed route the long bone becomes a bridge/ramp. The gameplay
+            # service rechecks stock, collision, support, and protected zones.
+            preferred_name = (
+                "prefab_zombiebone"
+                if state.stuck_attempts >= 2
+                else "prefab_zombiehand"
+            )
+            zombie_prefab = next(
+                (
+                    name for name in zombie_prefabs
+                    if name.lower() == preferred_name
+                ),
+                zombie_prefabs[0],
+            )
+            target = (
+                observer.position[0] + direction[0] * 4.0,
+                observer.position[1] + direction[1] * 4.0,
+                observer.position[2],
+            )
+            state.next_zombie_build_at = now + 2.0
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    crouch=True,
+                    affordance=MovementAffordance.BUILD_STEP,
+                ),
+                look=LookIntent(target, visible=False),
+                tool_id=int(C.ZOMBIE_PREFAB_TOOL),
+                action=BotAction(
+                    BotActionKind.PLACE_PREFAB,
+                    tool_id=int(C.ZOMBIE_PREFAB_TOOL),
+                    position=target,
+                    argument=str(zombie_prefab),
+                    yaw=math.atan2(direction[1], direction[0]),
+                ),
+                debug_role="zombie_build_climb",
+            )
+        if state.stuck_attempts >= 3:
+            # Abandon this local route and let patrol/objective selection pick
+            # a different heading on the next strategic tick.
+            state.last_path_direction = (0.0, 0.0, 0.0)
+            state.next_patrol_turn = 0.0
+        return None
+
+    def _class_world_action(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        profile: BotProfile,
+        now: float,
+        *,
+        role: str = "",
+    ) -> BotIntent | None:
+        """Occasionally request one real class deployable while out of combat.
+
+        This is intentionally conservative: the worker suggests only a tool
+        present in the normalized life loadout, and the gameplay-thread service
+        repeats class, held-tool, stock, range, and entity-limit checks.
+        """
+
+        defensive_role = any(
+            token in str(role).lower()
+            for token in ("defend", "guard", "fortify", "escort")
+        )
+        if state.next_world_action_at <= 0.0:
+            state.next_world_action_at = now + self._rng.uniform(
+                0.8 if defensive_role else 2.0,
+                2.5 if defensive_role else 6.0,
+            )
+            return None
+        if now < state.next_world_action_at:
+            return None
+        state.next_world_action_at = now + self._rng.uniform(
+            6.0 if defensive_role else 18.0,
+            14.0 if defensive_role else 35.0,
+        )
+        deployables = [tool for tool in observer.loadout if tool in _DEPLOYABLE_TOOLS]
+        can_prefab = (
+            int(C.PREFAB_TOOL) in observer.loadout
+            and bool(observer.prefabs)
+            and observer.blocks >= 16
+        )
+        if not deployables and not can_prefab:
+            return None
+        # Low-creativity profiles sometimes conserve equipment. The fixed RNG
+        # seed keeps this behavior reproducible in soak and statistical tests.
+        if (
+            not defensive_role
+            and self._rng.random() > 0.45 + 0.5 * float(profile.creativity)
+        ):
+            return None
+        choose_prefab = can_prefab and (
+            not deployables
+            or self._rng.random()
+            < (
+                0.45 + 0.35 * float(profile.creativity)
+                if defensive_role
+                else 0.15 + 0.35 * float(profile.creativity)
+            )
+        )
+        tool = (
+            int(C.PREFAB_TOOL)
+            if choose_prefab
+            else int(deployables[observer.player_id % len(deployables)])
+        )
+        last_used = state.last_world_action.get(tool, -math.inf)
+        if now - last_used < 15.0:
+            return None
+        if tool not in (int(C.DISGUISE_TOOL), int(C.PREFAB_TOOL)) and any(
+            entity.alive
+            and entity.owner_id == observer.player_id
+            for entity in frame.entities
+        ):
+            return None
+
+        forward = _normalized_xy(observer.orientation[0], observer.orientation[1])
+        distance = 4.0 if choose_prefab else 1.5
+        position = (
+            observer.position[0] + forward[0] * distance,
+            observer.position[1] + forward[1] * distance,
+            observer.position[2] + 2.0,
+        )
+        state.last_world_action[tool] = now
+        if choose_prefab:
+            name = observer.prefabs[
+                (observer.player_id + frame.frame_id) % len(observer.prefabs)
+            ]
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    crouch=True, affordance=MovementAffordance.PLACE_PREFAB
+                ),
+                look=LookIntent(position, visible=False),
+                tool_id=int(C.PREFAB_TOOL),
+                action=BotAction(
+                    BotActionKind.PLACE_PREFAB,
+                    tool_id=int(C.PREFAB_TOOL),
+                    position=position,
+                    argument=str(name),
+                    yaw=math.atan2(observer.orientation[1], observer.orientation[0]),
+                ),
+            )
+        action = BotAction(
+            BotActionKind.DEPLOY,
+            tool_id=tool,
+            position=None if tool == int(C.DISGUISE_TOOL) else position,
+            face=4,
+            yaw=math.atan2(observer.orientation[1], observer.orientation[0]),
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(),
+            look=LookIntent(position, visible=False),
+            tool_id=tool,
+            action=action,
+        )
+
+    @staticmethod
+    def _objective_decision(
+        frame: PerceptionFrame, observer: PlayerSnapshot
+    ) -> ModeBotDecision | None:
+        """Return legal mode/phase knowledge and its inspectable role."""
+        return objective_decision_for(frame, observer)
+
+    @staticmethod
+    def _resource_goal(
+        frame: PerceptionFrame, observer: PlayerSnapshot
+    ) -> Vector3 | None:
+        """Choose a visible world resource only when current stock is critical."""
+
+        desired_types: set[int] = set()
+        if observer.health < 50:
+            desired_types.add(int(C.HEALTH_CRATE))
+        if observer.ammo_clip <= 1 and observer.ammo_reserve <= 12:
+            desired_types.add(int(C.AMMO_CRATE))
+        if observer.blocks < 12 and int(C.BLOCK_TOOL) in observer.loadout:
+            desired_types.add(int(C.BLOCK_CRATE))
+        if not desired_types:
+            return None
+        candidates = [
+            entity
+            for entity in frame.entities
+            if entity.alive
+            and entity.entity_type in desired_types
+            and entity.team in (-1, int(C.TEAM_NEUTRAL), observer.team)
+            and _distance_squared(observer.position, entity.position) <= 160.0**2
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda entity: _distance_squared(observer.position, entity.position),
+        ).position
+
+    def _engage(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        state: _BrainState,
+        profile: BotProfile,
+        now: float,
+    ) -> BotIntent:
+        if (
+            int(observer.class_id) in _ZOMBIE_CLASSES
+            and int(C.ZOMBIEHAND_TOOL) in observer.loadout
+        ):
+            return self._engage_zombie(
+                frame,
+                observer,
+                target,
+                state,
+                now,
+            )
+
+        dx = target.position[0] - observer.position[0]
+        dy = target.position[1] - observer.position[1]
+        distance = math.hypot(dx, dy)
+        weapon_tool = (
+            int(observer.weapon_tool)
+            if int(observer.weapon_tool) in observer.loadout
+            else int(observer.tool)
+        )
+        melee_tool = self._preferred_melee_tool(observer)
+        dry_weapon = observer.ammo_clip <= 0 and observer.ammo_reserve <= 0
+        # The weapon's engagement envelope decides spacing: snipers hold far
+        # and stationary, shotguns and SMGs close in, rifles fight midrange.
+        envelope = envelope_for(weapon_tool)
+        band_min = float(envelope.ideal_min)
+        band_max = float(envelope.ideal_max)
+        stationary_hold = False
+        cover_direction = (0.0, 0.0, 0.0)
+        cover_reader = getattr(self.world, "cover_direction", None)
+        if (
+            callable(cover_reader)
+            and (
+                observer.health < 40
+                or (profile.caution > 0.75 and distance < band_min)
+            )
+        ):
+            cover_direction = cover_reader(observer.position, target.eye)
+        seeking_cover = math.hypot(cover_direction[0], cover_direction[1]) > 0.1
+        if dry_weapon and melee_tool is not None:
+            # Once ammunition is truly exhausted, close for a real selected
+            # melee attack instead of dry-firing the primary forever.
+            movement = self._path_direction(
+                observer.position,
+                target.position,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+            seeking_cover = False
+        elif seeking_cover:
+            # Peek discipline: settle behind cover for a beat, lean out for a
+            # short strafe, then tuck back in, instead of oscillating.
+            state.last_affordance = MovementAffordance.WALK
+            if now >= state.hold_until and now >= state.peek_until:
+                if state.peek_until >= state.hold_until:
+                    # A peek (or a fresh engagement) just ended: settle in.
+                    state.hold_until = now + self._rng.uniform(1.2, 2.5)
+                else:
+                    # The hold just ended: lean out.
+                    state.peek_until = now + self._rng.uniform(0.6, 1.2)
+                    state.strafe_sign = (
+                        -1.0 if self._rng.random() < 0.5 else 1.0
+                    )
+            if now < state.hold_until:
+                movement = cover_direction
+            else:
+                movement = _normalized_xy(
+                    -dy * state.strafe_sign,
+                    dx * state.strafe_sign,
+                )
+        elif distance > band_max:
+            movement = self._path_direction(
+                observer.position,
+                target.position,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+        elif distance < max(2.0, band_min * 0.6):
+            state.last_affordance = MovementAffordance.WALK
+            movement = _normalized_xy(-dx, -dy)
+        elif envelope.prefers_stationary and distance >= band_min:
+            # Hold a firing position; shift a few blocks laterally every few
+            # seconds so the bot is not a permanent statue.
+            state.last_affordance = MovementAffordance.WALK
+            if now >= state.next_reposition_at:
+                state.strafe_sign = -1.0 if self._rng.random() < 0.5 else 1.0
+                state.reposition_until = now + self._rng.uniform(0.8, 1.5)
+                state.next_reposition_at = now + self._rng.uniform(4.0, 7.0)
+            if now < state.reposition_until:
+                movement = _normalized_xy(
+                    -dy * state.strafe_sign,
+                    dx * state.strafe_sign,
+                )
+            else:
+                stationary_hold = True
+                movement = (0.0, 0.0, 0.0)
+        else:
+            state.last_affordance = MovementAffordance.WALK
+            # Hold a strafe for a human-sized interval. Random-per-frame side
+            # changes look like jitter and make the bot easier, not smarter.
+            if now >= state.next_strafe_switch_at:
+                state.strafe_sign = -1.0 if self._rng.random() < 0.5 else 1.0
+                state.next_strafe_switch_at = now + self._rng.uniform(0.7, 1.6)
+            movement = _normalized_xy(
+                -dy * state.strafe_sign,
+                dx * state.strafe_sign,
+            )
+        action = BotAction()
+        oriented_stock = dict(observer.oriented_stock)
+        oriented = [
+            int(tool)
+            for tool in observer.loadout
+            if int(tool) in _ORIENTED_TOOLS
+            and oriented_stock.get(int(tool), 1) > 0
+        ]
+        if observer.reloading:
+            # Tool selection outside the primary weapon cancels Player.reload;
+            # wait for the already-started reload instead of selecting a
+            # grenade/deployable on the next perception frame.
+            action = BotAction()
+        elif observer.ammo_clip <= 0 and observer.ammo_reserve > 0:
+            action = BotAction(BotActionKind.RELOAD, tool_id=weapon_tool)
+        elif dry_weapon:
+            if melee_tool is not None and distance <= 4.25:
+                weapon_tool = melee_tool
+                action = BotAction(BotActionKind.MELEE, tool_id=melee_tool)
+        elif seeking_cover and observer.health < 30:
+            action = BotAction()
+        else:
+            cover = self._combat_cover_intent(
+                frame,
+                observer,
+                target,
+                state,
+                profile,
+                now,
+            )
+            if cover is not None:
+                return cover
+
+        if (
+            action.kind is BotActionKind.NONE
+            and not dry_weapon
+            and not observer.reloading
+            and not (seeking_cover and observer.health < 30)
+            and now - state.acquired_at
+            >= profile.reaction_time + state.reaction_bonus
+            and (
+            oriented
+            and 12.0 <= distance <= 65.0
+            and now >= state.next_oriented_at
+            and self._rng.random() < 0.10 + float(profile.creativity) * 0.22
+            )
+        ):
+            chosen = oriented[(observer.player_id + frame.frame_id) % len(oriented)]
+            state.next_oriented_at = now + self._rng.uniform(5.0, 11.0)
+            action = BotAction(BotActionKind.ORIENTED, tool_id=chosen)
+            weapon_tool = chosen
+        elif (
+            action.kind is BotActionKind.NONE
+            and not dry_weapon
+            and not observer.reloading
+            and not (seeking_cover and observer.health < 30)
+            and observer.ammo_clip > 0
+            and now - state.acquired_at
+            >= profile.reaction_time + state.reaction_bonus
+        ):
+            burst_low, burst_high = envelope.burst_shots
+            action = BotAction(
+                BotActionKind.FIRE,
+                tool_id=weapon_tool,
+                burst=self._rng.randint(int(burst_low), int(burst_high)),
+                # Disciplined shooters pause less between bursts.
+                burst_pause=self._rng.uniform(*envelope.burst_pause)
+                * (1.3 - 0.5 * float(profile.burst_discipline)),
+            )
+
+        jump = self._combat_jump_due(
+            observer,
+            state,
+            profile,
+            now,
+            distance=distance,
+            seeking_cover=seeking_cover,
+        )
+        # AoS z increases downward. The torso sample is therefore below the
+        # eye; an occasional persistent head decision uses the eye sample.
+        lead_time = min(0.18, max(0.0, float(profile.tracking_delay)))
+        aim_offset_z = 0.0 if state.aim_head else 1.15
+        aim_target = (
+            target.eye[0] + state.delayed_target_velocity[0] * lead_time,
+            target.eye[1] + state.delayed_target_velocity[1] * lead_time,
+            target.eye[2]
+            + state.delayed_target_velocity[2] * lead_time
+            + aim_offset_z,
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=movement,
+                jump=jump,
+                crouch=(seeking_cover and observer.health < 35)
+                or stationary_hold,
+                sneak=seeking_cover and observer.health < 55,
+                sprint=(distance > band_max)
+                or (dry_weapon and melee_tool is not None),
+                affordance=state.last_affordance,
+            ),
+            # The frozen aim point stays the fallback; the ids authorize the
+            # director's short-lease live refinement of this visible target.
+            look=LookIntent(
+                aim_target,
+                visible=True,
+                target_player_id=int(target.player_id),
+                target_generation=int(target.generation),
+                aim_offset_z=aim_offset_z,
+            ),
+            tool_id=weapon_tool,
+            action=action,
+        )
+
+    def _engage_zombie(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent:
+        """Commit an infected bot to contact-range pursuit and claw attacks.
+
+        Zombie hands are melee weapons even when the compatibility snapshot
+        contains non-zero ammo counters.  They never apply firearm preferred
+        range, cover retreat, reload, or reaction-delay branches.  Terrain
+        pathing remains worker-owned, while the final hand swing still passes
+        through authoritative LOS, cadence, hitbox, damage, and replication.
+        """
+
+        dx = target.position[0] - observer.position[0]
+        dy = target.position[1] - observer.position[1]
+        distance = math.hypot(dx, dy)
+        direct = _normalized_xy(dx, dy)
+        if distance <= 6.0:
+            # Detour correctly ends at the nearest walkable polygon, but a
+            # living target's occupied cell is not itself a path endpoint.
+            # Direct contact steering closes the final body-width gap instead
+            # of idling just outside the hand ray.
+            movement = direct
+            state.last_affordance = MovementAffordance.WALK
+        else:
+            movement = self._path_direction(
+                observer.position,
+                target.position,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+
+        class_id = int(observer.class_id)
+        if class_id == int(C.CLASS_FAST_ZOMBIE) and 4.0 < distance < 24.0:
+            # A small persistent weave makes the fast variant harder to track
+            # without overriding the collision-safe forward path.
+            if now >= state.next_strafe_switch_at:
+                state.strafe_sign *= -1.0
+                state.next_strafe_switch_at = now + self._rng.uniform(0.55, 0.9)
+            movement = _normalized_xy(
+                movement[0] - movement[1] * 0.18 * state.strafe_sign,
+                movement[1] + movement[0] * 0.18 * state.strafe_sign,
+            )
+
+        aim_target = (
+            target.eye[0],
+            target.eye[1],
+            target.eye[2] + 1.0,
+        )
+        aim_delta = tuple(
+            aim_target[index] - observer.eye[index] for index in range(3)
+        )
+        aim_length = math.sqrt(sum(value * value for value in aim_delta))
+        orientation_length = math.sqrt(
+            sum(float(value) * float(value) for value in observer.orientation)
+        )
+        alignment = -1.0
+        if aim_length > 1e-6 and orientation_length > 1e-6:
+            alignment = sum(
+                float(observer.orientation[index]) * aim_delta[index]
+                for index in range(3)
+            ) / (aim_length * orientation_length)
+
+        # Alignment matters at arm's length but not in a contact scrum: the
+        # angle to a torso point swings wildly while bodies collide, so the
+        # gate tapers away at point-blank range (mirrored by the director).
+        if distance <= 1.2:
+            min_alignment = -1.0
+        elif distance <= 2.5:
+            min_alignment = 0.72 * ((distance - 1.2) / 1.3)
+        else:
+            min_alignment = 0.72
+        action = BotAction()
+        if distance <= 4.25 and alignment >= min_alignment:
+            action = BotAction(
+                BotActionKind.MELEE,
+                tool_id=int(C.ZOMBIEHAND_TOOL),
+            )
+
+        jump = self._zombie_jump_due(
+            observer,
+            target,
+            state,
+            now,
+            distance=distance,
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=movement,
+                jump=jump,
+                sprint=True,
+                affordance=state.last_affordance,
+            ),
+            look=LookIntent(
+                aim_target,
+                visible=True,
+                target_player_id=int(target.player_id),
+                target_generation=int(target.generation),
+                aim_offset_z=1.0,
+            ),
+            tool_id=int(C.ZOMBIEHAND_TOOL),
+            action=action,
+            debug_role=(
+                "zombie_contact_strike"
+                if action.kind is BotActionKind.MELEE
+                else "zombie_contact_charge"
+            ),
+        )
+
+    def _zombie_jump_due(
+        self,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+        *,
+        distance: float,
+    ) -> bool:
+        """Apply internal Fast/Jump Zombie mobility without jump spamming."""
+
+        if not observer.grounded or now < state.next_combat_jump_at:
+            return False
+        class_id = int(observer.class_id)
+        target_is_higher = target.position[2] < observer.position[2] - 0.75
+        if class_id == int(C.CLASS_JUMP_ZOMBIE):
+            if not (target_is_higher or 2.0 <= distance <= 38.0):
+                return False
+            state.next_combat_jump_at = now + self._rng.uniform(0.65, 0.9)
+            return True
+        if class_id == int(C.CLASS_FAST_ZOMBIE):
+            if not (target_is_higher or 5.0 <= distance <= 28.0):
+                return False
+            state.next_combat_jump_at = now + self._rng.uniform(1.15, 1.7)
+            return target_is_higher or self._rng.random() < 0.45
+        if class_id == int(C.CLASS_ZOMBIE) and target_is_higher and distance <= 18.0:
+            state.next_combat_jump_at = now + self._rng.uniform(1.4, 2.0)
+            return True
+        return False
+
+    def _combat_cover_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        state: _BrainState,
+        profile: BotProfile,
+        now: float,
+    ) -> BotIntent | None:
+        """Build one safe real cover cell/prefab under serious pressure."""
+
+        pressured = observer.health <= 35 or (
+            observer.health <= 55 and profile.caution >= 0.75
+        )
+        if not pressured or now < state.next_cover_build_at:
+            return None
+        position_reader = getattr(self.world, "cover_build_cell", None)
+        cell = (
+            position_reader(observer.position, target.eye)
+            if callable(position_reader)
+            else None
+        )
+        if cell is None:
+            state.next_cover_build_at = now + 1.0
+            return None
+        can_block = int(C.BLOCK_TOOL) in observer.loadout and observer.blocks > 0
+        can_prefab = (
+            int(C.PREFAB_TOOL) in observer.loadout
+            and bool(observer.prefabs)
+            and observer.blocks >= 16
+        )
+        if not can_block and not can_prefab:
+            return None
+
+        use_prefab = can_prefab and (
+            not can_block
+            or (
+                observer.health <= 22
+                and self._rng.random() < 0.35 + profile.creativity * 0.45
+            )
+        )
+        state.next_cover_build_at = now + self._rng.uniform(6.0, 11.0)
+        position = tuple(float(value) for value in cell)
+        yaw = math.atan2(
+            target.position[1] - observer.position[1],
+            target.position[0] - observer.position[0],
+        )
+        if use_prefab:
+            name = observer.prefabs[
+                (observer.player_id + frame.frame_id) % len(observer.prefabs)
+            ]
+            action = BotAction(
+                BotActionKind.PLACE_PREFAB,
+                tool_id=int(C.PREFAB_TOOL),
+                position=position,
+                argument=str(name),
+                yaw=yaw,
+            )
+            tool = int(C.PREFAB_TOOL)
+            role = "combat_prefab_cover"
+        else:
+            action = BotAction(
+                BotActionKind.BUILD,
+                tool_id=int(C.BLOCK_TOOL),
+                position=position,
+            )
+            tool = int(C.BLOCK_TOOL)
+            role = "combat_block_cover"
+        state.last_world_action[tool] = now
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True,
+                sneak=True,
+                affordance=MovementAffordance.BUILD_STEP,
+            ),
+            look=LookIntent(position, visible=False),
+            tool_id=tool,
+            action=action,
+            debug_role=role,
+        )
+
+    def _combat_jump_due(
+        self,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        profile: BotProfile,
+        now: float,
+        *,
+        distance: float,
+        seeking_cover: bool,
+    ) -> bool:
+        """Return one grounded, cooldown-bounded evasive jump decision."""
+
+        if (
+            not observer.grounded
+            or observer.reloading
+            or seeking_cover
+            or not 5.0 <= distance <= 45.0
+            or now < state.next_combat_jump_at
+        ):
+            return False
+        state.next_combat_jump_at = now + max(
+            1.1,
+            self._rng.uniform(2.0, 3.2) - profile.skill * 0.8,
+        )
+        chance = 0.10 + profile.skill * 0.32 + profile.aggression * 0.18
+        return (
+            profile.skill + profile.aggression >= 1.60
+            or self._rng.random() < chance
+        )
+
+    def _path_direction(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        state: _BrainState,
+        now: float,
+        *,
+        agent_id: int,
+        velocity: Vector3,
+        abilities: frozenset[MovementAffordance],
+    ) -> Vector3:
+        elapsed = max(0.0, now - self._path_refill_at)
+        self._path_refill_at = now
+        self._path_tokens = min(
+            self._path_rate,
+            self._path_tokens + elapsed * self._path_rate,
+        )
+        if self._path_tokens < 1.0:
+            return state.last_path_direction
+        self._path_tokens -= 1.0
+        state.last_path_direction = self.world.next_path_direction(
+            start,
+            goal,
+            agent_id=agent_id,
+            velocity=velocity,
+            abilities=abilities,
+        )
+        affordance_reader = getattr(self.world, "last_affordance", None)
+        state.last_affordance = (
+            affordance_reader(agent_id)
+            if callable(affordance_reader)
+            else MovementAffordance.WALK
+        )
+        return state.last_path_direction
+
+    @staticmethod
+    def _movement_abilities(
+        observer: PlayerSnapshot,
+    ) -> frozenset[MovementAffordance]:
+        """Derive legal topology edges from the normalized current life."""
+
+        abilities = {
+            MovementAffordance.CROUCH,
+            MovementAffordance.JUMP,
+            MovementAffordance.DROP,
+        }
+        if (
+            int(observer.jetpack_id)
+            in {
+                int(C.JETPACK_NORMAL),
+                int(C.JETPACK2),
+                int(C.JETPACK_ENGINEER),
+                int(C.JETPACK_UGCBUILDER),
+            }
+            and float(observer.jetpack_fuel) >= 10.0
+        ):
+            abilities.add(MovementAffordance.JETPACK)
+        return frozenset(abilities)
+
+    def _patrol(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent:
+        state.last_affordance = MovementAffordance.WALK
+        if now >= state.next_patrol_turn:
+            state.patrol_heading = self._rng.uniform(-math.pi, math.pi)
+            state.next_patrol_turn = now + self._rng.uniform(1.5, 3.5)
+        direction = (
+            math.cos(state.patrol_heading),
+            math.sin(state.patrol_heading),
+            0.0,
+        )
+        # Sweep the gaze slowly across the heading instead of a fixed stare:
+        # patrolling humans keep checking their flanks.
+        scan = state.patrol_heading + 0.7 * math.sin(
+            now * 0.9 + float(observer.player_id)
+        )
+        look_target = (
+            observer.eye[0] + math.cos(scan) * 8.0,
+            observer.eye[1] + math.sin(scan) * 8.0,
+            observer.eye[2],
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(direction=direction),
+            look=LookIntent(look_target, visible=False),
+        )
+
+    def _visible_enemies(
+        self,
+        observer: PlayerSnapshot,
+        players: tuple[PlayerSnapshot, ...],
+        state: _BrainState,
+    ) -> list[PlayerSnapshot]:
+        result: list[PlayerSnapshot] = []
+        alerted = bool(state.contacts)
+        fov_cos = _ALERTED_FOV_COS if alerted else _UNALERTED_FOV_COS
+        forward_xy = _normalized_xy(observer.orientation[0], observer.orientation[1])
+        for candidate in players:
+            if (
+                candidate.player_id == observer.player_id
+                or candidate.team == observer.team
+                or not candidate.alive
+                or not candidate.spawned
+            ):
+                continue
+            delta = (
+                candidate.eye[0] - observer.eye[0],
+                candidate.eye[1] - observer.eye[1],
+                candidate.eye[2] - observer.eye[2],
+            )
+            distance_sq = sum(value * value for value in delta)
+            if distance_sq > _VISUAL_RANGE * _VISUAL_RANGE:
+                continue
+            planar = math.hypot(delta[0], delta[1])
+            if planar > 1e-6:
+                facing_dot = (
+                    forward_xy[0] * delta[0] + forward_xy[1] * delta[1]
+                ) / planar
+                if facing_dot < fov_cos:
+                    continue
+            if self.world.has_line_of_sight(observer.eye, candidate.eye):
+                result.append(candidate)
+        return result
+
+    @staticmethod
+    def _expire_contacts(state: _BrainState, now: float) -> None:
+        expired = [
+            player_id
+            for player_id, contact in state.contacts.items()
+            if contact.age(now) > _CONTACT_LIFETIME
+        ]
+        for player_id in expired:
+            del state.contacts[player_id]
+            if state.target_id == player_id:
+                state.target_id = None
+
+    @staticmethod
+    def _best_contact(
+        observer: PlayerSnapshot, state: _BrainState, now: float
+    ) -> LastSeenContact | None:
+        if not state.contacts:
+            return None
+        for contact in state.contacts.values():
+            contact.uncertainty = min(24.0, contact.age(now) * 3.0)
+        return min(
+            state.contacts.values(),
+            key=lambda contact: _distance_squared(observer.position, contact.position),
+        )
+
+    @staticmethod
+    def _intent(
+        frame: PerceptionFrame,
+        now: float,
+        *,
+        movement: MovementIntent,
+        look: LookIntent | None,
+        tool_id: int = -1,
+        action: BotAction = BotAction(),
+        debug_role: str = "",
+    ) -> BotIntent:
+        direction = movement.direction
+        debug_path = ()
+        if math.hypot(direction[0], direction[1]) > 1e-6:
+            observer = next(
+                (
+                    player
+                    for player in frame.players
+                    if player.player_id == frame.observer_id
+                ),
+                None,
+            )
+            if observer is not None:
+                debug_path = (
+                    observer.position,
+                    (
+                        observer.position[0] + direction[0] * 4.0,
+                        observer.position[1] + direction[1] * 4.0,
+                        observer.position[2] + direction[2] * 4.0,
+                    ),
+                )
+        return BotIntent(
+            bot_id=frame.observer_id,
+            bot_generation=frame.observer_generation,
+            frame_id=frame.frame_id,
+            map_epoch=frame.map_epoch,
+            mode_epoch=frame.mode_epoch,
+            topology_version=frame.topology_version,
+            created_at=now,
+            expires_at=now + 0.250,
+            movement=movement,
+            look=look,
+            tool_id=tool_id,
+            action=action,
+            debug_goal=look.target if look is not None else None,
+            debug_path=debug_path,
+            debug_role=str(debug_role),
+        )
+
+
+def _fallback_profile(player_id: int) -> BotProfile:
+    return BotProfile(
+        name=f"Bot{player_id}",
+        difficulty="normal",
+        skill=0.55,
+        aggression=0.55,
+        caution=0.50,
+        teamwork=0.55,
+        creativity=0.50,
+        reaction_time=0.32,
+        tracking_delay=0.12,
+        turn_speed=3.8,
+        turn_acceleration=13.0,
+        recoil_control=0.60,
+        burst_discipline=0.60,
+        preferred_range=24.0,
+        aim_noise=0.055,
+    )
+
+
+def _process_worker_batch(
+    world: WorkerVoxelWorld,
+    brain: BotBrain,
+    messages: Iterable[object],
+) -> tuple[bool, list[BotIntent]]:
+    """Apply world messages and decide only the newest frame per bot life."""
+
+    frames: dict[tuple[int, int], PerceptionFrame] = {}
+    for message in messages:
+        if isinstance(message, WorkerShutdown):
+            return True, []
+        if isinstance(message, MapSnapshot):
+            world.load(message)
+            # Any earlier frame describes the old map generation.
+            frames.clear()
+            continue
+        if isinstance(message, WorldDelta):
+            world.apply(message)
+            continue
+        if isinstance(message, PerceptionFrame):
+            key = int(message.observer_id), int(message.observer_generation)
+            previous = frames.get(key)
+            if previous is None or message.frame_id > previous.frame_id:
+                frames[key] = message
+
+    intents: list[BotIntent] = []
+    for frame in sorted(frames.values(), key=lambda item: item.frame_id):
+        # The director also checks exact epochs. Filtering here avoids doing
+        # expensive LOS/path work for an intention guaranteed to be rejected.
+        if (
+            frame.map_epoch != world.map_epoch
+            or frame.topology_version != world.topology_version
+        ):
+            continue
+        intent = brain.decide(frame)
+        if intent is not None:
+            intents.append(intent)
+    return False, intents
+
+
+def run_worker(
+    input_queue,
+    output_queue,
+    seed: int = 0,
+    decision_hz: float = 8.0,
+    path_requests_per_second: float = 24.0,
+) -> None:
+    """Child-process entry point; process messages until orderly shutdown."""
+
+    world = WorkerVoxelWorld()
+    brain = BotBrain(
+        world,
+        seed=seed,
+        decision_hz=decision_hz,
+        path_requests_per_second=path_requests_per_second,
+    )
+    while True:
+        try:
+            first = input_queue.get(timeout=0.25)
+        except queue.Empty:
+            world.tactical.rebuild(64)
+            continue
+        messages = [first]
+        # Multiprocessing queues are intentionally allowed to contain a short
+        # burst. Drain it now and coalesce snapshots before doing any costly
+        # path/LOS work, preventing old frames from accumulating over a match.
+        for _ in range(63):
+            try:
+                messages.append(input_queue.get_nowait())
+            except queue.Empty:
+                break
+        shutdown, intents = _process_worker_batch(world, brain, messages)
+        if shutdown:
+            return
+        # Between batches, advance the incremental tactical layer a bounded
+        # step so a full map summarizes within a couple of seconds without
+        # ever competing with perception or pathfinding work.
+        world.tactical.rebuild(64)
+        for intent in intents:
+            try:
+                output_queue.put_nowait(intent)
+            except queue.Full:
+                # Results are intentionally lossy: an expired movement
+                # suggestion is less useful than a newer pending frame.
+                break

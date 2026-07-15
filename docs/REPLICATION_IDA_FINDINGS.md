@@ -586,21 +586,50 @@ Engineer jetpack behavior was verified in `world.pyd` and the character
 extension. `Character.update_jetpack` is wrapper/core
 `0x100831C0`/`0x1003DFC0`; `set_hover` is
 `0x10079530`/`0x100233D0`. The character routine only updates jetpack effects.
-Actual flight remains in `Player.update`: an active jetpack applies gravity
-`* 0.05` and the high-friction movement branch. The broken Engineer path was a
-spawn-handshake issue: a reordered or missing `SetClassLoadout` produced an
-empty `CreatePlayer.loadout`, so the stock client constructed the class with no
-jetpack. The server now supplies the stock concrete class default in that case.
+Actual flight remains in `Player.update` (`0x10012B80`). Held SPACE with active
+Engineer pack 68 subtracts the pack's `0.020` thrust before ordinary gravity
+and vertical damping; the first three stock-oracle velocities from rest are
+`-0.0032786874`, `-0.0065036258`, and `-0.0096756974`. The `* 0.05` branch at
+`0x10012EFB-0x10012F06` is `parachute_active`, not jetpack activity. The broken
+Engineer path was originally a spawn-handshake issue: a reordered or missing
+`SetClassLoadout` produced an empty `CreatePlayer.loadout`, so the stock client
+constructed the class with no jetpack. The server now supplies the stock
+concrete class default in that case.
+
+Active-flight horizontal drag has a separate native branch. At
+`0x10012F25-0x10012F7C`, an airborne active (`Player+176`) or passive
+(`Player+180`) pack keeps the already-computed `1 + dt` vertical divisor for
+X/Y. Only ordinary dry air uses `1 + 2*dt`; wade uses the class water-friction
+divisor. The former port treated active Engineer flight as wading, applying
+`1 + 8*dt`: a retail W+SPACE capture then showed seven periodic corrections
+in one ascent. With the native branch restored, an exact capture matched all
+thirteen active owner rows in X position and matched X velocity within
+`4.5e-8`, with zero ADJUST and zero SNAP. Adjacent control flow at
+`0x10012EAD` also proves hover (`Player+124`) skips the gravity-addition block;
+the `0.75` gravity path belongs only to passive jetpack state. Parachute state
+changes vertical gravity but retains ordinary airborne horizontal drag.
 
 The live client then exposed a second wire bug: `character.jetpack_fuel` was
 overwritten with zero on every WorldUpdate. After the pickup byte, the player
 row contains three consecutive 1.6 fixed shorts, not padding. Tuple element 26
-is jetpack fuel and is assigned at `0x101852F1-0x1018530C`; element 27 is
-`character.spawn_protection_timer` (`0x10185603-0x1018561E`), and element 28 is
-`character.weapon_deployment_yaw` (`0x10185127-0x1018513E`). The server now
-serializes its authoritative fuel in the first short. A live Engineer spawn
-initializes at 100 fuel; holding jump activated both client and server jetpack
-state, drained the meter to 82.8, and release cleared the active state.
+is the fuel value verified by parser round trips and the live meter; element 27
+is `character.spawn_protection_timer` (`0x10185603-0x1018561E`), and element 28
+is `character.weapon_deployment_yaw` (`0x10185127-0x1018513E`). The earlier
+address attribution for fuel was wrong: `0x101852F1-0x10185305` applies the
+parsed jetpack-active value to native `world.Player` (`Player+0xB0`), not to
+`character.jetpack_fuel`. The server serializes authoritative fuel in the first
+short. A live Engineer spawn initializes at 100 fuel; holding jump activated
+both client and server state, drained the meter, and release cleared activity.
+
+The same native audit proves there is no application acknowledgement to tune
+this transition against. Incoming WorldUpdate is the sole runtime writer of
+`world.Player+0xB0`: GameScene calls `Character.set_jetpack_active` around
+`0x10185280-0x1018529C`, then sets the native Player attribute around
+`0x101852F1-0x10185305`. `Character.update_jetpack` is effects-only, and
+`send_client_data` contains no active/fuel acknowledgement. The ClientData
+`ooo` nibble is exactly `(loop_count + 7) & 0x0F` in 448/448 captured rows, so
+it is only a redundant clock-phase check. Reliable+flush reduces delivery
+latency but cannot establish the GameScene frame where physics changed.
 
 Normal jetpacks do not use Z/hover for thrust. `GameScene.on_key_press`
 (`0x10234610`/`0x1015C9D0`) routes the configured hover key through
@@ -610,13 +639,25 @@ accepts that state only for A367 / UGC Builder jetpack 69 at
 `0x1002367A-0x100236B6`. Engineer, Rocketeer, and normal packs request thrust
 with the ordinary jump input; the server now mirrors that split.
 
+Jump packet phase differs at the native state boundary, but does not require a
+second server queue. `Player.update` clears the jump request at
+`0x10012D3F-0x10012D48` only while airborne with neither a jetpack nor a
+parachute equipped. Engineer therefore keeps held SPACE through the native
+update, and `send_client_data` reads that state afterward at `0x1016B037`.
+All buttons retain the ordinary one-observed-frame server latch. The separate
+grounded launch reconciliation fix mirrors `Character.update_alive`: after
+native launch it restores complete XYZ from the newest owner row strictly older
+than the jump's source ClientData stamp. It retains launch velocity/airborne
+state and must never restore an anchor on sustained airborne Engineer frames.
+
 The Commando A370 parachute is selected by `world.set_parachute` at
 `0x10018BC0` and toggled by `set_parachute_active` at `0x1000B030`. Its movement
 branches are in `Player.update` at `0x10012EB9-0x10012F4C`: active descent uses
-gravity `* 0.75`, high horizontal drag, and reduced landing severity. The stock
-client does not autonomously open it in the observed live fall, so the server
-now selects A370 from the loadout, opens it only while airborne and descending,
-and replicates the existing parachute state flag.
+gravity `* 0.05` (`0x10012EFB-0x10012F06`), high horizontal drag, and reduced
+landing severity. The separate `* 0.75` branch is passive jetpack/hover state.
+The December 2015 client behavior opens A370 only on a second airborne SPACE
+press after the launch press; the server mirrors that edge and keeps it open
+until landing/water while replicating the existing parachute state flag.
 
 Rocket-turret placement packet 88 is sent by wrapper/core
 `0x102398D0`/`0x10171A30`. The most important corrected wire detail is the
@@ -655,9 +696,10 @@ The former server heuristic treated any pure-blue/pure-green surface voxel as
 a spawn marker and removed it from the server map. That is not a VXL metadata
 encoding and could mutate ordinary buildings while the client retained the raw
 VXL geometry. The destructive scan is removed. Sidecars are authoritative when
-present; voxel-only maps use cached dry, locally level spawn columns with an
-elevation-ring test that rejects building roofs. The four bundled maps retain
-their original voxel/checksum state and produce safe candidates for both teams.
+present; voxel-only maps use cached dry, locally level spawn columns. Spawn
+validation additionally requires solid support beneath the surface, rejecting
+small platforms, broad roofs that defeat ring sampling, and cave ceilings.
+Cached choices are revalidated against live terrain edits.
 
 Player and entity z coordinates are distinct. A player ground anchor is the
 surface minus the 2.25-block standing offset; a crate, flag, or base model is
@@ -669,25 +711,43 @@ including flag hide/recreate transitions for pickup, drop, and capture.
 The client world is 240 blocks deep (`MAP_Z=240`) and the waterplane constant is
 `Z_ABOVE_WATERPLANE=238`. The server's old `WATER_LEVEL=62` was a stale
 64-height-world assumption and is now 238 in gameplay/config. Loaded bundled
-maps require no runtime z shift. The generated test map deliberately remains a
-high dry plateau at z=62; in a 240-deep coordinate system that is far above the
-waterplane, not immediately above water. The repository suite passes 244 tests;
-isolated ArcticBase TDM and CTF servers both bind and complete mode startup.
+Retail VXL loading normalizes short maps by
+`max(0, 239 - max_referenced_z)`: 20thCenturyTown shifts +176,
+CityOfChicago +39, and ArcticBase/CastleWars remain unshifted. This places dry
+terrain at z=237/238 beside the fixed waterplane instead of visibly suspending
+it far above water. Raw file bytes and CRC stay unchanged; full and delta
+MapSync records use normalized client-world coordinates.
 
 ### 12.10 Battle Builder equipment, graves, and late entity types
 
 The post-launch client's `gameScene.pyd.i64` supplies the late entity classes
-that the older named `ENTITY_LIST` left as `UNKNOWN_ENTITY1..10`. Class
-registration order and CreateEntity dispatch resolve the first six slots as:
+that the older named `ENTITY_LIST` left as `UNKNOWN_ENTITY1..10`. The
+`create_entity` core (`sub_10178B80`) indexes `GameScene.ENTITIES` directly by
+the packet's numeric `type`. Class registration order is not the wire order;
+using it previously made C4 render as a medpack and medpack render as block
+goo. A live enumeration of that dispatch table plus two-client rendering gives:
 
 | Entity type | Client class | Core function evidence |
 |---:|---|---|
-| 30 | `C4Entity` | initialize `0x100EAE70`, update `0x100EB640`, on_delete `0x100EBA90` |
-| 31 | `MedPackEntity` | class registration string at `0x10256090` |
-| 32 | `RadarStationEntity` | class registration string at `0x102561AC` |
-| 33 | `AttachedStickyGrenadeEntity` | class registration string at `0x10256658` |
-| 34 | `BlockGooEntity` | class registration string at `0x102569C4` |
-| 35 | `RiotShieldEntity` | class registration string at `0x10256D00` |
+| 30 | `MedPackEntity` | live `GameScene.ENTITIES[30]`; observer rendered `MedPackEntity` |
+| 31 | `BlockGooEntity` | live `GameScene.ENTITIES[31]` |
+| 32 | `ChemicalBombEntity` | live `GameScene.ENTITIES[32]` |
+| 33 | `GLGrenade` | live `GameScene.ENTITIES[33]` |
+| 34 | `StickyGrenadeEntity` | live `GameScene.ENTITIES[34]` |
+| 35 | `AttachedStickyGrenadeEntity` | live `GameScene.ENTITIES[35]` |
+| 36 | `RadarStationEntity` | live table; observer rendered `RadarStationEntity` |
+| 37 | `ProjectileMineEntity` | live `GameScene.ENTITIES[37]` |
+| 38 | `C4Entity` | live table; observer rendered `C4Entity` |
+| 39 | `RiotShieldEntity` | live `GameScene.ENTITIES[39]` |
+
+The equipped Medic riot shield is not a placed server entity. Recovered
+`riotShieldTool.py` renders it as the character's ordinary equipped tool;
+remote clients already receive tool 52 plus `can_display_weapon` (action bit
+0x10) and primary/bash (action bit 0x01) in WorldUpdate. No CreateEntity or new
+packet is needed. Retail A1881-A1887 resolve to a 1.0-second bash interval, 2
+damage, 50% frontal absorption, 0.5 knockback, 0.06 model size, and arm pitch
+-80..0. The late `RiotShieldEntity` class remains part of generic entity
+dispatch, but there is no placement/send path in the recovered shield tool.
 
 `C4Entity` also exposes `disable`, minimap drawing, and a distinct delete path,
 so C4 must be a real CreateEntity/DestroyEntity lifecycle rather than a hidden
@@ -696,12 +756,15 @@ server coordinate. Client send cores are `send_place_c4=0x10173F70` and
 `process_packet_team_map_visibility=0x1019FEB0` indexes the packet-selected team
 and applies its visible boolean, which is the per-recipient radar reveal lever.
 
-The placement decoder had a cross-cutting wire bug: PlaceC4, PlaceDynamite,
-PlaceLandmine, PlaceMG, PlaceMedPack, PlaceRadarStation, PlaceRocketTurret,
-PlaceFlareBlock, and PlaceUGC wrote coordinates through `tofixed()` but read raw
-shorts. Thus coordinate 100 decoded as 3200 and failed every distance check.
-All matching readers now use `fromfixed()` and the native packet extension was
-rebuilt; fixed-point round trips are regression-tested.
+The placement decoder had a cross-cutting wire bug. Live retail captures prove
+that PlaceC4, PlaceDynamite, PlaceLandmine, PlaceMG, PlaceMedPack,
+PlaceRadarStation, PlaceRocketTurret, PlaceUGC, and PlaceFlareBlock all send
+literal voxel `uint16` coordinates. The generated readers divided those values
+by 64 with `fromfixed()`, so a placement at voxel 339 became 5.296875 and failed
+the distance check. Runtime compatibility decoders now read raw coordinates;
+only the turret/MG yaw field remains a signed fixed-point short. Captured mine
+`59 D1 50 00 00 00 53 01 A7 00 E3 00` and dynamite
+`01 C6 57 00 00 B1 00 07 01 E2 00 04` fixtures protect the exact layouts.
 
 Grave client functions are initialize `0x100CC420`, update `0x100CCD80`, and
 on_delete `0x100CDC50`. The retail constants specify a 7-second fuse, radius 3,
@@ -717,3 +780,396 @@ pin C4 (300 damage, radius 8, block 7), sticky grenade (200, radius 5, block 6,
 5-second attached fuse), grenade launcher (100, radius 4, block 6, 3-second
 lifespan), mine launcher (75 speed, deployed landmine), Blocksucker state
 0/1/2 and 0.2-second cadence, radar lifetime 250, and disguise stock/state.
+
+### 12.11 Grenade-launcher crash and gap-free join terrain sync
+
+The retail crash at `gameScene.pyx:3588` is deterministic, not malformed
+floating-point data. `process_packet_use_oriented_item` is wrapper
+`0x102437E0`, with core `0x1018E930`. Its grenade-launcher branch at
+`0x10190928-0x10190CC8` constructs position and velocity vectors, then calls
+`GLGrenade(scene, position, velocity, value)` using a four-item Python tuple at
+`0x10190C1B-0x10190C69`. `GLGrenade` now derives from `Entity`, whose recovered
+initializer is `initialize(entity_id, team, player, spawned)`. The three values
+after `scene` therefore reach an initializer requiring four and produce the
+observed `initialize() takes exactly 5 arguments (4 given)`. No CreateEntity
+dispatch references `GLGrenade`; packet 10 is a stale remote path and must not
+be echoed for tool 55. Server projectile collision, lifetime, damage, and block
+damage remain authoritative while the unsafe remote visual path is suppressed.
+
+Map transfer previously serialized `dirty_columns`, sent MapSyncEnd, and then
+gated every gameplay broadcast until the first ClientData. A terrain change in
+that interval was absent from both the snapshot and the live stream. The server
+now watermarks the exact immutable dirty-column set used for MapSync, journals
+native PaintBlock/SetColor/BlockBuild/BlockBuildColored/Damage/BlockLine packets after that
+watermark, and replays them before admitting the connection to live gameplay.
+The replay watermark advances after every successful enqueue so a retry cannot
+double-apply Damage. Mismatched-CRC full sync now substitutes each dirty column
+in its original 512 x 512 position while walking the pristine raw VXL, keeping
+exactly 262,144 unique records in the zlib stream; the former optimized full
+path sent only the pristine file.
+
+### 12.12 Player-build completeness and reconnect colour parity
+
+Retail probing of `PaintBlock(7)` produced
+`07443322117b00ea002d00563412`; coordinates are raw signed shorts, not fixed
+point. The writer and authoritative handler now match that layout, recolour the
+canonical VXL, dirty the column, relay the mutation, and include it in join
+catch-up.
+
+`BlockLine(40)` carries endpoints but no cells or colour. The client regenerates
+the line, ignores already-solid cells, and charges only new cells. The server
+now mirrors this instead of rejecting a whole line that crosses one existing
+voxel. Late joiners receive every roster player's `SetColor` before replay. The
+retail client also emits grey, red, and yellow `SetColor` defaults while
+constructing its tools before `NewPlayerConnection`; the recovered server
+ignores these packets until an alive player is holding `BLOCK_TOOL`, so they
+must not be cached as palette input. Runtime RGB uses the
+same opaque dynamic-block encoding as prefab tuples, preventing reconnect
+MapSync from changing a placed block's colour/shading.
+
+World-coordinate MapSync serialization is separate from raw/source VXL
+serialization, so blocks built above a legacy map's original height range are
+not clipped from dirty columns.
+
+Follow-up retail IDA validation resolved the dynamic alpha ambiguity exactly.
+`VXL.set_point` core `0x1002B0A0` calls `make_color` at `0x10019780`; module
+initialization `0x100115B0` sets its scale constant to 128. Therefore RGBA
+alpha 255 is serialized with high byte `0x80`, confirming the server's
+`0x80RRGGBB` reconnect color word. `CreatePlayer` has no color field, so the
+server emits `SetColor` immediately after join/respawn creation.
+
+A follow-up live test exposed two palette regressions. `InitialInfo` had
+`enable_colour_palette=0`, although the recovered retail server sets both
+`enable_colour_palette` and `enable_colour_picker` to 1; `BlockTool.on_set`
+therefore never activated the HUD palette. In addition, forcing SetColor before
+every BlockLine overwrote the held-block selection with the server's cyan
+fallback. The palette is enabled again and the retail default is neutral
+`(112,112,112)`.
+
+The builder cannot be excluded from placement replication: the local client
+only displays ghost blocks and requires the native BlockLine(40) echo to commit
+the drag and wallet change. The stable split is therefore BlockLine(40) to the
+builder and explicit BlockBuildColored(33) cells to other clients.
+
+A 2026-07-11 foreground A/B invalidated the earlier block-tool self-row
+exception. Suppressing the row recreated a stale spawn anchor: ten visible
+rollbacks and a 62.759-block maximum discontinuity. Sending the ordinary safe
+self row produced zero visible rollbacks, retained the palette and selected
+colour across two seconds of updates, and placed correctly coloured native
+blocks. BlockLine owns the placement acknowledgement; WorldUpdate owns the
+fresh reconciliation anchor. Both are required.
+
+### 12.13 Mounted machine-gun placement and use
+
+`PlaceMG(87)` is 14 bytes on the wire: id, `loop_count:int32`, claimed
+`player_id:uint8`, raw voxel x/y/z, and fixed-point yaw. The claimed player
+id is not trustworthy; placement ownership comes from the sending connection.
+The recovered `ace-server` path creates entity type `MACHINE_GUN` (7), while
+the retail constants pin range 5, health 100, destruction radius 3, player
+damage 100, block damage 5, and knockback 0.2..1.0. The carried/deployed
+`mgWeapon.py` switches from a 0.5-second cadence to 0.1 seconds when deployed.
+
+The entity is durable and included in late-join StateData, with its placement
+yaw preserved. `UseCommand(86)` mounts or releases the nearest unoccupied gun
+through `ChangeEntity(16)` action `SET_PLAYER`; moving, jumping, crouching,
+dying, or leaving its four-block leash releases the carrier server-side.
+There is no recovered MG lifetime or placement-stock constant, so the server
+does not invent either and suppresses retransmitted duplicates per owner.
+
+`MG_AMMO=999` is a client-local infinite-ammo sentinel. It cannot be sent in
+`ChangeEntity.SET_AMMO`, whose signed fixed-point short tops out at
+511.984375; the client therefore retains its native 999 default instead of
+receiving a clamped/corrupt property. Live validation remains required for the
+compiled model's exact placement offset and mount camera transition.
+
+### 12.14 Flare/light block placement
+
+The recovered `flareBlockTool.py` fixes `block_cost=FLAREBLOCK_COST` (10), uses
+the active palette colour, and calls `send_place_flare_block(x, y, z)` after
+the ordinary support/range checks. A live packet capture,
+`68 65 F7 01 00 D4 00 DD 00 EE 00`, decodes as loop `0x01F765` followed by raw
+voxel coordinates `(212, 221, 238)`. Applying `fromfixed()` here would produce
+`(3.3125, 3.453125, 3.71875)`, so packet 104 is deliberately decoded outside
+the generated fixed-point Place* loader.
+
+The client entity dispatch maps flare blocks to type 13. Native anchors in the
+isolated `gameScene` image are `FlareBlockEntity.initialize=0x100DE610`,
+`delete=0x100DF070`, and `GameScene.send_place_flare_block=0x10177C60`.
+`delete` owns nontrivial render/light-manager cleanup, so every server removal
+uses DestroyEntity rather than silently dropping registry state. The server
+stores the placed entity's owner, wire team, and RGB palette colour, includes
+it in late-join static-entity reveal, and removes it when damaged or when all
+six-face support disappears.
+
+Changelog evidence distinguishes flare blocks from ordinary building: normal
+blocks cannot be built on water, but flare blocks were explicitly fixed to
+display correctly there. Placement therefore permits z=238 when the retail
+waterbed at z=239 supplies support, without passing through the ordinary VXL
+`can_build` water restriction. Unsupported floating lights, duplicate/occupied
+cells, bad tools/loadouts, insufficient block stock, and distant/out-of-bounds
+coordinates are rejected before charging the ten-block cost.
+
+### 12.15 Objective pickup and resource-crate lifecycle
+
+Retail `PickPickup(70)` is a four-byte server-to-client packet: id,
+`player_id:uint8`, `pickup_id:uint8`, and `burdensome:uint8`. The client lookup
+at `GameScene.process_packet_pick_pickup` (`0x1019AAF0`) calls
+`Player.pick_pickup(pickup_id, burdensome)`. `DropPickup(71)` is 19 bytes:
+id, `loop_count:int32`, claimed player/type bytes, then fixed-point position
+and velocity vectors. Its receive core is `0x1019AE10`; the send core is
+`0x1016EED0`.
+
+The client pickup table contains only objective types 14/15/16 (bomb, diamond,
+intel), mapped to tools 25/26/30. Ammo, health, block, and jetpack crates are
+entity types 3/4/5/6 and use `Restock(69)` instead. The server now supports the
+missing authored jetpack-crate path without mixing these two namespaces.
+
+CTF ground intel therefore uses entity type 16. On touch the server removes the
+entity and emits reliable PickPickup; on explicit drop, death, disconnect, or
+capture it emits authoritative DropPickup and updates the persistent entity
+registry. The client-supplied player id is ignored, the claimed pickup type must
+match server state, drop position must remain near the authoritative player,
+and throw velocity is capped to the recovered 15-block/s intel speed. Pickup
+radius and no-regrab delay use the recovered constants 3.0 and 2.5 seconds.
+
+WorldUpdate's formerly hardcoded pickup byte now reflects each carrier, while
+the existing reader retains its legacy tuple shape for compatibility. A
+dedicated reliable PickPickup is also sent during late-join reveal, including
+when generic static-entity replication is disabled, so burden/tool state cannot
+be lost between roster creation and the first WorldUpdate.
+
+### 12.16 CTF minimap zones and carrier visibility
+
+`GameScene.process_packet_minimap_zone` is `gameScene.pyd:0x101A4A70`; the
+native billboard construction path is `0x101A5B50`. A headless IDA session for
+`hud.pyd` plus a live packet-43 probe recovered the field meanings that the
+generated packet class leaves obfuscated. `key` becomes the zone's
+`visible_team`; A2018/A2019 are X min/max, A2020/A2021 are Y min/max, and
+A2022/A2023 are Z min/max. All six are raw voxel signed shorts. Icon id 6 is
+`ZONE_ICON_CTF` and constructs a `MinimapBillboard` for the base.
+
+Standalone billboard tracking was not used for the carrier: tracking id 1
+resolves entity ids in the scene registry and does not follow player id 1.
+Instead, `ChangePlayer(17)` action 8 is the native player path. Direct replay
+with values 1 then 0 changed `Player.high_minimap_visibility` to 1 then 0.
+Ground `IntelPickup` type 16 independently reports `minimap=True`, so the
+complete objective representation is:
+
+- packet 43 for both base/capture zones;
+- entity type 16 while intel is on the ground;
+- ChangePlayer action 8 while a player carries it.
+
+`GameScene.process_packet_drop_pickup` remains `0x1019AE10`. Direct replay
+cleared the carried tool but left no persistent ground entity, which is why a
+drop/death must be followed by an authoritative type-16 CreateEntity. The
+late-join mode snapshot replays both zones and any current carrier marker after
+the generic entity reveal. In a clean isolated retail session, join and
+same-scene `/restart` each produced exactly two native minimap zones and two
+minimap-enabled intel entities, without duplicate zones or a traceback.
+
+### 12.17 Explosion impulse, Molotov fire, and round cleanup
+
+The native `shared/explosionDamageManager.pyd` applies knockback by adding an
+impulse to the character's existing velocity; it does not use a dedicated
+network packet. Distance uses squared falloff from the character body centre
+(standing z offset 0.75, crouched 1.25), while direction uses the raw network
+position. Per-warhead min/max values come from the recovered constants and the
+result naturally replicates in the ordinary WorldUpdate velocity vector. LOS
+blocks both health and impulse. With friendly fire disabled, teammate health is
+suppressed while physical push remains; Rocket2 has its recovered self-boost
+range. Partial-cover weighting still needs live calibration—the server uses a
+conservative all-or-none terrain LOS gate.
+
+Molotov is not merely a one-shot 50/3 impact. Constants pin entity type 28,
+four-second block-fire life, five spread attempts at 0.5-second cadence, 0.7
+block damage every 0.4 seconds, and character ignition at 2.5 damage every 0.3
+seconds for ten seconds. The server creates durable BLOCKFIRE entities with
+their fuse, owns damage/spread, clears fire in water, and drives the verified
+WorldUpdate action bit 0x20 from authoritative state rather than trusting the
+client's echo.
+
+Finally, a same-map score-screen restart must clear controller indexes as well
+as client models. The supplied dump followed GameStats(67), MapEnded(52), and
+ShowGameStats(53): the latter two moved the retail client to `MenuScene`, then
+late DestroyEntity packets produced the visible `invalid entity on destroy`
+cascade before the native crash. Direct probes also proved
+ForceShowScores(1) terminal, while GameStats alone leaves GameScene and the
+local player intact.
+
+The restart now sends final GameStats data without any terminal scene packet,
+then removes projectiles, turret/MG state, mounts, C4/radar ownership,
+block-fire/burning state, and old live entity ids before the mode rebuilds
+crates/objectives, resets scores, and respawns players. A forced `/endround 1`
+against the instrumented retail client stayed in GameScene, consumed nine
+destroy/recreate pairs, respawned the player, remained responsive, and added no
+new dump (9 before, 9 after).
+
+A follow-up live transition exposed that the direct round respawn initially
+bypassed the normal death-respawn application of `pending_class_id` and
+`pending_loadout`. That could leave the server simulating the previous Medic
+movement/loadout while the local UI had selected Miner, presenting the health
+pack where dynamite was expected and causing reconciliation lag from mismatched
+class multipliers. Pending selection is now applied inside the shared
+`respawn_player` boundary. A retail Medic-to-Miner end-round transition returned
+as class 3 with tool 21, created type-10 `DynamiteEntity`, and an eight-second
+movement run recorded zero snaps/adjustments and a steady 600 applied, zero
+dropped input frames.
+
+### 12.18 Specialist/Engineer late tools and Block Cannon persistence
+
+Retail `SnowBlowerWeapon.shoot` calls `send_snowball(position, forward * 50)`,
+and `use_an_ammo` decrements `Character.block_count`. Final localisation
+renames SNOWBLOWER to `Block Cannon` and says it builds blocks and uses blocks
+for ammo. Damage type 20 is absent from the native BlockManager handler table;
+its Damage packet supplies blast prediction, not persistent construction. The
+server must commit the last free supported impact cell and publish packet 33
+with a shot-time palette snapshot. A fresh retail reconnect verified the
+canonical `0x2468AC` voxel from the rebuilt VXL stream.
+
+`snowBlowerWeapon.on_set` and its UGC subclass activate the ordinary palette,
+so SetColor is valid for tools 29/48 as well as 5/22. The source tool must have
+reached authoritative ClientData before accepting the palette packet; an
+automation script that selects and sends color in the same game-thread call can
+intentionally hit the anti-forgery gate.
+
+Native late-projectile validation used these exact entity transitions:
+ChemicalBomb 32, GL 33, Sticky 34, ProjectileMine 37 -> armed Landmine 9. Do
+not relay GL's packet 10 to remote clients: `process_packet_use_oriented_item`
+enters the stale Python `GLGrenade` constructor and raises the known
+`initialize() takes exactly 5 arguments (4 given)` exception. Molotov-spawned
+BlockFire 28 has a separate native invariant: wire face must remain 4 because
+every other face rotates a nonexistent model in base `Entity.set_face`.
+
+### 12.19 Placement callback ownership, Machete, and jetpack equipment
+
+Accepted voxel mutations must not automatically enter delayed terrain repair.
+Native packet 32/33 processing reaches `GameScene.build_block` at
+`0x1018AD60` and `GameScene.add_block` at `0x10136820`; a later canonical
+packet 33 therefore invokes the placement callback/effect path a second time.
+Normal BlockLine and prefab packets remain their primary reliable replication.
+`TerrainRepairService.record_cells` is reserved for rejected/cancelled local
+predictions.
+
+`BlockManager.handle_machete_damage` is `gameScene.pyd:0x1008AA60`. The Cython
+body sets debris display, constructs `range(z, z + 2)`, and calls
+`handle_single_block_damage` once for each value while preserving the original
+x/y, face, chunk-check, and causer. The integer global used as the upper offset
+is initialized with `PyInt_FromLong(2)`. Combined with
+`macheteTool.py` (`damage=2.0`, `shoot_interval=0.7`, damage type 35), the exact
+canonical footprint is `(x,y,z)` plus `(x,y,z+1)`, accumulating 2 damage on
+each. One base-position Damage(37,type=35,damage=2) makes every retail client
+perform the same expansion.
+
+Recovered `CLASS_ITEMS` makes jetpacks normal equipment choices: Rocketeer has
+`JETPACK2(67), JETPACK_NORMAL(66)` and Engineer has
+`JETPACK_ENGINEER(68), DISGUISE(64)`. Normalization and spawn must not append a
+separate default jetpack after selecting the alternate equipment item.
+
+Foreground packet replay confirmed the reconstructed boundaries. Three native
+Machete swings sent three normalized ShootPacket(6) messages and received three
+reliable Damage(37) messages whose damage-type byte was `0x23` (35). Engineer
+pack 68 and Rocketeer Jetpack2 67 each activated and drained through the retail
+client with zero ADJUST/SNAP/visible rollback; selecting Engineer Disguise 64
+instead yielded `NO_JETPACK(65)` on the spawned player.
+
+### 12.20 Classic CTF uses the CTF scene plus a feature bit
+
+The shipped `playlists/classic.txt` declares `modes ['ctf']`, `classic True`,
+shoot-with-intel ON, intel-auto-return OFF, and Classic SMG/shotgun OFF. The
+apparently relevant `MODE_CCTF=11` constant is therefore not sufficient
+evidence for a wire scene id.
+
+Hex-Rays resolves `GameScene.is_in_classic_mode` to
+`gameScene.pyd:0x10126C20`. Its Cython body gets `self.manager` and returns that
+object's `classic` attribute; the method-name string is referenced at
+`0x10126CD7`. HUD string tables separately expose `enable_minimap` at
+`hud.pyd:0x10102AAC` and `can_shoot_holding_intel` at `0x100FD104`. Together
+with the playlist, this establishes the server contract: send ordinary CTF id
+8, set `InitialInfo.classic=1`, disable the minimap, and allow carrier fire.
+
+Classic Soldier is client class 5 (Deuce) with Rifle 6, Classic Grenade 31,
+and Classic Spade 4. Tools 37/38 are present in the recovered class table but
+are excluded by the stock Classic playlist. `ClassicCTFMode` applies those
+disabled tools during normalization as well as InitialInfo construction, so a
+client packet cannot restore them after the menu hides them.
+
+### 12.21 Shooter hit-confirm, kill-feed color, and Drill bore
+
+`GameScene.process_packet_shoot_response` resolves to
+`gameScene.pyd:sub_10193D60`. The native branch first emits blood when
+`ShootResponse.damaged`/`blood` are set. It plays the hit sound and starts the
+crosshair-change timer only when `packet.damage_by` equals the local player id.
+Packet 9 therefore belongs on the broadcast path with the authoritative
+shooter's id, not as an unaddressed owner-only effect. A live Miner-shotgun run
+showed server packet 9 with `damage_by=12` and the retail client's
+`change_crosshair` timer become positive after the bot lost health.
+
+KillAction (46) has no wire color field. `HUD.add_kill` derives the names and
+colors from its local Player objects. A live `KillLine` stored the remote killer
+as green and the local victim `KikoTs` as `(255,255,255)`. The white local name
+is the stock client's own-player highlight and must not be "fixed" server-side.
+
+The Drill mismatch came from applying its collision trace as a one-cell server
+mutation while asking the client to run native Damage type 10. Both
+`BlockManager.handle_drill_damage` (`sub_1020B960` -> `sub_100864B0`) and the
+destroyed variant accept `(by_player_id, position, type, damage, face,
+chunk_check, seed=None)` and delegate to radius damage with hard-coded radius
+2. Direct calls against the compiled retail client in a solid 9x9x9 fixture
+removed exactly 81 cells for contact damage 20, stable for seeds 0, 1, 123,
+and 255. Their integer offsets satisfy `dx*dx + dy*dy + dz*dz <= 6` within
+`[-2,2]` on each axis.
+
+Live replication keeps one type-10 packet so the retail sound/particles and
+radius handler run once. Its `causer_id` must be the live Drill entity id;
+entity id zero is valid and cannot be replaced through an `id or owner_id`
+expression. Canonical terrain removes the same 81 cells, while reconnect
+catch-up journals exact type-6 removals because the projectile may no longer
+exist when replay begins.
+
+### 12.22 Remote shots use ShootFeedback, not an echoed ShootPacket
+
+`GameScene.process_packet_shoot_feedback` is
+`gameScene.pyd:sub_101935C0` (Cython source line 3642). Its recovered attribute
+accesses are `shooter_id`, `players`, `character`, `tool_id`, `shoot`, and
+`seed`. The control flow requires the shooter in `self.players`, gets the
+visible character, compares `packet.tool_id` with the character's current tool
+id, and calls `character.shoot(packet.seed)` on a match. It does not consume
+the packet-6 origin/direction/damage layout.
+
+This establishes the firearm directional split: `ShootPacket(6)` is the client
+fire request, while `ShootFeedbackPacket(8)` is the server's compact remote
+firearm action. It drives the equipped weapon's gunshot/muzzle/tracer behavior.
+Terrain and player damage remain separate authoritative packets/state. The
+firing human is excluded because its local weapon already executed; a peerless
+bot has no client and all real observers receive the event.
+
+Packet 8 is not a generic melee feedback message. A retail bot replay with
+tool 2 reached the recovered call and crashed at `Character.shoot` because
+`SpadeTool` has no `shoot` method. Digging classes expose `use_primary`; their
+remote action is WorldUpdate bit `0x01`, with `Damage(37)` carrying the terrain
+result. A peerless bot must keep that bit high long enough to intersect the
+30 Hz replication cadence; the server now holds each action pulse through two
+future 60 Hz loops.
+
+### 12.23 Zombie hand uses the native centered-cube damage handler
+
+The headless IDA MCP session `bot_multikill_scene_20260715` resolves the native
+Zombie terrain handler wrapper to `gameScene.pyd:0x10207ED0` and its Cython
+implementation to `0x10081340`. The Super Spade wrapper is `0x10208E30` and its
+implementation is `0x10082C90`. Hex-Rays shows both implementations subtract
+one from each supplied x/y/z coordinate and call the same area routine with an
+extent of three. The resulting client footprint is the centered 3x3x3 cube;
+the handlers differ by the incoming Damage type and amount, not geometry.
+
+`zombieHandTool.py` supplies `shoot_interval=0.4`, block damage 2, player
+damage 70, and Damage type 17. Class damage still applies: ordinary Zombie has
+multiplier 0.6 (42 effective player damage), while Fast/Jump Zombie use 0.5
+(35 effective). The server therefore commits the complete cube atomically and
+sends one type-17 area packet. Per-cell type-17 packets are invalid because
+each retail client would expand every cell into another cube.
+
+Zombie melee action remains a WorldUpdate primary-bit event; packet 8 must not
+be used. The authoritative player hit follows normal LOS, HP, kill, feedback,
+and mode-damage paths. Tool 28 is the distinct Zombie prefab tool and must be
+preserved through the shared packet-30 prefab service instead of being coerced
+to ordinary prefab tool 23.

@@ -43,6 +43,14 @@ WATER_LEVEL = int(C.Z_ABOVE_WATERPLANE)
 DEFAULT_TEAM_CLASSES = list(C.DEFAULT_TEAM_CLASSES)
 
 BLOCK_TOOL_IDS = frozenset({int(C.BLOCK_TOOL), int(getattr(C, "FLAREBLOCK_TOOL", C.BLOCK_TOOL))})
+# Tools whose retail ``on_set`` activates Character.block_color and the HUD
+# palette.  Block Cannons consume the same block wallet as tool 5, so rejecting
+# SetColor while they are held makes every projectile/build use stale grey.
+PALETTE_TOOL_IDS = frozenset({
+    *BLOCK_TOOL_IDS,
+    int(getattr(C, "SNOWBLOWER_TOOL", 29)),
+    int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
+})
 SPADE_TOOL_IDS = frozenset(int(tool) for tool in getattr(C, "ALL_MELEE_WEAPONS", (C.SPADE_TOOL,)))
 GRENADE_TOOL_IDS = frozenset(int(tool) for tool in getattr(C, "THROWABLE_EXPLOSIVE_TOOLS", (C.GRENADE_TOOL,)))
 
@@ -296,15 +304,15 @@ _CATALOG_LIST = [
     _melee(44, "UGC_PICKAXE",     0, 9,   0.2),
     _melee(45, "UGC_SUPERSPADE",  0, 7.5, 0.2),
     _melee(49, "RIOTSTICK",    1.75, 0,   0.5),
-    _melee(50, "MACHETE",       2.0, 0,   0.7),
+    _melee(50, "MACHETE",       2.0, 2,   0.7),
     _melee(52, "RIOTSHIELD",      2, 0,   1.0),
     # --- hit-scan guns: (id, name, cat, torso, head, fire_int, clip, reserve, reload, pellets, range, block_dmg) ---
     _gun(6,  "RIFLE",             CAT_RIFLE,   70, 150, 0.5,  10, 50,  2.5, 1, 10000, 2),
     # SMG range 350 (A1151), was 250.
     _gun(7,  "SMG",               CAT_SMG,     10, 15,  0.1,  25, 100, 1.25, 1, 350,   1),
     _gun(8,  "MINIGUN",           CAT_MG,      15, 30,  0.3,  100, 300, 2.0, 1, 100,   2.5),
-    _gun(9,  "SHOTGUN",           CAT_SHOTGUN, 20, 30,  1.0,  5, 20,  0.5, 10, 60,    1, spread=0.08),
-    _gun(10, "SHOTGUN2",          CAT_SHOTGUN, 40, 50,  1.0,  2, 14,  1.0, 10, 20,    2.5, spread=0.10),
+    _gun(9,  "SHOTGUN",           CAT_SHOTGUN, 20, 30,  1.0,  5, 20,  0.5, 10, 60,    1, spread=0.04),
+    _gun(10, "SHOTGUN2",          CAT_SHOTGUN, 40, 50,  1.0,  2, 14,  1.0, 10, 20,    2.5, spread=0.05),
     _gun(15, "MG",                CAT_MG,      30, 20,  0.5,  100, 400, 4.0, 1, 300,   2),
     # PISTOL named constants loaded by stock pistolWeapon.pyc: damage tuple
     # (20,50,20,20,20), interval .3, reload .5, range 800, ammo 6/30.
@@ -313,12 +321,12 @@ _CATALOG_LIST = [
     _gun(19, "SNIPER2",           CAT_SNIPER,  34, 85,  1.1,  5, 15,  3.0, 1, 10000, 3),
     _gun(35, "TOMMYGUN",          CAT_SMG,     30, 35,  0.12, 30, 120, 2.0, 1, 500,   1),
     _gun(36, "SNUB_PISTOL",       CAT_PISTOL,  40, 70,  0.5,  6, 30,  0.75, 1, 500,   1),
-    _gun(37, "CLASSIC_SHOTGUN",   CAT_SHOTGUN, 20, 30,  1.0,  5, 45,  0.5, 12, 75,    1, spread=0.08),
+    _gun(37, "CLASSIC_SHOTGUN",   CAT_SHOTGUN, 20, 30,  1.0,  5, 45,  0.5, 12, 75,    1, spread=0.04),
     _gun(38, "CLASSIC_SMG",       CAT_SMG,     20, 20,  0.1,  25, 100, 1.25, 1, 100,   2),
     _gun(53, "AUTOMATIC_PISTOL",  CAT_PISTOL,  15, 30,  0.175, 15, 50, 1.0, 1, 300,   2.5),
     _gun(60, "ASSAULT_RIFLE",     CAT_RIFLE,   20, 40,  0.5,  15, 60,  0.9, 1, 400,   2.5),
     _gun(61, "LIGHT_MACHINE_GUN", CAT_MG,      20, 37,  0.15, 50, 250, 2.0, 1, 175,   2.5),
-    _gun(62, "AUTO_SHOTGUN",      CAT_SHOTGUN, 20, 25,  0.35, 8, 40,  2.5, 10, 60,    2, spread=0.08),
+    _gun(62, "AUTO_SHOTGUN",      CAT_SHOTGUN, 20, 25,  0.35, 8, 40,  2.5, 10, 60,    2, spread=0.05),
     # --- projectiles / explosives: (id, name, cat, blast, radius, fire_int, clip, reserve, reload, block_dmg, fuse) ---
     _proj(11, "GRENADE",               CAT_GRENADE,  230, 4, 0.5,  4, 0, 0.0, 0, 2.5),
     _proj(12, "RPG",                   CAT_LAUNCHER, 140, 4, 0.7,  1, 3, 1.5, 5, 0.0, kill_type=KILL_TYPES.get("ROCKET_KILL")),
