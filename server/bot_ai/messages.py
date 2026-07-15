@@ -135,6 +135,11 @@ class PlayerSnapshot:
     last_action_position: Vector3 | None = None
     last_action_frame: int = -1
     last_action_at: float = 0.0
+    # Damage packets reveal their source to the victim; exposing that same
+    # bounded fact to bots is fair and lets them interrupt low-priority work.
+    last_damage_at: float = 0.0
+    last_damage_source_id: int = -1
+    last_damage_source_position: Vector3 | None = None
 
 
 @dataclass(frozen=True, slots=True)

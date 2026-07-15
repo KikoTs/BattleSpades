@@ -374,6 +374,9 @@ class Player:
         self._jetpack_requires_release: bool = False
         self._hover_since: float = 0.0
         self._last_damage_at: float = 0.0
+        self._last_combat_damage_at: float = 0.0
+        self._last_damage_source_id: int = -1
+        self._last_damage_source_position = None
         self.parachute_id: int = 0
         self.parachute_active: bool = False
         self.disguised: bool = False        # specialist disguise toggle
@@ -1257,6 +1260,13 @@ class Player:
 
         self.health = max(0, self.health - amount)
         source_position = self.position if source is None else source.position
+        self._last_combat_damage_at = time.monotonic()
+        self._last_damage_source_id = int(
+            getattr(source, "id", -1) if source is not None else -1
+        )
+        self._last_damage_source_position = tuple(
+            float(value) for value in source_position
+        )
         damage_type = 0 if source is None or source == self else 1
         if self.connection:
             from shared.packet import SetHP

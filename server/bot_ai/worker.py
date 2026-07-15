@@ -1005,6 +1005,12 @@ class BotBrain:
         retreat = self._blast_retreat(frame, observer, state, now)
         if retreat is not None:
             return retreat
+        if target is None:
+            damage_reaction = self._damage_reaction(
+                frame, observer, state, now
+            )
+            if damage_reaction is not None:
+                return damage_reaction
 
         contact = self._best_contact(observer, state, now)
         mode_decision = self._objective_decision(frame, observer)
@@ -1077,12 +1083,28 @@ class BotBrain:
             contact=contact is not None,
             stimulus=audible is not None,
         )
+        if branch == "engage" and target is not None:
+            if (
+                int(observer.class_id) in _ZOMBIE_CLASSES
+                and target.position[2] < observer.position[2] - 0.75
+            ):
+                # An elevated visible survivor is still the urgent combat
+                # target, but claws cannot reach it. Permit only the Zombie's
+                # route-recovery climb/breach before resuming direct attacks.
+                recovery = self._stuck_recovery(
+                    frame, observer, state, now
+                )
+                if recovery is not None:
+                    return recovery
+            return self._engage(frame, observer, target, state, profile, now)
+
+        maintenance = self._maintenance_intent(frame, observer, now)
+        if maintenance is not None:
+            return maintenance
+
         recovery = self._stuck_recovery(frame, observer, state, now)
         if recovery is not None:
             return recovery
-
-        if branch == "engage" and target is not None:
-            return self._engage(frame, observer, target, state, profile, now)
 
         medic = self._medic_support_intent(frame, observer, state, now)
         if medic is not None:
@@ -1876,6 +1898,82 @@ class BotBrain:
             debug_role="explosive_hazard_escape",
         )
 
+    def _damage_reaction(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Interrupt low-priority work after a recent non-visible hit."""
+
+        source = observer.last_damage_source_position
+        if (
+            source is None
+            or observer.last_damage_source_id < 0
+            or now - float(observer.last_damage_at) > 2.0
+        ):
+            return None
+        cover_reader = getattr(self.world, "cover_direction", None)
+        movement = (
+            cover_reader(observer.position, source)
+            if callable(cover_reader)
+            else (0.0, 0.0, 0.0)
+        )
+        if math.hypot(movement[0], movement[1]) <= 0.1:
+            away = _normalized_xy(
+                observer.position[0] - source[0],
+                observer.position[1] - source[1],
+            )
+            if math.hypot(away[0], away[1]) <= 0.1:
+                away = (
+                    math.cos(state.patrol_heading),
+                    math.sin(state.patrol_heading),
+                    0.0,
+                )
+            goal = (
+                observer.position[0] + away[0] * 10.0,
+                observer.position[1] + away[1] * 10.0,
+                observer.position[2],
+            )
+            movement = self._path_direction(
+                observer.position,
+                goal,
+                state,
+                now,
+                agent_id=observer.player_id,
+                velocity=observer.velocity,
+                abilities=self._movement_abilities(observer),
+            )
+            if math.hypot(movement[0], movement[1]) <= 0.1:
+                movement = away
+        weapon_tool = (
+            int(observer.weapon_tool)
+            if int(observer.weapon_tool) in observer.loadout
+            else -1
+        )
+        action = BotAction()
+        if (
+            weapon_tool >= 0
+            and observer.ammo_clip <= 0
+            and observer.ammo_reserve > 0
+            and not observer.reloading
+        ):
+            action = BotAction(BotActionKind.RELOAD, tool_id=weapon_tool)
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=movement,
+                sprint=True,
+                affordance=state.last_affordance,
+            ),
+            look=LookIntent(source, visible=False),
+            tool_id=weapon_tool,
+            action=action,
+            debug_role="damage_reaction",
+        )
+
     @staticmethod
     def _explosive_target_safe(
         frame: PerceptionFrame,
@@ -1992,6 +2090,33 @@ class BotBrain:
             ),
             look=LookIntent(patient.position, visible=False),
             debug_role="medic_support",
+        )
+
+    def _maintenance_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        now: float,
+    ) -> BotIntent | None:
+        """Reload a dry firearm before low-urgency travel or construction."""
+
+        weapon_tool = int(observer.weapon_tool)
+        if (
+            int(observer.class_id) in _ZOMBIE_CLASSES
+            or weapon_tool not in observer.loadout
+            or observer.reloading
+            or observer.ammo_clip > 0
+            or observer.ammo_reserve <= 0
+        ):
+            return None
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(crouch=True),
+            look=None,
+            tool_id=weapon_tool,
+            action=BotAction(BotActionKind.RELOAD, tool_id=weapon_tool),
+            debug_role="maintenance_reload",
         )
 
     def _miner_demolition(
@@ -2492,6 +2617,7 @@ class BotBrain:
         dx = target.position[0] - observer.position[0]
         dy = target.position[1] - observer.position[1]
         distance = math.hypot(dx, dy)
+        immediate_threat = distance <= 8.0
         weapon_tool = (
             int(observer.weapon_tool)
             if int(observer.weapon_tool) in observer.loadout
@@ -2597,6 +2723,13 @@ class BotBrain:
             for tool in observer.loadout
             if int(tool) in _ORIENTED_TOOLS
             and oriented_stock.get(int(tool), 1) > 0
+            and self._explosive_target_safe(
+                frame,
+                observer,
+                target.position,
+                int(tool),
+                ignore_observer=False,
+            )
         ]
         if observer.reloading:
             # Tool selection outside the primary weapon cancels Player.reload;
@@ -2609,7 +2742,7 @@ class BotBrain:
             if melee_tool is not None and distance <= 4.25:
                 weapon_tool = melee_tool
                 action = BotAction(BotActionKind.MELEE, tool_id=melee_tool)
-        elif seeking_cover and observer.health < 30:
+        elif seeking_cover and observer.health < 30 and not immediate_threat:
             action = BotAction()
         else:
             cover = self._combat_cover_intent(
@@ -2627,7 +2760,11 @@ class BotBrain:
             action.kind is BotActionKind.NONE
             and not dry_weapon
             and not observer.reloading
-            and not (seeking_cover and observer.health < 30)
+            and not (
+                seeking_cover
+                and observer.health < 30
+                and not immediate_threat
+            )
             and now - state.acquired_at
             >= profile.reaction_time + state.reaction_bonus
             and (
@@ -2645,7 +2782,11 @@ class BotBrain:
             action.kind is BotActionKind.NONE
             and not dry_weapon
             and not observer.reloading
-            and not (seeking_cover and observer.health < 30)
+            and not (
+                seeking_cover
+                and observer.health < 30
+                and not immediate_threat
+            )
             and observer.ammo_clip > 0
             and now - state.acquired_at
             >= profile.reaction_time + state.reaction_bonus
@@ -2883,6 +3024,8 @@ class BotBrain:
     ) -> BotIntent | None:
         """Build replicated line or prefab cover under serious pressure."""
 
+        if _distance_squared(observer.position, target.position) <= 8.0 ** 2:
+            return None
         pressured = observer.health <= 35 or (
             observer.health <= 55 and profile.caution >= 0.75
         )

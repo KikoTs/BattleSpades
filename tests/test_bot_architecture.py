@@ -275,6 +275,62 @@ def test_rejected_world_action_is_published_back_to_worker_snapshot() -> None:
     assert snapshot.last_action_position == (20.0, 20.0, 20.0)
 
 
+def test_motor_draws_worker_requested_weapon_before_reaction_finishes() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="QuickDrawBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    assert int(C.BLOCK_TOOL) in bot.loadout
+    bot.set_tool(int(C.BLOCK_TOOL), raw=True)
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=72,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(),
+        tool_id=int(bot.weapon),
+    )
+
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert bot.tool == int(bot.weapon)
+
+
+def test_damage_source_is_published_as_sanctioned_bot_perception() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    victim = asyncio.run(
+        director.add_bot(team=TEAM1, name="VictimBot", class_id=int(C.CLASS_SOLDIER))
+    )
+    attacker = asyncio.run(
+        director.add_bot(team=TEAM2, name="AttackerBot", class_id=int(C.CLASS_SOLDIER))
+    )
+    assert victim is not None and attacker is not None
+
+    victim.damage(5, source=attacker)
+    snapshot = next(
+        item for item in director._snapshot_players() if item.player_id == victim.id
+    )
+
+    assert snapshot.last_damage_at > 0.0
+    assert snapshot.last_damage_source_id == attacker.id
+    assert snapshot.last_damage_source_position == attacker.position
+
+
 def _facing_fixture(class_id: int = int(C.CLASS_MINER)):
     """Real server + one bot, oriented along +x with a settled aim motor."""
 
@@ -1624,6 +1680,31 @@ def test_worker_oriented_attack_uses_only_selected_positive_stock_tool() -> None
     assert oriented.tool_id == 12
 
 
+def test_oriented_attack_never_throws_explosive_into_friendly_blast_volume() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=29)
+    grenade = int(C.GRENADE_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        loadout=(DEFAULT_WEAPON_TOOL, grenade),
+        oriented_stock=((grenade, 2),),
+    )
+    enemy = _player_snapshot(2, TEAM2, (30.0, 0.0, 0.0))
+    teammate = _player_snapshot(3, TEAM1, (31.0, 0.0, 0.0))
+    oriented_actions = []
+
+    for frame_id in range(1, 80):
+        frame = replace(
+            _frame(frame_id, observer, enemy),
+            players=(observer, enemy, teammate),
+        )
+        intent = brain.decide(frame)
+        if intent is not None and intent.action.kind is BotActionKind.ORIENTED:
+            oriented_actions.append(intent.action)
+
+    assert oriented_actions == []
+
+
 def test_empty_clip_reload_has_priority_over_oriented_equipment() -> None:
     world = _SwitchableWorld()
     brain = BotBrain(world, seed=29)
@@ -1641,6 +1722,68 @@ def test_empty_clip_reload_has_priority_over_oriented_equipment() -> None:
         intent = brain.decide(_frame(frame_id, observer, enemy))
         assert intent is not None
         assert intent.action.kind is BotActionKind.RELOAD
+
+
+def test_out_of_combat_empty_clip_reloads_before_patrol_or_building() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=31)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.BLOCK_TOOL)),
+        ammo_clip=0,
+        ammo_reserve=30,
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=time.monotonic(),
+        mode_id="tdm",
+        players=(observer,),
+        profile=_profile(),
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.action.kind is BotActionKind.RELOAD
+    assert intent.action.tool_id == DEFAULT_WEAPON_TOOL
+    assert intent.debug_role == "maintenance_reload"
+
+
+def test_recent_damage_interrupts_resources_and_construction_without_wallhack() -> None:
+    world = _SwitchableWorld()
+    world.visible = False
+    brain = BotBrain(world, seed=17)
+    now = time.monotonic()
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        health=35,
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        tool=int(C.BLOCK_TOOL),
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.BLOCK_TOOL)),
+        last_damage_at=now - 0.2,
+        last_damage_source_id=2,
+        last_damage_source_position=(12.0, 0.0, 0.0),
+    )
+    hidden_enemy = _player_snapshot(2, TEAM2, (15.0, 0.0, 0.0))
+    frame = replace(
+        _frame(1, observer, hidden_enemy),
+        created_at=now,
+        entities=(EntitySnapshot(5, int(C.HEALTH_CRATE), -1, -1, (3.0, 0.0, 0.0)),),
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "damage_reaction"
+    assert intent.tool_id == DEFAULT_WEAPON_TOOL
+    assert intent.action.kind is BotActionKind.NONE
+    assert intent.look is not None
+    assert intent.look.visible is False
 
 
 def test_reloading_bot_does_not_cancel_reload_with_another_tool() -> None:
@@ -1875,6 +2018,35 @@ def test_critical_bot_builds_replicated_block_line_cover_across_threat() -> None
     assert intent.action.position == (1.0, -2.0, 2.0)
     assert intent.action.end_position == (1.0, 2.0, 2.0)
     assert intent.debug_role == "combat_block_line_cover"
+
+
+def test_point_blank_enemy_suppresses_cover_and_forces_weapon_combat() -> None:
+    class CoverWorld(_SwitchableWorld):
+        @staticmethod
+        def cover_direction(_position, _threat):
+            return (-1.0, 0.0, 0.0)
+
+        @staticmethod
+        def cover_build_line(_position, _threat):
+            return (1, -2, 2), (1, 2, 2)
+
+    brain = BotBrain(CoverWorld(), seed=3)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        health=20,
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        tool=int(C.BLOCK_TOOL),
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.BLOCK_TOOL)),
+        blocks=50,
+    )
+    enemy = _player_snapshot(2, TEAM2, (4.0, 0.0, 0.0))
+
+    intent = brain.decide(_frame(1, observer, enemy))
+
+    assert intent is not None
+    assert intent.action.kind is BotActionKind.FIRE
+    assert intent.action.tool_id == DEFAULT_WEAPON_TOOL
+    assert intent.tool_id == DEFAULT_WEAPON_TOOL
 
 
 def test_rejected_cover_feedback_breaks_the_build_and_aim_loop() -> None:
