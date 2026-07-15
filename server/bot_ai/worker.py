@@ -81,6 +81,9 @@ _ORIENTED_TOOLS = frozenset(int(tool) for tool in PROJECTILE_SPECS) - {
     int(C.LANDMINE_TOOL),
     int(C.C4_TOOL),
 }
+_GENERIC_DEPLOYABLE_EXCLUSIONS = frozenset(
+    {int(C.DYNAMITE_TOOL), int(C.C4_TOOL)}
+)
 _ZOMBIE_CLASSES = frozenset({
     int(C.CLASS_ZOMBIE),
     int(C.CLASS_FAST_ZOMBIE),
@@ -172,6 +175,7 @@ class _BrainState:
     reaction_bonus: float = 0.0
     peek_until: float = 0.0
     hold_until: float = 0.0
+    last_action_feedback_frame: int = -1
 
 
 class _DecisionComposer:
@@ -937,6 +941,7 @@ class BotBrain:
         state = self._states.setdefault(key, _BrainState())
         now = max(time.monotonic(), float(frame.created_at))
         profile = frame.profile or _fallback_profile(observer.player_id)
+        self._consume_action_feedback(observer, state, now)
         self._record_progress(state, observer.position, now)
         water_recovery = self._water_recovery(
             frame, observer, state, now
@@ -992,6 +997,11 @@ class BotBrain:
 
         # Own-explosive avoidance outranks everything, including a visible
         # enemy: running from your own lit dynamite is the human move.
+        hazard_retreat = self._active_hazard_retreat(
+            frame, observer, state, now
+        )
+        if hazard_retreat is not None:
+            return hazard_retreat
         retreat = self._blast_retreat(frame, observer, state, now)
         if retreat is not None:
             return retreat
@@ -1326,6 +1336,41 @@ class BotBrain:
         ):
             state.last_progress_at = now
             state.stuck_attempts = 0
+
+    @staticmethod
+    def _consume_action_feedback(
+        observer: PlayerSnapshot, state: _BrainState, now: float
+    ) -> None:
+        """Back off and replan after rejected construction or deployment."""
+
+        feedback_frame = int(observer.last_action_frame)
+        if feedback_frame <= state.last_action_feedback_frame:
+            return
+        state.last_action_feedback_frame = feedback_frame
+        if bool(observer.last_action_accepted):
+            return
+        if str(observer.last_action_kind) not in {
+            BotActionKind.BUILD.value,
+            BotActionKind.BUILD_LINE.value,
+            BotActionKind.PLACE_PREFAB.value,
+            BotActionKind.DEPLOY.value,
+        }:
+            return
+        # Allow normal combat/navigation immediately, but embargo every world
+        # action generator long enough for topology and reservations to move
+        # on. This breaks the stare/retry loop without muting valid gunfire.
+        retry_at = now + 2.5
+        state.next_cover_build_at = max(state.next_cover_build_at, retry_at)
+        state.next_world_action_at = max(state.next_world_action_at, retry_at)
+        state.next_fortify_build_at = max(
+            state.next_fortify_build_at, retry_at
+        )
+        state.next_zombie_build_at = max(state.next_zombie_build_at, retry_at)
+        state.next_breach_at = max(state.next_breach_at, retry_at)
+        state.path.clear()
+        state.path_goal = None
+        state.path_topology_version = -1
+        state.stuck_attempts = min(8, state.stuck_attempts + 1)
 
     def _water_recovery(
         self,
@@ -1760,6 +1805,120 @@ class BotBrain:
             debug_role="blast_retreat",
         )
 
+    def _active_hazard_retreat(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Escape every live blast volume, regardless of who armed it."""
+
+        nearby = [
+            entity
+            for entity in frame.entities
+            if entity.alive
+            and entity.hazardous
+            and entity.blast_radius > 0.0
+            and _distance_squared(observer.position, entity.position)
+            <= (float(entity.blast_radius) + 2.0) ** 2
+        ]
+        if not nearby:
+            return None
+        away_x = 0.0
+        away_y = 0.0
+        for entity in nearby:
+            dx = observer.position[0] - entity.position[0]
+            dy = observer.position[1] - entity.position[1]
+            distance = max(0.5, math.hypot(dx, dy))
+            weight = (float(entity.blast_radius) + 2.0) / (distance * distance)
+            away_x += dx * weight
+            away_y += dy * weight
+        away = _normalized_xy(away_x, away_y)
+        if math.hypot(away[0], away[1]) <= 0.1:
+            away = (
+                math.cos(state.patrol_heading),
+                math.sin(state.patrol_heading),
+                0.0,
+            )
+        escape_distance = max(float(item.blast_radius) for item in nearby) + 4.0
+        goal = (
+            observer.position[0] + away[0] * escape_distance,
+            observer.position[1] + away[1] * escape_distance,
+            observer.position[2],
+        )
+        movement = self._path_direction(
+            observer.position,
+            goal,
+            state,
+            now,
+            agent_id=observer.player_id,
+            velocity=observer.velocity,
+            abilities=self._movement_abilities(observer),
+        )
+        if math.hypot(movement[0], movement[1]) <= 0.1:
+            movement = away
+        nearest = min(
+            nearby,
+            key=lambda entity: _distance_squared(
+                observer.position, entity.position
+            ),
+        )
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                direction=movement,
+                sprint=True,
+                affordance=state.last_affordance,
+            ),
+            look=LookIntent(nearest.position, visible=False),
+            debug_role="explosive_hazard_escape",
+        )
+
+    @staticmethod
+    def _explosive_target_safe(
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        position: Vector3,
+        tool_id: int,
+        *,
+        ignore_observer: bool,
+    ) -> bool:
+        """Check friendly bodies and already-live blast volumes at a target."""
+
+        spec = PROJECTILE_SPECS.get(int(tool_id))
+        fallback = {
+            int(C.DYNAMITE_TOOL): float(
+                getattr(C, "DYNAMITE_EXPLOSION_RADIUS", 5.0)
+            ),
+            int(C.LANDMINE_TOOL): float(
+                getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)
+            ),
+            int(C.C4_TOOL): float(getattr(C, "C4_EXPLOSION_RADIUS", 8.0)),
+        }.get(int(tool_id), 0.0)
+        radius = max(
+            fallback,
+            float(getattr(spec, "blast_radius", 0.0) or 0.0),
+        )
+        if radius <= 0.0:
+            return True
+        for player in frame.players:
+            if player.team != observer.team or not player.alive or not player.spawned:
+                continue
+            if ignore_observer and player.player_id == observer.player_id:
+                continue
+            if _distance_squared(player.position, position) <= (radius + 1.5) ** 2:
+                return False
+        for entity in frame.entities:
+            if not entity.alive or not entity.hazardous:
+                continue
+            if _distance_squared(entity.position, position) <= (
+                radius + float(entity.blast_radius) + 1.0
+            ) ** 2:
+                return False
+        return True
+
     def _medic_support_intent(
         self,
         frame: PerceptionFrame,
@@ -1862,8 +2021,17 @@ class BotBrain:
         )
         if blocking is None:
             return None
-        state.next_dynamite_at = now + 15.0
         target = tuple(float(value) + 0.5 for value in blocking)
+        if not self._explosive_target_safe(
+            frame,
+            observer,
+            target,
+            int(C.DYNAMITE_TOOL),
+            ignore_observer=True,
+        ):
+            state.next_dynamite_at = now + 2.5
+            return None
+        state.next_dynamite_at = now + 15.0
         fuse = float(getattr(C, "DYNAMITE_FUSE_TIME", 7.0))
         state.retreat_from = target
         state.retreat_until = now + fuse + 1.0
@@ -2163,7 +2331,12 @@ class BotBrain:
             6.0 if defensive_role else 18.0,
             14.0 if defensive_role else 35.0,
         )
-        deployables = [tool for tool in observer.loadout if tool in _DEPLOYABLE_TOOLS]
+        deployables = [
+            tool
+            for tool in observer.loadout
+            if tool in _DEPLOYABLE_TOOLS
+            and tool not in _GENERIC_DEPLOYABLE_EXCLUSIONS
+        ]
         can_prefab = (
             int(C.PREFAB_TOOL) in observer.loadout
             and bool(observer.prefabs)
@@ -2209,6 +2382,18 @@ class BotBrain:
             observer.position[1] + forward[1] * distance,
             observer.position[2] + 2.0,
         )
+        if tool in {
+            int(C.DYNAMITE_TOOL),
+            int(C.LANDMINE_TOOL),
+            int(C.C4_TOOL),
+        } and not self._explosive_target_safe(
+            frame,
+            observer,
+            position,
+            tool,
+            ignore_observer=True,
+        ):
+            return None
         state.last_world_action[tool] = now
         if choose_prefab:
             name = observer.prefabs[

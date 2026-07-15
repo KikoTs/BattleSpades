@@ -252,6 +252,65 @@ def test_bot_block_line_uses_shared_combat_service_and_exact_reservation():
     assert (packet.x2, packet.y2, packet.z2) == (13, 10, 20)
 
 
+def test_bot_gateway_rejects_dynamite_inside_friendly_or_existing_blast_zone():
+    placements = []
+
+    class _MinerBot:
+        id = 9
+        team = TEAM1
+        is_bot = True
+        alive = True
+        spawned = True
+        x = 0.0
+        y = 0.0
+        z = 0.0
+        loadout = [int(C.DYNAMITE_TOOL)]
+        tool = -1
+
+        def set_tool(self, tool, raw=True):
+            self.tool = int(tool)
+
+    bot = _MinerBot()
+    teammate = SimpleNamespace(
+        id=10,
+        team=TEAM1,
+        alive=True,
+        spawned=True,
+        x=3.0,
+        y=0.0,
+        z=2.0,
+    )
+    live_entities = []
+    server = SimpleNamespace(
+        players={bot.id: bot, teammate.id: teammate},
+        entity_registry=SimpleNamespace(all=lambda: list(live_entities)),
+        deployable_actions=SimpleNamespace(
+            place_dynamite=lambda _player, position: placements.append(position) or True
+        ),
+    )
+    gateway = BotActionGateway(server)
+    action = BotAction(
+        BotActionKind.DEPLOY,
+        tool_id=int(C.DYNAMITE_TOOL),
+        position=(1.5, 0.0, 2.0),
+    )
+
+    assert gateway.execute(bot, action) is False
+    server.players.pop(teammate.id)
+    live_entities.append(
+        SimpleNamespace(
+            alive=True,
+            x=2.0,
+            y=0.0,
+            z=2.0,
+            type=int(C.DYNAMITE_ENTITY),
+            behavior=SimpleNamespace(blast_radius=5.0),
+        )
+    )
+    assert gateway.execute(bot, action) is False
+    assert placements == []
+
+
 def test_zombie_prefab_tool_routes_through_the_same_authoritative_service():
     calls = []
     server = SimpleNamespace(
