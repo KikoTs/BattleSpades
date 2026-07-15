@@ -271,6 +271,11 @@ def _navigation_player(
 ) -> PlayerSnapshot:
     """Build a complete immutable player view for worker behavior tests."""
 
+    zombie_classes = {
+        int(C.CLASS_ZOMBIE),
+        int(C.CLASS_FAST_ZOMBIE),
+        int(C.CLASS_JUMP_ZOMBIE),
+    }
     return PlayerSnapshot(
         player_id=player_id,
         generation=1,
@@ -290,6 +295,15 @@ def _navigation_player(
         is_bot=is_bot,
         weapon_tool=int(C.ZOMBIEHAND_TOOL),
         loadout=(int(C.ZOMBIEHAND_TOOL), int(C.ZOMBIE_PREFAB_TOOL)),
+        prefabs=(
+            (
+                "prefab_zombiehand",
+                "prefab_zombiebone",
+                "prefab_zombiehead",
+            )
+            if int(class_id) in zombie_classes
+            else ()
+        ),
         wade=wade,
     )
 
@@ -343,3 +357,122 @@ def test_wading_zombie_recovers_before_engaging_a_visible_survivor() -> None:
     assert intent.debug_role == "water_recovery"
     assert intent.movement.direction == (1.0, 0.0, 0.0)
     assert intent.movement.affordance is MovementAffordance.JUMP
+
+
+def test_close_zombie_uses_height_aware_jump_to_elevated_survivor() -> None:
+    columns = {
+        (6, 5): {10},
+        (7, 5): {8},
+    }
+    world = WorkerVoxelWorld()
+    world.map_epoch = 2
+    world.topology_version = 3
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    brain = BotBrain(world, seed=5)
+    zombie = _navigation_player(
+        1,
+        TEAM1,
+        (6.5, 5.5, 7.75),
+        class_id=int(C.CLASS_ZOMBIE),
+        is_bot=True,
+    )
+    survivor = _navigation_player(
+        2,
+        1,
+        (7.5, 5.5, 5.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=2,
+        map_epoch=2,
+        mode_epoch=1,
+        topology_version=3,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=now,
+        mode_id="zom",
+        players=(zombie, survivor),
+        mode_phase="ACTIVE",
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.movement.direction == (1.0, 0.0, 0.0)
+    assert intent.movement.affordance is MovementAffordance.JUMP
+    assert intent.movement.sprint is False
+
+
+def test_unreachable_elevated_survivor_escalates_to_zombie_climb_prefab() -> None:
+    columns = {
+        (6, 5): {10},
+        (7, 5): {7},
+    }
+    world = WorkerVoxelWorld()
+    world.map_epoch = 3
+    world.topology_version = 4
+    world._vxl = object()
+    world._native_nav = None
+    solid = _solid_columns(columns)
+    world.solid = lambda x, y, z: solid(x, y, z)
+    brain = BotBrain(world, seed=6)
+    zombie = _navigation_player(
+        1,
+        TEAM1,
+        (6.5, 5.5, 7.75),
+        class_id=int(C.CLASS_ZOMBIE),
+        is_bot=True,
+    )
+    survivor = _navigation_player(
+        2,
+        1,
+        (7.5, 5.5, 4.75),
+        class_id=int(C.CLASS_SOLDIER),
+    )
+    now = time.monotonic()
+    frame = PerceptionFrame(
+        frame_id=3,
+        map_epoch=3,
+        mode_epoch=1,
+        topology_version=4,
+        observer_id=zombie.player_id,
+        observer_generation=zombie.generation,
+        created_at=now,
+        mode_id="zom",
+        players=(zombie, survivor),
+        mode_phase="ACTIVE",
+    )
+
+    first = brain.decide(frame)
+    second = brain.decide(
+        replace(frame, frame_id=4, created_at=now + 1.0)
+    )
+
+    assert first is not None
+    assert second is not None
+    assert second.debug_role == "zombie_build_climb"
+    assert second.action.kind.value == "place_prefab"
+    assert second.action.argument == "prefab_zombiehand"
+
+
+def test_local_planner_rejects_a_jump_with_blocked_head_arc() -> None:
+    columns = {
+        (6, 5): {6, 10},
+        (7, 5): {8},
+    }
+    planner = VoxelActionPlanner(
+        VoxelTerrain(_solid_columns(columns))
+    )
+
+    step = planner.plan_local(
+        (6.5, 5.5, 7.75),
+        (7.5, 5.5, 5.75),
+        abilities=frozenset({MovementAffordance.JUMP}),
+        topology_version=5,
+    )
+
+    assert step is None or step.affordance is not MovementAffordance.JUMP
