@@ -8,6 +8,20 @@ max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 
+# Revival web registry, launcher identity, and persistent leaderboard bridge.
+# Set AOS_MASTER_WRITE_TOKEN in the server process environment to the same
+# secret configured on Vercel. Never place that secret in this file.
+[revival]
+enabled = true
+base_url = "https://www.aosplay.net"
+public_host = "127.0.0.1"   # replace with the public DNS name or IPv4 address
+server_id = ""              # blank = public_host:server.port
+region = "europe"
+official = false
+require_identity = false    # true rejects legacy/unranked clients
+heartbeat_interval_seconds = 30.0
+request_timeout_seconds = 5.0
+
 [network]
 timeout_ms = 10000
 max_connections = 64

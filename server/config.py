@@ -13,6 +13,23 @@ from server.lobby import LOBBY_MATCH_LENGTH_OPTIONS
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
+from urllib.parse import urlsplit
+
+
+def _revival_token(name: str, value: object, limit: int) -> str:
+    """Validate one short ASCII registry value from untrusted TOML."""
+
+    token = str(value).strip()
+    if len(token) > limit:
+        raise ValueError(f"revival.{name} must be at most {limit} characters")
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+    )
+    if any(character not in allowed for character in token):
+        raise ValueError(
+            f"revival.{name} may contain only ASCII letters, digits, _, ., and -"
+        )
+    return token
 
 
 @dataclass
@@ -33,6 +50,25 @@ class BotConfig:
     seed: int = 0
     debug_visualization: bool = False
     configured: bool = False
+
+
+@dataclass
+class RevivalMasterConfig:
+    """Public Revival registry and account/statistics bridge.
+
+    The shared write credential is deliberately read from
+    ``AOS_MASTER_WRITE_TOKEN`` at runtime and never accepted from TOML.
+    """
+
+    enabled: bool = True
+    base_url: str = "https://www.aosplay.net"
+    public_host: str = "127.0.0.1"
+    server_id: str = ""
+    region: str = "europe"
+    official: bool = False
+    require_identity: bool = False
+    heartbeat_interval_seconds: float = 30.0
+    request_timeout_seconds: float = 5.0
 
 
 @dataclass
@@ -142,6 +178,7 @@ class ServerConfig:
     # New isolated runtime. ``configured`` distinguishes an explicit [bots]
     # table from legacy game.bot_count fixed-population behavior.
     bots: BotConfig = field(default_factory=BotConfig)
+    revival: RevivalMasterConfig = field(default_factory=RevivalMasterConfig)
 
     # Map-entity (crate/intel) wire emission. The Entity byte layout was
     # RE-verified against the compiled client (shared/packet.pyx Entity.read/
@@ -506,6 +543,77 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.bots.seed = int(b.get("seed", config.bots.seed))
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
+        )
+
+    if "revival" in data:
+        revival = data["revival"]
+        if not isinstance(revival, dict):
+            raise ValueError("revival must be a TOML table")
+        config.revival.enabled = bool(
+            revival.get("enabled", config.revival.enabled)
+        )
+        config.revival.base_url = str(
+            revival.get("base_url", config.revival.base_url)
+        ).strip().rstrip("/")
+        parsed_base_url = urlsplit(config.revival.base_url)
+        local_http = (
+            parsed_base_url.scheme == "http"
+            and parsed_base_url.hostname in {"127.0.0.1", "localhost", "::1"}
+        )
+        if (
+            not parsed_base_url.netloc
+            or parsed_base_url.username is not None
+            or parsed_base_url.password is not None
+            or parsed_base_url.query
+            or parsed_base_url.fragment
+            or not (parsed_base_url.scheme == "https" or local_http)
+        ):
+            raise ValueError(
+                "revival.base_url must be an HTTPS origin "
+                "(localhost HTTP is allowed for development)"
+            )
+        config.revival.public_host = str(
+            revival.get("public_host", config.revival.public_host)
+        ).strip()
+        if not config.revival.public_host:
+            raise ValueError("revival.public_host cannot be empty")
+        config.revival.server_id = str(
+            revival.get("server_id", config.revival.server_id)
+        ).strip()
+        config.revival.region = _revival_token(
+            "region",
+            revival.get("region", config.revival.region),
+            31,
+        ) or "europe"
+        config.revival.official = bool(
+            revival.get("official", config.revival.official)
+        )
+        config.revival.require_identity = bool(
+            revival.get("require_identity", config.revival.require_identity)
+        )
+        config.revival.heartbeat_interval_seconds = min(
+            60.0,
+            max(
+                15.0,
+                float(
+                    revival.get(
+                        "heartbeat_interval_seconds",
+                        config.revival.heartbeat_interval_seconds,
+                    )
+                ),
+            ),
+        )
+        config.revival.request_timeout_seconds = min(
+            15.0,
+            max(
+                1.0,
+                float(
+                    revival.get(
+                        "request_timeout_seconds",
+                        config.revival.request_timeout_seconds,
+                    )
+                ),
+            ),
         )
 
     if "teams" in data:

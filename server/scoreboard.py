@@ -75,6 +75,14 @@ def broadcast_game_stats(server, winner: int | None = None) -> None:
     pkt.types = [0 for _ in players]
     server.broadcast(bytes(pkt.generate()))
 
+    # Submit the same finished-round snapshot outside the simulation thread.
+    # The bridge tracks per-player baselines, so same-map restarts add deltas
+    # rather than re-uploading cumulative scoreboard values.
+    revival_master = getattr(server, "revival_master", None)
+    schedule_results = getattr(revival_master, "schedule_round_results", None)
+    if callable(schedule_results):
+        schedule_results(winner)
+
 
 def show_game_stats(server) -> None:
     """Trigger the client's full-screen end-of-round stats screen
