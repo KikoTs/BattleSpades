@@ -783,6 +783,58 @@ class Connection:
     async def _on_new_player(self, packet: NewPlayerConnection):
         """Handle new player joining."""
         from server.player import Player
+        from server.revival_master import (
+            JoinTicketRejected,
+            JoinTicketUnavailable,
+            is_join_code,
+        )
+        from shared.constants import DISCONNECT
+
+        revival_master = getattr(self.server, "revival_master", None)
+        identity = None
+        requested_name = str(packet.name or "")
+        if is_join_code(requested_name):
+            if revival_master is None:
+                logger.warning(
+                    "Rejecting join-code client %s: Revival bridge unavailable",
+                    self.peer.address,
+                )
+                self.disconnect(reason=int(DISCONNECT.ERROR_TIMEOUT))
+                return
+            try:
+                identity = await revival_master.consume_join_ticket(
+                    requested_name
+                )
+            except JoinTicketRejected as error:
+                logger.info(
+                    "Rejected invalid Revival join code from %s: %s",
+                    self.peer.address,
+                    error,
+                )
+                self.disconnect(reason=int(DISCONNECT.ERROR_NOTICKET))
+                return
+            except JoinTicketUnavailable as error:
+                logger.warning(
+                    "Could not validate Revival join code from %s: %s",
+                    self.peer.address,
+                    error,
+                )
+                self.disconnect(reason=int(DISCONNECT.ERROR_TIMEOUT))
+                return
+            requested_name = identity.nickname
+        elif bool(
+            getattr(
+                getattr(self.server.config, "revival", None),
+                "require_identity",
+                False,
+            )
+        ):
+            logger.info(
+                "Rejected unverified legacy player %s on identity-required server",
+                self.peer.address,
+            )
+            self.disconnect(reason=int(DISCONNECT.ERROR_RANKED_SERVER))
+            return
 
         # Use the id already promised to this client in StateData.player_id
         # (reserved during send_connection_data) — the client's whole
@@ -803,16 +855,18 @@ class Connection:
         from server.player_names import allocate_unique_player_name
 
         player_name = allocate_unique_player_name(
-            packet.name,
+            requested_name,
             self.server.players.values(),
         )
-        if player_name != packet.name:
+        if player_name != requested_name:
             logger.info(
                 "Renamed duplicate/unsafe player %r to %r",
-                packet.name,
+                requested_name,
                 player_name,
             )
         player = Player(player_id, player_name, internal_team, weapon, self)
+        if revival_master is not None:
+            revival_master.bind_player(player, identity)
         player.local_language = int(packet.local_language)
         from server.class_selection import normalize_server_selection
 
@@ -841,9 +895,10 @@ class Connection:
             self.server.teams[player.team].add_player(player)
         
         logger.info(
-            "Player %s (ID %s) joined wire team %s as internal team %s",
+            "Player %s (ID %s, identity=%s) joined wire team %s as internal team %s",
             player.name,
             player_id,
+            getattr(player, "identity_type", "legacy"),
             wire_team,
             player.team,
         )

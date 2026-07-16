@@ -44,6 +44,7 @@ from .team import Team
 from .world_manager import WorldManager
 from .connection import Connection
 from .a2s_query import A2SHandler
+from .revival_master import RevivalMasterService
 from .debug_parity import DebugParityManager
 from .replication import ReplicationService
 from .round_lifecycle import RoundLifecycle
@@ -193,6 +194,7 @@ class BattleSpadesServer:
         
         # A2S Query handler for Steam browser and LAN discovery
         self.a2s_handler = A2SHandler(self)
+        self.revival_master = RevivalMasterService(self)
         
         # Game mode
         self.mode = None
@@ -1102,6 +1104,9 @@ class BattleSpadesServer:
             self.mode = mode_class(self)
             await self.mode.on_mode_start()
 
+        # Advertise only after product, map, and mode identity are established.
+        await self.revival_master.start()
+
         # Auto-discover + load plugins from the plugins/ package.
         await self._load_plugins()
 
@@ -1142,6 +1147,9 @@ class BattleSpadesServer:
     async def stop(self):
         """Stop the server."""
         if not self.running:
+            # Registry startup precedes optional plugins and bots, so a later
+            # startup failure must still stop its heartbeat worker.
+            await self.revival_master.close()
             return
         
         logger.info("Stopping server...")
@@ -1150,6 +1158,8 @@ class BattleSpadesServer:
         if self.bots is not None:
             await self.bots.close()
             self.bots = None
+
+        await self.revival_master.close()
         
         if self.mode:
             await self.mode.on_mode_end()
@@ -1342,6 +1352,10 @@ class BattleSpadesServer:
         if connection.player:
             player = connection.player
             logger.info(f"Player {player.name} disconnected")
+
+            revival_master = getattr(self, "revival_master", None)
+            if revival_master is not None:
+                revival_master.accumulate_departing_player(player)
 
             # Mode state (VIP ownership, CTF intel, etc.) must observe the
             # departing identity. The event is drained next tick after the
