@@ -7,10 +7,10 @@
 # The reliable-UDP ENet binding is built by setup.py from vendor/pyenet.
 
 # Python 3.12 virtual environments no longer install setuptools implicitly.
-setuptools>=75
+setuptools==80.9.0
 
 # Cython — builds the compiled physics / VXL / packet core.
-Cython>=3.0.0
+Cython==3.0.12
 
 # Config file parsing.
 toml>=0.10.2
