@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import struct
 
 import pytest
 
 from deploy.a2s_probe import decode_info
 from deploy.register_server import Registration, bounded_integer
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_a2s_probe_decodes_battlespades_identity_and_population() -> None:
@@ -54,3 +58,20 @@ def test_registration_uses_same_game_and_query_port_without_claiming_an_ip() -> 
 def test_registration_rejects_invalid_ports(value: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         bounded_integer(value, 1, 65535)
+
+
+def test_container_initializes_provider_volume_then_drops_privileges() -> None:
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    initializer = (
+        PROJECT_ROOT / "scripts" / "container_init.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "ca-certificates gosu tini" in dockerfile
+    assert (
+        'ENTRYPOINT ["/usr/bin/tini", "--", "/app/scripts/container_init.sh"]'
+        in dockerfile
+    )
+    assert "USER 10001:10001" not in dockerfile
+    assert 'case "$data_dir" in' in initializer
+    assert 'chown battlespades:battlespades "$data_dir"' in initializer
+    assert "exec gosu battlespades:battlespades" in initializer

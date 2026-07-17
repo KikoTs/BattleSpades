@@ -30,9 +30,11 @@ the tunnel path as the default production architecture.
 
 ## Container contract
 
-The image runs as UID/GID `10001`, drops Linux capabilities in the fleet
-example, keeps the source filesystem read-only, and writes runtime config,
-logs, and bans only beneath `/data`.
+The initializer claims only the `/data` volume when a provider mounts it as
+root, then permanently drops to UID/GID `10001` before Python or game data is
+loaded. The fleet example also drops Linux capabilities, keeps the source
+filesystem read-only, and writes runtime config, logs, and bans only beneath
+`/data`.
 
 Supported per-instance environment variables:
 
