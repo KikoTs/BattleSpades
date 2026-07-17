@@ -80,6 +80,30 @@ def test_heartbeat_identifier_matches_direct_connect_identifier(monkeypatch):
     assert "identity=ticket-v1" in payload["tags"]
 
 
+def test_heartbeat_uses_live_map_mode_and_population(monkeypatch):
+    monkeypatch.setenv("AOS_MASTER_WRITE_TOKEN", "x" * 48)
+    server = make_server()
+    server.config.default_map = "ConfiguredMap"
+    server.config.default_mode = "cctf"
+    server.world_manager = SimpleNamespace(map_name="LiveMap")
+    server.players = {
+        0: SimpleNamespace(is_bot=False),
+        1: SimpleNamespace(is_bot=False),
+        2: SimpleNamespace(is_bot=True),
+    }
+
+    payload = RevivalMasterService(server).heartbeat_payload()
+
+    assert payload["map"] == "LiveMap"
+    assert payload["game_mode"] == "CCTF"
+    assert payload["mode_tla"] == "cctf"
+    assert payload["classic"] is True
+    assert payload["players"] == 3
+    assert payload["human_players"] == 2
+    assert payload["bots"] == 1
+    assert "mode=0008" in payload["tags"]
+
+
 def test_consumed_join_code_returns_canonical_identity(monkeypatch):
     monkeypatch.setenv("AOS_MASTER_WRITE_TOKEN", "x" * 48)
     service = RevivalMasterService(make_server())
