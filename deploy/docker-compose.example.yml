@@ -1,0 +1,85 @@
+x-battlespades-common: &battlespades-common
+  image: ${BATTLESPADES_IMAGE:-ghcr.io/kikots/battlespades}:${BATTLESPADES_IMAGE_TAG:-main}
+  pull_policy: always
+  restart: unless-stopped
+  stop_grace_period: 30s
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+
+services:
+  eu-ctf:
+    <<: *battlespades-common
+    container_name: battlespades-eu-ctf
+    environment:
+      BATTLESPADES_SERVER_NAME: "AoS Revival EU / CTF"
+      BATTLESPADES_PORT: "27015"
+      BATTLESPADES_MAX_PLAYERS: "24"
+      BATTLESPADES_MODE: "ctf"
+      BATTLESPADES_MAP: "MayanJungle"
+      BATTLESPADES_BOT_COUNT: "4"
+      BATTLESPADES_REGION: "europe"
+      BATTLESPADES_REQUIRE_IDENTITY: "false"
+      BATTLESPADES_ADMIN_PASSWORD: ${SERVER_1_ADMIN_PASSWORD:?Set SERVER_1_ADMIN_PASSWORD}
+      AOS_MASTER_URL: ${AOS_MASTER_URL:-https://aosplay.net}
+      AOS_PUBLIC_HOST: ${AOS_PUBLIC_HOST:?Set the node public IPv4 address}
+      AOS_SERVER_ID: "${AOS_PUBLIC_HOST}:27015"
+      AOS_MASTER_WRITE_TOKEN: ${AOS_SERVER_1_TOKEN:-}
+    ports:
+      - "27015:27015/udp"
+    volumes:
+      - server-1-data:/data
+
+  eu-tdm:
+    <<: *battlespades-common
+    container_name: battlespades-eu-tdm
+    environment:
+      BATTLESPADES_SERVER_NAME: "AoS Revival EU / TDM"
+      BATTLESPADES_PORT: "27025"
+      BATTLESPADES_MAX_PLAYERS: "24"
+      BATTLESPADES_MODE: "tdm"
+      BATTLESPADES_MAP: "classicgen"
+      BATTLESPADES_BOT_COUNT: "4"
+      BATTLESPADES_REGION: "europe"
+      BATTLESPADES_REQUIRE_IDENTITY: "false"
+      BATTLESPADES_ADMIN_PASSWORD: ${SERVER_2_ADMIN_PASSWORD:?Set SERVER_2_ADMIN_PASSWORD}
+      AOS_MASTER_URL: ${AOS_MASTER_URL:-https://aosplay.net}
+      AOS_PUBLIC_HOST: ${AOS_PUBLIC_HOST:?Set the node public IPv4 address}
+      AOS_SERVER_ID: "${AOS_PUBLIC_HOST}:27025"
+      AOS_MASTER_WRITE_TOKEN: ${AOS_SERVER_2_TOKEN:-}
+    ports:
+      - "27025:27025/udp"
+    volumes:
+      - server-2-data:/data
+
+  eu-zombie:
+    <<: *battlespades-common
+    container_name: battlespades-eu-zombie
+    environment:
+      BATTLESPADES_SERVER_NAME: "AoS Revival EU / Zombie"
+      BATTLESPADES_PORT: "27035"
+      BATTLESPADES_MAX_PLAYERS: "24"
+      BATTLESPADES_MODE: "zombie"
+      BATTLESPADES_MAP: "MayanJungle"
+      BATTLESPADES_BOT_COUNT: "6"
+      BATTLESPADES_REGION: "europe"
+      BATTLESPADES_REQUIRE_IDENTITY: "false"
+      BATTLESPADES_ADMIN_PASSWORD: ${SERVER_3_ADMIN_PASSWORD:?Set SERVER_3_ADMIN_PASSWORD}
+      AOS_MASTER_URL: ${AOS_MASTER_URL:-https://aosplay.net}
+      AOS_PUBLIC_HOST: ${AOS_PUBLIC_HOST:?Set the node public IPv4 address}
+      AOS_SERVER_ID: "${AOS_PUBLIC_HOST}:27035"
+      AOS_MASTER_WRITE_TOKEN: ${AOS_SERVER_3_TOKEN:-}
+    ports:
+      - "27035:27035/udp"
+    volumes:
+      - server-3-data:/data
+
+volumes:
+  server-1-data:
+  server-2-data:
+  server-3-data:
