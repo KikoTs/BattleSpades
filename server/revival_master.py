@@ -19,6 +19,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
+from server.mode_data import get as get_mode_data
+
 
 logger = logging.getLogger(__name__)
 
@@ -249,28 +251,65 @@ class RevivalMasterService:
             if steam is not None and bool(getattr(steam, "enabled", False))
             else game_port
         )
-        mode_name = str(self.server.config.default_mode).lower()
+        mode = get_mode_data(
+            getattr(
+                self.server.config,
+                "game_mode",
+                self.server.config.default_mode,
+            )
+        )
+        world = getattr(self.server, "world_manager", None)
+        map_name = str(
+            getattr(world, "map_name", "")
+            or getattr(
+                self.server.config,
+                "map_name",
+                self.server.config.default_map,
+            )
+        )
+        players = tuple(getattr(self.server, "players", {}).values())
+        bot_count = min(
+            len(players),
+            sum(bool(getattr(player, "is_bot", False)) for player in players),
+        )
+        human_count = len(players) - bot_count
+        texture_skin = (
+            str(getattr(steam, "texture_skin", "") or "") if steam else ""
+        )
+        if not texture_skin and mode.mafia:
+            texture_skin = "mafia"
+        tags = [
+            "revival",
+            "protocol=168",
+            "identity=ticket-v1",
+            "mode=%04d" % int(mode.mode_id),
+        ]
         return {
             "identifier": self.server_id,
             "name": str(self.server.config.server_name),
             "ip": self.public_host,
             "port": game_port,
             "queryPort": query_port,
-            "players": len(self.server.players),
+            # `players` is the total browser population. The explicit fields
+            # preserve human/bot semantics without making the retail UI lie.
+            "players": len(players),
+            "human_players": human_count,
+            "bots": bot_count,
             "max_players": int(self.server.config.max_players),
-            "map": str(self.server.config.default_map),
-            "game_mode": mode_name.upper(),
-            "mode_tla": mode_name,
+            "map": map_name,
+            "game_mode": mode.code.upper(),
+            "mode_tla": mode.code,
             "version": str(
                 getattr(steam, "game_version", "1.0.0.0") if steam else "1.0.0.0"
             ),
             "region": str(getattr(self.config, "region", "europe")),
             "official": bool(getattr(self.config, "official", False)),
             "playlist_id": int(getattr(steam, "playlist_id", 0) if steam else 0),
-            "classic": True,
+            "texture_skin": texture_skin or None,
+            "classic": bool(mode.classic),
             "monitor": False,
             "beta": False,
-            "tags": ["revival", "protocol=168", "identity=ticket-v1"],
+            "tags": tags,
         }
 
     async def publish_heartbeat(self) -> None:
