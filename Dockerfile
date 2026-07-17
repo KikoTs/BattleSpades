@@ -36,7 +36,7 @@ ENV PYTHONUNBUFFERED=1 \
     BATTLESPADES_DATA_DIR=/data
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates tini \
+    && apt-get install --yes --no-install-recommends ca-certificates gosu tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 battlespades \
     && useradd --uid 10001 --gid battlespades --no-create-home --home-dir /app battlespades \
@@ -45,11 +45,12 @@ RUN apt-get update \
 COPY --from=builder /runtime-python/ /usr/local/
 COPY --from=builder --chown=battlespades:battlespades /build/ /app/
 
+RUN chmod 0755 /app/scripts/container_init.sh
+
 WORKDIR /app
-USER 10001:10001
 
 VOLUME ["/data"]
 EXPOSE 27015/udp
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "-u", "scripts/container_entrypoint.py"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/scripts/container_init.sh"]
