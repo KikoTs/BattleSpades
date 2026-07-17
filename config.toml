@@ -27,9 +27,9 @@ retail_root = ""      # blank = auto-discover; otherwise AoS directory containin
 # intentionally not bundled. Put steam_api.dll in ./steam-runtime; compatible
 # Steam client libraries are auto-discovered or selected with steamclient_dir.
 [steam]
-enabled = true
+enabled = false                   # opt in when the original x86 Steam runtime is installed
 app_id = 224540              # fixed Ace of Spades app; 480 is Spacewar
-runtime_dir = "G:/AoSRevival/aceofspades_decompiled"            # empty = ./steam-runtime or env override
+runtime_dir = ""             # empty = ./steam-runtime or env override
 steamclient_dir = ""         # empty = auto-detect the installed Steam folder
 helper_path = ""             # empty = bundled Windows x86 helper
 # Safe default: use Steam's installed client runtime. The old steamclient.dll
