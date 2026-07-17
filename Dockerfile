@@ -13,7 +13,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY . .
 
-RUN python -m pip install "setuptools>=75" "Cython>=3.0.0" \
+RUN python -m pip install "setuptools==80.9.0" "Cython==3.0.12" \
     && python -m pip install --prefix=/runtime-python "toml>=0.10.2" "py_trees>=2.5,<2.6" \
     && python setup.py build_ext --inplace \
     && python run_server.py --version \
