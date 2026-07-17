@@ -1,5 +1,5 @@
-BattleSpades 0.0.1 Alpha
-========================
+BattleSpades Portable Alpha
+===========================
 
 1. Extract the complete zip into a writable directory.
 2. Run `BattleSpades.exe --check` on Windows or `./BattleSpades --check` on
@@ -8,8 +8,37 @@ BattleSpades 0.0.1 Alpha
    exposing the server publicly.
 4. Run the same launcher without arguments.
 
+Retail tutorial
+---------------
+
+`BattleSpadesTutorial.exe` on Windows (or `./BattleSpadesTutorial` on
+Linux/macOS) is the isolated Training.vxl tutorial server. Run its own
+`--check` first, then launch it without arguments. It is deliberately separate
+from `BattleSpades`: changing `config.toml` to mode `tut` cannot expose the
+tutorial through the normal public server entrypoint.
+
+Retail Map Creator
+------------------
+
+`BattleSpadesMapCreator.exe` on Windows (or `./BattleSpadesMapCreator` on
+Linux/macOS) runs the isolated hosted UGC editor. It is not selectable through
+`BattleSpades` or `config.toml`. Point `--retail-root` at a legally installed
+Ace of Spades directory containing `ugc/maps` and `ugc/kv6`:
+
+    BattleSpadesMapCreator.exe --check --retail-root C:\Games\AceOfSpades
+    BattleSpadesMapCreator.exe --project MyMap --terrain grassland --target-mode ctf --retail-root C:\Games\AceOfSpades
+
+Projects are saved as sibling `.vxl`, `.txt`, and `.ugc` files under
+`ugc-projects/` unless `--output-dir` or a project path is supplied. Supported
+terrains are desert, lunar, mountain, grassland, temple, urban, marsh, snowy,
+and water. The retail baseplates and KV6 catalog are proprietary client assets
+and are deliberately not included in this archive.
+
 The default game listener uses UDP port 27015. Allow that UDP port through the
 host firewall and router when accepting players from outside the local network.
+Optional Steam registry/A2S advertisement also needs the configured Steam
+updater and query UDP ports (defaults 8766 and game port + 1). Valve retired
+the legacy list endpoint used by the unmodified 2015 All/Community screen.
 
 Runtime files
 -------------
@@ -19,6 +48,7 @@ Runtime files
 - `prefabs/`: KV6 models required by classes and game modes.
 - `plugins/`: optional trusted Python plugins.
 - `client_patches/`: retail-client compatibility hooks and installation notes.
+- `steam-runtime/`: instructions for optional operator-supplied Steam files.
 - `logs/`: created on first normal server start.
 - `bans.json`: created after the first persistent ban.
 

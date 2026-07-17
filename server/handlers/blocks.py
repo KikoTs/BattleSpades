@@ -17,33 +17,9 @@ logger = logging.getLogger(__name__)
 
 @register_handler(7)  # PaintBlockPacket
 async def handle_paint_block(server, player, packet):
-    """Authoritatively recolour an existing voxel and relay packet 7."""
+    """Route native packet 7 through shared paint authorization/replication."""
 
-    from server.game_rules import get_rules
-    if (
-        not player.alive
-        or not player.spawned
-        or not player.is_block_tool()
-        or not get_rules(server.config).is_tool_enabled(player.tool)
-    ):
-        return
-    x, y, z = int(packet.x), int(packet.y), int(packet.z)
-    world = server.world_manager
-    if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z <= 238):
-        return
-    if not world.get_solid(x, y, z):
-        return
-    color = tuple(int(component) & 0xFF for component in packet.color[:3])
-    if len(color) != 3 or not world.set_block(x, y, z, True, color):
-        return
-
-    from shared.packet import PaintBlockPacket
-
-    output = PaintBlockPacket()
-    output.loop_count = server.loop_count
-    output.x, output.y, output.z = x, y, z
-    output.color = color
-    server.broadcast(bytes(output.generate()))
+    get_combat_system(server).handle_paint_packet(player, packet)
 
 
 @register_handler(32)  # BlockBuild
@@ -98,20 +74,28 @@ async def handle_erase_prefab(server, player, packet):
         or not get_rules(server.config).enabled("RULE_ENABLE_PREFABS")
     ):
         return
+    service = getattr(server, "prefab_actions", None)
+    if service is not None and bool(getattr(server.config, "ugc_runtime", False)):
+        service.erase_packet(player, packet)
+        return
     from server import prefabs
 
     name = str(getattr(packet, "prefab_name", "") or "")
+    if service is not None and not service.authorized(player, name):
+        return
     model = prefabs.get_registry().get(name) if name else None
     if model is None:
         return
     yaw = int(getattr(packet, "prefab_yaw", 0)) & 3
     pitch = int(getattr(packet, "prefab_pitch", 0)) & 3
     roll = int(getattr(packet, "prefab_roll", 0)) & 3
-    position = (
-        int(getattr(packet, "x", 0)),
-        int(getattr(packet, "y", 0)),
-        int(getattr(packet, "z", 0)),
-    )
+    raw_position = getattr(packet, "position", (0, 0, 0))
+    try:
+        position = tuple(int(round(float(value))) for value in raw_position[:3])
+    except (IndexError, TypeError, ValueError):
+        return
+    if len(position) != 3:
+        return
 
     cells = prefabs.expand_prefab(model, position, yaw, pitch, roll)
     targets = [

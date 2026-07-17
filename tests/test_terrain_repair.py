@@ -87,6 +87,114 @@ def test_repair_uses_exact_non_collapsing_damage_for_canonical_air():
     assert packet.position == tuple(float(value) for value in cell)
 
 
+def test_collapse_confirmation_is_fast_exact_and_surface_first():
+    config = ServerConfig(
+        terrain_repair_delay_ticks=120,
+        terrain_repair_interval_ticks=1,
+        terrain_repair_batch_limit=1,
+        terrain_collapse_repair_delay_ticks=2,
+        terrain_collapse_repair_batch_limit=1,
+    )
+    server = BattleSpadesServer(config)
+    server.world_manager = FakeWorld()
+    connection = RecordingConnection()
+    server.connections = {object(): connection}
+    cube = [
+        (x, y, z)
+        for x in range(10, 13)
+        for y in range(20, 23)
+        for z in range(30, 33)
+    ]
+
+    server.terrain_repair.record_collapse_cells(cube)
+    assert server.terrain_repair.pending_count == 27
+    server.loop_count = 1
+    assert server.terrain_repair.tick() == 0
+    server.loop_count = 2
+    assert server.terrain_repair.tick() == 1
+
+    raw, reliable = connection.sent[0]
+    packet = Damage(ByteReader(raw[1:]))
+    assert reliable is True
+    assert raw[0] == 37
+    assert packet.type == int(C.WEAPON_DAMAGE)
+    assert packet.chunk_check == 0
+    assert packet.position != (11.0, 21.0, 31.0)
+    assert (11, 21, 31) in server.terrain_repair._collapse_pending
+
+
+def test_collapse_confirmation_drops_rebuilt_cells_without_duplicate_particles():
+    config = ServerConfig(
+        terrain_repair_interval_ticks=1,
+        terrain_collapse_repair_delay_ticks=1,
+        terrain_collapse_repair_batch_limit=8,
+    )
+    server = BattleSpadesServer(config)
+    server.world_manager = FakeWorld()
+    connection = RecordingConnection()
+    server.connections = {object(): connection}
+    rebuilt = (40, 50, 60)
+    stale_air = (41, 50, 60)
+
+    server.terrain_repair.record_collapse_cells((rebuilt, stale_air))
+    server.world_manager.cells[rebuilt] = 0x80112233
+    server.loop_count = 1
+
+    assert server.terrain_repair.tick() == 1
+    assert len(connection.sent) == 1
+    packet = Damage(ByteReader(connection.sent[0][0][1:]))
+    assert packet.position == tuple(float(value) for value in stale_air)
+    assert server.terrain_repair.pending_count == 0
+
+
+def test_collapse_queue_overflow_preserves_visible_shell_before_interior():
+    config = ServerConfig(
+        terrain_repair_queue_limit=64,
+        terrain_collapse_repair_delay_ticks=1,
+    )
+    server = BattleSpadesServer(config)
+    server.world_manager = FakeWorld()
+    cube = [
+        (x, y, z)
+        for x in range(5)
+        for y in range(5)
+        for z in range(5)
+    ]
+
+    server.terrain_repair.record_collapse_cells(cube)
+
+    assert server.terrain_repair.pending_count == 64
+    assert (2, 2, 2) not in server.terrain_repair._collapse_pending
+    assert all(
+        x in (0, 4) or y in (0, 4) or z in (0, 4)
+        for x, y, z in server.terrain_repair._collapse_pending
+    )
+    assert server.metrics.dropped_terrain_repairs == 61
+
+
+def test_collapse_confirmation_batch_is_bounded_with_fifty_clients():
+    config = ServerConfig(
+        terrain_repair_interval_ticks=1,
+        terrain_collapse_repair_delay_ticks=1,
+        terrain_collapse_repair_batch_limit=4,
+    )
+    server = BattleSpadesServer(config)
+    server.world_manager = FakeWorld()
+    connections = [RecordingConnection(player_id=index) for index in range(50)]
+    server.connections = {
+        index: connection for index, connection in enumerate(connections)
+    }
+    cells = [(index, 4, 5) for index in range(10)]
+    server.terrain_repair.record_collapse_cells(cells)
+    server.loop_count = 1
+
+    assert server.terrain_repair.tick() == 4
+    assert server.terrain_repair.pending_count == 6
+    assert sum(len(connection.sent) for connection in connections) == 200
+    assert server.metrics.terrain_repair_cells == 4
+    assert server.metrics.terrain_repair_sends == 200
+
+
 def test_mid_join_connection_does_not_receive_repair_packets():
     server, connection = _server_with_fast_repair()
     connection.in_game = False

@@ -110,4 +110,15 @@ def apply_runtime_paths(config: ServerConfig, paths: RuntimePaths) -> ServerConf
     config.prefabs_path = str(paths.resolve_configured_path(config.prefabs_path))
     config.plugins_path = str(paths.resolve_configured_path(config.plugins_path))
     config.bans_path = str(paths.resolve_configured_path(config.bans_path))
+    config.steam.runtime_dir = str(
+        paths.resolve_configured_path(config.steam.runtime_dir or "steam-runtime")
+    )
+    if config.steam.steamclient_dir:
+        config.steam.steamclient_dir = str(
+            paths.resolve_configured_path(config.steam.steamclient_dir)
+        )
+    if config.steam.helper_path:
+        config.steam.helper_path = str(
+            paths.resolve_configured_path(config.steam.helper_path)
+        )
     return config

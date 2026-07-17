@@ -170,6 +170,7 @@ class MapResourceService:
         registry = server.entity_registry
         metadata = world.map_metadata
         placements: list[tuple[float, float, float, tuple[int, int, int]]] = []
+        missing_marker_families: dict[int, int] = {}
 
         for spec in metadata.entities:
             if int(spec.entity_type) != int(C.FLARE_BLOCK) or spec.color is None:
@@ -180,9 +181,27 @@ class MapResourceService:
         # vxl.pyd removes these chroma voxels from client terrain. Re-create
         # their intended illumination as neutral FlareBlockEntity instances.
         for x, y, z, family in getattr(world.map, "retail_marker_families", ()):
-            color = metadata.static_light_colors.get(int(family))
-            if color is not None:
-                placements.append((float(x), float(y), float(z), color))
+            family = int(family)
+            color = metadata.static_light_colors.get(family)
+            if color is None:
+                missing_marker_families[family] = (
+                    missing_marker_families.get(family, 0) + 1
+                )
+                continue
+            placements.append((float(x), float(y), float(z), color))
+
+        if missing_marker_families:
+            details = ", ".join(
+                f"{family}={count}"
+                for family, count in sorted(missing_marker_families.items())
+            )
+            logger.warning(
+                "Skipped %d static-light markers on %s because their map "
+                "palette is missing (family counts: %s)",
+                sum(missing_marker_families.values()),
+                getattr(world, "map_name", "unknown"),
+                details,
+            )
 
         if len(placements) > _MAX_STATIC_LIGHTS:
             logger.warning(
@@ -191,16 +210,31 @@ class MapResourceService:
             )
             placements = placements[:_MAX_STATIC_LIGHTS]
 
+        placed_count = 0
         for x, y, z, color in placements:
+            # Native FlareBlockEntity adds a coloured user block as well as a
+            # point light. Restore the same cell in authoritative collision;
+            # otherwise the retail client stops on a block the server calls
+            # air and movement reconciliation pulls the player through it.
+            restore_block = getattr(world, "restore_static_light_block", None)
+            if callable(restore_block) and not restore_block(x, y, z, color):
+                logger.warning(
+                    "Ignoring out-of-world static light at %s on %s",
+                    (x, y, z),
+                    getattr(world, "map_name", "unknown"),
+                )
+                continue
             entity = registry.place(
                 int(C.FLARE_BLOCK), x, y, z,
                 state=TEAM_NEUTRAL,
                 color=color,
                 kind="map_flare",
                 player_id=0,
-                # Hidden map lights are intentionally absent from collision.
+                # Static map ownership: player deployable support/damage rules
+                # do not delete authored atmosphere during a round.
                 behavior=None,
             )
             if getattr(server.config, "entities_wire_ready", False):
                 server.broadcast_create_entity(entity)
-        return len(placements)
+            placed_count += 1
+        return placed_count

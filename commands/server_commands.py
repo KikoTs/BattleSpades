@@ -352,6 +352,8 @@ async def cmd_bots(ctx: CommandContext):
             (
                 f"Bots={len(director.bots)} worker={'up' if worker.running else 'down'} "
                 f"pid={worker.process_id or '-'} restarts={worker.restarts} "
+                f"stalls={getattr(worker, 'stalled_restarts', 0)} "
+                f"silence={getattr(worker, 'intent_silence_seconds', 0.0):.1f}s "
                 f"frames={worker.queued_frames} intents={worker.queued_intents} "
                 f"terrain={worker.pending_terrain_cells}"
             ),

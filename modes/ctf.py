@@ -70,6 +70,7 @@ class CTFMode(BaseMode):
     mode_code = "ctf"
     intel_auto_return_default = True
     shoot_with_intel_default = False
+    intel_offset_from_base = 12.0
     
     def __init__(self, server):
         super().__init__(server)
@@ -166,8 +167,13 @@ class CTFMode(BaseMode):
 
         # Intel sits a few blocks toward midfield from each base, re-anchored to
         # dry ground so it never floats over water.
-        self.intel_positions[TEAM1] = _intel_near(self.server, self.base_positions[TEAM1], +12.0)
-        self.intel_positions[TEAM2] = _intel_near(self.server, self.base_positions[TEAM2], -12.0)
+        offset = float(self.intel_offset_from_base)
+        self.intel_positions[TEAM1] = _intel_near(
+            self.server, self.base_positions[TEAM1], +offset
+        )
+        self.intel_positions[TEAM2] = _intel_near(
+            self.server, self.base_positions[TEAM2], -offset
+        )
         self.intel_home_positions = dict(self.intel_positions)
         self.base_bounds = {
             TEAM1: self._base_zone_bounds(TEAM1),
@@ -376,7 +382,7 @@ class CTFMode(BaseMode):
                     radius=float(C.PICKUP_DISTANCE),
                 )
             ):
-                await self._return_intel(player.team)
+                await self._return_intel(player.team, returned_by=player)
             
             # Check intel pickup
             enemy_team = TEAM2 if player.team == TEAM1 else TEAM1
@@ -443,11 +449,23 @@ class CTFMode(BaseMode):
         
         # Add score
         player.captures += 1
+        self._award_player_score(
+            player,
+            int(CG.CTF_INDIVIDUAL_SCORE_FOR_CAPTURED_INTEL),
+            int(C.SCORE_REASON.CTF_CAPTURE_SCORE_REASON),
+        )
         capturing_team = self.server.teams[player.team]
         capturing_team.add_capture()
         # Push the new team score to the HUD (CTF never did this, so the
         # score bar stayed frozen at its spawn value).
-        self.server.broadcast_set_score(capturing_team)
+        try:
+            self.server.broadcast_set_score(
+                capturing_team,
+                reason=int(C.SCORE_REASON.CTF_CAPTURE_SCORE_REASON),
+            )
+        except TypeError:
+            # Compatibility with plugin/test facades predating score reasons.
+            self.server.broadcast_set_score(capturing_team)
 
         # Check for win
         winning = capturing_team.score >= self.score_limit
@@ -466,6 +484,33 @@ class CTFMode(BaseMode):
             if self.intel_holder[team_id] == player:
                 await self._drop_intel(player, team_id)
                 break
+
+    async def on_player_kill(
+        self,
+        killer: 'Player',
+        victim: 'Player',
+        kill_type: int,
+    ) -> None:
+        """Award the stock one-point personal score for an enemy kill.
+
+        The recovered reference ``aosmodes.GameMode.on_player_kill`` performs
+        this independently of intel capture/return bonuses. Classic CTF
+        inherits this hook, restoring its missing per-kill points without
+        changing the team capture score.
+        """
+        if self.ended or killer is victim:
+            return
+        if (
+            int(getattr(killer, "team", -1)) not in (TEAM1, TEAM2)
+            or int(getattr(victim, "team", -1)) not in (TEAM1, TEAM2)
+            or int(killer.team) == int(victim.team)
+        ):
+            return
+        self._award_player_score(
+            killer,
+            1,
+            int(C.SCORE_REASON.KILL_SCORE_REASON),
+        )
     
     async def _drop_intel(self, player: 'Player', intel_team: int,
                           position=None, velocity=None):
@@ -500,16 +545,32 @@ class CTFMode(BaseMode):
         
         logger.info(f"{player.name} dropped {team_name} intel at {drop_pos}")
 
-    async def _return_intel(self, intel_team: int) -> None:
-        """Return an abandoned ground intel after the retail 60-second timer."""
+    async def _return_intel(self, intel_team: int, returned_by=None) -> None:
+        """Return ground intel and award the recovered touch-return point."""
         home_pos = self.intel_home_positions[intel_team]
         self.intel_positions[intel_team] = home_pos
         self.intel_drop_time[intel_team] = 0.0
         self.server.teams[intel_team].return_intel(home_pos)
         self._set_intel_entity(intel_team, True)
+        if returned_by is not None:
+            self._award_player_score(
+                returned_by,
+                int(CG.CTF_INDIVIDUAL_SCORE_FOR_RETURNING_INTEL),
+                int(C.SCORE_REASON.CTF_CLAIM_SCORE_REASON),
+            )
         team_name = self.server.teams[intel_team].name
         await self.broadcast_message(f"The {team_name} intel returned to base!")
         logger.info("%s intel auto-returned", team_name)
+
+    def _award_player_score(self, player, amount: int, reason: int) -> None:
+        """Apply and replicate one native CTF personal-score event."""
+
+        if amount <= 0:
+            return
+        player.score = int(getattr(player, "score", 0)) + int(amount)
+        from server.scoreboard import send_player_score
+
+        send_player_score(self.server, player, reason=int(reason))
 
     async def handle_drop_pickup(self, player, position, velocity) -> bool:
         """Packet-71 mode hook; only the actual enemy-intel holder may drop."""

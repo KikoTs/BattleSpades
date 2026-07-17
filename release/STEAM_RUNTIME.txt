@@ -1,0 +1,28 @@
+Optional Steam master-server runtime
+====================================
+
+BattleSpades does not redistribute Valve binaries. To register a Windows
+server as Ace of Spades app 224540, place an operator-owned x86 copy of this
+file in this directory:
+
+  steam_api.dll
+
+Set [steam].enabled = true in config.toml. BattleSpades supplies app ID 224540
+from an isolated working directory; a steam_appid.txt copied from a development
+client is ignored because some decompiled trees contain Spacewar app ID 480.
+
+By default the server auto-discovers Steam's current x86 steamclient.dll,
+tier0_s.dll, and vstdlib_s.dll. A headless machine without desktop Steam can
+point steam.steamclient_dir at an operator-supplied directory containing those
+three compatible files. Do not enable use_supplied_steamclient for the small
+legacy steamclient.dll from decompiled client trees: that file was observed
+blocking indefinitely inside SteamGameServer_Init.
+
+The Steam helper opens [steam].steam_port and [steam].query_port in addition to
+the ENet game port. Forward all three UDP ports through the firewall/NAT.
+
+Important compatibility limits: Valve retired the legacy UDP master-list
+endpoint consumed by the unmodified 2015 All/Community screen. Registration
+can therefore be healthy while that screen shows zero rows. Also, a stock
+server row always joins UDP 32887 regardless of the advertised game port; use
+that as [server].port when targeting an unmodified row.

@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 # 7 fall_damage_multiplier, 8 death_acceleration).
 _JETPACK_PROPERTIES: dict = dict(getattr(C, "JETPACK_PROPERTIES", {}) or {})
 # ClientData carries no jetpack-active acknowledgement. Two deferred physics
-# recurrences are the best local-scheduling estimate recovered from retail
-# captures, not a delivery/application proof. ReplicationService owns the
-# bounded no-correction handoff that makes this estimate safe under jitter.
+# recurrences are the closest common scheduling phase recovered from retail
+# captures. ReplicationService owns the delivery handoff and, critically,
+# withholds the inactive owner row until release/landing: the high-thrust pack
+# cannot represent its remaining half-frame phase with another integer delay.
 JETPACK_ACTIVATION_DEFER_FRAMES = 2
 
 JUMP_BUFFER_SECONDS = 0.25
@@ -402,6 +403,7 @@ class Player:
         self.respawn_time: float = 0.0
         self.death_time: float = 0.0
         self.spawned_at: float = 0.0
+        self._grave_entity_id = None
 
         self.input = InputState()
 
@@ -1035,6 +1037,12 @@ class Player:
         # compatibility facade for legacy mode spawn paths, so reset the
         # replication service here until every mode delegates to RoundLifecycle.
         server = self.connection.server if self.connection else None
+        corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+        before_player_spawn = getattr(
+            corpse_lifecycle, "before_player_spawn", None
+        )
+        if callable(before_player_spawn):
+            before_player_spawn(self)
         replication = getattr(server, "replication", None)
         forget_player = getattr(replication, "forget_player", None)
         if callable(forget_player):
@@ -1164,7 +1172,7 @@ class Player:
     def get_weapon_profile(self):
         if self.is_spade_tool():
             # Per-tool melee stats (pickaxe 50 player/7 block, superspade
-            # 50/7.5, knife 20/1, crowbar 80/5, ...) from the catalog; the
+            # 50/7.5, knife 80/1, crowbar 80/5, ...) from the catalog; the
             # generic spade profile only as a fallback for unknown tools.
             from server.game_constants import WEAPON_CATALOG
             tool = self.tool if self.tool_is_raw else self.weapon
@@ -1348,6 +1356,15 @@ class Player:
         if not self.alive:
             return
 
+        server = self.connection.server if self.connection else None
+        mode = getattr(server, "mode", None)
+        death_kill_type = getattr(mode, "death_kill_type_for", None)
+        if callable(death_kill_type):
+            # Some native modes use a dedicated death transition. VIP_MODE_KILL
+            # is not merely a score label: retail uses it for the boss-death
+            # presentation and no-respawn state.
+            kill_type = int(death_kill_type(self, killer, int(kill_type)))
+
         self.alive = False
         self.spawned = False
         self.grounded = False
@@ -1378,7 +1395,6 @@ class Player:
             killer.kill_streak = min(255, int(killer.kill_streak) + 1)
             kill_count = killer.kill_streak
 
-        server = self.connection.server if self.connection else None
         if server is not None:
             from shared.packet import KillAction
 
@@ -1401,6 +1417,12 @@ class Player:
             self.last_kill_action_data = bytes(packet.generate())
             server.broadcast(self.last_kill_action_data)
 
+            corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+            on_player_death = getattr(corpse_lifecycle, "on_player_death", None)
+            uses_classic_corpse = bool(
+                callable(on_player_death) and on_player_death(self)
+            )
+
             # Spawn the stock team-coloured grave on the supporting surface.
             # GraveEntity is a moving client object; feeding it the player's
             # eye/body Z made it fall and tumble while the death camera tracked
@@ -1413,7 +1435,8 @@ class Player:
                 "RULE_ENABLE_GRAVESTONES"
             )
             if (
-                grave_enabled
+                not uses_classic_corpse
+                and grave_enabled
                 and reg is not None
                 and getattr(server.config, "entities_wire_ready", False)
             ):
@@ -1641,6 +1664,10 @@ class Player:
             int(getattr(C, "SNOWBLOWER_TOOL", 29)),
             int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
         ):
+            # UGCSnowBlowerWeapon.use_an_ammo is deliberately a no-op; the
+            # editor's only limit is the client's global BlockManager capacity.
+            if tool == int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)):
+                return True
             return int(self.blocks) > 0
         return int(self.oriented_stock.get(tool, 1)) > 0
 
@@ -1656,7 +1683,8 @@ class Player:
             int(getattr(C, "SNOWBLOWER_TOOL", 29)),
             int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
         ):
-            self.blocks = max(0, int(self.blocks) - 1)
+            if tool != int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)):
+                self.blocks = max(0, int(self.blocks) - 1)
         elif tool in self.oriented_stock:
             self.oriented_stock[tool] = max(0, self.oriented_stock[tool] - 1)
             if tool == int(C.GRENADE_TOOL):

@@ -30,6 +30,42 @@ mirrored into the new rule service when their `RULE_*` equivalents are absent.
 - `max_players`: 1–255. The retail lobby presets are 2, 4, …, 24.
 - `tick_rate`: bounded to 10–240; production must remain 60 for retail physics.
 
+### `[steam]`
+
+- `enabled`: starts the isolated legacy Steam registrar. It is off by default;
+  direct ENet/A2S hosting remains available without Valve binaries.
+- `app_id`: fixed at `224540`. Startup rejects Spacewar ID `480` because the
+  retail browser queries only the Ace of Spades application.
+- `runtime_dir`: directory containing the original x86 `steam_api.dll`; blank
+  uses `./steam-runtime` or `BATTLESPADES_STEAM_RUNTIME`.
+- `steamclient_dir`: compatible x86 `steamclient.dll`, `tier0_s.dll`, and
+  `vstdlib_s.dll`; blank discovers the installed Steam directory.
+- `helper_path`: optional x86 bridge override. Windows releases bundle the
+  helper under `_internal/steam` but never bundle Valve DLLs.
+- `use_supplied_steamclient`: unsafe compatibility opt-in. Keep false for the
+  small legacy client-tree DLL, which was measured hanging during init.
+- `steam_port`: Steam updater/master UDP port (the retail server used `8766`).
+- `query_port`: Steam A2S UDP port; zero means game port + 1. All three ports
+  must be distinct.
+- `public`: public anonymous listing (`true`) versus LAN/no-master mode.
+- `secure`: requests VAC mode. The default public-insecure mode is truthful
+  because BattleSpades does not yet authenticate player Steam tickets.
+- `region`, `playlist_id`, `protocol_version`, `texture_skin`: inputs to the
+  exact retail tags `v...;playlist=...;region=...;mode=%04d[;classic][;skin=...]`.
+- `game_version`: original value `1.0.0.0`.
+- `require_registration`: when false, a Steam outage never stops gameplay;
+  when true, startup fails unless anonymous logon completes within
+  `startup_timeout_seconds`.
+- `publish_interval_seconds`: coalesced live name/map/population refresh rate;
+  it runs outside the 60 Hz simulation.
+
+The stock server-row implementation ignores Steam's returned game port and
+always connects to UDP `32887`. Use `[server].port = 32887` when compatibility
+with an unmodified browser row matters. This does not repair list discovery:
+Valve retired the legacy master-list endpoint used by the 2015 client. The
+bridge still registers with Valve's current registry for updated clients,
+directories, and external Steam tooling.
+
 ### `[network]`
 
 - `timeout_ms`, `max_connections`, `bandwidth_limit`: ENet limits; zero
@@ -39,15 +75,29 @@ mirrored into the new rule service when their `RULE_*` equivalents are absent.
 - `plugin_event_budget_ms`: total synchronous plugin time allowed per event.
 - `max_map_mutation_journal`: terrain changes retained during a joining
   client's map snapshot.
+- `map_air_catchup_batch_limit`: exact destroyed voxels replayed per input
+  frame before a reconnect is admitted. This is the bounded safety net for
+  stale native collision after Drill/mining/explosion-heavy map merges.
 - `entity_tick_batch_limit`, `mode_event_queue_limit`,
   `mode_event_drain_budget`: bounded entity/mode work.
 - `world_mutation_queue_limit`, `world_mutation_batch_limit`,
   `world_mutation_cell_budget`, `world_mutation_timeout_ticks`: post-physics
   block-edit admission and commit limits.
-- `prefab_queue_limit`, `prefab_cell_batch_limit`: incremental KV6 expansion.
+- `prefab_queue_limit`, `prefab_cell_batch_limit`: admitted prefab actions and
+  maximum committed cells per tick.
+- `prefab_validation_batch_limit`: already-prepared UGC prefab cells checked
+  against the live world per tick. Retail KV6 loading, rotation, and raw-color
+  expansion happen on the editor's single preparation worker; this value
+  bounds only authoritative main-thread contact/erase validation and must not
+  be made unbounded.
 - `terrain_repair_enabled`, `terrain_repair_queue_limit`,
   `terrain_repair_batch_limit`, `terrain_repair_interval_ticks`,
-  `terrain_repair_delay_ticks`: delayed canonical voxel repair.
+  `terrain_repair_delay_ticks`: delayed canonical repair of rejected client
+  prediction.
+- `terrain_collapse_repair_batch_limit`,
+  `terrain_collapse_repair_delay_ticks`: faster exact-air confirmation for
+  server-derived unsupported collapses. The stock checked Damage animation is
+  still sent first; these values only bound the stale-geometry safety net.
 - `transition_grace_seconds`: time between `MapEnded(52)` and disconnect reason
   18 during a map/mode rollover.
 
@@ -66,6 +116,10 @@ mirrored into the new rule service when their `RULE_*` equivalents are absent.
   30, 35, 40, 45, 50, 55, 60, or 90.
 - `lobby.map_rotation`: ordered map basenames used by voting; `[]` discovers
   every VXL under `world.maps_path`.
+- `lobby.end_screen_seconds`: `0.0` to `120.0`, default `12.0`. After the
+  next-map ballot resolves, an official map holds the native scores/credits
+  overlay for this duration before the validated map loader starts. Custom
+  maps without a bundled retail level screenshot keep a safe in-scene hold.
 
 ### `[game_rules]`
 

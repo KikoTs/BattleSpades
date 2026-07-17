@@ -8,6 +8,7 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
+import shared.constants_gamemode as CG  # noqa: E402
 from modes import get_mode_class  # noqa: E402
 from modes.vip import VIPMode, VIPPhase  # noqa: E402
 from server.builders.initial_info import build_initial_info  # noqa: E402
@@ -18,7 +19,7 @@ from server.game_constants import TEAM1, TEAM2  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer  # noqa: E402
+from shared.packet import ChangePlayer, SetScore  # noqa: E402
 
 
 class _Connection:
@@ -68,7 +69,7 @@ class _Server:
         self.respawned.append((player.id, player.class_id))
 
 
-def _player(server, player_id, team, *, alive=True):
+def _player(server, player_id, team, *, alive=True, position=(0.0, 0.0, 0.0)):
     connection = _Connection()
     player = SimpleNamespace(
         id=player_id,
@@ -83,6 +84,7 @@ def _player(server, player_id, team, *, alive=True):
         ugc_tools=[],
         score=0,
         health=100,
+        position=position,
     )
 
     def apply(selection):
@@ -91,7 +93,13 @@ def _player(server, player_id, team, *, alive=True):
         player.prefabs = list(selection.prefabs)
         player.ugc_tools = list(selection.ugc_tools)
 
+    def die(*, killer=None, kill_type=0):
+        player.alive = False
+        player.spawned = False
+        player.last_kill_type = int(kill_type)
+
     player.apply_class_selection = apply
+    player.die = die
     player.send = connection.send
     server.players[player_id] = player
     server.teams[team].add_player(player)
@@ -114,6 +122,14 @@ def _visibility_packets(data):
     ]
 
 
+def _score_packets(data):
+    return [
+        SetScore(ByteReader(packet[1:]))
+        for packet in data
+        if packet and packet[0] == SetScore.id
+    ]
+
+
 def test_vip_is_registered_and_join_state_bypasses_class_picker():
     server, _mode = _new_mode()
 
@@ -127,6 +143,17 @@ def test_vip_is_registered_and_join_state_bypasses_class_picker():
     assert state.team2_classes == list(C.MAFIA_TEAM_CLASSES)
     assert info.texture_skin == "mafia"
     assert state.score_limit == 3
+
+
+def test_vip_uses_the_two_shipped_gangster_maps_for_default_votes():
+    config = ServerConfig(default_mode="vip")
+    from server.main import BattleSpadesServer
+
+    server = BattleSpadesServer(config)
+    server.mode = VIPMode(server)
+
+    assert server.mode.stock_maps == ("Alcatraz", "CityOfChicago")
+    assert server.vote_manager._mode_available_maps() == server.mode.stock_maps
 
 
 def test_vip_join_selection_rejects_non_gangster_class_and_loadout():
@@ -154,6 +181,8 @@ def test_vip_selection_promotes_one_boss_per_team_and_tracks_them():
     assert mode.vips == {TEAM1: blue, TEAM2: green}
     assert blue.class_id == int(C.MAFIA_VIPS[TEAM1])
     assert green.class_id == int(C.MAFIA_VIPS[TEAM2])
+    assert blue.last_kill_type == int(C.KILL.CLASS_CHANGE_KILL)
+    assert green.last_kill_type == int(C.KILL.CLASS_CHANGE_KILL)
     assert server.respawned == [
         (blue.id, int(C.MAFIA_VIPS[TEAM1])),
         (green.id, int(C.MAFIA_VIPS[TEAM2])),
@@ -162,6 +191,29 @@ def test_vip_selection_promotes_one_boss_per_team_and_tracks_them():
     assert {(packet.player_id, packet.high_minimap_visibility) for packet in visible} >= {
         (blue.id, 1), (green.id, 1),
     }
+
+
+def test_live_vip_death_uses_native_boss_kill_and_zero_respawn_timer():
+    server, mode = _new_mode()
+    blue = _player(server, 1, TEAM1)
+    green = _player(server, 2, TEAM2)
+    asyncio.run(mode.on_tick(1))
+    blue_vip = mode.vips[TEAM1]
+    green_vip = mode.vips[TEAM2]
+
+    assert mode.death_kill_type_for(
+        blue_vip,
+        green_vip,
+        int(C.KILL.WEAPON_KILL),
+    ) == int(C.KILL.VIP_MODE_KILL)
+    assert mode.respawn_time_for(blue_vip) == 0.0
+    ordinary = green if green is not green_vip else blue
+    if ordinary is not blue_vip:
+        assert mode.death_kill_type_for(
+            ordinary,
+            blue_vip,
+            int(C.KILL.WEAPON_KILL),
+        ) == int(C.KILL.WEAPON_KILL)
 
 
 def test_vip_damage_is_halved_and_only_dead_vip_team_loses_respawns():
@@ -279,3 +331,114 @@ def test_round_lifecycle_does_not_respawn_sudden_death_casualty(monkeypatch):
 
     assert player.alive is False
     assert player._grave_entity_id == 7
+
+
+def test_vip_subround_respawns_are_bounded_per_gameplay_tick():
+    server, mode = _new_mode()
+    for player_id in range(1, 11):
+        team = TEAM1 if player_id % 2 else TEAM2
+        _player(server, player_id, team)
+    mode.round_respawns_per_tick = 3
+    server.respawned.clear()
+
+    asyncio.run(mode._begin_round(reset_players=True))
+
+    assert mode.phase is VIPPhase.RESETTING
+    assert server.respawned == []
+    previous = 0
+    for tick in range(1, 5):
+        asyncio.run(mode.on_tick(tick))
+        assert len(server.respawned) - previous <= 3
+        previous = len(server.respawned)
+
+    assert len(server.respawned) == 10
+    assert mode.phase is VIPPhase.SELECTING
+
+
+def test_vip_active_roster_audit_is_not_a_60_hz_player_scan():
+    server, mode = _new_mode()
+    _player(server, 1, TEAM1)
+    _player(server, 2, TEAM2)
+    asyncio.run(mode.on_tick(1))
+    assert mode.phase is VIPPhase.ACTIVE
+
+    calls = []
+
+    async def record_audit():
+        calls.append(True)
+
+    mode._check_team_elimination = record_audit
+    mode._next_roster_audit = time.monotonic() + 60.0
+    for tick in range(2, 122):
+        asyncio.run(mode.on_tick(tick))
+    assert calls == []
+
+    mode._next_roster_audit = 0.0
+    asyncio.run(mode.on_tick(122))
+    assert calls == [True]
+
+
+def test_vip_periodic_survival_and_escort_scores_use_retail_reasons():
+    server, mode = _new_mode()
+    blue_a = _player(server, 1, TEAM1)
+    blue_b = _player(server, 3, TEAM1)
+    green_a = _player(server, 2, TEAM2)
+    green_b = _player(server, 4, TEAM2)
+    asyncio.run(mode.on_tick(1))
+
+    blue_vip = mode.vips[TEAM1]
+    blue_guard = blue_b if blue_vip is blue_a else blue_a
+    green_vip = mode.vips[TEAM2]
+    green_guard = green_b if green_vip is green_a else green_a
+    blue_vip.position = (100.0, 100.0, 100.0)
+    blue_guard.position = (114.0, 100.0, 100.0)
+    green_vip.position = (300.0, 300.0, 100.0)
+    green_guard.position = (316.0, 300.0, 100.0)
+    server.packets.clear()
+    mode._next_vip_survival_score = 0.0
+    mode._next_escort_score = 0.0
+
+    asyncio.run(mode.on_tick(2))
+
+    assert blue_vip.score == int(CG.VIP_SCORE_LIVEVIP_SCORE)
+    assert green_vip.score == int(CG.VIP_SCORE_LIVEVIP_SCORE)
+    assert blue_guard.score == int(CG.VIP_SCORE_ESCORT_SCORE)
+    assert green_guard.score == 0
+    score_packets = _score_packets(server.packets)
+    assert [packet.reason for packet in score_packets].count(
+        int(C.SCORE_REASON.VIP_SURVIVE_SCORE_REASON)
+    ) == 2
+    assert [packet.reason for packet in score_packets].count(
+        int(C.SCORE_REASON.VIP_ESCORT_SCORE_REASON)
+    ) == 1
+
+    # A second tick cannot replay missed intervals or duplicate reliable HUD
+    # score packets; deadlines are re-armed from the current monotonic time.
+    packet_count = len(score_packets)
+    asyncio.run(mode.on_tick(3))
+    assert len(_score_packets(server.packets)) == packet_count
+
+
+def test_live_vip_kill_bonus_is_separate_from_enemy_vip_percentage():
+    server, mode = _new_mode()
+    blue = _player(server, 1, TEAM1)
+    green = _player(server, 2, TEAM2)
+    asyncio.run(mode.on_tick(1))
+    blue_vip = mode.vips[TEAM1]
+    green_vip = mode.vips[TEAM2]
+    green_vip.score = 250
+    green_vip.alive = green_vip.spawned = False
+    server.packets.clear()
+
+    asyncio.run(mode.on_player_death(green_vip, blue_vip, 0))
+
+    assert blue_vip.score == int(CG.VIP_SCORE_KILL_AS_VIP) + 25
+    reasons = [
+        packet.reason
+        for packet in _score_packets(server.packets)
+        if packet.type == int(C.SCORE.PLAYER)
+    ]
+    assert reasons == [
+        int(C.SCORE_REASON.VIP_KILL_SCORE_REASON),
+        int(C.SCORE_REASON.VIP_KILLENEMYVIP_SCORE_REASON),
+    ]

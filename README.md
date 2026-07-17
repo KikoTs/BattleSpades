@@ -48,7 +48,7 @@ structure collapse, pickups, deaths/respawns, and bots all work and stay in sync
 client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
 what's still on the list.
 
-- **866** unit/regression tests pass (`py -3 -m pytest -q`)
+- **1,017** unit/regression tests pass (`py -3 -m pytest tests -q`)
 - The executable 50-player capacity gate sustains ~60 Hz with sub-5 ms tick
   p99 on the current Windows/Python 3.12 baseline. See
   [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
@@ -126,6 +126,49 @@ server:
 ./BattleSpades
 ```
 
+The reconstructed retail tutorial is intentionally a separate program. It is
+not a selectable public mode and `run_server.py` cannot start it:
+
+```powershell
+# Source checkout
+py -3.12 run_tutorial.py --check
+py -3.12 run_tutorial.py
+
+# Portable Windows release (use ./BattleSpadesTutorial on Linux/macOS)
+.\BattleSpadesTutorial.exe --check
+.\BattleSpadesTutorial.exe
+```
+
+That launcher locks the process to the original `Training.vxl`, tutorial mode
+ID 10, twelve isolated training lanes, and the stock staged inventory flow:
+the gallery grants/equips the pistol, then the climb grants the block tool and
+spade. It disables bots, plugins, public registration, voting, rotation, and
+competitive rules in memory without rewriting `config.toml`.
+
+The reconstructed Map Creator is also an isolated program. It uses the stock
+client's native six-tab Construct browser, five-item backpack, prefab ghosts,
+Game Data object placer, validation HUD, palette, and raw-voxel editor tools,
+while the dedicated process owns persistence:
+
+```powershell
+# Source checkout. Retail UGC art remains user-supplied and is never bundled.
+py -3.12 run_map_creator.py --check --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
+py -3.12 run_map_creator.py --project MyMap --terrain grassland `
+  --target-mode ctf --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
+
+# Portable Windows release (use ./BattleSpadesMapCreator elsewhere)
+.\BattleSpadesMapCreator.exe --project MyMap --terrain grassland `
+  --target-mode ctf --retail-root C:\Games\AceOfSpades
+```
+
+New projects may use `desert`, `lunar`, `mountain`, `grassland`, `temple`,
+`urban`, `marsh`, `snowy`, or `water`. Publish validation supports `tdm`,
+`ctf`, `dem`, `mh`, `oc`, `tc`, `vip`, `zom`, and `dia`. The launcher creates
+and continuously checkpoints a portable `.vxl`/`.txt`/`.ugc` triplet under
+`ugc-projects/` by default. It requires the operator's legally installed
+retail `ugc/maps` and `ugc/kv6` assets; BattleSpades does not redistribute
+those proprietary baseplates or models.
+
 No system Python or compiler is needed. Change the default admin password
 `changeme` before exposing UDP port 27015. Verify the downloaded zip against
 the release's `SHA256SUMS.txt`.
@@ -146,6 +189,7 @@ explicit operator override. The release does not claim Apple notarization.
 | **Pickups** | Ammo / health crates, restock on spawn |
 | **Combat lifecycle** | Damage, kills, kill feed, death → grave entity → timed respawn |
 | **Game modes** | Team Deathmatch, CTF, Classic CTF, Arena, gangster VIP, and Zombie infection |
+| **Map Creator** | Isolated retail-compatible UGC host with nine terrain baseplates, all 373 native catalog entries, prefabs, carving, palettes, 19 Game Data objects, mode validation, preview PNGs, and atomic project checkpoints |
 | **Bots** | Isolated process worker with voxel navigation, fair perception/aim, class actions, and phase-aware CTF/Classic/VIP/Zombie/Arena roles |
 | **Map transfer** | Full VXL streaming with correct CRC validation |
 | **Admin / chat** | Player + admin command set, team management |
@@ -155,6 +199,8 @@ explicit operator override. The release does not claim Apple notarization.
 ```
 BattleSpades/
 ├── run_server.py       # entry point (async event loop + logging)
+├── run_tutorial.py     # isolated retail tutorial entry point
+├── run_map_creator.py  # isolated retail UGC editor entry point
 ├── config.toml         # all server settings
 ├── setup.py            # Cython build definition
 │
@@ -280,9 +326,13 @@ For local tweaks that shouldn't be committed, use `config.local.toml` (gitignore
 python run_server.py
 ```
 
-To host publicly, forward **UDP `27015`** (or your configured port) and set a real
-`admin.password`. The server advertises itself over the classic A2S/master query path, so it
-can appear in server browsers that support the 1.x protocol.
+To host directly, forward **UDP `27015`** (or your configured game port) and set
+a real `admin.password`. The ENet socket answers direct A2S/LAN queries. The
+optional `[steam]` bridge registers app `224540` with Valve's current registry;
+also forward its updater and query UDP ports (defaults `8766` and game port +
+1). Valve retired the legacy UDP list used by the unmodified 2015 in-game
+browser, so verify registration with the source-tree checker described in the
+[runbook](docs/RUNBOOK.md#steam-master-server-listing).
 
 ## Commands
 

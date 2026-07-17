@@ -14,8 +14,10 @@ at a safe scene boundary; a packet handler never swaps the authoritative VXL.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
+import time
 
 from shared.packet import GenericVoteMessage
 
@@ -35,6 +37,19 @@ MAP_VOTE_LEAD_SECONDS = 60.0
 VOTE_COOLDOWN = 60.0
 
 
+def _retail_localised_text(identifier: str) -> str:
+    """Encode one string for ``GenericVotingHUD.decode_string``.
+
+    The retail HUD literal-evaluates the field and unconditionally reads both
+    tuple indexes: ``value[0]`` is the string-table identifier and ``value[1]``
+    is an iterable of format arguments.  A one-item tuple reaches native line
+    67 and raises ``IndexError``, terminating the client.  Empty text therefore
+    still needs an explicit empty argument tuple.
+    """
+
+    return repr((str(identifier), ()))
+
+
 class VoteManager:
     """Own at most one bounded retail vote overlay at a time."""
 
@@ -51,6 +66,7 @@ class VoteManager:
         self.votes: dict[int, int] = {}
         self.next_map: str | None = None
         self.opened_at = 0.0
+        self._map_result_event = asyncio.Event()
         self._last_start: dict[int, float] = {}
         # Map discovery is startup work. Never glob the filesystem from the
         # 60 Hz mode tick when the final-minute vote is opened.
@@ -91,6 +107,34 @@ class VoteManager:
             for connection in self.server.connections.values()
             if connection.in_game
         )
+
+    def _mode_available_maps(self) -> tuple[str, ...]:
+        """Return the cached operator catalog narrowed by a stock playlist.
+
+        An explicit ``lobby.map_rotation`` always wins.  With an empty
+        rotation, modes may publish their recovered retail ``stock_maps``;
+        this keeps Classic CTF votes on its seven purpose-built layouts while
+        retaining custom-map support for operators who request it.
+        """
+
+        available = self._available_maps
+        config = getattr(self.server, "config", None)
+        if tuple(getattr(config, "map_rotation", ()) or ()):
+            return available
+        playlist = tuple(
+            getattr(getattr(self.server, "mode", None), "stock_maps", ()) or ()
+        )
+        if not playlist:
+            return available
+        by_name = {name.casefold(): name for name in available}
+        filtered = tuple(
+            by_name[name.casefold()]
+            for name in playlist
+            if name.casefold() in by_name
+        )
+        # A partial release bundle must still offer a vote instead of wedging
+        # the end sequence when none of a playlist's maps were installed.
+        return filtered or available
 
     def _needed(self) -> int:
         # Kick targets are not eligible, so a majority of the remaining
@@ -140,6 +184,9 @@ class VoteManager:
             return False
         normalized: list[str] = []
         seen: set[str] = set()
+        available = {
+            value.casefold(): value for value in self._available_maps
+        }
         for raw in candidates:
             value = str(raw).strip()
             path = Path(value)
@@ -147,6 +194,14 @@ class VoteManager:
                 continue
             value = path.stem if path.suffix.lower() == ".vxl" else value
             key = value.casefold()
+            # Internal callers use the startup catalog. Keep the direct API
+            # useful for map-less unit/plugin servers, but when a real catalog
+            # exists never advertise a target that cannot pass map preflight.
+            if available:
+                value = available.get(key, "")
+                if not value:
+                    continue
+                key = value.casefold()
             if key in seen:
                 continue
             seen.add(key)
@@ -166,6 +221,7 @@ class VoteManager:
         self.no = set()
         self.next_map = None
         self.opened_at = float(now)
+        self._map_result_event = asyncio.Event()
         self._broadcast(VOTE_START, None)
         logger.info("MAP VOTE opened: %s", ", ".join(self.candidates))
         return True
@@ -175,7 +231,7 @@ class VoteManager:
 
         if self.active or self.next_map is not None:
             return False
-        available = list(self._available_maps)
+        available = list(self._mode_available_maps())
         current = str(
             getattr(self.server.config, "default_map", "")
         ).casefold()
@@ -193,6 +249,56 @@ class VoteManager:
             ordered = available
         choices = [name for name in ordered if name.casefold() != current]
         return self.start_map_vote(choices[:3], now) if choices else False
+
+    def ensure_round_end_map_vote(self, now: float) -> bool:
+        """Guarantee that the round boundary owns the retail vote overlay.
+
+        A kick ballot is useful during play but must not consume the complete
+        end-of-round voting window. Closing it before opening the map ballot
+        also prevents its delayed timeout from mutating a replacement scene.
+        An already-running map ballot or a staged winner is preserved.
+        """
+
+        if self.active and self.kind == "map":
+            return False
+        if self.active:
+            self.cancel()
+        return self.ensure_map_vote(now)
+
+    async def wait_for_map_result(self) -> str | None:
+        """Wait non-blockingly for votes or the bounded map-vote deadline.
+
+        The simulation tick normally resolves the timeout. This waiter owns a
+        second deterministic timeout so a paused/slow scheduler cannot let the
+        end sequence consume an unresolved ballot and restart the wrong map.
+        """
+
+        if not self.active or self.kind != "map":
+            return self.next_map
+        remaining = max(
+            0.0,
+            MAP_VOTE_DURATION - (time.time() - float(self.opened_at)),
+        )
+        if remaining > 0.0:
+            try:
+                await asyncio.wait_for(
+                    self._map_result_event.wait(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                pass
+        if self.active and self.kind == "map":
+            self._resolve_map()
+        return self.next_map
+
+    def reveal_to(self, connection) -> None:
+        """Open the current ballot for a client that just entered GameScene."""
+
+        if not self.active:
+            return
+        send = getattr(connection, "send", None)
+        if callable(send):
+            send(bytes(self._build_packet(VOTE_START).generate()), reliable=True)
 
     def cast(self, voter, yes: bool) -> None:
         """Compatibility API for a yes/no kick choice."""
@@ -260,6 +366,7 @@ class VoteManager:
         else:
             self._broadcast(VOTE_CLOSED, None)
             self._clear_active()
+            self._map_result_event.set()
 
     def forget_player(self, player_id: int) -> None:
         """Remove vote state before a compact player id is reassigned."""
@@ -308,6 +415,7 @@ class VoteManager:
     def _resolve_map(self) -> None:
         if not self.candidates:
             self._clear_active()
+            self._map_result_event.set()
             return
         counts = self._candidate_counts()
         # ``max`` keeps the lowest candidate index on ties. Candidate order is
@@ -322,6 +430,7 @@ class VoteManager:
             ", ".join(str(value) for value in counts),
         )
         self._clear_active()
+        self._map_result_event.set()
 
     def _clear_active(self) -> None:
         self.active = False
@@ -348,6 +457,11 @@ class VoteManager:
         )
 
     def _broadcast(self, message_type: int, target) -> None:
+        self.server.broadcast(bytes(self._build_packet(message_type).generate()))
+
+    def _build_packet(self, message_type: int) -> GenericVoteMessage:
+        """Build one literal-safe retail vote packet for broadcast or replay."""
+
         packet = GenericVoteMessage()
         packet.player_id = (
             int(self.starter_id) if self.starter_id is not None else 255
@@ -358,17 +472,19 @@ class VoteManager:
             {"name": name, "votes": counts[index]}
             for index, name in enumerate(self.candidates)
         ]
-        # The client literal-evaluates these fields into localized-string
-        # tuples. Raw prose is a native exception hazard.
+        # The client literal-evaluates these fields into (id, arguments).
+        # Omitting the empty arguments tuple is a native exception hazard.
         if self.kind == "map":
-            packet.title = repr(("VOTE_MAP_TITLE",))
-            packet.description = repr(("VOTE_MAP_DESCRIPTION",))
+            packet.title = _retail_localised_text("VOTE_MAP_TITLE")
+            packet.description = _retail_localised_text(
+                "VOTE_MAP_DESCRIPTION"
+            )
         else:
-            packet.title = repr(("KICK_PLAYER",))
-            packet.description = repr(("KICK_PLAYER",))
+            packet.title = _retail_localised_text("KICK_PLAYER")
+            packet.description = _retail_localised_text("KICK_PLAYER")
         packet.allow_revote = 1
         packet.can_vote = int(message_type != VOTE_CLOSED)
-        self.server.broadcast(bytes(packet.generate()))
+        return packet
 
 
 __all__ = [

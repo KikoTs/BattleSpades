@@ -202,7 +202,7 @@ def normalize_server_selection(
 
     disabled = set(get_rules(config).selection_disabled_tools())
     disabled.update(int(tool) for tool in additionally_disabled)
-    return normalize_class_selection(
+    selection = normalize_class_selection(
         class_id,
         loadout,
         prefabs,
@@ -210,6 +210,38 @@ def normalize_server_selection(
         fallback_class_id=fallback_class_id,
         disabled_tools=disabled,
     )
+    # The retail UGC Builder's prefab table is populated by the Map Creator
+    # menu at runtime and is intentionally empty in shared.constants.  Only
+    # the isolated launcher sets this allow-list; ordinary servers therefore
+    # retain the exact class-table boundary above.
+    if (
+        selection.class_id == int(C.CLASS_UGCBUILDER)
+        and bool(getattr(config, "ugc_runtime", False))
+    ):
+        allowed = {
+            str(name).casefold(): str(name)
+            for name in (getattr(config, "ugc_prefabs", ()) or ())
+        }
+        selected = tuple(
+            allowed[key]
+            for key in dict.fromkeys(str(value).casefold() for value in prefabs)
+            if key in allowed
+        )[: int(getattr(C, "UGC_MAX_LOADOUT_PREFABS", 5))]
+        selection = ClassSelection(
+            class_id=selection.class_id,
+            # GameClass.build_class_loadout normally appends tool 23 whenever
+            # prefabs are globally enabled.  The UGC Builder instead carries
+            # its dedicated construct manipulator (42), and InitialInfo marks
+            # ordinary tool 23 disabled.  Do not create a hidden/stray wheel
+            # entry that the client cannot legitimately select.
+            loadout=tuple(
+                tool for tool in selection.loadout
+                if int(tool) != int(C.PREFAB_TOOL)
+            ),
+            prefabs=selected,
+            ugc_tools=selection.ugc_tools,
+        )
+    return selection
 
 
 def active_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:

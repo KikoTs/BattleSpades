@@ -129,12 +129,40 @@ def test_scene_reload_reset_preserves_authentication_and_clears_old_epoch() -> N
 def test_team_mapping_helpers():
     assert wire_team_to_internal(TEAM1) == TEAM1
     assert wire_team_to_internal(TEAM2) == TEAM2
-    assert wire_team_to_internal(TEAM_SPECTATOR) is None
+    assert wire_team_to_internal(TEAM_SPECTATOR) == TEAM_SPECTATOR
     assert wire_team_to_internal(TEAM_NEUTRAL) is None
     assert wire_team_to_internal(99) is None
     assert internal_team_to_wire(TEAM1) == TEAM1
     assert internal_team_to_wire(TEAM2) == TEAM2
+    assert internal_team_to_wire(TEAM_SPECTATOR) == TEAM_SPECTATOR
     assert internal_team_to_wire(99) == DEFAULT_WIRE_TEAM
+
+
+def test_initial_spectator_join_preserves_team_zero_without_spawning_body():
+    server = DummyServer()
+    server.config.game_rules = {"RULE_ENABLE_SPECTATORS": True}
+    connection = make_connection(server)
+    sent_packets = []
+    connection.send = (
+        lambda data, reliable=True, prefix=0x30: sent_packets.append(data)
+    )
+
+    join = NewPlayerConnection()
+    join.team = TEAM_SPECTATOR
+    join.class_id = 0
+    join.forced_team = 0
+    join.local_language = 0
+    join.name = "Observer"
+
+    asyncio.run(connection._on_new_player(join))
+
+    own_create = CreatePlayer(ByteReader(sent_packets[0][1:]))
+    assert own_create.team == TEAM_SPECTATOR
+    assert connection.player.team == TEAM_SPECTATOR
+    assert connection.player.alive is False
+    assert connection.player.spawned is False
+    assert connection.player.death_time == 0.0
+    assert all(packet[0] not in (SetHP.id, 69) for packet in sent_packets)
 
 
 def test_player_default_block_color_matches_retail_neutral_gray():

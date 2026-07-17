@@ -55,8 +55,8 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 9 | ShootResponse | S→C | Sent | Authoritative player-hit response. Broadcast with `damage_by=shooter_id`; native clients show blood to observers but play the hit-confirm sound/crosshair only for the matching local shooter. |
 | 10 | UseOrientedItem | both | Handled+Sent | Validates active normalized tool, cadence, and stock. Legacy grenade-family objects are relayed to observers; entity-backed projectiles use CreateEntity instead. Never relay GL tool 55 into the retail client's stale `GLGrenade` packet constructor. |
 | 11 | SetColor | both | Handled+Sent | Palette state for block, flare, and Block Cannon tools (5/22/29/48); broadcast only to observers because the sender already applied the UI choice. |
-| 12 | SetUGCEditMode | — | Planned | Toggle UGC editor mode (UGC). |
-| 13 | SetClassLoadout | C→S | Handled | Normalized atomically at life boundaries. Retail may omit the trailing zero UGC-count byte; the bounded decoder accepts only that optional empty tail. Stock-LZF regression coverage proves three prefab strings survive compression in their selected order. |
+| 12 | SetUGCEditMode | C→S | Handled | Isolated editor host changes the target validation mode; ordinary servers reject it. |
+| 13 | SetClassLoadout | both | Handled+Sent | Normalized atomically at life boundaries and acknowledged with instant=1 when the class is unchanged. Retail may omit the trailing zero UGC-count byte; the bounded decoder accepts only that optional empty tail. UGC preserves one shared five-item prefab/Game Data backpack. |
 | 14 | ExistingPlayer | — | Planned | Roster entry format; imported but NOT sent — roster goes out as CreatePlayer(28) on purpose (client stores ExistingPlayer.pickup verbatim as pickup_id, no 0xFF sentinel). |
 | 15 | NewPlayerConnection | C→S | Handled | Client's join announcement (name/team/class), parsed in handshake. Before CreatePlayer, names are normalized to a case-insensitively unique 15-byte wire value; duplicate names can steal the native client's local-player association. |
 | 16 | ChangeEntity | S→C | Sent | Server-owned turret/MG target, carrier, ammo, state, and map-pickup position. Action 1 (`SET_POSITION`) reliably settles a pickup after its supporting structure breaks. |
@@ -73,35 +73,35 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 27 | StopMusic | S→C | Sent | Stop the current music track (server/audio.py). |
 | 28 | CreatePlayer | S→C | Sent | Spawns a player on clients; also carries the roster. Loadout and all three selected prefab names come from the same committed ClassSelection. Every live player name must be unique before this packet is emitted; the packet direction contains no movement-owner identity field. |
 | 29 | PrefabComplete | S→C | Sent | Sent to the builder when a prefab finishes placing. |
-| 30 | BuildPrefabAction | C→S | Handled | Shared `PrefabActionService` validates selected class prefab, stock, world contact, construction reservations, and queues bounded KV6 expansion. Stock is reserved up front; observers receive colored packet 33 cells, the owner packet 32 cells and packet 29 on completion. Bots use this same boundary. |
-| 31 | ErasePrefabAction | C→S | Handled | Prefab carve (UGC tool): destroys the expanded cell set via the verified Damage(37) block-destroy path. Wire layout carries no rotation fields — unverified vs live client. |
+| 30 | BuildPrefabAction | both | Handled+Sent | Shared `PrefabActionService` validates selection, stock, contact, and reservations. In UGC it snapshots/echoes the native action, prepares retail KV6 rotation and raw colors off-thread, then validates and commits through bounded main-thread batches. Competitive owners still receive packet 32 cells and packet 29; observers receive packet 33. |
+| 31 | ErasePrefabAction | both | Handled+Sent | Native UGC carve with verified yaw/pitch/roll fields. The action is echoed only after bounded live-world target validation, then the expanded set is removed through the authoritative block-destroy path. |
 | 32 | BlockBuild | both | Handled+Sent | Single-block place; handled on receive, also sent by combat. |
 | 33 | BlockBuildColored | S→C | Sent | Per-block colored placement for prefabs, ordinary-build observers, terrain repair, and persistent Block Cannon impacts; recorded for MapSync catch-up when a join is active. |
 | 34 | BlockOccupy | — | Planned | Mark a block occupied (building). |
 | 35 | BlockLiberate | C→S | Handled | Block destroy request (spade dig). |
-| 36 | ExplodeCorpse | — | Planned | Gib a corpse (combat/death FX). |
+| 36 | ExplodeCorpse | S→C | Sent | Three bytes: player id and effect flag. Classic CTF uses KillAction to create the client-owned `ClassicCorpse` Character, then packet 36 with flag 1 for an authoritative corpse hit or flag 0 for silent cleanup before respawn/late-join repair. It is not entity type 12. |
 | 37 | Damage | S→C | Sent | Block/player damage broadcast. Snowball sends one reliable zero-damage type-20 event at impact before DestroyEntity(19), allowing the native explosion manager to predict impulse. |
-| 38 | BlockManagerState | — | Planned | Bulk block-manager state sync (building). |
+| 38 | BlockManagerState | — | Planned | Three BlockManager dictionaries: damaged, occupied, and user-owned blocks. It is not a VXL topology/removed-voxel resync packet. Non-empty entry encoding remains unverified. |
 | 39 | ServerBlockAction | — | Planned | Server-authoritative block op; client-side no-op stub today. |
 | 40 | BlockLine | C→S | Handled | How the 1.x client actually PLACES blocks (line of blocks). |
 | 41 | MinimapBillboard | — | Planned | Place a minimap billboard/icon (minimap). |
 | 42 | MinimapBillboardClear | — | Planned | Clear minimap billboards (minimap). |
 | 43 | MinimapZone | S→C | Sent | CTF team-base zone and icon. Six signed-short fields are raw voxel min/max bounds for X/Y/Z; `key` is native `visible_team`, and icon 6 is `ZONE_ICON_CTF`. Sent at mode start and late join. |
 | 44 | MinimapZoneClear | — | Planned | Clear minimap zones (minimap). |
-| 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). VIP sends gangster classes with both `locked_class` bits. ZOM sends survivor classes on team 2, only base Zombie on team 3, and phase-aware team locks. |
+| 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). Prefab and entity catalog lengths are signed little-endian 16-bit counts, not padded bytes; this carries all 373 native UGC items. VIP sends gangster locks and ZOM sends phase-aware team/class locks. |
 | 46 | KillAction | S→C | Sent | Broadcast kill/death event. `kill_count` is the killer's current-life streak for the retail multikill HUD; it resets on death/round transition and is not the cumulative scoreboard kill total. |
-| 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact candidate records; the retail client binds the first three to F1/F2/F3. Title/description is a repr'd localized-string tuple (client ast.literal_evals it). |
+| 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact candidate records; the retail client binds the first three to F1/F2/F3. Title/description is exactly `repr((string_id, arguments_tuple))`: native `GenericVotingHUD.decode_string` unconditionally indexes both elements and crashes on the historical one-item tuple. |
 | 48 | InitiateKickMessage | C→S | Handled | Client starts a kick vote → VoteManager (server/voting.py). |
 | 49 | ChatMessage | both | Handled+Sent | Player chat uses types 0/1; private system replies use type 2. Global server/mode announcements use `CHAT_BIG` type 3 and render at the top of every retail HUD. |
 | 50 | LocalisedMessage | S→C | Sent | Top-screen string-table announcement. Resolves `string_id`, optionally resolves every positional parameter as another localization ID (for example `TEAM1_COLOR`), formats `{0}`/`{1}`/`{2}`, and supports replace-previous behavior. See Broadcast templates below. |
 | 51 | SkyboxData | S→C | Sent | Null-terminated retail mesh-environment filename (sent at join, prefix 0x30). It comes from the active VXL's validated sidecar `skybox_texture`/`skybox_name`; `[world].default_skybox` is the missing-metadata fallback. |
 | 52 | MapEnded | S→C | Sent | Native full-scene rollover trigger. It freezes the compiled `GameScene`; the compatibility hook opens `LoadingMenu`, then the server sends a fresh validated loader handshake over the same authenticated peer. Same-map score presentation deliberately omits it. |
-| 53 | ShowGameStats | S→C | Sent | Opens the full-screen end-of-round scores/credits screen (base_mode end sequence). LIVE-VERIFIED. |
-| 54 | MapDataStart | — | Planned | Legacy map-data transfer start (map-sync-legacy). |
+| 53 | ShowGameStats | S→C | Sent | Opens `GameScene.show_game_statistics(False)`. Used only after voted-map preflight and only for maps with a bundled retail level screenshot; custom maps and same-map restarts omit it. |
+| 54 | MapDataStart | S→C | Sent | Opens the native UGC source-map transfer before MapDataValidation. |
 | 55 | MapSyncStart | S→C | Sent | Bare-id map sync start (prefix 0x32). |
-| 56 | MapDataChunk | — | Planned | Legacy map-data chunk (map-sync-legacy). |
+| 56 | MapDataChunk | S→C | Sent | Persistent-zlib UGC source VXL chunks produced from 1048-byte input slices. |
 | 57 | MapSyncChunk | S→C | Sent | Map content chunk stream (prefix 0x31). |
-| 58 | MapDataEnd | — | Planned | Legacy map-data transfer end (map-sync-legacy). |
+| 58 | MapDataEnd | S→C | Sent | Terminates the pre-validation UGC source-map stream. |
 | 59 | MapSyncEnd | S→C | Sent | Map sync stream terminator. |
 | 60 | MapDataValidation | both | Handled+Sent | CRC handshake; server replies with OUR file CRC. |
 | 61 | PackStart | — | Planned | Resource-pack transfer start (network buffering). |
@@ -111,7 +111,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 65 | ProgressBar | — | Planned | UI progress bar (capture/build progress). |
 | 66 | RankUps | — | Planned | XP/rank changes at map end (match lifecycle/progression). |
 | 67 | GameStats | S→C | Sent | End-of-round scoreboard widget (server/scoreboard.py, on_mode_end). |
-| 68 | UGCObjectives | — | Planned | UGC-defined objectives (UGC). |
+| 68 | UGCObjectives | S→C | Sent | Exact current/min/max/priority rows for shared and target-mode Map Creator requirements. |
 | 69 | Restock | S→C | Sent | Resource-specific refill. Type 0 is the full-life spawn/general restock; a physical ammo crate must send type 3. Health (4), block (5), and jetpack (6) crates use their own paths. Sending type 0 for an ammo crate also restores client health. |
 | 70 | PickPickup | S→C | Sent | Authoritative objective pickup; initializes carried tool and burden state. CTF removes the type-16 ground entity and enables the carrier's high-visibility minimap marker. |
 | 71 | DropPickup | both | Handled+Sent | Client drop request validated against sender/current pickup, then relayed with authoritative identity, type, position, and capped throw velocity. DropPickup clears the carried tool but does not persist ground intel, so CTF follows it with a type-16 CreateEntity at the settled dry-ground position. |
@@ -134,18 +134,18 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 88 | PlaceRocketTurret | C→S | Handled | Validated Engineer/Rocketeer turret placement and server-owned targeting/rockets. |
 | 89 | PlaceLandmine | C→S | Handled | Validated placement, four-second arm, buried proximity detection, and blast. |
 | 90 | PlaceMedPack | C→S | Handled | Validated type-30 placement, three 25-HP team uses, health/destruction; two-client retail rendering verified. |
-| 91 | PlaceRadarStation | C→S | Handled | Validated type-36 placement, 250-second life, team minimap reveal; two-client retail rendering verified. |
+| 91 | PlaceRadarStation | C→S | Handled | Validated type-36 placement, native 35-second fuse/life, team minimap reveal, team-change cleanup, and damageable destruction. |
 | 92 | PlaceC4 | C→S | Handled | Validated oriented type-38 placement with owner stock tracking; two-client retail rendering verified. |
 | 93 | DetonateC4 | C→S | Handled | Detonates only the sender's live charges. |
 | 94 | BlockSuckerPacket | both | Handled+Sent | Sanitized remote state relay plus authoritative timed voxel pull/grant. |
 | 95 | DisguisePacket | C→S | Handled | Loadout/tool-gated disguise state, replicated through WorldUpdate bit 0x02. |
 | 96 | DisableEntity | — | Planned | Disable an entity without destroying it (entity mgmt). |
-| 97 | PlaceUGC | — | Planned | Place a UGC object (UGC). |
-| 98 | InitialUGCBatch | — | Planned | Initial batch of UGC objects at join (UGC). |
-| 99 | ReqestUGCEntities | — | Planned | Client requests UGC entities (UGC). |
-| 100 | UGCMessage | — | Planned | UGC channel message (UGC). |
-| 101 | UGCMapLoadingFromHost | — | Planned | UGC map loading from host (UGC). |
-| 102 | UGCMapInfo | — | Planned | UGC map metadata (UGC). |
+| 97 | PlaceUGC | both | Handled+Sent | Host-only raw-voxel placement/removal for all 19 Game Data items; range, tool, bounds, duplicate, and project-cap checks precede authoritative echo. |
+| 98 | InitialUGCBatch | S→C | Sent | Bounded initial/reconnect replay of persisted UGC objects. |
+| 99 | ReqestUGCEntities | C→S | Handled | Retail refresh request; spelling is native. Replays packet 98 plus packet 68 validation. |
+| 100 | UGCMessage | both | Handled+Sent | Recovered editor control channel for map info, validation, source-map, and conversion requests; late source-map requests are not replayed into GameScene. |
+| 101 | UGCMapLoadingFromHost | — | Reversed/unused | Local Steam-lobby host progress packet. Unsafe and unnecessary on dedicated direct connect; packets 54/56/58 provide the source map before validation. |
+| 102 | UGCMapInfo | both | Handled+Sent | Optional bounded PNG preview exchange; disk checkpointing stays off the gameplay thread. |
 | 103 | VoiceData | — | Planned | Voice-chat audio frames (voice). |
 | 104 | PlaceFlareBlock | C→S | Handled | Flare tool 22 only; raw voxel-short coordinates, ten-block cost, contact/range validation, and coloured entity type 13 with late-join persistence. A successful `FLARE BLOCK` log is this packet, not ordinary BlockLine(40). |
 | 105 | SteamSessionTicket | C→S | — | Steam auth ticket; received in handshake (not via register_handler). |
@@ -158,10 +158,10 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 112 | PasswordNeeded | — | Planned | Server requests a password (auth). |
 | 113 | PasswordProvided | — | Planned | Client submits a password (auth). |
 | 114 | InitialInfo | S→C | Sent | First join packet: map filename, checksum, movement multipliers, and a null-terminated `texture_skin` string. VIP sends `mafia`; the empty string selects the normal skin. |
-| 115 | ForceTeamJoin | — | Planned | Force a player onto a team (mode rules/admin). |
+| 115 | ForceTeamJoin | S→C | Sent | Map Creator sends team 2/instant 0 after loading so Start opens the native prefab/Game Data selector. |
 | 116 | PositionData | C→S | Handled | Handler registered, but the 1.x client does NOT send it (no-op path). |
 | 117 | TeamProgress | — | Planned | Team objective progress bar (territory/mode rules). |
-| 118 | SetGroundColors | — | Planned | Set per-team ground color palette (visuals). |
+| 118 | SetGroundColors | both | Handled+Sent | Complete UGC terrain/water palette from the host, persisted and replayed to editor guests. |
 
 ### Snowball Damage/Destroy ordering
 
@@ -221,9 +221,22 @@ and team spawn/base volumes without executing map code.
 The native VXL loader removes exposed chroma markers before gameplay. Green
 markers select static-light colour slot 0 and blue markers select slot 1. The
 server mirrors that collision removal and creates neutral type-13 entities at
-the removed marker positions only when the map metadata defines that colour
-slot. `FlareBlockEntity` owns the retail point light; the ordinary entity
-snapshot path reproduces the same lights for late joiners.
+the removed marker positions. The shipped editor baseplate defines stock slot
+0 as `(255,255,82)` and slot 1 as `(250,250,200)`; recovered per-map sidecars
+override those defaults. The fallback is restricted to recognized stock maps,
+so a community VXL with missing palette metadata cannot turn accidental chroma
+terrain into guessed lights.
+
+Native `FlareBlockEntity.post_initialize` calls both
+`BlockManager.add_user_block(x,y,z,RGB,5,0)` and
+`LightManager.add_static_point_light(x,y,z,RGB,5.0)`. RGB bytes are normalized
+by the client to floats; the server must not pre-normalize them on the wire.
+Because the entity re-creates a solid coloured voxel after VXL cleanup, the
+server restores that same voxel in authoritative collision without recording a
+player mutation. Packet 21 is sent after the first ClientData/GameScene gate,
+including for late joiners; sending hundreds inside the loading transition is
+still forbidden. A retail 20th Century Town join accepted 524 flare entities
+with uint16 IDs through this path.
 
 ### Stock presentation assets and ambience
 
@@ -258,25 +271,18 @@ surface (no class in `packet.pyx`). Handlers exist for dev parity tooling:
 - **119** packets defined in `shared/packet.pyx` (ids 0–118; id 21 is shared by
   `Entity` and `CreateEntity`, plus the `id: -1` base `Loader`/`AddServer` which
   are not wire packets).
-- **33** standard ids are registered in `protocol.packet_handler`, plus the
-  three development ids 241/242/243. NewPlayerConnection(15),
-  MapDataValidation(60), and SteamSessionTicket(105) also have connection-layer
-  paths outside the decorator registry.
-- The current table records **43** distinct server-sent ids and **51** ids still
-  planned. These counts should be regenerated when a packet changes status;
-  do not copy the older counts retained in historical handoffs.
-- **11** ids currently operate in both directions: 0, 6, 10, 11, 32, 47, 49,
-  60, 71, 76, and 94.
-
-Quick counts: **119 defined · 33 registered standard handlers · 41 sent · 53
-planned.**
+- Registered handlers are discovered from `protocol.packet_handler` and
+  `server.handlers`; NewPlayerConnection(15), MapDataValidation(60), and
+  SteamSessionTicket(105) also have connection-layer paths outside the
+  decorator registry. Do not preserve hand-counted totals: editor isolation
+  makes the active set process-specific, and the master table is authoritative.
 
 ---
 
-## Planned packets grouped by feature area
+## Packet feature-area notes
 
-What lighting up each feature area unlocks (all ids below are already defined in
-`packet.pyx`, just not yet wired):
+The active and remaining packet families are grouped here with their recovered
+ordering and native-client hazards.
 
 ### Sounds
 CreateAmbientSound (22), PlaySound (23), PlayAmbientSound (24), PlayMusic (26),
@@ -296,7 +302,13 @@ the server accepts only an exact advertised candidate and rejects forged or
 missing records. The map catalog is captured at startup, and the final-minute
 vote offers at most three maps in deterministic rotation order. A vote merely
 stages `VoteManager.next_map`; the round lifecycle consumes it at the safe
-scene boundary. `InitiateKickMessage(48)` remains the kick start/cancel path.
+scene boundary. A sudden score-limit ending waits for an unresolved ballot's
+bounded 15-second deadline instead of consuming `None`; zero-vote and tied
+ballots select the earliest candidate in deterministic rotation order. A kick
+ballot still active at the round boundary is closed before the map ballot.
+Players finishing GameScene construction during voting receive the current
+overlay after roster/terrain reveal. `InitiateKickMessage(48)` remains the kick
+start/cancel path.
 
 ### Map and mode scene rollover
 
@@ -306,15 +318,26 @@ IDA confirms that the retail receiver dispatches packet 52 through
 not select `LoadingMenu`, disconnect, or reconnect. Disconnect reason 18 is
 terminal in the tested retail build.
 
-Replacing the VXL or mode therefore follows this order: preflight the target,
-send and flush `MapEnded(52)`, detach the old server-side `Player`, commit the
-new runtime, and retain the authenticated ENet peer. The client compatibility
+For a voted official map, the end sequence is `GameStats(67)`, resolved vote,
+`ShowGameStats(53)`, the configured `lobby.end_screen_seconds` dwell, then
+`MapEnded(52)`. IDA shows packet 53 calls the live
+`GameScene.show_game_statistics(False)` overlay; packet 52 remains the actual
+loader boundary. A custom map may have no `png/ui/level_screenshots` asset, so
+the server omits packet 53 rather than triggering the client's native
+`ResourceNotFoundException`.
+
+Replacing the VXL or mode then sends and flushes `MapEnded(52)`, detaches the
+old server-side `Player`, commits the new runtime, and retains each settled
+authenticated ENet peer. The client compatibility
 hook selects `LoadingMenu(identifier=None)`, which deliberately reuses the
 current `GameClient`. The server then sends `InitialInfo`; only after receiving
 the matching `MapDataValidation` response does it stream the VXL and finish the
 normal `MapSync`/`StateData`/roster sequence. A peer that does not enter the
 loader is retired with reason 18 without affecting compatible peers. Invalid
-targets fail before packet 52 and leave the active scene untouched.
+targets fail before packets 53/52 and fall back to a same-map restart. A peer
+still inside its original InitialInfo/MapSync when rollover begins never
+receives gameplay-gated packet 52; it is retired with reason 18 instead of
+starting an overlapping second VXL handshake.
 
 ### Deployables / Place*
 PlaceDynamite (1), UseCommand (86), PlaceMG (87), PlaceRocketTurret (88),
@@ -338,6 +361,23 @@ The server owns selection, respawn lockout, disconnect-as-death, sub-round
 score, intermission, and late-join marker replay. Do not use `TeamLockClass(80)`
 for this path; the stock SelectTeam flow reads the class lock from StateData.
 
+Retail score metadata also defines two timed SetScore events. A living boss
+receives 50 points every ten seconds with reason `VIP_SURVIVE` (12); each
+living teammate within 15 blocks receives 10 points every five seconds with
+reason `VIP_ESCORT` (13). BattleSpades re-arms these deadlines from the current
+monotonic time, so a stalled tick can emit at most one event instead of a
+reliable catch-up burst. Sub-round CreatePlayer/loadout/health publication is
+likewise drained in bounded slices rather than respawning the whole roster in
+one tick.
+
+Molotov fire is server-owned. The native `BlockFireEntity` does not recursively
+spawn children itself; constants permit five spread attempts for the whole
+impact. Every child therefore shares one cluster budget instead of receiving a
+fresh budget. A conservative 96-emitter global ceiling is an inferred native
+client safety bound: a new impact replaces the oldest emitter at the ceiling,
+while child spread stops. The shared-budget rule is recovered behavior; the
+numeric global ceiling is BattleSpades operational hardening.
+
 ### Zombie Infection
 
 Zombie uses the retail mode id 2 and existing role packets; it introduces no
@@ -349,8 +389,13 @@ custom wire format:
   the following `CreatePlayer(28)` respawns Patient Zero as class 4 on team 3.
 - Team 3 is class-locked to base Zombie. Fast/Jump Zombie remain disabled
   because this client has no stable ordinary picker icons for those classes.
+- `InitialInfo.exposed_teams_always_on_minimap` is set for Zombie mode. The
+  native `Player.display_map_icon_out_of_bounds` routine uses this boolean for
+  ordinary opposing-role map visibility; it does **not** apply the VIP icon.
 - `ChangePlayer(17)` action 8 marks the sole remaining living survivor and is
-  replayed to late joiners.
+  replayed to late joiners. This is a separate
+  `high_minimap_visibility` path which does apply the special/VIP marker, so it
+  must not be broadcast for every survivor.
 - A client joining after outbreak is normalized to team 3/class 4 regardless
   of its requested team, class, or loadout. Zombie respawn delay is zero.
 
@@ -359,13 +404,63 @@ waiting for enough players is not round time.
 
 ### Territory control / mode rules (planned)
 TimeScale (75), LockTeam (79), TeamLockClass (80), TeamLockScore (81),
-TeamInfiniteBlocks (82), LockToZone (108), ForceTeamJoin (115),
-TerritoryBaseState (106), TeamProgress (117), ProgressBar (65).
+TeamInfiniteBlocks (82), LockToZone (108), TerritoryBaseState (106),
+TeamProgress (117), ProgressBar (65). ForceTeamJoin(115) is already active in
+the isolated Map Creator.
 
-### UGC (planned)
-SetUGCEditMode (12), UGCObjectives (68), PlaceUGC (97), InitialUGCBatch (98),
-ReqestUGCEntities (99), UGCMessage (100), UGCMapLoadingFromHost (101),
-UGCMapInfo (102).
+### UGC Map Creator
+
+The editor is isolated behind `run_map_creator.py`; the normal mode registry
+cannot select it. The recovered dedicated sequence is
+`InitialInfo(114) -> MapDataStart(54) -> MapDataChunk(56)* -> MapDataEnd(58)
+-> MapDataValidation(60) -> MapSync(55/57/59) -> StateData(45) ->
+ForceTeamJoin(115)`. StateData's signed-16-bit catalog counts carry the six
+native tabs (138/90/47/47/26/25, 373 total), and SetClassLoadout(13) commits a
+shared five-item Construct/Game Data backpack.
+
+Build/erase packets 30/31 preserve raw KV6 color and all three rotations.
+Packets 97/98 own the 19 authored object types, packet 68 mirrors exact mode
+requirements, packet 118 carries the ground/water palette, and packet 102
+exchanges an optional preview PNG. Project state checkpoints as the retail
+`.vxl`/`.txt`/`.ugc` triplet.
+
+The two prefab actions are intentionally asymmetric on the wire:
+
+- `BuildPrefabAction(30)` writes its anchor as three raw signed voxel shorts.
+- `ErasePrefabAction(31)` writes the same logical anchor as three signed
+  1.6 fixed-point shorts (`coordinate * 64`).
+- Both range fields are unsigned 32-bit indexes with native semantics
+  `[from_block_index, to_block_index)`. A non-empty model echoed as `0, 0`
+  processes zero client voxels. After authoritative commit the server echoes
+  `0, model_block_count`, including the authored model count when clipping
+  prevents some cells from changing.
+
+This was recovered from retail `shared/packet.pyd` and `vxl.pyd`, not inferred
+from the similarly named packet classes. For anchor `(112, 269, 223)`, packet
+31's final six bytes are `00 1c 40 43 c0 37`; decoding those as raw shorts
+produces the old 64-times-too-large erase position.
+
+The UGC Paintbrush has two accepted input paths. A normal `PaintBlockPacket(7)`
+is validated directly. Dedicated direct-connect clients can instead keep the
+action only in held `ClientData(4)` primary/secondary bits, so the server
+raycasts the authoritative eye/orientation, applies the single-cell or bounded
+surface brush, and broadcasts packet 7 with the exact RGB. The packed
+`palette_enabled` bit is not an action veto: the native Paintbrush deliberately
+keeps its palette active while painting, while an actual palette click arrives
+without the action bits.
+
+The UGC Super Spade uses `ShootPacket(6).secondary` as its dual-use selector.
+Primary sends UGC damage type 29 and affects one cell. Secondary sends UGC
+secondary type 31 and affects one centered 3x3x3 footprint. The server commits
+that footprint once and emits one matching native expanding `Damage(37)`;
+emitting a damage packet for every removed cell would make the retail client
+expand the cube repeatedly and create a larger client-only hole.
+
+The stock menu Host path assumes a local Steam-lobby owner. Dedicated direct
+connect therefore makes the server the editor host and retains the native
+in-game Construct and Game Data screens. Packet 101 is reversed but unused;
+injecting it or replaying source-map state after GameScene construction is a
+native crash hazard.
 
 ### Entity management
 ChangeEntity (16) is sent for turret/MG target, ammo, and carrier properties;
@@ -373,20 +468,53 @@ HitEntity (20) is sent as a visual impact callback after authoritative server
 ray selection. EntityUpdates (3) and DisableEntity (96) remain unused pending
 an evidence-backed gameplay path.
 
+Create/destroy symmetry is tracked per connection. Moving projectiles are
+deliberately omitted from a joining client's static snapshot; if one spawned
+during MapSync and expires after first ClientData, that GameScene receives no
+DestroyEntity because it never received the matching CreateEntity. Knowledge
+is cleared on scene reload and on each successful destroy, so entity-id reuse
+starts a fresh lifetime. This prevents the retail `invalid entity on destroy`
+join race without replaying stale mid-flight projectiles.
+
 ### Building / blocks
 PaintBlockPacket (7), BlockBuildColored (33), PrefabComplete (29),
 BuildPrefabAction (30), ErasePrefabAction (31), and BlockSuckerPacket (94) have
-active paths. Native block mutation packets are retained in a bounded late-join
-journal between MapSync and first ClientData; if that journal cannot provide a
-contiguous replay, the join is rejected so the client never enters with partial
-terrain state. BlockOccupy (34), BlockManagerState (38), and ServerBlockAction
-(39) remain planned.
+active paths. Between MapSync and first ClientData, a bounded per-cell sequence
+retains every committed canonical voxel coordinate. Replay coalesces repeated
+edits, reads final solidity/RGB from the VXL, and sends only explicit-RGB
+`BlockBuildColored(33)` or exact-cell `Damage(37)` with `chunk_check=0`. A
+multi-cell collapse therefore cannot be re-expanded against newer topology,
+and retry resumes at the first reliable packet ENet did not accept. If the
+journal loses sequence continuity, the join is rejected rather than entering
+with partial terrain. BlockOccupy (34), BlockManagerState (38), and
+ServerBlockAction (39) remain planned.
+
+Edits completed before a reconnect's MapSync boundary have a second exact-air
+safety path. `WorldManager` retains current destroyed cells as one 240-bit mask
+per changed `(x,y)` column. After the first ClientData proves `GameScene`
+exists, the server reasserts those cells in bounded type-6,
+`chunk_check=0` batches while keeping ordinary gameplay gated. Only after this
+frozen pre-snapshot set drains does the newer per-cell journal replay, so a
+block rebuilt while the client loads always wins. This ordering is required
+for Drill tunnels: the native VXL worker can visually merge a dirty column yet
+retain stale collision until an exact removal callback arrives.
 
 Settled clients also receive a delayed, bounded canonical repair of recently
 changed cells. This is not a new packet contract: solid cells use explicit-RGB
 `BlockBuildColored(33)` and air uses exact-cell `Damage(37)` with type 6 and
 `chunk_check=0`. The replay reads VXL state at send time and is deliberately
 excluded from the late-join mutation journal.
+
+Unsupported collapse needs a distinct confirmation lane. The initiating
+checked `Damage(37)` asks every retail BlockManager to derive and animate the
+falling component from local topology. The server mirrors that component, then
+queues every actually removed cell surface-first. After 18 ticks it sends a
+bounded stream of exact type-6, `chunk_check=0` air confirmations. Correct
+clients treat them as no-ops; a divergent client clears stale visible but
+non-colliding geometry. Cells rebuilt before confirmation are dropped. Packet
+38 cannot replace this path: IDA recovery of
+`BlockManager.send_block_manager_state`/`receive_block_manager_state` shows
+damage, occupancy, and user-block dictionaries rather than world topology.
 
 Melee terrain Damage is type-dependent. Type 2 expands to the centered
 three-cell z column; type 3 expands to a centered, axis-aligned 3x3x3 Super
@@ -418,6 +546,14 @@ also disables CTF intel auto-return; that is a server rule and emits no new
 packet. Ground intel remains entity type 16, and carried intel continues to use
 the ordinary pickup/WorldUpdate representation.
 
+The shipped playlist contains Crossroads, Hiesville, ToTheBridge, Trenches,
+WinterValley, WW1, and Classic. With no explicit operator rotation, voting is
+limited to that catalog. Its stock capture target is five and its intel begins
+three blocks from the authored base anchor. A capture awards 10 personal points
+with reason `CTF_CAPTURE` (50) plus one team capture; a touch return awards one
+personal point with reason `CTF_CLAIM` (53). Operator score/map overrides still
+take precedence over the playlist defaults.
+
 ### Combat / death FX
 ShootResponse (9) is sent only after authoritative player health decreases.
 Its `damage_by` field is the shooter's player id: the native handler shows
@@ -439,8 +575,24 @@ excluded from packet 8: their classes implement `use_primary()` but no
 bit `0x01`; peerless bot pulses are held for three 60 Hz loops so the 30 Hz
 replication stream cannot miss the state. `Damage(37)` remains the canonical
 terrain hit/removal.
-ExplodeCorpse (36) remains planned. DisguisePacket (95) is handled and
-replicated through WorldUpdate.
+Classic CTF deliberately bypasses the normal entity-11 gravestone. `KillAction`
+changes the existing native Character into `ClassicCorpse.kv6`; no
+`CreateEntity(21)` packet is involved and the server allocates no entity id.
+The server retains a generation-tagged static hit target using the recovered
+48x50x14 KV6 bounds and compares its ray-entry distance with players,
+deployables, and terrain. A hit emits `ExplodeCorpse(36)` once with
+`show_explosion_effect=1`, then applies the recovered corpse blast constants:
+radius 3, player damage 0, block damage 1, knockback 0.05–0.1, and kill reason
+12. Disabling `RULE_ENABLE_CORPSE_EXPLOSION` leaves the corpse visible but not
+hittable.
+
+Packet 36 is never sent at death because it removes the Character corpse that
+`KillAction` just created. A surviving corpse is removed with effect flag 0
+before the same numeric player id receives its next `CreatePlayer`. Roster
+catch-up records death separately from life creation: a joining GameScene sees
+`CreatePlayer -> SetColor -> KillAction` exactly once, and if the corpse
+exploded while gameplay was gated it receives only a silent packet-36 repair.
+DisguisePacket (95) is handled and replicated through WorldUpdate.
 
 Drill contact uses one reliable Damage (37) with type 10, damage 20,
 `chunk_check=1`, and the still-live Drill entity id as `causer_id`. The retail
@@ -453,8 +605,9 @@ also falls back to exact type-6 packets to avoid the native
 
 ### Match lifecycle / stats / progression
 MapEnded (52), ShowGameStats (53), GameStats (67), and DisplayCountdown (84)
-are sent by the round lifecycle. RankUps (66) and ForceShowScores (72) remain
-planned.
+are sent by the round lifecycle. The full-rollover order is 67, resolved vote,
+53, configured dwell, then 52; same-map and screenshot-less custom-map paths
+omit 53. RankUps (66) and ForceShowScores (72) remain planned.
 
 ### Legacy map-data sync (planned)
 MapDataStart (54), MapDataChunk (56), MapDataEnd (58).
@@ -488,6 +641,49 @@ join-time rollback. Ordinary 30 Hz WorldUpdates remain unreliable. ChangePlayer
 ### Auth (planned)
 Password (111), PasswordNeeded (112), PasswordProvided (113).
 
+### Steam Internet server discovery
+
+The shipped `shared/steam.pyd` initializes `SteamGameServer011` as follows:
+
+```text
+SteamGameServer_Init(0, 8766, game_port, query_port, mode, "1.0.0.0")
+SetProduct("aos")
+SetGameDescription("Ace of Spades")
+SetModDir("aceofspades")
+SetDedicatedServer(true)
+SetGameTags("v<protocol>;playlist=<id>[;region=...];mode=%04d[;classic][;skin=...]")
+EnableHeartbeats(true)
+LogOnAnonymous()
+```
+
+Mode `1` is LAN/no-list, `2` is public insecure, and `3` requests VAC. The
+retail Internet list requests app `224540` and filters
+`gamedir=aceofspades`. Its Official tab additionally requires `white=1`; its
+User tab applies `nand(white=1)`. BattleSpades deliberately does not forge the
+official-only key, so community hosts belong in the generic/User lists. The
+client then locally matches `mode=%04d` and optional `region=...`. It uses a
+separate game and query port. Its displayed map is `<MODE>_<MapName>` with
+spaces removed and the following character capitalized, for example
+`TDM_CityOfChicago`.
+
+The retail `ServerInfo` code then hardcodes the connection port to `32887`
+instead of honoring the game port returned by Steam. A stock-compatible host
+must therefore bind its ENet server on UDP `32887`. The query port remains the
+separate address advertised by Steam.
+
+`steam_appid.txt` value `480` in a decompiled tree is Spacewar test identity,
+not an AoS server identity. BattleSpades creates a private `224540` file for
+the helper. The helper's Steam-owned query socket is separate from the ENet
+port's direct A2S intercept.
+
+As of the 2026 recovery, registration and retrieval are different systems.
+Valve's public `ISteamApps/GetServersAtAddress` registry returns BattleSpades
+with app `224540` and game dir `aceofspades`, while the old
+`hl2master.steampowered.com` UDP endpoint no longer resolves. Consequently the
+unmodified 2015 All/Community UI completes with `eServerFailedToRespond` even
+for a correctly registered and publicly queryable server. This is a client
+discovery outage, not permission to alter the recovered app/game-dir identity.
+
 ### UI / messaging
 ChatMessage (49) and LocalisedMessage (50) are active for retail top-screen
 broadcasts. Because packet 49 never performs localization, its shared builder
@@ -499,8 +695,9 @@ remains planned. The formatter contract and variables are documented below.
 ### Voice (planned)
 VoiceData (103).
 
-### Visuals (planned)
-SetGroundColors (118).
+### Visuals
+SetGroundColors (118) is active in the isolated Map Creator; ordinary maps use
+their StateData/map-metadata palette.
 
 ### Dev tooling (planned)
 DebugDraw (107).

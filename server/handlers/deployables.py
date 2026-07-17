@@ -128,7 +128,9 @@ async def handle_place_flare_block(server, player, packet):
 async def handle_place_dynamite(server, player, packet):
     """Miner dynamite: a timed charge that craters + damages on a 7s fuse."""
     return server.deployable_actions.place_dynamite(
-        player, (packet.x, packet.y, packet.z)
+        player,
+        (packet.x, packet.y, packet.z),
+        face=int(getattr(packet, "face", -1)),
     )
 
 
@@ -272,7 +274,14 @@ async def handle_block_sucker(server, player, packet):
         return
     was_solid = server.world_manager.get_solid(*hit)
     get_combat_system(server)._apply_block_damage(
-        player, hit, float(C.BLOCK_SUCKER_BLOCK_DAMAGE)
+        player,
+        hit,
+        float(C.BLOCK_SUCKER_BLOCK_DAMAGE),
+        # BLOCK_SUCKER_DAMAGE is in the retail BLOCK_GRANTING_DAMAGES tuple.
+        # Sending generic WEAPON_DAMAGE removed the voxel visually but never
+        # incremented the client's held block counter.
+        damage_type=int(C.BLOCK_SUCKER_DAMAGE),
+        causer_id=int(player.id),
     )
     if was_solid and not server.world_manager.get_solid(*hit):
         player.add_blocks(1)

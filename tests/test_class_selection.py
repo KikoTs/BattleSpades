@@ -14,6 +14,7 @@ from server.config import ServerConfig
 from server.class_data import default_client_loadout
 from server.game_constants import TEAM1
 from server.player import Player
+from shared.bytes import ByteReader
 from shared.packet import ChangeClass, SetClassLoadout
 
 
@@ -25,7 +26,9 @@ def _live_medic() -> Player:
 
 
 def _handler() -> PacketHandler:
-    return PacketHandler(SimpleNamespace(config=ServerConfig()))
+    server = SimpleNamespace(config=ServerConfig(), broadcasts=[])
+    server.broadcast = lambda data, **kwargs: server.broadcasts.append(bytes(data))
+    return PacketHandler(server)
 
 
 def _loadout_packet(class_id: int, loadout: list[int], instant: int = 0) -> bytes:
@@ -230,6 +233,13 @@ def test_same_class_live_loadout_change_commits_without_forcing_death():
     assert player.class_id == C.CLASS_MEDIC
     assert C.SHOTGUN2_TOOL in player.loadout
     assert player.pending_selection is None
+    acknowledgement = SetClassLoadout(
+        ByteReader(handler.server.broadcasts[-1][1:])
+    )
+    assert acknowledgement.player_id == player.id
+    assert acknowledgement.class_id == C.CLASS_MEDIC
+    assert acknowledgement.instant == 1
+    assert acknowledgement.loadout == player.loadout
 
 
 def test_deployable_authorization_requires_matching_active_class_and_loadout():

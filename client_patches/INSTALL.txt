@@ -1,5 +1,5 @@
-Retail session-transition compatibility patch
-=============================================
+Retail compatibility patches
+============================
 
 The stock retail MapEnded(52) handler freezes GameScene, but it does not open
 the map loader and disconnect reason 18 does not reconnect this client build.
@@ -7,12 +7,17 @@ BattleSpades reloads maps and modes over the existing authenticated connection.
 The included session_transition_patch.py moves the frozen scene into
 LoadingMenu so the normal InitialInfo and VXL validation handshake can run.
 
+The stock EditBoxControl also has no clipboard keyboard handler. The included
+clipboard_input_patch.py adds Unicode Ctrl+V insertion at the current caret,
+including the Join by IP field, without polling or background work.
+
 Install in each retail client:
 
-1. Copy session_transition_patch.py beside the client's launcher.
+1. Copy session_transition_patch.py and clipboard_input_patch.py beside the
+   client's launcher.
 2. In aoslib/run.py, import session_transition_patch before BootClass() creates
-   the game manager.
+   the game manager. Import clipboard_input_patch after aoslib.gui is imported.
 3. Restart the retail client once.
 
-The hook is Python 2 compatible and only wraps GameManager.update. It creates
-no thread, performs no update-loop file I/O, and opens no second connection.
+Both hooks are Python 2 compatible. They create no thread, perform no
+update-loop file I/O, and open no second connection.

@@ -1,5 +1,8 @@
 """Audio cue + vote-kick tests."""
+import ast
+import asyncio
 import sys
+import time
 from types import SimpleNamespace
 
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
@@ -258,8 +261,14 @@ def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
         "CastleWars",
         "CityOfChicago",
     ]
-    assert start.title == repr(("VOTE_MAP_TITLE",))
-    assert start.description == repr(("VOTE_MAP_DESCRIPTION",))
+    assert start.title == repr(("VOTE_MAP_TITLE", ()))
+    assert start.description == repr(("VOTE_MAP_DESCRIPTION", ()))
+    # GenericVotingHUD.decode_string accesses both indexes before formatting.
+    # This guards the exact retail crash reported on 2026-07-16.
+    for encoded in (start.title, start.description):
+        identifier, arguments = ast.literal_eval(encoded)
+        assert identifier
+        assert arguments == ()
 
     vm.cast_candidate(srv.players[0], "CastleWars")
     vm.cast_candidate(srv.players[1], "CastleWars")
@@ -271,6 +280,106 @@ def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
     closed = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
     assert closed.message_type == voting.VOTE_CLOSED
     assert closed.can_vote == 0
+
+
+def test_map_vote_rejects_empty_unsafe_and_unavailable_candidates():
+    srv = _vote_server(2)
+    vm = voting.VoteManager(srv)
+    vm._available_maps = ("London", "ArcticBase")
+
+    assert not vm.start_map_vote(
+        ("", "../London", "Missing", "nested/ArcticBase"),
+        now=100.0,
+    )
+    assert vm.start_map_vote(
+        ("london.vxl", "LONDON", "arcticbase", "Missing"),
+        now=101.0,
+    )
+    assert vm.candidates == ("London", "ArcticBase")
+
+
+def test_map_vote_with_no_votes_selects_first_rotated_candidate():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("CastleWars", "London"), now=100.0)
+
+    vm.tick(100.0 + voting.MAP_VOTE_DURATION + 0.1)
+
+    assert vm.next_map == "CastleWars"
+    assert vm.active is False
+
+
+def test_map_vote_tie_is_deterministic_by_candidate_order():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("CastleWars", "London"), now=100.0)
+    vm.cast_candidate(srv.players[0], "London")
+    vm.cast_candidate(srv.players[1], "CastleWars")
+
+    vm.tick(100.0 + voting.MAP_VOTE_DURATION + 0.1)
+
+    assert vm.next_map == "CastleWars"
+
+
+def test_all_eligible_votes_resolve_map_without_waiting_for_timeout():
+    srv = _vote_server(2)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("CastleWars", "London"), now=100.0)
+
+    vm.cast_candidate(srv.players[0], "London")
+    assert vm.active is True
+    vm.cast_candidate(srv.players[1], "London")
+
+    assert vm.active is False
+    assert vm.next_map == "London"
+
+
+def test_round_end_map_vote_supersedes_an_in_game_kick_ballot():
+    srv = _vote_server(4)
+    srv.config = SimpleNamespace(
+        default_map="London",
+        maps_path="maps",
+        map_rotation=[],
+    )
+    vm = voting.VoteManager(srv)
+    vm._available_maps = ("London", "CastleWars")
+    assert vm.start_kick(srv.players[0], srv.players[3], 2, now=100.0)
+
+    assert vm.ensure_round_end_map_vote(now=101.0)
+
+    assert vm.kind == "map"
+    assert vm.candidates == ("CastleWars",)
+    assert srv.players[3].disconnected is None
+
+
+def test_wait_for_map_result_forces_expired_ballot_resolution():
+    srv = _vote_server(1)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("CastleWars",), now=time.time())
+    vm.opened_at = time.time() - voting.MAP_VOTE_DURATION - 1.0
+
+    selected = asyncio.run(vm.wait_for_map_result())
+
+    assert selected == "CastleWars"
+    assert vm.active is False
+
+
+def test_late_game_scene_receives_current_vote_overlay():
+    srv = _vote_server(2)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("CastleWars", "London"), now=100.0)
+    vm.cast_candidate(srv.players[0], "London")
+    sent = []
+    connection = SimpleNamespace(
+        send=lambda data, **kwargs: sent.append((bytes(data), kwargs))
+    )
+
+    vm.reveal_to(connection)
+
+    packet = GenericVoteMessage(ByteReader(sent[0][0][1:]))
+    assert packet.message_type == voting.VOTE_START
+    assert [candidate["votes"] for candidate in packet.candidates] == [0, 1]
+    assert sent[0][1] == {"reliable": True}
 
 
 def test_generic_candidate_cast_maps_kick_choice_by_exact_candidate_name():

@@ -832,7 +832,10 @@ cdef class HelpMessage(Loader): # Fixed
         
     cpdef read(self, ByteReader reader):
         import struct
-        self.delay = struct.unpack(">f", reader.read_bytes(4))[0]
+        # ByteReader exposes ``read`` (not ``read_bytes``).  The writer uses a
+        # deliberately big-endian float for this one legacy packet, so retain
+        # that exception while making server-side diagnostics/tests parseable.
+        self.delay = struct.unpack(">f", reader.read(4))[0]
         count = reader.read_byte()
         self.message_ids = []
         for i in range(count):
@@ -1438,23 +1441,25 @@ cdef class PlaceUGC(Loader): # Fixed
     compress_packet: bool = False
     cdef public:
         int loop_count
-        float x, y, z
-        int ugc_item_id, placing
+        int x, y, z, ugc_item_id, placing
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.x = fromfixed(reader.read_short())
-        self.y = fromfixed(reader.read_short())
-        self.z = fromfixed(reader.read_short())
+        # Packet 97 is an editor-object coordinate, not a physics vector.
+        # Retail writes raw voxel shorts here; fixed-point conversion corrupts
+        # every position except zero and makes authored objects disappear.
+        self.x = reader.read_short()
+        self.y = reader.read_short()
+        self.z = reader.read_short()
         self.ugc_item_id = reader.read_byte()
         self.placing = reader.read_byte()
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_short(self.x)
+        writer.write_short(self.y)
+        writer.write_short(self.z)
         writer.write_byte(self.ugc_item_id)
         writer.write_byte(self.placing)
 
@@ -3156,16 +3161,22 @@ cdef class StateData(Loader): # Fixed?
         self.lock_team_swap = (lock_flags & 1) != 0
         self.lock_spectator_swap = (lock_flags & 2) != 0
         
-        # Prefabs
-        prefab_count = reader.read_byte()
-        reader.read_byte() # Padding
+        # Prefabs.  The retail client reads this as one little-endian
+        # 16-bit count.  It was previously mistaken for an 8-bit count plus
+        # padding because ordinary server maps rarely advertise more than
+        # 255 entries.  UGC terrains legitimately expose 250-373 constructs,
+        # so dropping the high byte empties/truncates the native library.
+        prefab_count = reader.read_short()
+        if prefab_count < 0:
+            raise ValueError("negative StateData prefab count")
         self.prefabs = []
         for i in range(prefab_count):
             self.prefabs.append(reader.read_string())
             
-        # Entities
-        entity_count = reader.read_byte()
-        reader.read_byte() # Padding
+        # Entities use the same recovered 16-bit count layout.
+        entity_count = reader.read_short()
+        if entity_count < 0:
+            raise ValueError("negative StateData entity count")
         self.entities = []
         for i in range(entity_count):
             ent = Entity()
@@ -3270,15 +3281,19 @@ cdef class StateData(Loader): # Fixed?
         if self.lock_spectator_swap: lock_flags |= 2
         writer.write_byte(lock_flags)
 
-        # Prefabs
-        writer.write_byte(len(self.prefabs)) # Prefabs length
-        writer.write_byte(0) # Padding
+        # Prefab/entity counts are signed little-endian shorts in the native
+        # Cython packet.  In particular, Map Creator's Grassland catalog has
+        # 373 entries and therefore requires a non-zero high byte.
+        if len(self.prefabs) > 0x7FFF:
+            raise ValueError("StateData prefab count exceeds wire limit")
+        writer.write_short(len(self.prefabs))
         for prefab in self.prefabs:
             writer.write_string(prefab) # Prefabs
 
         # Entities
-        writer.write_byte(len(self.entities)) # Entities length
-        writer.write_byte(0) # Padding
+        if len(self.entities) > 0x7FFF:
+            raise ValueError("StateData entity count exceeds wire limit")
+        writer.write_short(len(self.entities))
         for ent in self.entities:
             ent.write(writer) # Entities
 
@@ -3585,26 +3600,29 @@ cdef class InitialUGCBatch(Loader): # Fixed
 
     cpdef read(self, ByteReader reader):
         self.items = []
-        cdef int count = reader.read_byte()
+        # Native packet 98 uses a 32-bit count and eight-byte records:
+        # mode:u8, x/y/z:s16, item:u8.  Do not reorder these fields; the stock
+        # client walks this array without a framing guard.
+        cdef int count = reader.read_int()
         cdef int i
         for i in range(count):
             item = UGCBatchEntity()
             item.mode = reader.read_byte()
-            item.ugc_item_id = reader.read_int()
             item.x = reader.read_short()
             item.y = reader.read_short()
             item.z = reader.read_short()
+            item.ugc_item_id = reader.read_byte()
             self.items.append(item)
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
-        writer.write_byte(len(self.items))
+        writer.write_int(len(self.items))
         for item in self.items:
             writer.write_byte(item.mode)
-            writer.write_int(item.ugc_item_id)
             writer.write_short(item.x)
             writer.write_short(item.y)
             writer.write_short(item.z)
+            writer.write_byte(item.ugc_item_id)
 
 
 cdef class BlockManagerState(Loader): # Fixed
@@ -3672,28 +3690,34 @@ cdef class ErasePrefabAction(Loader): # Fixed
         int player_id
         str prefab_name
         int from_block_index, to_block_index
-        float x, y, z
+        int prefab_yaw, prefab_pitch, prefab_roll
+        tuple position
 
     cpdef read(self, ByteReader reader):
         self.loop_count = reader.read_int()
-        self.player_id = reader.read_byte()
         self.prefab_name = reader.read_string()
-        self.from_block_index = reader.read_short()
-        self.to_block_index = reader.read_short()
-        self.x = fromfixed(reader.read_short())
-        self.y = fromfixed(reader.read_short())
-        self.z = fromfixed(reader.read_short())
+        self.player_id = reader.read_byte()
+        self.prefab_yaw = reader.read_byte()
+        self.prefab_pitch = reader.read_byte()
+        self.prefab_roll = reader.read_byte()
+        # IDA and a live retail packet capture prove this asymmetric layout:
+        # range indices are 32-bit, but unlike BuildPrefabAction's raw voxel
+        # shorts, ErasePrefabAction stores its position as 1.6 fixed shorts.
+        self.from_block_index = reader.read_int()
+        self.to_block_index = reader.read_int()
+        self.position = read_fixed_position(reader)
 
     cpdef write(self, ByteWriter writer):
         writer.write_byte(self.id)
         writer.write_int(self.loop_count)
-        writer.write_byte(self.player_id)
         writer.write_string(self.prefab_name)
-        writer.write_short(self.from_block_index)
-        writer.write_short(self.to_block_index)
-        writer.write_short(tofixed(self.x))
-        writer.write_short(tofixed(self.y))
-        writer.write_short(tofixed(self.z))
+        writer.write_byte(self.player_id)
+        writer.write_byte(self.prefab_yaw)
+        writer.write_byte(self.prefab_pitch)
+        writer.write_byte(self.prefab_roll)
+        writer.write_int(self.from_block_index)
+        writer.write_int(self.to_block_index)
+        write_fixed_position(writer, self.position)
 
 
 cdef class ChangeEntity(Loader): # Fixed

@@ -37,6 +37,7 @@ from .messages import (
     PlayerSnapshot,
     VoxelChange,
 )
+from .prefab_policy import bot_prefab_is_suitable, is_zombie_prefab
 from .profiles import ProfileFactory
 from .supervisor import AIWorkerSupervisor, WorkerStatus
 
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
-# A latched FIRE/MELEE/ORIENTED action may outlive its 250 ms intent TTL by
+# A latched FIRE/MELEE/ORIENTED action may outlive its 400 ms intent TTL by
 # this grace period while the aim motor finishes converging on the target.
 _ACTION_CONVERGENCE_GRACE = 0.15
 # The worker's native player-target claw gate (see _engage_zombie).  The
@@ -67,6 +68,9 @@ _LOCK_SETTLE_TIME = 1.2
 # per-tick cap so the 60 Hz gameplay thread never runs unbounded raycasts.
 _WALL_PROBE_INTERVAL = 0.10
 _WALL_PROBE_TICK_BUDGET = 4
+_WALK_STEER_ANGLES = tuple(
+    math.radians(value) for value in (20.0, 40.0, 60.0)
+)
 _DEFAULT_CLASSES = tuple(
     int(value)
     for value in (
@@ -80,6 +84,61 @@ _DEFAULT_CLASSES = tuple(
     )
     if int(value) in C.CLASS_ITEMS
 )
+_BOT_TRAVERSAL_PREFAB_TOKENS = (
+    "bridge",
+    "corridor",
+    "ladder",
+    "steps",
+    "stair",
+    "platform",
+    "tube",
+)
+_BOT_COVER_PREFAB_TOKENS = (
+    "barricade",
+    "wall",
+    "barrier",
+    "bunker",
+    "shield",
+    "caltrop",
+)
+
+
+def _choose_bot_prefabs(
+    available: list[str] | tuple[str, ...],
+    rng: random.Random,
+    *,
+    limit: int = 3,
+) -> tuple[str, ...]:
+    """Give each bot traversal and cover utility before optional variety."""
+
+    pool = sorted({str(name) for name in available})
+    if not pool or limit <= 0:
+        return ()
+    selection_limit = int(limit)
+    if all(is_zombie_prefab(name) for name in pool):
+        return tuple(rng.sample(pool, k=min(selection_limit, len(pool))))
+    selected: list[str] = []
+    for purpose, tokens in (
+        ("traversal", _BOT_TRAVERSAL_PREFAB_TOKENS),
+        ("cover", _BOT_COVER_PREFAB_TOKENS),
+    ):
+        if len(selected) >= selection_limit:
+            break
+        candidates = [
+            name
+            for name in pool
+            if any(token in name.lower() for token in tokens)
+            and bot_prefab_is_suitable(name, purpose)
+        ]
+        if candidates:
+            choice = rng.choice(candidates)
+            selected.append(choice)
+            pool.remove(choice)
+    pool = [name for name in pool if bot_prefab_is_suitable(name, "variety")]
+    remaining = min(max(0, selection_limit - len(selected)), len(pool))
+    if remaining:
+        selected.extend(rng.sample(pool, k=remaining))
+    return tuple(selected)
 
 
 class _BotConnection:
@@ -91,6 +150,7 @@ class _BotConnection:
         self.peer = None
         self.in_game = True
         self.map_sent = True
+        self.known_entity_ids: set[int] = set()
 
     def send(self, data, reliable: bool = True, prefix: int = 0x30):
         """Discard owner-only packets; observers receive normal broadcasts."""
@@ -298,13 +358,9 @@ class BotDirector:
         from server.prefabs import allowed_prefabs_for_class
 
         available_prefabs = sorted(allowed_prefabs_for_class(selected_class))
-        selected_prefabs = (
-            self._rng.sample(
-                available_prefabs,
-                k=min(3, len(available_prefabs)),
-            )
-            if available_prefabs
-            else []
+        selected_prefabs = _choose_bot_prefabs(
+            available_prefabs,
+            self._rng,
         )
         from server.class_selection import normalize_server_selection
         selection = normalize_server_selection(
@@ -346,12 +402,9 @@ class BotDirector:
         self._generation_counter[player_id] = generation
         setattr(player, "bot_generation", generation)
 
-        spawn_resolver = getattr(self.server.mode, "get_spawn_point", None)
-        spawn = (
-            spawn_resolver(player)
-            if callable(spawn_resolver)
-            else self.server.world_manager.get_spawn_point(selected_team)
-        )
+        from server.round_lifecycle import resolve_player_spawn
+
+        spawn = resolve_player_spawn(self.server, player)
         player.spawn(*spawn)
         self._select_spawn_weapon(player)
         # Bots have no retail ClientData stream to supply the stock display
@@ -1090,11 +1143,11 @@ class BotDirector:
             hover=runtime.action_hover,
         )
         self._try_pending_action(runtime, now)
-        direction = intent.movement.direction
-        if not self._waypoint_is_live(
-            runtime, direction, intent.movement.affordance
-        ):
-            direction = (0.0, 0.0, 0.0)
+        direction = self._live_movement_direction(
+            runtime,
+            intent.movement.direction,
+            intent.movement.affordance,
+        )
         forward = (float(player.o_x), float(player.o_y))
         side = (-forward[1], forward[0])
         forward_amount = direction[0] * forward[0] + direction[1] * forward[1]
@@ -1114,7 +1167,14 @@ class BotDirector:
             or affordance is MovementAffordance.JUMP
         )
         current_loop = int(getattr(self.server, "loop_count", 0))
-        if (
+        wading_jump = bool(getattr(player, "wade", False)) and jump_requested
+        if wading_jump:
+            # Native swimming needs held ascent. Ground jumps remain bounded
+            # pulses, but pulsing only a few ticks per worker frame made bots
+            # bob and crawl across large water maps.
+            runtime.jump_until_loop = -1
+            runtime.jump_rearm_loop = -1
+        elif (
             jump_requested
             and int(intent.frame_id) != runtime.last_jump_frame
             and current_loop >= runtime.jump_rearm_loop
@@ -1124,7 +1184,7 @@ class BotDirector:
             # A release window prevents adjacent worker frames from merging
             # into one native held-key interval.
             runtime.jump_rearm_loop = runtime.jump_until_loop + 2
-        jump_held = current_loop <= runtime.jump_until_loop
+        jump_held = wading_jump or current_loop <= runtime.jump_until_loop
         self._set_movement_state(runtime, (
             forward_amount > 0.25,
             forward_amount < -0.25,
@@ -1134,7 +1194,8 @@ class BotDirector:
             bool(intent.movement.crouch)
             or affordance is MovementAffordance.CROUCH,
             bool(intent.movement.sneak),
-            bool(intent.movement.sprint),
+            bool(intent.movement.sprint)
+            and math.hypot(direction[0], direction[1]) > 0.1,
         ))
         self._set_action_state(
             runtime,
@@ -1567,26 +1628,50 @@ class BotDirector:
         if length <= 1e-6:
             return True
         dx, dy = dx / length, dy / length
+        wading = bool(getattr(player, "wade", False))
+        speed = math.hypot(
+            float(getattr(player, "vx", 0.0)),
+            float(getattr(player, "vy", 0.0)),
+        )
+        # A close probe catches walls but is too late to arrest native sprint
+        # momentum at a water cliff. WorldPlayer velocity is not expressed in
+        # blocks/second: a measured 0.35 horizontal velocity needs roughly four
+        # blocks to coast to a stop. Sample that whole braking corridor so a
+        # one-cell gap cannot hide between the body probe and its endpoint.
+        ordinary_walk = affordance in {
+            MovementAffordance.WALK,
+            MovementAffordance.CROUCH,
+        }
+        probe_distance = (
+            min(5.0, max(1.25, 1.0 + speed * 10.0))
+            if ordinary_walk and not wading
+            else 0.65
+        )
         probe_key = (
-            int(round(float(player.x) * 4.0)),
-            int(round(float(player.y) * 4.0)),
-            int(round(float(player.z) * 4.0)),
+            int(round(float(player.x) * 8.0)),
+            int(round(float(player.y) * 8.0)),
+            int(round(float(player.z) * 8.0)),
             int(round(dx * 100.0)),
             int(round(dy * 100.0)),
             int(getattr(world, "topology_version", 0)),
-            bool(getattr(player, "wade", False)),
+            wading,
+            int(round(probe_distance * 100.0)),
             affordance.value,
         )
         if runtime.waypoint_probe_key == probe_key:
             return runtime.waypoint_probe_result
-        center_x = float(player.x) + dx * 0.65
-        center_y = float(player.y) + dy * 0.65
         shoulder_x, shoulder_y = -dy * 0.45, dx * 0.45
-        probes = (
-            (center_x, center_y),
-            (center_x + shoulder_x, center_y + shoulder_y),
-            (center_x - shoulder_x, center_y - shoulder_y),
-        )
+
+        def probes_at(distance: float):
+            center_x = float(player.x) + dx * distance
+            center_y = float(player.y) + dy * distance
+            return (
+                (center_x, center_y),
+                (center_x + shoulder_x, center_y + shoulder_y),
+                (center_x - shoulder_x, center_y - shoulder_y),
+            )
+
+        immediate = probes_at(min(0.65, probe_distance))
         result = all(
             BotDirector._probe_surface_is_live(
                 world,
@@ -1595,11 +1680,93 @@ class BotDirector:
                 probe_y,
                 affordance,
             )
-            for probe_x, probe_y in probes
+            for probe_x, probe_y in immediate
         )
+        if result and ordinary_walk and not wading and probe_distance > 0.65:
+            # The immediate full probe owns walls and step height. Farther
+            # samples only own water/void braking: comparing their support
+            # against the current z would reject a perfectly walkable gradual
+            # slope several blocks ahead.
+            sample_count = int(math.ceil(probe_distance / 0.5))
+            for sample_index in range(2, sample_count + 1):
+                distance = min(
+                    probe_distance,
+                    float(sample_index) * 0.5,
+                )
+                if any(
+                    bool(
+                        world.is_water_column(
+                            int(math.floor(probe_x)),
+                            int(math.floor(probe_y)),
+                        )
+                    )
+                    for probe_x, probe_y in probes_at(distance)
+                ):
+                    result = False
+                    break
+        if not result and affordance is MovementAffordance.JUMP:
+            body_clear = all(
+                not world.clipbox(probe_x, probe_y, float(player.z))
+                and not world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
+                for probe_x, probe_y in immediate
+            )
+            if body_clear:
+                result = all(
+                    BotDirector._probe_surface_is_live(
+                        world,
+                        player,
+                        probe_x,
+                        probe_y,
+                        affordance,
+                    )
+                    for probe_x, probe_y in probes_at(2.05)
+                )
         runtime.waypoint_probe_key = probe_key
         runtime.waypoint_probe_result = result
         return result
+
+    @staticmethod
+    def _live_movement_direction(
+        runtime: _RuntimeBot,
+        direction,
+        affordance: MovementAffordance = MovementAffordance.WALK,
+    ) -> tuple[float, float, float]:
+        """Return requested locomotion or the nearest body-clear walk vector.
+
+        Worker navigation owns the route. This is only local collision
+        steering, analogous to sliding along a wall: special traversal edges
+        stay fail-closed because rotating a jump or drop can invalidate its
+        authored landing.
+        """
+
+        requested = tuple(float(value) for value in direction)
+        if BotDirector._waypoint_is_live(runtime, requested, affordance):
+            return requested
+        if affordance not in {
+            MovementAffordance.WALK,
+            MovementAffordance.CROUCH,
+        }:
+            return (0.0, 0.0, 0.0)
+        length = math.hypot(requested[0], requested[1])
+        if length <= 1e-6:
+            return (0.0, 0.0, 0.0)
+        dx, dy = requested[0] / length, requested[1] / length
+        identity = int(getattr(runtime.player, "id", 0)) + int(
+            getattr(runtime, "generation", 0)
+        )
+        preferred_sign = -1.0 if identity & 1 else 1.0
+        for magnitude in _WALK_STEER_ANGLES:
+            for sign in (preferred_sign, -preferred_sign):
+                angle = magnitude * sign
+                cosine, sine = math.cos(angle), math.sin(angle)
+                candidate = (
+                    (dx * cosine - dy * sine) * length,
+                    (dx * sine + dy * cosine) * length,
+                    requested[2],
+                )
+                if BotDirector._waypoint_is_live(runtime, candidate, affordance):
+                    return candidate
+        return (0.0, 0.0, 0.0)
 
     @staticmethod
     def _probe_surface_is_live(
@@ -1621,13 +1788,16 @@ class BotDirector:
         ):
             return False
         cell_x, cell_y = int(math.floor(probe_x)), int(math.floor(probe_y))
-        # A dry plan may never enter the universal water plane. Wading bots
-        # are allowed to traverse it only so recovery can lead them to land.
-        if (
-            not bool(getattr(player, "wade", False))
-            and bool(world.is_water_column(cell_x, cell_y))
-        ):
+        # A dry plan may never enter the universal water plane. A swimmer's
+        # vertical bob is unrelated to support height, however: comparing its
+        # current z against the waterbed intermittently rejects every valid
+        # waypoint and can freeze it in open water forever.
+        wading = bool(getattr(player, "wade", False))
+        water_column = bool(world.is_water_column(cell_x, cell_y))
+        if not wading and water_column:
             return False
+        if wading and water_column:
+            return True
 
         expected_support = int(round(float(player.z) + 2.25))
         climb, drop = {
@@ -1755,10 +1925,9 @@ class BotDirector:
                 from server.prefabs import allowed_prefabs_for_class
 
                 available = sorted(allowed_prefabs_for_class(selected_class))
-                selected_prefabs = (
-                    runtime.rng.sample(available, k=min(3, len(available)))
-                    if available
-                    else ()
+                selected_prefabs = _choose_bot_prefabs(
+                    available,
+                    runtime.rng,
                 )
                 from server.class_selection import normalize_server_selection
                 selection = normalize_server_selection(

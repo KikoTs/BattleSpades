@@ -74,3 +74,4 @@ from server.handlers import diagnostics as _diagnostic_handlers  # noqa: E402,F4
 from server.handlers import deployables as _deployable_handlers  # noqa: E402,F401
 from server.handlers import blocks as _block_handlers  # noqa: E402,F401
 from server.handlers import world as _world_handlers  # noqa: E402,F401
+from server.handlers import ugc as _ugc_handlers  # noqa: E402,F401

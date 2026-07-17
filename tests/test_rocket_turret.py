@@ -6,6 +6,7 @@ from shared.packet import ChangeEntity
 
 from server.rocket_turret import (
     ROCKET_TURRET_AMMO,
+    ROCKET_TURRET_HEALTH,
     ROCKET_TURRET_INITIAL_STOCK,
     ROCKET_TURRET_ROCKET_SPEC,
     RocketTurretController,
@@ -32,7 +33,15 @@ class Registry:
         self.entities = {}
 
     def place(self, type, x, y, z, **kw):
-        result = SimpleNamespace(entity_id=self.next_id, type=type, x=x, y=y, z=z, **kw)
+        result = SimpleNamespace(
+            entity_id=self.next_id,
+            type=type,
+            x=x,
+            y=y,
+            z=z,
+            alive=True,
+            **kw,
+        )
         self.next_id += 1
         self.entities[result.entity_id] = result
         return result
@@ -63,6 +72,7 @@ class Server:
         self.created = []
         self.changed = []
         self.destroyed = []
+        self.blasts = []
 
     def broadcast_create_entity(self, ent):
         self.created.append(ent)
@@ -75,6 +85,9 @@ class Server:
 
     def broadcast_destroy_entity(self, entity_id):
         self.destroyed.append(entity_id)
+
+    def _apply_blast(self, *args, **kwargs):
+        self.blasts.append((args, kwargs))
 
 
 def test_engineer_places_visible_turret_and_consumes_stock():
@@ -186,3 +199,29 @@ def test_disconnect_does_not_destroy_an_already_unregistered_turret():
 
     assert turret.entity_id not in server.rocket_turrets
     assert server.destroyed == []
+
+
+def test_turret_takes_authoritative_damage_and_uses_stock_destruction_blast():
+    server = Server()
+    owner = Player(1, 2, (10.0, 10.0, 10.0))
+    controller = RocketTurretController(server)
+    turret = controller.place(owner, (10.0, 10.0, 10.0), yaw=0.0, now=0.0)
+    entity = server.entity_registry.get(turret.entity_id)
+    context = SimpleNamespace(server=server)
+
+    entity.behavior.on_damage(entity, ROCKET_TURRET_HEALTH - 1, owner, context)
+    assert turret.health == 1
+    assert entity.alive
+    assert server.destroyed == []
+
+    entity.behavior.on_damage(entity, 1, owner, context)
+    assert turret.entity_id not in server.rocket_turrets
+    assert server.entity_registry.get(turret.entity_id) is None
+    assert server.destroyed == [turret.entity_id]
+    assert len(server.blasts) == 1
+    args, kwargs = server.blasts[0]
+    assert args[3:5] == (
+        float(C.ROCKET_TURRET_EXPLOSION_DAMAGE),
+        float(C.ROCKET_TURRET_EXPLOSION_BLOCK_DAMAGE),
+    )
+    assert kwargs["blast_radius"] == float(C.ROCKET_TURRET_EXPLOSION_RADIUS)

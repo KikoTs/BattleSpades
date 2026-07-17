@@ -143,6 +143,114 @@ class VoxelTerrain:
             return None
         return sample.x, sample.y, sample.support_z
 
+    def direction_is_traversable(
+        self,
+        start: Vector3,
+        direction: Vector3,
+        affordance: MovementAffordance,
+        *,
+        allow_water: bool = False,
+    ) -> bool:
+        """Validate an immediate step using the gameplay motor's body width."""
+
+        dx, dy = float(direction[0]), float(direction[1])
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return True
+        dx, dy = dx / length, dy / length
+        shoulder_x, shoulder_y = -dy * 0.45, dx * 0.45
+        expected_support = int(round(float(start[2]) + PLAYER_STANDING_OFFSET))
+        climb, drop = {
+            MovementAffordance.JUMP: (2, 3),
+            MovementAffordance.DROP: (1, 4),
+            MovementAffordance.JETPACK: (8, 8),
+        }.get(affordance, (1, 1))
+
+        def probes_at(distance: float) -> tuple[tuple[float, float], ...]:
+            center_x = float(start[0]) + dx * distance
+            center_y = float(start[1]) + dy * distance
+            return (
+                (center_x, center_y),
+                (center_x + shoulder_x, center_y + shoulder_y),
+                (center_x - shoulder_x, center_y - shoulder_y),
+            )
+
+        def supported(probes: tuple[tuple[float, float], ...]) -> bool:
+            for probe_x, probe_y in probes:
+                sample = self.classify(
+                    int(math.floor(probe_x)),
+                    int(math.floor(probe_y)),
+                    float(start[2]),
+                    allow_water=allow_water,
+                    vertical_span=max(climb, drop),
+                    clearance=2,
+                )
+                if sample is None:
+                    return False
+                delta = int(sample.support_z) - expected_support
+                if not -climb <= delta <= drop:
+                    return False
+            return True
+
+        immediate = probes_at(0.65)
+        if supported(immediate):
+            return True
+        if affordance is not MovementAffordance.JUMP:
+            return False
+        body_z = int(math.floor(float(start[2])))
+        if any(
+            self.solid(int(math.floor(x)), int(math.floor(y)), z)
+            for x, y in immediate
+            for z in (body_z, body_z + 1)
+        ):
+            return False
+        # A one-cell gap is allowed only when the full body width has a valid
+        # two-cell landing beyond empty air.
+        return supported(probes_at(2.05))
+
+    def dry_corridor_is_traversable(
+        self,
+        start: Vector3,
+        direction: Vector3,
+        *,
+        distance: float = 1.5,
+    ) -> bool:
+        """Reject a short walk corridor containing water or unsupported void.
+
+        Local A* can legally choose a first 0.65-block step beside a cliff even
+        when the next cell in the same escape direction is water. The live
+        motor must account for braking distance, so worker escape selection
+        uses this slightly longer, body-width dry lookahead as well.
+        """
+        dx, dy = float(direction[0]), float(direction[1])
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return True
+        dx, dy = dx / length, dy / length
+        shoulder_x, shoulder_y = -dy * 0.45, dx * 0.45
+        limit = max(0.5, float(distance))
+        sample_count = max(1, int(math.ceil(limit / 0.5)))
+        for sample_index in range(1, sample_count + 1):
+            sample_distance = min(limit, float(sample_index) * 0.5)
+            center_x = float(start[0]) + dx * sample_distance
+            center_y = float(start[1]) + dy * sample_distance
+            for probe_x, probe_y in (
+                (center_x, center_y),
+                (center_x + shoulder_x, center_y + shoulder_y),
+                (center_x - shoulder_x, center_y - shoulder_y),
+            ):
+                sample = self.classify(
+                    int(math.floor(probe_x)),
+                    int(math.floor(probe_y)),
+                    float(start[2]),
+                    allow_water=True,
+                    vertical_span=8,
+                    clearance=2,
+                )
+                if sample is None or sample.water:
+                    return False
+        return True
+
 
 class VoxelActionPlanner:
     """Bounded local search for survival and topology-changing actions."""
@@ -220,7 +328,9 @@ class VoxelActionPlanner:
                 vertical_span=3,
             )
             if cached_sample is not None:
-                return self._water_step(start, cached_sample, cached_goal)
+                return self._water_step(
+                    position, cached_sample, cached_goal
+                )
             # A caller using a mutable terrain without explicit invalidation
             # still fails closed instead of steering into a newly blocked cell.
             self.invalidate_water_routes()
@@ -253,7 +363,9 @@ class VoxelActionPlanner:
                     self._water_route_columns.add(water_key)
                     self._water_route_columns.add(path[index + 1])
                 self._water_route_columns.add((current.x, current.y))
-                return self._water_step(start, samples[path[1]], current)
+                return self._water_step(
+                    position, samples[path[1]], current
+                )
 
             for offset_x, offset_y in (
                 (1, 0),
@@ -291,14 +403,25 @@ class VoxelActionPlanner:
 
     @staticmethod
     def _water_step(
-        start: SurfaceSample,
+        position: Vector3,
         first: SurfaceSample,
         goal: SurfaceSample,
     ) -> VoxelActionStep | None:
-        """Encode one adjacent swim/jump step from a cached escape route."""
+        """Encode one adjacent swim step or the final jump onto dry land.
 
-        dx = float(first.x - start.x)
-        dy = float(first.y - start.y)
+        Treating every water cell as a JUMP edge made the gameplay-thread
+        safety gate fail closed on any imperfect probe. Ordinary water travel
+        is steerable WALK locomotion with the swim key held by the worker;
+        only the actual shore transition needs the non-rotatable JUMP edge.
+        """
+
+        # Correct cross-track drift on every worker sample. A cardinal vector
+        # based only on cell indices preserves a tiny shoulder offset forever;
+        # alongside a cliff that offset is enough for the live body-width probe
+        # to reject an otherwise valid escape corridor.
+        first_position = first.player_position
+        dx = float(first_position[0] - position[0])
+        dy = float(first_position[1] - position[1])
         length = math.hypot(dx, dy)
         if length <= 1e-6:
             return None
@@ -306,7 +429,11 @@ class VoxelActionPlanner:
             direction=(dx / length, dy / length, 0.0),
             waypoint=first.player_position,
             goal=goal.player_position,
-            affordance=MovementAffordance.JUMP,
+            affordance=(
+                MovementAffordance.WALK
+                if first.water
+                else MovementAffordance.JUMP
+            ),
             cells=(
                 (first.x, first.y, first.support_z),
                 (goal.x, goal.y, goal.support_z),
@@ -371,6 +498,9 @@ class VoxelActionPlanner:
             for neighbor, affordance, edge_cost in self._local_neighbors(
                 current,
                 abilities=abilities,
+                origin_position=(
+                    start_position if current_key == start_key else None
+                ),
             ):
                 if (
                     abs(neighbor.x - start.x) > radius
@@ -406,8 +536,8 @@ class VoxelActionPlanner:
             return None
         first_key = path[1]
         first = samples[first_key]
-        dx = float(first.x - start.x)
-        dy = float(first.y - start.y)
+        dx = float(first.player_position[0] - start_position[0])
+        dy = float(first.player_position[1] - start_position[1])
         length = math.hypot(dx, dy)
         if length <= 1e-6:
             return None
@@ -439,8 +569,26 @@ class VoxelActionPlanner:
         current: SurfaceSample,
         *,
         abilities: frozenset[MovementAffordance],
+        origin_position: Vector3 | None = None,
     ) -> Iterable[tuple[SurfaceSample, MovementAffordance, float]]:
         """Yield walk, jump, drop, and one-cell-gap actions from a surface."""
+
+        origin = origin_position or current.player_position
+
+        def fits_body(
+            destination: SurfaceSample,
+            affordance: MovementAffordance,
+        ) -> bool:
+            waypoint = destination.player_position
+            return self.terrain.direction_is_traversable(
+                origin,
+                (
+                    waypoint[0] - origin[0],
+                    waypoint[1] - origin[1],
+                    0.0,
+                ),
+                affordance,
+            )
 
         for offset_x, offset_y in (
             (1, 0),
@@ -457,17 +605,19 @@ class VoxelActionPlanner:
             if neighbor is not None:
                 delta_z = neighbor.support_z - current.support_z
                 if abs(delta_z) <= 1:
-                    yield (
-                        neighbor,
-                        MovementAffordance.WALK,
-                        1.0 + abs(delta_z) * 0.25,
-                    )
+                    if fits_body(neighbor, MovementAffordance.WALK):
+                        yield (
+                            neighbor,
+                            MovementAffordance.WALK,
+                            1.0 + abs(delta_z) * 0.25,
+                        )
                     continue
                 if (
                     delta_z < 0
                     and -delta_z <= 2
                     and MovementAffordance.JUMP in abilities
                     and self._jump_arc_clear(current, neighbor)
+                    and fits_body(neighbor, MovementAffordance.JUMP)
                 ):
                     yield (
                         neighbor,
@@ -478,6 +628,7 @@ class VoxelActionPlanner:
                 if (
                     1 < delta_z <= 4
                     and MovementAffordance.DROP in abilities
+                    and fits_body(neighbor, MovementAffordance.DROP)
                 ):
                     yield (
                         neighbor,

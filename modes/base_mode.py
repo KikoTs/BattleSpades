@@ -21,6 +21,9 @@ class BaseMode(ABC):
     # Mode metadata
     name: str = "Base Mode"
     description: str = "Base game mode"
+    # Most Battle Builder modes add an entity-11 gravestone after KillAction.
+    # Classic CTF overrides this with the client-owned ClassicCorpse Character.
+    death_representation: str = "grave"
     
     # Scoring
     score_limit: int = 10
@@ -79,7 +82,13 @@ class BaseMode(ABC):
         self.ended = True
         import time
         vote_manager = getattr(self.server, "vote_manager", None)
-        ensure_vote = getattr(vote_manager, "ensure_map_vote", None)
+        ensure_vote = getattr(
+            vote_manager,
+            "ensure_round_end_map_vote",
+            None,
+        )
+        if not callable(ensure_vote):
+            ensure_vote = getattr(vote_manager, "ensure_map_vote", None)
         if callable(ensure_vote):
             ensure_vote(time.time())
         self.winner = winner
@@ -296,9 +305,8 @@ class BaseMode(ABC):
     # End-of-round sequence  (win message already sent by the caller)
     # =========================================================================
 
-    # How long the client holds the full-screen scores/credits widget before
-    # the server restarts the round. TIME_AFTER_WIN_BEFORE_SCORES (5.0) is the
-    # measured gap between the win and the scores screen (constants_gamemode).
+    # Compatibility default for old config objects used by plugins/tests.
+    # Production reads lobby.end_screen_seconds through ServerConfig.
     SCORES_SCREEN_SECONDS = 12.0
 
     async def _run_end_sequence(self, winner: Optional[int]):
@@ -324,24 +332,90 @@ class BaseMode(ABC):
             play_ending_music(self.server)
 
             # 2) Send final leaderboard data without a terminal UI trigger.
-            # ShowGameStats, MapEnded, and ForceShowScores all destroy the
-            # retail client's GameScene, which makes a same-map restart unsafe.
+            # ShowGameStats opens a native statistics overlay which is safe
+            # only when a full map rollover will follow; this packet alone is
+            # intentionally safe for a same-GameScene restart.
             await asyncio.sleep(TIME_AFTER_WIN_BEFORE_SCORES)
             broadcast_game_stats(self.server, winner)
 
-            # 3) Hold the final scores, then rebuild the same live scene.
-            await asyncio.sleep(self.SCORES_SCREEN_SECONDS)
+            # 3) A score-limit win can occur before the final-minute ballot.
+            # Never consume an unresolved vote: wait for all eligible players
+            # or its bounded 15-second deadline before choosing the scene path.
+            vote_manager = getattr(self.server, "vote_manager", None)
+            wait_for_map = getattr(vote_manager, "wait_for_map_result", None)
+            if callable(wait_for_map):
+                await wait_for_map()
+            consume_map = getattr(vote_manager, "consume_next_map", None)
+            next_map = consume_map() if callable(consume_map) else None
+            current_map = str(
+                getattr(getattr(self.server, "config", None), "default_map", "")
+            )
+            if (
+                next_map
+                and current_map
+                and str(next_map).casefold() == current_map.casefold()
+            ):
+                # ShowGameStats is not reversible enough for a same-GameScene
+                # restart. A forged/synthetic same-map winner therefore stays
+                # on the safe in-place path.
+                next_map = None
+
+            end_screen_seconds = min(
+                120.0,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            getattr(self.server, "config", None),
+                            "end_screen_seconds",
+                            self.SCORES_SCREEN_SECONDS,
+                        )
+                    ),
+                ),
+            )
+
+            # 4) A full map rollover may use the native scores overlay. The
+            # transition service preflights the target first, holds the overlay
+            # for the configured dwell, then emits MapEnded(52). Same-map
+            # restarts deliberately keep the active GameScene and omit packet
+            # 53 because its statistics menu is not an in-place reset signal.
             transition = getattr(self.server, "match_transition", None)
             if transition is None:
+                await asyncio.sleep(end_screen_seconds)
                 await self._restart_round()
-            else:
-                vote_manager = getattr(self.server, "vote_manager", None)
-                consume_map = getattr(vote_manager, "consume_next_map", None)
-                next_map = consume_map() if callable(consume_map) else None
-                if next_map:
-                    result = await transition.change_map(next_map)
+            elif next_map:
+                change_after_scores = getattr(
+                    transition,
+                    "change_map_after_end_screen",
+                    None,
+                )
+                if callable(change_after_scores):
+                    result = await change_after_scores(
+                        next_map,
+                        end_screen_seconds=end_screen_seconds,
+                    )
                 else:
+                    # Compatibility for a legacy transition façade. It cannot
+                    # safely emit packet 53 because it has no preflight hook.
+                    await asyncio.sleep(end_screen_seconds)
+                    result = await transition.change_map(next_map)
+                if not result.ok and not getattr(
+                    result,
+                    "reconnect_required",
+                    False,
+                ):
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "voted map %s failed preflight; restarting current map: %s",
+                        next_map,
+                        result.message,
+                    )
                     result = await transition.restart_round()
+                if not result.ok:
+                    raise RuntimeError(result.message)
+            else:
+                await asyncio.sleep(end_screen_seconds)
+                result = await transition.restart_round()
                 if not result.ok:
                     raise RuntimeError(result.message)
         except Exception:

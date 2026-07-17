@@ -306,12 +306,14 @@ class FakeServer:
     def __init__(self):
         self.players = {}
         self.blasts = []
+        self.blast_kwargs = []
 
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
                      crater_radius=1, force_destroy=True, blast_radius=16.0,
                      **kwargs):
         self.blasts.append((gx, gy, gz, damage, block_damage, kill_type,
                             crater_radius, force_destroy, blast_radius))
+        self.blast_kwargs.append(dict(kwargs))
 
 
 def deploy_ctx(server, players, now):
@@ -338,8 +340,11 @@ def test_dynamite_detonates_after_fuse():
     reg.tick(c)
     assert not e.alive
     assert len(srv.blasts) == 1
+    assert srv.blasts[0][:3] == (100.5, 100.5, 60.0)
     assert srv.blasts[0][3] == 300.0              # damage
     assert srv.blasts[0][6] == 2                  # crater_radius
+    assert srv.blast_kwargs[0]["native_damage_type"] == int(C.DYNAMITE_DAMAGE)
+    assert srv.blast_kwargs[0]["causer_entity_id"] == e.entity_id
     assert c._destroyed == [e.entity_id]
 
 
@@ -358,7 +363,11 @@ def test_c4_waits_for_remote_detonation_and_uses_stock_blast():
 
     assert not ent.alive
     assert reg.get(ent.entity_id) is None
-    assert srv.blasts == [(10.0, 20.0, 30.0, 300.0, 7.0, 36, 2, True, 8.0)]
+    assert srv.blasts == [
+        (10.5, 20.5, 30.0, 300.0, 7.0, 36, 2, True, 8.0)
+    ]
+    assert srv.blast_kwargs[0]["native_damage_type"] == int(C.C4_DAMAGE)
+    assert srv.blast_kwargs[0]["causer_entity_id"] == ent.entity_id
     assert c._destroyed == [ent.entity_id]
 
 

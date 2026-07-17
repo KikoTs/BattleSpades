@@ -35,6 +35,7 @@ from .messages import (
     WorldDelta,
 )
 from .combat_profiles import envelope_for
+from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
 from .policies import ModeBotDecision, _formation_point, objective_decision_for
 from .voxel_navigation import VoxelActionPlanner, VoxelTerrain, WATERBED_SUPPORT_Z
 from server.projectiles import PROJECTILE_SPECS
@@ -64,6 +65,17 @@ _ALERTED_FOV_COS = math.cos(math.radians(180.0 / 2.0))
 _CONTACT_LIFETIME = 5.0
 _MAX_PATH_EXPANSIONS = 2048
 _MAX_PATH_RADIUS = 64
+_STUCK_TRIGGER_SECONDS = 0.6
+_STUCK_RETRY_SECONDS = 0.6
+_ROUTE_ESCAPE_STALL_SECONDS = 1.0
+_REGIONAL_PROGRESS_DISTANCE = 4.0
+_REGIONAL_STALL_SECONDS = 6.0
+# A decision sampled at 10 Hz can legitimately have one 200 ms gap while an
+# 8 Hz schedule catches up. Keep enough lease margin for process/queue jitter
+# without allowing stale suggestions to survive mode, map, life, or topology
+# validation in the director.
+_INTENT_TTL_SECONDS = 0.4
+_TEAM_ORIENTED_SPACING_SECONDS = 1.25
 _DEPLOYABLE_TOOLS = frozenset(
     int(tool)
     for tool in (
@@ -92,6 +104,31 @@ _ZOMBIE_CLASSES = frozenset({
 })
 _SNIPER_TOOLS = frozenset(
     {int(C.SNIPER_TOOL), int(C.SNIPER2_TOOL)}
+)
+_TRAVERSAL_PREFAB_TOKENS = (
+    "bridge",
+    "platform",
+    "corridor",
+    "tube",
+)
+_CLIMB_PREFAB_TOKENS = (
+    "ladder",
+    "steps",
+    "stair",
+    "platform",
+    "tower",
+)
+_COVER_PREFAB_TOKENS = (
+    "barricade",
+    "wall",
+    "barrier",
+    "bunker",
+    "shield",
+    "caltrop",
+    "dome",
+    "tower",
+    "crowsnest",
+    "plug",
 )
 
 
@@ -139,6 +176,7 @@ class _TeamReport:
 
 @dataclass(slots=True)
 class _BrainState:
+    mode_epoch: int = -1
     life_id: int = -1
     contacts: dict[int, LastSeenContact] = field(default_factory=dict)
     target_id: int | None = None
@@ -146,10 +184,12 @@ class _BrainState:
     path: list[Vector3] = field(default_factory=list)
     path_goal: Vector3 | None = None
     path_topology_version: int = -1
+    next_path_request_at: float = 0.0
     patrol_heading: float = 0.0
     next_patrol_turn: float = 0.0
     next_decision_at: float = 0.0
     next_world_action_at: float = 0.0
+    next_traversal_prefab_at: float = 0.0
     last_world_action: dict[int, float] = field(default_factory=dict)
     last_path_direction: Vector3 = (0.0, 0.0, 0.0)
     last_position: Vector3 | None = None
@@ -163,6 +203,8 @@ class _BrainState:
     # valid per-frame displacement without ever leaving a base bottleneck.
     strategic_progress_at: float = 0.0
     strategic_goal_distance: float | None = None
+    regional_progress_anchor: Vector3 | None = None
+    regional_progress_at: float = 0.0
     aim_head: bool = False
     delayed_target_velocity: Vector3 = (0.0, 0.0, 0.0)
     next_oriented_at: float = 0.0
@@ -200,6 +242,7 @@ class _BrainState:
     # identical blocked corridor.
     route_escape_goal: Vector3 | None = None
     route_escape_until: float = 0.0
+    route_escape_started_at: float = 0.0
     route_escape_failures: int = 0
     # Resource pursuit is bounded: malformed/embedded official-map pickups
     # must not capture a bot forever. Position is part of the key so a crate
@@ -540,6 +583,70 @@ class WorkerVoxelWorld:
             return None
         return cells[0], cells[-1]
 
+    def narrow_bridge_shoulder_line(
+        self,
+        position: Vector3,
+        direction: Vector3,
+        *,
+        max_cells: int = 6,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+        """Return the missing lane beside a supported one-cell bridge.
+
+        A native body can stand on a single voxel lane only while perfectly
+        centered. Real movement reaches it with sub-cell drift, so the live
+        body-width probe correctly refuses to continue. Extend the shoulder on
+        the side the body currently overhangs; every proposed cell remains
+        face-supported by the existing center lane.
+        """
+
+        dx, dy, _ = direction
+        if math.hypot(dx, dy) <= 1e-6:
+            return None
+        step_x, step_y = (
+            (1 if dx > 0.0 else -1, 0)
+            if abs(dx) >= abs(dy)
+            else (0, 1 if dy > 0.0 else -1)
+        )
+        side_x, side_y = -step_y, step_x
+        start_x = int(math.floor(position[0]))
+        start_y = int(math.floor(position[1]))
+        support_z = int(round(position[2] + 2.25))
+        if not self.solid(start_x, start_y, support_z):
+            return None
+        cross_track = (
+            (float(position[0]) - (float(start_x) + 0.5)) * side_x
+            + (float(position[1]) - (float(start_y) + 0.5)) * side_y
+        )
+        preferred_side = 1 if cross_track >= 0.0 else -1
+        limit = max(1, min(8, int(max_cells)))
+        for side_sign in (preferred_side, -preferred_side):
+            cells: list[tuple[int, int, int]] = []
+            for distance in range(0, limit + 1):
+                center_x = start_x + step_x * distance
+                center_y = start_y + step_y * distance
+                if not self.solid(center_x, center_y, support_z):
+                    break
+                x = center_x + side_x * side_sign
+                y = center_y + side_y * side_sign
+                if not (0 <= x < 512 and 0 <= y < 512):
+                    break
+                if self.solid(x, y, support_z):
+                    if cells:
+                        break
+                    continue
+                if self.solid(x, y, support_z - 1) or self.solid(
+                    x, y, support_z - 2
+                ):
+                    if cells:
+                        break
+                    continue
+                cells.append((x, y, support_z))
+                if len(cells) >= limit:
+                    break
+            if cells:
+                return cells[0], cells[-1]
+        return None
+
     def overhead_block(self, position: Vector3) -> tuple[int, int, int] | None:
         """Return the closest solid cell trapping the bot above its head."""
 
@@ -803,10 +910,14 @@ class WorkerVoxelWorld:
             start, goal, agent_id=agent_id, velocity=velocity
         )
         if math.hypot(native_direction[0], native_direction[1]) > 1e-6:
-            self._last_affordance[agent_id] = self._immediate_affordance(
+            native_affordance = self._immediate_affordance(
                 start, native_direction, abilities
             )
-            return native_direction
+            if self._direction_is_traversable(
+                start, native_direction, native_affordance
+            ):
+                self._last_affordance[agent_id] = native_affordance
+                return native_direction
         path, affordance = self._a_star(start, goal, abilities=abilities)
         if not path:
             self._last_affordance[agent_id] = MovementAffordance.WALK
@@ -886,6 +997,20 @@ class WorkerVoxelWorld:
             return MovementAffordance.WALK
         return MovementAffordance.WALK
 
+    def _direction_is_traversable(
+        self,
+        start: Vector3,
+        direction: Vector3,
+        affordance: MovementAffordance,
+    ) -> bool:
+        """Mirror the gameplay motor's body-width live movement probe."""
+
+        return self._terrain.direction_is_traversable(
+            start,
+            direction,
+            affordance,
+        )
+
     @property
     def native_tile_count(self) -> int:
         """Return built Recast tiles for diagnostics and smoke fixtures."""
@@ -927,16 +1052,16 @@ class WorkerVoxelWorld:
                     )
                     if math.hypot(crowd_direction[0], crowd_direction[1]) > 1e-6:
                         return crowd_direction
-            path = self._native_nav.find_path(native_start, native_end)
         except (RuntimeError, TypeError, ValueError):
             logger.exception("Native Recast path query failed")
             return 0.0, 0.0, 0.0
-        if len(path) < 3:
-            return 0.0, 0.0, 0.0
-        waypoint_offset = 3 if len(path) >= 6 else 0
-        waypoint_x = float(path[waypoint_offset])
-        waypoint_y = float(path[waypoint_offset + 2])
-        return _normalized_xy(waypoint_x - start[0], waypoint_y - start[1])
+        # Do not call Detour's synchronous find_path as a live fallback here.
+        # A malformed/cyclic multi-tile corridor observed on MayanJungle kept
+        # that native query inside dtNavMeshQuery indefinitely, pinning the
+        # single AI worker and expiring every bot intent.  A zero crowd result
+        # deliberately falls through to the bounded voxel A* in
+        # next_path_direction instead.
+        return 0.0, 0.0, 0.0
 
     @staticmethod
     def _tile_corridor(start: Vector3, goal: Vector3) -> tuple[tuple[int, int], ...]:
@@ -1198,6 +1323,7 @@ class BotBrain:
         self.world = world
         self._rng = random.Random(int(seed))
         self._states: dict[tuple[int, int], _BrainState] = {}
+        self._map_epoch = -1
         # Shared fortify sites keyed (map_epoch, team) -> (site, computed_at).
         self._fortify_sites: dict[tuple[int, int], tuple[Vector3, float]] = {}
         self._decision_interval = (
@@ -1209,6 +1335,42 @@ class BotBrain:
         self._composer = _DecisionComposer()
         self._team_reports: list[_TeamReport] = []
         self._last_team_report: dict[tuple[int, int], float] = {}
+        self._team_oriented_ready_at: dict[int, float] = {}
+
+    def reset_for_map(self, map_epoch: int) -> None:
+        """Discard every map-scoped cache when the loaded world changes."""
+
+        normalized = int(map_epoch)
+        if normalized == self._map_epoch:
+            return
+        self._map_epoch = normalized
+        self._states.clear()
+        self._fortify_sites.clear()
+        self._team_reports.clear()
+        self._last_team_report.clear()
+        self._team_oriented_ready_at.clear()
+        self._path_tokens = self._path_rate
+        self._path_refill_at = time.monotonic()
+
+    def _prune_retired_states(self, frame: PerceptionFrame) -> None:
+        """Retire bot generations absent from the current frozen roster."""
+
+        active = {
+            (int(player.player_id), int(player.generation))
+            for player in frame.players
+        }
+        retired = [key for key in self._states if key not in active]
+        reset_navigation = getattr(self.world, "reset_agent_navigation", None)
+        for key in retired:
+            self._states.pop(key, None)
+            if callable(reset_navigation):
+                reset_navigation(key[0])
+        active_ids = {int(player.player_id) for player in frame.players}
+        self._last_team_report = {
+            key: reported_at
+            for key, reported_at in self._last_team_report.items()
+            if key[0] in active_ids and key[1] in active_ids
+        }
 
     def decide(self, frame: PerceptionFrame) -> BotIntent | None:
         """Produce one expiring intention for a valid observer frame."""
@@ -1224,9 +1386,35 @@ class BotBrain:
         )
         if observer is None or not observer.alive or not observer.spawned:
             return None
+        if self._map_epoch != int(frame.map_epoch):
+            self.reset_for_map(frame.map_epoch)
+        self._prune_retired_states(frame)
         key = observer.player_id, observer.generation
-        state = self._states.setdefault(key, _BrainState())
-        now = max(time.monotonic(), float(frame.created_at))
+        # State and cooldowns live on the authoritative perception timeline.
+        # Worker completion time may drift under pathfinding load; feeding that
+        # latency back into progress clocks delays stuck recovery and makes
+        # behavior depend on CPU speed. _intent stamps its separate live lease.
+        now = float(frame.created_at)
+        state = self._states.get(key)
+        state_scope_changed = state is not None and (
+            int(state.mode_epoch) != int(frame.mode_epoch)
+            or (
+                int(state.life_id) >= 0
+                and int(state.life_id) != int(observer.life_id)
+            )
+        )
+        if state is None or state_scope_changed:
+            if state_scope_changed:
+                reset_navigation = getattr(
+                    self.world, "reset_agent_navigation", None
+                )
+                if callable(reset_navigation):
+                    reset_navigation(observer.player_id)
+            state = _BrainState(
+                mode_epoch=int(frame.mode_epoch),
+                life_id=int(observer.life_id),
+            )
+            self._states[key] = state
         profile = frame.profile or _fallback_profile(observer.player_id)
         self._consume_action_feedback(observer, state, now)
         teleported = self._record_progress(
@@ -1289,9 +1477,26 @@ class BotBrain:
             )
             self._queue_team_report(observer, target, now)
 
-        if now < state.next_decision_at:
+        # Cadence belongs to the authoritative perception timeline, not to the
+        # time at which this process finishes pathfinding. Variable query cost
+        # otherwise pushes a deadline just beyond the next frame and can halve
+        # an equal-rate decision stream (for example 5 Hz becoming 2.5 Hz).
+        decision_time = float(frame.created_at)
+        if decision_time + 1e-9 < state.next_decision_at:
             return None
-        state.next_decision_at = now + self._decision_interval
+        if self._decision_interval > 0.0:
+            scheduled_at = state.next_decision_at
+            if (
+                scheduled_at <= 0.0
+                or decision_time - scheduled_at > self._decision_interval * 4.0
+            ):
+                # Do not burst through a long worker pause or map-load stall.
+                state.next_decision_at = decision_time + self._decision_interval
+            else:
+                # Advance the schedule from its prior phase. Using ``now`` here
+                # turns 8 Hz over 10 Hz perception into 5 Hz (every other
+                # frame), which periodically expires otherwise valid movement.
+                state.next_decision_at = scheduled_at + self._decision_interval
 
         # Own-explosive avoidance outranks everything, including a visible
         # enemy: running from your own lit dynamite is the human move.
@@ -1389,7 +1594,7 @@ class BotBrain:
             if int(observer.class_id) in _ZOMBIE_CLASSES:
                 # Visible survivors remain the urgent target, but a stalled
                 # claw charge still needs topology recovery. Progress tracking
-                # keeps this inert during a successful chase; after 0.75s it
+                # keeps this inert during a successful chase; after 0.6s it
                 # may breach/build rather than returning a zero vector forever.
                 recovery = self._stuck_recovery(
                     frame, observer, state, now
@@ -1402,9 +1607,14 @@ class BotBrain:
         if maintenance is not None:
             return maintenance
 
-        recovery = self._stuck_recovery(frame, observer, state, now)
-        if recovery is not None:
-            return recovery
+        recovery_active = (
+            state.escape_build_cell is not None
+            or state.route_escape_goal is not None
+        )
+        if branch in {"objective", "investigate", "sound"} or recovery_active:
+            recovery = self._stuck_recovery(frame, observer, state, now)
+            if recovery is not None:
+                return recovery
 
         medic = self._medic_support_intent(frame, observer, state, now)
         if medic is not None:
@@ -1449,7 +1659,10 @@ class BotBrain:
                     sprint=objective_sprint,
                     affordance=state.last_affordance,
                 ),
-                look=LookIntent(objective, visible=False),
+                look=LookIntent(
+                    self._navigation_look(observer, movement, objective),
+                    visible=False,
+                ),
                 debug_role=objective_role,
             )
 
@@ -1491,7 +1704,12 @@ class BotBrain:
                     sprint=True,
                     affordance=state.last_affordance,
                 ),
-                look=LookIntent(contact.position, visible=False),
+                look=LookIntent(
+                    self._navigation_look(
+                        observer, movement, contact.position
+                    ),
+                    visible=False,
+                ),
             )
 
         if branch == "sound" and audible is not None:
@@ -1512,7 +1730,12 @@ class BotBrain:
                     sprint=False,
                     affordance=state.last_affordance,
                 ),
-                look=LookIntent(audible.position, visible=False),
+                look=LookIntent(
+                    self._navigation_look(
+                        observer, movement, audible.position
+                    ),
+                    visible=False,
+                ),
             )
 
         if fortify_site is not None and mode_objective is None:
@@ -1660,6 +1883,7 @@ class BotBrain:
             state.path.clear()
             state.path_goal = None
             state.path_topology_version = -1
+            state.next_path_request_at = 0.0
             state.last_path_direction = (0.0, 0.0, 0.0)
             state.last_affordance = MovementAffordance.WALK
             state.last_progress_at = now
@@ -1667,10 +1891,13 @@ class BotBrain:
             state.stuck_attempts = 0
             state.strategic_progress_at = now
             state.strategic_goal_distance = None
+            state.regional_progress_anchor = None
+            state.regional_progress_at = now
             state.escape_build_cell = None
             state.escape_build_until = 0.0
             state.route_escape_goal = None
             state.route_escape_until = 0.0
+            state.route_escape_started_at = 0.0
             state.route_escape_failures = 0
             state.resource_target = None
             state.resource_target_since = 0.0
@@ -1712,6 +1939,16 @@ class BotBrain:
             elif strategic_distance <= state.strategic_goal_distance - 3.0:
                 state.strategic_goal_distance = strategic_distance
                 state.strategic_progress_at = now
+            regional_anchor = state.regional_progress_anchor
+            if regional_anchor is None:
+                state.regional_progress_anchor = position
+                state.regional_progress_at = now
+            elif math.hypot(
+                float(position[0]) - float(regional_anchor[0]),
+                float(position[1]) - float(regional_anchor[1]),
+            ) >= _REGIONAL_PROGRESS_DISTANCE:
+                state.regional_progress_anchor = position
+                state.regional_progress_at = now
 
         if (
             forward_progress >= 0.2
@@ -1724,7 +1961,13 @@ class BotBrain:
                 and state.strategic_progress_at > 0.0
                 and now - state.strategic_progress_at >= 6.0
             )
-            if not strategic_stalled:
+            regional_stalled = (
+                state.path_goal is not None
+                and state.regional_progress_at > 0.0
+                and now - state.regional_progress_at
+                >= _REGIONAL_STALL_SECONDS
+            )
+            if not strategic_stalled and not regional_stalled:
                 state.next_stuck_recovery_at = 0.0
                 state.stuck_attempts = 0
                 if state.route_escape_goal is None:
@@ -1756,6 +1999,9 @@ class BotBrain:
         retry_at = now + 2.5
         state.next_cover_build_at = max(state.next_cover_build_at, retry_at)
         state.next_world_action_at = max(state.next_world_action_at, retry_at)
+        state.next_traversal_prefab_at = max(
+            state.next_traversal_prefab_at, retry_at
+        )
         state.next_fortify_build_at = max(
             state.next_fortify_build_at, retry_at
         )
@@ -1764,8 +2010,12 @@ class BotBrain:
         state.path.clear()
         state.path_goal = None
         state.path_topology_version = -1
+        state.next_path_request_at = 0.0
         state.escape_build_cell = None
         state.escape_build_until = 0.0
+        state.route_escape_goal = None
+        state.route_escape_until = 0.0
+        state.route_escape_started_at = 0.0
         state.stuck_attempts = min(8, state.stuck_attempts + 1)
 
     def _water_recovery(
@@ -1820,6 +2070,80 @@ class BotBrain:
             if preferred in selected:
                 return preferred
         return min(selected) if selected else None
+
+    @staticmethod
+    def _select_prefab(
+        prefabs: Iterable[str],
+        *,
+        purpose: str,
+        selector: int = 0,
+        block_budget: int | None = None,
+    ) -> str | None:
+        """Choose a prefab whose authored name matches the tactical need."""
+
+        tokens = {
+            "traversal": _TRAVERSAL_PREFAB_TOKENS,
+            "climb": _CLIMB_PREFAB_TOKENS,
+            "cover": _COVER_PREFAB_TOKENS,
+        }.get(str(purpose), _COVER_PREFAB_TOKENS)
+        ranked: list[tuple[int, int, str, str]] = []
+        for value in prefabs:
+            name = str(value)
+            normalized = name.lower()
+            if not bot_prefab_is_suitable(normalized, purpose):
+                continue
+            block_count = bot_prefab_block_count(normalized)
+            if block_budget is not None and (
+                block_count is None or block_count > int(block_budget)
+            ):
+                continue
+            rank = next(
+                (index for index, token in enumerate(tokens) if token in normalized),
+                None,
+            )
+            if rank is not None:
+                ranked.append((rank, len(normalized), normalized, name))
+        if not ranked:
+            return None
+        ranked.sort()
+        # Rotate among equally useful authored options without ever selecting
+        # decorative props for a bridge or cover request.
+        best_rank = ranked[0][0]
+        candidates = [row[3] for row in ranked if row[0] == best_rank]
+        return candidates[int(selector) % len(candidates)]
+
+    @staticmethod
+    def _navigation_look(
+        observer: PlayerSnapshot,
+        direction: Vector3,
+        goal: Vector3,
+    ) -> Vector3:
+        """Look along the immediate route instead of through distant terrain."""
+
+        normalized = _normalized_xy(direction[0], direction[1])
+        if math.hypot(normalized[0], normalized[1]) <= 0.1:
+            normalized = _normalized_xy(
+                goal[0] - observer.position[0],
+                goal[1] - observer.position[1],
+            )
+        if math.hypot(normalized[0], normalized[1]) <= 0.1:
+            normalized = _normalized_xy(
+                observer.orientation[0], observer.orientation[1]
+            )
+        planar_goal = math.hypot(
+            goal[0] - observer.position[0],
+            goal[1] - observer.position[1],
+        )
+        distance = min(10.0, max(4.0, planar_goal))
+        # Strategic anchors can sit on another vertical layer. A travel gaze
+        # only needs the next few blocks; cap pitch so a blocked route does
+        # not present as a bot staring into the sky or straight at the floor.
+        vertical = max(-2.0, min(2.0, goal[2] - observer.eye[2]))
+        return (
+            observer.eye[0] + normalized[0] * distance,
+            observer.eye[1] + normalized[1] * distance,
+            observer.eye[2] + vertical,
+        )
 
     def _tactical_goal(
         self,
@@ -2396,6 +2720,103 @@ class BotBrain:
                 return False
         return True
 
+    @staticmethod
+    def _friendly_launch_lane_clear(
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        target: Vector3,
+    ) -> bool:
+        """Reject an oriented explosive when a teammate crosses its lane."""
+
+        start = observer.eye
+        delta = tuple(target[index] - start[index] for index in range(3))
+        length_squared = sum(value * value for value in delta)
+        if length_squared <= 1e-6:
+            return False
+        for player in frame.players:
+            if (
+                player.player_id == observer.player_id
+                or player.team != observer.team
+                or not player.alive
+                or not player.spawned
+            ):
+                continue
+            relative = tuple(
+                player.eye[index] - start[index] for index in range(3)
+            )
+            fraction = sum(
+                relative[index] * delta[index] for index in range(3)
+            ) / length_squared
+            if not 0.03 < fraction < 0.97:
+                continue
+            closest = tuple(
+                start[index] + delta[index] * fraction for index in range(3)
+            )
+            if _distance_squared(player.eye, closest) <= 2.25 ** 2:
+                return False
+        return True
+
+    def _oriented_attack_utility(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        target: PlayerSnapshot,
+        tool_id: int,
+    ) -> float:
+        """Score a selected explosive for this visible engagement."""
+
+        spec = PROJECTILE_SPECS.get(int(tool_id))
+        if spec is None:
+            return 0.0
+        distance = math.hypot(
+            target.position[0] - observer.position[0],
+            target.position[1] - observer.position[1],
+        )
+        radius = max(0.0, float(getattr(spec, "blast_radius", 0.0)))
+        minimum = max(
+            radius + 4.0,
+            15.0 if spec.behavior in {"bounce", "stick", "deploy"} else 10.0,
+        )
+        maximum = {
+            "bounce": 50.0,
+            "stick": 55.0,
+            "deploy": 45.0,
+            "contact": 90.0,
+        }.get(str(spec.behavior), 60.0)
+        if not minimum <= distance <= maximum:
+            return 0.0
+        if not self._explosive_target_safe(
+            frame,
+            observer,
+            target.position,
+            int(tool_id),
+            ignore_observer=False,
+        ):
+            return 0.0
+        if not self._friendly_launch_lane_clear(
+            frame, observer, target.position
+        ):
+            return 0.0
+        cluster = sum(
+            1
+            for player in frame.players
+            if player.team != observer.team
+            and player.alive
+            and player.spawned
+            and _distance_squared(player.position, target.position)
+            <= (radius + 2.0) ** 2
+        )
+        # Do not spend scarce equipment finishing a nearly-dead isolated
+        # opponent; ordinary gunfire is safer and faster in that case.
+        if cluster <= 1 and int(target.health) <= 25:
+            return 0.0
+        damage = min(250.0, max(0.0, float(getattr(spec, "damage", 0.0))))
+        utility = 0.5 + damage / 250.0 + radius / 12.0 + max(0, cluster - 1)
+        target_speed = math.sqrt(sum(value * value for value in target.velocity))
+        if spec.behavior == "bounce" and target_speed > 4.0:
+            utility *= 0.65
+        return utility
+
     def _medic_support_intent(
         self,
         frame: PerceptionFrame,
@@ -2467,7 +2888,12 @@ class BotBrain:
                 sprint=True,
                 affordance=state.last_affordance,
             ),
-            look=LookIntent(patient.position, visible=False),
+            look=LookIntent(
+                self._navigation_look(
+                    observer, movement, patient.position
+                ),
+                visible=False,
+            ),
             debug_role="medic_support",
         )
 
@@ -2685,6 +3111,65 @@ class BotBrain:
             debug_role="zombie_hunt_breach",
         )
 
+    def _traversal_prefab_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+        direction: Vector3,
+        prefab_name: str | None,
+        *,
+        role: str,
+    ) -> BotIntent | None:
+        """Place one semantically matched bridge/climb prefab when stalled."""
+
+        prefab_cost = (
+            bot_prefab_block_count(prefab_name)
+            if prefab_name is not None
+            else None
+        )
+        if (
+            prefab_name is None
+            or prefab_cost is None
+            or prefab_cost > int(observer.blocks)
+            or now < state.next_traversal_prefab_at
+        ):
+            return None
+        normalized = _normalized_xy(direction[0], direction[1])
+        if math.hypot(normalized[0], normalized[1]) <= 0.1:
+            return None
+        distance = 4.0 if "bridge" in str(role) else 2.5
+        target = (
+            observer.position[0] + normalized[0] * distance,
+            observer.position[1] + normalized[1] * distance,
+            observer.position[2],
+        )
+        state.next_traversal_prefab_at = now + 4.0
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True,
+                affordance=(
+                    MovementAffordance.BUILD_BRIDGE
+                    if "bridge" in str(role)
+                    else MovementAffordance.BUILD_STEP
+                ),
+            ),
+            look=LookIntent(target, visible=False),
+            tool_id=int(C.PREFAB_TOOL),
+            action=BotAction(
+                BotActionKind.PLACE_PREFAB,
+                tool_id=int(C.PREFAB_TOOL),
+                position=target,
+                argument=str(prefab_name),
+                yaw=math.atan2(normalized[1], normalized[0]),
+            ),
+            priority=BotIntentPriority.TRAVERSAL,
+            debug_role=str(role),
+        )
+
     def _stuck_recovery(
         self,
         frame: PerceptionFrame,
@@ -2702,6 +3187,27 @@ class BotBrain:
 
         block_tool = int(C.BLOCK_TOOL)
         has_blocks = block_tool in observer.loadout and observer.blocks > 0
+        can_prefab = int(C.PREFAB_TOOL) in observer.loadout and observer.blocks > 0
+        bridge_prefab = (
+            self._select_prefab(
+                observer.prefabs,
+                purpose="traversal",
+                selector=observer.player_id + frame.frame_id,
+                block_budget=observer.blocks,
+            )
+            if can_prefab
+            else None
+        )
+        climb_prefab = (
+            self._select_prefab(
+                observer.prefabs,
+                purpose="climb",
+                selector=observer.player_id + frame.frame_id,
+                block_budget=observer.blocks,
+            )
+            if can_prefab
+            else None
+        )
         pending_build = state.escape_build_cell
         solid_reader = getattr(self.world, "solid", None)
         if pending_build is not None:
@@ -2760,12 +3266,18 @@ class BotBrain:
         stalled = (
             (
                 state.last_progress_at > 0.0
-                and now - state.last_progress_at >= 0.75
+                and now - state.last_progress_at >= _STUCK_TRIGGER_SECONDS
             )
             or (
                 state.path_goal is not None
                 and state.strategic_progress_at > 0.0
                 and now - state.strategic_progress_at >= 6.0
+            )
+            or (
+                state.path_goal is not None
+                and state.regional_progress_at > 0.0
+                and now - state.regional_progress_at
+                >= _REGIONAL_STALL_SECONDS
             )
         ) and now >= state.next_stuck_recovery_at
         if not stalled:
@@ -2794,14 +3306,17 @@ class BotBrain:
             math.hypot(raw_direction[0], raw_direction[1]) <= 0.1
             and overhead is None
             and hole is None
+            and state.path_goal is None
         ):
-            # A marksman intentionally holding a position is not "stuck".
+            # No route has requested progress yet. This occurs on the first
+            # objective frame after a legitimate hold; wait for that branch to
+            # establish its path goal before choosing an escape direction.
             return None
 
         # Pace attempts without claiming that an attempted jump/dig/build was
         # actual locomotion. Real progress is written only by
         # ``_record_progress`` from the next authoritative player snapshot.
-        state.next_stuck_recovery_at = now + 0.75
+        state.next_stuck_recovery_at = now + _STUCK_RETRY_SECONDS
         state.stuck_attempts += 1
         preferred = self._preferred_melee_tool(observer)
         if (
@@ -2867,6 +3382,18 @@ class BotBrain:
                     priority=BotIntentPriority.TRAVERSAL,
                     debug_role="hole_jump_build_launch",
                 )
+            if rise > 2 and state.stuck_attempts <= 3:
+                prefab_intent = self._traversal_prefab_intent(
+                    frame,
+                    observer,
+                    state,
+                    now,
+                    direction,
+                    climb_prefab,
+                    role="hole_prefab_climb",
+                )
+                if prefab_intent is not None:
+                    return prefab_intent
 
         blocking_reader = getattr(self.world, "blocking_cell", None)
         blocking = (
@@ -2894,16 +3421,34 @@ class BotBrain:
             )
 
         line_reader = getattr(self.world, "water_bridge_line", None)
-        line = (
+        center_line = (
             line_reader(
+                observer.position,
+                direction,
+                max_cells=(
+                    min(6, max(1, int(observer.blocks)))
+                    if has_blocks
+                    else 6
+                ),
+            )
+            if (has_blocks or bridge_prefab is not None)
+            and callable(line_reader)
+            else None
+        )
+        line = center_line
+        line_role = "water_gap_block_line"
+        shoulder_reader = getattr(
+            self.world, "narrow_bridge_shoulder_line", None
+        )
+        if line is None and has_blocks and callable(shoulder_reader):
+            line = shoulder_reader(
                 observer.position,
                 direction,
                 max_cells=min(6, max(1, int(observer.blocks))),
             )
-            if has_blocks and callable(line_reader)
-            else None
-        )
-        if line is not None and state.stuck_attempts <= 3:
+            if line is not None:
+                line_role = "water_gap_widen_block_line"
+        if line is not None and has_blocks and state.stuck_attempts <= 3:
             start, end = line
             cost = max(
                 abs(int(end[index]) - int(start[index])) for index in range(3)
@@ -2925,8 +3470,20 @@ class BotBrain:
                         end_position=tuple(float(value) for value in end),
                     ),
                     priority=BotIntentPriority.TRAVERSAL,
-                    debug_role="water_gap_block_line",
+                    debug_role=line_role,
                 )
+        if center_line is not None and state.stuck_attempts <= 3:
+            prefab_intent = self._traversal_prefab_intent(
+                frame,
+                observer,
+                state,
+                now,
+                direction,
+                bridge_prefab,
+                role="water_gap_prefab_bridge",
+            )
+            if prefab_intent is not None:
+                return prefab_intent
 
         bridge_reader = getattr(self.world, "bridge_cell", None)
         bridge = (
@@ -2956,8 +3513,23 @@ class BotBrain:
                 priority=BotIntentPriority.TRAVERSAL,
                 debug_role="single_gap_bridge",
             )
+        if bridge is not None and state.stuck_attempts <= 3:
+            prefab_intent = self._traversal_prefab_intent(
+                frame,
+                observer,
+                state,
+                now,
+                direction,
+                bridge_prefab,
+                role="single_gap_prefab_bridge",
+            )
+            if prefab_intent is not None:
+                return prefab_intent
         zombie_prefabs = tuple(
-            name for name in observer.prefabs if "zombie" in name.lower()
+            name
+            for name in observer.prefabs
+            if "zombie" in name.lower()
+            and (bot_prefab_block_count(name) or math.inf) <= observer.blocks
         )
         if (
             int(observer.class_id) in _ZOMBIE_CLASSES
@@ -3030,9 +3602,30 @@ class BotBrain:
         goal = state.route_escape_goal
         if goal is None:
             return None
+        reached = math.hypot(
+            float(goal[0]) - float(observer.position[0]),
+            float(goal[1]) - float(observer.position[1]),
+        ) <= 1.0
+        progress_at = max(
+            float(state.route_escape_started_at),
+            float(state.last_progress_at),
+        )
+        escape_stalled = (
+            state.route_escape_started_at > 0.0
+            and now - progress_at >= _ROUTE_ESCAPE_STALL_SECONDS
+        )
+        if reached or escape_stalled:
+            state.route_escape_goal = None
+            state.route_escape_until = 0.0
+            state.route_escape_started_at = 0.0
+            if escape_stalled:
+                state.stuck_attempts = max(3, state.stuck_attempts)
+                state.next_stuck_recovery_at = 0.0
+            return None
         if now >= state.route_escape_until:
             state.route_escape_goal = None
             state.route_escape_until = 0.0
+            state.route_escape_started_at = 0.0
             return None
         planner = getattr(self.world, "action_planner", None)
         step = (
@@ -3050,6 +3643,20 @@ class BotBrain:
         if step is None:
             state.route_escape_goal = None
             state.route_escape_until = 0.0
+            state.route_escape_started_at = 0.0
+            state.stuck_attempts = max(3, state.stuck_attempts)
+            state.next_stuck_recovery_at = 0.0
+            return None
+        if not self._escape_step_has_braking_room(
+            planner,
+            observer.position,
+            step,
+        ):
+            state.route_escape_goal = None
+            state.route_escape_until = 0.0
+            state.route_escape_started_at = 0.0
+            state.stuck_attempts = max(3, state.stuck_attempts)
+            state.next_stuck_recovery_at = 0.0
             return None
         state.last_path_direction = step.direction
         state.last_affordance = step.affordance
@@ -3086,10 +3693,12 @@ class BotBrain:
         state.path_topology_version = -1
         state.strategic_progress_at = now
         state.strategic_goal_distance = None
+        state.regional_progress_anchor = observer.position
+        state.regional_progress_at = now
         state.escape_build_cell = None
         state.escape_build_until = 0.0
-        state.stuck_attempts = 0
         state.route_escape_failures += 1
+        state.route_escape_started_at = 0.0
 
         planner = getattr(self.world, "action_planner", None)
         direct_step = (
@@ -3106,6 +3715,12 @@ class BotBrain:
             and planner is not None
             else None
         )
+        if direct_step is not None and not self._escape_step_has_braking_room(
+            planner,
+            observer.position,
+            direct_step,
+        ):
+            direct_step = None
         if direct_step is not None:
             # DetourCrowd can return a non-zero velocity into a dead-end face
             # when the real voxel exit begins with a short staircase/turn.
@@ -3113,6 +3728,8 @@ class BotBrain:
             # strategic goal, recomputing its immediate edge each frame.
             state.route_escape_goal = failed_goal
             state.route_escape_until = now + 3.0
+            state.route_escape_started_at = now
+            state.stuck_attempts = 0
             state.last_path_direction = direct_step.direction
             state.last_affordance = direct_step.affordance
             return self._intent(
@@ -3138,6 +3755,7 @@ class BotBrain:
         )
         if drop is not None:
             direction, landing = drop
+            state.stuck_attempts = 0
             state.last_path_direction = direction
             state.last_affordance = MovementAffordance.DROP
             state.next_patrol_turn = 0.0
@@ -3176,6 +3794,13 @@ class BotBrain:
             (-forward[0], -forward[1], 0.0),
         )
         distance = 6.0 + min(3, state.route_escape_failures) * 2.0
+        terrain = getattr(planner, "terrain", None)
+        immediate_probe = getattr(
+            terrain, "direction_is_traversable", None
+        )
+        corridor_probe = getattr(
+            terrain, "dry_corridor_is_traversable", None
+        )
         for candidate in candidates:
             goal = (
                 observer.position[0] + candidate[0] * distance,
@@ -3186,6 +3811,54 @@ class BotBrain:
             # but never uses the outer map boundary as an escape corridor.
             if not (8.0 <= goal[0] < 504.0 and 8.0 <= goal[1] < 504.0):
                 continue
+            # Local A* is goal-biased and can begin every distant side-route
+            # with the same bad shoreline edge. Before invoking it, accept a
+            # short direct retreat only when both the immediate body probe and
+            # a braking-width dry corridor prove that direction traversable.
+            direct_retreat = (
+                callable(immediate_probe)
+                and callable(corridor_probe)
+                and bool(
+                    immediate_probe(
+                        observer.position,
+                        candidate,
+                        MovementAffordance.WALK,
+                    )
+                )
+                and bool(
+                    corridor_probe(
+                        observer.position,
+                        candidate,
+                        distance=1.5,
+                    )
+                )
+            )
+            if direct_retreat:
+                retreat_distance = min(3.0, distance)
+                retreat_goal = (
+                    observer.position[0] + candidate[0] * retreat_distance,
+                    observer.position[1] + candidate[1] * retreat_distance,
+                    observer.position[2],
+                )
+                state.route_escape_goal = retreat_goal
+                state.route_escape_until = now + 2.0
+                state.route_escape_started_at = now
+                state.stuck_attempts = 0
+                state.last_path_direction = candidate
+                state.last_affordance = MovementAffordance.WALK
+                state.next_patrol_turn = 0.0
+                return self._intent(
+                    frame,
+                    now,
+                    movement=MovementIntent(
+                        direction=candidate,
+                        sprint=False,
+                        affordance=MovementAffordance.WALK,
+                    ),
+                    look=LookIntent(retreat_goal, visible=False),
+                    priority=BotIntentPriority.TRAVERSAL,
+                    debug_role="stuck_route_retreat",
+                )
             step = (
                 planner.plan_local(
                     observer.position,
@@ -3200,8 +3873,16 @@ class BotBrain:
             )
             if step is None:
                 continue
+            if not self._escape_step_has_braking_room(
+                planner,
+                observer.position,
+                step,
+            ):
+                continue
             state.route_escape_goal = goal
             state.route_escape_until = now + 2.0
+            state.route_escape_started_at = now
+            state.stuck_attempts = 0
             state.last_path_direction = step.direction
             state.last_affordance = step.affordance
             state.next_patrol_turn = 0.0
@@ -3221,7 +3902,35 @@ class BotBrain:
 
         state.last_path_direction = (0.0, 0.0, 0.0)
         state.next_patrol_turn = 0.0
+        # No alternate route exists. Keep the real progress clock stalled, but
+        # recycle the bounded physical sequence so a durable wall can receive
+        # more than three spade hits and a newly widened bridge can be retried.
+        state.stuck_attempts = 0
         return None
+
+    @staticmethod
+    def _escape_step_has_braking_room(
+        planner,
+        position: Vector3,
+        step,
+    ) -> bool:
+        """Keep a worker escape compatible with the live motor's dry brake."""
+        if step.affordance not in {
+            MovementAffordance.WALK,
+            MovementAffordance.CROUCH,
+        }:
+            return True
+        terrain = getattr(planner, "terrain", None)
+        corridor = getattr(terrain, "dry_corridor_is_traversable", None)
+        if not callable(corridor):
+            return True
+        return bool(
+            corridor(
+                position,
+                step.direction,
+                distance=1.5,
+            )
+        )
 
     def _local_objective_route(
         self,
@@ -3310,10 +4019,16 @@ class BotBrain:
             if tool in _DEPLOYABLE_TOOLS
             and tool not in _GENERIC_DEPLOYABLE_EXCLUSIONS
         ]
+        prefab_name = self._select_prefab(
+            observer.prefabs,
+            purpose="cover",
+            selector=observer.player_id + frame.frame_id,
+            block_budget=observer.blocks,
+        )
         can_prefab = (
-            int(C.PREFAB_TOOL) in observer.loadout
-            and bool(observer.prefabs)
-            and observer.blocks >= 16
+            defensive_role
+            and int(C.PREFAB_TOOL) in observer.loadout
+            and prefab_name is not None
         )
         if not deployables and not can_prefab:
             return None
@@ -3369,9 +4084,6 @@ class BotBrain:
             return None
         state.last_world_action[tool] = now
         if choose_prefab:
-            name = observer.prefabs[
-                (observer.player_id + frame.frame_id) % len(observer.prefabs)
-            ]
             return self._intent(
                 frame,
                 now,
@@ -3384,7 +4096,7 @@ class BotBrain:
                     BotActionKind.PLACE_PREFAB,
                     tool_id=int(C.PREFAB_TOOL),
                     position=position,
-                    argument=str(name),
+                    argument=str(prefab_name),
                     yaw=math.atan2(observer.orientation[1], observer.orientation[0]),
                 ),
             )
@@ -3472,6 +4184,11 @@ class BotBrain:
         if float(now) - float(state.resource_target_since) < 3.0:
             return selected.position
 
+        # A moving/reused pickup cannot grow one bot's rejection memory for
+        # an entire server lifetime. Life changes clear this set; the cap is
+        # a final bound for pathological entity churn within one life.
+        if len(state.ignored_resources) >= 128:
+            state.ignored_resources.clear()
         state.ignored_resources.add(key)
         state.resource_target = None
         state.resource_target_since = 0.0
@@ -3618,19 +4335,20 @@ class BotBrain:
             )
         action = BotAction()
         oriented_stock = dict(observer.oriented_stock)
-        oriented = [
-            int(tool)
-            for tool in observer.loadout
-            if int(tool) in _ORIENTED_TOOLS
-            and oriented_stock.get(int(tool), 1) > 0
-            and self._explosive_target_safe(
-                frame,
-                observer,
-                target.position,
-                int(tool),
-                ignore_observer=False,
+        oriented: list[tuple[float, int]] = []
+        for tool in observer.loadout:
+            normalized_tool = int(tool)
+            if (
+                normalized_tool not in _ORIENTED_TOOLS
+                or oriented_stock.get(normalized_tool, 1) <= 0
+            ):
+                continue
+            utility = self._oriented_attack_utility(
+                frame, observer, target, normalized_tool
             )
-        ]
+            if utility > 0.0:
+                oriented.append((utility, normalized_tool))
+        oriented.sort()
         if observer.reloading:
             # Tool selection outside the primary weapon cancels Player.reload;
             # wait for the already-started reload instead of selecting a
@@ -3668,14 +4386,22 @@ class BotBrain:
             and now - state.acquired_at
             >= profile.reaction_time + state.reaction_bonus
             and (
-            oriented
-            and 12.0 <= distance <= 65.0
-            and now >= state.next_oriented_at
-            and self._rng.random() < 0.10 + float(profile.creativity) * 0.22
+                oriented
+                and 12.0 <= distance <= 65.0
+                and now >= state.next_oriented_at
+                and now
+                >= self._team_oriented_ready_at.get(
+                    int(observer.team), -math.inf
+                )
+                and self._rng.random()
+                < 0.10 + float(profile.creativity) * 0.22
             )
         ):
-            chosen = oriented[(observer.player_id + frame.frame_id) % len(oriented)]
+            _utility, chosen = oriented[-1]
             state.next_oriented_at = now + self._rng.uniform(5.0, 11.0)
+            self._team_oriented_ready_at[int(observer.team)] = (
+                now + _TEAM_ORIENTED_SPACING_SECONDS
+            )
             action = BotAction(BotActionKind.ORIENTED, tool_id=chosen)
             weapon_tool = chosen
         elif (
@@ -3688,6 +4414,7 @@ class BotBrain:
                 and not immediate_threat
             )
             and observer.ammo_clip > 0
+            and distance <= float(envelope.hard_max)
             and now - state.acquired_at
             >= profile.reaction_time + state.reaction_bonus
         ):
@@ -3865,12 +4592,14 @@ class BotBrain:
                 tool_id=int(C.ZOMBIEHAND_TOOL),
             )
 
-        jump = self._zombie_jump_due(
-            observer,
-            target,
-            state,
-            now,
-            distance=distance,
+        jump = state.last_affordance is MovementAffordance.JUMP or (
+            self._zombie_jump_due(
+                observer,
+                target,
+                state,
+                now,
+                distance=distance,
+            )
         )
         return self._intent(
             frame,
@@ -3979,10 +4708,15 @@ class BotBrain:
             int(C.BLOCK_TOOL) in observer.loadout
             and observer.blocks >= block_cost
         )
+        prefab_name = self._select_prefab(
+            observer.prefabs,
+            purpose="cover",
+            selector=observer.player_id + frame.frame_id,
+            block_budget=observer.blocks,
+        )
         can_prefab = (
             int(C.PREFAB_TOOL) in observer.loadout
-            and bool(observer.prefabs)
-            and observer.blocks >= 16
+            and prefab_name is not None
         )
         if not can_block and not can_prefab:
             return None
@@ -4001,14 +4735,11 @@ class BotBrain:
         )
         if use_prefab:
             state.next_cover_build_at = now + self._rng.uniform(6.0, 9.0)
-            name = observer.prefabs[
-                (observer.player_id + frame.frame_id) % len(observer.prefabs)
-            ]
             action = BotAction(
                 BotActionKind.PLACE_PREFAB,
                 tool_id=int(C.PREFAB_TOOL),
                 position=position,
-                argument=str(name),
+                argument=str(prefab_name),
                 yaw=yaw,
             )
             tool = int(C.PREFAB_TOOL)
@@ -4095,13 +4826,21 @@ class BotBrain:
         # fallback voxel routes populated this field, so successful native
         # Recast routes could not measure whether they approached their goal.
         previous_goal = state.path_goal
-        if (
+        topology_version = int(getattr(self.world, "topology_version", -1))
+        route_changed = (
             previous_goal is None
             or math.hypot(
                 float(previous_goal[0]) - float(goal[0]),
                 float(previous_goal[1]) - float(goal[1]),
             )
             >= 6.0
+            or state.path_topology_version != topology_version
+        )
+        if previous_goal is None:
+            state.regional_progress_anchor = start
+            state.regional_progress_at = now
+        if (
+            route_changed
             or state.strategic_progress_at <= 0.0
         ):
             state.strategic_progress_at = now
@@ -4110,18 +4849,24 @@ class BotBrain:
                 float(goal[1]) - float(start[1]),
             )
         state.path_goal = goal
-        state.path_topology_version = int(
-            getattr(self.world, "topology_version", -1)
-        )
+        state.path_topology_version = topology_version
         elapsed = max(0.0, now - self._path_refill_at)
         self._path_refill_at = now
         self._path_tokens = min(
             self._path_rate,
             self._path_tokens + elapsed * self._path_rate,
         )
+        active_bots = max(1, len(self._states))
+        request_interval = active_bots / self._path_rate
+        if (
+            not route_changed
+            and now + 1e-9 < state.next_path_request_at
+        ):
+            return state.last_path_direction
         if self._path_tokens < 1.0:
             return state.last_path_direction
         self._path_tokens -= 1.0
+        state.next_path_request_at = now + request_interval
         state.last_path_direction = self.world.next_path_direction(
             start,
             goal,
@@ -4272,15 +5017,26 @@ class BotBrain:
     ) -> BotIntent:
         direction = movement.direction
         debug_path = ()
+        observer = next(
+            (
+                player
+                for player in frame.players
+                if player.player_id == frame.observer_id
+            ),
+            None,
+        )
+        resolved_tool = int(tool_id)
+        if (
+            resolved_tool < 0
+            and action.kind is BotActionKind.NONE
+            and observer is not None
+            and int(observer.weapon_tool) in observer.loadout
+        ):
+            # Utility actions select their held item authoritatively. The next
+            # passive/navigation intent must draw the life primary again or an
+            # engineer can retain a prefab, block, or pickaxe indefinitely.
+            resolved_tool = int(observer.weapon_tool)
         if math.hypot(direction[0], direction[1]) > 1e-6:
-            observer = next(
-                (
-                    player
-                    for player in frame.players
-                    if player.player_id == frame.observer_id
-                ),
-                None,
-            )
             if observer is not None:
                 debug_path = (
                     observer.position,
@@ -4290,6 +5046,7 @@ class BotBrain:
                         observer.position[2] + direction[2] * 4.0,
                     ),
                 )
+        emitted_at = max(time.monotonic(), float(frame.created_at), float(now))
         return BotIntent(
             bot_id=frame.observer_id,
             bot_generation=frame.observer_generation,
@@ -4297,11 +5054,11 @@ class BotBrain:
             map_epoch=frame.map_epoch,
             mode_epoch=frame.mode_epoch,
             topology_version=frame.topology_version,
-            created_at=now,
-            expires_at=now + 0.250,
+            created_at=emitted_at,
+            expires_at=emitted_at + _INTENT_TTL_SECONDS,
             movement=movement,
             look=look,
-            tool_id=tool_id,
+            tool_id=resolved_tool,
             action=action,
             priority=priority,
             secondary_fire=bool(secondary_fire),
@@ -4345,6 +5102,7 @@ def _process_worker_batch(
             return True, []
         if isinstance(message, MapSnapshot):
             world.load(message)
+            brain.reset_for_map(message.map_epoch)
             # Any earlier frame describes the old map generation.
             frames.clear()
             continue

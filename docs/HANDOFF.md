@@ -1,5 +1,63 @@
 # BattleSpades — Session Handoff (2026-07-09, evening)
 
+## Current checkpoint — retail Map Creator (updated 2026-07-17)
+
+- `run_map_creator.py` and `server/ugc_launcher.py` are the isolated third
+  runtime. Normal `run_server.py` cannot register/select `ugc`, matching the
+  tutorial isolation boundary.
+- `server/ugc_project.py` recovers all nine terrain choices, the nine
+  publishable target modes, all 19 Game Data object IDs, their exact per-mode
+  requirements, and the retail `.ugc` sidecar fields. Projects are atomic
+  `.vxl`/`.txt`/`.ugc` triplets; preview PNG, skybox, colors, objects, and
+  validation state survive reconnect/restart.
+- `modes/ugc.py` and `server/handlers/ugc.py` own the native editor handshake,
+  one builder team/class, five combined backpack slots, raw-color construct
+  build/erase, object placement/removal, mode validation, and autosave. The
+  complete six-tab catalog is 138/90/47/47/26/25 = 373 entries.
+- StateData prefab/entity counts are signed little-endian 16-bit values. The
+  UGC source-map preamble is packet 54, zlib packet 56 chunks, then packet 58
+  before ordinary MapDataValidation/MapSync. ForceTeamJoin(115) opens the stock
+  selection screens after LoadingMenu Start.
+- `PrefabActionService` snapshots packet 30/31 fields, prepares large retail
+  KV6 models on one private worker, validates live contact in bounded slices,
+  then uses the existing bounded commit queue. Worker code never touches world,
+  player, or connection state.
+- The prefab visibility/carve mismatch is closed. Retail VXL consumes
+  `[from_block_index, to_block_index)`, so native echoes now use
+  `0..model_block_count` instead of the zero-length `0..0` range. Packet 30
+  uses raw voxel shorts, but packet 31 uses signed 1.6 fixed-point coordinates;
+  `shared.packet` now preserves that retail asymmetry.
+- UGC Super Spade primary is an exact type-29 cell and secondary is one native
+  type-31 centered 3x3x3 action. Paintbrush accepts packet 7 or reconstructs
+  held ClientData input; palette-open state no longer suppresses valid strokes.
+- `[map_creator]` in `config.toml` selects the project/path, output directory,
+  terrain, target validation mode, and retail asset root. The launcher prints
+  the resolved `.ugc`/`.vxl`/`.txt` paths and reopen command. Metadata
+  checkpoints asynchronously; the complete VXL is written only during clean
+  shutdown.
+- Clean-client evidence: all 373 catalog entries rendered; native selection of
+  `UGC_Prefab_Desert_landscape_4` succeeded; all 115,080 raw-color voxels
+  committed; packet-drain maximum fell from the old 410 ms stall to 0.90 ms,
+  prefab commit peak was 4.29 ms, and the retail process remained alive.
+- Focused UGC/combat/palette coverage is 82 passing after a native rebuild.
+  A clean retail run built and erased `ugc_prefab_tree_stumpsmall` at
+  `(112,269,223)` with 19/19 server commits; 18 newly visible client cells
+  returned to air (the nineteenth authored cell overlapped terrain). A live
+  primary spade packet removed exactly one client voxel, and a live secondary
+  removed all 26 solid cells present in its 3x3x3 footprint. Paint with the
+  palette active was previously verified as an authoritative packet-7 color
+  change. Test terrain was not persisted.
+- IDA evidence is retained in sessions `ugc-gamescene`, `ugc-vxl`, and
+  `ugc-packet`: VXL range loop `sub_1002E7F0`; ErasePrefab read/write
+  `sub_1005DE10`/`sub_1005E270`; fixed-short helpers
+  `sub_10009520`/`sub_10041980`; BuildPrefab raw-short read
+  `sub_1005D640`.
+- The original menu Host branch assumes local Steam-lobby ownership. Forging
+  that state on a direct connection crashes the client, so the dedicated
+  launcher owns host authority/persistence while retaining the native in-game
+  Construct and Game Data UI. Packet 101 is intentionally not injected into a
+  live GameScene.
+
 ## Current checkpoint — 2026-07-16
 
 - Match Lobby recovery is centralized in `server/lobby.py` and
@@ -32,6 +90,32 @@ This addendum supersedes the old performance, WorldUpdate-cadence, test-count,
 and client-path claims below. The remainder of this handoff is retained because
 its packet and map-sync investigation history is still valuable.
 
+### Reconstructed retail tutorial checkpoint (updated 2026-07-17)
+
+- The tutorial is intentionally absent from the normal `modes` registry.
+  Source operators use `run_tutorial.py`; portable releases contain the second
+  executable `BattleSpadesTutorial[.exe]`. `run_server.py` cannot select it.
+- The dedicated launcher verifies the genuine retail `Training.vxl` SHA-256
+  `aea9cc551f46d449324d24e6fbf0be0c11fc76286d1b00cff6cfe036e4e2114d`,
+  registers mode `tut` only in that process, and locks all runtime settings in
+  memory. It does not rewrite `config.toml`.
+- Recovered client/map ground truth: mode ID 10; twelve repeated authored
+  lanes; spawn `(140.5, 76.5, 230.75)` per lane; five 13-voxel red targets;
+  staged pistol then block/spade grants; stock HelpPanel string IDs, target
+  counter, tutorial music packet, completion sound 27, and countdown packet.
+- The missing original server state machine is reconstructed in
+  `modes/tutorial.py`: movement/jump/crouch geometry gates, authoritative
+  target mutations, BlockLine completion, lane reset/reuse, invulnerability,
+  and clean completion disconnect. The retail capsule reaches x=134.45 at the
+  first obstacle, so the basic gate deliberately uses x<=135 rather than the
+  unreachable raw voxel plane.
+- Retail smoke reached Shooting through real W/Space/Ctrl input and displayed
+  the translated stock prompt while packet 13 changed the loadout from `[]` to
+  `[17]` and selected the pistol. The target-completion regression then grants
+  `[17, 5, 2]` and selects the spade for Climb. The focused tutorial,
+  packaging, and audio groups pass, and a staged Windows onedir bundle passed
+  `--version`/`--check` for both executables.
+
 ### Map-owned skybox checkpoint (updated 2026-07-15)
 
 - `Connection.send_skybox` no longer sends `Chicago.txt` for every map.
@@ -46,7 +130,7 @@ its packet and map-sync investigation history is still valuable.
   resources, including fallback `User_Grassland.txt`, exist in the stock
   retail client. Missing metadata uses `[world].default_skybox`.
 
-### Map resources, fog, and authored flare lights (updated 2026-07-15)
+### Map resources, fog, and authored flare lights (updated 2026-07-16)
 
 - `MapResourceService` now owns map crates and static lights for every mode.
   TDM no longer has a private crate implementation, and CTF objective rebuilds
@@ -63,6 +147,24 @@ its packet and map-sync investigation history is still valuable.
   the map service turns metadata-authorized markers into neutral coloured
   type-13 entities. This is the native `FlareBlockEntity` point-light path and
   automatically participates in late-join entity reveal.
+- The shipped `ugc/maps/GrasslandBaseplate.txt` authoring template supplies
+  the missing stock defaults exactly: family 0 `(255, 255, 82)` and family 1
+  `(250, 250, 200)`. Recognized stock maps inherit those values, while an
+  explicit sidecar overrides its own slot (Mayan Jungle remains amber).
+  Unknown/community maps never inherit a guessed palette; missing families are
+  skipped with one aggregate warning.
+- `FlareBlockEntity.post_initialize` does two things in the native client: it
+  creates the RGB user block and registers a radius/intensity `5.0` static
+  point light. `MapResourceService` now mirrors the first operation in server
+  collision without dirtying the map/reconnect mutation journals. This closes
+  the former client-solid/server-air cell mismatch at recovered markers.
+- A full audit loaded all 28 bundled VXLs: 703 exposed native markers across
+  10 maps, zero unresolved families. The largest case, 20th Century Town,
+  joined a clean retail `GameScene` with all 524 flare entities (IDs 9..532),
+  533 total map entities, no traceback, and steady entity tick work around
+  `0.07 ms`. Arctic Base delivered its exact 19/23 dual-family split; a live
+  before/after removal capture visibly changed the recovered lit area from
+  bright to dark.
 - Retail CTF validation on Mayan Jungle joined cleanly with 7 ammo, 7 health,
   7 block crates, 4 `FlareBlockEntity` lights, both intel pickups, fog
   `(69, 76, 39)`, and `MayanJungle.txt`. The process remained in `GameScene`
@@ -267,13 +369,17 @@ its packet and map-sync investigation history is still valuable.
   Tool 22 is now advertised in `InitialInfo.disabled_tools` and omitted by the
   same default class normalizer, so it cannot reappear in CreatePlayer while the
   real Prefab tool 23 and its three selected names remain available.
-- Settled-client terrain has a bounded prediction-repair layer in
-  `server/terrain_repair.py`. It is enrolled only for rejected or cancelled
-  client-predicted footprints. Successful builds, prefabs, digs, and collapse
-  already have one reliable gameplay packet and must never be globally queued:
-  replaying packet 33/37 after the quiet delay runs native placement/damage
-  callbacks and particles twice. Joining clients remain gated out and use the
-  full snapshot plus contiguous mutation journal.
+- Settled-client terrain has bounded regular and collapse-confirmation lanes in
+  `server/terrain_repair.py`. Rejected/cancelled predictions use the original
+  two-second canonical replay. Successful builds, prefabs, and ordinary digs
+  are not replayed because packet 33/37 would run native particles twice.
+  Unsupported collapse is the evidence-backed exception: checked Damage asks
+  each client to derive a component locally, so every server-removed collapse
+  cell is confirmed later with exact type-6, `chunk_check=0` Damage. The queue
+  drains visible shells first, drops rebuilt cells, and stays globally bounded.
+  Joining clients remain gated out and use the full snapshot plus contiguous
+  mutation journal. Packet 38 is not a terrain replacement mechanism; reverse
+  engineering shows only damaged/occupied/user-block dictionaries.
 - Engineer has exactly one numeric jetpack resource. Its CLASS_EQUIPMENT slot
   is `JETPACK_ENGINEER OR DISGUISE`, never both. Rocketeer's independent legacy
   slot is `JETPACK2 OR JETPACK_NORMAL`; Jetpack2 uses the existing per-pack
@@ -1528,3 +1634,314 @@ broken baseline with the same seed/map/roster:
   bot p99 0.711 ms, overall tick p99 1.023 ms, zero queue/gameplay drops, and
   worker usage 0.669 CPU core. Human aim noise and reaction bands were not
   weakened to conceal this scheduling bug.
+
+## Alive AI worker deadlock and automatic recovery (2026-07-16)
+
+- The freeze reproduced in the packaged `0.0.2-alpha.1` server with all humans
+  disconnected. The server remained healthy, but its single AI child consumed
+  one full core and stopped returning intentions. Bot leases expired after
+  250 ms, so every bot correctly became inert even though the process still
+  reported alive.
+- A native `py-spy --native` capture identified the exact blocking path:
+  `BotBrain.decide -> WorkerVoxelWorld._path_direction ->
+  _native_path_direction -> recast.cp312-win_amd64.pyd`. The live fallback was
+  inside Detour `find_path` on a bad multi-tile corridor. Process liveness alone
+  could never detect this failure.
+- Live worker navigation no longer calls synchronous native `find_path` after
+  a zero DetourCrowd result. It falls through to the bounded voxel A* already
+  owned by `next_path_direction`; the direct native API remains available for
+  isolated bridge tests.
+- `AIWorkerSupervisor` now starts a heartbeat lease when it sends a frame for
+  an alive, spawned bot. After eight seconds of startup grace, five seconds
+  without any returned intent causes only the AI child to be terminated and
+  restarted through the existing 1/2/5/30-second backoff. `/bots status` shows
+  `stalls` and current `silence` for operator diagnosis.
+- Killing only the wedged packaged child proved the recovery boundary: the old
+  supervisor restarted it one second later and unattended bots immediately
+  resumed drill projectiles and combat while the authoritative server stayed
+  online.
+- Validation: startup/config check including a real spawned child passed; the
+  full suite passed `868` tests; focused heartbeat/native-fallback coverage is
+  included. A 900-second MayanJungle replay completed instead of hanging. A
+  captured 120-second replay kept all bots producing actions with no action,
+  jump, priority, look, or water violation, but still reported recoverable
+  per-bot route stalls. Do not conflate those local terrain recoveries with the
+  fixed worker-wide deadlock.
+
+## Late-join terrain convergence and voted rollover (2026-07-16)
+
+- The missing-texture/phantom-collision failure was a malformed VXL span, not a
+  palette problem. Both generated-VXL and dirty-column serializers duplicated
+  the final voxel of a fully explicit non-final run as overlapping top and
+  bottom colors. The retail decoder rejects that whole column, so the client
+  could render air while the authoritative server still collided with blocks.
+  A one-voxel run must encode one color word, never two overlapping words.
+- MapSync now records a canonical per-cell sequence watermark. Every committed
+  voxel after that snapshot is retained only while a joiner is gated, repeated
+  coordinates coalesce to final solidity/RGB in support-safe order, and replay
+  uses `BlockBuildColored(33)` or exact `Damage(37, chunk_check=0)`. A retained
+  send cursor resumes at the first packet ENet did not accept. Journal gaps or
+  overflow fail closed and require a fresh join rather than admitting partial
+  terrain.
+- Match transitions rebind the mutation listener to the candidate world and
+  restore it on rollback. A peer still inside the old InitialInfo/MapSync when
+  rollover begins is retired with reason 18; beginning a second VXL handshake
+  on that peer can splice map epochs and crash or corrupt the client.
+- End-of-round map voting now resolves before transition. No-vote/tie results
+  are deterministic, late joiners receive the active ballot, and invalid map
+  choices fail preflight before the native terminal packets. Official maps use
+  `GameStats(67) -> ShowGameStats(53) -> lobby.end_screen_seconds ->
+  MapEnded(52)`; screenshot-less custom maps omit packet 53 but keep the dwell.
+- Validation after a clean native rebuild: 101 high-risk terrain/vote/transition
+  tests passed, the complete repository passed 903 tests, and
+  `run_server.py --check` validated 28 maps, eight native imports, 40 prefabs,
+  configuration, and a real spawned worker. The state-convergence fuzzer also
+  matched exact solidity and RGB for 144 mutated columns across six official
+  maps.
+
+## Settled-client collapse ghost convergence (2026-07-16)
+
+- Unsupported components were removed exactly on the server but represented to
+  settled clients only by the initiating `Damage(37, chunk_check=1)`. Every
+  retail BlockManager independently derived the falling component from local
+  history; one differing voxel could therefore leave visible, non-authoritative
+  geometry after the server had removed the whole component.
+- `TerrainRepairService` now has a dedicated collapse-confirmation lane. Combat
+  retains the original checked Damage/falling animation, records only cells
+  actually removed by `WorldManager`, orders their visible shell before the
+  interior, waits 18 simulation ticks, and drains eight exact type-6,
+  `chunk_check=0` air confirmations every three ticks. Rebuilt cells are
+  discarded before send. Both lanes share the existing 8192-cell hard bound;
+  overflow preserves visible-shell confirmations before deep interior cells.
+- IDA recovered packet 38 as three dictionaries (`damaged_blocks`,
+  `occupied_blocks`, `user_blocks`), not a topology snapshot, so it must not be
+  used as a removed-voxel resync. `BlockManager.handle_weapon_damage ->
+  remove_block` reaches the native map removal/update call even for an exact
+  confirmation, which also invalidates stale rendered geometry.
+- Live retail validation on ArcticBase built an 18-cell fixture, removed its
+  three-cell base, collapsed and confirmed the remaining 15 cells, and drained
+  the repair queue to zero. The client remained in `GameScene`, reported zero
+  solid fixture cells, and a framebuffer facing the fixture showed no orange
+  ghost. No traceback, crash, invalid entity, or unhandled packet appeared.
+  Artifacts are under `logs/terrain-collapse-confirmation/retail-fixture-v4/`.
+- Final focused terrain/combat coverage passed 70 tests, including a
+  50-recipient batch-bound test. `run_server.py --check` passed 28 maps, eight
+  native imports, 40 prefabs, configuration, and a real spawned worker.
+  The monolithic suite is not currently claimable as green: legacy
+  `tests/test_packets.py` imports unexported `protocol.serialization`
+  `tofixed/fromfixed`, and two telemetry tests patch `toml.load` while the
+  Python 3.12 loader uses `tomllib`. These collection/harness defects are
+  unrelated to collapse repair and were not folded into this change.
+
+## Steam master registration recovery (2026-07-16)
+
+- The inspected decompiled `steam_appid.txt` contains `480` (Spacewar); the
+  retail AoS app and browser request use `224540`. The signed x86
+  `steam_api.dll` SHA-256 is
+  `abfedd473b3f4a9597bbdc90d20f4b6f696bb2ebb937a03177461df695430ad6`.
+- The adjacent 300,456-byte `steamclient.dll` SHA-256 is
+  `9c9baf7490598693c0f669ec79bec257e0f513fa443d5cc486ebca374fac9e32`;
+  its Authenticode status is hash-mismatch. It previously blocked inside
+  `SteamGameServer_Init`; a later desktop-Steam-assisted run did log on, but
+  it remains excluded by default because that is not a headless guarantee.
+- IDA recovered `SteamGameServer011`, product `aos`, game dir
+  `aceofspades`, description `Ace of Spades`, updater port `8766`, version
+  `1.0.0.0`, anonymous logon, heartbeats, and the exact tag/map transforms now
+  implemented in `server/steam_master.py` and the Win32 helper.
+- Browser filters are now distinguished: the generic list filters only
+  `gamedir=aceofspades`, Official adds `white=1`, and User applies
+  `nand(white=1)`. Do not set or spoof `white`; community servers correctly
+  appear under generic/User results.
+- With the old signed `steam_api.dll` plus Steam's current installed x86
+  `steamclient.dll`, `tier0_s.dll`, and `vstdlib_s.dll`, the helper completed
+  anonymous logon, received server SteamID `90289085333726212`, answered a
+  local A2S_INFO on its separate query port, and shut down cleanly. That ID was
+  ephemeral test evidence, not a configured constant.
+- Proprietary Valve files are never committed or packaged. The service stages
+  operator-owned copies in a private temporary directory with app ID 224540,
+  kills blocked initialization, restarts later failures with bounded backoff,
+  and does not touch the gameplay tick. Public registry/A2S visibility still
+  requires externally reachable game/updater/query UDP ports.
+- External proof is now complete. On `2026-07-16`, Valve's public
+  `ISteamApps/GetServersAtAddress` returned `88.80.155.252:27016`, SteamID
+  `90289091849869316`, app `224540`, game dir `aceofspades`, game port `27015`;
+  a public challenged A2S_INFO returned the BattleSpades name/map/tags. This
+  final run used the safe default (`use_supplied_steamclient = false`) and
+  auto-discovered Steam's installed x86 runtime. Run
+  `scripts/check_steam_registration.py` to reproduce both checks.
+- The stock All/Community UI still returned zero. This is now explained:
+  `hl2master.steampowered.com`, the legacy UDP list service, no longer resolves
+  and its historical IPs time out. The retail callback finishes
+  `eServerFailedToRespond`; this is independent of current Valve registration.
+- Retail `serverInfo.py` hardcodes every selected row to game port `32887`.
+  Deploy on/forward `32887` for unmodified row compatibility, or update the
+  client to honor the returned game port.
+
+## Generic vote native-crash fix (2026-07-16)
+
+- Retail `GenericVotingHUD.decode_string` literal-evaluates title/description
+  and unconditionally reads tuple indexes `0` and `1`. The prior
+  `repr(("VOTE_MAP_TITLE",))` packet raised `IndexError` in native HUD code.
+- All vote text now uses `repr((identifier, ()))`. The exact retail decoder was
+  exercised live for map and kick identifiers; the focused vote/Steam suite
+  passes 48 tests.
+
+## VIP performance and Classic CTF retail completion (2026-07-17)
+
+- VIP's progressive lag was not its state-machine scan. Historical tick traces
+  showed `mode` near 0.01 ms while `fire` grew continuously. Each server-created
+  BlockFire child had incorrectly received five new spread attempts, producing
+  a supercritical tree the retail client never creates itself. Fire now shares
+  one five-attempt budget per Molotov cluster, has one attempt per emitter, and
+  obeys a 96-emitter operational ceiling with deterministic oldest replacement.
+- VIP sub-round reset now publishes at most four respawns per gameplay tick,
+  uses event-driven roster transitions with only a 4 Hz safety audit, and uses
+  monotonic selection/intermission deadlines. Retail timed scoring is active:
+  boss survival is 50/10 s, escort is 10/5 s inside 15 blocks, and missed
+  intervals never replay as a reliable packet burst. Boss-kill and
+  boss-as-killer bonuses retain distinct native score reasons. Default VIP
+  voting uses the shipped Alcatraz/CityOfChicago playlist.
+- A post-change 45-second CityOfChicago run with 12 real worker bots sustained
+  59.999 Hz, tick p99 2.141 ms, VIP p99 0.019 ms, fire p99 0.132 ms, peak fire
+  15/end fire 2, memory growth 2.25 MiB, and zero gameplay, mode, terrain, or
+  mutation drops. The only red capacity gate was the separate bot main-thread
+  p99 (1.310 ms against its 0.75 ms target).
+- Classic CTF uses the ordinary CTF scene (`mode=8`) plus `classic=1`, locked
+  Deuce class 5, no minimap, shooting with intel, no auto-return, a three-block
+  intel offset, five-capture target, and the exact seven-map shipped rotation.
+  Captures now award 10 personal points with native reason 50 and one team
+  point; touch return awards one personal point with reason 53.
+- Classic death now uses the native Character corpse rather than the Battle
+  Builder entity-11 gravestone. `KillAction` creates `ClassicCorpse.kv6`;
+  packet 36 removes it on a hit (effect byte 1) or silently before respawn
+  (effect byte 0). The server owns a generation-tagged static KV6 hitbox and
+  applies the recovered zero-player-damage/radius-3 corpse blast. Per-client
+  death ledgers prevent a joining GameScene from receiving duplicate
+  KillAction while still repairing an explosion missed during MapSync.
+- Seven dedicated corpse lifecycle tests plus the high-risk Classic/combat/
+  roster/entity/transition gate pass (136 tests). `run_server.py --check`
+  validates configuration, 28 maps, eight native imports, 40 prefabs, and a
+  real spawned worker. An isolated Crossroads retail run observed the native
+  Character enter `dead=True`, `exploded=False` with its `classic_corpse`
+  display list loaded, no Grave entity in the GameScene, and a clean respawn;
+  no traceback, invalid entity warning, or new dump appeared. Evidence is in
+  `logs/classic-corpse-retail-20260717/`. The monolithic pytest command emitted
+  no progress before its bounded 300-second timeout, so no all-suite claim is
+  made for this checkpoint.
+- Clean retail Crossroads validation saw mode 8/classic 1, two IntelPickup
+  entities, and no dump. An authoritative real pickup followed by return to
+  base produced `intel_count=2`, personal score 10, and team score 1 while the
+  client remained in GameScene. A second isolated VIP score soak stayed in
+  GameScene/mode 7 with both boss markers, showed 100 survival points on both
+  bosses plus 10-point escort increments on nearby guards, remained connected,
+  and created no dump. That first soak exposed a projectile expiring just after
+  first ClientData: the joiner had missed its CreateEntity during MapSync but
+  received its DestroyEntity. Entity lifetimes are now tracked per connection;
+  a second retail run had no invalid-entity, traceback, or unhandled-packet
+  warning. Evidence is in
+  `logs/classic-retail-20260717/`,
+  `logs/classic-objective-retail-20260717-r2/`, and
+  `logs/vip-retail-soak-20260717/` plus
+  `logs/vip-score-retail-20260717-r2/`.
+- Expanded entity/VIP/fire/Classic/CTF/score/vote coverage is 104 passing. The repository
+  monolithic collection is slow enough on this Windows workspace to exceed a
+  two-minute collection-only timeout; no all-suite claim was made for this
+  checkpoint.
+
+## Playtester DOCX closeout (2026-07-17)
+
+The English playtester report and all 20 embedded screenshots were reviewed.
+The reproducible protocol and gameplay defects were handled as one compatibility
+pass:
+
+- Knife, police baton, and machete damage now use the recovered retail values;
+  the machete retains its one-hit zombie-head behavior. Snub pistol and
+  semi-auto rifle are registered as real ranged weapons, including damage,
+  tracer, and block-impact handling. The drill damages players as well as
+  terrain, while the block sucker uses its own damage constant and grants the
+  blocks it removes.
+- Dynamite is placed against the selected face instead of inside the voxel,
+  damages players, and uses one bounded native radius-destruction operation.
+  C4 uses the same bounded terrain path, removing the client freeze caused by a
+  burst of individual block packets.
+- Rocket turrets are destructible, clean up on owner/team changes, retain a
+  finite ammunition state, and accept the retail human-control/fire path. Radar
+  uses the recovered 35-second fuse, is destructible, and is removed when its
+  owner changes team. Team authorization is re-evaluated rather than inherited
+  from a stale owner state.
+- TDM rejects non-standard mode classes. Spectator selection no longer becomes
+  a blue paratrooper. Zombie uses retail team semantics (Blue zombies, Green
+  survivors), countdown/infection placement, scoring, sounds, role markers,
+  and role colors. Zombie's `InitialInfo` now enables the native ordinary
+  opposing-role minimap fallback, while only the final survivor receives the
+  separate `ChangePlayer.high_minimap_visibility` VIP marker. VIP promotion
+  and sub-round reset no longer retain invalid or duplicate state.
+- Classic CTF uses the native corpse lifecycle rather than Battle Builder
+  graves and now awards kill/capture/return points. Ordinary CTF carrier and
+  dropped-intel state uses the native pickup/minimap flags. Remote spade
+  destruction, block placement, and prefab placement now emit their native
+  observer audio.
+- Default team colors are the retail blue and green values, rather than the
+  overly bright cyan palette. A distributable Python 2 client patch adds
+  Ctrl+V support to every native `EditBoxControl`; it is bundled by the release
+  packager and installed in the maintained non-Steam client.
+
+The movement report was reproduced with a real retail client rather than
+accepted as a generic interpolation complaint. Pack 66 produced one visible
+0.628-block adjustment when fuel expired next to geometry. The client already
+ends local thrust on fuel/key state; sending the owner an inactive
+`WorldUpdate` at a fractional simulation phase forced the correction. The
+replicator now defers only that owner transition until key release and grounded
+input settlement. Observers still receive the authoritative inactive state.
+Do not restore a general activation delay: a tested one-frame delay produced a
+4.898-block error and a hard snap.
+
+Live retail evidence:
+
+- `logs/playtester-docx/rocketeer-pack66-final/`: Pack 66, zero SNAP,
+  zero ADJUST, zero visible rollback, and zero matched position error.
+- `logs/playtester-docx/rocketeer-pack67/`: Pack 67, zero SNAP/ADJUST and
+  zero visible rollback.
+- `logs/playtester-docx/engineer-pack68/`: Pack 68, zero SNAP/ADJUST and
+  zero visible rollback.
+
+The apparent all-suite collection stall was duplicate discovery, not a gameplay
+or teardown leak: pytest recursively entered 104 copied test modules under
+`tmp/` and 77 more under `.worktrees/`, in addition to the 95 canonical modules
+under `tests/`. Root `pytest.ini` now constrains discovery to `tests/`. With a
+real Windows worker permitted, the canonical monolithic command
+`py -3.12 -m pytest -q` passes **1,075 tests** in 216.09 seconds. The launcher
+check and `py -3.12 run_server.py --check` also pass their real spawned-worker
+probe; no test-only inline worker was used for that acceptance.
+
+Real multiprocessing gameplay smokes were also run after the permissions fix:
+
+- CTF / CityOfChicago, eight bots, 20 simulated seconds: every bot moved
+  12.24--188.78 blocks, no requested-motion stall reached five seconds, and
+  all eight world mutations committed.
+- Zombie / CastleWars, eight bots, 20 simulated seconds: every bot moved, 74
+  world mutations committed, and a bot fault-injected into a real water column
+  reached land in 0.87 seconds without an expired mutation.
+
+Two report items are intentionally not represented as universal server fixes:
+
+- The Classic CTF "tent" is map-authored VXL geometry, not a dynamic server
+  entity in this retail build. All seven shipped Classic-map sidecars were
+  inspected and contain no authored base zones, and the client assets contain
+  no dedicated Classic tent KV6. Retail `GameScene` also omits legacy `BASE=1`
+  from its active entity table, so sending type 1 can crash a clean client.
+  BattleSpades therefore uses native packet-43 capture/minimap zones around
+  stable dry map anchors and never exposes its internal base marker. A custom
+  visual tent requires authored VXL geometry (or a coordinated custom-client
+  asset), not a stock-server wire workaround.
+- The report promises mouse videos but contains no video or deterministic
+  reproduction. The maintained client still loads the existing raw
+  `WM_INPUT`/pyglet mouse patch. A different mouse defect needs the promised
+  capture plus sensitivity, display mode, and frame-rate details before another
+  client patch is safe.
+
+The report's broad statements about bot quality are playtest/tuning targets,
+not a single protocol defect. The broken Zombie team semantics and mode state
+were fixed here, but long-match navigation and human-like behavior remain an
+ongoing bot-AI workstream and should not be marked complete from these focused
+compatibility tests.

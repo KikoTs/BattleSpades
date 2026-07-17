@@ -14,7 +14,13 @@ import math
 
 import shared.constants as C
 
-from .messages import BotActionKind, BotIntent, PlayerSnapshot, Vector3
+from .messages import (
+    BotActionKind,
+    BotIntent,
+    MovementAffordance,
+    PlayerSnapshot,
+    Vector3,
+)
 
 
 _CONSTRUCTION_ACTIONS = frozenset(
@@ -129,7 +135,13 @@ class BotSoakMonitor:
             self._action_loops += 1
             state.action_loop_reported = True
 
-        if intent.movement.jump:
+        if (
+            intent.movement.jump
+            and not (
+                intent.action.kind in _CONSTRUCTION_ACTIONS
+                and intent.movement.affordance is MovementAffordance.BUILD_STEP
+            )
+        ):
             if state.jump_started_at is None:
                 state.jump_started_at = timestamp
                 state.jump_loop_reported = False
@@ -159,7 +171,13 @@ class BotSoakMonitor:
                 timestamp - state.travel_progress_at
                 >= max(6.0, self.loop_seconds * 3.0)
             )
-            physically_stalled = stationary_for >= self.loop_seconds
+            # A defender may begin traveling after a long legitimate hold.
+            # Give the newly requested movement its own progress window before
+            # attributing that earlier stationary time to navigation.
+            physically_stalled = (
+                stationary_for >= self.loop_seconds
+                and timestamp - state.travel_progress_at >= self.loop_seconds
+            )
             # A non-zero input is not proof of navigation. Check both complete
             # immobility and bounded oscillation inside the same small region.
             if (

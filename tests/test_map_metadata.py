@@ -7,7 +7,12 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
 from server.game_constants import TEAM1, TEAM2  # noqa: E402
-from server.map_metadata import MapMetadata, MapZone, load_map_metadata  # noqa: E402
+from server.map_metadata import (  # noqa: E402
+    STOCK_STATIC_LIGHT_COLORS,
+    MapMetadata,
+    MapZone,
+    load_map_metadata,
+)
 from server.config import ServerConfig  # noqa: E402
 from server.world_manager import WorldManager  # noqa: E402
 
@@ -170,6 +175,43 @@ def test_official_alias_catalog_selects_client_assets_but_not_map_sync():
     assert metadata.skybox_name == "Egypt.txt"
     assert [sound.name for sound in metadata.ambient_sounds] == ["amb_desert"]
     assert metadata.ambient_sounds[0].points == ()
+
+
+def test_stock_maps_inherit_the_shipped_editor_static_light_palette():
+    metadata = load_map_metadata(Path("maps") / "ArcticBase.vxl", "tdm")
+
+    assert metadata.official_map is True
+    assert metadata.static_light_colors == STOCK_STATIC_LIGHT_COLORS
+
+
+def test_stock_sidecar_static_light_color_overrides_only_its_family(
+    tmp_path: Path,
+):
+    vxl = tmp_path / "MayanJungle.vxl"
+    vxl.write_bytes(b"")
+    vxl.with_suffix(".txt").write_text(
+        "static_light_color0 = (224, 172, 29)\n",
+        encoding="utf-8",
+    )
+
+    metadata = load_map_metadata(vxl, "tdm")
+
+    assert metadata.static_light_colors == {
+        0: (224, 172, 29),
+        1: STOCK_STATIC_LIGHT_COLORS[1],
+    }
+
+
+def test_unknown_map_without_palette_does_not_guess_static_light_colors(
+    tmp_path: Path,
+):
+    vxl = tmp_path / "CommunityNight.vxl"
+    vxl.write_bytes(b"")
+
+    metadata = load_map_metadata(vxl, "tdm")
+
+    assert metadata.official_map is False
+    assert metadata.static_light_colors == {}
 
 
 def test_legacy_metadata_loads_global_and_local_ambience_and_lighting(tmp_path: Path):

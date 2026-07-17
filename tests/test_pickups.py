@@ -71,7 +71,11 @@ def test_late_join_reveal_announces_carrier_when_entity_wire_is_disabled():
     broadcast_pickup(server, player, C.INTEL_PICKUP, burdensome=True, state=TEAM2)
     server.config.entities_wire_ready = False
     revealed = []
+    votes_revealed = []
     server.mode = SimpleNamespace(reveal_to=lambda target: revealed.append(target))
+    server.vote_manager = SimpleNamespace(
+        reveal_to=lambda target: votes_revealed.append(target)
+    )
     connection.sent.clear()
 
     server.reveal_world_to(connection)
@@ -83,6 +87,7 @@ def test_late_join_reveal_announces_carrier_when_entity_wire_is_disabled():
     assert packet.pickup_id == C.INTEL_PICKUP
     assert packet.burdensome == 1
     assert revealed == [connection]
+    assert votes_revealed == [connection]
 
 
 def test_drop_ignores_spoofed_identity_caps_speed_and_persists_entity():

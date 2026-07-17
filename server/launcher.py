@@ -10,7 +10,7 @@ import multiprocessing
 import signal
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from server.release_check import CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, apply_runtime_paths, read_version
@@ -90,14 +90,30 @@ async def _serve(config, logging_runtime) -> None:
         await server.stop()
 
 
-def _run_server(paths: RuntimePaths) -> int:
-    """Configure process resources, run the server, and close every sink."""
+def _run_server(
+    paths: RuntimePaths,
+    *,
+    config_transform: Callable[[object], object | None] | None = None,
+    banner: str = "BattleSpades Server - Protocol 1.0 Battle Builders",
+) -> int:
+    """Configure process resources, run one server variant, and close sinks.
+
+    ``config_transform`` is intentionally applied after portable paths are
+    resolved and before logging or networking starts.  Dedicated entrypoints
+    such as the reconstructed tutorial can therefore lock their runtime
+    identity without duplicating the normal lifecycle or modifying the
+    operator's ``config.toml`` on disk.
+    """
 
     from server.config import load_config
     from server.logging_runtime import configure_logging
 
     _configure_console_encoding()
     config = apply_runtime_paths(load_config(paths.config), paths)
+    if config_transform is not None:
+        transformed = config_transform(config)
+        if transformed is not None:
+            config = transformed
     paths.logs.mkdir(parents=True, exist_ok=True)
     logging_runtime = configure_logging(config, paths.logs)
     logger = logging.getLogger("BattleSpades")
@@ -107,7 +123,7 @@ def _run_server(paths: RuntimePaths) -> int:
         with fault_file.open("a", encoding="utf-8") as fault_stream:
             faulthandler.enable(fault_stream)
             logger.info("=" * 50)
-            logger.info("BattleSpades Server - Protocol 1.0 Battle Builders")
+            logger.info("%s", banner)
             logger.info("=" * 50)
             logger.info("Application root: %s", paths.root)
             logger.info("Log level set to: %s", config.log_level.upper())

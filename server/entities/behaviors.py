@@ -19,6 +19,32 @@ from __future__ import annotations
 import math
 
 
+_ATTACHMENT_FACE_OFFSETS = {
+    0: (0.0, 0.5, 0.5),
+    1: (1.0, 0.5, 0.5),
+    2: (0.5, 0.0, 0.5),
+    3: (0.5, 1.0, 0.5),
+    4: (0.5, 0.5, 0.0),
+    5: (0.5, 0.5, 1.0),
+}
+
+
+def _attached_face_center(ent):
+    """Return the exposed face center named by an attachment packet.
+
+    PlaceDynamite/PlaceC4 coordinates identify the supporting solid voxel,
+    not the rendered object center. Starting a blast at that integer voxel
+    makes the support block occlude every player ray and is also why a charge
+    appears sunk into terrain after a late-join entity snapshot.
+    """
+
+    ox, oy, oz = _ATTACHMENT_FACE_OFFSETS.get(
+        int(ent.face),
+        (0.5, 0.5, 0.5),
+    )
+    return (float(ent.x) + ox, float(ent.y) + oy, float(ent.z) + oz)
+
+
 class EntityBehavior:
     """Base behavior — inert. Subclass and override the hooks you need."""
 
@@ -262,6 +288,7 @@ class TimedExplosiveBehavior(EntityBehavior):
         self.force_destroy = bool(force_destroy)
         self.kill_type = int(kill_type)
         import shared.constants as C
+        self.damage_type = int(C.DYNAMITE_DAMAGE)
         self.knockback_min = float(
             getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MIN", 0.1)
             if knockback_min is None else knockback_min
@@ -278,6 +305,11 @@ class TimedExplosiveBehavior(EntityBehavior):
             return
         if ctx.now >= self._detonate_at:
             _detonate_deployable(self, ent, ctx)
+
+    def get_explosion_center(self, ent):
+        """Use the rendered attachment center, outside its support voxel."""
+
+        return _attached_face_center(ent)
 
 
 class ProximityMineBehavior(EntityBehavior):
@@ -360,6 +392,7 @@ class RemoteChargeBehavior(DamageableEntityBehavior):
         self.blast_radius = float(blast_radius)
         self.force_destroy = True
         import shared.constants as C
+        self.damage_type = int(C.C4_DAMAGE)
         self.knockback_min = float(getattr(C, "C4_EXPLOSION_KNOCKBACK_MIN", 0.1))
         self.knockback_max = float(getattr(C, "C4_EXPLOSION_KNOCKBACK_MAX", 0.15))
 
@@ -371,16 +404,12 @@ class RemoteChargeBehavior(DamageableEntityBehavior):
         # PlaceC4 coordinates name the supporting voxel.  ``face`` selects the
         # exposed face on which the model is centered (client C4Weapon ghost
         # transform, recovered Python source).
-        offsets = {
-            0: (0.0, 0.5, 0.5),
-            1: (1.0, 0.5, 0.5),
-            2: (0.5, 0.0, 0.5),
-            3: (0.5, 1.0, 0.5),
-            4: (0.5, 0.5, 0.0),
-            5: (0.5, 0.5, 1.0),
-        }
-        ox, oy, oz = offsets.get(int(ent.face), (0.5, 0.5, 0.5))
-        return (float(ent.x) + ox, float(ent.y) + oy, float(ent.z) + oz)
+        return _attached_face_center(ent)
+
+    def get_explosion_center(self, ent):
+        """Detonate from the visible C4 face instead of inside terrain."""
+
+        return _attached_face_center(ent)
 
     def on_destroyed(self, ent, source, ctx) -> None:
         owner = ctx.server.players.get(ent.player_id) if ctx.server else None
@@ -435,14 +464,21 @@ def _detonate_deployable(behavior, ent, ctx) -> None:
     # its own explosion back through on_damage and recursively destroy itself.
     ent.alive = False
     if ctx.server is not None:
+        get_center = getattr(behavior, "get_explosion_center", None)
+        if callable(get_center):
+            gx, gy, gz = get_center(ent)
+        else:
+            gx, gy, gz = ent.x, ent.y, ent.z
         ctx.server._apply_blast(
-            ent.x, ent.y, ent.z, behavior.damage, behavior.block_damage,
+            gx, gy, gz, behavior.damage, behavior.block_damage,
             behavior.kill_type, thrower,
             crater_radius=behavior.crater_radius,
             force_destroy=getattr(behavior, "force_destroy", True),
             blast_radius=getattr(behavior, "blast_radius", 16.0),
             knockback_min=getattr(behavior, "knockback_min", 0.0),
             knockback_max=getattr(behavior, "knockback_max", 0.0),
+            native_damage_type=getattr(behavior, "damage_type", None),
+            causer_entity_id=int(ent.entity_id),
         )
     if ctx.destroy is not None:
         ctx.destroy(ent.entity_id)

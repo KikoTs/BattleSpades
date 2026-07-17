@@ -219,6 +219,32 @@ def test_engineer_advertises_activation_two_frames_before_physics():
     assert p._jetpack_physics_active is True
 
 
+def test_jump_pack_uses_the_common_two_frame_activation_handoff():
+    """Pack 66's fractional phase is handled at release, not by extra thrust."""
+    p = make_player(class_id=int(C.CLASS_ROCKETEER))
+    p.jetpack_id = int(C.JETPACK_NORMAL)
+    p.jetpack_fuel = 100.0
+    p.input.jump = True
+
+    for _ in range(30):
+        p._update_jetpack(DT)
+        if p.jetpack_active:
+            break
+
+    assert p.jetpack_active is True
+    assert p._jetpack_physics_active is False
+    assert p._jetpack_activation_defer_remaining == 2
+
+    consume_jetpack_frame(p, 101)
+    assert p._jetpack_physics_active is False
+
+    consume_jetpack_frame(p, 102)
+    assert p._jetpack_physics_active is False
+
+    consume_jetpack_frame(p, 103)
+    assert p._jetpack_physics_active is True
+
+
 def test_engineer_activation_does_not_repurpose_fire_state_as_an_ack():
     """A protocol handoff must never ignite the retail owner as a marker."""
     p = make_player(class_id=int(C.CLASS_ENGINEER))

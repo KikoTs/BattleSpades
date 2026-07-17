@@ -1,0 +1,35 @@
+{
+    "use_overhead_image": false,
+    "description": "MyUGCMap",
+    "title": "MyUGCMap",
+    "ugc_entities": [],
+    "ground_colors": [
+        [
+            85,
+            60,
+            30,
+            32
+        ],
+        [
+            31,
+            22,
+            11,
+            238
+        ],
+        [
+            75,
+            113,
+            157,
+            239
+        ]
+    ],
+    "skybox_name": "User_Grassland.txt",
+    "aos_ugc_handle": 18446744073709551615,
+    "author": "Unknown",
+    "baseplate": "GrasslandBaseplate",
+    "modified_since_publish": true,
+    "tags": [
+        "map",
+        "tdm"
+    ]
+}
