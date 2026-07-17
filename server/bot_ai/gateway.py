@@ -352,14 +352,80 @@ class BotActionGateway:
                 return False
         return True
 
+    def _oriented_launch_safe(self, player: "Player", direction, spec) -> bool:
+        """Revalidate the live muzzle lane before launching an explosive."""
+
+        eye = tuple(float(value) for value in player.eye)
+        radius = max(0.0, float(getattr(spec, "blast_radius", 0.0) or 0.0))
+        world = getattr(self.server, "world_manager", None)
+        raycast = getattr(world, "raycast", None)
+        if callable(raycast):
+            try:
+                hit = raycast(
+                    eye[0],
+                    eye[1],
+                    eye[2],
+                    direction[0],
+                    direction[1],
+                    direction[2],
+                    radius + 3.0,
+                )
+            except (TypeError, ValueError):
+                return False
+            if hit is not None:
+                return False
+
+        for teammate in tuple(getattr(self.server, "players", {}).values()):
+            if int(getattr(teammate, "id", -1)) == int(player.id):
+                continue
+            if int(getattr(teammate, "team", -1)) != int(player.team):
+                continue
+            if not bool(getattr(teammate, "alive", False)) or not bool(
+                getattr(teammate, "spawned", False)
+            ):
+                continue
+            try:
+                teammate_eye = tuple(float(value) for value in teammate.eye)
+            except (AttributeError, TypeError, ValueError):
+                return False
+            relative = tuple(
+                teammate_eye[index] - eye[index] for index in range(3)
+            )
+            along = sum(
+                relative[index] * direction[index] for index in range(3)
+            )
+            if not 0.75 < along < 96.0:
+                continue
+            closest = tuple(
+                eye[index] + direction[index] * along for index in range(3)
+            )
+            lateral = math.sqrt(
+                sum(
+                    (teammate_eye[index] - closest[index]) ** 2
+                    for index in range(3)
+                )
+            )
+            if lateral <= 1.75:
+                return False
+        return True
+
     def oriented(self, player: "Player", action: BotAction) -> bool:
         """Launch an equipped oriented weapon through its shared action service."""
 
         tool = int(action.tool_id)
-        if tool not in _ORIENTED_SPEEDS or not self.select_tool(player, tool):
+        if tool not in _ORIENTED_SPEEDS:
             return False
         direction = self._normalized(getattr(player, "orientation", ()))
         if direction is None:
+            return False
+        from server.projectiles import PROJECTILE_SPECS
+
+        spec = PROJECTILE_SPECS.get(tool)
+        if (
+            spec is None
+            or not self._oriented_launch_safe(player, direction, spec)
+            or not self.select_tool(player, tool)
+        ):
             return False
         speed = _ORIENTED_SPEEDS[tool]
         eye = tuple(float(value) for value in player.eye)
@@ -373,11 +439,6 @@ class BotActionGateway:
             direction[index] * speed + player_velocity[index] * 0.35
             for index in range(3)
         )
-        from server.projectiles import PROJECTILE_SPECS
-
-        spec = PROJECTILE_SPECS.get(tool)
-        if spec is None:
-            return False
         if spec.behavior in ("contact", "deploy"):
             fuse = 0.0
         elif spec.behavior == "stick":

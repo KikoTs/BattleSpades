@@ -11,7 +11,7 @@ from server.game_constants import TEAM1, TEAM2  # noqa: E402
 from server.map_metadata import MapZone  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer, MinimapZone  # noqa: E402
+from shared.packet import ChangePlayer, MinimapZone, PickPickup, SetScore  # noqa: E402
 
 
 class _World:
@@ -48,7 +48,7 @@ class _Server:
     def broadcast_destroy_entity(self, entity_id):
         self.destroyed.append(entity_id)
 
-    def broadcast_set_score(self, _team):
+    def broadcast_set_score(self, _team, reason=None):
         pass
 
 
@@ -109,6 +109,11 @@ def test_ctf_flag_hides_on_pickup_and_reappears_when_carrier_dies():
     asyncio.run(mode._pickup_intel(player, TEAM2))
     assert mode._intel_entities[TEAM2] is None
     assert server.entity_registry.get(original_id) is None
+    pickup = _packets(server, PickPickup)[-1]
+    assert pickup.player_id == player.id
+    assert pickup.pickup_id == int(C.INTEL_PICKUP)
+    # Retail uses this wire bit to render the carrier's burdened/special state.
+    assert pickup.burdensome == 1
     visibility = _packets(server, ChangePlayer)
     assert visibility[-1].player_id == player.id
     assert visibility[-1].type == C.SET_HIGH_MINIMAP_VISIBILITY
@@ -245,3 +250,73 @@ def test_ctf_objective_rebuild_preserves_shared_map_resources():
     assert server.entity_registry.get(resource.entity_id) is resource
     assert resource.entity_id not in server.destroyed
     assert len(server.entity_registry.all()) == 5
+
+
+def test_ctf_capture_awards_retail_personal_and_team_scores():
+    server = _Server()
+    mode = CTFMode(server)
+    asyncio.run(mode.on_mode_start())
+    player = SimpleNamespace(
+        id=7, name="Blue", team=TEAM1, alive=True, spawned=True,
+        x=200.0, y=210.0, z=40.0, vx=0.0, vy=0.0, vz=0.0,
+        pickup_id=None, pickup_burdensome=False, pickup_state=None,
+        _world_object=None, captures=0, score=0,
+    )
+
+    asyncio.run(mode._pickup_intel(player, TEAM2))
+    asyncio.run(mode._capture_intel(player, TEAM2))
+
+    assert player.captures == 1
+    assert player.score == 10
+    assert server.teams[TEAM1].score == 1
+    personal = _packets(server, SetScore)[-1]
+    assert personal.type == int(C.SCORE.PLAYER)
+    assert personal.specifier == player.id
+    assert personal.reason == int(C.SCORE_REASON.CTF_CAPTURE_SCORE_REASON)
+    assert personal.value == 10
+
+
+def test_ctf_player_touch_return_awards_retail_claim_point():
+    server = _Server()
+    mode = CTFMode(server)
+    asyncio.run(mode.on_mode_start())
+    player = SimpleNamespace(id=8, score=4)
+
+    asyncio.run(mode._return_intel(TEAM1, returned_by=player))
+
+    assert player.score == 5
+    personal = _packets(server, SetScore)[-1]
+    assert personal.reason == int(C.SCORE_REASON.CTF_CLAIM_SCORE_REASON)
+    assert personal.value == 5
+
+
+def test_ctf_and_classic_award_one_personal_point_for_enemy_kill():
+    server = _Server()
+    mode = CTFMode(server)
+    killer = SimpleNamespace(id=3, team=TEAM1, score=6)
+    victim = SimpleNamespace(id=4, team=TEAM2)
+
+    asyncio.run(mode.on_player_kill(killer, victim, kill_type=0))
+
+    assert killer.score == 7
+    personal = _packets(server, SetScore)[-1]
+    assert personal.type == int(C.SCORE.PLAYER)
+    assert personal.specifier == killer.id
+    assert personal.reason == int(C.SCORE_REASON.KILL_SCORE_REASON)
+    assert personal.value == 7
+
+
+def test_ctf_does_not_score_teamkill_suicide_or_post_round_kill():
+    server = _Server()
+    mode = CTFMode(server)
+    killer = SimpleNamespace(id=3, team=TEAM1, score=6)
+    teammate = SimpleNamespace(id=4, team=TEAM1)
+
+    asyncio.run(mode.on_player_kill(killer, teammate, kill_type=0))
+    asyncio.run(mode.on_player_kill(killer, killer, kill_type=0))
+    mode.ended = True
+    enemy = SimpleNamespace(id=5, team=TEAM2)
+    asyncio.run(mode.on_player_kill(killer, enemy, kill_type=0))
+
+    assert killer.score == 6
+    assert not _packets(server, SetScore)

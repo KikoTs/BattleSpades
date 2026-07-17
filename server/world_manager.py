@@ -124,6 +124,13 @@ class WorldManager:
         # Columns modified since map load — what a matched-CRC client is
         # missing relative to its local file. Sent as the MapSync delta.
         self.dirty_columns: set[tuple[int, int]] = set()
+        # Exact air overrides accumulated since map load, packed as one
+        # 240-bit mask per (x, y) column. MapSync remains the primary bulk
+        # transfer, but the retail VXL worker can occasionally retain stale
+        # native collision/mesh state after a heavily drilled column merge.
+        # A late joiner replays these cells after entering GameScene. Bitmasks
+        # avoid retaining one Python tuple per destroyed voxel.
+        self._air_override_masks: dict[tuple[int, int], int] = {}
         self.map_metadata = MapMetadata()
         self._surface_cache: dict[tuple[int, int], int] = {}
         self._spawn_candidates: dict[int, list[tuple[int, int]]] = {
@@ -164,6 +171,7 @@ class WorldManager:
             self._full_sync_chunks = None
             self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
+            self._air_override_masks = {}
             self.topology_version = 0
             self._surface_cache.clear()
             self._spawn_candidates = {TEAM1: [], TEAM2: []}
@@ -208,6 +216,7 @@ class WorldManager:
         self._full_sync_chunks = None
         self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
+        self._air_override_masks = {}
         self.topology_version = 0
         self._surface_cache.clear()
         self._spawn_candidates = {TEAM1: [], TEAM2: []}
@@ -263,14 +272,81 @@ class WorldManager:
             return False
         if solid:
             self.map.set_point(x, y, z, self._canonical_vxl_color(color))
+            self._set_air_override(x, y, z, False)
         else:
             self.map.remove_point(x, y, z)
+            self._set_air_override(x, y, z, True)
         self._surface_cache.pop((x, y), None)
         self.dirty_columns.add((x, y))
         self.clear_block_damage(x, y, z)
         published_color = self._canonical_vxl_color(color) & 0xFFFFFF
         self._publish_mutations(((x, y, z, bool(solid), published_color),))
         return True
+
+    def restore_static_light_block(
+        self,
+        x: int,
+        y: int,
+        z: int,
+        color: tuple[int, int, int],
+    ) -> bool:
+        """Mirror the voxel created by a retail ``FlareBlockEntity``.
+
+        Native ``vxl.pyd`` first removes exposed chroma-key marker voxels.
+        ``FlareBlockEntity.post_initialize`` then adds the cell back with the
+        resolved RGB while registering its point light.  The authoritative
+        collision map must perform the same second half or clients collide
+        with a block through which server movement can pass.
+
+        This is load-derived map state, not a player mutation: the raw VXL
+        still carries the marker and packet 21 supplies its final colour, so
+        no dirty-column, reconnect, navigation-delta, or mutation-journal
+        record is emitted here.  It runs on the gameplay thread during map
+        resource construction.
+        """
+        x, y, z = int(x), int(y), int(z)
+        if self.map is None or not self._valid_block_position(x, y, z):
+            return False
+        self.map.set_point(x, y, z, self._canonical_vxl_color(color))
+        self._surface_cache.pop((x, y), None)
+        self.clear_block_damage(x, y, z)
+        return True
+
+    def _set_air_override(self, x: int, y: int, z: int, air: bool) -> None:
+        """Update the compact reconnect repair index for one committed cell.
+
+        The index intentionally records any cell made air, including a
+        player-built block that was later destroyed. Replaying an exact
+        removal against pristine air is harmless, while omitting it can leave
+        native collision behind when the retail map worker rejected a prior
+        column update.
+        """
+
+        key = (int(x), int(y))
+        bit = 1 << int(z)
+        mask = int(self._air_override_masks.get(key, 0))
+        if air:
+            self._air_override_masks[key] = mask | bit
+            return
+        mask &= ~bit
+        if mask:
+            self._air_override_masks[key] = mask
+        else:
+            self._air_override_masks.pop(key, None)
+
+    def snapshot_air_overrides(self) -> tuple[tuple[int, int, int], ...]:
+        """Return immutable per-column air masks for one MapSync boundary.
+
+        Called only while preparing a join snapshot on the gameplay thread.
+        No voxel scan occurs: cost is proportional to columns that currently
+        retain a destroyed cell, and each column occupies one tuple.
+        """
+
+        return tuple(
+            (x, y, int(mask))
+            for (x, y), mask in sorted(self._air_override_masks.items())
+            if mask
+        )
 
     def subscribe_mutations(
         self,
@@ -341,6 +417,103 @@ class WorldManager:
         """A column whose topmost solid is the forced waterbed (z >= 239) is
         open water; land columns surface at or above the waterplane (z<=238)."""
         return self._get_surface_z(x, y) > MAP_Z - 2
+
+    def spawn_position_is_safe(
+        self, position: Tuple[float, float, float]
+    ) -> bool:
+        """Return whether a mode-authored player position is usable as-is.
+
+        Mode spawns may be inside authored buildings, so this deliberately
+        validates the body position instead of replacing it with the column's
+        topmost surface. Open water, non-finite/out-of-world coordinates, and
+        positions embedded in terrain are never valid life anchors.
+        """
+        try:
+            x, y, z = (float(position[index]) for index in range(3))
+        except (IndexError, TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            return False
+        if not (0.0 <= x < MAP_X and 0.0 <= y < MAP_Y):
+            return False
+        if not (-float(MAP_Z) <= z < float(MAP_Z)):
+            return False
+        cell_x, cell_y = int(math.floor(x)), int(math.floor(y))
+        if self.map is None or self.is_water_column(cell_x, cell_y):
+            return False
+        return not self.clipbox(x, y, z) and not self.clipbox(x, y, z + 1.0)
+
+    def _nearest_safe_spawn_point(
+        self, x: float, y: float, *, search: int
+    ) -> Tuple[float, float, float] | None:
+        """Find the closest ordinary terrain spawn around an invalid anchor."""
+        center_x, center_y = int(math.floor(x)), int(math.floor(y))
+        for radius in range(max(0, int(search)) + 1):
+            ring: list[tuple[float, int, int]] = []
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    cell_x, cell_y = center_x + dx, center_y + dy
+                    if not (1 <= cell_x < MAP_X - 1 and 1 <= cell_y < MAP_Y - 1):
+                        continue
+                    ring.append(
+                        (
+                            (float(cell_x) + 0.5 - x) ** 2
+                            + (float(cell_y) + 0.5 - y) ** 2,
+                            cell_x,
+                            cell_y,
+                        )
+                    )
+            for _distance, cell_x, cell_y in sorted(ring):
+                if not self._safe_spawn_column(cell_x, cell_y):
+                    continue
+                surface_z = self._get_surface_z(cell_x, cell_y)
+                return (
+                    float(cell_x) + 0.5,
+                    float(cell_y) + 0.5,
+                    float(surface_z)
+                    - PLAYER_STANDING_POS_ABOVE_GROUND
+                    - 0.5,
+                )
+        return None
+
+    def sanitize_spawn_point(
+        self,
+        position: Tuple[float, float, float],
+        team: int,
+        *,
+        local_search: int = 64,
+    ) -> Tuple[float, float, float]:
+        """Return a dry final life anchor for a mode-proposed spawn.
+
+        Every life-creation path calls this after its mode resolver. Valid
+        authored interiors remain untouched. Invalid or water positions move
+        to nearby safe terrain when possible, then fall back to the team's
+        prewarmed production spawn pool.
+        """
+        if self.spawn_position_is_safe(position):
+            return tuple(float(position[index]) for index in range(3))
+
+        try:
+            x, y = float(position[0]), float(position[1])
+        except (IndexError, TypeError, ValueError):
+            x = y = math.nan
+        resolved = (
+            self._nearest_safe_spawn_point(x, y, search=local_search)
+            if math.isfinite(x) and math.isfinite(y)
+            else None
+        )
+        if resolved is None:
+            resolved = self.get_spawn_point(int(team))
+        logger.warning(
+            "Relocated invalid spawn on %s for team %s: %r -> %r",
+            self.map_name or "<unloaded>",
+            team,
+            position,
+            resolved,
+        )
+        return tuple(float(value) for value in resolved)
 
     def dry_ground_anchor(
         self, x: float, y: float, search: int = 24
@@ -641,13 +814,24 @@ class WorldManager:
                 if base is not None:
                     # Official stock-map coordinates are unavailable, but a
                     # team still needs one coherent fallback base rather than
-                    # spawning anywhere in a 128x256 region. Keep random spawn
-                    # variation inside a compact 24-block base perimeter.
+                    # spawning anywhere in a 128x256 region. Start with a
+                    # compact perimeter, then expand only enough to avoid maps
+                    # such as Double Dragon collapsing a whole team onto one
+                    # isolated safe column.
                     bx, by = base
-                    clustered = [
-                        (x, y) for x, y in choices
-                        if (x - bx) ** 2 + (y - by) ** 2 <= 24 ** 2
-                    ]
+                    target_count = min(8, len(choices))
+                    cluster_radius = 24
+                    clustered: list[tuple[int, int]] = []
+                    while cluster_radius <= 64:
+                        clustered = [
+                            (x, y)
+                            for x, y in choices
+                            if (x - bx) ** 2 + (y - by) ** 2
+                            <= cluster_radius ** 2
+                        ]
+                        if len(clustered) >= target_count:
+                            break
+                        cluster_radius += 4
                     if clustered:
                         choices = clustered
             random.shuffle(choices)
@@ -718,6 +902,7 @@ class WorldManager:
                 continue
 
             self.map.remove_point_nochecks(x, y, z)
+            self._set_air_override(x, y, z, True)
             self._surface_cache.pop((x, y), None)
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)

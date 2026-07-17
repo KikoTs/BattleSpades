@@ -8,6 +8,46 @@ max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 
+# Used only by run_map_creator.py / BattleSpadesMapCreator.exe.
+# `project` reopens an existing .ugc/.vxl/.txt triplet or names a new one.
+# Relative project/output/retail paths are resolved beside the executable.
+# `terrain` is used only when creating a project; it never silently replaces
+# an existing map. CLI flags override these values, and --overwrite is
+# intentionally CLI-only.
+[map_creator]
+project = "MyUGCMap"
+output_dir = "ugc-projects"
+terrain = ""          # blank = grassland for new maps; or desert/lunar/mountain/grassland/temple/urban/marsh/snowy/water
+target_mode = ""      # blank = preserve existing / tdm for new; or tdm/ctf/dem/mh/oc/tc/vip/zom/dia
+retail_root = ""      # blank = auto-discover; otherwise AoS directory containing ugc/maps and ugc/kv6
+
+# Optional registration in the original retail Steam server browser. The
+# supplied Valve runtime must be 32-bit; BattleSpades runs it in an isolated
+# helper so a DLL/backend failure cannot stall gameplay. Proprietary DLLs are
+# intentionally not bundled. Put steam_api.dll in ./steam-runtime; compatible
+# Steam client libraries are auto-discovered or selected with steamclient_dir.
+[steam]
+enabled = true
+app_id = 224540              # fixed Ace of Spades app; 480 is Spacewar
+runtime_dir = "G:/AoSRevival/aceofspades_decompiled"            # empty = ./steam-runtime or env override
+steamclient_dir = ""         # empty = auto-detect the installed Steam folder
+helper_path = ""             # empty = bundled Windows x86 helper
+# Safe default: use Steam's installed client runtime. The old steamclient.dll
+# supplied with decompiled builds can block forever in SteamGameServer_Init.
+use_supplied_steamclient = false
+steam_port = 8766            # original master/updater UDP port
+query_port = 0               # 0 = server.port + 1; must be separately forwarded
+public = true                # false selects LAN/no-master mode
+secure = false               # true requests VAC mode; false is public insecure
+region = ""                  # optional retail region filter value
+game_version = "1.0.0.0"     # exact original wrapper version
+protocol_version = 168       # emitted as the retail v168 browser tag
+playlist_id = 8
+texture_skin = ""            # blank auto-selects mafia skin for Mafia/VIP
+require_registration = false # true makes startup fail if Steam cannot log on
+startup_timeout_seconds = 8.0
+publish_interval_seconds = 1.0
+
 # Revival web registry, launcher identity, and persistent leaderboard bridge.
 # Set AOS_MASTER_WRITE_TOKEN in the server process environment to the same
 # secret configured on Vercel. Never place that secret in this file.
@@ -31,6 +71,10 @@ max_pending_packets = 4096
 packet_drain_budget = 4096
 plugin_event_budget_ms = 2.0
 max_map_mutation_journal = 8192
+# Reassert this many pre-existing destroyed cells per joining ClientData.
+# The player remains gameplay-gated until the exact Drill/mining/explosion
+# repair is complete, preventing stale invisible collision after reconnect.
+map_air_catchup_batch_limit = 256
 entity_tick_batch_limit = 8192
 mode_event_queue_limit = 8192
 mode_event_drain_budget = 512
@@ -44,15 +88,23 @@ world_mutation_timeout_ticks = 180
 # bounded queue so model expansion cannot monopolize a 60 Hz simulation tick.
 prefab_queue_limit = 32
 prefab_cell_batch_limit = 16
+# Maximum already-decoded prefab cells checked for world contact per tick.
+# UGC model decoding/rotation is off-thread; this keeps validation bounded.
+prefab_validation_batch_limit = 1024
 # Delayed canonical reassertion of rejected or cancelled client predictions.
-# Successful builds, prefabs, digs, and collapses already have one reliable
-# gameplay packet and must not be enrolled here: replaying them runs native
-# placement/damage particle callbacks twice.
+# Successful ordinary builds/prefabs/digs are not replayed because that would
+# run native placement/damage particles twice. Unsupported collapses are the
+# exception: each client derives the fallen component locally, so the server
+# later confirms its exact air cells with non-cascading type-6 Damage packets.
 terrain_repair_enabled = true
 terrain_repair_queue_limit = 8192
 terrain_repair_batch_limit = 8
 terrain_repair_interval_ticks = 3
 terrain_repair_delay_ticks = 120
+# Collapse confirmations start after 0.3 seconds at 60 Hz. Eight cells every
+# three ticks bounds reliable traffic while clearing the visible shell first.
+terrain_collapse_repair_batch_limit = 8
+terrain_collapse_repair_delay_ticks = 18
 # Let MapEnded(52) move retail clients into the terminal/reconnect scene before
 # the old ENet session closes with MATCH_ENDED(18).
 transition_grace_seconds = 1.25
@@ -79,6 +131,9 @@ map_sync_mode = "full"
 friendly_fire = false
 fall_damage = true
 build_damage = true
+# Radar packet 21 carries this value as a native visible countdown. The server
+# removes the station on the same deadline, so team visibility cannot linger.
+radar_station_lifetime_seconds = 35.0
 
 [lobby]
 # Stock Match Lobby choices are 2,4,...24 players. Dedicated servers accept
@@ -89,6 +144,10 @@ build_damage = true
 # Empty discovers every .vxl in world.maps_path. Otherwise this exact order is
 # used for the F1/F2/F3 map vote; missing files are logged and skipped.
 map_rotation = []
+# Full map rollovers hold the native scores/credits overlay for this many
+# seconds after voting resolves, then send MapEnded and reload every retained
+# peer. Same-map /restart never opens the terminal overlay.
+end_screen_seconds = 12.0
 
 # Exact Match Lobby rule names recovered from gameRulesPanel.pyc. Values are
 # validated at startup; unknown names and unsupported slider values are fatal
@@ -244,6 +303,7 @@ time_limit = 1800      # shipped CTF clock (30 minutes)
 
 [modes.cctf]
 time_limit = 5400      # shipped Classic CTF clock (90 minutes)
+score_limit = 5        # shipped Match Lobby target (intel captures)
 intel_auto_return = false
 shoot_with_intel = true
 
@@ -280,9 +340,9 @@ time_limit = 900
 # Team names are STRING-TABLE IDS the client localizes (TEAM1_COLOR -> "Blue"),
 # NOT literal text — literals render as "Missing string <name>" in-game.
 team1_name = "TEAM1_COLOR"
-team1_color = [0, 0, 255]
+team1_color = [44, 117, 179]  # retail AoS blue; pure RGB makes HUD/blocks glow
 team2_name = "TEAM2_COLOR"
-team2_color = [0, 255, 0]
+team2_color = [137, 179, 44]   # retail AoS green
 auto_balance = true
 balance_threshold = 2
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import time
 
+import shared.constants as C
+
 from protocol.handler_registry import register_handler
 
 logger = logging.getLogger(__name__)
@@ -92,8 +94,23 @@ async def handle_client_data(server, player, packet) -> None:
         packet.palette_enabled,
     )
     from server.game_rules import get_rules
-    if get_rules(server.config).is_tool_enabled(packet.tool_id):
+    tool_allowed = get_rules(server.config).is_tool_enabled(packet.tool_id)
+    mode_gate = getattr(getattr(server, "mode", None), "allows_equipped_tool", None)
+    if tool_allowed and callable(mode_gate):
+        tool_allowed = bool(mode_gate(player, int(packet.tool_id)))
+    if tool_allowed:
         player.set_tool(packet.tool_id, raw=True)
+        # The original UGC host paints its local VXL before packet-7
+        # replication.  Direct dedicated-editor clients safely join as UGC
+        # clients and may therefore expose only held input here.  Reconstruct
+        # the brush through the same authoritative paint service.
+        if int(packet.tool_id) == int(C.PAINTBRUSH_TOOL) and (
+            bool(getattr(packet, "primary", False))
+            or bool(getattr(packet, "secondary", False))
+        ):
+            from server.combat_runtime import get_combat_system
+
+            get_combat_system(server).handle_paintbrush_input(player, packet)
 
     capture = bool(getattr(server.config, "movement_debug_capture", False))
     if capture and logger.isEnabledFor(logging.DEBUG):

@@ -86,6 +86,15 @@ jobs:
       - name: Compile native extensions
         run: python setup.py build_ext --inplace
 
+      - name: Build isolated x86 Steam bridge
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cmake -S tools/steam_bridge -B build/steam-bridge -A Win32
+          if ($LASTEXITCODE -ne 0) { throw "Steam bridge configure failed" }
+          cmake --build build/steam-bridge --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Steam bridge build failed" }
+
       - name: Run complete source test suite
         run: python -m pytest tests -q
 
@@ -114,6 +123,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "packaged --version failed" }
             & "$($bundle.FullName)\BattleSpades.exe" --check
             if ($LASTEXITCODE -ne 0) { throw "packaged --check failed" }
+            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "tutorial --version failed" }
+            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --check
+            if ($LASTEXITCODE -ne 0) { throw "tutorial --check failed" }
+            & "$($bundle.FullName)\BattleSpadesMapCreator.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "map creator --version failed" }
           } finally {
             Pop-Location
           }
@@ -127,6 +142,9 @@ jobs:
           cd "$RUNNER_TEMP"
           "$bundle/BattleSpades" --version
           "$bundle/BattleSpades" --check
+          "$bundle/BattleSpadesTutorial" --version
+          "$bundle/BattleSpadesTutorial" --check
+          "$bundle/BattleSpadesMapCreator" --version
 
       - name: Upload native zip
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

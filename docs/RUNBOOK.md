@@ -25,6 +25,16 @@ ground truth and reverse-engineering workflow live in [PROTOCOL.md](PROTOCOL.md)
 # Server (from BattleSpades; logs -> logs/log.txt, faulthandler.log)
 py run_server.py
 
+# Reconstructed retail tutorial (isolated; never use run_server.py for this)
+py -3.12 run_tutorial.py --check
+py -3.12 run_tutorial.py              # optional: --port 27016
+
+# Hosted retail Map Creator (isolated; retail UGC assets are user-supplied)
+py -3.12 run_map_creator.py --check `
+  --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
+py -3.12 run_map_creator.py --project MyMap --terrain grassland `
+  --target-mode ctf --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
+
 # Game client (from AceOfSpades_no_steam_new; MUST use the bundled py2!)
 .\python\python.exe launcher.py +s
 
@@ -34,6 +44,84 @@ Get-CimInstance Win32_Process | ? {$_.CommandLine -match 'run_server'} | % {Stop
 # Rebuild Cython after editing aoslib/world.pyx etc. (server must be stopped)
 py setup.py build_ext --inplace
 ```
+
+The tutorial launcher verifies the exact `Training.vxl` SHA-256 before it
+opens a socket. It then locks mode 10, allocates one of the map's twelve
+authored lanes per player, restores that lane's five targets when reused, and
+drives the stock HelpPanel, target counter, completion sound, and exit
+countdown. The player begins with no selectable tools; packet 13 atomically
+grants/equips the pistol at Shooting, then grants pistol/block/spade (with the
+spade selected) at Climb. Bots, plugins, map votes/rotation, master
+registration, normal map entities, and competitive damage are disabled only
+for this process. The normal mode registry intentionally contains no `tut`
+entry.
+
+The Map Creator launcher creates or resumes a sibling `.vxl`/`.txt`/`.ugc`
+project triplet. New projects default to `ugc-projects/`; pass an explicit
+`.ugc` path or `--output-dir` to change that location. `--overwrite` replaces
+the triplet from the selected retail baseplate. The normal server mode registry
+intentionally contains no `ugc` entry, and editor startup disables bots,
+plugins, voting, rotation, Steam registration, damage, and competitive round
+rules in memory.
+
+The persistent launcher defaults live in `config.toml`:
+
+```toml
+[map_creator]
+project = "MyUGCMap"       # project name, or a path to an existing .ugc
+output_dir = "ugc-projects"
+terrain = ""               # blank/new = grassland; see --help for all nine
+target_mode = ""           # blank = preserve existing; new projects use tdm
+retail_root = ""           # AoS directory containing ugc/maps and ugc/kv6
+```
+
+Command-line values take precedence over this table. Relative project and
+output paths are resolved from the application root, not the terminal's
+current directory. For example, either of these reopens the same authored map:
+
+```powershell
+py -3.12 run_map_creator.py --project MyUGCMap
+py -3.12 run_map_creator.py --project .\ugc-projects\MyUGCMap.ugc
+```
+
+At startup the launcher prints the resolved sidecar, editable VXL, metadata,
+and exact reopen command. With the defaults above the files are:
+
+```text
+ugc-projects/MyUGCMap.ugc  # title, author, palette, Game Data objects, tags
+ugc-projects/MyUGCMap.vxl  # authoritative edited voxel terrain
+ugc-projects/MyUGCMap.txt  # baseplate presentation metadata
+ugc-projects/MyUGCMap.png  # optional overhead preview when supplied
+```
+
+Small `.ugc` metadata changes checkpoint atomically at most once per second.
+The full VXL is intentionally serialized only during a clean editor shutdown,
+outside the 60 Hz gameplay loop. Stop with Ctrl+C and wait for shutdown to
+finish; force-killing the process discards terrain edits made since startup.
+`--terrain` selects a baseplate only when creating a project (or when explicitly
+replacing one with `--overwrite`). `--target-mode` may reopen an existing
+project under a different validation ruleset.
+
+Clean-client Map Creator acceptance is:
+
+1. Run `--check` and require `9 terrain triplets` plus at least 400 installed
+   KV6 files.
+2. Join from a fresh retail process, finish LoadingMenu, and press Start.
+3. Require the six native tab counts `138/90/47/47/26/25` and a 373-entry
+   prefab catalog. Select up to five combined Constructs/Game Data items.
+4. Place, rotate, and erase a small prefab; place an ammo point and the target
+   mode's required spawn/base objects. Reconnect and require identical terrain,
+   raw prefab colors, objects, palette, and validation rows.
+5. Place a large catalog model while watching tick metrics. Packet drain must
+   remain below 10 ms; preparation must not block the gameplay thread, and the
+   client must remain in GameScene after the final commit.
+6. Stop with Ctrl+C and verify that the VXL and sidecar timestamps advance and
+   no `.tmp` checkpoint remains.
+
+Do not introspect native Character/world fields during the immediate spawn
+transition with the tracer console; the stock client can dereference an
+incomplete scene and create a misleading crash dump. Use menu/state queries
+until GameScene is settled.
 
 ## Controlling the live game (no human needed)
 
@@ -118,9 +206,24 @@ Gotchas:
 `plugin_event_budget_ms`, `entity_tick_batch_limit`,
   `packet_drain_budget`, `mode_event_queue_limit`,
   `mode_event_drain_budget`, and `max_map_mutation_journal`.
-- If the mutation journal overflows while a client is still joining, the server
-  disconnects that join rather than replaying an incomplete block-edit history.
-  That client should reconnect for a fresh map snapshot.
+- A joining client snapshots the canonical per-cell terrain sequence when its
+  MapSync stream is complete. Edits before that cursor are already in the VXL;
+  later edits coalesce by coordinate and replay as explicit-RGB builds or exact
+  removals before the client is admitted to gameplay.
+- If the bounded cell journal overflows while a client is still joining, the
+  server disconnects that join rather than replaying incomplete terrain. That
+  client should reconnect for a fresh contiguous map snapshot.
+- After changing VXL serialization or join orchestration, rebuild the native
+  modules and run the convergence gates:
+
+  ```powershell
+  py -3 setup.py build_ext --inplace
+  py -3 -m pytest tests/test_vxl_sync_stress.py tests/test_reversed_map_sync.py tests/test_join_mutation_catchup.py -q
+  ```
+
+  The stress decoder must match authoritative solidity and RGB, including
+  isolated voxels, caves, deletion-only columns, collapses, repeated edits,
+  simultaneous joiners, and a reliable-send retry inside a multi-cell batch.
 - Projectile collision advances before player physics. This mirrors the native
   frame where `process_packet_damage` (`gameScene.pyd:0x1018C270`) applies
   explosion prediction before the GameScene update core (`0x10149CF0`). Generic
@@ -171,6 +274,20 @@ py scripts\scenarios\movement_stress.py --launch --class-id 0 --repeats 1 `
 # than contaminating the grounded/block gate.
 py scripts\scenarios\movement_stress.py --launch --class-id 12 --repeats 1 `
   --segments settle,engineer_jetpack_hold
+
+# Rocketeer has two distinct equipment profiles. Validate the high-thrust Jump
+# Pack (66) and low-thrust Glide Pack/Jetpack2 (67) independently.
+py scripts\scenarios\movement_stress.py --launch --class-id 2 --repeats 1 `
+  --segments settle,rocketeer_jump_pack_hold
+py scripts\scenarios\movement_stress.py --launch --class-id 2 --repeats 1 `
+  --segments settle,rocketeer_jetpack2_hold
+
+Pack 66 release is deliberately asymmetric: observers receive the inactive
+state immediately, while the owner row waits for key-up plus grounded input
+settlement. Sending the inactive owner row at fuel exhaustion reproduced a
+0.628-block correction; delaying activation instead caused a 4.898-block hard
+snap. The clean retail reference artifact is
+`logs/playtester-docx/rocketeer-pack66-final/`.
 
 # Isolate the exact block -> sprint -> terrain-step landing regression.
 py scripts\scenarios\block_transition_ab.py --launch --class-id 0 `
@@ -258,6 +375,15 @@ py -m pytest -q
 py scripts\server_capacity.py --players 50 --seconds 30 --port 27016
 ```
 
+Root `pytest.ini` deliberately limits canonical discovery to `tests/`. Do not
+remove that boundary: developer snapshots under `tmp/` and `.worktrees/` may
+contain copied `test_*.py` modules and make an unconstrained recursive run look
+like a collection stall. To verify the release inventory first:
+
+```powershell
+py -3.12 -m pytest --collect-only -q
+```
+
 The gate must spawn all 50 players, sustain at least 58 Hz, keep tick p99 at or
 below 12 ms, and report zero dropped gameplay packets. A release candidate must
 also pass a 15-minute soak:
@@ -342,6 +468,23 @@ non-empty canonical VXL stream for official maps; checksum-only or delta-only
 stock-map joins are a release blocker because they create hollow/desynchronized
 worlds. Compare `aos_crash_*.dmp` counts before and after the join.
 
+For static-light coverage, repeat with `--map ArcticBase` and inspect the live
+scene after spawning:
+
+```powershell
+py scripts/game_console.py --port 32906 `
+  "[(int(v.r),int(v.g),int(v.b)) for v in manager.scene.entities.values() if type(v).__name__=='FlareBlockEntity']"
+```
+
+Expect 42 entries: 19 `(250,250,200)` and 23 `(255,255,82)`. Then validate the
+high-density boundary with `--map 20thCenturyTown`: expect 524 flare entities,
+533 total map entities including the nine fallback crates, a responsive
+`GameScene`, no new dump, and no `invalid entity`/traceback output. On the
+server, probe marker `(362,153,229)`; it must be solid with canonical colour
+`0x80FAFAC8`, while `dirty_columns` and the reconnect air-override journal stay
+empty. This distinguishes map-derived collision restoration from a player
+block mutation.
+
 ## CTF objective and minimap validation
 
 Use an isolated CTF server and a clean retail client. Do not validate packet 43
@@ -365,6 +508,35 @@ by sending legacy `BASE=1`; that type is absent from the retail entity table.
 
 Reject the build for a new dump, traceback, `invalid entity on destroy`, a
 missing marker, or a capture volume that does not match the visible base box.
+
+## Classic CTF retail validation
+
+Classic is an ordinary CTF scene with a feature bit, so validate both the wire
+identity and a real objective cycle:
+
+```powershell
+py -3.12 scripts/run_validation_server.py --port 27019 --map Crossroads --mode cctf
+py -3.12 scripts/auto_join.py --server 127.0.0.1:27019 --team 2 --class-id 0 --console-port 32901
+py -3.12 scripts/game_console.py --port 32901 "_={'mode':manager.game_mode,'classic':manager.classic,'players':[(int(i),int(p.class_id)) for i,p in scene.players.items()],'intel':len([e for e in scene.entities.values() if e.__class__.__name__ == 'IntelPickup'])}"
+```
+
+Require mode 8, `classic=1`, local class 5 (Deuce), minimap disabled, and
+exactly two IntelPickup entities. Pick up the enemy intel and return to the
+visible friendly base zone. The carrier must clear, personal score must rise by
+10, team score by one, and the intel must reappear three blocks from its home
+anchor. Repeat once after reconnect. The default vote must contain only
+Crossroads, Hiesville, ToTheBridge, Trenches, WinterValley, WW1, or Classic;
+an explicitly configured map list may override that catalog.
+
+Validate the Classic-only death representation separately. Run `/kill` and,
+before the respawn delay expires, require the native Character to report
+`dead=True`, `exploded=False`, and a loaded `classic_corpse`; the scene entity
+table must contain no `GraveEntity`. From a second client, shoot that corpse
+once and require it to disappear without an entity-11 create/destroy pair or a
+new dump. Repeated shots must do nothing. Also reconnect an observer while a
+corpse is visible, then shoot it during that observer's MapSync: reveal must
+produce one death transition followed by silent cleanup, never a duplicate
+KillAction.
 
 ## VIP retail validation
 
@@ -393,6 +565,23 @@ remaining teammate, confirm one team point and a clean new selection, then
 terminate an active VIP client and confirm disconnect follows the same death
 path. Compare crash-dump counts before/after and stop only the isolated clients
 and server.
+
+Keep both clients connected for at least 45 seconds and verify the native score
+reasons: a live boss gains 50 every ten seconds and a living guard within 15
+blocks gains 10 every five seconds. Move the guard outside the radius and
+confirm escort score stops. Throw repeated Molotovs during the same interval;
+fire entities must rise and decay instead of growing without bound.
+
+Run the headless performance companion on a private port:
+
+```powershell
+py -3.12 scripts/server_capacity.py --players 12 --seconds 45 --port 27021 --mode vip --map CityOfChicago
+```
+
+Require 58+ Hz, overall tick p99 at most 12 ms, zero gameplay/mode/terrain
+drops, bounded active fire, and VIP mode p99 comfortably below one millisecond.
+The separate bot-main-thread 0.75 ms gate remains a bot-runtime requirement;
+do not attribute that failure to VIP when the report identifies `bots` alone.
 
 ## Admin map, mode, and restart validation
 
@@ -440,10 +629,32 @@ editing files does not hot-reload the running server.
 To validate retail map voting, lower the round time on the isolated server or
 wait until its final minute. The localized next-map overlay must expose one to
 three candidates on F1/F2/F3. Cast from two clients, confirm the chosen map is
-announced in chat, and let the end sequence finish. The winner must be consumed
-only at that boundary and use the same retained-peer packet-52 loader
-transition.
+announced on the HUD, and let the end sequence finish. On an official map the
+client must receive final `GameStats(67)`, show the packet-53 scores/credits
+screen for `lobby.end_screen_seconds`, and only then enter the packet-52 loader.
+The winner must be consumed only at that boundary and use the same retained-peer
+loader transition.
 An unadvertised candidate packet must not affect the tally.
+
+Also validate the boundary cases on an isolated server:
+
+1. End a score-limited round before the final-minute vote and do not vote. The
+   ballot must remain open for its bounded deadline, then choose the first
+   rotated candidate and continue; the server must not restart the old map
+   early.
+2. Join a second client while the ballot is open. Once its first ClientData
+   finishes world reveal it must receive the live vote records and current
+   counts. Join another client but leave it inside MapSync when rollover starts;
+   that peer must receive reason 18 and must never receive a second interleaved
+   VXL stream.
+3. Select an unavailable/stale target through a test/plugin ballot. No packet
+   53 or 52 may be sent; the current map must restart safely.
+4. Run the same end on `Training` or another map without a bundled level
+   screenshot. Packet 53 must be absent, the configured dwell must still occur,
+   and packet 52 must start the ordinary validated rollover.
+5. Issue an admin `/map`, `/mode`, or `/restart` during the pre-transition end
+   timer. The old end task must cancel and must never wake later to replace the
+   administrator's selected epoch.
 
 ## Bot runtime validation
 
@@ -473,6 +684,16 @@ equipment use is intentionally probabilistic. The capacity gate must sustain
 58+ Hz, keep overall tick p99 at or below 12 ms and `subsystem_bots_p99_ms` at
 or below the configured 0.75 ms, keep worker memory below 256 MiB and CPU below
 one core, and report zero gameplay/mode/world-mutation drops.
+
+For a report that every bot froze at once while the server tick stayed healthy,
+run `/bots status`. A running worker with growing `silence` and no new actions
+is a worker-wide stall, not twelve simultaneous navigation failures. Production
+supervision waits through the eight-second startup grace, then automatically
+replaces a child that leaves a live-bot frame unanswered for five seconds;
+`stalls` records those watchdog restarts. If profiling is available, capture
+the child before restarting it; a stack inside `recast*.pyd` from
+`WorkerVoxelWorld._native_path_direction` is the known synchronous Detour
+signature. Do not stop the authoritative server to recover this condition.
 
 `bot_city_soak.py` loads the real CityOfChicago VXL and advances worker policy
 time without sleeping. It prints each bot's position, role, action, affordance,
@@ -543,6 +764,61 @@ movement affordance plus the current mode role. They remain off by default (`bot
 false`) and do not render client packets. Prefab work is controlled by
 `network.prefab_queue_limit` and `network.prefab_cell_batch_limit`; do not make
 either unbounded to accelerate large models.
+
+## Steam master-server listing
+
+Windows releases include the x86 bridge but not Valve binaries. Put the
+original signed x86 `steam_api.dll` in `steam-runtime/`, then set:
+
+```toml
+[steam]
+enabled = true
+runtime_dir = "steam-runtime"
+steamclient_dir = ""       # auto-discover desktop Steam
+steam_port = 8766
+query_port = 0              # game port + 1
+public = true
+secure = false
+require_registration = false
+```
+
+For a headless host without desktop Steam, set `steamclient_dir` to an
+operator-owned directory containing compatible x86 `steamclient.dll`,
+`tier0_s.dll`, and `vstdlib_s.dll`. Do not copy the 300 KB legacy
+`steamclient.dll` from the decompiled client: it was observed blocking inside
+`SteamGameServer_Init`. The helper watchdog contains that failure, but it
+cannot register it.
+
+Forward UDP for the ENet game port, `steam_port`, and the effective
+`query_port`. A healthy startup reports `Steam GameServer011 initialized` and
+then `Steam master logon complete: steam_id=...`. Verify both Valve
+registration and the public A2S socket from another network:
+
+```powershell
+py scripts\check_steam_registration.py 203.0.113.10 `
+  --game-port 27015 --query-port 27016
+```
+
+The checker uses Valve's public `ISteamApps/GetServersAtAddress` endpoint and
+then performs the optional A2S challenge round-trip. A pass proves that the
+server-owned registration path is healthy.
+
+The original server-list UI has two independent 2026 limitations:
+
+- Valve removed the `hl2master.steampowered.com` legacy list service used by
+  the 2015 client. All/Community can therefore show zero and finish with
+  `eServerFailedToRespond` even when the checker passes.
+- The retail `ServerInfo` class ignores the returned game port and always
+  joins UDP `32887`. Set `[server].port = 32887` and forward it when an
+  unmodified browser row/direct default is a deployment requirement.
+
+Do not change app `224540`, game dir `aceofspades`, or forge `white=1` to work
+around the retired client endpoint. A modern directory/client fallback is a
+separate client-distribution concern.
+
+`require_registration=false` is the production-safe default: the supervisor
+backs off while the game remains online. Set it true only when an orchestration
+system should treat missing Steam discovery as a failed deployment.
 
 ## Historical status (2026-06-12, evening — post map-sync fix)
 

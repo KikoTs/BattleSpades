@@ -16,6 +16,22 @@ from typing import List, Tuple, Optional
 from urllib.parse import urlsplit
 
 
+def _steam_token(name: str, value: object, limit: int) -> str:
+    """Validate one legacy ASCII tag/version token from untrusted TOML."""
+
+    token = str(value).strip()
+    if len(token) > limit:
+        raise ValueError(f"steam.{name} must be at most {limit} characters")
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+    )
+    if any(character not in allowed for character in token):
+        raise ValueError(
+            f"steam.{name} may contain only ASCII letters, digits, _, ., and -"
+        )
+    return token
+
+
 def _revival_token(name: str, value: object, limit: int) -> str:
     """Validate one short ASCII registry value from untrusted TOML."""
 
@@ -50,6 +66,46 @@ class BotConfig:
     seed: int = 0
     debug_visualization: bool = False
     configured: bool = False
+
+
+@dataclass
+class SteamMasterConfig:
+    """Optional legacy Steam master-server registration.
+
+    The retail AoS Steamworks runtime is 32-bit.  BattleSpades therefore
+    launches it through the isolated ``battlespades-steam-bridge`` helper;
+    these settings never load Valve DLLs into the authoritative server.
+    """
+
+    enabled: bool = False
+    app_id: int = 224540
+    runtime_dir: str = ""
+    # Directory containing a compatible x86 steamclient.dll plus tier0_s.dll
+    # and vstdlib_s.dll. Blank auto-discovers the installed Steam directory.
+    steamclient_dir: str = ""
+    helper_path: str = ""
+    # Copy a supplied steamclient.dll into the isolated runtime. The inspected
+    # legacy file can hang inside SteamGameServer_Init, so safe default is to
+    # let steam_api locate the installed Steam client instead.
+    use_supplied_steamclient: bool = False
+    steam_port: int = 8766
+    # Zero means game port + 1, matching the original separate query socket.
+    query_port: int = 0
+    public: bool = True
+    secure: bool = False
+    region: str = ""
+    game_version: str = "1.0.0.0"
+    protocol_version: int = 168
+    playlist_id: int = 8
+    texture_skin: str = ""
+    require_registration: bool = False
+    startup_timeout_seconds: float = 8.0
+    publish_interval_seconds: float = 1.0
+
+    def effective_query_port(self, game_port: int) -> int:
+        """Return the dedicated Steam query port for one game port."""
+
+        return int(self.query_port or (int(game_port) + 1))
 
 
 @dataclass
@@ -98,6 +154,10 @@ class ServerConfig:
     # snapshot and first ClientData. Overflow marks the join as unsafe instead
     # of admitting a desynced player.
     max_map_mutation_journal: int = 8192
+    # Exact pre-snapshot destroyed cells sent per ClientData while a reconnect
+    # remains gameplay-gated. At 256, a typical Drill tunnel converges in a
+    # handful of 60 Hz input frames without one join monopolizing the tick.
+    map_air_catchup_batch_limit: int = 256
     # Upper bound for per-frame behavior on_tick calls. Touch/proximity uses a
     # spatial index and still checks all relevant entities; this prevents a
     # pathological pile of ticking effects from monopolizing one frame.
@@ -118,6 +178,7 @@ class ServerConfig:
     # limits bound both retained placements and per-tick cell/packet work.
     prefab_queue_limit: int = 32
     prefab_cell_batch_limit: int = 16
+    prefab_validation_batch_limit: int = 1024
     # Reliable mutation packets are primary. This delayed, bounded canonical
     # replay repairs rare native BlockManager rejection/prediction divergence.
     terrain_repair_enabled: bool = True
@@ -128,6 +189,10 @@ class ServerConfig:
     terrain_repair_batch_limit: int = 8
     terrain_repair_interval_ticks: int = 3
     terrain_repair_delay_ticks: int = 120
+    # Native collapse is derived independently by each retail BlockManager.
+    # Confirm its exact air cells sooner, still in a bounded per-tick lane.
+    terrain_collapse_repair_batch_limit: int = 8
+    terrain_collapse_repair_delay_ticks: int = 18
     # Packet 52 gives the retail GameScene time to enter its terminal map
     # state before ENet reason 18 closes the old session. Zero is useful only
     # for deterministic tests; production should retain a visible grace.
@@ -141,6 +206,11 @@ class ServerConfig:
     fall_damage: bool = True
     build_damage: bool = True
     score_limit: int = 10
+    # RadarStationEntity only starts its native countdown when CreateEntity
+    # carries a non-zero fuse.  The shipped server behavior observed by the
+    # playtest team is roughly 35 seconds; keep the server expiry and wire
+    # countdown on the same configurable clock.
+    radar_station_lifetime_seconds: float = 35.0
     # This value is sent in InitialInfo and must also govern the authoritative
     # collision list.  A mismatch makes the native client predict through an
     # ally while the server injects a collision impulse, producing rollback.
@@ -163,6 +233,9 @@ class ServerConfig:
     # Empty means discover every .vxl in maps_path. A non-empty list is the
     # ordered catalog used by map voting and future lobby hosting.
     map_rotation: List[str] = field(default_factory=list)
+    # Seconds the retail statistics overlay remains visible after a map vote
+    # resolves and before MapEnded starts the next validated loader handshake.
+    end_screen_seconds: float = 12.0
     game_rules: GameRules = field(default_factory=GameRules.server_defaults)
 
     # Team settings
@@ -178,6 +251,7 @@ class ServerConfig:
     # New isolated runtime. ``configured`` distinguishes an explicit [bots]
     # table from legacy game.bot_count fixed-population behavior.
     bots: BotConfig = field(default_factory=BotConfig)
+    steam: SteamMasterConfig = field(default_factory=SteamMasterConfig)
     revival: RevivalMasterConfig = field(default_factory=RevivalMasterConfig)
 
     # Map-entity (crate/intel) wire emission. The Entity byte layout was
@@ -401,6 +475,18 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 seen_maps.add(folded)
                 normalized_rotation.append(name)
         config.map_rotation = normalized_rotation
+        config.end_screen_seconds = min(
+            120.0,
+            max(
+                0.0,
+                float(
+                    lobby.get(
+                        "end_screen_seconds",
+                        config.end_screen_seconds,
+                    )
+                ),
+            ),
+        )
 
     game_rule_data = data.get("game_rules", {})
     if game_rule_data:
@@ -423,6 +509,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "plugin_event_budget_ms", config.plugin_event_budget_ms)))
         config.max_map_mutation_journal = max(64, int(n.get(
             "max_map_mutation_journal", config.max_map_mutation_journal)))
+        config.map_air_catchup_batch_limit = max(1, int(n.get(
+            "map_air_catchup_batch_limit",
+            config.map_air_catchup_batch_limit)))
         config.entity_tick_batch_limit = max(64, int(n.get(
             "entity_tick_batch_limit", config.entity_tick_batch_limit)))
         config.mode_event_queue_limit = max(64, int(n.get(
@@ -441,6 +530,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "prefab_queue_limit", config.prefab_queue_limit))))
         config.prefab_cell_batch_limit = min(128, max(1, int(n.get(
             "prefab_cell_batch_limit", config.prefab_cell_batch_limit))))
+        config.prefab_validation_batch_limit = min(4096, max(64, int(n.get(
+            "prefab_validation_batch_limit",
+            config.prefab_validation_batch_limit))))
         config.terrain_repair_enabled = bool(n.get(
             "terrain_repair_enabled", config.terrain_repair_enabled))
         config.terrain_repair_queue_limit = max(64, int(n.get(
@@ -451,6 +543,12 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "terrain_repair_interval_ticks", config.terrain_repair_interval_ticks)))
         config.terrain_repair_delay_ticks = max(1, int(n.get(
             "terrain_repair_delay_ticks", config.terrain_repair_delay_ticks)))
+        config.terrain_collapse_repair_batch_limit = max(1, int(n.get(
+            "terrain_collapse_repair_batch_limit",
+            config.terrain_collapse_repair_batch_limit)))
+        config.terrain_collapse_repair_delay_ticks = max(1, int(n.get(
+            "terrain_collapse_repair_delay_ticks",
+            config.terrain_collapse_repair_delay_ticks)))
         config.transition_grace_seconds = min(5.0, max(0.0, float(n.get(
             "transition_grace_seconds", config.transition_grace_seconds))))
 
@@ -463,6 +561,18 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.fall_damage = g.get("fall_damage", config.fall_damage)
         config.build_damage = g.get("build_damage", config.build_damage)
         config.score_limit = max(0, int(g.get("score_limit", config.score_limit)))
+        config.radar_station_lifetime_seconds = min(
+            250.0,
+            max(
+                1.0,
+                float(
+                    g.get(
+                        "radar_station_lifetime_seconds",
+                        config.radar_station_lifetime_seconds,
+                    )
+                ),
+            ),
+        )
         config.same_team_collision = bool(g.get(
             "same_team_collision", config.same_team_collision
         ))
@@ -544,6 +654,116 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
         )
+
+    if "steam" in data:
+        steam = data["steam"]
+        if not isinstance(steam, dict):
+            raise ValueError("steam must be a TOML table")
+        config.steam.enabled = bool(steam.get("enabled", config.steam.enabled))
+        config.steam.app_id = int(steam.get("app_id", config.steam.app_id))
+        if config.steam.app_id != 224540:
+            raise ValueError(
+                "steam.app_id must be 224540; the retail browser filters the "
+                "Ace of Spades application, and app 480 is only Spacewar"
+            )
+        config.steam.runtime_dir = str(
+            steam.get("runtime_dir", config.steam.runtime_dir)
+        ).strip()
+        config.steam.steamclient_dir = str(
+            steam.get("steamclient_dir", config.steam.steamclient_dir)
+        ).strip()
+        config.steam.helper_path = str(
+            steam.get("helper_path", config.steam.helper_path)
+        ).strip()
+        config.steam.use_supplied_steamclient = bool(
+            steam.get(
+                "use_supplied_steamclient",
+                config.steam.use_supplied_steamclient,
+            )
+        )
+        config.steam.steam_port = int(
+            steam.get("steam_port", config.steam.steam_port)
+        )
+        config.steam.query_port = int(
+            steam.get("query_port", config.steam.query_port)
+        )
+        config.steam.public = bool(steam.get("public", config.steam.public))
+        config.steam.secure = bool(steam.get("secure", config.steam.secure))
+        config.steam.region = _steam_token(
+            "region",
+            steam.get("region", config.steam.region),
+            31,
+        )
+        config.steam.game_version = _steam_token(
+            "game_version",
+            steam.get("game_version", config.steam.game_version),
+            31,
+        )
+        if not config.steam.game_version:
+            raise ValueError("steam.game_version cannot be empty")
+        config.steam.protocol_version = max(
+            0,
+            int(steam.get("protocol_version", config.steam.protocol_version)),
+        )
+        config.steam.playlist_id = max(
+            0,
+            int(steam.get("playlist_id", config.steam.playlist_id)),
+        )
+        config.steam.texture_skin = _steam_token(
+            "texture_skin",
+            steam.get("texture_skin", config.steam.texture_skin),
+            31,
+        )
+        config.steam.require_registration = bool(
+            steam.get(
+                "require_registration",
+                config.steam.require_registration,
+            )
+        )
+        config.steam.startup_timeout_seconds = min(
+            60.0,
+            max(
+                1.0,
+                float(
+                    steam.get(
+                        "startup_timeout_seconds",
+                        config.steam.startup_timeout_seconds,
+                    )
+                ),
+            ),
+        )
+        config.steam.publish_interval_seconds = min(
+            10.0,
+            max(
+                0.25,
+                float(
+                    steam.get(
+                        "publish_interval_seconds",
+                        config.steam.publish_interval_seconds,
+                    )
+                ),
+            ),
+        )
+        if not 1 <= int(config.steam.steam_port) <= 65535:
+            raise ValueError("steam.steam_port must be a valid UDP port")
+        if config.steam.query_port and not 1 <= int(config.steam.query_port) <= 65535:
+            raise ValueError("steam.query_port must be a valid UDP port")
+        if config.steam.enabled:
+            effective_query = config.steam.effective_query_port(config.port)
+            if not 1 <= int(effective_query) <= 65535:
+                raise ValueError("steam.query_port must be a valid UDP port")
+            ports = {
+                int(config.port),
+                int(config.steam.steam_port),
+                int(effective_query),
+            }
+            if len(ports) != 3:
+                raise ValueError(
+                    "server.port, steam.steam_port, and the Steam query port "
+                    "must be distinct"
+                )
+        if config.steam.secure and not config.steam.public:
+            raise ValueError("steam.secure requires steam.public")
 
     if "revival" in data:
         revival = data["revival"]

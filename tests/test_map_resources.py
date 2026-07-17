@@ -20,6 +20,15 @@ class _Map:
         (41, 51, 61, 1),
     )
 
+    def __init__(self):
+        self.points = {}
+
+    def set_point(self, x, y, z, color):
+        self.points[(int(x), int(y), int(z))] = int(color)
+
+    def get_solid(self, x, y, z):
+        return (int(x), int(y), int(z)) in self.points
+
 
 class _World:
     map_name = "Fixture"
@@ -33,6 +42,18 @@ class _World:
 
     def dry_surface_anchor(self, x: float, y: float):
         return (float(x), float(y), 55.0)
+
+    def restore_static_light_block(self, x, y, z, color):
+        if not (0 <= int(x) < int(C.MAP_X)
+                and 0 <= int(y) < int(C.MAP_Y)
+                and 0 <= int(z) < int(C.MAP_Z)):
+            return False
+        r, g, b = color
+        self.map.set_point(
+            x, y, z,
+            0x80000000 | (int(r) << 16) | (int(g) << 8) | int(b),
+        )
+        return True
 
 
 class _Server:
@@ -98,7 +119,7 @@ def test_each_pickup_refills_only_its_own_resource():
     ]
 
 
-def test_authored_pickups_and_chroma_lights_replicate_with_map_values():
+def test_authored_pickups_and_chroma_lights_replicate_with_map_values(caplog):
     metadata = MapMetadata(
         static_light_colors={0: (224, 172, 29)},
         entities=[
@@ -129,6 +150,36 @@ def test_authored_pickups_and_chroma_lights_replicate_with_map_values():
     )
     assert (marker_flare.x, marker_flare.y, marker_flare.z) == (40, 50, 60)
     assert all(entity.state == TEAM_NEUTRAL for entity in entities)
+    assert server.world_manager.map.points[(11, 21, 33)] == 0x80010203
+    assert server.world_manager.map.points[(40, 50, 60)] == 0x80E0AC1D
+    assert "family counts: 1=1" in caplog.text
+
+
+def test_both_chroma_marker_families_keep_their_distinct_palette_colors():
+    metadata = MapMetadata(static_light_colors={
+        0: (255, 255, 82),
+        1: (250, 250, 200),
+    })
+    server = _Server(metadata)
+
+    MapResourceService(server).rebuild()
+
+    marker_flares = [
+        entity for entity in server.entity_registry.all()
+        if entity.kind == "map_flare"
+    ]
+    assert [entity.color for entity in marker_flares] == [
+        (255, 255, 82),
+        (250, 250, 200),
+    ]
+    assert [(entity.x, entity.y, entity.z) for entity in marker_flares] == [
+        (40.0, 50.0, 60.0),
+        (41.0, 51.0, 61.0),
+    ]
+    assert server.world_manager.map.points == {
+        (40, 50, 60): 0x80FFFF52,
+        (41, 51, 61): 0x80FAFAC8,
+    }
 
 
 def test_rebuild_replaces_only_map_owned_entities():

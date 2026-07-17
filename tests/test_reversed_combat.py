@@ -12,7 +12,7 @@ import shared.constants as C
 import server.combat_runtime as combat_runtime
 from aoslib.vxl import VXL
 from shared.bytes import ByteReader
-from shared.packet import BlockBuild, BlockBuildColored, BlockLiberate, BlockLine, BlockOccupy, Damage, DestroyEntity, HitEntity, KillAction, PaintBlockPacket, SetHP, ShootFeedbackPacket, ShootPacket, ShootResponse, WeaponReload
+from shared.packet import BlockBuild, BlockBuildColored, BlockLiberate, BlockLine, BlockOccupy, Damage, DestroyEntity, HitEntity, KillAction, PaintBlockPacket, PlaySound, SetHP, ShootFeedbackPacket, ShootPacket, ShootResponse, WeaponReload
 
 from protocol.packet_handler import PacketHandler
 from server.combat_runtime import get_combat_system
@@ -25,8 +25,11 @@ from server.game_constants import (
     BLOCK_ACTION_DESTROY,
     DEFAULT_BLOCK_HEALTH,
     KILL_HEADSHOT,
+    RIFLE_LIKE_TOOLS,
     TEAM1,
     TEAM2,
+    WEAPON_CATALOG,
+    WEAPON_TOOL_IDS,
 )
 from server.player import Player
 from server.world_manager import WorldManager
@@ -48,6 +51,32 @@ def test_disconnect_clears_combat_cadence_before_player_id_reuse():
     assert 7 not in combat._pellet_spread
     assert 7 not in combat._assault_bursts
     assert 7 not in combat._minigun_runs
+
+
+def test_spade_block_hit_sends_remote_positioned_audio_once():
+    """Damage alone is silent for observers; the actor predicts its own cue."""
+
+    server = DummyServer()
+    player = SimpleNamespace(id=7)
+    combat = get_combat_system(server)
+
+    combat._broadcast_block_damage(
+        player,
+        (100, 101, 55),
+        5.0,
+        damage_type=int(C.SPADE_DAMAGE),
+    )
+
+    sounds = [
+        PlaySound(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data and data[0] == PlaySound.id
+    ]
+    assert len(sounds) == 1
+    assert sounds[0].sound_id == 33
+    assert sounds[0].positioned
+    assert (sounds[0].x, sounds[0].y, sounds[0].z) == (100.0, 101.0, 55.0)
+    assert server.broadcast_excludes[-1] is player
 
 
 def test_kill_action_count_resets_when_the_killer_dies():
@@ -542,6 +571,66 @@ def test_rifle_body_hit_sends_hp_and_broadcasts_shot():
     assert hp_packet.damage_type == 1
 
 
+def test_snub_and_semiautomatic_rifle_use_the_normal_hitscan_pipeline():
+    """Tools 36 and 19 were catalogued but omitted from is_weapon_tool()."""
+
+    expected_damage = {
+        int(C.SNUB_PISTOL_TOOL): 40,
+        int(C.SNIPER2_TOOL): 34,
+    }
+    for tool, damage in expected_damage.items():
+        server = DummyServer()
+        attacker, _ = make_player(
+            server, 0, "Attacker", TEAM1, tool, (100.5, 100.5, 60.0)
+        )
+        target, _ = make_player(
+            server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0)
+        )
+        attacker.set_tool(tool)
+        aim_at(attacker, target.position)
+
+        assert tool in WEAPON_TOOL_IDS
+        assert tool in RIFLE_LIKE_TOOLS
+        assert attacker.is_weapon_tool()
+        assert get_combat_system(server).handle_shot(
+            attacker,
+            make_shoot_packet(attacker),
+        )
+        assert target.health == 100 - damage
+        assert any(
+            packet[0] == ShootFeedbackPacket.id
+            for packet in server.broadcast_packets
+        )
+
+
+def test_original_knife_baton_and_machete_player_damage_was_not_block_damage():
+    assert WEAPON_CATALOG[int(C.KNIFE_TOOL)].base_damage == 80
+    assert WEAPON_CATALOG[int(C.RIOTSTICK_TOOL)].base_damage == 85
+    assert WEAPON_CATALOG[int(C.RIOTSTICK_TOOL)].block_damage == 1.75
+    assert WEAPON_CATALOG[int(C.MACHETE_TOOL)].base_damage == 100
+    assert WEAPON_CATALOG[int(C.MACHETE_TOOL)].block_damage == 2
+
+
+def test_scout_knife_head_hit_is_lethal():
+    server = DummyServer()
+    attacker, _ = make_player(
+        server, 0, "Scout", TEAM1, C.KNIFE_TOOL, (100.5, 100.5, 60.0)
+    )
+    target, _ = make_player(
+        server, 1, "Target", TEAM2, C.RIFLE_TOOL, (102.5, 100.5, 60.0)
+    )
+    attacker.class_id = int(C.CLASS_SCOUT)
+    attacker.set_tool(C.KNIFE_TOOL)
+    aim_at(attacker, target.eye)
+
+    assert get_combat_system(server)._resolve_melee_hit(
+        attacker,
+        attacker.eye,
+        attacker.orientation,
+    )
+    assert not target.alive
+
+
 def test_peerless_bot_takes_normal_hitscan_damage_and_dies() -> None:
     """Bots are authoritative Player targets even without an ENet peer."""
 
@@ -833,7 +922,7 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
     assert target.health == 30
 
 
-def test_server_mirrors_native_collapse_without_per_fallen_voxel_flood():
+def test_server_mirrors_native_collapse_and_queues_bounded_exact_confirmation():
     server = DummyServer()
     player, _ = make_player(
         server,
@@ -855,12 +944,19 @@ def test_server_mirrors_native_collapse_without_per_fallen_voxel_flood():
         return [falling] if calls == 1 else []
 
     server.world_manager.find_unsupported_chunks = find_once
+    collapse_confirmations = []
+    server.terrain_repair = SimpleNamespace(
+        record_collapse_cells=lambda cells: collapse_confirmations.extend(cells)
+    )
     combat = get_combat_system(server)
     before = list(server.broadcast_packets)
 
     combat._collapse_unsupported(player, [(119, 120, 100)])
 
     assert all(not server.world_manager.get_solid(*position) for position in falling)
+    assert collapse_confirmations == falling
+    # Confirmation is delayed and bounded by TerrainRepairService. The
+    # original destruction path still emits no per-fallen-voxel packet flood.
     assert server.broadcast_packets == before
 
 
@@ -1079,6 +1175,74 @@ def test_miner_superspade_shoot_removes_centered_3x3x3_atomically():
     assert tuple(int(value) for value in damage.position) == center
 
 
+def test_ugc_superspade_primary_removes_only_the_aimed_block():
+    """UGC LMB is damage type 29, not the secondary cube action."""
+
+    server = DummyServer()
+    player, _ = make_player(
+        server, 0, "UGCBuilder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0)
+    )
+    player.class_id = int(C.CLASS_UGCBUILDER)
+    player.loadout = [int(C.UGC_SUPERSPADE_TOOL)]
+    player.set_tool(C.UGC_SUPERSPADE_TOOL, raw=True)
+    center = (103, 100, 60)
+    neighbor = (104, 100, 60)
+    for position in (center, neighbor):
+        server.world_manager.set_block(*position, True, TEST_COLOR)
+    server.world_manager.raycast = lambda *_args: center
+    server.world_manager.find_unsupported_chunks = lambda _frontier: []
+    packet = make_shoot_packet(player, orientation=(1.0, 0.0, 0.0))
+    packet.secondary = 0
+
+    assert get_combat_system(server).handle_shot(player, packet)
+    assert server.world_manager.get_solid(*center) is False
+    assert server.world_manager.get_solid(*neighbor) is True
+    damage_packets = [
+        data for data in server.broadcast_packets if data[0] == Damage.id
+    ]
+    assert len(damage_packets) == 1
+    damage = Damage(ByteReader(damage_packets[0][1:]))
+    assert damage.type == int(C.UGC_SUPERSPADE_DAMAGE)
+
+
+def test_ugc_superspade_secondary_removes_one_native_cube():
+    """UGC RMB selects type 31 and exactly one centered 3x3x3 footprint."""
+
+    server = DummyServer()
+    player, _ = make_player(
+        server, 0, "UGCBuilder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0)
+    )
+    player.class_id = int(C.CLASS_UGCBUILDER)
+    player.loadout = [int(C.UGC_SUPERSPADE_TOOL)]
+    player.set_tool(C.UGC_SUPERSPADE_TOOL, raw=True)
+    player.blocks = 0
+    center = (103, 100, 60)
+    footprint = set(
+        combat_runtime._melee_dig_positions(center, combat_runtime.DIG_CUBE)
+    )
+    outside = (center[0] + 2, center[1], center[2])
+    for position in footprint | {outside}:
+        server.world_manager.set_block(*position, True, TEST_COLOR)
+    server.world_manager.raycast = lambda *_args: center
+    server.world_manager.find_unsupported_chunks = lambda _frontier: []
+    packet = make_shoot_packet(player, orientation=(1.0, 0.0, 0.0))
+    packet.secondary = 1
+
+    assert get_combat_system(server).handle_shot(player, packet)
+    assert all(not server.world_manager.get_solid(*pos) for pos in footprint)
+    assert server.world_manager.get_solid(*outside) is True
+    # Builder's retail wallet is capped; Map Creator grants infinite team
+    # blocks, so geometry/packet parity matters rather than stored count.
+    assert player.blocks >= 1
+    damage_packets = [
+        data for data in server.broadcast_packets if data[0] == Damage.id
+    ]
+    assert len(damage_packets) == 1
+    damage = Damage(ByteReader(damage_packets[0][1:]))
+    assert damage.type == int(C.UGC_SUPERSPADE_SECONDARY_DAMAGE)
+    assert tuple(int(value) for value in damage.position) == center
+
+
 def test_spade_mining_never_emits_crash_unsafe_shoot_feedback():
     """Spades animate through WorldUpdate; packet 8 calls a missing method."""
 
@@ -1159,7 +1323,11 @@ def test_block_build_consumes_inventory_and_clears_old_damage():
     assert player.blocks == 4
     assert server.world_manager.get_solid(*block) is True
     assert block not in server.world_manager.block_damage
-    broadcast_packet = BlockBuild(ByteReader(server.broadcast_packets[-1][1:]))
+    build_packets = [
+        data for data in server.broadcast_packets if data[0] == BlockBuild.id
+    ]
+    assert build_packets
+    broadcast_packet = BlockBuild(ByteReader(build_packets[-1][1:]))
     assert broadcast_packet.block_type == BLOCK_ACTION_BUILD
     assert (broadcast_packet.x, broadcast_packet.y, broadcast_packet.z) == block
 
@@ -1218,7 +1386,11 @@ def test_block_build_waits_for_its_originating_movement_loop():
     player.last_applied_input_loop = 103
     assert server.world_mutations.commit_ready() == 1
     assert server.world_manager.get_solid(*block) is True
-    echoed = BlockBuild(ByteReader(server.broadcast_packets[-1][1:]))
+    build_packets = [
+        data for data in server.broadcast_packets if data[0] == BlockBuild.id
+    ]
+    assert build_packets
+    echoed = BlockBuild(ByteReader(build_packets[-1][1:]))
     assert echoed.loop_count == 103
 
 
@@ -1313,14 +1485,18 @@ def test_block_line_replicates_as_explicit_colored_cells():
 
     assert player.blocks == 2
     assert all(server.world_manager.get_solid(x, 100, 60) for x in range(101, 104))
-    assert [data[0] for data in server.broadcast_packets] == [
+    colored_packets = [
+        data for data in server.broadcast_packets
+        if data[0] == BlockBuildColored.id
+    ]
+    assert [data[0] for data in colored_packets] == [
         BlockBuildColored.id,
         BlockBuildColored.id,
         BlockBuildColored.id,
     ]
     replicated = [
         BlockBuildColored(ByteReader(data[1:]))
-        for data in server.broadcast_packets
+        for data in colored_packets
     ]
     assert [(p.x, p.y, p.z) for p in replicated] == [
         (101, 100, 60),
@@ -1329,6 +1505,15 @@ def test_block_line_replicates_as_explicit_colored_cells():
     ]
     assert all(p.player_id == player.id for p in replicated)
     assert all(p.color == player.block_color for p in replicated)
+    sounds = [
+        PlaySound(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data[0] == PlaySound.id
+    ]
+    assert len(sounds) == 1
+    assert sounds[0].sound_id == 46
+    assert sounds[0].positioned
+    assert server.broadcast_excludes[-1] is player
     assert len(connection.sent_packets) == 1
     own_echo = BlockLine(ByteReader(connection.sent_packets[0][1:]))
     assert own_echo.loop_count == packet.loop_count
@@ -1534,7 +1719,10 @@ def test_block_line_supports_cells_on_earlier_cells_of_the_same_line():
 
     assert player.blocks == 2
     assert all(server.world_manager.get_solid(x, 100, 60) for x in range(101, 104))
-    assert [data[0] for data in server.broadcast_packets] == [
+    assert [
+        data[0] for data in server.broadcast_packets
+        if data[0] == BlockBuildColored.id
+    ] == [
         BlockBuildColored.id,
         BlockBuildColored.id,
         BlockBuildColored.id,
@@ -1560,7 +1748,10 @@ def test_block_line_skips_existing_cells_and_builds_the_remaining_line():
     assert server.world_manager.get_solid(101, 100, 60) is True
     assert server.world_manager.get_solid(102, 100, 60) is True
     assert server.world_manager.get_solid(103, 100, 60) is True
-    assert [data[0] for data in server.broadcast_packets] == [
+    assert [
+        data[0] for data in server.broadcast_packets
+        if data[0] == BlockBuildColored.id
+    ] == [
         BlockBuildColored.id,
         BlockBuildColored.id,
     ]

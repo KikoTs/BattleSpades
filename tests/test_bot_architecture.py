@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import random
 import queue
 import time
@@ -14,7 +15,7 @@ from modes.zombie import ZombieMode, ZombiePhase
 from shared.bytes import ByteReader
 from shared.packet import CreatePlayer
 from server.bot_ai.director import BotDirector
-from server.bot_ai.director import _BotConnection
+from server.bot_ai.director import _BotConnection, _choose_bot_prefabs
 from server.bot_ai.gateway import BotActionGateway
 from server.bot_ai.messages import (
     BotAction,
@@ -27,11 +28,13 @@ from server.bot_ai.messages import (
     MapSnapshot,
     MovementAffordance,
     MovementIntent,
+    ObjectiveSnapshot,
     PerceptionFrame,
     PlayerSnapshot,
     StimulusKind,
     VoxelChange,
 )
+from server.bot_ai.prefab_policy import BOT_PREFAB_BLOCK_COUNTS
 from server.bot_ai.profiles import ProfileFactory
 from server.bot_ai.supervisor import AIWorkerSupervisor
 from server.bot_ai.stimuli import BotStimulusBus
@@ -170,7 +173,7 @@ def test_active_zombie_bot_create_player_defaults_to_validated_base_class() -> N
     zombie_prefabs = tuple(
         C.PREFAB_LISTS[int(C.CLASS_PREFABS_ZOMBIE)]
     )
-    assert bot.team == TEAM2
+    assert bot.team == TEAM1
     assert bot.class_id == int(C.CLASS_ZOMBIE)
     assert create.class_id == bot.class_id
     assert tuple(create.loadout) == tuple(bot.loadout)
@@ -858,6 +861,87 @@ def test_smg_closes_distance_and_fires_in_bursts() -> None:
     assert strike.action.burst_pause > 0.0
 
 
+def test_passive_engineer_redraws_smg_after_holding_a_prefab() -> None:
+    world = _SwitchableWorld()
+    world.visible = False
+    brain = BotBrain(world, seed=19)
+    smg = int(C.SMG_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        class_id=int(C.CLASS_ENGINEER),
+        weapon_tool=smg,
+        tool=int(C.PREFAB_TOOL),
+        loadout=(
+            smg,
+            int(C.PICKAXE_TOOL),
+            int(C.BLOCK_TOOL),
+            int(C.PREFAB_TOOL),
+        ),
+    )
+    enemy = _player_snapshot(2, TEAM2, (200.0, 0.0, 0.0))
+
+    intent = brain.decide(_frame(1, observer, enemy))
+
+    assert intent is not None
+    assert intent.action.kind is BotActionKind.NONE
+    assert intent.tool_id == smg
+
+
+def test_engineer_with_prefab_equipped_redraws_and_fires_smg() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=21)
+    smg = int(C.SMG_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        class_id=int(C.CLASS_ENGINEER),
+        weapon_tool=smg,
+        tool=int(C.PREFAB_TOOL),
+        loadout=(
+            smg,
+            int(C.PICKAXE_TOOL),
+            int(C.BLOCK_TOOL),
+            int(C.PREFAB_TOOL),
+        ),
+    )
+    enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+
+    draw = brain.decide(_frame(1, observer, enemy))
+    state = brain._states[(observer.player_id, observer.generation)]
+    state.acquired_at -= 2.0
+    fire = brain.decide(_frame(2, observer, enemy))
+
+    assert draw is not None and draw.tool_id == smg
+    assert fire is not None
+    assert fire.tool_id == smg
+    assert fire.action.kind is BotActionKind.FIRE
+    assert fire.action.tool_id == smg
+
+
+def test_fire_waits_until_target_enters_weapon_hard_range() -> None:
+    from server.game_constants import CAT_SHOTGUN
+
+    shotgun = _tool_of_category(CAT_SHOTGUN)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=shotgun,
+        tool=shotgun,
+        loadout=(shotgun,),
+    )
+
+    far_brain = BotBrain(_SwitchableWorld(), seed=12)
+    far_enemy = _player_snapshot(2, TEAM2, (80.0, 0.0, 0.0))
+    far_intent = far_brain.decide(_frame(1, observer, far_enemy))
+
+    close_brain = BotBrain(_SwitchableWorld(), seed=12)
+    close_enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+    close_intent = close_brain.decide(_frame(1, observer, close_enemy))
+
+    assert far_intent is not None
+    assert far_intent.action.kind is BotActionKind.NONE
+    assert far_intent.movement.sprint is True
+    assert close_intent is not None
+    assert close_intent.action.kind is BotActionKind.FIRE
+
+
 def test_medic_moves_to_wounded_teammate_and_deploys_medpack() -> None:
     world = _SwitchableWorld()
     world.visible = False
@@ -1363,6 +1447,66 @@ def test_profile_factory_is_deterministic_unique_and_wire_bounded() -> None:
     assert all(profile.name.isascii() for profile in profiles)
 
 
+def test_bot_prefab_loadout_includes_traversal_and_cover_utility() -> None:
+    selected = _choose_bot_prefabs(
+        [
+            "prefab_caltrop",
+            "prefab_superbridge",
+            "prefab_small_wall",
+        ],
+        random.Random(7),
+    )
+
+    assert len(selected) == 3
+    assert any("bridge" in name for name in selected)
+    assert any("wall" in name for name in selected)
+
+
+def test_bot_prefab_loadout_excludes_oversized_routine_structures() -> None:
+    selected = _choose_bot_prefabs(
+        [
+            "prefab_caltrop",
+            "prefab_fort_wall",
+            "prefab_superbridge",
+            "prefab_superdome",
+            "prefab_ultrabarrier",
+        ],
+        random.Random(3),
+    )
+
+    assert "prefab_superbridge" in selected
+    assert "prefab_superdome" not in selected
+    assert "prefab_ultrabarrier" not in selected
+
+
+def test_bot_prefab_complexity_metadata_matches_kv6_headers() -> None:
+    prefab_root = Path(__file__).resolve().parents[1] / "prefabs"
+
+    for name, expected in BOT_PREFAB_BLOCK_COUNTS.items():
+        with (prefab_root / f"{name}.kv6").open("rb") as stream:
+            header = stream.read(32)
+        assert header[:4] == b"Kvxl"
+        assert int.from_bytes(header[28:32], "little") == expected
+
+
+def test_prefab_selection_falls_back_to_an_affordable_tactical_option() -> None:
+    assert BotBrain._select_prefab(
+        ("prefab_superbridge", "prefab_platform"),
+        purpose="traversal",
+        block_budget=100,
+    ) == "prefab_platform"
+    assert BotBrain._select_prefab(
+        ("prefab_ultrabarrier", "prefab_superbarrier"),
+        purpose="cover",
+        block_budget=200,
+    ) == "prefab_superbarrier"
+    assert BotBrain._select_prefab(
+        ("prefab_zombiehand", "prefab_zombiebone"),
+        purpose="climb",
+        block_budget=100,
+    ) is None
+
+
 def test_supervisor_queues_are_bounded_and_terrain_coalesces() -> None:
     supervisor = AIWorkerSupervisor(seed=1)
     observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
@@ -1409,6 +1553,42 @@ def test_supervisor_frame_coalescing_remains_hard_bounded_across_bots() -> None:
     status = supervisor.status()
     assert status.queued_frames == 64
     assert status.dropped_frames == 16
+
+
+def test_supervisor_detects_alive_worker_that_stops_returning_intents() -> None:
+    supervisor = AIWorkerSupervisor(seed=1)
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    frame = _frame(10, observer, enemy)
+    started_at = 100.0
+    with supervisor._status_lock:
+        supervisor._running = True
+        supervisor._worker_started_at = started_at
+        supervisor._last_intent_at = started_at
+
+    supervisor._note_frame_sent(frame, started_at + 0.1)
+
+    assert not supervisor._worker_is_stalled(started_at + 4.9)
+    assert supervisor._worker_is_stalled(started_at + 8.1)
+
+    output = queue.Queue()
+    output.put(
+        BotIntent(
+            bot_id=observer.player_id,
+            bot_generation=observer.generation,
+            frame_id=frame.frame_id,
+            map_epoch=frame.map_epoch,
+            mode_epoch=frame.mode_epoch,
+            topology_version=frame.topology_version,
+            created_at=started_at + 8.1,
+            expires_at=started_at + 9.1,
+            movement=MovementIntent(),
+        )
+    )
+    supervisor._receive_intents(output)
+
+    assert not supervisor._worker_is_stalled(started_at + 20.0)
+    assert supervisor.drain_intents(limit=1)[0].frame_id == frame.frame_id
 
 
 def test_worker_restart_snapshot_replays_every_committed_terrain_overlay() -> None:
@@ -1746,6 +1926,234 @@ class _SwitchableWorld:
         return (1.0 if dx > 0 else -1.0, 1.0 if dy > 0 else 0.0, 0.0)
 
 
+def test_decision_schedule_does_not_collapse_to_five_hz(monkeypatch) -> None:
+    import server.bot_ai.worker as worker_module
+
+    clock = [1_000.0]
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+    brain = BotBrain(_SwitchableWorld(), seed=2, decision_hz=8.0)
+    observer = _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+    emitted = []
+
+    for index in range(10):
+        clock[0] = 1_000.0 + index * 0.1
+        intent = brain.decide(_frame(index + 1, observer, enemy))
+        if intent is not None:
+            emitted.append(intent)
+
+    gaps = [
+        current.created_at - previous.created_at
+        for previous, current in zip(emitted, emitted[1:])
+    ]
+    assert len(emitted) == 8
+    assert max(gaps) <= 0.200_001
+    assert all(
+        previous.expires_at > current.created_at
+        for previous, current in zip(emitted, emitted[1:])
+    )
+    assert all(
+        0.399 <= intent.expires_at - intent.created_at <= 0.401
+        for intent in emitted
+    )
+
+
+def test_decision_schedule_ignores_variable_worker_latency(monkeypatch) -> None:
+    import server.bot_ai.worker as worker_module
+
+    clock = [2_000.0]
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+    brain = BotBrain(_SwitchableWorld(), seed=3, decision_hz=5.0)
+    observer = _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+    emitted = []
+
+    for index in range(8):
+        sampled_at = 2_000.0 + index * 0.2
+        clock[0] = sampled_at + (0.015 if index % 2 == 0 else 0.002)
+        frame = replace(
+            _frame(index + 1, observer, enemy),
+            created_at=sampled_at,
+        )
+        intent = brain.decide(frame)
+        if intent is not None:
+            emitted.append(intent)
+
+    assert len(emitted) == 8
+
+
+def test_worker_latency_does_not_advance_behavior_timers(monkeypatch) -> None:
+    import server.bot_ai.worker as worker_module
+
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: 500.0)
+    brain = BotBrain(_SwitchableWorld(), seed=3)
+    observer = _player_snapshot(
+        1, TEAM1, (0.0, 0.0, 0.0), is_bot=True
+    )
+    enemy = _player_snapshot(2, TEAM2, (20.0, 0.0, 0.0))
+    frame = replace(_frame(1, observer, enemy), created_at=100.0)
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    state = brain._states[(observer.player_id, observer.generation)]
+    assert state.last_progress_at == 100.0
+    assert state.acquired_at == 100.0
+    assert intent.created_at == 500.0
+    assert intent.expires_at == 500.4
+
+
+def test_global_path_budget_is_fair_across_bot_ids() -> None:
+    class CountingWorld(_SwitchableWorld):
+        def __init__(self) -> None:
+            super().__init__()
+            self.path_calls: list[int] = []
+
+        def next_path_direction(self, _start, _goal, *, agent_id, **_kwargs):
+            self.path_calls.append(int(agent_id))
+            return (1.0, 0.0, 0.0)
+
+        @staticmethod
+        def last_affordance(_agent_id):
+            return MovementAffordance.WALK
+
+    world = CountingWorld()
+    brain = BotBrain(world, seed=3, path_requests_per_second=4.0)
+    states = {player_id: _BrainState() for player_id in range(1, 13)}
+    brain._states = {
+        (player_id, 1): state for player_id, state in states.items()
+    }
+    started_at = time.monotonic()
+    brain._path_refill_at = started_at
+
+    for tick in range(3):
+        now = started_at + float(tick)
+        for player_id, state in states.items():
+            brain._path_direction(
+                (float(player_id), 0.0, 0.0),
+                (100.0, 0.0, 0.0),
+                state,
+                now,
+                agent_id=player_id,
+                velocity=(0.0, 0.0, 0.0),
+                abilities=frozenset(),
+            )
+
+    assert world.path_calls == list(range(1, 13))
+
+
+def test_zero_direction_objective_enters_voxel_recovery() -> None:
+    class ZeroRouteWorld(_SwitchableWorld):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_planner = SimpleNamespace(
+                plan_local=lambda *_args, **_kwargs: SimpleNamespace(
+                    direction=(0.0, 1.0, 0.0),
+                    waypoint=(0.5, 1.5, 0.0),
+                    affordance=MovementAffordance.WALK,
+                )
+            )
+
+    now = time.monotonic()
+    world = ZeroRouteWorld()
+    brain = BotBrain(world, seed=4)
+    observer = _player_snapshot(1, TEAM1, (0.5, 0.5, 0.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (50.0, 0.5, 0.0))
+    state = _BrainState(
+        path_goal=enemy.position,
+        last_path_direction=(0.0, 0.0, 0.0),
+        last_progress_at=now - 2.0,
+        stuck_attempts=2,
+    )
+
+    intent = brain._stuck_recovery(
+        _frame(1, observer, enemy),
+        observer,
+        state,
+        now,
+    )
+
+    assert intent is not None
+    assert intent.debug_role == "stuck_voxel_replan"
+    assert intent.movement.direction == (0.0, 1.0, 0.0)
+
+
+def test_brain_state_is_scoped_to_mode_life_generation_and_map() -> None:
+    world = _SwitchableWorld()
+    brain = BotBrain(world, seed=2)
+    observer = _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (10.0, 0.0, 0.0))
+
+    assert brain.decide(_frame(1, observer, enemy)) is not None
+    first = brain._states[(1, 1)]
+    assert first.contacts
+    first.ignored_resources.add((99, (1.0, 2.0, 3.0)))
+
+    world.visible = False
+    mode_frame = replace(
+        _frame(2, observer, enemy),
+        mode_epoch=2,
+        players=(observer,),
+    )
+    assert brain.decide(mode_frame) is not None
+    second = brain._states[(1, 1)]
+    assert second is not first
+    assert second.contacts == {}
+    assert second.ignored_resources == set()
+
+    next_life = replace(observer, life_id=1)
+    life_frame = replace(
+        mode_frame,
+        frame_id=3,
+        players=(next_life,),
+    )
+    assert brain.decide(life_frame) is not None
+    third = brain._states[(1, 1)]
+    assert third is not second
+    assert third.life_id == 1
+
+    next_generation = replace(next_life, generation=2)
+    generation_frame = replace(
+        life_frame,
+        frame_id=4,
+        observer_generation=2,
+        players=(next_generation,),
+    )
+    assert brain.decide(generation_frame) is not None
+    assert (1, 1) not in brain._states
+    assert (1, 2) in brain._states
+
+    brain._fortify_sites[(1, TEAM1)] = ((1.0, 1.0, 1.0), 1.0)
+    brain._team_oriented_ready_at[TEAM1] = 100.0
+    brain.reset_for_map(2)
+
+    assert brain._states == {}
+    assert brain._fortify_sites == {}
+    assert brain._team_oriented_ready_at == {}
+
+
+def test_travel_look_tracks_the_route_without_extreme_pitch() -> None:
+    world = _SwitchableWorld()
+    world.visible = False
+    brain = BotBrain(world, seed=3)
+    observer = _player_snapshot(1, TEAM1, (10.0, 10.0, 20.0), is_bot=True)
+    enemy = _player_snapshot(2, TEAM2, (300.0, 10.0, 20.0))
+    objective = ObjectiveSnapshot(
+        "team_anchor", TEAM2, (300.0, 10.0, 100.0)
+    )
+    frame = replace(
+        _frame(1, observer, enemy),
+        objectives=(objective,),
+    )
+
+    intent = brain.decide(frame)
+
+    assert intent is not None and intent.look is not None
+    assert intent.debug_role == "team_assault_enemy_side"
+    assert intent.look.target[0] < objective.position[0]
+    assert abs(intent.look.target[2] - observer.eye[2]) <= 2.0
+
+
 def test_worker_batch_discards_obsolete_frames_for_the_same_bot_life() -> None:
     world = _SwitchableWorld()
     brain = BotBrain(world, seed=2)
@@ -1820,11 +2228,31 @@ def test_worker_oriented_attack_uses_only_selected_positive_stock_tool() -> None
     for frame_id in range(1, 80):
         intent = brain.decide(_frame(frame_id, observer, enemy))
         if intent is not None and intent.action.kind is BotActionKind.ORIENTED:
-            oriented = intent.action
+            oriented = intent
             break
 
     assert oriented is not None
-    assert oriented.tool_id == 12
+    assert oriented.action.tool_id == 12
+    assert brain._team_oriented_ready_at[observer.team] > oriented.created_at
+
+
+def test_team_utility_spacing_blocks_synchronized_oriented_attacks() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=29)
+    grenade = int(C.GRENADE_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        loadout=(DEFAULT_WEAPON_TOOL, grenade),
+        oriented_stock=((grenade, 2),),
+    )
+    enemy = _player_snapshot(2, TEAM2, (30.0, 0.0, 0.0))
+    brain.reset_for_map(1)
+    brain._team_oriented_ready_at[TEAM1] = float("inf")
+
+    for frame_id in range(1, 80):
+        intent = brain.decide(_frame(frame_id, observer, enemy))
+        assert intent is not None
+        assert intent.action.kind is not BotActionKind.ORIENTED
 
 
 def test_oriented_attack_never_throws_explosive_into_friendly_blast_volume() -> None:
@@ -1850,6 +2278,48 @@ def test_oriented_attack_never_throws_explosive_into_friendly_blast_volume() -> 
             oriented_actions.append(intent.action)
 
     assert oriented_actions == []
+
+
+def test_oriented_attack_rejects_a_teammate_crossing_the_launch_lane() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=29)
+    grenade = int(C.GRENADE_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        loadout=(DEFAULT_WEAPON_TOOL, grenade),
+        oriented_stock=((grenade, 2),),
+    )
+    enemy = _player_snapshot(2, TEAM2, (30.0, 0.0, 0.0))
+    teammate = _player_snapshot(3, TEAM1, (15.0, 0.0, 0.0))
+
+    for frame_id in range(1, 80):
+        frame = replace(
+            _frame(frame_id, observer, enemy),
+            players=(observer, enemy, teammate),
+        )
+        intent = brain.decide(frame)
+        assert intent is not None
+        assert intent.action.kind is not BotActionKind.ORIENTED
+
+
+def test_oriented_attack_conserves_explosive_against_isolated_low_health_target() -> None:
+    brain = BotBrain(_SwitchableWorld(), seed=29)
+    grenade = int(C.GRENADE_TOOL)
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        weapon_tool=DEFAULT_WEAPON_TOOL,
+        loadout=(DEFAULT_WEAPON_TOOL, grenade),
+        oriented_stock=((grenade, 2),),
+    )
+    enemy = replace(
+        _player_snapshot(2, TEAM2, (30.0, 0.0, 0.0)),
+        health=20,
+    )
+
+    for frame_id in range(1, 80):
+        intent = brain.decide(_frame(frame_id, observer, enemy))
+        assert intent is not None
+        assert intent.action.kind is not BotActionKind.ORIENTED
 
 
 def test_empty_clip_reload_has_priority_over_oriented_equipment() -> None:
@@ -2117,6 +2587,55 @@ def test_stuck_zombie_builds_a_selected_native_prefab_with_tool_28() -> None:
     assert build.movement.affordance is MovementAffordance.BUILD_STEP
 
 
+def test_stuck_builder_uses_a_bridge_prefab_for_a_real_gap() -> None:
+    class GapWorld(_SwitchableWorld):
+        @staticmethod
+        def overhead_block(_position):
+            return None
+
+        @staticmethod
+        def hole_escape(_position, _direction):
+            return None
+
+        @staticmethod
+        def blocking_cell(_position, _direction):
+            return None
+
+        @staticmethod
+        def water_bridge_line(_position, _direction, **_kwargs):
+            return (1, 0, 2), (4, 0, 2)
+
+        @staticmethod
+        def bridge_cell(_position, _direction):
+            return None
+
+    brain = BotBrain(GapWorld(), seed=5)
+    now = time.monotonic()
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.PREFAB_TOOL)),
+        prefabs=("prefab_london_taxi", "prefab_superbridge"),
+        blocks=250,
+    )
+    enemy = _player_snapshot(2, TEAM2, (30.0, 0.0, 0.0))
+    state = _BrainState(
+        mode_epoch=1,
+        life_id=0,
+        last_progress_at=now - 2.0,
+        last_path_direction=(1.0, 0.0, 0.0),
+        path_goal=(30.0, 0.0, 0.0),
+    )
+
+    intent = brain._stuck_recovery(
+        _frame(1, observer, enemy), observer, state, now
+    )
+
+    assert intent is not None
+    assert intent.action.kind is BotActionKind.PLACE_PREFAB
+    assert intent.action.argument == "prefab_superbridge"
+    assert intent.debug_role == "water_gap_prefab_bridge"
+
+
 def test_skilled_grounded_bot_uses_bounded_combat_jump() -> None:
     world = _SwitchableWorld()
     brain = BotBrain(world, seed=11)
@@ -2332,6 +2851,33 @@ def test_gateway_routes_fire_through_public_combat_service() -> None:
     assert len(packets) == 1
     assert packets[0][1].shooter_id == player.id
     assert (packets[0][1].x, packets[0][1].y, packets[0][1].z) == player.eye
+
+
+def test_gateway_revalidates_live_oriented_explosive_lane() -> None:
+    server, director, bot, _runtime = _facing_fixture(
+        class_id=int(C.CLASS_SOLDIER)
+    )
+    teammate = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="LaneMate",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert teammate is not None
+    teammate.set_position(bot.eye_x + 10.0, bot.eye_y, bot.eye_z)
+    server.world_manager.raycast = lambda *_args, **_kwargs: None
+    spec = PROJECTILE_SPECS[int(C.GRENADE_TOOL)]
+
+    assert not director.gateway._oriented_launch_safe(
+        bot, (1.0, 0.0, 0.0), spec
+    )
+
+    teammate.set_position(bot.eye_x + 10.0, bot.eye_y + 5.0, bot.eye_z)
+
+    assert director.gateway._oriented_launch_safe(
+        bot, (1.0, 0.0, 0.0), spec
+    )
 
 
 def test_gateway_routes_zombie_melee_through_public_combat_service() -> None:

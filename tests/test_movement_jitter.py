@@ -1194,3 +1194,46 @@ def test_jetpack_release_also_sends_one_immediate_owner_row() -> None:
     replication.broadcast_world_updates()
 
     assert sent == [(b"2:None", True), (b"3:0", True)]
+
+
+def test_retail_jetpack_release_waits_for_key_up_and_ground_settle() -> None:
+    """The inactive owner row may not reconcile a mid-air fuel transition."""
+    player = SimpleNamespace(
+        id=4,
+        airborne=True,
+        jetpack_id=66,
+        jetpack_active=False,
+        last_applied_input_loop=200,
+        input=SimpleNamespace(jump=True, hover=False),
+        _input_receive_sequence=30,
+    )
+    connection = SimpleNamespace(in_game=True, player=player)
+    server = SimpleNamespace(
+        config=SimpleNamespace(
+            worldupdate_include_self=True,
+            jetpack_owner_handoff_input_frames=2,
+        )
+    )
+    replication = ReplicationService(server)
+    replication._last_advertised_jetpack_active[player.id] = True
+    replication._jetpack_owner_handoff_deadline[player.id] = 32
+    replication._jetpack_owner_handoff_target[player.id] = True
+
+    assert replication._jetpack_transition_connections((connection,)) == []
+    assert replication._jetpack_owner_handoff_active(player) is True
+
+    # Landing alone is insufficient while the physical activation key remains
+    # held; this is the fuel-zero auto-jump edge from the retail report.
+    player.airborne = False
+    player._input_receive_sequence = 40
+    assert replication._jetpack_transition_connections((connection,)) == []
+
+    # Key-up starts a short accepted-input settle window.
+    player.input.jump = False
+    assert replication._jetpack_transition_connections((connection,)) == []
+    player._input_receive_sequence = 41
+    assert replication._jetpack_transition_connections((connection,)) == []
+    player._input_receive_sequence = 42
+    assert replication._jetpack_transition_connections((connection,)) == [
+        connection
+    ]

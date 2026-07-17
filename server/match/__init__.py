@@ -136,6 +136,35 @@ class MatchTransitionService:
     async def change_map(self, map_name: str) -> TransitionResult:
         """Preload ``map_name`` and replace the client session if it is valid."""
 
+        return await self._change_map(map_name, end_screen_seconds=None)
+
+    async def change_map_after_end_screen(
+        self,
+        map_name: str,
+        *,
+        end_screen_seconds: float,
+    ) -> TransitionResult:
+        """Preflight a voted map, show scores, then commit the rollover.
+
+        Packet 53 is emitted only after the VXL candidate exists. This avoids
+        stranding clients in the terminal statistics overlay when a stale or
+        invalid vote target fails validation. The later packet-52 boundary and
+        loader handshake remain owned by :meth:`_rollover`.
+        """
+
+        return await self._change_map(
+            map_name,
+            end_screen_seconds=end_screen_seconds,
+        )
+
+    async def _change_map(
+        self,
+        map_name: str,
+        *,
+        end_screen_seconds: float | None,
+    ) -> TransitionResult:
+        """Prepare one map and optionally hold the native statistics screen."""
+
         if self._transition_busy(allow_current_request=True):
             return TransitionResult(False, "Another match transition is already in progress")
         normalized = self._normalize_map_name(map_name)
@@ -157,6 +186,26 @@ class MatchTransitionService:
             except Exception:
                 logger.exception("unexpected map preflight failure for %s", normalized)
                 return TransitionResult(False, f"Failed to load map: {normalized}")
+            if end_screen_seconds is not None:
+                from server.builders.initial_info import supports_game_stats_screen
+                from server.scoreboard import show_game_stats
+
+                dwell = min(120.0, max(0.0, float(end_screen_seconds)))
+                if supports_game_stats_screen(self.server):
+                    # IDA: packet 53 calls GameScene.show_game_statistics(False).
+                    # It is a terminal overlay for this scene, but the scene
+                    # remains available to receive packet 52 after the dwell.
+                    show_game_stats(self.server)
+                    host = getattr(self.server, "host", None)
+                    if host is not None:
+                        host.flush()
+                else:
+                    logger.info(
+                        "Skipping ShowGameStats for %s: no stock level screenshot",
+                        self.server.config.default_map,
+                    )
+                if dwell > 0.0:
+                    await asyncio.sleep(dwell)
             return await self._rollover(
                 map_name=normalized,
                 mode_name=mode_name,
@@ -223,7 +272,22 @@ class MatchTransitionService:
         async with self._lock:
             self.in_progress = True
             server = self.server
-            connections = tuple(server.connections.values())
+            all_connections = tuple(server.connections.values())
+            # Packet 52 is gameplay-gated and therefore cannot reach a peer
+            # still inside InitialInfo/MapSync. Starting reload_scene on such
+            # a peer would cancel its waiter while its original coroutine can
+            # still emit old VXL chunks, splicing two map epochs. Retire these
+            # rare mid-handshake peers explicitly; settled peers retain ENet.
+            connections = tuple(
+                connection
+                for connection in all_connections
+                if bool(getattr(connection, "in_game", False))
+            )
+            loading_connections = tuple(
+                connection
+                for connection in all_connections
+                if not bool(getattr(connection, "in_game", False))
+            )
             old_mode = server.mode
             old_world = server.world_manager
             old_map = str(server.config.default_map)
@@ -250,11 +314,15 @@ class MatchTransitionService:
                 # This is the crash boundary.  Detach the old Player objects
                 # immediately so late movement packets cannot be queued against
                 # the retired map while the client changes scenes.
-                for connection in connections:
+                for connection in all_connections:
                     connection.in_game = False
+                for connection in loading_connections:
+                    connection.disconnect(
+                        reason=int(DISCONNECT.ERROR_MATCH_ENDED)
+                    )
                 if old_mode is not None:
                     await self._cancel_mode_end(old_mode)
-                for connection in connections:
+                for connection in all_connections:
                     await self._detach_transition_player(connection, old_mode)
                 if old_mode is not None:
                     deactivate = getattr(old_mode, "deactivate", None)
@@ -288,6 +356,11 @@ class MatchTransitionService:
                 if candidate_world is not None:
                     candidate_world.config = server.config
                     server.world_manager = candidate_world
+                    bind_journal = getattr(
+                        server, "_bind_world_mutation_journal", None
+                    )
+                    if callable(bind_journal):
+                        bind_journal()
                 # An admin fog command belongs to the retired map epoch. The
                 # replacement StateData must use its own authored atmosphere.
                 server.fog_color_override = None
@@ -307,7 +380,7 @@ class MatchTransitionService:
                     *(connection.reload_scene() for connection in connections),
                     return_exceptions=True,
                 )
-                failed_connections = []
+                failed_connections = list(loading_connections)
                 for connection, outcome in zip(connections, reloads):
                     if outcome is True:
                         continue
@@ -348,9 +421,14 @@ class MatchTransitionService:
                 server.config.default_map = old_map
                 server.config.default_mode = old_mode_name
                 server.world_manager = old_world
+                bind_journal = getattr(
+                    server, "_bind_world_mutation_journal", None
+                )
+                if callable(bind_journal):
+                    bind_journal()
                 server.fog_color_override = old_fog_override
                 server.mode = old_mode
-                for connection in connections:
+                for connection in all_connections:
                     connection.in_game = False
                     try:
                         connection.disconnect(reason=int(DISCONNECT.ERROR_DATA))
@@ -359,7 +437,7 @@ class MatchTransitionService:
                 return TransitionResult(
                     False,
                     "Session change failed safely; reconnect after checking server log",
-                    reconnect_required=bool(connections),
+                    reconnect_required=bool(all_connections),
                 )
             finally:
                 self.in_progress = False
@@ -435,10 +513,19 @@ class MatchTransitionService:
         journal = getattr(self.server, "_map_mutation_journal", None)
         if journal is not None:
             journal.clear()
+        cell_journal = getattr(
+            self.server, "_map_cell_journal", None
+        )
+        if cell_journal is not None:
+            cell_journal.clear()
         self.server._map_mutation_sequence = 0
+        self.server._map_cell_sequence = 0
         for connection in self.server.connections.values():
             connection.map_mutation_watermark = None
             connection.map_mutation_overflow = False
+            connection.map_cell_watermark = None
+            connection.map_cell_overflow = False
+            connection.map_cell_replay = None
 
     def _load_world_candidate(self, map_name: str, mode_name: str):
         """Load a VXL off to the side so a typo cannot destroy the live world."""

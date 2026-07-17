@@ -29,8 +29,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SURVIVOR_TEAM = TEAM1
-ZOMBIE_TEAM = TEAM2
+# Retail Zombie mode assigns its infected models to Blue/team 1 and the
+# survivors to Green/team 2. Reversing these roles makes zombie hands inherit
+# the green palette, breaks native team-specific HUD assumptions, and has
+# triggered the Tab-list crash reported by retail playtesters.
+ZOMBIE_TEAM = TEAM1
+SURVIVOR_TEAM = TEAM2
 _ZOMBIE_CLASSES = frozenset((int(C.CLASS_ZOMBIE),))
 _ZOMBIE_PREFABS = tuple(
     str(name)
@@ -91,6 +95,12 @@ class ZombieMode(BaseMode):
         self.last_survivor_id: int | None = None
         self._next_survival_score_at: float | None = None
         self._next_last_man_score_at: float | None = None
+        # A newly infected player respawns where the human died. Without this
+        # one-use anchor, generic team spawning teleports every conversion to
+        # the opposite side of large maps.
+        self._infection_spawn_by_player: dict[
+            int, tuple[float, float, float]
+        ] = {}
 
     async def on_mode_start(self) -> None:
         """Reset one round and return every connected body to the survivors."""
@@ -101,6 +111,7 @@ class ZombieMode(BaseMode):
         self.patient_zero_ids.clear()
         self._next_survival_score_at = None
         self._next_last_man_score_at = None
+        self._infection_spawn_by_player.clear()
         for team in self.server.teams.values():
             team.reset()
         for player in list(self.server.players.values()):
@@ -123,6 +134,7 @@ class ZombieMode(BaseMode):
     async def deactivate(self) -> None:
         """Remove the last-man marker before a map or mode rollover."""
         self._clear_last_survivor_marker()
+        self._infection_spawn_by_player.clear()
         await super().deactivate()
 
     async def on_tick(self, tick: int) -> None:
@@ -158,6 +170,7 @@ class ZombieMode(BaseMode):
     async def on_player_leave(self, player: Player) -> None:
         """Replace a departed sole zombie so the infection cannot soft-lock."""
         self.patient_zero_ids.discard(int(player.id))
+        self._infection_spawn_by_player.pop(int(player.id), None)
         if self.phase is ZombiePhase.COUNTDOWN:
             if len(self._connected_players()) < self.minimum_players:
                 self.phase = ZombiePhase.WAITING
@@ -185,7 +198,11 @@ class ZombieMode(BaseMode):
         if self.phase is not ZombiePhase.ACTIVE or int(player.team) != SURVIVOR_TEAM:
             return
         if killer is not None and killer is not player and int(killer.team) == ZOMBIE_TEAM:
-            self._award_player(killer, int(CG.ZOM_SCORE_KILL_SURVIVOR))
+            self._award_player(
+                killer,
+                int(CG.ZOM_SCORE_KILL_SURVIVOR),
+                reason=int(C.ZOM_KILLSURVIVOR_SCORE_REASON),
+            )
         await self._infect(player, patient_zero=False)
         await self._check_population()
 
@@ -202,7 +219,11 @@ class ZombieMode(BaseMode):
             and int(victim.team) == ZOMBIE_TEAM
             and self.last_survivor_id == int(killer.id)
         ):
-            self._award_player(killer, int(CG.ZOM_SCORE_LASTMAN_ZOMBIEKILL))
+            self._award_player(
+                killer,
+                int(CG.ZOM_SCORE_LASTMAN_ZOMBIEKILL),
+                reason=int(C.ZOM_LASTMAN_ZOMBIEKILL_SCORE_REASON),
+            )
 
     def prepare_join_team(self, requested_team: int) -> int:
         """Force pre-outbreak joins to survivors and late joins to zombies."""
@@ -282,7 +303,12 @@ class ZombieMode(BaseMode):
         return int(amount)
 
     def get_spawn_point(self, player: Player) -> tuple[float, float, float]:
-        """Use the map's validated team regions for survivor/zombie separation."""
+        """Reuse the infection site once, then use normal team spawn regions."""
+        infection_spawn = self._infection_spawn_by_player.pop(
+            int(player.id), None
+        )
+        if infection_spawn is not None:
+            return infection_spawn
         return tuple(
             float(value)
             for value in self.server.world_manager.get_spawn_point(player.team)
@@ -290,26 +316,34 @@ class ZombieMode(BaseMode):
 
     def configure_state_data(self, packet) -> None:
         """Publish asymmetric native class menus and phase-aware team locks."""
-        packet.team1_name = "Survivors"
-        packet.team2_name = "Zombies"
-        packet.team1_classes = sorted(_SURVIVOR_CLASSES)
-        packet.team2_classes = [int(C.CLASS_ZOMBIE)]
-        packet.team1_locked = self.phase is ZombiePhase.ACTIVE
-        packet.team2_locked = self.phase is not ZombiePhase.ACTIVE
+        packet.team1_name = "Zombies"
+        packet.team2_name = "Survivors"
+        packet.team1_classes = [int(C.CLASS_ZOMBIE)]
+        packet.team2_classes = sorted(_SURVIVOR_CLASSES)
+        packet.team1_locked = self.phase is not ZombiePhase.ACTIVE
+        packet.team2_locked = self.phase is ZombiePhase.ACTIVE
         packet.lock_team_swap = True
-        packet.team1_locked_class = False
         # One stable class bypasses the ordinary class picker.  Fast/Jump
         # Zombie lack picker icons in this client and are intentionally hidden.
-        packet.team2_locked_class = True
+        packet.team1_locked_class = True
+        packet.team2_locked_class = False
         packet.team1_show_score = False
         packet.team2_show_score = False
         packet.team1_show_max_score = False
         packet.team2_show_max_score = False
 
     def configure_initial_info(self, packet) -> None:
-        """Force role-safe combat and leave minimap exposure event-driven."""
+        """Force role-safe combat and expose the opposing infection roster.
+
+        Retail ``Player.display_map_icon_out_of_bounds`` reads
+        ``exposed_teams_always_on_minimap`` as its ordinary enemy-marker
+        fallback.  This is distinct from ``high_minimap_visibility``, whose
+        VIP icon is reserved below for the final survivor.  Enabling the
+        former restores the report's missing survivor highlight without
+        turning every survivor into a VIP on the Tab list.
+        """
         packet.friendly_fire = 0
-        packet.exposed_teams_always_on_minimap = 0
+        packet.exposed_teams_always_on_minimap = 1
         class_speed = float(
             self.server.config.game_rules.get("RULE_CLASS_SPEED")
         )
@@ -326,6 +360,23 @@ class ZombieMode(BaseMode):
         if player is not None:
             self._set_high_minimap_visibility(player, True, connection=connection)
 
+    def countdown_seconds_remaining(self, now: float) -> float:
+        """Return the phase-appropriate native HUD countdown.
+
+        During preparation the HUD must count toward Patient Zero, not show the
+        ten-minute survival clock. Once active it returns the normal remaining
+        round time consumed by ``SimulationRuntime``.
+        """
+
+        if (
+            self.phase is ZombiePhase.COUNTDOWN
+            and self.infection_deadline is not None
+        ):
+            return max(0.0, float(self.infection_deadline) - float(now))
+        if self.phase is ZombiePhase.WAITING:
+            return 0.0
+        return max(0.0, float(self.time_limit) - float(self.elapsed_time))
+
     async def _arm_countdown_if_ready(self, now: float) -> None:
         if self.phase is not ZombiePhase.WAITING:
             return
@@ -334,8 +385,13 @@ class ZombieMode(BaseMode):
         self.phase = ZombiePhase.COUNTDOWN
         self.infection_deadline = now + max(0.0, self.infection_delay)
         from server.audio import SND_ZOMBIE_TIMER, play_sound
+        from server.scoreboard import send_round_timer
 
         play_sound(self.server, SND_ZOMBIE_TIMER, volume=1.0)
+        send_round_timer(
+            self.server,
+            self.countdown_seconds_remaining(now),
+        )
         await self.broadcast_message(
             f"Zombie outbreak in {int(round(max(0.0, self.infection_delay)))} seconds!"
         )
@@ -362,11 +418,27 @@ class ZombieMode(BaseMode):
         for player in selected:
             await self._infect(player, patient_zero=True)
             await self.broadcast_message(f"{player.name} is Patient Zero!")
+        # This is an outbreak cue, not a per-kill sound. Replaying it for every
+        # later infection made ordinary Zombie kills sound like round starts.
+        from server.audio import SND_ZOMBIE_BECOME, play_sound
+
+        play_sound(self.server, SND_ZOMBIE_BECOME, volume=1.0)
+        from server.scoreboard import send_round_timer
+
+        send_round_timer(self.server, self.time_limit)
         await self._refresh_last_survivor_marker()
 
     async def _infect(self, player: Player, *, patient_zero: bool) -> None:
         if int(getattr(player, "team", -1)) == ZOMBIE_TEAM:
             return
+        position = getattr(player, "position", None)
+        if position is not None and len(position) >= 3:
+            try:
+                self._infection_spawn_by_player[int(player.id)] = tuple(
+                    float(value) for value in position[:3]
+                )
+            except (TypeError, ValueError):
+                self._infection_spawn_by_player.pop(int(player.id), None)
         if getattr(player, "alive", False):
             # KillAction is the native-safe model replacement boundary.  A
             # server-only team mutation leaves the old human Character alive.
@@ -379,9 +451,6 @@ class ZombieMode(BaseMode):
         player.pending_loadout = None
         if patient_zero:
             self.patient_zero_ids.add(int(player.id))
-        from server.audio import SND_ZOMBIE_BECOME, play_sound
-
-        play_sound(self.server, SND_ZOMBIE_BECOME, volume=1.0)
 
     def _assign_survivor(self, player: Player) -> None:
         self._move_to_team(player, SURVIVOR_TEAM)
@@ -518,7 +587,11 @@ class ZombieMode(BaseMode):
             )
             points = intervals * int(CG.ZOM_SCORE_SURVIVE)
             for player in living:
-                self._award_player(player, points)
+                self._award_player(
+                    player,
+                    points,
+                    reason=int(C.ZOM_SURVIVE_SCORE_REASON),
+                )
             self._next_survival_score_at += (
                 intervals * float(CG.ZOM_SCORE_SURVIVE_INTERVAL)
             )
@@ -532,19 +605,27 @@ class ZombieMode(BaseMode):
                 // float(CG.ZOM_SCORE_LASTMAN_INTERVAL)
             )
             self._award_player(
-                living[0], intervals * int(CG.ZOM_SCORE_LASTMAN)
+                living[0],
+                intervals * int(CG.ZOM_SCORE_LASTMAN),
+                reason=int(C.ZOM_LASTMAN_SCORE_REASON),
             )
             self._next_last_man_score_at += (
                 intervals * float(CG.ZOM_SCORE_LASTMAN_INTERVAL)
             )
 
-    def _award_player(self, player: Player, points: int) -> None:
+    def _award_player(
+        self,
+        player: Player,
+        points: int,
+        *,
+        reason: int,
+    ) -> None:
         if points <= 0:
             return
         player.score = int(getattr(player, "score", 0)) + int(points)
         from server.scoreboard import send_player_score
 
-        send_player_score(self.server, player)
+        send_player_score(self.server, player, reason=reason)
 
     async def _end_by_time(self) -> None:
         """Survivors win the native round if any living human lasts 600s."""

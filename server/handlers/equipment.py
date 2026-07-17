@@ -12,6 +12,7 @@ from protocol.handler_registry import register_handler
 from server.class_selection import normalize_server_selection
 from server.game_rules import get_rules
 from server.game_constants import KILL_CLASS_CHANGE
+from shared.packet import SetClassLoadout
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,22 @@ async def handle_set_class_loadout(server, player, packet) -> None:
         player.pending_selection = None
         player.pending_class_id = None
         player.pending_loadout = None
+        # The menu updates a temporary GameClass, not the live Character.  A
+        # normalized server echo with instant=1 is therefore required for the
+        # stock client's process_packet_change_class_loadout path to replace
+        # its active prefab/UGC backpack without waiting for a respawn.  This
+        # is especially visible in Map Creator when switching from Constructs
+        # to spawn/base/crate placement tools.
+        acknowledgement = SetClassLoadout()
+        acknowledgement.player_id = int(player.id)
+        acknowledgement.class_id = int(selection.class_id)
+        acknowledgement.instant = 1
+        acknowledgement.loadout = list(selection.loadout)
+        acknowledgement.prefabs = list(selection.prefabs)
+        acknowledgement.ugc_tools = list(selection.ugc_tools)
+        broadcast = getattr(server, "broadcast", None)
+        if callable(broadcast):
+            broadcast(bytes(acknowledgement.generate()), reliable=True)
     else:
         player.stage_class_selection(selection)
         if selection.class_id != int(player.class_id) and player.alive:

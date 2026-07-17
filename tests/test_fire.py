@@ -52,6 +52,18 @@ class _Server:
         self.destroyed.append(entity_id)
 
 
+class _AlwaysSpread:
+    """Deterministic RNG that exercises the worst-case spread branch."""
+
+    @staticmethod
+    def random():
+        return 0.0
+
+    @staticmethod
+    def choice(values):
+        return values[0]
+
+
 def test_blockfire_entity_carries_retail_fuse_and_deduplicates_cells():
     owner = _Player()
     server = _Server(_World({(10, 10, 10)}), [owner])
@@ -192,3 +204,40 @@ def test_disconnect_forgets_owned_fire_and_burn_before_id_reuse():
     assert server.destroyed == [entity_id]
     assert target.id not in fire.burning_players
     assert target.on_fire is False
+
+
+def test_one_molotov_uses_one_shared_spread_budget(monkeypatch):
+    """Descendant fires must not receive a fresh recursive budget."""
+
+    owner = _Player(position=(10.0, 10.0, 8.0))
+    solids = {(x, y, 10) for x in range(4, 17) for y in range(4, 17)}
+    server = _Server(_World(solids), [owner])
+    fire = FireController(server, rng=_AlwaysSpread())
+    monkeypatch.setattr(
+        "server.combat_runtime.get_combat_system",
+        lambda _server: SimpleNamespace(_apply_block_damage=lambda *a, **k: None),
+    )
+
+    initial = fire.ignite_impact(10.0, 10.0, 9.5, owner, now=0.0)
+    maximum = len(initial)
+    for step in range(1, 8):
+        fire.update(now=step * C.BLOCKFIRE_SPREAD_TIMER)
+        maximum = max(maximum, len(fire.block_fires))
+
+    assert len(initial) == C.BLOCKFIRE_SPREAD_COUNT
+    assert maximum <= len(initial) + C.BLOCKFIRE_SPREAD_COUNT
+
+
+def test_blockfire_global_cap_replaces_oldest_emitters():
+    owner = _Player(position=(0.0, 0.0, 0.0))
+    count = FireController.MAX_ACTIVE_BLOCK_FIRES + 7
+    solids = {(index, 0, 10) for index in range(count)}
+    server = _Server(_World(solids), [owner])
+    fire = FireController(server)
+
+    for index in range(count):
+        assert fire.ignite_block((index, 0, 10), owner, now=float(index)) is not None
+
+    assert len(fire.block_fires) == FireController.MAX_ACTIVE_BLOCK_FIRES
+    assert len(server.destroyed) == count - FireController.MAX_ACTIVE_BLOCK_FIRES
+    assert len(fire._clusters) == FireController.MAX_ACTIVE_BLOCK_FIRES

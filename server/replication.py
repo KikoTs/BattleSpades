@@ -304,8 +304,62 @@ class ReplicationService:
                 player.id, False
             )
             if active != advertised:
+                if (
+                    advertised
+                    and not active
+                    and self._defer_jetpack_release_transition(player)
+                ):
+                    # Key-up and fuel exhaustion already stop local thrust.
+                    # Sending the inactive row in mid-air only adds a position
+                    # correction; wait until the owner is settled while every
+                    # observer continues receiving authoritative false state.
+                    continue
                 urgent.append(connection)
         return urgent
+
+    def _defer_jetpack_release_transition(self, player) -> bool:
+        """Hold the owner's inactive action row until grounded and released.
+
+        Retail stops local thrust from physical SPACE key-up or zero fuel even
+        while its last WorldUpdate action bit remains active. Position and
+        velocity in that same row are inseparable from the bit. During fast
+        Jump Pack flight an integer server/client phase differs by either
+        0.63 or 4.9 blocks at exhaustion, so transmitting the row there causes
+        the reported ADJUST/SNAP. Observers are unaffected because their rows
+        are never suppressed.
+        """
+        input_state = getattr(player, "input", None)
+        if input_state is None:
+            # Lightweight tests and non-retail facades have no physical-input
+            # witness; preserve their immediate transition behavior.
+            return False
+
+        player_id = int(player.id)
+        jetpack_id = int(getattr(player, "jetpack_id", 0))
+        activation_held = bool(
+            getattr(input_state, "hover", False)
+            if jetpack_id == 69
+            else getattr(input_state, "jump", False)
+        )
+        if activation_held or bool(getattr(player, "airborne", False)):
+            self._jetpack_owner_release_settle_deadline.pop(player_id, None)
+            return True
+
+        received = int(getattr(player, "_input_receive_sequence", 0))
+        settle_deadline = self._jetpack_owner_release_settle_deadline.get(
+            player_id
+        )
+        if settle_deadline is None:
+            settle_frames = max(1, min(120, int(getattr(
+                getattr(self.server, "config", None),
+                "jetpack_owner_handoff_input_frames",
+                30,
+            ))))
+            settle_deadline = received + settle_frames
+            self._jetpack_owner_release_settle_deadline[player_id] = (
+                settle_deadline
+            )
+        return received < settle_deadline
 
     def _send_urgent_owner_rows(self, connections: list) -> None:
         """Send transition-only owner snapshots between 30 Hz cadence rows."""
@@ -458,6 +512,12 @@ class ReplicationService:
         received = int(getattr(player, "_input_receive_sequence", 0))
         if target_active is True and bool(
             getattr(player, "jetpack_active", False)
+        ):
+            return True
+        if (
+            target_active is True
+            and not bool(getattr(player, "jetpack_active", False))
+            and self._defer_jetpack_release_transition(player)
         ):
             return True
         if received >= deadline:

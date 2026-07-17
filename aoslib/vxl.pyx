@@ -794,9 +794,20 @@ cdef class VXL:
             for z in range(run_start, top_end + 1):
                 top_colors.append(self._surface_color_world(map_x, map_y, z))
 
+            # A fully explicit run is already covered by ``top_colors``.
+            # Starting the bottom run at ``run_end`` unconditionally used to
+            # serialize that last voxel twice.  For a one-voxel island this
+            # produced ``span_words=3`` with top_start == top_end, which the
+            # retail span decoder rejects because the inferred bottom range
+            # overlaps the top range.  A rejected dirty column leaves the
+            # client with stale/blank geometry while server collision has
+            # already advanced.
             bottom_colors = []
-            for z in range(bottom_start, run_end + 1):
-                bottom_colors.append(self._surface_color_world(map_x, map_y, z))
+            if bottom_start > top_end:
+                for z in range(bottom_start, run_end + 1):
+                    bottom_colors.append(
+                        self._surface_color_world(map_x, map_y, z)
+                    )
 
             span_words = 1 + len(top_colors) + len(bottom_colors)
             out.extend((span_words, run_start, top_end, prev_air_start))
@@ -887,8 +898,11 @@ cdef class VXL:
                         top_colors.append(self._surface_color_source(map_x, map_y, z))
 
                     bottom_colors = []
-                    for z in range(bottom_start, run_end + 1):
-                        bottom_colors.append(self._surface_color_source(map_x, map_y, z))
+                    if bottom_start > top_end:
+                        for z in range(bottom_start, run_end + 1):
+                            bottom_colors.append(
+                                self._surface_color_source(map_x, map_y, z)
+                            )
 
                     span_words = 1 + len(top_colors) + len(bottom_colors)
                     out.extend((span_words, run_start, top_end, prev_air_start))

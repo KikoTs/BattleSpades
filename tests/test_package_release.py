@@ -28,6 +28,8 @@ def _fake_frozen_tree(tmp_path: Path) -> Path:
     frozen = tmp_path / "frozen"
     (frozen / "_internal").mkdir(parents=True)
     (frozen / "BattleSpades.exe").write_bytes(b"launcher")
+    (frozen / "BattleSpadesTutorial.exe").write_bytes(b"tutorial launcher")
+    (frozen / "BattleSpadesMapCreator.exe").write_bytes(b"map creator launcher")
     (frozen / "_internal" / "runtime.dll").write_bytes(b"runtime")
     return frozen
 
@@ -70,6 +72,8 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     )
 
     assert (staged / "BattleSpades.exe").is_file()
+    assert (staged / "BattleSpadesTutorial.exe").is_file()
+    assert (staged / "BattleSpadesMapCreator.exe").is_file()
     assert (staged / "_internal" / "runtime.dll").is_file()
     assert (staged / "config.toml").is_file()
     assert (staged / "LICENSE").is_file()
@@ -77,8 +81,10 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert sorted(path.name for path in (staged / "maps").glob("*.vxl")) == TRACKED_MAPS
     assert sorted(path.name for path in (staged / "prefabs").glob("*.kv6")) == TRACKED_PREFABS
     assert (staged / "plugins" / "README.txt").is_file()
+    assert (staged / "steam-runtime" / "README.txt").is_file()
     assert (staged / "client_patches" / "INSTALL.txt").is_file()
     assert (staged / "client_patches" / "session_transition_patch.py").is_file()
+    assert (staged / "client_patches" / "clipboard_input_patch.py").is_file()
     assert not (staged / "codex-command-runner.exe").exists()
     assert not (staged / "tests").exists()
 
@@ -122,6 +128,10 @@ def test_pyinstaller_spec_keeps_operator_content_external() -> None:
     assert "exclude_binaries=True" in spec
     assert "COLLECT(" in spec
     assert 'name="BattleSpades"' in spec
+    assert 'name="BattleSpadesTutorial"' in spec
+    assert 'name="BattleSpadesMapCreator"' in spec
+    assert 'project_root / "run_tutorial.py"' in spec
+    assert 'project_root / "run_map_creator.py"' in spec
     assert '"server.bot_ai.recast"' in spec
     assert "maps" not in spec
     assert "prefabs" not in spec

@@ -26,6 +26,8 @@ _SERVER_TO_BRIDGE_LIMIT = 64
 _BRIDGE_TO_SERVER_LIMIT = 128
 _TERRAIN_SNAPSHOT_THRESHOLD = 65_536
 _RESTART_BACKOFF = (1.0, 2.0, 5.0, 30.0)
+_WORKER_STARTUP_GRACE_SECONDS = 8.0
+_WORKER_STALL_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,8 @@ class WorkerStatus:
     running: bool
     process_id: int | None
     restarts: int
+    stalled_restarts: int
+    intent_silence_seconds: float
     queued_frames: int
     queued_intents: int
     pending_terrain_cells: int
@@ -86,8 +90,15 @@ class AIWorkerSupervisor:
         self._running = False
         self._process_id: int | None = None
         self._restarts = 0
+        self._stalled_restarts = 0
         self._dropped_frames = 0
         self._dropped_intents = 0
+        # The child can remain alive while blocked inside a native path query.
+        # Track an unanswered live-bot frame as a heartbeat lease so the
+        # bridge can reap that wedged process without touching gameplay.
+        self._worker_started_at = 0.0
+        self._last_intent_at = 0.0
+        self._awaiting_intent_since: float | None = None
 
     def start(self, snapshot: MapSnapshot) -> None:
         """Start supervision and publish the first map without blocking spawn."""
@@ -194,8 +205,20 @@ class AIWorkerSupervisor:
             running = self._running
             process_id = self._process_id
             restarts = self._restarts
+            stalled_restarts = self._stalled_restarts
             dropped_frames = self._dropped_frames
             dropped_intents = self._dropped_intents
+            last_intent_at = self._last_intent_at
+            awaiting_intent_since = self._awaiting_intent_since
+            intent_silence_seconds = (
+                max(
+                    0.0,
+                    time.monotonic()
+                    - max(last_intent_at, awaiting_intent_since),
+                )
+                if running and awaiting_intent_since is not None
+                else 0.0
+            )
         with self._terrain_lock:
             pending = len(self._pending_terrain)
             snapshot_required = self._snapshot_required
@@ -203,6 +226,8 @@ class AIWorkerSupervisor:
             running=running,
             process_id=process_id,
             restarts=restarts,
+            stalled_restarts=stalled_restarts,
+            intent_silence_seconds=intent_silence_seconds,
             queued_frames=self._queued_frame_count(),
             queued_intents=self._intents.qsize(),
             pending_terrain_cells=pending,
@@ -240,6 +265,7 @@ class AIWorkerSupervisor:
                             self._running = False
                             self._process_id = None
                             self._restarts += 1
+                            self._awaiting_intent_since = None
                         logger.warning(
                             "AI worker exited code=%s; restart in %.1fs",
                             exit_code,
@@ -264,9 +290,13 @@ class AIWorkerSupervisor:
                     )
                     process.start()
                     sent_snapshot_serial = -1
+                    started_at = time.monotonic()
                     with self._status_lock:
                         self._running = True
                         self._process_id = process.pid
+                        self._worker_started_at = started_at
+                        self._last_intent_at = started_at
+                        self._awaiting_intent_since = None
                     logger.info("AI worker started pid=%s", process.pid)
 
                 sent_snapshot_serial = self._send_snapshot_if_needed(
@@ -275,6 +305,18 @@ class AIWorkerSupervisor:
                 self._send_pending_terrain(process_input)
                 self._send_frames(process_input)
                 self._receive_intents(process_output)
+                if self._worker_is_stalled(time.monotonic()):
+                    logger.error(
+                        "AI worker pid=%s stopped returning intentions; "
+                        "terminating wedged process",
+                        process.pid,
+                    )
+                    process.terminate()
+                    process.join(timeout=0.5)
+                    with self._status_lock:
+                        self._stalled_restarts += 1
+                        self._awaiting_intent_since = None
+                    continue
                 self._stop_event.wait(0.005)
         except (OSError, RuntimeError):
             logger.exception("AI bridge failed")
@@ -349,6 +391,7 @@ class AIWorkerSupervisor:
         for index, (_key, frame) in enumerate(batch):
             try:
                 process_input.put_nowait(frame)
+                self._note_frame_sent(frame, time.monotonic())
             except (OSError, queue.Full):
                 # The process pipe is temporarily full. Requeue only frames
                 # that have not already been superseded on the game thread.
@@ -357,6 +400,40 @@ class AIWorkerSupervisor:
                         if pending_key not in self._frames:
                             self._frames[pending_key] = pending_frame
                 return
+
+    def _note_frame_sent(self, frame: PerceptionFrame, now: float) -> None:
+        """Start a heartbeat lease for a live bot's unanswered frame."""
+
+        observer = next(
+            (
+                player
+                for player in frame.players
+                if int(player.player_id) == int(frame.observer_id)
+                and int(player.generation) == int(frame.observer_generation)
+            ),
+            None,
+        )
+        if (
+            observer is None
+            or not bool(observer.alive)
+            or not bool(observer.spawned)
+        ):
+            return
+        with self._status_lock:
+            if self._awaiting_intent_since is None:
+                self._awaiting_intent_since = float(now)
+
+    def _worker_is_stalled(self, now: float) -> bool:
+        """Return true when live frames receive no child result for too long."""
+
+        with self._status_lock:
+            waiting_since = self._awaiting_intent_since
+            started_at = self._worker_started_at
+        if waiting_since is None or started_at <= 0.0:
+            return False
+        if float(now) - started_at < _WORKER_STARTUP_GRACE_SECONDS:
+            return False
+        return float(now) - waiting_since >= _WORKER_STALL_TIMEOUT_SECONDS
 
     def _queued_frame_count(self) -> int:
         """Return the coalesced server-to-bridge frame count."""
@@ -370,6 +447,10 @@ class AIWorkerSupervisor:
                 intent = process_output.get_nowait()
             except (OSError, queue.Empty):
                 return
+            received_at = time.monotonic()
+            with self._status_lock:
+                self._last_intent_at = received_at
+                self._awaiting_intent_since = None
             try:
                 self._intents.put_nowait(intent)
             except queue.Full:

@@ -5,6 +5,9 @@ Portable archives contain or are produced with CPython (PSF License),
 PyInstaller (GPL-2.0-or-later with bootloader exception), pyenet (BSD-3-Clause),
 ENet (MIT), Cython (Apache-2.0), toml (MIT), and py_trees (BSD-3-Clause).
 
+Valve Steam runtime files are not part of BattleSpades archives. Optional
+master-server registration loads only operator-supplied copies at runtime.
+
 Recast/Detour
 -------------
 

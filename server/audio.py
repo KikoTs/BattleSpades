@@ -127,9 +127,9 @@ def _play_music_bytes(name: str, seconds_played: float = 0.0) -> bytes:
 
 
 def _switch_music(send, track: str) -> None:
-    """StopMusic THEN PlayMusic on a `send(bytes)` sink. The Stop is required —
-    process_packet_play_music refuses to override music that's already playing
-    (e.g. the leftover 'mainmenu' track). The track then alure-loops forever."""
+    """StopMusic THEN PlayMusic on a ``send(bytes)`` sink. The Stop is required
+    before replacing an existing gameplay track; normal connection and
+    broadcast sinks already use reliable ordered delivery by default."""
     send(_stop_music_bytes())
     send(_play_music_bytes(track))
 

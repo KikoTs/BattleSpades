@@ -10,6 +10,7 @@ scene id leaves this retail build without a compatible game scene.
 from __future__ import annotations
 
 import shared.constants as C
+import shared.constants_gamemode as CG
 
 from server.class_selection import (
     DEFAULT_DISABLED_TOOLS,
@@ -17,6 +18,7 @@ from server.class_selection import (
     normalize_class_selection,
 )
 from server.game_constants import TEAM1, TEAM2
+from server.corpse_lifecycle import CLASSIC_CORPSE_REPRESENTATION
 
 from .ctf import CTFMode
 
@@ -40,8 +42,34 @@ class ClassicCTFMode(CTFMode):
     name = "Classic CTF"
     description = "Classic Deuce CTF: capture the enemy intel!"
     mode_code = "cctf"
+    death_representation = CLASSIC_CORPSE_REPRESENTATION
     intel_auto_return_default = False
     shoot_with_intel_default = True
+    intel_offset_from_base = float(CG.CLASSIC_CTF_INTEL_MIN_RADIUS_FROM_BASE)
+    stock_maps = (
+        "Crossroads",
+        "Hiesville",
+        "ToTheBridge",
+        "Trenches",
+        "WinterValley",
+        "WW1",
+        "Classic",
+    )
+
+    def __init__(self, server) -> None:
+        super().__init__(server)
+        # BattleSpades historically used ten captures when no TOML was loaded,
+        # while the retail Match Lobby and Classic playlist use five. Preserve
+        # an explicit operator rule/overlay, otherwise recover the stock value.
+        overlay = getattr(server.config, "mode_settings", {}).get("cctf", {})
+        from server.game_rules import get_rules
+
+        rules = get_rules(server.config)
+        if (
+            "score_limit" not in overlay
+            and "RULE_CTF_SCORE_TARGET" not in getattr(rules, "explicit", set())
+        ):
+            self.score_limit = 5
 
     def prepare_join_selection(
         self,

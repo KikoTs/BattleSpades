@@ -55,8 +55,18 @@ def _allowed_for(code: str) -> tuple[int, ...]:
     if mafia:
         return tuple(int(x) for x in C.MAFIA_TEAM_CLASSES)
     if code == 'tdm':
-        # Deathmatch: every class available (incl. DLC), per user request.
-        return _all_classes()
+        # Ordinary TDM uses the seven Battle Builder combat classes. Event,
+        # Classic, Gangster, Zombie and UGC classes have mode-owned state and
+        # exposing them here produces invalid loadouts and class UI.
+        return (
+            int(C.CLASS_SOLDIER),
+            int(C.CLASS_SCOUT),
+            int(C.CLASS_ROCKETEER),
+            int(C.CLASS_MINER),
+            int(C.CLASS_ENGINEER),
+            int(C.CLASS_SPECIALIST),
+            int(C.CLASS_MEDIC),
+        )
     if code == 'zom':
         # Zombie mode has asymmetric class menus.  This union is used by
         # InitialInfo.disabled_classes; ZombieMode.configure_state_data splits
@@ -89,7 +99,7 @@ def _mode_data(code: str) -> ModeData:
         # Score/win limits. TDM plays to 200 team kills (user spec). CTF to
         # the intel-capture count. Sourced here so wire HUD + rules agree.
         default_score_limit={
-            'ctf': 10, 'cctf': 10, 'tdm': 200, 'dem': 5, 'mh': 100,
+            'ctf': 10, 'cctf': 5, 'tdm': 200, 'dem': 5, 'mh': 100,
             'oc': 100, 'dia': 10, 'tc': 100,
             'vip': int(MG.VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP), 'zom': 1,
             'ugc': 0,

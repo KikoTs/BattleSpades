@@ -10,6 +10,7 @@ from server.player import Player
 from shared.bytes import ByteReader
 from shared.packet import (
     BlockBuild,
+    BlockBuildColored,
     ClientData,
     CreatePlayer,
     Damage,
@@ -48,6 +49,29 @@ class FailSecondSendConnection(RecordingConnection):
         self.attempts += 1
         if self.attempts == 2:
             raise RuntimeError("synthetic send failure")
+        super().send(data, reliable=reliable, prefix=prefix)
+
+
+class CanonicalRecordingConnection(RecordingConnection):
+    """Join fixture opting into the production topology catch-up path."""
+
+    def __init__(self, player_id=9):
+        super().__init__(in_game=False)
+        self.player = SimpleNamespace(id=player_id, team=0)
+        self.map_cell_watermark = None
+        self.map_cell_overflow = False
+        self.map_cell_replay = None
+
+
+class FailSecondCanonicalSendConnection(CanonicalRecordingConnection):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def send(self, data, reliable=True, prefix=0x30):
+        self.attempts += 1
+        if self.attempts == 2:
+            raise RuntimeError("synthetic canonical send failure")
         super().send(data, reliable=reliable, prefix=prefix)
 
 
@@ -90,6 +114,148 @@ def test_joiner_replays_build_and_destroy_after_map_snapshot():
     assert joiner.sent == []
     server.replay_map_mutations(joiner)
     assert joiner.sent == [build, destroy]
+
+
+def test_canonical_join_replay_coalesces_repeated_cell_edits_to_final_color():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+
+    cell = (10, 20, 61)
+    assert server.world_manager.set_block(*cell, True, 0x112233)
+    assert server.world_manager.set_block(*cell, True, 0x445566)
+    assert server.world_manager.set_block(*cell, False)
+    assert server.world_manager.set_block(*cell, True, 0xA1B2C3)
+
+    server.replay_map_mutations(joiner)
+
+    assert len(joiner.sent) == 1
+    packet = BlockBuildColored(ByteReader(joiner.sent[0][1:]))
+    assert packet.player_id == joiner.player.id
+    assert (packet.x, packet.y, packet.z) == cell
+    assert packet.color == 0xA1B2C3
+
+
+def test_canonical_coalescing_preserves_supported_build_order_after_recolor():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+    base = (20, 20, 61)
+    extension = (20, 20, 60)
+
+    assert server.world_manager.set_block(*base, True, 0x101010)
+    assert server.world_manager.set_block(*extension, True, 0x202020)
+    assert server.world_manager.set_block(*base, True, 0x303030)
+    server.replay_map_mutations(joiner)
+
+    packets = [
+        BlockBuildColored(ByteReader(data[1:])) for data in joiner.sent
+    ]
+    assert [
+        (packet.x, packet.y, packet.z) for packet in packets
+    ] == [base, extension]
+    assert packets[0].color == 0x303030
+
+
+def test_canonical_join_replay_expands_collapse_to_exact_air_cells():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    cells = [(30, 30, 61), (30, 30, 60), (31, 30, 60)]
+    for cell in cells:
+        assert server.world_manager.set_block(*cell, True, 0x334455)
+    server.mark_map_snapshot_complete(joiner)
+
+    assert server.world_manager.destroy_blocks(cells) == cells
+    server.replay_map_mutations(joiner)
+
+    packets = [Damage(ByteReader(data[1:])) for data in joiner.sent]
+    assert len(packets) == len(cells)
+    assert {tuple(int(value) for value in packet.position) for packet in packets} == set(cells)
+    assert all(packet.chunk_check == 0 for packet in packets)
+    assert all(packet.player_id == joiner.player.id for packet in packets)
+
+
+def test_canonical_join_snapshot_excludes_earlier_edits_and_catches_later_ones():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+
+    before = (40, 40, 61)
+    after = (41, 40, 61)
+    assert server.world_manager.set_block(*before, True, 0x102030)
+    assert list(server._map_cell_journal) == []
+    server.mark_map_snapshot_complete(joiner)
+    assert server.world_manager.set_block(*after, True, 0x405060)
+
+    server.replay_map_mutations(joiner)
+    packets = [BlockBuildColored(ByteReader(data[1:])) for data in joiner.sent]
+    assert [(packet.x, packet.y, packet.z) for packet in packets] == [after]
+
+
+def test_simultaneous_canonical_joiners_keep_independent_topology_watermarks():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    first = CanonicalRecordingConnection(player_id=8)
+    second = CanonicalRecordingConnection(player_id=9)
+    server.connections = {8: first, 9: second}
+    server.mark_map_snapshot_complete(first)
+    cell_a = (50, 50, 61)
+    cell_b = (51, 50, 61)
+    assert server.world_manager.set_block(*cell_a, True, 0x111111)
+    server.mark_map_snapshot_complete(second)
+    assert server.world_manager.set_block(*cell_b, True, 0x222222)
+
+    server.replay_map_mutations(second)
+    server.replay_map_mutations(first)
+
+    second_cells = {
+        tuple(
+            getattr(BlockBuildColored(ByteReader(data[1:])), name)
+            for name in ("x", "y", "z")
+        )
+        for data in second.sent
+    }
+    first_cells = {
+        tuple(
+            getattr(BlockBuildColored(ByteReader(data[1:])), name)
+            for name in ("x", "y", "z")
+        )
+        for data in first.sent
+    }
+    assert second_cells == {cell_b}
+    assert first_cells == {cell_a, cell_b}
+
+
+def test_canonical_replay_retry_resumes_inside_multi_cell_collapse():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = FailSecondCanonicalSendConnection()
+    server.connections = {9: joiner}
+    cells = [(60, 60, 61), (60, 60, 60), (61, 60, 60)]
+    for cell in cells:
+        assert server.world_manager.set_block(*cell, True, 0x778899)
+    server.mark_map_snapshot_complete(joiner)
+    assert server.world_manager.destroy_blocks(cells) == cells
+
+    try:
+        server.replay_map_mutations(joiner)
+    except RuntimeError:
+        pass
+    server.replay_map_mutations(joiner)
+
+    assert len(joiner.sent) == 3
+    assert all(
+        Damage(ByteReader(data[1:])).chunk_check == 0
+        for data in joiner.sent
+    )
+    assert joiner.map_cell_replay is None
 
 
 def test_new_snapshot_does_not_replay_mutations_already_in_its_columns():
@@ -243,6 +409,69 @@ def test_pending_join_disconnect_releases_retained_journal():
     assert list(server._map_mutation_journal) == []
 
 
+def test_pending_canonical_join_disconnect_releases_exact_cell_journal():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    peer = object()
+    joiner = CanonicalRecordingConnection()
+    joiner.reserved_player_id = None
+    joiner.on_disconnect = lambda: None
+    server.connections = {peer: joiner}
+    server.mark_map_snapshot_complete(joiner)
+    assert server.world_manager.set_block(70, 70, 61, True, 0x123456)
+    assert server._map_cell_journal
+    joiner.player = None
+
+    server._on_disconnect_sync(peer)
+
+    assert list(server._map_cell_journal) == []
+
+
+def test_world_replacement_rebinds_exact_cell_listener_and_rollback_restores_it():
+    server = BattleSpadesServer(ServerConfig())
+    original = server.world_manager
+    original.generate_flat_map()
+    replacement = type(original)(server.config)
+    replacement.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+
+    original.set_block(80, 80, 61, True, 0x111111)
+    assert server._map_cell_sequence == 1
+    server.world_manager = replacement
+    server._bind_world_mutation_journal()
+    original.set_block(81, 80, 61, True, 0x222222)
+    assert server._map_cell_sequence == 1
+    replacement.set_block(82, 80, 61, True, 0x333333)
+    assert server._map_cell_sequence == 2
+
+    server.world_manager = original
+    server._bind_world_mutation_journal()
+    replacement.set_block(83, 80, 61, True, 0x444444)
+    assert server._map_cell_sequence == 2
+    original.set_block(84, 80, 61, True, 0x555555)
+    assert server._map_cell_sequence == 3
+
+
+def test_transition_reset_clears_exact_cell_cursor_and_connection_lease():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+    assert server.world_manager.set_block(90, 90, 61, True, 0x123456)
+    joiner.map_cell_replay = object()
+
+    server.match_transition._reset_map_journal()
+
+    assert list(server._map_cell_journal) == []
+    assert server._map_cell_sequence == 0
+    assert joiner.map_cell_watermark is None
+    assert joiner.map_cell_overflow is False
+    assert joiner.map_cell_replay is None
+
+
 def test_disconnect_releases_replication_state_for_reused_player_id():
     server = BattleSpadesServer(ServerConfig())
     peer = object()
@@ -283,6 +512,33 @@ def test_joiner_is_rejected_instead_of_partially_replayed_after_journal_overflow
     assert server.metrics.map_mutation_overflows >= 1
 
 
+def test_canonical_join_is_rejected_after_exact_cell_journal_overflow():
+    server = BattleSpadesServer(ServerConfig(max_map_mutation_journal=64))
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    joiner.disconnect_reason = None
+    joiner.disconnect = lambda reason=0: setattr(
+        joiner, "disconnect_reason", reason
+    )
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+
+    for index in range(65):
+        x, y = divmod(index, 16)
+        assert server.world_manager.set_block(
+            100 + x, 100 + y, 61, True, 0xABCDEF
+        )
+
+    assert joiner.map_cell_overflow is True
+    try:
+        server.replay_map_mutations(joiner)
+    except RuntimeError as exc:
+        assert "contiguous terrain snapshot" in str(exc)
+    else:
+        raise AssertionError("overflowed canonical catch-up was admitted")
+    assert joiner.disconnect_reason == 13
+
+
 class DummyPeer:
     address = ("127.0.0.1", 32887)
 
@@ -314,10 +570,10 @@ def test_real_handshake_replays_post_mapsync_mutations_before_ingame():
     assert connection.map_mutation_watermark is not None
     sent.clear()
 
-    build = _block_build_bytes(7, 8, 61)
-    destroy = _damage_bytes(9.0, 10.0, 61.0)
-    server.broadcast(build)
-    server.broadcast(destroy)
+    build_cell = (7, 8, 61)
+    destroy_cell = (9, 10, 62)
+    assert server.world_manager.set_block(*build_cell, True, 0x123456)
+    assert server.world_manager.destroy_blocks([destroy_cell]) == [destroy_cell]
     assert sent == []
 
     packet = ClientData()
@@ -329,9 +585,14 @@ def test_real_handshake_replays_post_mapsync_mutations_before_ingame():
     packet.weapon_deployment_yaw = 0.0
     asyncio.run(connection.on_receive(bytes([0x30]) + bytes(packet.generate())))
 
-    # Palette and the reliable remote-only roster WorldUpdate precede terrain
-    # replay because BlockBuild/BlockLine do not carry RGB.
+    # Palette and the reliable remote-only roster WorldUpdate precede exact
+    # canonical terrain replay.
     assert sent[0][0] == 11
     assert sent[1][0] == WorldUpdate.id
-    assert sent[2:4] == [build, destroy]
+    built = BlockBuildColored(ByteReader(sent[2][1:]))
+    destroyed = Damage(ByteReader(sent[3][1:]))
+    assert (built.x, built.y, built.z) == build_cell
+    assert built.color == 0x123456
+    assert tuple(int(value) for value in destroyed.position) == destroy_cell
+    assert destroyed.chunk_check == 0
     assert connection.in_game is True

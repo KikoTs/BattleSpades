@@ -208,7 +208,16 @@ class SimulationRuntime:
         ):
             from server.scoreboard import send_round_timer
 
-            remaining = server.mode.time_limit - server.mode.elapsed_time
+            countdown = getattr(
+                server.mode,
+                "countdown_seconds_remaining",
+                None,
+            )
+            remaining = (
+                float(countdown(time.time()))
+                if callable(countdown)
+                else server.mode.time_limit - server.mode.elapsed_time
+            )
             send_round_timer(server, remaining)
         if server.vote_manager.active:
             server.vote_manager.tick(time.time())

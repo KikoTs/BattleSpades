@@ -25,7 +25,25 @@ class _BlockFire:
     next_character_damage: float
     next_block_damage: float
     next_spread: float
+    cluster_id: int
+    spread_pending: bool = True
+
+
+@dataclass
+class _FireCluster:
+    """A single Molotov's bounded, shared spread budget.
+
+    ``BLOCKFIRE_SPREAD_COUNT`` belongs to the impact as a whole.  Giving the
+    full count to every child creates a supercritical tree (five initial
+    fires, each producing children that each receive five more attempts).
+    Besides being unlike the retail effect, that eventually floods clean
+    clients with particle entities.  Members therefore consume this one
+    shared budget and each member receives at most one attempt.
+    """
+
+    cluster_id: int
     spreads_left: int
+    members: int = 0
 
 
 @dataclass
@@ -39,12 +57,20 @@ class _BurningPlayer:
 class FireController:
     """Own visible block-fire entities and damage-over-time state."""
 
+    # Retail clients render each BLOCKFIRE as a persistent particle emitter.
+    # Keep a hard safety ceiling even when many Gangsters throw at once; old
+    # fire naturally expires after four seconds and new impact fire replaces
+    # the oldest emitter so player feedback is never silently lost.
+    MAX_ACTIVE_BLOCK_FIRES = 96
+
     def __init__(self, server, rng: Optional[random.Random] = None):
         self.server = server
         self.rng = rng if rng is not None else random.Random()
         self.block_fires: dict[int, _BlockFire] = {}
         self.burning_players: dict[int, _BurningPlayer] = {}
         self._burning_blocks: dict[tuple[int, int, int], int] = {}
+        self._clusters: dict[int, _FireCluster] = {}
+        self._next_cluster_id = 1
 
     def clear(self) -> None:
         """Discard runtime state when the world/round is replaced."""
@@ -53,6 +79,7 @@ class FireController:
         self.block_fires.clear()
         self.burning_players.clear()
         self._burning_blocks.clear()
+        self._clusters.clear()
 
     def forget_player(self, player_id: int) -> None:
         """Remove fire whose target or damage owner is disconnecting.
@@ -109,14 +136,28 @@ class FireController:
                     if distance <= float(radius + 1) ** 2:
                         candidates.append((distance, (cx, cy, cz)))
         candidates.sort(key=lambda item: (item[0], item[1]))
-        return [
+        cluster_id = self._new_cluster()
+        entity_ids = [
             entity_id
             for _distance, block in candidates[:limit]
-            if (entity_id := self.ignite_block(block, owner, now=now)) is not None
+            if (
+                entity_id := self.ignite_block(
+                    block,
+                    owner,
+                    now=now,
+                    _cluster_id=cluster_id,
+                    _replace_oldest=True,
+                )
+            ) is not None
         ]
+        if not entity_ids:
+            self._clusters.pop(cluster_id, None)
+        return entity_ids
 
     def ignite_block(self, block: tuple[int, int, int], owner,
-                     now: Optional[float] = None) -> Optional[int]:
+                     now: Optional[float] = None, *,
+                     _cluster_id: Optional[int] = None,
+                     _replace_oldest: bool = True) -> Optional[int]:
         """Create one replicated BLOCKFIRE entity unless already burning."""
         block = tuple(int(value) for value in block)
         if block in self._burning_blocks:
@@ -125,6 +166,29 @@ class FireController:
             now = time.time()
         if not self.server.world_manager.get_solid(*block):
             return None
+
+        if len(self.block_fires) >= self.MAX_ACTIVE_BLOCK_FIRES:
+            if not _replace_oldest:
+                return None
+            oldest = min(
+                self.block_fires.values(),
+                key=lambda state: (state.expires_at, state.entity_id),
+            )
+            self._remove_block_fire(oldest)
+
+        if _cluster_id is None:
+            _cluster_id = self._new_cluster()
+        cluster = self._clusters.get(_cluster_id)
+        if cluster is None:
+            # A spread may have lost its last member to the global cap between
+            # candidate selection and creation. Recreate only for direct/new
+            # impacts; stale child spreads must not resurrect old clusters.
+            if not _replace_oldest:
+                return None
+            self._clusters[_cluster_id] = cluster = _FireCluster(
+                cluster_id=_cluster_id,
+                spreads_left=int(getattr(C, "BLOCKFIRE_SPREAD_COUNT", 5)),
+            )
 
         from server.connection import internal_team_to_wire
 
@@ -155,10 +219,22 @@ class FireController:
                 getattr(C, "BLOCKFIRE_BLOCK_DAMAGE_TIMER", 0.4)
             ),
             next_spread=now + float(getattr(C, "BLOCKFIRE_SPREAD_TIMER", 0.5)),
-            spreads_left=int(getattr(C, "BLOCKFIRE_SPREAD_COUNT", 5)),
+            cluster_id=_cluster_id,
         )
+        cluster.members += 1
         self._burning_blocks[block] = ent.entity_id
         return ent.entity_id
+
+    def _new_cluster(self) -> int:
+        """Allocate one wrap-safe Molotov spread group."""
+
+        cluster_id = self._next_cluster_id
+        self._next_cluster_id += 1
+        self._clusters[cluster_id] = _FireCluster(
+            cluster_id=cluster_id,
+            spreads_left=max(0, int(getattr(C, "BLOCKFIRE_SPREAD_COUNT", 5))),
+        )
+        return cluster_id
 
     def _exposed_faces(self, block: tuple[int, int, int]):
         """Return wire face/anchor pairs for every air-facing voxel side."""
@@ -253,11 +329,17 @@ class FireController:
                         causer_id=state.entity_id,
                     )
 
-            if state.spreads_left > 0 and now >= state.next_spread:
-                state.next_spread = now + float(
-                    getattr(C, "BLOCKFIRE_SPREAD_TIMER", 0.5)
-                )
-                state.spreads_left -= 1
+            cluster = self._clusters.get(state.cluster_id)
+            if (
+                state.spread_pending
+                and cluster is not None
+                and cluster.spreads_left > 0
+                and now >= state.next_spread
+            ):
+                # The count is an impact-wide attempt budget. Consume it even
+                # if the random roll finds no target, exactly once per member.
+                state.spread_pending = False
+                cluster.spreads_left -= 1
                 if owner is not None:
                     self._spread_one(state, owner, now)
 
@@ -281,7 +363,13 @@ class FireController:
                 ):
                     candidates.append(block)
         if candidates and self.rng.random() <= chance:
-            self.ignite_block(self.rng.choice(candidates), owner, now=now)
+            self.ignite_block(
+                self.rng.choice(candidates),
+                owner,
+                now=now,
+                _cluster_id=state.cluster_id,
+                _replace_oldest=False,
+            )
 
     def _update_burning_players(self, now: float) -> None:
         interval = float(getattr(C, "BLOCKFIRE_CHARACTER_DAMAGE_TIMER", 0.3))
@@ -310,5 +398,10 @@ class FireController:
     def _remove_block_fire(self, state: _BlockFire) -> None:
         self.block_fires.pop(state.entity_id, None)
         self._burning_blocks.pop(state.block, None)
+        cluster = self._clusters.get(state.cluster_id)
+        if cluster is not None:
+            cluster.members -= 1
+            if cluster.members <= 0:
+                self._clusters.pop(state.cluster_id, None)
         if self.server.entity_registry.remove(state.entity_id) is not None:
             self.server.broadcast_destroy_entity(state.entity_id)

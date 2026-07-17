@@ -39,6 +39,8 @@ def test_classic_ctf_registry_uses_ctf_scene_with_classic_switches() -> None:
     assert state.team2_classes == [int(C.CLASS_CLASSIC_SOLDIER)]
     assert state.team1_locked_class is True
     assert state.team2_locked_class is True
+    assert state.score_limit == 5
+    assert server.mode.score_limit == 5
     assert int(C.CLASSIC_SMG_TOOL) in info.disabled_tools
     assert int(C.CLASSIC_SHOTGUN_TOOL) in info.disabled_tools
 
@@ -61,6 +63,24 @@ def test_classic_selection_forces_deuce_rifle_grenade_and_spade() -> None:
     assert mode.allows_class_selection(
         SimpleNamespace(team=TEAM1), selected
     )
+
+
+def test_classic_uses_recovered_intel_offset_and_stock_vote_catalog() -> None:
+    server = _native_server()
+
+    assert server.mode.intel_offset_from_base == 3.0
+    assert server.vote_manager._mode_available_maps() == server.mode.stock_maps
+
+
+def test_classic_mode_specific_score_target_remains_operator_configurable() -> None:
+    config = ServerConfig(
+        default_mode="cctf",
+        mode_settings={"cctf": {"score_limit": 7}},
+    )
+    server = BattleSpadesServer(config)
+    server.mode = ClassicCTFMode(server)
+
+    assert server.mode.score_limit == 7
 
 
 def test_classic_dropped_intel_does_not_auto_return(monkeypatch) -> None:

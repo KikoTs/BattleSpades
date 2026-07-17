@@ -217,6 +217,26 @@ def test_legacy_chroma_key_cleanup_requires_native_exposure_guard() -> None:
     assert wm.get_solid(362, 153, 230) is True
 
 
+def test_static_light_entity_restores_server_collision_without_join_mutation() -> None:
+    """The type-13 client entity re-adds its marker voxel after VXL cleanup."""
+    path = MAPS_DIR / "ArcticBase.vxl"
+    if not path.exists():
+        return
+    wm = WorldManager(SimpleNamespace(
+        maps_path=str(path.parent), game_mode="tdm"
+    ))
+    assert wm.load_map(path.stem)
+    x, y, z = 213, 189, 221
+    assert not wm.get_solid(x, y, z)
+
+    assert wm.restore_static_light_block(x, y, z, (250, 250, 200))
+
+    assert wm.get_solid(x, y, z)
+    assert wm.get_color(x, y, z) == 0x80FAFAC8
+    assert wm.dirty_columns == set()
+    assert wm.snapshot_air_overrides() == ()
+
+
 def test_generated_and_edited_maps_use_valid_old_style_chunking():
     world_map = VXL(-1, b"", 0, 2)
     world_map.set_point(32, 48, 60, 0x7F008F00)
@@ -272,11 +292,11 @@ def test_player_block_delta_serializes_retail_opaque_color_word():
 
     raw = zlib.decompress(wm.serialize_dirty_columns_compressed())
     assert struct.unpack_from("<II", raw, 0) == (10, 20)
-    # A one-voxel floating run is both its top and bottom surface, so the
-    # compact VXL record carries the color twice (header + two color words).
-    assert (raw[8], raw[9], raw[10]) == (3, 30, 30)
+    # One explicit voxel needs one top-surface word. Encoding the same voxel
+    # again as an overlapping bottom surface makes the retail VXL decoder
+    # reject the complete dirty column, leaving stale/phantom geometry.
+    assert (raw[8], raw[9], raw[10]) == (2, 30, 30)
     assert struct.unpack_from("<I", raw, 12)[0] == 0x80123456
-    assert struct.unpack_from("<I", raw, 16)[0] == 0x80123456
 
 
 def test_out_of_world_block_write_is_not_marked_dirty():

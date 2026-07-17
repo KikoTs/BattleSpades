@@ -113,12 +113,16 @@ SPAWN_HP_DAMAGE_TYPE = 2
 
 def wire_team_to_internal(team_id: int) -> Optional[int]:
     """Convert wire team IDs into reversed runtime team IDs."""
-    return team_id if is_playable_team(team_id) else None
+    if is_playable_team(team_id) or team_id == WIRE_TEAM_SPECTATOR:
+        return team_id
+    return None
 
 
 def internal_team_to_wire(team_id: int) -> int:
     """Convert runtime team IDs into the wire representation."""
-    return team_id if is_playable_team(team_id) else DEFAULT_WIRE_TEAM
+    if is_playable_team(team_id) or team_id == TEAM_SPECTATOR:
+        return team_id
+    return DEFAULT_WIRE_TEAM
 
 
 def is_non_playable_wire_team(team_id: int) -> bool:
@@ -168,9 +172,33 @@ class Connection:
         # block packets after this watermark are replayed at first ClientData.
         self.map_mutation_watermark: Optional[int] = None
         self.map_mutation_overflow: bool = False
+        # Canonical VXL topology represented by this peer's MapSync payload.
+        # Packet watermarks remain for compatibility with old embedders, but
+        # real joins catch up from exact committed cells so replay cannot make
+        # a collapse/damage effect produce a different result later.
+        self.map_cell_watermark: Optional[int] = None
+        self.map_cell_overflow: bool = False
+        self.map_cell_replay: object | None = None
+        # Frozen destroyed-cell masks represented by this connection's
+        # MapSync snapshot. They are replayed only after the native GameScene
+        # starts, in bounded batches, to clear stale retail VXL collision.
+        self.map_air_replay: object | None = None
         # player_id -> concrete Player object/life token. The roster sent
         # before map loading can change while gameplay broadcasts are gated.
         self.known_player_lives: dict[int, tuple[int, int]] = {}
+        # player_id -> life token whose KillAction was already queued. This is
+        # separate from known_player_lives so Classic corpse reveal never
+        # replays a death merely to repair a later packet-36 cleanup.
+        self.known_player_deaths: dict[int, tuple[int, int]] = {}
+        # player_id -> life token whose missed corpse explosion has already
+        # been repaired with silent packet 36 for this GameScene.
+        self.known_corpse_cleanups: dict[int, tuple[int, int]] = {}
+        # Runtime entity IDs whose CreateEntity reached this exact GameScene.
+        # A projectile may spawn while a peer is still loading and expire just
+        # after it becomes in_game; sending DestroyEntity to that peer without
+        # a matching create produces the retail "invalid entity on destroy"
+        # warning and has crashed less forgiving entity classes.
+        self.known_entity_ids: set[int] = set()
 
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
@@ -255,8 +283,18 @@ class Connection:
         self.pending_ugc_tools = list(selection.ugc_tools)
 
     def _resolve_join_team(self, wire_team: int) -> tuple[int, int]:
-        """Resolve the initial playable team from the client's wire team ID."""
+        """Resolve the initial team without coercing a spectator into Blue."""
         internal_team = wire_team_to_internal(wire_team)
+        if internal_team == TEAM_SPECTATOR:
+            from server.game_rules import get_rules
+
+            if get_rules(self.server.config).enabled(
+                "RULE_ENABLE_SPECTATORS"
+            ):
+                # Spectator is a real native team (wire id 0). Mode-specific
+                # playable-team coercion must never turn it into a Character.
+                return TEAM_SPECTATOR, WIRE_TEAM_SPECTATOR
+            internal_team = None
         if internal_team is not None:
             prepare_team = getattr(self.server.mode, "prepare_join_team", None)
             if callable(prepare_team):
@@ -371,7 +409,11 @@ class Connection:
             and not self.in_game
         ):
             try:
-                self.server.reveal_world_to(self)
+                reveal_complete = self.server.reveal_world_to(self)
+                if reveal_complete is False:
+                    # Exact pre-snapshot air repairs are intentionally bounded.
+                    # Keep gameplay gated and continue on the next ClientData.
+                    return
                 self.in_game = True
                 prune = getattr(self.server, "_prune_map_mutations", None)
                 if prune is not None:
@@ -420,6 +462,15 @@ class Connection:
         from server.builders import build_state_data
         state = build_state_data(self.server, player_id=player_id)
         self.send(bytes(state.generate()), prefix=0x31)
+        # Modes with a native pre-spawn menu contract may append small state
+        # packets here.  Map Creator uses ForceTeamJoin(115) so the stock
+        # LoadingMenu enters SelectPrefabs; sending it later (after ClientData)
+        # is too late because the player has already been constructed.
+        send_post_state = getattr(
+            getattr(self.server, "mode", None), "send_post_state_data", None
+        )
+        if callable(send_post_state):
+            send_post_state(self)
         self.state_sent = True
 
     async def send_skybox(self):
@@ -462,7 +513,17 @@ class Connection:
         for player in self.server.players.values():
             if new_player and player.id == new_player.id:
                 continue
-            if not player.alive or not player.spawned:
+
+            live_character = bool(player.alive and player.spawned)
+            spectator = int(player.team) == TEAM_SPECTATOR
+            corpse_lifecycle = getattr(self.server, "corpse_lifecycle", None)
+            active_for_join = getattr(
+                corpse_lifecycle, "active_for_join", None
+            )
+            classic_corpse = bool(
+                callable(active_for_join) and active_for_join(player)
+            )
+            if not live_character and not classic_corpse and not spectator:
                 continue
 
             packet = CreatePlayer()
@@ -489,6 +550,14 @@ class Connection:
             color.player_id = player.id
             color.value = int(player.block_color) & 0xFFFFFF
             self.send(bytes(color.generate()))
+
+            if classic_corpse:
+                # CreatePlayer establishes the player connection; KillAction
+                # immediately changes its Character to ClassicCorpse. Packet
+                # 36 cannot be used as creation and is intentionally absent.
+                from server.roster import send_player_death
+
+                send_player_death(self, player, self.server)
     
     async def handle_pre_join_packet(self, data: bytes):
         """Handle packets before player is fully joined."""
@@ -591,7 +660,14 @@ class Connection:
         self.in_game = False
         self.map_mutation_watermark = None
         self.map_mutation_overflow = False
+        self.map_cell_watermark = None
+        self.map_cell_overflow = False
+        self.map_cell_replay = None
+        self.map_air_replay = None
         self.known_player_lives.clear()
+        self.known_player_deaths.clear()
+        self.known_corpse_cleanups.clear()
+        self.known_entity_ids.clear()
 
     async def reload_scene(self) -> bool:
         """Stream the active map/mode into the existing authenticated peer.
@@ -615,6 +691,20 @@ class Connection:
         
         # Send initial info
         await self.send_info()
+
+        # UGC guests cannot participate in the ordinary CRC/MapSync handshake
+        # until a lobby host has supplied packet 54/56/58 and populated the
+        # native client's map_data buffer.  The isolated Map Creator server
+        # deliberately acts as that host.  This hook is synchronous so the
+        # MapDataValidation waiter below is installed before ENet can deliver
+        # the client's reply on the next event-loop turn.
+        pre_validation_transfer = getattr(
+            getattr(self.server, "mode", None),
+            "send_pre_validation_map_data",
+            None,
+        )
+        if callable(pre_validation_transfer):
+            pre_validation_transfer(self)
         
         # Send map data
         map_ready = await self.send_map_data(
@@ -647,6 +737,16 @@ class Connection:
         """
         from server.builders import build_initial_info
         packet = build_initial_info(self.server)
+        # UGC distinguishes its first connected editor (host) from observing
+        # clients in InitialInfo.  This must be per connection; mutating the
+        # shared builder would accidentally promote every joiner to host.
+        configure_for = getattr(
+            getattr(self.server, "mode", None),
+            "configure_initial_info_for",
+            None,
+        )
+        if callable(configure_for):
+            configure_for(self, packet)
         self.send(bytes(packet.generate()))
         logger.info(
             "Sent InitialInfo to %s map=%s mode_key=%d crc=%d",
@@ -852,6 +952,7 @@ class Connection:
         # NewPlayerConnection does not carry a concrete tool, so start with the default weapon tool.
         weapon = DEFAULT_WEAPON_TOOL
         internal_team, wire_team = self._resolve_join_team(packet.team)
+        is_spectator = internal_team == TEAM_SPECTATOR
         from server.player_names import allocate_unique_player_name
 
         player_name = allocate_unique_player_name(
@@ -883,9 +984,20 @@ class Connection:
         prepare_selection = getattr(
             self.server.mode, "prepare_join_selection", None
         )
-        if callable(prepare_selection):
+        if callable(prepare_selection) and not is_spectator:
             selection = prepare_selection(internal_team, selection)
         player.apply_class_selection(selection)
+
+        # Some isolated rulesets need to choose the concrete tool used by the
+        # very first Character life.  CreatePlayer must already contain that
+        # decision; changing it from on_player_join is one packet too late and
+        # briefly creates a model/tool combination the retail scene cannot
+        # reconcile.  Ordinary modes have no hook and retain existing logic.
+        prepare_spawn = getattr(
+            self.server.mode, "prepare_player_spawn", None
+        )
+        if callable(prepare_spawn) and not is_spectator:
+            prepare_spawn(player)
         
         self.player = player
         self.server.players[player_id] = player
@@ -919,12 +1031,30 @@ class Connection:
         # at the authored team base; bypassing this hook on the first life
         # made joins use the generic random terrain spawn while later lives
         # correctly used RoundLifecycle's mode-aware resolver.
-        spawn_resolver = getattr(self.server.mode, "get_spawn_point", None)
-        spawn = (
-            spawn_resolver(player)
-            if callable(spawn_resolver)
-            else self.server.world_manager.get_spawn_point(player.team)
+        if is_spectator:
+            # CreatePlayer still needs finite coordinates, but no server-side
+            # Character life may be created for team 0. A normal team spawn is
+            # a stable initial free-camera anchor understood by retail.
+            spawn = self.server.world_manager.get_spawn_point(
+                DEFAULT_WIRE_TEAM
+            )
+            sanitizer = getattr(
+                self.server.world_manager,
+                "sanitize_spawn_point",
+                None,
+            )
+            if callable(sanitizer):
+                spawn = sanitizer(spawn, DEFAULT_WIRE_TEAM)
+            spawn = tuple(float(value) for value in spawn)
+        else:
+            from server.round_lifecycle import resolve_player_spawn
+
+            spawn = resolve_player_spawn(self.server, player)
+        orientation_resolver = getattr(
+            self.server.mode, "get_spawn_orientation", None
         )
+        if callable(orientation_resolver) and not is_spectator:
+            player.set_orientation_vector(*orientation_resolver(player))
         create_packet.x = spawn[0]
         create_packet.y = spawn[1]
         create_packet.z = spawn[2]
@@ -959,8 +1089,16 @@ class Connection:
         self.send(color_bytes)
         self.server.broadcast(color_bytes, exclude=player)
         
-        # Spawn player
-        player.spawn(spawn[0], spawn[1], spawn[2])
+        # Team 0 is a roster/camera state, not a Character simulation state.
+        # Calling Player.spawn here is the exact bug that produced a visible
+        # Blue paratrooper when the client asked to spectate.
+        if is_spectator:
+            player.set_position(spawn[0], spawn[1], spawn[2])
+            player.alive = False
+            player.spawned = False
+            player.death_time = 0.0
+        else:
+            player.spawn(spawn[0], spawn[1], spawn[2])
         from server.roster import remember_player_life
         remember_player_life(self, player)
         # broadcast() delivered CreatePlayer only to settled connections.
@@ -970,12 +1108,13 @@ class Connection:
             if other is self or not getattr(other, "in_game", False):
                 continue
             remember_player_life(other, player)
-        self._send_spawn_hp()
+        if not is_spectator:
+            self._send_spawn_hp()
         if getattr(self.server, 'debug_parity', None) is not None:
             self.server.debug_parity.on_player_join(player)
         
         # Notify game mode
-        if self.server.mode:
+        if self.server.mode and not is_spectator:
             await self.server.mode.on_player_join(player)
 
         # NB: the live roster + map entities are revealed to this client on its

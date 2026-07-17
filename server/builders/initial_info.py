@@ -28,8 +28,12 @@ _DEFAULT_UGC_PREFAB_SETS: list[int] = [0, 1]
 
 
 def _server_steam_id(server: 'BattleSpadesServer') -> int:
-    # The original game's `server_steam_id` is a uint64 the master server
-    # gives out. For local/test servers we use a stable placeholder.
+    # Once anonymous GameServer logon completes, advertise Valve's assigned
+    # server SteamID. Local/test servers retain the configured stable value.
+    steam_master = getattr(server, 'steam_master', None)
+    registered_id = int(getattr(steam_master, 'steam_id', 0) or 0)
+    if registered_id:
+        return registered_id
     return int(getattr(server.config, 'steam_id', 90087911866072064))
 
 
@@ -53,7 +57,7 @@ _MAP_DISPLAY_NAMES = {
     "ArcticBase": "Arctic Base",
     "CastleWars": "Castle Wars",
     "CityOfChicago": "City of Chicago",
-    "20thCenturyTown": "WW",          # stock ships WW0-3.png for this theme
+    "20thCenturyTown": "WW1",         # stock ships WW10-13.png for this theme
     "London": "London",
     "Alcatraz": "Alcatraz",
     "Invasion": "Invasion",
@@ -61,6 +65,37 @@ _MAP_DISPLAY_NAMES = {
     "Trenches": "Trenches",
     "Crossroads": "Crossroads",
 }
+
+# Packet 53 indexes ``png/ui/level_screenshots/<map_name><camera>.png``
+# directly. A missing file raises ResourceNotFoundException in the retail
+# client, so custom/utility maps must use the safe in-scene score hold instead.
+_STOCK_LEVEL_SCREENSHOT_NAMES = frozenset({
+    "Alcatraz",
+    "Ancient Egypt",
+    "Arctic Base",
+    "Atlantis",
+    "Block Ness",
+    "Bran Castle",
+    "Castle Wars",
+    "City of Chicago",
+    "Crossroads",
+    "Double Dragon",
+    "Dragon Island",
+    "Frontier",
+    "Great Wall",
+    "Hiesville",
+    "Invasion",
+    "London",
+    "Lunar Base",
+    "Mayan Jungle",
+    "Spooky Mansion",
+    "The Colosseum",
+    "To The Bridge",
+    "Tokyo Neon",
+    "Trenches",
+    "Winter Valley",
+    "WW1",
+})
 
 
 def _map_display_name(server: 'BattleSpadesServer') -> str:
@@ -72,6 +107,12 @@ def _map_display_name(server: 'BattleSpadesServer') -> str:
     import re
     spaced = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', base)
     return spaced
+
+
+def supports_game_stats_screen(server: 'BattleSpadesServer') -> bool:
+    """Return whether packet 53 can resolve a bundled retail screenshot."""
+
+    return _map_display_name(server) in _STOCK_LEVEL_SCREENSHOT_NAMES
 
 
 def _map_checksum(server: 'BattleSpadesServer') -> int:
@@ -119,9 +160,13 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
 
     # ---- Server identity ------------------------------------------------
     pkt.server_steam_id = _server_steam_id(server)
-    pkt.server_ip = 0
+    steam_master = getattr(server, 'steam_master', None)
+    pkt.server_ip = int(getattr(steam_master, 'public_ip', 0) or 0)
     pkt.server_port = int(cfg.port)
-    pkt.query_port = int(cfg.port)
+    if bool(getattr(steam_master, 'query_active', False)):
+        pkt.query_port = int(cfg.steam.effective_query_port(cfg.port))
+    else:
+        pkt.query_port = int(cfg.port)
     pkt.server_name = cfg.server_name
 
     # ---- Mode metadata --------------------------------------------------
@@ -188,7 +233,9 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     pkt.disabled_classes = _classes_disabled(server)
     pkt.movement_speed_multipliers = _movement_speed_multipliers(server)
     pkt.ugc_prefab_sets = list(_DEFAULT_UGC_PREFAB_SETS)
-    pkt.ground_colors = list(_DEFAULT_GROUND_COLORS)
+    metadata = getattr(getattr(server, "world_manager", None), "map_metadata", None)
+    authored_ground_colors = getattr(metadata, "ground_colors", None) or ()
+    pkt.ground_colors = list(authored_ground_colors or _DEFAULT_GROUND_COLORS)
     pkt.custom_game_rules = []
     pkt.loadout_overrides = {}
 

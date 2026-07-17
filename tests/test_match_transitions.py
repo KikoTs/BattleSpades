@@ -210,6 +210,144 @@ def test_scene_transition_holds_reload_until_after_mapended_grace(
     assert all(connection.disconnect_reasons == [] for connection in server.connections.values())
 
 
+def test_voted_map_preflights_then_holds_scores_before_mapended(
+    monkeypatch,
+) -> None:
+    server = _Server()
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    observations: list[tuple[float, list[int]]] = []
+
+    async def observed_sleep(seconds: float) -> None:
+        packet_ids = [packet[0] for packet in server.broadcast_packets if packet]
+        observations.append((seconds, packet_ids))
+        assert 53 in packet_ids
+        assert 52 not in packet_ids
+        assert all(connection.reload_calls == 0 for connection in server.connections.values())
+
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
+
+    result = asyncio.run(
+        service.change_map_after_end_screen(
+            "HallwayPin",
+            end_screen_seconds=9.5,
+        )
+    )
+
+    packet_ids = [packet[0] for packet in server.broadcast_packets if packet]
+    assert result.ok is True
+    assert len(observations) == 1
+    assert observations[0][0] == 9.5
+    assert packet_ids.index(53) < packet_ids.index(52)
+    assert all(connection.reload_calls == 1 for connection in server.connections.values())
+
+
+def test_invalid_voted_map_never_opens_terminal_scores(monkeypatch) -> None:
+    server = _Server()
+    service = MatchTransitionService(server)
+
+    def fail_load(_map_name: str, _mode_name: str):
+        raise ValueError("Map not found: Missing")
+
+    monkeypatch.setattr(service, "_load_world_candidate", fail_load)
+
+    result = asyncio.run(
+        service.change_map_after_end_screen(
+            "Missing",
+            end_screen_seconds=12.0,
+        )
+    )
+
+    assert result.ok is False
+    assert [packet[0] for packet in server.broadcast_packets if packet] == []
+    assert all(connection.in_game for connection in server.connections.values())
+
+
+def test_custom_map_without_stock_screenshot_skips_packet_53(monkeypatch) -> None:
+    server = _Server()
+    server.config.default_map = "Training"
+    server.world_manager.map_name = "Training"
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    sleeps: list[float] = []
+
+    async def observed_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
+
+    result = asyncio.run(
+        service.change_map_after_end_screen(
+            "HallwayPin",
+            end_screen_seconds=7.0,
+        )
+    )
+
+    packet_ids = [packet[0] for packet in server.broadcast_packets if packet]
+    assert result.ok is True
+    assert sleeps == [7.0]
+    assert 53 not in packet_ids
+    assert 52 in packet_ids
+
+
+def test_player_joining_during_end_screen_is_included_in_rollover(
+    monkeypatch,
+) -> None:
+    server = _Server()
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    late_connection = _Connection()
+
+    async def join_during_dwell(_seconds: float) -> None:
+        server.connections[object()] = late_connection
+
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+    monkeypatch.setattr(asyncio, "sleep", join_during_dwell)
+
+    result = asyncio.run(
+        service.change_map_after_end_screen(
+            "HallwayPin",
+            end_screen_seconds=12.0,
+        )
+    )
+
+    assert result.ok is True
+    assert late_connection.reload_calls == 1
+    assert late_connection.in_game is False
+    assert late_connection.disconnect_reasons == []
+
+
+def test_mid_mapsync_peer_is_retired_instead_of_receiving_second_handshake(
+    monkeypatch,
+) -> None:
+    server = _Server()
+    loading_connection = _Connection()
+    loading_connection.in_game = False
+    server.connections[object()] = loading_connection
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+
+    result = asyncio.run(service.change_map("HallwayPin"))
+
+    assert result.ok is True
+    assert result.reconnect_required is True
+    assert loading_connection.reload_calls == 0
+    assert loading_connection.disconnect_reasons == [18]
+    settled = [
+        connection
+        for connection in server.connections.values()
+        if connection is not loading_connection
+    ]
+    assert all(connection.reload_calls == 1 for connection in settled)
+
+
 def test_scene_reload_failure_retires_only_the_incompatible_peer(monkeypatch) -> None:
     server = _Server()
     connections = list(server.connections.values())

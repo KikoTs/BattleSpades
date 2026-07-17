@@ -91,6 +91,28 @@ class PrefabRegistry:
         self.search_dirs = tuple(search_dirs)
         self._models: dict[str, object] = {}
         self._missing: set[str] = set()
+        self._filenames: dict[str, str] | None = None
+
+    def _build_filename_index(self) -> dict[str, str]:
+        """Index KV6 files case-insensitively for Linux/macOS releases.
+
+        Retail UGC names mix ``UGC_Prefab`` and ``UGC_prefab`` casing while
+        packet authorization is case-insensitive.  Directly appending a
+        lower-case filename only worked on Windows and made the same project
+        silently lose buildings on case-sensitive hosts.
+        """
+
+        index: dict[str, str] = {}
+        for base in self.search_dirs:
+            try:
+                entries = os.scandir(base)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.lower().endswith(".kv6"):
+                        index.setdefault(entry.name[:-4].lower(), entry.path)
+        return index
 
     def get(self, name: str):
         """Return the KV6 model for a prefab name (lazy load), or None."""
@@ -99,20 +121,24 @@ class PrefabRegistry:
             return self._models[key]
         if key in self._missing:
             return None
-        for base in self.search_dirs:
-            path = os.path.join(base, key + ".kv6")
-            if os.path.isfile(path):
-                try:
-                    from aoslib.kv6 import KV6
-                    # invscale=1: true block geometry (display default 3 shrinks)
-                    model = KV6(path, False, load_display=False, invscale=1)
-                    self._models[key] = model
-                    logger.info("Prefab loaded: %s (%d blocks) from %s",
-                                key, len(model.get_points()), base)
-                    return model
-                except Exception:
-                    logger.warning("Prefab load FAILED: %s", path, exc_info=True)
-                    break
+        if self._filenames is None:
+            self._filenames = self._build_filename_index()
+        path = self._filenames.get(key)
+        if path is not None:
+            try:
+                from aoslib.kv6 import KV6
+                # invscale=1: true block geometry (display default 3 shrinks)
+                model = KV6(path, False, load_display=False, invscale=1)
+                self._models[key] = model
+                logger.info(
+                    "Prefab loaded: %s (%d blocks) from %s",
+                    key,
+                    len(model.get_points()),
+                    os.path.dirname(path),
+                )
+                return model
+            except Exception:
+                logger.warning("Prefab load FAILED: %s", path, exc_info=True)
         self._missing.add(key)
         logger.warning("Prefab model not found: %s (searched %s)", key, self.search_dirs)
         return None

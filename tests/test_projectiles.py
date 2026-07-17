@@ -20,7 +20,7 @@ from server.handlers.world import handle_oriented_item
 from server.player import Player
 from server.projectiles import (
     PROJECTILE_SPECS, DrillContact, ProjectileDeployment, ProjectileEngine,
-    BASE_GRAVITY, BOUNCE_DAMP, drill_contact_cells,
+    BASE_GRAVITY, BOUNCE_DAMP, drill_contact_cells, radius_damage_offsets,
 )
 
 DT = 1.0 / 60.0
@@ -67,6 +67,15 @@ def test_specs_cover_requested_tools():
                  C.SNOWBLOWER_TOOL, C.STICKY_GRENADE_TOOL, C.CHEMICALBOMB_TOOL,
                  C.GRENADE_LAUNCHER_WEAPON_TOOL, C.MINE_LAUNCHER_TOOL):
         assert int(tool) in PROJECTILE_SPECS, f"tool {tool} missing"
+
+
+def test_native_radius_two_uses_measured_81_cell_footprint():
+    offsets = radius_damage_offsets(2)
+    assert len(offsets) == 81
+    assert (0, 0, 0) in offsets
+    assert (2, 1, 1) in offsets
+    assert (2, 2, 0) not in offsets
+    assert (2, 2, 2) not in offsets
 
 
 def test_rocket_spec_matches_client_constants():
@@ -601,6 +610,58 @@ def test_drill_explodes_on_player_contact():
     assert len(events) == 1
     assert events[0].damage == 50
     assert eng.projectiles == []
+
+
+def test_drill_player_contact_reaches_authoritative_hp_damage_path():
+    """Engine contact alone is insufficient; the server must apply its blast."""
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+
+    owner_connection = RecordingConnection()
+    owner_connection.server = server
+    owner = Player(
+        1,
+        "Miner",
+        TEAM1,
+        C.DRILLGUN_TOOL,
+        owner_connection,
+    )
+    owner_connection.player = owner
+    owner.spawn(100.0, 100.0, 29.0)
+
+    target_connection = RecordingConnection()
+    target_connection.server = server
+    target = Player(
+        2,
+        "Target",
+        int(C.TEAM2),
+        C.RIFLE_TOOL,
+        target_connection,
+    )
+    target_connection.player = target
+    target.spawn(106.0, 100.0, 29.0)
+
+    server.players = {owner.id: owner, target.id: target}
+    server.connections = {
+        owner.id: owner_connection,
+        target.id: target_connection,
+    }
+    server.projectile_engine.spawn(
+        int(C.DRILLGUN_TOOL),
+        (100.0, 100.0, 30.0),
+        (20.0, 0.0, 0.0),
+        0.0,
+        owner.id,
+    )
+
+    for _ in range(30):
+        server._update_grenades(DT)
+        if not server.projectile_engine.projectiles:
+            break
+
+    assert not server.projectile_engine.projectiles
+    assert target.health < 100
 
 
 # --- grenade regression -----------------------------------------------------

@@ -8,6 +8,7 @@ import logging
 from typing import Optional, List, TYPE_CHECKING
 
 from server.game_constants import TEAM1, TEAM2
+from server.round_lifecycle import resolve_player_spawn
 
 from .base_mode import BaseMode
 
@@ -71,7 +72,7 @@ class ArenaMode(BaseMode):
         
         # Respawn all players
         for player in self.server.players.values():
-            spawn = self.get_spawn_point(player)
+            spawn = resolve_player_spawn(self.server, player)
             player.spawn(*spawn)
         
         self.alive_players = list(self.server.players.values())

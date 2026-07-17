@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import shared.constants as C
 from server.connection import internal_team_to_wire
+from server.entities.behaviors import EntityBehavior
 from server.projectiles import ProjectileSpec
 
 
@@ -72,6 +73,50 @@ class RocketTurret:
         return (self.entity_id, self.yaw, self.pitch)
 
 
+class RocketTurretBehavior(EntityBehavior):
+    """Route ordinary hitscan/blast damage into the turret controller.
+
+    The client renders health effects but never owns turret health. Keeping
+    this adapter on the registry entity makes bullets, melee, and explosions
+    use the same authoritative entity-hit path as medpacks, C4, and radar.
+    """
+
+    takes_damage = True
+    hit_radius = 1.25
+    hit_center_offset = (0.0, 0.0, -0.55)
+
+    def __init__(self, controller: "RocketTurretController") -> None:
+        self.controller = controller
+
+    def on_damage(self, ent, amount, source, ctx) -> None:
+        turret = self.controller.server.rocket_turrets.get(int(ent.entity_id))
+        if turret is None or not ent.alive:
+            return
+        turret.health = max(0.0, turret.health - max(0.0, float(amount)))
+        if turret.health > 0.0:
+            return
+
+        # Mark dead before applying the stock 100/15 destruction blast so it
+        # cannot recursively damage itself through the registry snapshot.
+        ent.alive = False
+        server = self.controller.server
+        server._apply_blast(
+            ent.x,
+            ent.y,
+            ent.z,
+            float(C.ROCKET_TURRET_EXPLOSION_DAMAGE),
+            float(C.ROCKET_TURRET_EXPLOSION_BLOCK_DAMAGE),
+            int(C.ENTITY_KILL),
+            source,
+            crater_radius=1,
+            force_destroy=True,
+            blast_radius=float(C.ROCKET_TURRET_EXPLOSION_RADIUS),
+            knockback_min=float(C.ROCKET_TURRET_EXPLOSION_KNOCKBACK_MIN),
+            knockback_max=float(C.ROCKET_TURRET_EXPLOSION_KNOCKBACK_MAX),
+        )
+        self.controller.remove(ent.entity_id)
+
+
 class RocketTurretController:
     def __init__(self, server):
         self.server = server
@@ -84,6 +129,7 @@ class RocketTurretController:
             int(C.ROCKET_TURRET_ENTITY), x, y, z,
             state=internal_team_to_wire(player.team),
             kind="rocket_turret", player_id=player.id,
+            behavior=RocketTurretBehavior(self),
         )
         turret = RocketTurret(
             entity_id=ent.entity_id,
@@ -141,17 +187,22 @@ class RocketTurretController:
         for entity_id, turret in list(self.server.rocket_turrets.items()):
             if int(turret.owner_id) != owner_id:
                 continue
-            self.server.rocket_turrets.pop(entity_id, None)
-            entity = self.server.entity_registry.remove(entity_id)
-            # DestroyEntity is crash-sensitive in the retail client: sending
-            # it for an id absent from the client's entity table produces the
-            # native "invalid entity on destroy" path.  A stale controller
-            # row may legitimately outlive registry cleanup during teardown,
-            # so broadcast only for an entity that still existed here.
-            if entity is not None:
-                self.server.broadcast_destroy_entity(entity_id)
+            self.remove(entity_id)
             removed.append(int(entity_id))
         return removed
+
+    def remove(self, entity_id: int) -> bool:
+        """Remove one controller/registry pair with create/destroy symmetry."""
+
+        entity_id = int(entity_id)
+        self.server.rocket_turrets.pop(entity_id, None)
+        entity = self.server.entity_registry.remove(entity_id)
+        # DestroyEntity is crash-sensitive in the retail client: never send it
+        # for a controller row whose registry entity was already retired.
+        if entity is None:
+            return False
+        self.server.broadcast_destroy_entity(entity_id)
+        return True
 
     def _target_for(self, turret: RocketTurret):
         current = self.server.players.get(turret.target_id) if turret.target_id is not None else None

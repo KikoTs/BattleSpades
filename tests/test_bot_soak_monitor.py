@@ -11,6 +11,7 @@ from server.bot_ai.messages import (
     BotAction,
     BotActionKind,
     BotIntent,
+    MovementAffordance,
     MovementIntent,
 )
 from server.bot_ai.soak_monitor import BotSoakMonitor
@@ -26,6 +27,8 @@ def _intent(
     role="",
     jump=False,
     direction=(0.0, 0.0, 0.0),
+    affordance=MovementAffordance.WALK,
+    sprint=False,
 ):
     return BotIntent(
         bot_id=1,
@@ -36,7 +39,12 @@ def _intent(
         topology_version=0,
         created_at=float(frame_id),
         expires_at=float(frame_id) + 1.0,
-        movement=MovementIntent(direction=direction, jump=jump),
+        movement=MovementIntent(
+            direction=direction,
+            jump=jump,
+            sprint=sprint,
+            affordance=affordance,
+        ),
         action=action,
         debug_role=role,
     )
@@ -173,6 +181,61 @@ def test_monitor_flags_small_travel_oscillation_without_route_progress() -> None
     assert monitor.summary()["navigation_stalls"] == 1
 
 
+def test_monitor_does_not_charge_a_prior_hold_to_new_travel() -> None:
+    monitor = BotSoakMonitor(loop_seconds=1.0)
+    observer = _player_snapshot(1, TEAM1, (10.0, 10.0, 10.0), is_bot=True)
+
+    for index in range(6):
+        monitor.observe(
+            float(index),
+            observer,
+            _intent(index + 1, role="fortify_hold"),
+            (observer,),
+        )
+    monitor.observe(
+        6.0,
+        observer,
+        _intent(7, role="team_assault_enemy_side", direction=(1.0, 0.0, 0.0)),
+        (observer,),
+    )
+
+    assert monitor.summary()["navigation_stalls"] == 0
+
+    monitor.observe(
+        7.0,
+        observer,
+        _intent(8, role="team_assault_enemy_side", direction=(1.0, 0.0, 0.0)),
+        (observer,),
+    )
+    assert monitor.summary()["navigation_stalls"] == 1
+
+
+def test_jump_build_placement_is_not_counted_as_jump_spam() -> None:
+    monitor = BotSoakMonitor(loop_seconds=1.0, jump_loop_seconds=1.0)
+    observer = _player_snapshot(1, TEAM1, (10.0, 10.0, 10.0), is_bot=True)
+    placement = BotAction(
+        BotActionKind.BUILD,
+        tool_id=int(C.BLOCK_TOOL),
+        position=(10.0, 10.0, 12.0),
+    )
+
+    for index in range(5):
+        monitor.observe(
+            float(index) * 0.5,
+            observer,
+            _intent(
+                index + 1,
+                action=placement,
+                role="hole_jump_build_place",
+                jump=True,
+                affordance=MovementAffordance.BUILD_STEP,
+            ),
+            (observer,),
+        )
+
+    assert monitor.summary()["jump_loops"] == 0
+
+
 def test_accelerated_soak_settles_actor_after_support_collapse() -> None:
     from scripts.bot_city_soak import CitySoak
 
@@ -194,3 +257,76 @@ def test_accelerated_soak_settles_actor_after_support_collapse() -> None:
     assert actor.position == (5.5, 5.5, 17.75)
     assert actor.grounded is True
     assert actor.airborne_until == 0.0
+
+
+def test_accelerated_soak_integrates_drop_with_live_vertical_span() -> None:
+    from scripts.bot_city_soak import CitySoak
+
+    spans: list[int] = []
+    terrain = SimpleNamespace(
+        direction_is_traversable=lambda *_args, **_kwargs: True,
+        classify=lambda _x, _y, _z, **kwargs: (
+            spans.append(int(kwargs["vertical_span"]))
+            or SimpleNamespace(support_z=14)
+        ),
+    )
+    soak = object.__new__(CitySoak)
+    soak.world = SimpleNamespace(
+        action_planner=SimpleNamespace(terrain=terrain)
+    )
+    actor = SimpleNamespace(
+        airborne_until=0.0,
+        grounded=True,
+        wade=False,
+        position=(5.5, 5.5, 7.75),
+    )
+
+    soak._apply_intent(
+        actor,
+        _intent(
+            1,
+            direction=(1.0, 0.0, 0.0),
+            affordance=MovementAffordance.DROP,
+            sprint=True,
+        ),
+        1.0,
+    )
+
+    assert actor.position[0] > 6.5
+    assert spans and set(spans) == {4}
+
+
+def test_accelerated_soak_applies_centered_melee_to_terrain() -> None:
+    from scripts.bot_city_soak import CitySoak
+
+    deltas = []
+    soak = object.__new__(CitySoak)
+    soak.topology_version = 0
+    soak.world = SimpleNamespace(
+        solid=lambda x, y, z: (int(x), int(y), int(z)) == (4, 5, 6),
+        apply=deltas.append,
+    )
+    actor = SimpleNamespace(
+        airborne_until=0.0,
+        grounded=True,
+        wade=False,
+        position=(4.5, 5.5, 3.75),
+    )
+
+    soak._apply_intent(
+        actor,
+        _intent(
+            2,
+            action=BotAction(
+                BotActionKind.MELEE,
+                tool_id=int(C.SPADE_TOOL),
+                position=(4.5, 5.5, 6.5),
+            ),
+            role="hole_break_ceiling",
+        ),
+        2.0,
+    )
+
+    assert actor.last_action_accepted is True
+    assert soak.topology_version == 1
+    assert deltas[0].changed_cells[0].coordinate == (4, 5, 6)

@@ -169,6 +169,29 @@ def run_release_check(paths: RuntimePaths) -> CheckReport:
     if not items[-1].ok:
         return CheckReport(tuple(items))
 
+    def check_steam_discovery() -> str:
+        if not config.steam.enabled:
+            return "disabled"
+        from server.steam_master import (
+            inspect_runtime,
+            resolve_helper_path,
+            resolve_runtime_dir,
+            resolve_steamclient_dir,
+        )
+
+        inspection = inspect_runtime(resolve_runtime_dir(config.steam))
+        helper = resolve_helper_path(config.steam)
+        if not helper.is_file():
+            raise OSError(f"missing Steam bridge {helper}")
+        client_dir = resolve_steamclient_dir(
+            config.steam,
+            inspection.runtime_dir,
+        )
+        client_detail = str(client_dir) if client_dir is not None else "desktop Steam"
+        return f"x86 API + bridge; client={client_detail}"
+
+    items.append(_attempt("Steam discovery", check_steam_discovery))
+
     def check_prefabs() -> str:
         from server.prefabs import PrefabRegistry
 

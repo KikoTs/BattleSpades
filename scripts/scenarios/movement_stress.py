@@ -650,6 +650,17 @@ DEFAULT_SEGMENTS = (
         include_by_default=False,
     ),
     StressSegment(
+        "rocketeer_jump_pack_hold",
+        4.0,
+        ("SPACE",),
+        required_class_id=2,
+        # The retail loadout calls pack 66 the Jump Pack. It shares the class
+        # slot with Glide Pack/Jetpack2 but has different thrust and fuel
+        # constants, so both must have an independent reconciliation gate.
+        required_loadout_tools=(66,),
+        include_by_default=False,
+    ),
+    StressSegment(
         "rocketeer_jetpack2_hold",
         4.0,
         ("SPACE",),
@@ -844,6 +855,7 @@ def analyze_stress_samples(
         if int(sample.get("network_loop", 0)) > 0
         and str(sample.get("segment", "")) not in {
             "engineer_jetpack_hold",
+            "rocketeer_jump_pack_hold",
             "rocketeer_jetpack2_hold",
         }
     ]
@@ -961,10 +973,21 @@ def analyze_stress_samples(
                 and bool(sample.get("airborne", False))
                 and vertical_velocity > 0.0
             )
+            explained_jetpack_climb = (
+                common["segment"] in {
+                    "engineer_jetpack_hold",
+                    "rocketeer_jump_pack_hold",
+                    "rocketeer_jetpack2_hold",
+                }
+                and dz < 0.0
+                and bool(sample.get("airborne", False))
+                and vertical_velocity < 0.0
+            )
             if (
                 vertical_step_per_loop
                 > thresholds.max_vertical_step_per_client_loop
                 and not explained_fall
+                and not explained_jetpack_climb
             ):
                 events.append({
                     "kind": "visible_vertical_snap",
@@ -1216,6 +1239,7 @@ def analyze_stress_samples(
 
     for jetpack_segment in (
         "engineer_jetpack_hold",
+        "rocketeer_jump_pack_hold",
         "rocketeer_jetpack2_hold",
     ):
         jetpack_rows = [

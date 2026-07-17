@@ -1,5 +1,7 @@
 """Stock VXL maps must use safe terrain, never colour-marker mutation."""
 
+import math
+import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from server.game_constants import (  # noqa: E402
     TEAM1,
     TEAM2,
 )
+from server.round_lifecycle import resolve_player_spawn  # noqa: E402
 from server.world_manager import MAP_X, MAP_Y, WorldManager  # noqa: E402
 
 
@@ -111,6 +114,57 @@ def test_stock_maps_have_safe_spawn_candidates_for_both_teams():
                     int(x), int(y), authored_zone=authored,
                     reject_roofs=authored is None,
                 )
+
+
+def test_double_dragon_water_life_candidates_relocate_nearby_to_dry_ground():
+    wm = _wm(Path("maps/DoubleDragon.vxl"))
+
+    for team, water_spawn in (
+        (TEAM1, (132.5, 286.5, 236.75)),
+        (TEAM2, (384.5, 250.5, 236.75)),
+    ):
+        assert wm.is_water_column(int(water_spawn[0]), int(water_spawn[1]))
+        resolved = wm.sanitize_spawn_point(water_spawn, team)
+
+        assert wm.spawn_position_is_safe(resolved)
+        assert not wm.is_water_column(int(resolved[0]), int(resolved[1]))
+        assert math.dist(resolved[:2], water_spawn[:2]) <= 64.0
+
+
+def test_double_dragon_fallback_base_keeps_safe_spawn_diversity():
+    wm = _wm(Path("maps/DoubleDragon.vxl"))
+    random_state = random.getstate()
+    random.seed(7331)
+    try:
+        spawns = {wm.get_spawn_point(TEAM1) for _ in range(32)}
+    finally:
+        random.setstate(random_state)
+
+    assert len(spawns) >= 4
+    assert all(wm.spawn_position_is_safe(spawn) for spawn in spawns)
+    assert max(
+        math.dist(spawn[:2], wm.team_base_anchor(TEAM1)[:2])
+        for spawn in spawns
+    ) <= 40.0
+
+
+def test_mode_spawn_candidate_passes_through_final_world_sanitizer():
+    calls = []
+
+    class SpawnWorld:
+        def sanitize_spawn_point(self, candidate, team):
+            calls.append((candidate, team))
+            return (10.5, 20.5, 30.5)
+
+    candidate = (100.0, 200.0, 236.75)
+    player = SimpleNamespace(team=TEAM2)
+    server = SimpleNamespace(
+        mode=SimpleNamespace(get_spawn_point=lambda _player: candidate),
+        world_manager=SpawnWorld(),
+    )
+
+    assert resolve_player_spawn(server, player) == (10.5, 20.5, 30.5)
+    assert calls == [(candidate, TEAM2)]
 
 
 def test_exposed_retail_chroma_voxel_is_removed_without_dirtying_map():

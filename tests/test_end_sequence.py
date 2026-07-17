@@ -198,3 +198,171 @@ def test_end_sequence_consumes_voted_map_instead_of_same_map_restart(monkeypatch
 
     assert transition.maps == ["CastleWars"]
     assert transition.restarts == 0
+
+
+def test_end_sequence_waits_for_vote_then_uses_configured_screen_dwell(
+    monkeypatch,
+):
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    order = []
+
+    class _Vote:
+        async def wait_for_map_result(self):
+            order.append("vote-resolved")
+            return "CastleWars"
+
+        def consume_next_map(self):
+            order.append("vote-consumed")
+            return "CastleWars"
+
+    class _Transition:
+        def __init__(self):
+            self.restarts = 0
+
+        async def change_map_after_end_screen(
+            self,
+            map_name,
+            *,
+            end_screen_seconds,
+        ):
+            order.append((map_name, end_screen_seconds))
+            return SimpleNamespace(ok=True, message="ok")
+
+        async def restart_round(self):
+            self.restarts += 1
+            return SimpleNamespace(ok=True, message="ok")
+
+    async def scenario():
+        srv = _Server()
+        srv.config = SimpleNamespace(
+            default_map="London",
+            end_screen_seconds=23.0,
+        )
+        srv.vote_manager = _Vote()
+        transition = _Transition()
+        srv.match_transition = transition
+        mode = _Mode(srv)
+        await mode.on_mode_start()
+        await mode.on_mode_end(0)
+        for _ in range(8):
+            await _REAL_SLEEP(0)
+        return transition
+
+    transition = asyncio.run(scenario())
+
+    assert order == [
+        "vote-resolved",
+        "vote-consumed",
+        ("CastleWars", 23.0),
+    ]
+    assert transition.restarts == 0
+
+
+def test_invalid_voted_map_falls_back_to_safe_same_map_restart(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    class _Transition:
+        def __init__(self):
+            self.restarts = 0
+
+        async def change_map_after_end_screen(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                ok=False,
+                message="Map not found: Missing",
+                reconnect_required=False,
+            )
+
+        async def restart_round(self):
+            self.restarts += 1
+            return SimpleNamespace(ok=True, message="ok")
+
+    async def scenario():
+        srv = _Server()
+        srv.config = SimpleNamespace(
+            default_map="London",
+            end_screen_seconds=12.0,
+        )
+        transition = _Transition()
+        srv.match_transition = transition
+        srv.vote_manager = SimpleNamespace(
+            ensure_round_end_map_vote=lambda _now: False,
+            consume_next_map=lambda: "Missing",
+        )
+        mode = _Mode(srv)
+        await mode.on_mode_start()
+        await mode.on_mode_end(0)
+        for _ in range(8):
+            await _REAL_SLEEP(0)
+        return transition, mode
+
+    transition, mode = asyncio.run(scenario())
+
+    assert transition.restarts == 1
+    assert mode._end_sequence_running is True
+
+
+def test_same_map_vote_never_enters_terminal_transition(monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    class _Transition:
+        def __init__(self):
+            self.map_changes = 0
+            self.restarts = 0
+
+        async def change_map_after_end_screen(self, *_args, **_kwargs):
+            self.map_changes += 1
+            return SimpleNamespace(ok=True, message="ok")
+
+        async def restart_round(self):
+            self.restarts += 1
+            return SimpleNamespace(ok=True, message="ok")
+
+    async def scenario():
+        srv = _Server()
+        srv.config = SimpleNamespace(
+            default_map="London",
+            end_screen_seconds=12.0,
+        )
+        transition = _Transition()
+        srv.match_transition = transition
+        srv.vote_manager = SimpleNamespace(
+            ensure_round_end_map_vote=lambda _now: False,
+            consume_next_map=lambda: "lOnDoN",
+        )
+        mode = _Mode(srv)
+        await mode.on_mode_start()
+        await mode.on_mode_end(0)
+        for _ in range(8):
+            await _REAL_SLEEP(0)
+        return transition
+
+    transition = asyncio.run(scenario())
+
+    assert transition.map_changes == 0
+    assert transition.restarts == 1
+
+
+def test_admin_transition_can_cancel_end_screen_timer(monkeypatch):
+    entered_sleep = asyncio.Event()
+    release_sleep = asyncio.Event()
+
+    async def blocking_sleep(_seconds):
+        entered_sleep.set()
+        await release_sleep.wait()
+
+    monkeypatch.setattr(asyncio, "sleep", blocking_sleep)
+
+    async def scenario():
+        srv = _Server()
+        mode = _Mode(srv)
+        await mode.on_mode_start()
+        await mode.on_mode_end(0)
+        await entered_sleep.wait()
+        await mode.cancel_end_sequence()
+        return mode, srv
+
+    mode, srv = asyncio.run(scenario())
+
+    assert mode._end_task is None
+    assert mode._end_sequence_running is False
+    assert srv.runtime_resets == 0

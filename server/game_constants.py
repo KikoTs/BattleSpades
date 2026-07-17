@@ -49,6 +49,11 @@ BLOCK_TOOL_IDS = frozenset({int(C.BLOCK_TOOL), int(getattr(C, "FLAREBLOCK_TOOL",
 # SetColor while they are held makes every projectile/build use stale grey.
 PALETTE_TOOL_IDS = frozenset({
     *BLOCK_TOOL_IDS,
+    # Map Creator's Paintbrush owns Character.block_color just like the
+    # ordinary block tools.  Rejecting SetColor while tool 43 is held leaves
+    # the server painting with a stale palette even though the host HUD has
+    # already changed colour.
+    int(getattr(C, "PAINTBRUSH_TOOL", 43)),
     int(getattr(C, "SNOWBLOWER_TOOL", 29)),
     int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
 })
@@ -71,6 +76,8 @@ WEAPON_TOOL_IDS = frozenset(
         C.MG_TOOL,
         C.PISTOL_TOOL,
         C.SNIPER_TOOL,
+        C.SNIPER2_TOOL,
+        C.SNUB_PISTOL_TOOL,
         C.TOMMYGUN_TOOL,
         C.CLASSIC_SHOTGUN_TOOL,
         C.CLASSIC_SMG_TOOL,
@@ -90,6 +97,8 @@ RIFLE_LIKE_TOOLS = frozenset(
         C.DRILLGUN_TOOL,
         C.PISTOL_TOOL,
         C.SNIPER_TOOL,
+        C.SNIPER2_TOOL,
+        C.SNUB_PISTOL_TOOL,
         C.ASSAULT_RIFLE_TOOL,
         getattr(C, "AUTOMATIC_PISTOL_TOOL", C.PISTOL_TOOL),
     )
@@ -296,7 +305,10 @@ def _util(tool_id, name, category, fire_interval=0.5, clip=0, reload_time=0.0):
 _CATALOG_LIST = [
     # --- melee (block dig / player hit) ---
     _melee(0,  "PICKAXE",        50, 7,   0.4),
-    _melee(1,  "KNIFE",          20, 1,   0.25),
+    # These three player-hit values come from the original pre-overwrite
+    # constants (A1111/A1856/A1859).  A later decompiler name collision reused
+    # the block-damage values and made every melee weapon nearly harmless.
+    _melee(1,  "KNIFE",          80, 1,   0.25),
     _melee(2,  "SPADE",          35, 5,   0.4),
     _melee(3,  "SUPERSPADE",     50, 7.5, 0.6),
     _melee(4,  "CLASSIC_SPADE",  50, 3,   0.3),
@@ -304,8 +316,8 @@ _CATALOG_LIST = [
     _melee(34, "CROWBAR",        80, 5,   0.6),
     _melee(44, "UGC_PICKAXE",     0, 9,   0.2),
     _melee(45, "UGC_SUPERSPADE",  0, 7.5, 0.2),
-    _melee(49, "RIOTSTICK",    1.75, 0,   0.5),
-    _melee(50, "MACHETE",       2.0, 2,   0.7),
+    _melee(49, "RIOTSTICK",      85, 1.75, 0.5),
+    _melee(50, "MACHETE",       100, 2,    0.7),
     _melee(52, "RIOTSHIELD",      2, 0,   1.0),
     # --- hit-scan guns: (id, name, cat, torso, head, fire_int, clip, reserve, reload, pellets, range, block_dmg) ---
     _gun(6,  "RIFLE",             CAT_RIFLE,   70, 150, 0.5,  10, 50,  2.5, 1, 10000, 2),

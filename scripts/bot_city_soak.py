@@ -29,10 +29,12 @@ if str(ROOT) not in sys.path:
 
 from aoslib.world import cube_line
 import shared.constants as C
+from server.bot_ai.director import _choose_bot_prefabs
 from server.bot_ai.messages import (
     BotActionKind,
     EntitySnapshot,
     MapSnapshot,
+    MovementAffordance,
     ObjectiveSnapshot,
     PerceptionFrame,
     PlayerSnapshot,
@@ -53,6 +55,7 @@ from server.world_manager import WorldManager
 DECISION_DT = 0.2
 MOVE_SPEED = 4.2
 SPRINT_SPEED = 6.0
+MOTOR_SUBSTEP = 0.2
 
 
 @dataclass(slots=True)
@@ -211,6 +214,9 @@ class CitySoak:
             TEAM2: self.canonical.team_base_anchor(TEAM2),
         }
         self.actors = self._make_actors()
+        self.production_spawns = {
+            actor.player_id: actor.position for actor in self.actors
+        }
         self.stranded_water_bots = self._strand_bots_in_deep_water(
             max(0, min(self.bot_count, int(stranded_water_bots)))
         )
@@ -288,11 +294,6 @@ class CitySoak:
             int(C.CLASS_MEDIC),
         )
         infected = max(1, self.bot_count // 4)
-        offsets = (
-            (-7, -7), (-7, 0), (-7, 7), (0, -7),
-            (0, 0), (0, 7), (7, -7), (7, 0), (7, 7),
-            (-12, 0), (12, 0), (0, -12), (0, 12),
-        )
         for index in range(self.bot_count):
             if self.mode == "zom":
                 zombie = index >= self.bot_count - infected
@@ -305,7 +306,10 @@ class CitySoak:
             else:
                 team = TEAM1 if index < (self.bot_count + 1) // 2 else TEAM2
                 class_id = ordinary_classes[index % len(ordinary_classes)]
-            prefabs = sorted(allowed_prefabs_for_class(class_id))[:3]
+            prefabs = _choose_bot_prefabs(
+                sorted(allowed_prefabs_for_class(class_id)),
+                self.rng,
+            )
             selection = normalize_class_selection(class_id, prefabs=prefabs)
             weapon = next(
                 (tool for tool in selection.loadout if tool in WEAPON_PROFILES),
@@ -320,11 +324,10 @@ class CitySoak:
             )
             held = weapon if weapon >= 0 else melee
             profile = get_weapon_profile(weapon) if weapon >= 0 else None
-            anchor = self.anchors[team]
-            ox, oy = offsets[index % len(offsets)]
-            spawn = self.canonical.dry_ground_anchor(
-                anchor[0] + ox, anchor[1] + oy, search=16
-            )
+            # Sample the same prewarmed spawn pool used by real joins and
+            # respawns. Hand-authored offsets concealed map-specific spawn
+            # clustering, slopes, and nearby water hazards.
+            spawn = self.canonical.get_spawn_point(team)
             actors.append(
                 _Actor(
                     player_id=index + 1,
@@ -437,6 +440,10 @@ class CitySoak:
                 "native_nav_tiles": self.world.native_tile_count,
                 "alive": sum(actor.alive for actor in self.actors),
                 "water_remaining": sum(actor.wade for actor in self.actors),
+                "production_spawns": {
+                    str(player_id): tuple(round(value, 2) for value in position)
+                    for player_id, position in self.production_spawns.items()
+                },
                 "positions": {
                     str(actor.player_id): tuple(round(value, 2) for value in actor.position)
                     for actor in self.actors
@@ -495,27 +502,98 @@ class CitySoak:
         direction = intent.movement.direction
         magnitude = math.hypot(direction[0], direction[1])
         if magnitude > 1e-6:
+            terrain = self.world.action_planner.terrain
             speed = SPRINT_SPEED if intent.movement.sprint else MOVE_SPEED
-            distance = speed * DECISION_DT
-            dx = direction[0] / magnitude * distance
-            dy = direction[1] / magnitude * distance
-            candidate_x = min(510.5, max(1.5, old[0] + dx))
-            candidate_y = min(510.5, max(1.5, old[1] + dy))
-            surface = self.world.action_planner.terrain.classify(
-                int(math.floor(candidate_x)),
-                int(math.floor(candidate_y)),
-                old[2],
-                # Dry actors must never enter water. A stranded actor must be
-                # able to traverse its cached water-only route toward shore.
-                allow_water=bool(actor.wade),
-                vertical_span=(8 if intent.movement.jump else 3),
+            dx, dy = direction[0] / magnitude, direction[1] / magnitude
+            # A dry jump needs a short airborne travel window. Wading uses a
+            # held ascent key but still receives one ordinary decision slice;
+            # treating it as a ground-jump lunge overshoots cached water turns.
+            jump_window = (
+                0.35
+                if intent.movement.jump and not actor.wade
+                else DECISION_DT
             )
-            if surface is not None:
-                actor.position = candidate_x, candidate_y, surface.support_z - 2.25
-            elif intent.debug_role == "stuck_emergency_drop":
-                # Native physics permits walking off an unsupported ledge.
-                # Gravity settles the actor on the next accelerated frame.
-                actor.position = candidate_x, candidate_y, old[2]
+            remaining = speed * jump_window
+            crossing_jump_gap = False
+            while remaining > 1e-6:
+                distance = min(MOTOR_SUBSTEP, remaining)
+                current = actor.position
+                traversable = crossing_jump_gap or (
+                    terrain.direction_is_traversable(
+                        current,
+                        (dx, dy, 0.0),
+                        intent.movement.affordance,
+                        allow_water=bool(actor.wade),
+                    )
+                )
+                if (
+                    not traversable
+                    and intent.movement.affordance
+                    in {MovementAffordance.WALK, MovementAffordance.CROUCH}
+                ):
+                    # Mirror the gameplay-thread wall/shore slide. The worker
+                    # owns the route, while the live motor may rotate an
+                    # ordinary walk vector around one immediate body-width
+                    # obstruction. Special traversal edges remain exact.
+                    preferred_sign = -1.0 if actor.player_id & 1 else 1.0
+                    for degrees in (20.0, 40.0, 60.0):
+                        for sign in (preferred_sign, -preferred_sign):
+                            angle = math.radians(degrees) * sign
+                            cosine, sine = math.cos(angle), math.sin(angle)
+                            candidate_dx = dx * cosine - dy * sine
+                            candidate_dy = dx * sine + dy * cosine
+                            if terrain.direction_is_traversable(
+                                current,
+                                (candidate_dx, candidate_dy, 0.0),
+                                intent.movement.affordance,
+                                allow_water=bool(actor.wade),
+                            ):
+                                dx, dy = candidate_dx, candidate_dy
+                                traversable = True
+                                break
+                        if traversable:
+                            break
+                if not traversable:
+                    if intent.debug_role == "stuck_emergency_drop":
+                        actor.position = (
+                            min(510.5, max(1.5, current[0] + dx * distance)),
+                            min(510.5, max(1.5, current[1] + dy * distance)),
+                            current[2],
+                        )
+                    break
+                candidate_x = min(510.5, max(1.5, current[0] + dx * distance))
+                candidate_y = min(510.5, max(1.5, current[1] + dy * distance))
+                surface = self.world.action_planner.terrain.classify(
+                    int(math.floor(candidate_x)),
+                    int(math.floor(candidate_y)),
+                    current[2],
+                    # Dry actors must never enter water. A stranded actor must
+                    # traverse its cached water route toward shore.
+                    allow_water=bool(actor.wade),
+                    vertical_span={
+                        MovementAffordance.JUMP: 8,
+                        MovementAffordance.DROP: 4,
+                        MovementAffordance.JETPACK: 8,
+                    }.get(intent.movement.affordance, 3),
+                )
+                if surface is None:
+                    if (
+                        intent.movement.jump
+                        and intent.movement.affordance
+                        is MovementAffordance.JUMP
+                    ):
+                        crossing_jump_gap = True
+                        actor.position = candidate_x, candidate_y, current[2]
+                        remaining -= distance
+                        continue
+                    break
+                actor.position = (
+                    candidate_x,
+                    candidate_y,
+                    surface.support_z - 2.25,
+                )
+                crossing_jump_gap = False
+                remaining -= distance
         actor.velocity = (
             (actor.position[0] - old[0]) / DECISION_DT,
             (actor.position[1] - old[1]) / DECISION_DT,
@@ -551,7 +629,16 @@ class CitySoak:
                 actor.ammo_clip -= 1
                 self._damage_target(actor, intent, now, melee=False)
         elif action.kind is BotActionKind.MELEE:
-            accepted = self._damage_target(actor, intent, now, melee=True)
+            target_id = (
+                int(intent.look.target_player_id)
+                if intent.look is not None
+                else -1
+            )
+            accepted = (
+                self._damage_target(actor, intent, now, melee=True)
+                if target_id >= 0
+                else self._apply_mine(action, centered=True)
+            )
         elif action.kind in {BotActionKind.BUILD, BotActionKind.BUILD_LINE}:
             accepted = self._apply_build(actor, action)
         elif action.kind is BotActionKind.MINE:
@@ -559,8 +646,9 @@ class CitySoak:
         elif action.kind is BotActionKind.PLACE_PREFAB:
             accepted = actor.blocks >= 10 and action.position is not None
             if accepted:
-                actor.blocks -= 10
                 accepted = self._apply_single_change(action.position, solid=True)
+                if accepted:
+                    actor.blocks -= 10
         elif action.kind in {BotActionKind.ORIENTED, BotActionKind.DEPLOY}:
             accepted = self._spawn_hazard(actor, action, intent, now)
 
@@ -622,10 +710,13 @@ class CitySoak:
         self._apply_delta(changes)
         return True
 
-    def _apply_mine(self, action) -> bool:
+    def _apply_mine(self, action, *, centered: bool = False) -> bool:
         if action.position is None:
             return False
-        cell = tuple(int(round(value)) for value in action.position)
+        cell = tuple(
+            int(math.floor(value)) if centered else int(round(value))
+            for value in action.position
+        )
         if not self.world.solid(*cell):
             return False
         self._apply_delta((VoxelChange(*cell, False, 0),))

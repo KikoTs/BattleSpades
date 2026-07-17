@@ -279,6 +279,39 @@ def test_normal_jump_ascent_is_normalized_by_native_client_loops():
     assert not any(event["kind"] == "visible_vertical_snap" for event in events)
 
 
+def test_high_thrust_jump_pack_climb_is_not_a_vertical_snap():
+    rows = [
+        sample(
+            0,
+            segment="rocketeer_jump_pack_hold",
+            airborne=True,
+            z=225.5,
+        ),
+        sample(
+            3,
+            segment="rocketeer_jump_pack_hold",
+            airborne=True,
+            z=223.8,
+        ),
+    ]
+    for index, row in enumerate(rows):
+        row.update(
+            position=(10.0, 10.0, 225.5 - index * 1.7),
+            velocity=(0.0, 0.0, -0.65),
+            jetpack_id=66,
+            jetpack_active=True,
+            jetpack_fuel=90.0 - index * 5.0,
+        )
+
+    analysis, _segments, events = movement_stress.analyze_stress_samples(
+        rows,
+        interval=0.05,
+    )
+
+    assert analysis.visible_rollback_count == 0
+    assert not any(event["kind"] == "visible_vertical_snap" for event in events)
+
+
 def test_one_client_loop_vertical_restore_is_still_reported():
     rows = [
         sample(0, segment="jump_in_place", airborne=True, z=225.5),
@@ -618,6 +651,10 @@ def test_stress_catalog_separates_generic_and_engineer_segments():
     assert segments["engineer_jetpack_hold"].duration >= 4.0
     assert segments["engineer_jetpack_hold"].required_class_id == 12
     assert segments["engineer_jetpack_hold"].include_by_default is False
+    assert segments["rocketeer_jump_pack_hold"].required_class_id == 2
+    assert segments["rocketeer_jump_pack_hold"].required_loadout_tools == (66,)
+    assert segments["rocketeer_jetpack2_hold"].required_class_id == 2
+    assert segments["rocketeer_jetpack2_hold"].required_loadout_tools == (67,)
 
 
 def test_client_sample_records_equipment_and_palette_state():

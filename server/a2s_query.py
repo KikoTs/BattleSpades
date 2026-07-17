@@ -12,10 +12,11 @@ import struct
 import json
 import random
 import logging
+import sys
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
 from .game_constants import TEAM1, TEAM2
-from .mode_data import get as get_mode_data
+from .steam_master import build_game_tags, STEAM_APP_ID, STEAM_DESCRIPTION
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -298,11 +299,11 @@ class A2SHandler:
         # Game directory
         packet.extend(b"aceofspades\0")
         
-        # Game name
-        packet.extend(b"AoS\0")
+        # Game description recovered from the retail Steam wrapper.
+        packet.extend(STEAM_DESCRIPTION.encode("ascii") + b"\0")
         
-        # App ID (short) - full ID in EDF
-        packet.extend(struct.pack("<h", 0))
+        # A2S keeps a historical uint16 AppID plus the full uint64 GameID EDF.
+        packet.extend(struct.pack("<H", STEAM_APP_ID & 0xFFFF))
         
         # Player counts
         packet.append(len(self.server.players))
@@ -315,17 +316,21 @@ class A2SHandler:
         # Server type: 'd' = dedicated
         packet.append(ord('d'))
         
-        # OS: 'l' = linux (what original uses)
-        packet.append(ord('l'))
+        # Host OS, as required by Source query protocol.
+        os_code = "w" if sys.platform == "win32" else (
+            "m" if sys.platform == "darwin" else "l"
+        )
+        packet.append(ord(os_code))
         
         # Password protected
         packet.append(0)
         
-        # VAC secured (original uses 1)
-        packet.append(1)
+        # VAC is truthful: anonymous public listing defaults to insecure mode.
+        steam_master = getattr(self.server, "steam_master", None)
+        packet.append(1 if bool(getattr(steam_master, "secure", False)) else 0)
         
         # Version
-        packet.extend(b"1.0.0.0\0")
+        packet.extend(config.steam.game_version.encode('ascii', 'replace') + b'\0')
         
         # EDF - must include STEAM_ID like original
         edf = A2SConstants.EDF_PORT | A2SConstants.EDF_STEAM_ID | A2SConstants.EDF_KEYWORDS | A2SConstants.EDF_GAME_ID
@@ -334,23 +339,17 @@ class A2SHandler:
         # Port (EDF_PORT)
         packet.extend(struct.pack("<H", config.port))
         
-        # Steam ID (EDF_STEAM_ID) - 64-bit, must come before keywords
-        packet.extend(struct.pack("<q", 224540))
+        # Steam ID (EDF_STEAM_ID) - Valve-assigned when registered, otherwise
+        # the stable non-Steam identity used by InitialInfo.
+        steam_id = int(getattr(steam_master, "steam_id", 0) or config.steam_id)
+        packet.extend(struct.pack("<Q", steam_id & 0xFFFFFFFFFFFFFFFF))
         
         # Keywords (EDF_KEYWORDS)
-        active_mode = get_mode_data(config.game_mode)
-        tags = [
-            "v168",
-            "playlist=8",
-            f"mode={int(active_mode.mode_id):04d}",
-        ]
-        if active_mode.classic:
-            tags.append("classic")
-        keywords = ";".join(tags)
+        keywords = build_game_tags(config)
         packet.extend(keywords.encode('utf-8', 'replace') + b'\0')
         
         # Game ID (EDF_GAME_ID) - 64-bit
-        packet.extend(struct.pack("<q", 224540))
+        packet.extend(struct.pack("<Q", STEAM_APP_ID))
         
         return bytes(packet)
     

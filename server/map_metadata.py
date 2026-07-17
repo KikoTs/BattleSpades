@@ -99,6 +99,9 @@ class MapMetadata:
     ambient_light_color: tuple[int, int, int] | None = None
     ambient_light_intensity: float | None = None
     ambient_sounds: list[MapAmbientSound] = field(default_factory=list)
+    # Retail UGC exports keep the terrain/water material palette in `.ugc`.
+    # InitialInfo consumes these RGBA rows verbatim (at most 32 entries).
+    ground_colors: list[tuple[int, int, int, int]] = field(default_factory=list)
     # Index 0 is the green chroma family; index 1 is the blue family.
     static_light_colors: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     spawn_zones: dict[int, list[MapZone]] = field(
@@ -174,6 +177,17 @@ STOCK_MAP_SKYBOXES = {
     "ww1": "WW1.txt",
 }
 
+# The stock editor's shipped GrasslandBaseplate metadata defines the two
+# chroma-marker families even when a finished map does not retain its sidecar:
+# green markers use slot 0 and blue markers use slot 1.  Individual stock-map
+# metadata (for example MayanJungle's amber slot 0) overrides these defaults.
+# Do not apply them to arbitrary UGC maps: custom authors own their palette and
+# silently guessing it would turn accidental chroma terrain into light sources.
+STOCK_STATIC_LIGHT_COLORS = {
+    0: (255, 255, 82),
+    1: (250, 250, 200),
+}
+
 _MAP_AMBIENT_OVERRIDES = {
     "20thcenturytown": "amb_city",
     "alcatraz": "amb_alcatraz",
@@ -231,11 +245,13 @@ _LEGACY_ENVIRONMENT_KEYS = frozenset((
 
 
 def _candidate_sidecars(map_path: Path) -> Iterable[Path]:
-    # UGC downloads use both .txt and .ugc.  Accept .json for hand-authored
-    # server maps and the map.vxl.json convention as well.
+    # UGC projects use both .txt and .ugc.  The project sidecar is later than
+    # its immutable baseplate .txt and therefore owns settings changed in the
+    # editor (skybox, water palette, objects).  Explicit server JSON remains
+    # the highest-priority operator override.
     yield map_path.with_suffix(".json")
-    yield map_path.with_suffix(".txt")
     yield map_path.with_suffix(".ugc")
+    yield map_path.with_suffix(".txt")
     yield Path(str(map_path) + ".json")
 
 
@@ -272,6 +288,26 @@ def normalize_rgb(value: object) -> tuple[int, int, int] | None:
     except (TypeError, ValueError):
         return None
     return rgb if all(0 <= component <= 255 for component in rgb) else None
+
+
+def normalize_ground_colors(
+    value: object,
+) -> list[tuple[int, int, int, int]]:
+    """Return the bounded native RGBA terrain palette from untrusted data."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    colors: list[tuple[int, int, int, int]] = []
+    for row in value[:32]:
+        if not isinstance(row, (list, tuple)) or len(row) != 4:
+            continue
+        try:
+            color = tuple(int(component) for component in row)
+        except (TypeError, ValueError):
+            continue
+        if all(0 <= component <= 255 for component in color):
+            colors.append(color)  # type: ignore[arg-type]
+    return colors
 
 
 def normalize_vector3(value: object) -> tuple[float, float, float] | None:
@@ -493,18 +529,34 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     map_path = Path(map_path)
     map_key = map_path.stem.casefold()
     official_map = map_key in STOCK_MAP_SKYBOXES
-    sidecar = next((p for p in _candidate_sidecars(map_path) if p.is_file()), None)
-    payload = _read_sidecar(sidecar) if sidecar is not None else {}
-    if payload is None:
-        # An unreadable/malformed file did not contribute any metadata. Keep
-        # ``source`` truthful so diagnostics do not claim it was accepted.
-        sidecar = None
-        payload = {}
+    # A retail Map Creator project is intentionally split across siblings:
+    # ``.txt`` owns atmosphere/lighting while ``.ugc`` owns placements and
+    # publishing metadata.  Stopping at the first file makes every authored
+    # spawn/base/crate disappear when an editor project is later hosted as a
+    # normal game.  Layer accepted sidecars in the historical priority order;
+    # the first file containing a key wins, while a later sibling fills fields
+    # that are absent.  This also preserves the old single-sidecar behavior.
+    sidecar = None
+    payload: dict[str, object] = {}
+    contributing_sidecars: list[Path] = []
+    for candidate in _candidate_sidecars(map_path):
+        if not candidate.is_file():
+            continue
+        candidate_payload = _read_sidecar(candidate)
+        if candidate_payload is None:
+            continue
+        if sidecar is None:
+            sidecar = candidate
+        contributing_sidecars.append(candidate)
+        for key, value in candidate_payload.items():
+            payload.setdefault(key, value)
 
     raw_skybox = next(
         (
             payload[key]
-            for key in ("skybox_texture", "skybox_name", "skybox")
+            # UGC's explicit editor value supersedes its baseplate's immutable
+            # ``skybox_texture`` assignment when both siblings are present.
+            for key in ("skybox_name", "skybox_texture", "skybox")
             if key in payload
         ),
         None,
@@ -523,7 +575,12 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     if fog_color is None and skybox_name is not None:
         fog_color = normalize_rgb(C.FOG_COLORS.get(skybox_name))
 
-    static_light_colors: dict[int, tuple[int, int, int]] = {}
+    # Many retail VXL files preserve their hidden chroma markers but not the
+    # companion map-description file.  Recognized stock maps inherit the
+    # editor's two shipped defaults; any recovered per-map values below win.
+    static_light_colors: dict[int, tuple[int, int, int]] = (
+        dict(STOCK_STATIC_LIGHT_COLORS) if official_map else {}
+    )
     for index in (0, 1):
         color = normalize_rgb(payload.get(f"static_light_color{index}"))
         if color is not None:
@@ -553,6 +610,7 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         ambient_light_color=normalize_rgb(payload.get("ambient_light_color")),
         ambient_light_intensity=ambient_intensity,
         ambient_sounds=ambient_sounds,
+        ground_colors=normalize_ground_colors(payload.get("ground_colors")),
         static_light_colors=static_light_colors,
     )
     _append_legacy_drop_points(result, payload)
@@ -609,9 +667,10 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         target[team].append(zone)
 
     logger.info(
-        "Loaded map metadata %s (official %s, skybox %s, fog %s, ambience %s, static lights %d, "
+        "Loaded map metadata %s (sources %d, official %s, skybox %s, fog %s, ambience %s, static lights %d, "
         "spawn zones %d/%d, bases %d/%d, entities %d)",
         sidecar or "<stock inference>",
+        len(contributing_sidecars),
         result.official_map,
         result.skybox_name or "default",
         result.fog_color or "default",

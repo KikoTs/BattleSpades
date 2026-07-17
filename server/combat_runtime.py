@@ -12,6 +12,7 @@ from typing import Optional
 
 from aoslib.world import cube_line
 import shared.constants as C
+from server.audio import SND_BUILD, play_sound
 from server.game_constants import (
     BLOCK_ACTION_BUILD,
     BLOCK_ACTION_DESTROY,
@@ -24,6 +25,7 @@ from shared.packet import (
     BlockBuildColored,
     BlockLine,
     HitEntity,
+    PaintBlockPacket,
     ShootFeedbackPacket,
     ShootPacket,
     ShootResponse,
@@ -50,6 +52,9 @@ _COMMON_ARMS = ((24, 20, 12), (12, 2, 1))
 _ZOMBIE_ARMS = ((24, 20, 12), (12, 10, 6))
 _CROUCH_TORSO = ((16, 16, 14), (8, 14, 2))
 _CROUCH_LEG = ((6, 14, 16), (3, 7, 3))
+# ``kv6/ClassicCorpse.kv6`` header: size 48x50x14, pivot 24.5/25/7.
+# KillAction owns the model; this box is only for authoritative shot ordering.
+_CLASSIC_CORPSE_BOUNDS = ((48, 50, 14), (24.5, 25.0, 7.0))
 
 
 def _part(size, pivot):
@@ -126,8 +131,11 @@ def _build_melee_profiles():
         # the hit voxel and the next voxel in VXL z (z and z+1).
         T("MACHETE_TOOL", 50):     (T("MACHETE_DAMAGE", 35),   2.0, DIG_MACHETE),
         T("UGC_PICKAXE_TOOL", 44): (T("UGC_PICKAXE_DAMAGE", 28), 9.0, DIG_SINGLE),
+        # UGC Super Spade is dual-use. LMB/type 29 is one block; only
+        # ShootPacket.secondary (RMB/type 31 in this retail build) uses the
+        # large cube handler.
         T("UGC_SUPERSPADE_TOOL", 45): (
-            T("UGC_SUPERSPADE_DAMAGE", 29), 7.5, DIG_CUBE
+            T("UGC_SUPERSPADE_DAMAGE", 29), 7.5, DIG_SINGLE
         ),
     }
 
@@ -149,6 +157,7 @@ _BLOCK_HIT_SOUND_BY_DAMAGE = {
     int(getattr(C, "CROWBAR_DAMAGE", 26)): 34,
     int(getattr(C, "UGC_PICKAXE_DAMAGE", 28)): 36,
     int(getattr(C, "UGC_SUPERSPADE_DAMAGE", 29)): 37,
+    int(getattr(C, "UGC_SUPERSPADE_SECONDARY_DAMAGE", 31)): 37,
     # Machete has no dedicated entry in this client's 61-id SOUND_MAP. Knife
     # is the closest safe stock cue; arbitrary sound filenames cannot travel
     # in PlaySound(23).
@@ -187,6 +196,7 @@ class CombatSystem:
         self._pellet_spread = {}
         self._assault_bursts = {}
         self._minigun_runs = {}
+        self._paintbrush_next_use = {}
 
     def forget_player(self, player_id: int) -> None:
         """Discard cadence/group state before a wire player id is reused."""
@@ -195,6 +205,7 @@ class CombatSystem:
         self._pellet_spread.pop(player_id, None)
         self._assault_bursts.pop(player_id, None)
         self._minigun_runs.pop(player_id, None)
+        self._paintbrush_next_use.pop(player_id, None)
 
     def _queue_canonical_terrain_repair(self, positions) -> None:
         """Schedule bounded repair for a client-predicted edit footprint.
@@ -521,6 +532,14 @@ class CombatSystem:
         self._broadcast_block_mutation(
             player, position, BLOCK_ACTION_BUILD, loop_count=action_loop
         )
+        # The actor predicts its own placement sample. Build packets do not
+        # trigger that Character sound for remote observers.
+        play_sound(
+            self.server,
+            SND_BUILD,
+            position=position,
+            exclude=player,
+        )
 
     # Longest line the server will accept. The client regenerates the cells
     # from the echoed ENDPOINTS with its own generator, so the server must
@@ -661,6 +680,16 @@ class CombatSystem:
             echo.x, echo.y, echo.z = x, y, z
             echo.color = color
             self.server.broadcast(bytes(echo.generate()), exclude=player)
+        successful_cells = [
+            cell for cell in build_cells if cell not in failed_cells
+        ]
+        if successful_cells:
+            play_sound(
+                self.server,
+                SND_BUILD,
+                position=successful_cells[0],
+                exclude=player,
+            )
 
     def block_line_cells(self, a, b):
         """Return the stock face-connected cells for public action validation."""
@@ -672,13 +701,258 @@ class CombatSystem:
 
         return self.block_line_cells(a, b)
 
+    def _paintbrush_authorized(self, player) -> bool:
+        """Return whether this life owns the dedicated UGC paintbrush."""
+
+        from server.game_rules import get_rules
+
+        tool = int(getattr(player, "tool", -1))
+        return (
+            bool(getattr(self.server.config, "ugc_runtime", False))
+            and bool(getattr(player, "alive", False))
+            and bool(getattr(player, "spawned", False))
+            and int(getattr(player, "class_id", -1))
+            == int(getattr(C, "CLASS_UGCBUILDER", 13))
+            and bool(getattr(player, "tool_is_raw", False))
+            and tool == int(getattr(C, "PAINTBRUSH_TOOL", 43))
+            and tool in {
+                int(value) for value in (getattr(player, "loadout", ()) or ())
+            }
+            and get_rules(self.server.config).enabled("RULE_ENABLE_COLOUR_PICKER")
+            and get_rules(self.server.config).is_tool_enabled(tool)
+        )
+
+    @staticmethod
+    def _unpack_rgb(color) -> tuple[int, int, int]:
+        """Normalize packed VXL or tuple colour values to wire RGB."""
+
+        if isinstance(color, (tuple, list)):
+            values = tuple(int(value) & 0xFF for value in color[:3])
+            return values if len(values) == 3 else (0, 0, 0)
+        packed = int(color) & 0xFFFFFF
+        return ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF)
+
+    def _paintbrush_surface_cells(
+        self,
+        center: tuple[int, int, int],
+        *,
+        radius: int,
+    ) -> list[tuple[int, int, int]]:
+        """Return a bounded exposed-surface brush around one raycast hit."""
+
+        world = self.server.world_manager
+        cx, cy, cz = center
+        radius = max(0, min(4, int(radius)))
+        radius_sq = radius * radius
+        rows = []
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                for dz in range(-radius, radius + 1):
+                    distance_sq = dx * dx + dy * dy + dz * dz
+                    if distance_sq > radius_sq:
+                        continue
+                    coordinate = (cx + dx, cy + dy, cz + dz)
+                    x, y, z = coordinate
+                    if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z <= 238):
+                        continue
+                    if not world.get_solid(x, y, z):
+                        continue
+                    # Painting buried voxels has no visible result and turns a
+                    # held RMB into a needless packet/mutation flood.  Retail's
+                    # brush is a surface spray, so retain only exposed cells.
+                    if radius and all(
+                        world.get_solid(x + ox, y + oy, z + oz)
+                        for ox, oy, oz in self._NEIGHBOR_OFFSETS
+                        if (
+                            0 <= x + ox < 512
+                            and 0 <= y + oy < 512
+                            and 0 <= z + oz <= 238
+                        )
+                    ):
+                        continue
+                    rows.append((distance_sq, coordinate))
+        rows.sort(key=lambda row: (row[0], row[1]))
+        return [coordinate for _distance, coordinate in rows[:128]]
+
+    def _commit_paint(
+        self,
+        player,
+        positions,
+        color,
+        *,
+        loop_count: int,
+    ) -> int:
+        """Recolour canonical VXL cells and relay native packet 7 per cell."""
+
+        world = self.server.world_manager
+        rgb = self._unpack_rgb(color)
+        changed = 0
+        for x, y, z in positions:
+            x, y, z = int(x), int(y), int(z)
+            if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z <= 238):
+                continue
+            if not world.get_solid(x, y, z):
+                continue
+            try:
+                current = self._unpack_rgb(world.get_color(x, y, z))
+            except (AttributeError, TypeError, ValueError):
+                current = None
+            if current == rgb:
+                continue
+            if not world.set_block(x, y, z, True, rgb):
+                continue
+            packet = PaintBlockPacket()
+            packet.loop_count = max(0, int(loop_count))
+            packet.x, packet.y, packet.z = x, y, z
+            packet.color = rgb
+            # The direct editor can be a MAP_IS_UGC_CLIENT for safe source-map
+            # transfer, so it does not always retain the original host's local
+            # paint mutation. Include the owner in this idempotent echo.
+            self.server.broadcast(bytes(packet.generate()))
+            changed += 1
+        return changed
+
+    def handle_paint_packet(self, player, packet) -> bool:
+        """Validate a native packet-7 request and commit its one target cell."""
+
+        is_editor_brush = self._paintbrush_authorized(player)
+        if not is_editor_brush:
+            from server.game_rules import get_rules
+
+            if not (
+                bool(getattr(player, "alive", False))
+                and bool(getattr(player, "spawned", False))
+                and bool(getattr(player, "is_block_tool", lambda: False)())
+                and get_rules(self.server.config).is_tool_enabled(
+                    int(getattr(player, "tool", -1))
+                )
+            ):
+                return False
+        try:
+            position = (
+                int(packet.x),
+                int(packet.y),
+                int(packet.z),
+            )
+            color = tuple(int(value) & 0xFF for value in packet.color[:3])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
+        if len(color) != 3:
+            return False
+        if is_editor_brush:
+            dx = float(getattr(player, "x", 0.0)) - position[0]
+            dy = float(getattr(player, "y", 0.0)) - position[1]
+            dz = float(getattr(player, "z", 0.0)) - position[2]
+            reach = float(getattr(C, "PAINTBRUSH_RANGE", 15.0)) + 1.0
+            if dx * dx + dy * dy + dz * dz > reach * reach:
+                return False
+        return bool(
+            self._commit_paint(
+                player,
+                (position,),
+                color,
+                loop_count=int(getattr(packet, "loop_count", self.server.loop_count)),
+            )
+        )
+
+    def handle_paintbrush_input(self, player, packet) -> bool:
+        """Drive the original host-local brush for a dedicated editor client.
+
+        The retail UGC host mutates its own VXL before packet 7 is replicated.
+        A standalone dedicated host advertises direct joiners as UGC clients
+        so they can safely accept the server's source VXL; those clients do not
+        consistently originate packet 7. ClientData still carries held
+        primary/secondary state, orientation, loop stamp, and palette state,
+        so the server reconstructs the same single-block/surface-brush action.
+        This runs in packet-drain context and is capped by the stock 30 ms
+        brush interval and a 128-cell surface footprint.
+        """
+
+        if not self._paintbrush_authorized(player):
+            return False
+        # PaintbrushTool.on_set deliberately leaves the palette active, which
+        # sets ClientData's packed ``palette_enabled`` bit for normal strokes.
+        # Actual palette clicks are consumed by the HUD and arrive without
+        # these action bits, so gating on the palette flag disables painting.
+        primary = bool(getattr(packet, "primary", False))
+        secondary = bool(getattr(packet, "secondary", False))
+        if not primary and not secondary:
+            return False
+
+        now = time.monotonic()
+        player_id = int(player.id)
+        if now < float(self._paintbrush_next_use.get(player_id, 0.0)):
+            return False
+        interval = float(getattr(C, "PAINTBRUSH_SHOOT_INTERVAL", 0.03))
+        self._paintbrush_next_use[player_id] = now + max(0.01, interval)
+
+        direction = self._normalize(tuple(float(value) for value in player.orientation))
+        if direction is None:
+            return False
+        origin = tuple(float(value) for value in player.eye)
+        center = self.server.world_manager.raycast(
+            origin[0],
+            origin[1],
+            origin[2],
+            direction[0],
+            direction[1],
+            direction[2],
+            float(getattr(C, "PAINTBRUSH_RANGE", 15.0)),
+        )
+        if center is None:
+            return False
+        center = tuple(int(value) for value in center)
+        radius = (
+            int(getattr(C, "PAINTBRUSH_SECONDARY_RADIUS", 3))
+            if secondary
+            else 0
+        )
+        positions = self._paintbrush_surface_cells(center, radius=radius)
+        packed_color = int(getattr(player, "block_color", 0)) & 0xFFFFFF
+        return bool(
+            self._commit_paint(
+                player,
+                positions,
+                packed_color,
+                loop_count=int(getattr(packet, "loop_count", self.server.loop_count)),
+            )
+        )
+
+    @staticmethod
+    def _spade_profile_for_packet(player, packet):
+        """Resolve a melee terrain profile including dual-use mouse actions.
+
+        ``DiggingTool.use_spade`` stores its ``secondary_damage`` boolean in
+        bit 1 of ShootPacket's flags byte.  The UGC Super Spade uses that bit
+        to select between its type-29 single-block LMB and type-31 3x3x3 RMB.
+        Treating the base tool profile as a cube made every ordinary click
+        erase client-predicted neighbors and was the editor's spade glitch.
+        """
+
+        profile = MELEE_DIG_PROFILES.get(
+            int(getattr(player, "tool", -1)),
+            DEFAULT_MELEE_PROFILE,
+        )
+        if (
+            int(getattr(player, "tool", -1))
+            == int(getattr(C, "UGC_SUPERSPADE_TOOL", 45))
+            and bool(int(getattr(packet, "secondary", 0)))
+        ):
+            return (
+                int(getattr(C, "UGC_SUPERSPADE_SECONDARY_DAMAGE", 31)),
+                float(getattr(C, "UGC_SUPERSPADE_SECONDARY_DAMAGE_AMOUNT", 7.5)),
+                DIG_CUBE,
+            )
+        return profile
+
     def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
         """Raycast terrain from the CLIENT's reported origin/direction and dig
         per the player's CURRENT tool (MELEE_DIG_PROFILES).
 
-        - Ordinary spades remove the classic (z-1, z, z+1) column. The Miner
-          and UGC Super Spades remove the retail centered 3x3x3 cube. One
-          matching area-damage packet makes each client self-expand once.
+        - Ordinary spades remove the classic (z-1, z,z+1) column. The Miner
+          Super Spade and the UGC Super Spade's RMB remove the retail centered
+          3x3x3 cube; UGC LMB removes one block. One matching area-damage
+          packet makes each client self-expand once.
         - Pickaxe / knife / crowbar (single cell) and Machete (z,z+1):
           accumulate the tool's per-hit block damage (knife 1 -> 5
           hits/block, Machete 2 -> 3 hits, pickaxe 9 -> 1 hit); each block
@@ -697,8 +971,10 @@ class CombatSystem:
         if block_pos is None:
             return False
 
-        dmg_type, block_dmg, pattern = MELEE_DIG_PROFILES.get(
-            getattr(player, "tool", None), DEFAULT_MELEE_PROFILE)
+        dmg_type, block_dmg, pattern = self._spade_profile_for_packet(
+            player,
+            packet,
+        )
         x, y, z = block_pos
         wm = self.server.world_manager
         positions = _melee_dig_positions(block_pos, pattern)
@@ -870,8 +1146,12 @@ class CombatSystem:
         if hit is None:
             return False
 
-        target, _, _, position = hit
-        damage = self._calculate_damage(attacker, attacker.get_weapon_profile(), headshot=False)
+        target, headshot, _, position = hit
+        damage = self._calculate_damage(
+            attacker,
+            attacker.get_weapon_profile(),
+            headshot=headshot,
+        )
         damage = self._apply_riot_shield_mitigation(target, attacker, damage)
         if int(getattr(attacker, "tool", -1)) == int(C.RIOTSHIELD_TOOL):
             self._apply_riot_shield_knockback(attacker, target)
@@ -910,6 +1190,19 @@ class CombatSystem:
                 target.entity_id, damage, attacker, self.server._build_entity_ctx()
             )
             return True
+
+        if kind == "corpse":
+            corpse_lifecycle = getattr(self.server, "corpse_lifecycle", None)
+            explode = getattr(corpse_lifecycle, "explode", None)
+            if not callable(explode):
+                return False
+            return bool(
+                explode(
+                    target,
+                    attacker,
+                    show_explosion_effect=True,
+                )
+            )
 
         if kind == "block":
             return self._apply_block_damage(
@@ -1121,6 +1414,46 @@ class CombatSystem:
             )
         self._collapse_unsupported(player, positions)
 
+    def broadcast_native_radius_destroy(
+        self,
+        player,
+        center,
+        positions,
+        *,
+        damage: float,
+        damage_type: int,
+        causer_entity_id: int,
+    ) -> None:
+        """Publish one native expanding blast and journal exact catch-up cells.
+
+        Dynamite and C4 handlers call ``handle_radius_damage(radius=2)`` in the
+        retail BlockManager. Sending one Damage packet preserves the original
+        effects while avoiding 81 reliable packets, 81 collapse scans, and 81
+        sound/particle paths on the render thread. Late joiners cannot resolve
+        the expired charge id, so their journal remains exact type-6 cells.
+        """
+
+        packet = self._build_block_damage_packet(
+            player,
+            center,
+            damage,
+            damage_type=int(damage_type),
+            causer_id=int(causer_entity_id),
+        )
+        data = bytes(packet.generate())
+        sender = getattr(self.server, "broadcast_known_entity_packet", None)
+        if callable(sender):
+            sender(data, int(causer_entity_id), reliable=True)
+        else:
+            self.server.broadcast(data, record_mutation=False)
+
+        self.record_exact_block_destroy_catchup(
+            player,
+            positions,
+            causer_id=(int(player.id) if player is not None else 0),
+        )
+        self._collapse_unsupported(player, positions)
+
     def _collapse_unsupported(self, player, removed_positions):
         """Floating-structure collapse: any solid chunk left disconnected from
         the base plane by these removals falls too (cascading until stable).
@@ -1128,12 +1461,23 @@ class CombatSystem:
         out levitates forever."""
         wm = self.server.world_manager
         chunks = wm.find_unsupported_chunks(list(removed_positions))
+        collapsed = []
         for chunk in chunks:
             # The triggering Damage(chunk_check=1) makes every client remove
             # and animate this whole component natively. Mirror it server-side
-            # only; broadcasting one reliable Damage per falling voxel causes
-            # effect noise, channel floods, and duplicate collapse work.
-            wm.destroy_blocks(chunk)
+            # immediately; do not flood the original action with one Damage per
+            # voxel because that duplicates collapse work and effects.
+            collapsed.extend(wm.destroy_blocks(chunk))
+
+        # A client whose topology differs by even one voxel can derive a
+        # different falling component and retain visible blocks that no longer
+        # collide on the server. Confirm the committed air cells later through
+        # a bounded exact-cell lane. On clients that collapsed correctly these
+        # type-6, chunk_check=0 packets are no-ops.
+        repair = getattr(self.server, "terrain_repair", None)
+        record = getattr(repair, "record_collapse_cells", None)
+        if collapsed and callable(record):
+            record(collapsed)
 
     def _broadcast_block_mutation(
         self, player, position, block_type: int, loop_count: int = None
@@ -1231,12 +1575,11 @@ class CombatSystem:
         return None, False, None, block_pos
 
     def _trace_authoritative_hit(self, attacker, origin, direction, max_range: float):
-        """Return the nearest player, damageable entity, or terrain impact.
+        """Return the nearest player, Classic corpse, entity, or terrain hit.
 
-        Terrain caps the ray before player/entity tests, while players and
-        entities are compared by their actual entry distance.  This prevents a
-        deployable behind a wall (or behind a nearer player) from absorbing the
-        shot merely because it exists on the same ray.
+        Terrain caps the ray before dynamic-target tests. Players, corpses, and
+        entities are compared by actual entry distance so no farther target can
+        absorb a shot through nearer geometry.
         """
         block_pos = self.server.world_manager.raycast(
             origin[0], origin[1], origin[2],
@@ -1255,12 +1598,22 @@ class CombatSystem:
         entity_hit = self._find_first_entity_hit(
             origin, direction, max_distance
         )
+        corpse_hit = self._find_first_classic_corpse_hit(
+            origin, direction, max_distance
+        )
 
         if player_hit is not None and (
             entity_hit is None or player_hit[2] <= entity_hit[1]
+        ) and (
+            corpse_hit is None or player_hit[2] <= corpse_hit[1]
         ):
             target, headshot, _, position = player_hit
             return "player", target, headshot, position
+        if corpse_hit is not None and (
+            entity_hit is None or corpse_hit[1] <= entity_hit[1]
+        ):
+            corpse, _, position = corpse_hit
+            return "corpse", corpse, False, position
         if entity_hit is not None:
             entity, _, position = entity_hit
             return "entity", entity, False, position
@@ -1293,6 +1646,42 @@ class CombatSystem:
             distance, position = hit
             if closest is None or distance < closest[1]:
                 closest = (entity, distance, position)
+        return closest
+
+    def _find_first_classic_corpse_hit(
+        self,
+        origin,
+        direction,
+        max_distance: float,
+    ):
+        """Return the nearest static ClassicCorpse KV6 intersected by a ray.
+
+        Corpse state is server-owned but has no entity id.  Reuse the retail
+        oriented-KV6 slab transform so a corpse competes with players,
+        deployables, and terrain by entry distance instead of absorbing shots
+        through nearer geometry.
+        """
+
+        corpse_lifecycle = getattr(self.server, "corpse_lifecycle", None)
+        iter_hittable = getattr(corpse_lifecycle, "iter_hittable", None)
+        if not callable(iter_hittable):
+            return None
+
+        closest = None
+        for corpse in iter_hittable():
+            hit = self._ray_hits_model_bounds(
+                origin,
+                direction,
+                max_distance,
+                corpse,
+                (0.0, 0.0, 0.0),
+                _CLASSIC_CORPSE_BOUNDS,
+            )
+            if hit is None:
+                continue
+            distance, position = hit
+            if closest is None or distance < closest[1]:
+                closest = (corpse, distance, position)
         return closest
 
     @staticmethod

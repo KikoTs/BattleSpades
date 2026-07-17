@@ -94,11 +94,17 @@ def stage_release(
         raise FileExistsError(f"release destination already exists: {destination}")
     if not frozen.is_dir():
         raise FileNotFoundError(f"PyInstaller output is missing: {frozen}")
-    launcher = frozen / (
-        "BattleSpades.exe" if target.platform == "windows" else "BattleSpades"
+    executable_suffix = ".exe" if target.platform == "windows" else ""
+    launchers = (
+        frozen / f"BattleSpades{executable_suffix}",
+        frozen / f"BattleSpadesTutorial{executable_suffix}",
+        frozen / f"BattleSpadesMapCreator{executable_suffix}",
     )
-    if not launcher.is_file():
-        raise FileNotFoundError(f"frozen launcher is missing: {launcher}")
+    missing_launchers = [str(path) for path in launchers if not path.is_file()]
+    if missing_launchers:
+        raise FileNotFoundError(
+            "frozen launcher is missing: " + ", ".join(missing_launchers)
+        )
     repository_version = read_version(root)
     if repository_version != target.version:
         raise ValueError(
@@ -112,9 +118,13 @@ def stage_release(
         root / "VERSION": "VERSION",
         root / "release" / "README.txt": "README.txt",
         root / "release" / "THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
+        root / "release" / "STEAM_RUNTIME.txt": "steam-runtime/README.txt",
         root / "client_patches" / "INSTALL.txt": "client_patches/INSTALL.txt",
         root / "client_patches" / "session_transition_patch.py": (
             "client_patches/session_transition_patch.py"
+        ),
+        root / "client_patches" / "clipboard_input_patch.py": (
+            "client_patches/clipboard_input_patch.py"
         ),
     }
     missing = [str(path) for path in required_files if not path.is_file()]

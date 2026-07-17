@@ -22,7 +22,8 @@ from server.config import ServerConfig  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer  # noqa: E402
+from shared.packet import ChangePlayer, DisplayCountdown, SetScore  # noqa: E402
+from server.game_constants import TEAM1, TEAM2  # noqa: E402
 
 
 class _Connection:
@@ -54,8 +55,8 @@ class _Server:
         }}
         self.world_manager = _World()
         self.teams = {
-            SURVIVOR_TEAM: Team(SURVIVOR_TEAM, "Blue", (0, 0, 255)),
-            ZOMBIE_TEAM: Team(ZOMBIE_TEAM, "Green", (0, 255, 0)),
+            TEAM1: Team(TEAM1, "Blue", (0, 0, 255)),
+            TEAM2: Team(TEAM2, "Green", (0, 255, 0)),
         }
         self.players = {}
         self.packets = []
@@ -82,6 +83,7 @@ def _player(server, player_id, team=SURVIVOR_TEAM, class_id=C.CLASS_SOLDIER):
         pending_loadout=None,
         score=0,
         death_time=0.0,
+        position=(100.5 + player_id, 200.5, 60.0),
     )
 
     def apply(selection):
@@ -129,14 +131,17 @@ def test_zombie_mode_is_registered_with_asymmetric_native_snapshot():
     assert get_mode_class("zom") is ZombieMode
     assert get_mode_class("zombie") is ZombieMode
     assert state.mode_type == 2
-    assert state.team1_name == "Survivors"
-    assert state.team2_name == "Zombies"
-    assert int(C.CLASS_ROCKETEER) in state.team1_classes
-    assert state.team2_classes == [int(C.CLASS_ZOMBIE)]
-    assert state.team2_locked is True
-    assert state.team2_locked_class is True
+    assert ZOMBIE_TEAM == TEAM1
+    assert SURVIVOR_TEAM == TEAM2
+    assert state.team1_name == "Zombies"
+    assert state.team2_name == "Survivors"
+    assert state.team1_classes == [int(C.CLASS_ZOMBIE)]
+    assert int(C.CLASS_ROCKETEER) in state.team2_classes
+    assert state.team1_locked is True
+    assert state.team1_locked_class is True
     assert state.lock_team_swap is True
     assert info.friendly_fire == 0
+    assert info.exposed_teams_always_on_minimap == 1
     assert int(C.CLASS_ROCKETEER) not in info.disabled_classes
     assert int(C.CLASS_ZOMBIE) not in info.disabled_classes
     assert int(C.CLASS_FAST_ZOMBIE) in info.disabled_classes
@@ -152,7 +157,27 @@ def test_human_facing_zombie_alias_keeps_retail_mode_id_two():
 
     assert state.mode_type == 2
     assert info.mode_key == 2
-    assert state.team2_name == "Zombies"
+    assert state.team1_name == "Zombies"
+
+
+def test_pre_infection_countdown_uses_native_hud_timer():
+    server = _Server()
+    first = _player(server, 1)
+    second = _player(server, 2)
+    mode = ZombieMode(server)
+    server.mode = mode
+    mode.infection_delay = 12.0
+
+    asyncio.run(mode.on_mode_start())
+
+    countdowns = [
+        DisplayCountdown(ByteReader(packet[1:]))
+        for packet in server.packets
+        if packet and packet[0] == DisplayCountdown.id
+    ]
+    assert first.team == second.team == SURVIVOR_TEAM
+    assert countdowns
+    assert 11.9 <= countdowns[-1].timer <= 12.0
 
 
 def test_outbreak_keeps_one_survivor_and_assigns_melee_only_patient_zero():
@@ -215,11 +240,48 @@ def test_survivor_death_converts_before_respawn_and_reveals_last_man():
     assert victim.class_id == int(C.CLASS_ZOMBIE)
     assert mode.last_survivor_id == survivor.id
     assert zombie.score == 100
+    score_packets = [
+        SetScore(ByteReader(packet[1:]))
+        for packet in server.packets
+        if packet and packet[0] == SetScore.id
+    ]
+    assert score_packets[-1].reason == int(
+        C.ZOM_KILLSURVIVOR_SCORE_REASON
+    )
     visible = _visibility_packets(server.packets)
     assert (survivor.id, 1) in {
         (packet.player_id, packet.high_minimap_visibility)
         for packet in visible
     }
+
+
+def test_newly_infected_respawns_once_at_the_death_site():
+    server, mode = _new_mode(player_count=3)
+    asyncio.run(mode.on_tick(1))
+    victim = next(p for p in server.players.values() if p.team == SURVIVOR_TEAM)
+    death_site = victim.position
+    victim.alive = victim.spawned = False
+
+    asyncio.run(mode.on_player_death(victim, None, 0))
+
+    assert mode.get_spawn_point(victim) == death_site
+    assert mode.get_spawn_point(victim) != death_site
+
+
+def test_periodic_survival_score_uses_native_zombie_xp_reason():
+    server, mode = _new_mode(player_count=3)
+    asyncio.run(mode.on_tick(1))
+    mode._next_survival_score_at = time.time() - 0.01
+
+    mode._award_periodic_survival_score(time.time())
+
+    scores = [
+        SetScore(ByteReader(packet[1:]))
+        for packet in server.packets
+        if packet and packet[0] == SetScore.id
+    ]
+    assert scores
+    assert scores[-1].reason == int(C.ZOM_SURVIVE_SCORE_REASON)
 
 
 def test_departed_only_zombie_is_replaced_without_soft_lock():

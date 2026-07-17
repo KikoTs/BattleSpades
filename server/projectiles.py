@@ -30,7 +30,8 @@ flagged for live calibration.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Optional
 
 import shared.constants as C
@@ -54,13 +55,27 @@ MAX_FLIGHT_SECONDS = 10.0
 # 81 cells exactly (stable across seeds 0, 1, 123, and 255).  This is wider
 # than the projectile's one-cell collision trace: the trace chooses the
 # centre, while this footprint is the actual boring operation.
-DRILL_CONTACT_OFFSETS = tuple(
-    (dx, dy, dz)
-    for dx in range(-2, 3)
-    for dy in range(-2, 3)
-    for dz in range(-2, 3)
-    if dx * dx + dy * dy + dz * dz <= 6
-)
+@lru_cache(maxsize=8)
+def radius_damage_offsets(radius: int) -> tuple[tuple[int, int, int], ...]:
+    """Return the retail BlockManager's spherical integer-cell footprint.
+
+    ``handle_radius_damage`` tests voxel centers against ``radius + 0.5``.
+    Radius two therefore contains the live-measured 81 Drill/Dynamite/C4
+    cells, not the 125 cells in a full 5x5x5 cube.
+    """
+
+    radius = max(0, int(radius))
+    limit_sq = (float(radius) + 0.5) ** 2
+    return tuple(
+        (dx, dy, dz)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        for dz in range(-radius, radius + 1)
+        if dx * dx + dy * dy + dz * dz < limit_sq
+    )
+
+
+DRILL_CONTACT_OFFSETS = radius_damage_offsets(2)
 
 
 def drill_contact_cells(block) -> tuple[tuple[int, int, int], ...]:
@@ -69,6 +84,19 @@ def drill_contact_cells(block) -> tuple[tuple[int, int, int], ...]:
     x, y, z = (int(value) for value in block)
     return tuple((x + dx, y + dy, z + dz)
                  for dx, dy, dz in DRILL_CONTACT_OFFSETS)
+
+
+def radius_damage_cells(
+    center,
+    radius: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Translate a native radius-damage footprint to canonical VXL cells."""
+
+    x, y, z = (int(value) for value in center)
+    return tuple(
+        (x + dx, y + dy, z + dz)
+        for dx, dy, dz in radius_damage_offsets(radius)
+    )
 
 
 @dataclass(frozen=True)
@@ -236,6 +264,54 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         blast_radius=float(getattr(C, "GRENADE_LAUNCHER_EXPLOSION_RADIUS", 4.0)),
         knockback_min=0.0, knockback_max=0.25),
 }
+
+# Map Creator subclasses the ordinary Drill and Block Cannon on the client,
+# but emits distinct tool/damage/kill ids (47/48 and 33/32 respectively).
+# Their flight/entity geometry is otherwise identical.  Keep aliases explicit
+# here so packet 10 remains byte-faithful and the native client selects the UGC
+# BlockManager handlers instead of silently rejecting an unknown projectile.
+PROJECTILE_SPECS[int(getattr(C, "UGC_DRILLGUN_TOOL", 47))] = replace(
+    PROJECTILE_SPECS[int(C.DRILLGUN_TOOL)],
+    gravity_mult=float(getattr(C, "UGC_DRILL_GRAVITY_MULTIPLIER", 1.5)),
+    damage=float(getattr(C, "UGC_DRILL_EXPLOSION_DAMAGE", 50.0)),
+    block_damage=float(getattr(C, "UGC_DRILL_EXPLOSION_BLOCK_DAMAGE", 5.0)),
+    kill_type=_kill("UGC_DRILL_KILL", 28),
+    damage_type=int(getattr(C, "UGC_DRILL_DAMAGE", 33)),
+    lifespan=float(getattr(C, "UGC_DRILL_LIFESPAN", 3.0)),
+    destroyed_damage=float(
+        getattr(C, "UGC_DRILL_DESTROYED_EXPLOSION_DAMAGE", 95.0)
+    ),
+    destroyed_block_damage=float(
+        getattr(C, "UGC_DRILL_DESTROYED_EXPLOSION_BLOCK_DAMAGE", 10.0)
+    ),
+    blast_radius=float(getattr(C, "UGC_DRILL_EXPLOSION_RADIUS", 3.0)),
+    knockback_min=float(getattr(C, "UGC_DRILL_EXPLOSION_KNOCKBACK_MIN", 0.01)),
+    knockback_max=float(getattr(C, "UGC_DRILL_EXPLOSION_KNOCKBACK_MAX", 0.1)),
+    destroyed_blast_radius=float(
+        getattr(C, "UGC_DRILL_DESTROYED_EXPLOSION_RADIUS", 3.5)
+    ),
+    destroyed_knockback_min=float(
+        getattr(C, "UGC_DRILL_DESTROYED_EXPLOSION_KNOCKBACK_MIN", 0.1)
+    ),
+    destroyed_knockback_max=float(
+        getattr(C, "UGC_DRILL_DESTROYED_EXPLOSION_KNOCKBACK_MAX", 0.2)
+    ),
+)
+PROJECTILE_SPECS[int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48))] = replace(
+    PROJECTILE_SPECS[int(getattr(C, "SNOWBLOWER_TOOL", 29))],
+    gravity_mult=float(getattr(C, "UGC_SNOWBALL_GRAVITY_MULTIPLIER", 0.5)),
+    damage=float(getattr(C, "UGC_SNOWBALL_EXPLOSION_DAMAGE", 10.0)),
+    block_damage=float(getattr(C, "UGC_SNOWBALL_EXPLOSION_BLOCK_DAMAGE", 0.0)),
+    kill_type=_kill("UGC_SNOWBALL_KILL", 29),
+    damage_type=int(getattr(C, "UGC_SNOWBALL_DAMAGE", 32)),
+    blast_radius=float(getattr(C, "UGC_SNOWBALL_EXPLOSION_RADIUS", 5.0)),
+    knockback_min=float(
+        getattr(C, "UGC_SNOWBALL_EXPLOSION_KNOCKBACK_MIN", 0.3)
+    ),
+    knockback_max=float(
+        getattr(C, "UGC_SNOWBALL_EXPLOSION_KNOCKBACK_MAX", 0.3)
+    ),
+)
 
 
 class Projectile:

@@ -9,6 +9,7 @@ marker visible through terrain.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from enum import Enum, auto
 import logging
 import random
@@ -20,7 +21,7 @@ import shared.constants_gamemode as CG
 
 from server import mode_data
 from server.class_selection import ClassSelection, normalize_class_selection
-from server.game_constants import TEAM1, TEAM2
+from server.game_constants import KILL_CLASS_CHANGE, TEAM1, TEAM2
 
 from .base_mode import BaseMode
 
@@ -38,6 +39,7 @@ class VIPPhase(Enum):
     """Authoritative phase of one VIP sub-round."""
 
     WAITING = auto()
+    RESETTING = auto()
     SELECTING = auto()
     ACTIVE = auto()
     INTERMISSION = auto()
@@ -59,6 +61,10 @@ class VIPMode(BaseMode):
 
     name = "VIP"
     description = "Protect your VIP, kill theirs, then mop up the survivors!"
+    # Exact retail ``playlists/vip.txt`` rotation. An explicit operator map
+    # list still wins in VoteManager, but an unconfigured VIP server should
+    # not vote into maps that lack the shipped gangster-mode layout.
+    stock_maps = ("Alcatraz", "CityOfChicago")
 
     def __init__(self, server) -> None:
         super().__init__(server)
@@ -74,6 +80,9 @@ class VIPMode(BaseMode):
             "selection_delay", CG.VIP_SELECTION_DELAY
         ))
         self.round_intermission = float(overlay.get("round_intermission", 7.0))
+        self.round_respawns_per_tick = max(1, int(overlay.get(
+            "round_respawns_per_tick", 4
+        )))
         self.minimum_team_size = int(overlay.get(
             "minimum_team_size", CG.VIP_MINIMUM_TEAM_SIZE_TO_START
         ))
@@ -90,10 +99,20 @@ class VIPMode(BaseMode):
         self.respawn_enabled: dict[int, bool] = {TEAM1: True, TEAM2: True}
         self.selection_deadline: float | None = None
         self._round_task: asyncio.Task | None = None
+        self._round_reset_queue: deque[Player] = deque()
+        self._next_roster_audit = 0.0
+        self._next_vip_survival_score = float("inf")
+        self._next_escort_score = float("inf")
+        # Promotion uses KillAction -> CreatePlayer so retail never receives a
+        # second live Character for the same id. These synthetic class-change
+        # deaths are ignored when their queued mode event drains later.
+        self._promotion_deaths: set[int] = set()
 
     async def on_mode_start(self) -> None:
         """Reset the full match and wait until both teams can choose a VIP."""
         await self._cancel_round_task()
+        self._round_reset_queue.clear()
+        self._promotion_deaths.clear()
         self._clear_vip_markers()
         await super().on_mode_start()
         for team in self.server.teams.values():
@@ -115,6 +134,8 @@ class VIPMode(BaseMode):
     async def deactivate(self) -> None:
         """Cancel a pending sub-round before a map or mode rollover."""
         await self._cancel_round_task()
+        self._round_reset_queue.clear()
+        self._promotion_deaths.clear()
         self._clear_vip_markers()
         await super().deactivate()
 
@@ -123,8 +144,18 @@ class VIPMode(BaseMode):
         await super().on_tick(tick)
         if self.ended or self.phase is VIPPhase.INTERMISSION:
             return
-        now = time.time()
-        if self.phase is VIPPhase.WAITING:
+        now = time.monotonic()
+        if self.phase is VIPPhase.RESETTING:
+            await self._drain_round_reset(now)
+            return
+
+        # Joins, deaths, leaves, and team changes drive roster transitions.
+        # This low-frequency audit is only a safety net for plugins that alter
+        # player state without calling the public mode hooks.
+        audit_due = now >= self._next_roster_audit
+        if audit_due:
+            self._next_roster_audit = now + 0.25
+        if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING) and audit_due:
             await self._arm_selection_if_ready(now)
         if (
             self.phase is VIPPhase.SELECTING
@@ -133,12 +164,14 @@ class VIPMode(BaseMode):
         ):
             await self._select_vips()
         if self.phase is VIPPhase.ACTIVE:
-            await self._check_team_elimination()
+            self._award_periodic_scores(now)
+            if audit_due:
+                await self._check_team_elimination()
 
     async def on_player_join(self, player: Player) -> None:
         """Start the selection countdown once both teams have a player."""
         if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING):
-            await self._arm_selection_if_ready(time.time())
+            await self._arm_selection_if_ready(time.monotonic())
 
     async def on_player_death(
         self,
@@ -147,7 +180,32 @@ class VIPMode(BaseMode):
         kill_type: int,
     ) -> None:
         """Lock a VIP's team out of respawns and test for elimination."""
+        player_id = int(getattr(player, "id", -1))
+        if (
+            int(kill_type) == KILL_CLASS_CHANGE
+            and player_id in self._promotion_deaths
+        ):
+            self._promotion_deaths.discard(player_id)
+            return
         team = int(getattr(player, "team", -1))
+        killer_team = int(getattr(killer, "team", -1))
+        if (
+            self.phase is VIPPhase.ACTIVE
+            and killer is not None
+            and killer is not player
+            and team in _PLAYABLE_TEAMS
+            and killer_team in _PLAYABLE_TEAMS
+            and killer_team != team
+            and self.vips.get(killer_team) is killer
+            and self.vip_alive.get(killer_team, False)
+        ):
+            # Retail awards this mode bonus for every enemy killed by a live
+            # boss, independently of the ordinary combat kill score.
+            self._award_player_score(
+                killer,
+                int(CG.VIP_SCORE_KILL_AS_VIP),
+                int(C.SCORE_REASON.VIP_KILL_SCORE_REASON),
+            )
         if (
             self.phase is VIPPhase.ACTIVE
             and team in _PLAYABLE_TEAMS
@@ -168,6 +226,8 @@ class VIPMode(BaseMode):
         ):
             await self._kill_vip(team, player, killer=None)
         await self._check_team_elimination()
+        if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING):
+            await self._arm_selection_if_ready(time.monotonic())
 
     async def on_player_team_change(
         self,
@@ -178,8 +238,8 @@ class VIPMode(BaseMode):
         """Re-evaluate a sudden-death team after a regular member leaves it."""
         if old_team in _PLAYABLE_TEAMS:
             await self._check_team_elimination()
-        if self.phase is VIPPhase.WAITING:
-            await self._arm_selection_if_ready(time.time())
+        if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING):
+            await self._arm_selection_if_ready(time.monotonic())
 
     def prepare_join_selection(
         self,
@@ -217,15 +277,45 @@ class VIPMode(BaseMode):
         team = int(getattr(player, "team", -1))
         return (
             not self.ended
-            and self.phase is not VIPPhase.INTERMISSION
+            and self.phase not in (VIPPhase.INTERMISSION, VIPPhase.RESETTING)
             and self.respawn_enabled.get(team, False)
         )
 
     def respawn_time_for(self, player: Player) -> float:
         """Expose zero respawn time to a permanently dead retail client."""
+        team = int(getattr(player, "team", -1))
+        if (
+            self.phase is VIPPhase.ACTIVE
+            and team in _PLAYABLE_TEAMS
+            and self.vips.get(team) is player
+            and self.vip_alive.get(team, False)
+        ):
+            # The hook is queried while Player.die is constructing KillAction,
+            # before the queued mode event flips vip_alive. Advertising the
+            # ordinary delay here leaves retail counting toward a respawn the
+            # server will correctly refuse.
+            return 0.0
         if not self.can_player_respawn(player):
             return 0.0
         return float(self.server.config.respawn_time)
+
+    def death_kill_type_for(
+        self,
+        player: Player,
+        killer: Player | None,
+        kill_type: int,
+    ) -> int:
+        """Select retail's dedicated boss-death transition for a live VIP."""
+
+        team = int(getattr(player, "team", -1))
+        if (
+            self.phase is VIPPhase.ACTIVE
+            and team in _PLAYABLE_TEAMS
+            and self.vips.get(team) is player
+            and self.vip_alive.get(team, False)
+        ):
+            return int(C.KILL.VIP_MODE_KILL)
+        return int(kill_type)
 
     def modify_incoming_damage(
         self,
@@ -267,16 +357,58 @@ class VIPMode(BaseMode):
         self.vip_alive = {TEAM1: False, TEAM2: False}
         self.respawn_enabled = {TEAM1: True, TEAM2: True}
         self.selection_deadline = None
-        self.phase = VIPPhase.WAITING
+        self._next_roster_audit = 0.0
+        self._next_vip_survival_score = float("inf")
+        self._next_escort_score = float("inf")
+        self._round_reset_queue.clear()
+        self._promotion_deaths.clear()
 
         if reset_players:
             for player in list(self.server.players.values()):
                 if player.team not in _PLAYABLE_TEAMS or player.connection is None:
                     continue
+                self._round_reset_queue.append(player)
+            if self._round_reset_queue:
+                self.phase = VIPPhase.RESETTING
+                return
+
+        self.phase = VIPPhase.WAITING
+        await self._arm_selection_if_ready(time.monotonic())
+
+    async def _drain_round_reset(self, now: float) -> None:
+        """Respawn a bounded slice of the next VIP sub-round.
+
+        This executes on the gameplay tick.  A respawn publishes reliable
+        CreatePlayer, loadout, health, and restock packets; sending an entire
+        24-player roster in one frame stalls both ENet and the native scene.
+        Entries retain object identity so a disconnected player's reused
+        compact id can never respawn the replacement accidentally.
+        """
+
+        budget = self.round_respawns_per_tick
+        while budget > 0 and self._round_reset_queue:
+            player = self._round_reset_queue.popleft()
+            budget -= 1
+            if (
+                self.server.players.get(int(player.id)) is not player
+                or player.team not in _PLAYABLE_TEAMS
+                or player.connection is None
+            ):
+                continue
+            try:
+                if bool(getattr(player, "alive", False)):
+                    player.die(kill_type=KILL_CLASS_CHANGE)
                 player.apply_class_selection(self._ordinary_selection(player))
                 self.server.respawn_player(player)
+            except Exception:
+                logger.exception(
+                    "VIP sub-round respawn failed for player %s",
+                    getattr(player, "id", "?"),
+                )
 
-        await self._arm_selection_if_ready(time.time())
+        if not self._round_reset_queue:
+            self.phase = VIPPhase.WAITING
+            await self._arm_selection_if_ready(now)
 
     def _ordinary_selection(self, player: Player) -> ClassSelection:
         """Return one legal ordinary gangster selection for a new sub-round."""
@@ -324,14 +456,23 @@ class VIPMode(BaseMode):
 
         selected = {team: random.choice(candidates[team]) for team in _PLAYABLE_TEAMS}
         self.vips = selected
-        self.vip_alive = {TEAM1: True, TEAM2: True}
+        # Keep promotions outside ACTIVE until both old Characters have been
+        # retired and recreated with their boss class.
+        self.vip_alive = {TEAM1: False, TEAM2: False}
         self.respawn_enabled = {TEAM1: True, TEAM2: True}
-        self.phase = VIPPhase.ACTIVE
         self.selection_deadline = None
+        now = time.monotonic()
+        self._next_vip_survival_score = (
+            now + float(CG.VIP_SCORE_LIVEVIP_INTERVAL)
+        )
+        self._next_escort_score = now + float(CG.VIP_SCORE_ESCORT_INTERVAL)
 
         for team in _PLAYABLE_TEAMS:
             vip = selected[team]
             vip_class = int(C.MAFIA_VIPS[team])
+            if bool(getattr(vip, "alive", False)):
+                self._promotion_deaths.add(int(vip.id))
+                vip.die(kill_type=KILL_CLASS_CHANGE)
             vip.apply_class_selection(normalize_class_selection(vip_class))
             self.server.respawn_player(vip)
             from server.game_constants import MAX_HEALTH
@@ -352,6 +493,8 @@ class VIPMode(BaseMode):
             await self.broadcast_message(
                 f"{vip.name} is the {self.server.teams[team].name} VIP!"
             )
+        self.vip_alive = {TEAM1: True, TEAM2: True}
+        self.phase = VIPPhase.ACTIVE
         await self.broadcast_message("Protect the VIP!")
 
     async def _kill_vip(
@@ -385,8 +528,6 @@ class VIPMode(BaseMode):
             play_sound_to(player, sound, volume=1.0)
 
         if killer is not None and killer is not vip:
-            from server.scoreboard import send_player_score
-
             if int(getattr(killer, "team", -1)) == team:
                 bonus = int(CG.VIP_SCORE_OWN_VIP_KILL)
             else:
@@ -396,22 +537,102 @@ class VIPMode(BaseMode):
                     * int(CG.VIP_SCORE_VIP_KILL_PERCENT)
                     / 100
                 )
-                killer_team = int(getattr(killer, "team", -1))
-                if (
-                    killer_team in _PLAYABLE_TEAMS
-                    and self.vips.get(killer_team) is killer
-                    and self.vip_alive.get(killer_team, False)
-                ):
-                    bonus += int(CG.VIP_SCORE_KILL_AS_VIP)
             if bonus:
-                killer.score = int(getattr(killer, "score", 0)) + bonus
-                send_player_score(self.server, killer)
+                self._award_player_score(
+                    killer,
+                    bonus,
+                    int(C.SCORE_REASON.VIP_KILLENEMYVIP_SCORE_REASON),
+                )
 
         # This compatibility option is useful for servers that want the old
         # kill-the-boss rule without the elimination phase. The retail rule
         # keeps sudden death enabled and follows the elimination check below.
         if not self.sudden_death_enabled:
             await self._finish_round(_other_team(team))
+
+    def _award_periodic_scores(self, now: float) -> None:
+        """Award the two retail timed VIP score types without catch-up bursts.
+
+        The native score menu specifies 50 points per ten seconds survived by
+        a boss and 10 points per five seconds spent within 15 blocks of a live
+        friendly boss.  A delayed gameplay tick awards at most one interval;
+        replaying every missed interval after a stall would create a reliable
+        packet burst and amplify exactly the client hitch this mode used to
+        suffer from.
+        """
+
+        award_survival = now >= self._next_vip_survival_score
+        award_escort = now >= self._next_escort_score
+        if not award_survival and not award_escort:
+            return
+
+        if award_survival:
+            self._next_vip_survival_score = (
+                now + float(CG.VIP_SCORE_LIVEVIP_INTERVAL)
+            )
+        if award_escort:
+            self._next_escort_score = now + float(CG.VIP_SCORE_ESCORT_INTERVAL)
+
+        players = tuple(self.server.players.values())
+        for team in _PLAYABLE_TEAMS:
+            vip = self.vips.get(team)
+            if (
+                vip is None
+                or not self.vip_alive.get(team, False)
+                or not bool(getattr(vip, "alive", False))
+                or not bool(getattr(vip, "spawned", False))
+                or getattr(vip, "connection", None) is None
+            ):
+                continue
+
+            if award_survival:
+                self._award_player_score(
+                    vip,
+                    int(CG.VIP_SCORE_LIVEVIP_SCORE),
+                    int(C.SCORE_REASON.VIP_SURVIVE_SCORE_REASON),
+                )
+            if not award_escort:
+                continue
+
+            vip_position = getattr(vip, "position", None)
+            if vip_position is None:
+                continue
+            radius_sq = float(CG.VIP_ESCORT_RADIUS) ** 2
+            for player in players:
+                if (
+                    player is vip
+                    or int(getattr(player, "team", -1)) != team
+                    or not bool(getattr(player, "alive", False))
+                    or not bool(getattr(player, "spawned", False))
+                    or getattr(player, "connection", None) is None
+                ):
+                    continue
+                position = getattr(player, "position", None)
+                if position is None:
+                    continue
+                try:
+                    distance_sq = sum(
+                        (float(position[index]) - float(vip_position[index])) ** 2
+                        for index in range(3)
+                    )
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if distance_sq <= radius_sq:
+                    self._award_player_score(
+                        player,
+                        int(CG.VIP_SCORE_ESCORT_SCORE),
+                        int(C.SCORE_REASON.VIP_ESCORT_SCORE_REASON),
+                    )
+
+    def _award_player_score(self, player: Player, amount: int, reason: int) -> None:
+        """Commit one mode score and publish its native HUD reason."""
+
+        if amount == 0:
+            return
+        from server.scoreboard import send_player_score
+
+        player.score = int(getattr(player, "score", 0)) + int(amount)
+        send_player_score(self.server, player, reason=int(reason))
 
     async def _check_team_elimination(self) -> None:
         if self.phase is not VIPPhase.ACTIVE:

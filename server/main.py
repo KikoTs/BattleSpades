@@ -7,6 +7,7 @@ Uses ENet for networking with asyncio integration.
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 import logging
 import sys
 import time
@@ -28,6 +29,7 @@ from shared.packet import (
 
 from .config import ServerConfig
 from .combat_runtime import CombatSystem, get_combat_system
+from .corpse_lifecycle import CorpseLifecycle
 from .deployable_actions import DeployableActionService
 from .oriented_actions import OrientedActionService
 from .construction import ConstructionSafetyService
@@ -44,6 +46,7 @@ from .team import Team
 from .world_manager import WorldManager
 from .connection import Connection
 from .a2s_query import A2SHandler
+from .steam_master import SteamMasterService
 from .revival_master import RevivalMasterService
 from .debug_parity import DebugParityManager
 from .replication import ReplicationService
@@ -67,6 +70,26 @@ logger = logging.getLogger(__name__)
 # server.loop_count nor the sparse client loop label was a stable clock. This
 # is not a transport ACK. The effect itself is recomputed at that state.
 _SNOWBALL_PREDICTION_OBSERVED_FRAMES = 3
+
+
+@dataclass
+class _MapCellReplayLease:
+    """Stable exact-cell batch retained across a failed reliable send."""
+
+    target_sequence: int
+    cells: tuple[tuple[int, int, int], ...]
+    next_index: int = 0
+
+
+@dataclass
+class _MapAirReplayLease:
+    """Compact pre-snapshot air catch-up retained across input frames."""
+
+    columns: tuple[tuple[int, int, int], ...]
+    column_index: int = 0
+    current_x: int = 0
+    current_y: int = 0
+    remaining_mask: int = 0
 
 
 class BattleSpadesServer:
@@ -107,6 +130,14 @@ class BattleSpadesServer:
         # needs catch-up.
         self._map_mutation_sequence = 0
         self._map_mutation_journal = deque()
+        # Exact canonical cells changed after a joining peer's immutable map
+        # snapshot. Native damage/collapse packets are excellent live effects,
+        # but replaying their semantics later is not deterministic after more
+        # terrain edits. This journal has a monotonic per-cell sequence and is
+        # replayed from current VXL state at first ClientData.
+        self._map_cell_journal = deque()
+        self._map_cell_sequence = 0
+        self._map_mutation_listener_token = None
         self._next_player_id = 0
         # Ids promised to joining clients via StateData.player_id before
         # their Player object exists (see Connection.send_connection_data).
@@ -130,7 +161,12 @@ class BattleSpadesServer:
         # before any action service can resolve a model; never consult a
         # developer-specific client installation as a hidden fallback.
         from server.prefabs import configure_prefab_search_dirs
-        configure_prefab_search_dirs(config.prefabs_path)
+        # Dedicated variants may add a read-only retail KV6 catalog while the
+        # normal release keeps its single portable prefab directory.
+        prefab_search_dirs = getattr(
+            config, "prefab_search_dirs", (config.prefabs_path,)
+        )
+        configure_prefab_search_dirs(*prefab_search_dirs)
         # Persistent ban list (bans.json), enforced on connect.
         from server.bans import BanManager
         self.ban_manager = BanManager(config.bans_path)
@@ -179,12 +215,14 @@ class BattleSpadesServer:
         
         # World
         self.world_manager = WorldManager(config)
+        self._bind_world_mutation_journal()
         # /fog is a per-map live override. A full map/mode rollover clears it
         # so the replacement scene receives its authored atmosphere again.
         self.fog_color_override = None
         from server.map_resources import MapResourceService
         self.map_resources = MapResourceService(self)
         self.terrain_repair = TerrainRepairService(self)
+        self.corpse_lifecycle = CorpseLifecycle(self)
         self.combat = CombatSystem(self)
         self.construction = ConstructionSafetyService(self)
         self.prefab_actions = PrefabActionService(self)
@@ -194,6 +232,9 @@ class BattleSpadesServer:
         
         # A2S Query handler for Steam browser and LAN discovery
         self.a2s_handler = A2SHandler(self)
+        # Optional legacy master registration owns its 32-bit DLL helper and
+        # callback cadence outside SimulationRuntime.
+        self.steam_master = SteamMasterService(self)
         self.revival_master = RevivalMasterService(self)
         
         # Game mode
@@ -296,7 +337,10 @@ class BattleSpadesServer:
             return False
 
         entity_color = None
-        if tool == int(getattr(C, "SNOWBLOWER_TOOL", 29)):
+        if tool in {
+            int(getattr(C, "SNOWBLOWER_TOOL", 29)),
+            int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
+        }:
             # The retail weapon is named Block Cannon in the final strings.
             # It consumes one ordinary block per shot, and the projectile must
             # retain the selected palette colour even if the player changes it
@@ -616,7 +660,9 @@ class BattleSpadesServer:
                      blast_radius: float = 16.0, knockback_min: float = 0.0,
                      knockback_max: float = 0.0,
                      self_knockback_min=None, self_knockback_max=None,
-                     prediction_frame_delay: int | None = None) -> None:
+                     prediction_frame_delay: int | None = None,
+                     native_damage_type: int | None = None,
+                     causer_entity_id: int | None = None) -> None:
         """Shared explosion: crater a cube of `crater_radius` and damage nearby
         players with the live-verified falloff. Used by projectiles AND
         deployables (dynamite/landmine/C4)."""
@@ -632,19 +678,39 @@ class BattleSpadesServer:
             )
         bx, by, bz = int(gx), int(gy), int(gz)
         r = max(1, int(crater_radius))
-        positions = [
-            (ax, ay, az)
-            for ax in range(bx - r, bx + r + 1)
-            for ay in range(by - r, by + r + 1)
-            for az in range(bz - r, bz + r + 1)
-        ]
+        if native_damage_type is not None and causer_entity_id is not None:
+            from server.projectiles import radius_damage_cells
+
+            positions = list(radius_damage_cells((bx, by, bz), r))
+        else:
+            positions = [
+                (ax, ay, az)
+                for ax in range(bx - r, bx + r + 1)
+                for ay in range(by - r, by + r + 1)
+                for az in range(bz - r, bz + r + 1)
+            ]
         if getattr(self.config, "build_damage", True) and block_damage > 0.0:
             if block_damage >= DEFAULT_BLOCK_HEALTH or force_destroy:
                 destroyed = self.world_manager.destroy_blocks(positions)
                 if destroyed:
-                    get_combat_system(self)._broadcast_block_destroy(
-                        thrower if thrower is not None else None, destroyed
-                    )
+                    combat = get_combat_system(self)
+                    if (
+                        native_damage_type is not None
+                        and causer_entity_id is not None
+                    ):
+                        combat.broadcast_native_radius_destroy(
+                            thrower if thrower is not None else None,
+                            (float(gx), float(gy), float(gz)),
+                            destroyed,
+                            damage=float(block_damage),
+                            damage_type=int(native_damage_type),
+                            causer_entity_id=int(causer_entity_id),
+                        )
+                    else:
+                        combat._broadcast_block_destroy(
+                            thrower if thrower is not None else None,
+                            destroyed,
+                        )
             else:
                 combat = get_combat_system(self)
                 for block in positions:
@@ -822,7 +888,7 @@ class BattleSpadesServer:
         color.value = int(player.block_color) & 0xFFFFFF
         self.broadcast(bytes(color.generate()))
 
-    def reveal_world_to(self, connection) -> None:
+    def reveal_world_to(self, connection) -> bool:
         """Send a now-in-game client the map entities (crates). Called from the
         connection's FIRST ClientData, never during the join handshake — a
         flood of entity creates while the client is still building the world /
@@ -836,6 +902,15 @@ class BattleSpadesServer:
         The caller sets connection.in_game only after this complete reveal, so
         ongoing gameplay broadcasts cannot interleave with catch-up.
         """
+        # MapSync is still the efficient bulk path, but the retail VXL worker
+        # has a native collision/mesh cache that can retain stale solids after
+        # a heavily drilled column merge. Clear every pre-snapshot destroyed
+        # cell through the proven exact packet path before gameplay broadcasts
+        # are admitted. Large histories drain over consecutive ClientData
+        # frames so one reconnect cannot monopolize the authoritative tick.
+        if not self.replay_map_air_overrides(connection):
+            return False
+
         from server.roster import catch_up_roster
         catch_up_roster(self, connection)
 
@@ -907,6 +982,11 @@ class BattleSpadesServer:
                     pkt = CreateEntity()
                     pkt.set_entity(ent.to_wire_entity())
                     connection.send(bytes(pkt.generate()), reliable=True)
+                    known = getattr(connection, "known_entity_ids", None)
+                    if known is None:
+                        known = set()
+                        connection.known_entity_ids = known
+                    known.add(int(ent.entity_id))
                 except Exception:
                     logger.debug("reveal entity send failed", exc_info=True)
 
@@ -924,6 +1004,17 @@ class BattleSpadesServer:
         player = getattr(connection, "player", None)
         if player is not None and self._radar_station_counts.get(player.team, 0) > 0:
             self._send_radar_visibility(player, True)
+
+        # Gameplay broadcasts are gated until this first ClientData, so a
+        # player who loaded during the final map ballot missed its original
+        # GenericVoteMessage. Replay only after the GameScene, terrain, roster,
+        # and entities are complete; packet 47 is unsafe in LoadingMenu.
+        vote_manager = getattr(self, "vote_manager", None)
+        reveal_vote = getattr(vote_manager, "reveal_to", None)
+        if callable(reveal_vote):
+            reveal_vote(connection)
+
+        return True
 
     def _send_radar_visibility(self, player, visible: bool) -> None:
         """Expose the enemy team on one teammate's minimap."""
@@ -961,7 +1052,41 @@ class BattleSpadesServer:
         from shared.packet import CreateEntity
         pkt = CreateEntity()
         pkt.set_entity(map_entity.to_wire_entity())
-        self.broadcast(bytes(pkt.generate()), reliable=True)
+        data = bytes(pkt.generate())
+        entity_id = int(map_entity.entity_id)
+        for connection in tuple(self.connections.values()):
+            if not bool(getattr(connection, "in_game", False)):
+                continue
+            connection.send(data, reliable=True)
+            known = getattr(connection, "known_entity_ids", None)
+            if known is None:
+                known = set()
+                connection.known_entity_ids = known
+            known.add(entity_id)
+
+    def broadcast_known_entity_packet(
+        self,
+        data: bytes,
+        entity_id: int,
+        *,
+        reliable: bool = True,
+    ) -> None:
+        """Send an entity-referencing packet only to peers that saw CreateEntity.
+
+        The native Damage handler dereferences ``causer_id`` without a safe
+        missing-entity fallback. A peer crossing MapSync may be in-game without
+        having observed a short-lived charge, so ordinary global broadcast is
+        not safe for this packet family.
+        """
+
+        entity_id = int(entity_id)
+        for connection in tuple(self.connections.values()):
+            if not bool(getattr(connection, "in_game", False)):
+                continue
+            known = getattr(connection, "known_entity_ids", ())
+            if entity_id not in known:
+                continue
+            connection.send(data, reliable=reliable)
 
     def broadcast_change_entity_position(self, map_entity) -> None:
         """Move an existing static entity without duplicate create/destroy.
@@ -1014,10 +1139,35 @@ class BattleSpadesServer:
         self.broadcast(bytes(ammo.generate()), reliable=True)
 
     def broadcast_destroy_entity(self, entity_id: int) -> None:
+        """Destroy an entity only in GameScenes that received its creation.
+
+        Gameplay gating alone is insufficient at the join boundary: moving
+        projectiles are intentionally absent from the static entity snapshot.
+        If one was created during MapSync and expired immediately after the
+        peer entered GameScene, a global DestroyEntity referred to an ID that
+        client had never allocated. Per-connection create knowledge preserves
+        the native create/destroy symmetry without replaying stale projectiles.
+        """
         from shared.packet import DestroyEntity
+
+        entity_id = int(entity_id)
         pkt = DestroyEntity()
-        pkt.entity_id = int(entity_id)
-        self.broadcast(bytes(pkt.generate()), reliable=True)
+        pkt.entity_id = entity_id
+        data = bytes(pkt.generate())
+        for connection in tuple(self.connections.values()):
+            if not bool(getattr(connection, "in_game", False)):
+                continue
+            known = getattr(connection, "known_entity_ids", None)
+            # Every real Connection owns this set.  A missing attribute means
+            # a legacy embedding/test connection that predates per-scene
+            # knowledge, so preserve the historical broadcast contract for
+            # that compatibility facade.  An explicit set remains strict and
+            # protects retail GameScene from destroy-without-create crashes.
+            if known is not None and entity_id not in known:
+                continue
+            connection.send(data, reliable=True)
+            if known is not None:
+                known.discard(entity_id)
 
     def broadcast_state_data(self) -> None:
         """Re-send StateData(45) to every in-game client.
@@ -1043,7 +1193,7 @@ class BattleSpadesServer:
             except Exception:
                 logger.debug("broadcast_state_data: send failed", exc_info=True)
 
-    def broadcast_set_score(self, team) -> None:
+    def broadcast_set_score(self, team, *, reason: int | None = None) -> None:
         """Update one team's HUD score on every in-game client via the
         lightweight SetScore(85) packet — the correct mid-game score update.
         Unlike StateData it carries no scene/prefab/UGC data, so the client
@@ -1054,7 +1204,11 @@ class BattleSpadesServer:
 
         pkt = SetScore()
         pkt.type = int(SCORE.TEAM)
-        pkt.reason = int(SCORE_REASON.KILL_SCORE_REASON)
+        pkt.reason = (
+            int(SCORE_REASON.KILL_SCORE_REASON)
+            if reason is None
+            else int(reason)
+        )
         pkt.specifier = internal_team_to_wire(team.id)
         pkt.value = int(team.score)
         self.broadcast(bytes(pkt.generate()))
@@ -1104,7 +1258,9 @@ class BattleSpadesServer:
             self.mode = mode_class(self)
             await self.mode.on_mode_start()
 
-        # Advertise only after product, map, and mode identity are established.
+        # Product/map/mode identity must be established before anonymous Steam
+        # logon. Missing optional runtime files do not prevent local hosting.
+        await self.steam_master.start()
         await self.revival_master.start()
 
         # Auto-discover + load plugins from the plugins/ package.
@@ -1147,9 +1303,13 @@ class BattleSpadesServer:
     async def stop(self):
         """Stop the server."""
         if not self.running:
-            # Registry startup precedes optional plugins and bots, so a later
-            # startup failure must still stop its heartbeat worker.
+            # Steam registration starts before optional plugins and bots so
+            # its public identity is complete before logon.  If either later
+            # startup stage raises, ``stop`` must still reap the helper and
+            # stop heartbeats even though the gameplay loops never ran.
+            await self.steam_master.close()
             await self.revival_master.close()
+            self.prefab_actions.close()
             return
         
         logger.info("Stopping server...")
@@ -1159,6 +1319,7 @@ class BattleSpadesServer:
             await self.bots.close()
             self.bots = None
 
+        await self.steam_master.close()
         await self.revival_master.close()
         
         if self.mode:
@@ -1166,6 +1327,8 @@ class BattleSpadesServer:
 
         if self.debug_parity is not None:
             self.debug_parity.close()
+
+        self.prefab_actions.close()
         
         # Disconnect all players
         for peer in list(self.connections.keys()):
@@ -1515,14 +1678,162 @@ class BattleSpadesServer:
         watermark = self._map_mutation_sequence
         connection.map_mutation_watermark = watermark
         connection.map_mutation_overflow = False
+        if (
+            hasattr(connection, "map_cell_watermark")
+            and self._map_mutation_listener_token is not None
+        ):
+            connection.map_cell_watermark = self._map_cell_sequence
+            connection.map_cell_overflow = False
+        if hasattr(connection, "map_air_replay"):
+            snapshot_air = getattr(
+                self.world_manager, "snapshot_air_overrides", None
+            )
+            columns = tuple(snapshot_air()) if callable(snapshot_air) else ()
+            connection.map_air_replay = _MapAirReplayLease(columns=columns)
         self._prune_map_mutations()
         return watermark
+
+    def replay_map_air_overrides(self, connection) -> bool:
+        """Repair destroyed cells represented by this peer's MapSync.
+
+        Runs on the gameplay thread only after the first ClientData proves the
+        native GameScene exists. The snapshot is a compact set of per-column
+        Z masks taken at the same boundary as the map mutation watermark.
+        Cells changed later are read from canonical VXL at send time and are
+        then reasserted by :meth:`replay_map_mutations`, preserving ordering.
+
+        Returns ``True`` when the frozen snapshot is exhausted. ``False``
+        keeps the connection gameplay-gated until its next input frame.
+        """
+
+        lease = getattr(connection, "map_air_replay", None)
+        if lease is None:
+            return True
+
+        player = getattr(connection, "player", None)
+        if player is None:
+            raise RuntimeError(
+                "pre-snapshot terrain repair requires an admitted player id"
+            )
+        actor_id = int(player.id)
+        budget = max(
+            1,
+            int(getattr(self.config, "map_air_catchup_batch_limit", 256)),
+        )
+        sent = 0
+
+        while sent < budget:
+            if not lease.remaining_mask:
+                if lease.column_index >= len(lease.columns):
+                    connection.map_air_replay = None
+                    return True
+                x, y, mask = lease.columns[lease.column_index]
+                lease.column_index += 1
+                lease.current_x = int(x)
+                lease.current_y = int(y)
+                lease.remaining_mask = int(mask)
+                if not lease.remaining_mask:
+                    continue
+
+            lowest_bit = lease.remaining_mask & -lease.remaining_mask
+            z = lowest_bit.bit_length() - 1
+            cell = (lease.current_x, lease.current_y, z)
+            data = self.terrain_repair.canonical_packet(cell, actor_id)
+            # Advance only after ENet accepts the reliable packet. A failed
+            # reveal retries the unsent bit on the next ClientData.
+            connection.send(data, reliable=True)
+            lease.remaining_mask ^= lowest_bit
+            sent += 1
+
+        if (
+            not lease.remaining_mask
+            and lease.column_index >= len(lease.columns)
+        ):
+            connection.map_air_replay = None
+            return True
+        return False
+
+    def _bind_world_mutation_journal(self) -> None:
+        """Subscribe catch-up journaling to the active canonical VXL.
+
+        The callback runs synchronously after a successful world mutation on
+        the gameplay thread. Match transitions replace ``world_manager`` and
+        call this method again after installing the prepared map.
+        """
+
+        old_world = getattr(self, "_map_mutation_listener_world", None)
+        old_token = getattr(self, "_map_mutation_listener_token", None)
+        if old_world is not None and old_token is not None:
+            unsubscribe = getattr(old_world, "unsubscribe_mutations", None)
+            if callable(unsubscribe):
+                unsubscribe(old_token)
+
+        world = self.world_manager
+        subscribe = getattr(world, "subscribe_mutations", None)
+        self._map_mutation_listener_world = world
+        self._map_mutation_listener_token = (
+            subscribe(self._record_canonical_map_mutation)
+            if callable(subscribe) else None
+        )
+
+    def _record_canonical_map_mutation(
+        self,
+        x: int,
+        y: int,
+        z: int,
+        _solid: bool,
+        _color: int,
+        _topology_version: int,
+    ) -> None:
+        """Retain one committed cell only while a MapSync join needs it."""
+
+        # This cursor is deliberately per cell, not WorldManager's per-batch
+        # topology version. A collapse publishes many cells under one topology
+        # version; a per-cell cursor lets retry resume after the exact packet
+        # ENet accepted without replaying the successful prefix.
+        self._map_cell_sequence += 1
+        sequence = self._map_cell_sequence
+        pending = any(
+            not getattr(connection, "in_game", False)
+            and getattr(connection, "map_cell_watermark", None) is not None
+            for connection in self.connections.values()
+        )
+        if not pending:
+            return
+        self._map_cell_journal.append(
+            (sequence, (int(x), int(y), int(z)))
+        )
+        self._enforce_map_cell_journal_limit()
+
+    def _enforce_map_cell_journal_limit(self) -> None:
+        """Bound exact-cell catch-up and reject joins missing any sequence."""
+
+        limit = max(
+            64,
+            int(getattr(self.config, "max_map_mutation_journal", 8192)),
+        )
+        while len(self._map_cell_journal) > limit:
+            dropped_sequence, _cell = self._map_cell_journal.popleft()
+            for connection in self.connections.values():
+                watermark = getattr(
+                    connection, "map_cell_watermark", None
+                )
+                if (
+                    getattr(connection, "in_game", False)
+                    or watermark is None
+                    or int(watermark) >= int(dropped_sequence)
+                ):
+                    continue
+                if not getattr(connection, "map_cell_overflow", False):
+                    connection.map_cell_overflow = True
+                    self.metrics.map_mutation_overflows += 1
 
     def _record_map_mutation(self, data: bytes) -> None:
         self._map_mutation_sequence += 1
         pending = any(
             not getattr(connection, "in_game", False)
             and getattr(connection, "map_mutation_watermark", None) is not None
+            and getattr(connection, "map_cell_watermark", None) is None
             for connection in self.connections.values()
         )
         if pending:
@@ -1541,19 +1852,35 @@ class BattleSpadesServer:
             dropped_sequence, _data = self._map_mutation_journal.popleft()
             for connection in self.connections.values():
                 watermark = getattr(connection, "map_mutation_watermark", None)
-                if getattr(connection, "in_game", False) or watermark is None:
+                if (
+                    getattr(connection, "in_game", False)
+                    or watermark is None
+                    or getattr(connection, "map_cell_watermark", None)
+                    is not None
+                ):
                     continue
                 if int(watermark) < int(dropped_sequence):
                     connection.map_mutation_overflow = True
                     self.metrics.map_mutation_overflows += 1
 
     def replay_map_mutations(self, connection) -> None:
-        """Replay every terrain packet newer than this joiner's snapshot.
+        """Replay canonical terrain newer than this joiner's map snapshot.
 
-        Native BlockBuild/BlockLine/Damage packets are replayed rather than a
-        synthetic cell diff so client collapse, colours, and effects follow
-        the same code paths as clients that were already in game.
+        Real connections use exact committed cells. The native packet journal
+        below remains only as a compatibility fallback for focused embedders
+        without a WorldManager topology stream.
         """
+        cell_watermark = getattr(
+            connection, "map_cell_watermark", None
+        )
+        if cell_watermark is not None:
+            self._replay_canonical_map_mutations(
+                connection, int(cell_watermark)
+            )
+            return
+
+        # Compatibility fallback for focused embedders that do not expose the
+        # canonical WorldManager mutation stream.
         watermark = getattr(connection, "map_mutation_watermark", None)
         if watermark is None:
             return
@@ -1579,6 +1906,76 @@ class BattleSpadesServer:
         connection.map_mutation_watermark = self._map_mutation_sequence
         self._prune_map_mutations()
 
+    def _replay_canonical_map_mutations(
+        self, connection, watermark: int
+    ) -> None:
+        """Coalesce and replay final VXL state newer than ``watermark``.
+
+        A coordinate can be built, painted, destroyed, and rebuilt while a
+        client loads. Keeping only its last occurrence avoids duplicate native
+        effects. Coordinates retain their first mutation order so a multi-cell
+        build remains base-before-extension, while each packet reads the final
+        VXL state. Collapsed structures are exact removals because WorldManager
+        publishes every removed cell.
+        """
+
+        while True:
+            if getattr(connection, "map_cell_overflow", False):
+                self._fail_map_catchup(connection)
+                return
+
+            lease = getattr(connection, "map_cell_replay", None)
+            if lease is None:
+                target_sequence = self._map_cell_sequence
+                journal = tuple(self._map_cell_journal)
+                if journal and journal[0][0] > int(watermark) + 1:
+                    connection.map_cell_overflow = True
+                    self.metrics.map_mutation_overflows += 1
+                    self._fail_map_catchup(connection)
+                    return
+
+                first_occurrence: dict[tuple[int, int, int], int] = {}
+                for index, (sequence, cell) in enumerate(journal):
+                    if int(watermark) < int(sequence) <= target_sequence:
+                        # Keep the first-occurrence order so a supported build
+                        # chain remains base-before-extension. The packet is
+                        # generated later from the coordinate's final state.
+                        first_occurrence.setdefault(cell, index)
+                cells = tuple(
+                    cell
+                    for cell, _index in sorted(
+                        first_occurrence.items(), key=lambda item: item[1]
+                    )
+                )
+                lease = _MapCellReplayLease(
+                    target_sequence=target_sequence,
+                    cells=cells,
+                )
+                connection.map_cell_replay = lease
+
+            cells = lease.cells
+            player = getattr(connection, "player", None)
+            if cells and player is None:
+                raise RuntimeError(
+                    "canonical terrain catch-up requires an admitted player id"
+                )
+            actor_id = int(player.id) if player is not None else 0
+            while lease.next_index < len(cells):
+                cell = cells[lease.next_index]
+                data = self.terrain_repair.canonical_packet(cell, actor_id)
+                connection.send(data, reliable=True)
+                # Only advance after ENet accepted this reliable packet. A
+                # failed reveal retries from the first unsent exact cell.
+                lease.next_index += 1
+
+            watermark = int(lease.target_sequence)
+            connection.map_cell_watermark = watermark
+            connection.map_mutation_watermark = self._map_mutation_sequence
+            connection.map_cell_replay = None
+            self._prune_map_mutations()
+            if self._map_cell_sequence <= watermark:
+                return
+
     def _fail_map_catchup(self, connection) -> None:
         """Reject a join whose terrain catch-up is no longer contiguous."""
         logger.warning(
@@ -1602,11 +1999,27 @@ class BattleSpadesServer:
         ]
         if not pending_watermarks:
             self._map_mutation_journal.clear()
+        else:
+            oldest = min(pending_watermarks)
+            while (self._map_mutation_journal
+                   and self._map_mutation_journal[0][0] <= oldest):
+                self._map_mutation_journal.popleft()
+
+        cell_watermarks = [
+            int(connection.map_cell_watermark)
+            for connection in self.connections.values()
+            if not getattr(connection, "in_game", False)
+            and getattr(connection, "map_cell_watermark", None) is not None
+        ]
+        if not cell_watermarks:
+            self._map_cell_journal.clear()
             return
-        oldest = min(pending_watermarks)
-        while (self._map_mutation_journal
-               and self._map_mutation_journal[0][0] <= oldest):
-            self._map_mutation_journal.popleft()
+        oldest_cell = min(cell_watermarks)
+        while (
+            self._map_cell_journal
+            and self._map_cell_journal[0][0] <= oldest_cell
+        ):
+            self._map_cell_journal.popleft()
     
     def broadcast_team(self, team_id: int, data: bytes):
         """Send packet to all players on a team."""

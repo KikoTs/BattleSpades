@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import shared.constants as C
+from shared.bytes import ByteReader
+from shared.packet import PlaySound
 
 from server import prefabs
 from server.bot_ai.gateway import BotActionGateway
@@ -160,7 +162,17 @@ def test_prefab_service_uses_colored_observer_and_plain_owner_paths(monkeypatch)
     assert accepted is True
     assert player.blocks == 9
     assert world.get_solid(10, 10, 10)
-    assert [payload[0] for payload, _kwargs in server.broadcasts] == [33]
+    assert [
+        payload[0] for payload, _kwargs in server.broadcasts
+        if payload[0] == 33
+    ] == [33]
+    placement_sounds = [
+        PlaySound(ByteReader(payload[1:]))
+        for payload, _kwargs in server.broadcasts
+        if payload[0] == PlaySound.id
+    ]
+    assert len(placement_sounds) == 1
+    assert placement_sounds[0].sound_id == 32
     assert [payload[0] for payload in sent] == [32, 29]
 
 
@@ -434,5 +446,12 @@ def test_production_prefab_queue_drains_in_bounded_cell_batches(monkeypatch):
     assert service.pending_count == 1
     assert service.tick() == 1
     assert service.pending_count == 0
-    assert [payload[0] for payload, _kwargs in server.broadcasts] == [33, 33]
+    assert [
+        payload[0] for payload, _kwargs in server.broadcasts
+        if payload[0] == 33
+    ] == [33, 33]
+    assert sum(
+        payload[0] == PlaySound.id
+        for payload, _kwargs in server.broadcasts
+    ) == 1
     assert [payload[0] for payload in sent] == [32, 32, 29]

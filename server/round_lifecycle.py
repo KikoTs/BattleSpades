@@ -16,6 +16,20 @@ if TYPE_CHECKING:
     from .main import BattleSpadesServer
 
 
+def resolve_player_spawn(server, player) -> tuple[float, float, float]:
+    """Resolve and validate the final coordinates for one new player life."""
+    spawn_resolver = getattr(server.mode, "get_spawn_point", None)
+    candidate = (
+        spawn_resolver(player)
+        if callable(spawn_resolver)
+        else server.world_manager.get_spawn_point(player.team)
+    )
+    sanitizer = getattr(server.world_manager, "sanitize_spawn_point", None)
+    if callable(sanitizer):
+        candidate = sanitizer(candidate, player.team)
+    return tuple(float(value) for value in candidate)
+
+
 class RoundLifecycle:
     """Own respawn scheduling and transient same-map round cleanup."""
 
@@ -30,6 +44,11 @@ class RoundLifecycle:
         now = time.time()
         for player in list(server.players.values()):
             if player.alive or player.spawned or player.death_time <= 0.0:
+                continue
+            # Spectator is a native roster/camera team, not a playable life.
+            # A stale death timestamp must never manufacture a team-0 body.
+            teams = getattr(server, "teams", None)
+            if teams is not None and player.team not in teams:
                 continue
             can_respawn = getattr(server.mode, "can_player_respawn", None)
             if callable(can_respawn) and not can_respawn(player):
@@ -65,12 +84,20 @@ class RoundLifecycle:
                 player.loadout = list(pending_loadout)
                 player.pending_loadout = None
 
-        spawn_resolver = getattr(server.mode, "get_spawn_point", None)
-        spawn = (
-            spawn_resolver(player)
-            if callable(spawn_resolver)
-            else server.world_manager.get_spawn_point(player.team)
+        # This synchronous pre-spawn hook runs before both Player.spawn and
+        # CreatePlayer.  It is the safe boundary for a mode-specific initial
+        # weapon; on_player_spawn is intentionally later and cannot alter the
+        # native Character construction packet already sent to observers.
+        prepare_spawn = getattr(server.mode, "prepare_player_spawn", None)
+        if callable(prepare_spawn):
+            prepare_spawn(player)
+
+        spawn = resolve_player_spawn(server, player)
+        orientation_resolver = getattr(
+            server.mode, "get_spawn_orientation", None
         )
+        if callable(orientation_resolver):
+            player.set_orientation_vector(*orientation_resolver(player))
         player.spawn(spawn[0], spawn[1], spawn[2])
         player.death_time = 0.0
         server._broadcast_create_player(player, spawn)
@@ -110,11 +137,6 @@ class RoundLifecycle:
                 if server.entity_registry.remove(entity_id) is not None:
                     server.broadcast_destroy_entity(entity_id)
 
-        turret_controller = getattr(server, "rocket_turret_controller", None)
-        remove_turrets = getattr(turret_controller, "remove_by_owner", None)
-        if callable(remove_turrets):
-            remove_turrets(player_id)
-
         fire_controller = getattr(server, "fire_controller", None)
         forget_fire = getattr(fire_controller, "forget_player", None)
         if callable(forget_fire):
@@ -124,6 +146,11 @@ class RoundLifecycle:
         forget_combat = getattr(combat, "forget_player", None)
         if callable(forget_combat):
             forget_combat(player_id)
+
+        corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+        forget_corpse = getattr(corpse_lifecycle, "forget_player", None)
+        if callable(forget_corpse):
+            forget_corpse(player_id)
 
         vote_manager = getattr(server, "vote_manager", None)
         forget_vote = getattr(vote_manager, "forget_player", None)
@@ -135,6 +162,25 @@ class RoundLifecycle:
         if callable(forget_replication):
             forget_replication(player_id)
 
+        self.remove_owned_deployables(player)
+
+    def remove_owned_deployables(self, player) -> None:
+        """Retire entities whose allegiance is bound to the owner's team.
+
+        Called for disconnects and before a live team change. A deployable may
+        retain its placement team for targeting/minimap behavior, so carrying
+        it across the transition would make a turret shoot its owner and leave
+        radar visibility enabled for the old roster.
+        """
+
+        turret_controller = getattr(
+            self.server,
+            "rocket_turret_controller",
+            None,
+        )
+        remove_turrets = getattr(turret_controller, "remove_by_owner", None)
+        if callable(remove_turrets):
+            remove_turrets(int(player.id))
         self._remove_owned_entities(player)
 
     def _remove_owned_entities(self, player) -> None:
@@ -213,6 +259,10 @@ class RoundLifecycle:
         server.rocket_turrets.clear()
         server.projectile_engine.projectiles.clear()
         server.fire_controller.clear()
+        corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+        clear_corpses = getattr(corpse_lifecycle, "clear", None)
+        if callable(clear_corpses):
+            clear_corpses(notify=True)
 
         for player in server.players.values():
             # KillAction.kill_count is a current-life streak used by the

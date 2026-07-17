@@ -10,6 +10,18 @@ from shared.bytes import ByteReader  # noqa: E402
 from shared.packet import CreateEntity, DestroyEntity  # noqa: E402
 from server.entities.registry import EntityRegistry  # noqa: E402
 from server.game_constants import TEAM_NEUTRAL  # noqa: E402
+from server.config import ServerConfig  # noqa: E402
+from server.main import BattleSpadesServer  # noqa: E402
+
+
+class _Connection:
+    def __init__(self, *, in_game=True):
+        self.in_game = in_game
+        self.known_entity_ids = set()
+        self.sent = []
+
+    def send(self, data, **_kwargs):
+        self.sent.append(bytes(data))
 
 
 def test_late_battle_builder_entity_ids_match_retail_dispatch_table():
@@ -88,3 +100,43 @@ def test_static_entities_excludes_dead():
     b.alive = False
     statics = reg.static_entities()
     assert a in statics and b not in statics
+
+
+def test_projectile_destroy_skips_peer_that_missed_create_while_loading():
+    server = BattleSpadesServer(ServerConfig())
+    observer = _Connection(in_game=True)
+    loading = _Connection(in_game=False)
+    server.connections = {object(): observer, object(): loading}
+    projectile = server.entity_registry.place(
+        C.MOLOTOV_ENTITY,
+        10.0,
+        20.0,
+        30.0,
+        kind="projectile",
+    )
+
+    server.broadcast_create_entity(projectile)
+    loading.in_game = True
+    server.broadcast_destroy_entity(projectile.entity_id)
+
+    assert [packet[0] for packet in observer.sent] == [
+        CreateEntity.id,
+        DestroyEntity.id,
+    ]
+    assert loading.sent == []
+    assert projectile.entity_id not in observer.known_entity_ids
+
+
+def test_reused_entity_id_gets_a_fresh_create_destroy_lifetime():
+    server = BattleSpadesServer(ServerConfig())
+    observer = _Connection(in_game=True)
+    server.connections = {object(): observer}
+    entity = server.entity_registry.place(C.AMMO_CRATE, 1.0, 2.0, 3.0)
+
+    server.broadcast_create_entity(entity)
+    server.broadcast_destroy_entity(entity.entity_id)
+    server.broadcast_create_entity(entity)
+    server.broadcast_destroy_entity(entity.entity_id)
+
+    assert [packet[0] for packet in observer.sent] == [21, 19, 21, 19]
+    assert observer.known_entity_ids == set()

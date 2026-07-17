@@ -97,10 +97,19 @@ class DeployableActionService:
         logger.info("MEDPACK id=%d placed by %s at %s", entity.entity_id, player.name, pos)
         return True
 
-    def place_dynamite(self, player: "Player", position: Vector3) -> bool:
-        """Place one timed Miner charge through normal entity replication."""
+    def place_dynamite(
+        self,
+        player: "Player",
+        position: Vector3,
+        *,
+        face: int = 4,
+    ) -> bool:
+        """Attach one timed Miner charge to the client-selected voxel face."""
 
-        if not deployable_authorized(player, C.DYNAMITE_TOOL):
+        if (
+            not deployable_authorized(player, C.DYNAMITE_TOOL)
+            or not 0 <= int(face) <= 5
+        ):
             return False
         pos = self.validate_position(
             player,
@@ -125,6 +134,7 @@ class DeployableActionService:
             state=internal_team_to_wire(player.team),
             kind="deployable",
             player_id=player.id,
+            face=int(face),
             behavior=behavior,
         )
         self.server.broadcast_create_entity(entity)
@@ -255,15 +265,26 @@ class DeployableActionService:
         )
         if pos is None:
             return False
+        lifetime = float(
+            getattr(
+                self.server.config,
+                "radar_station_lifetime_seconds",
+                35.0,
+            )
+        )
         entity = self.server.entity_registry.place(
             int(getattr(C, "RADAR_STATION_ENTITY", 36)),
             *pos,
             state=internal_team_to_wire(player.team),
             kind="deployable",
             player_id=player.id,
+            # RadarStationEntity.set_fuse enables the retail countdown. A zero
+            # fuse leaves the model alive forever on the client even when the
+            # authoritative behavior later removes it.
+            fuse=lifetime,
             behavior=RadarStationBehavior(
                 player.team,
-                lifetime=float(getattr(C, "RADAR_STATION_LIFETIME", 250.0)),
+                lifetime=lifetime,
                 health=float(getattr(C, "RADAR_STATION_HEALTH", 45.0)),
             ),
         )
@@ -366,4 +387,3 @@ class DeployableActionService:
         player.disguised = True
         logger.info("DISGUISE %s activated (%d remaining)", player.name, player.disguise_stock)
         return True
-

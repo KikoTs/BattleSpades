@@ -49,7 +49,14 @@ class SyntheticConnection:
         self.bytes += len(wire)
 
 
-async def run_capacity(players: int, seconds: float, port: int) -> dict:
+async def run_capacity(
+    players: int,
+    seconds: float,
+    port: int,
+    *,
+    mode: str = "tdm",
+    map_name: str | None = None,
+) -> dict:
     import psutil
 
     config = load_config(ROOT / "config.toml")
@@ -63,7 +70,9 @@ async def run_capacity(players: int, seconds: float, port: int) -> dict:
     config.bots.fill_target = players
     config.bots.max_bots = players
     config.bots.reserve_human_slots = 0
-    config.default_mode = "tdm"
+    config.default_mode = str(mode).strip().lower()
+    if map_name:
+        config.default_map = str(map_name).strip()
     config.debug_parity = False
     config.debug_selfrow = False
     config.movement_debug_capture = False
@@ -117,6 +126,7 @@ async def run_capacity(players: int, seconds: float, port: int) -> dict:
         start_rss = process.memory_info().rss
         peak_rss = start_rss
         peak_pending_packets = len(server._pending_ingame_packets)
+        peak_active_block_fires = len(server.fire_controller.block_fires)
         deadline = start_wall + seconds
         while True:
             remaining = deadline - time.perf_counter()
@@ -126,6 +136,10 @@ async def run_capacity(players: int, seconds: float, port: int) -> dict:
             peak_rss = max(peak_rss, process.memory_info().rss)
             peak_pending_packets = max(
                 peak_pending_packets, len(server._pending_ingame_packets)
+            )
+            peak_active_block_fires = max(
+                peak_active_block_fires,
+                len(server.fire_controller.block_fires),
             )
             if worker_process is not None and worker_process.is_running():
                 worker_peak_rss = max(
@@ -147,6 +161,8 @@ async def run_capacity(players: int, seconds: float, port: int) -> dict:
             worker_end_rss = worker_process.memory_info().rss
 
         result = {
+            "mode": config.default_mode,
+            "map": config.default_map,
             "requested_players": players,
             "spawned_players": spawned,
             "seconds": round(elapsed, 3),
@@ -164,6 +180,16 @@ async def run_capacity(players: int, seconds: float, port: int) -> dict:
                 (end_rss - start_rss) / (1024 * 1024), 3
             ),
             "peak_pending_packets": peak_pending_packets,
+            "peak_active_block_fires": peak_active_block_fires,
+            "active_block_fires_end": len(server.fire_controller.block_fires),
+            "team_scores": {
+                str(team_id): int(team.score)
+                for team_id, team in server.teams.items()
+            },
+            "player_captures": sum(
+                int(getattr(player, "captures", 0))
+                for player in server.players.values()
+            ),
             "outbound_mib_per_second": round(
                 total_bytes / elapsed / (1024 * 1024), 3
             ),
@@ -218,8 +244,16 @@ def main(argv=None) -> int:
     parser.add_argument("--players", type=int, default=50)
     parser.add_argument("--seconds", type=float, default=15.0)
     parser.add_argument("--port", type=int, default=27016)
+    parser.add_argument("--mode", default="tdm")
+    parser.add_argument("--map", dest="map_name", default=None)
     args = parser.parse_args(argv)
-    result = asyncio.run(run_capacity(args.players, args.seconds, args.port))
+    result = asyncio.run(run_capacity(
+        args.players,
+        args.seconds,
+        args.port,
+        mode=args.mode,
+        map_name=args.map_name,
+    ))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["passed"] else 1
 

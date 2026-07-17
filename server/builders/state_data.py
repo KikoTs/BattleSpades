@@ -112,12 +112,11 @@ def build_state_data(server: 'BattleSpadesServer',
     pkt.team2_locked_class = mode.code == 'vip'
 
     # ---- Prefabs / entities --------------------------------------------
-    # StateData.prefabs is the MAP-SPECIFIC prefab set (client map_prefabs);
-    # the class-select screen appends each entry to EVERY class's prefab list
-    # as a MAP_PREFAB and looks its image up by name in the prefab palette.
-    # A bogus/hardcoded name (the old 'supertower') therefore injected a
-    # wrong/overflowing entry into every class. Ship none — each class's real
-    # prefabs come from the client's local CLASS_ITEMS/PREFAB_LISTS.
+    # StateData.prefabs is the map-specific client ``map_prefabs`` catalog.
+    # Competitive modes start empty; isolated UGC mode replaces this with its
+    # terrain-compatible list in configure_state_data().  Never invent a
+    # default name here because the stock menu expects every entry to have a
+    # model/image already loaded through InitialInfo.ugc_prefab_sets.
     pkt.prefabs = []
     # The join handshake NEVER carries entities. Cramming crates into the
     # join-time StateData makes the compiled client process them mid-

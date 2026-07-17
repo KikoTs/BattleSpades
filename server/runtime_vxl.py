@@ -210,11 +210,12 @@ class ServerVXL(VXL):
         self.retail_marker_families = ()
         # Battle Builder maps can embed blue/green chroma-key voxels as ordinary
         # VXL words. The compiled client deletes an eligible voxel only when it
-        # and both immediately higher cells form an exposed marker. Retaining
-        # those points server-side creates invisible one-block steps and
-        # deterministic reconciliation corrections. Snapshot every candidate
-        # before removal so a mutation cannot make the next point appear newly
-        # exposed during this pass.
+        # and both immediately higher cells form an exposed marker. Snapshot
+        # every candidate before removal so one deletion cannot make the next
+        # point appear newly exposed. MapResourceService later performs the
+        # paired native operation: a type-13 entity restores the resolved RGB
+        # voxel/light on the client, and authoritative collision restores the
+        # same voxel. A marker with no valid UGC palette remains air on both.
         if raw_data:
             markers = tuple(
                 (x, y, z + self.source_z_shift, _retail_marker_family(color))

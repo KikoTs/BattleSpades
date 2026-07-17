@@ -29,23 +29,23 @@ REASON_KILL = int(getattr(C.SCORE_REASON, "KILL_SCORE_REASON", 1))
 REASON_SUICIDE = int(getattr(C.SCORE_REASON, "SUICIDE_SCORE_REASON", 2))
 
 
-def send_player_score(server, player) -> None:
+def send_player_score(server, player, *, reason: int | None = None) -> None:
     """Push ONE player's personal score to every client (SetScore type=PLAYER).
     Without this the per-player scoreboard column stays 0 no matter how many
     kills they get."""
     pkt = SetScore()
     pkt.type = SCORE_PLAYER
-    pkt.reason = REASON_KILL
+    pkt.reason = REASON_KILL if reason is None else int(reason)
     pkt.specifier = int(player.id)
     pkt.value = int(getattr(player, "score", 0))
     server.broadcast(bytes(pkt.generate()))
 
 
-def send_team_score(server, team) -> None:
+def send_team_score(server, team, *, reason: int | None = None) -> None:
     """Push one team's score bar to every client (SetScore type=TEAM)."""
     pkt = SetScore()
     pkt.type = SCORE_TEAM
-    pkt.reason = REASON_KILL
+    pkt.reason = REASON_KILL if reason is None else int(reason)
     pkt.specifier = internal_team_to_wire(team.id)
     pkt.value = int(team.score)
     server.broadcast(bytes(pkt.generate()))
