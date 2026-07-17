@@ -8,6 +8,7 @@ import pytest
 from server.revival_master import (
     JoinTicketRejected,
     RevivalIdentity,
+    RevivalMasterError,
     RevivalMasterService,
     is_join_code,
 )
@@ -78,6 +79,29 @@ def test_heartbeat_identifier_matches_direct_connect_identifier(monkeypatch):
     assert payload["identifier"] == service.server_id
     assert payload["port"] == 27015
     assert "identity=ticket-v1" in payload["tags"]
+
+
+def test_heartbeat_advertises_tunnel_mapped_public_ports(monkeypatch):
+    monkeypatch.setenv("AOS_MASTER_WRITE_TOKEN", "x" * 48)
+    monkeypatch.setenv("AOS_PUBLIC_HOST", "147.185.221.26")
+    monkeypatch.setenv("AOS_PUBLIC_PORT", "56675")
+    monkeypatch.setenv("AOS_PUBLIC_QUERY_PORT", "56675")
+    monkeypatch.setenv("AOS_SERVER_ID", "147.185.221.26:56675")
+
+    service = RevivalMasterService(make_server())
+    payload = service.heartbeat_payload()
+
+    assert service.server_id == "147.185.221.26:56675"
+    assert payload["port"] == 56675
+    assert payload["queryPort"] == 56675
+    assert "public_port_mapped" in payload["tags"]
+    assert "listen_port=27015" in payload["tags"]
+
+
+def test_invalid_public_port_fails_closed(monkeypatch):
+    monkeypatch.setenv("AOS_PUBLIC_PORT", "not-a-port")
+    with pytest.raises(RevivalMasterError, match="AOS_PUBLIC_PORT"):
+        RevivalMasterService(make_server()).heartbeat_payload()
 
 
 def test_heartbeat_uses_live_map_mode_and_population(monkeypatch):

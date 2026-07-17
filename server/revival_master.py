@@ -133,11 +133,47 @@ class RevivalMasterService:
         )
         return str(configured).strip()
 
+    def _public_port(self, name: str, fallback: int) -> int:
+        configured = os.environ.get(name)
+        if configured is None or not configured.strip():
+            return fallback
+        try:
+            port = int(configured)
+        except ValueError as error:
+            raise RevivalMasterError(
+                f"{name} must be an integer UDP port"
+            ) from error
+        if not 1 <= port <= 65_535:
+            raise RevivalMasterError(f"{name} must be between 1 and 65535")
+        return port
+
+    @property
+    def public_port(self) -> int:
+        """Externally reachable game port, which may be tunnel-mapped."""
+
+        return self._public_port("AOS_PUBLIC_PORT", int(self.server.config.port))
+
+    @property
+    def public_query_port(self) -> int:
+        """Externally reachable A2S port, independent from the listen socket."""
+
+        configured = os.environ.get("AOS_PUBLIC_QUERY_PORT")
+        if configured is not None and configured.strip():
+            return self._public_port("AOS_PUBLIC_QUERY_PORT", self.public_port)
+        # A public game-port override normally represents a single-port ENet
+        # relay such as Playit, which forwards A2S on that same UDP endpoint.
+        if os.environ.get("AOS_PUBLIC_PORT", "").strip():
+            return self.public_port
+        steam = getattr(self.server.config, "steam", None)
+        if steam is not None and bool(getattr(steam, "enabled", False)):
+            return int(steam.effective_query_port(int(self.server.config.port)))
+        return self.public_port
+
     @property
     def server_id(self) -> str:
         derived = "%s:%d" % (
             self.public_host,
-            int(self.server.config.port),
+            self.public_port,
         )
         configured = os.environ.get("AOS_SERVER_ID") or getattr(
             self.config, "server_id", ""
@@ -149,7 +185,7 @@ class RevivalMasterService:
             )
         if identifier != derived:
             raise RevivalMasterError(
-                "revival server_id must equal public_host:server.port (%s)" % derived
+                "revival server_id must equal public_host:public_port (%s)" % derived
             )
         return identifier
 
@@ -244,13 +280,10 @@ class RevivalMasterService:
         return await asyncio.to_thread(self._request_json, path, payload)
 
     def heartbeat_payload(self) -> dict[str, Any]:
-        game_port = int(self.server.config.port)
+        listen_port = int(self.server.config.port)
+        game_port = self.public_port
         steam = getattr(self.server.config, "steam", None)
-        query_port = (
-            int(steam.effective_query_port(game_port))
-            if steam is not None and bool(getattr(steam, "enabled", False))
-            else game_port
-        )
+        query_port = self.public_query_port
         mode = get_mode_data(
             getattr(
                 self.server.config,
@@ -284,6 +317,8 @@ class RevivalMasterService:
             "identity=ticket-v1",
             "mode=%04d" % int(mode.mode_id),
         ]
+        if listen_port != game_port:
+            tags.extend(("public_port_mapped", "listen_port=%d" % listen_port))
         return {
             "identifier": self.server_id,
             "name": str(self.server.config.server_name),

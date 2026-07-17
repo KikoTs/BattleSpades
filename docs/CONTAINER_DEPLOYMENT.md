@@ -23,10 +23,11 @@ GitHub push
 ```
 
 An outbound UDP tunnel such as playit.gg can make a Railway container
-experimentally reachable, but it adds another network dependency and the
-tunnel's public address does not equal Railway's observed HTTP source address.
-That conflicts with the registry's anti-spoofing verification model. Do not use
-the tunnel path as the default production architecture.
+experimentally reachable, but it adds another network dependency. Managed
+tunnel deployments use a scoped or first-party master credential and explicit
+`AOS_PUBLIC_PORT` values so the browser advertises the relay endpoint rather
+than Railway's private listen socket. A directly addressed UDP game node is
+still the preferred production architecture.
 
 ## Container contract
 
@@ -51,7 +52,9 @@ Supported per-instance environment variables:
 | `BATTLESPADES_ADMIN_PASSWORD` | Required strong server-console password |
 | `AOS_MASTER_URL` | Revival API origin |
 | `AOS_PUBLIC_HOST` | Public IPv4 used in listing identity |
-| `AOS_SERVER_ID` | Must equal `AOS_PUBLIC_HOST:BATTLESPADES_PORT` |
+| `AOS_PUBLIC_PORT` | Public UDP game port; defaults to `BATTLESPADES_PORT` |
+| `AOS_PUBLIC_QUERY_PORT` | Public A2S UDP port; defaults to the public game port when mapped |
+| `AOS_SERVER_ID` | Must equal `AOS_PUBLIC_HOST:AOS_PUBLIC_PORT` |
 | `AOS_MASTER_WRITE_TOKEN` | One server-scoped `aos_srv_*` token |
 
 Despite its legacy environment name, `AOS_MASTER_WRITE_TOKEN` should contain a
@@ -61,6 +64,11 @@ master write credential onto a game node.
 The Windows x86 Steam browser helper is disabled in the Linux image. This does
 not reject original Steam customers: retail identity still travels through the
 normal Protocol 168/Revival validation path.
+
+For a Playit endpoint such as `147.185.221.26:56675` forwarding to the
+container's `27015/udp`, keep `BATTLESPADES_PORT=27015` and set both public port
+variables to `56675`. A2S continues to answer on the private listen socket, but
+heartbeats and join tickets use the reachable public identifier.
 
 ## Build locally
 
