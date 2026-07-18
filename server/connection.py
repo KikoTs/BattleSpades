@@ -202,6 +202,10 @@ class Connection:
 
         # Packet waiting
         self._waiters: Dict[int, asyncio.Future] = {}
+        # Armed only during a full map/mode replacement. The maintained retail
+        # hook sends ClientInMenu(110) after it has installed LoadingMenu;
+        # without this proof InitialInfo must never be sent into GameScene.
+        self._scene_transition_ready: asyncio.Event | None = None
     
     def send(self, data: bytes, reliable: bool = True, prefix: int = 0x30):
         """Send packet to this connection."""
@@ -452,6 +456,30 @@ class Connection:
         finally:
             if packet_id in self._waiters:
                 del self._waiters[packet_id]
+
+    def arm_scene_transition(self) -> None:
+        """Require a fresh loader acknowledgement for the next scene epoch."""
+
+        self.in_menu = False
+        self._scene_transition_ready = asyncio.Event()
+
+    def note_scene_transition_menu(self, in_menu: bool) -> None:
+        """Accept packet 110 as ready only while a transition is armed."""
+
+        if bool(in_menu) and self._scene_transition_ready is not None:
+            self._scene_transition_ready.set()
+
+    async def wait_for_scene_transition(self, timeout: float) -> bool:
+        """Return whether the client entered LoadingMenu before ``timeout``."""
+
+        ready = self._scene_transition_ready
+        if ready is None:
+            return False
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=max(0.0, float(timeout)))
+        except asyncio.TimeoutError:
+            return False
+        return True
     
     async def send_state_data(self, player_id: int = -1):
         """Send game state to newly joined player.
@@ -622,6 +650,7 @@ class Connection:
         elif packet_id == ClientInMenu.id:
             packet = ClientInMenu(reader)
             self.in_menu = bool(packet.in_menu)
+            self.note_scene_transition_menu(self.in_menu)
             logger.debug("Client pre-join menu state updated: in_menu=%s", self.in_menu)
         else:
             logger.debug(f"Unknown pre-join packet ID: {packet_id}")
@@ -668,15 +697,15 @@ class Connection:
         self.known_player_deaths.clear()
         self.known_corpse_cleanups.clear()
         self.known_entity_ids.clear()
+        self._scene_transition_ready = None
 
     async def reload_scene(self) -> bool:
         """Stream the active map/mode into the existing authenticated peer.
 
-        A transition reload is stricter than a first connection: the client
-        must answer the new ``InitialInfo`` with ``MapDataValidation``.  That
-        response proves it entered ``LoadingMenu`` instead of remaining in a
-        stale compiled ``GameScene``.  ``False`` lets the lifecycle retire
-        only that incompatible/timed-out peer without endangering the others.
+        The transition service has already received ClientInMenu from the
+        replacement loader before calling this method. The client must also
+        answer the new ``InitialInfo`` with ``MapDataValidation``; ``False``
+        lets the lifecycle retire only that timed-out peer.
         """
         self.reset_for_scene_reload()
         return await self.send_connection_data(require_map_validation=True)

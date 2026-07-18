@@ -302,10 +302,14 @@ class MatchTransitionService:
                 # replacement round.
                 self._reset_vote_state()
 
-                # MapEnded(52) freezes the compiled GameScene.  BattleSpades'
-                # lightweight client compatibility hook responds by opening
-                # LoadingMenu on the SAME GameClient; it is not a reconnect or
-                # an ENet disconnect packet (verified in gameScene.pyd).
+                # Arm readiness before MapEnded so a fast client cannot race
+                # its acknowledgement ahead of the server-side waiter.
+                for connection in connections:
+                    connection.arm_scene_transition()
+
+                # MapEnded(52) freezes the compiled GameScene. BattleSpades'
+                # maintained client opens LoadingMenu on the same GameClient
+                # and acknowledges that state with ClientInMenu(110).
                 server.broadcast(bytes(MapEnded().generate()))
                 host = getattr(server, "host", None)
                 if host is not None:
@@ -329,10 +333,10 @@ class MatchTransitionService:
                     if callable(deactivate):
                         await deactivate()
                 self._discard_old_timeline_work()
-                grace = min(
+                ready_timeout = min(
                     5.0,
                     max(
-                        0.0,
+                        0.25,
                         float(
                             getattr(
                                 server.config,
@@ -342,8 +346,32 @@ class MatchTransitionService:
                         ),
                     ),
                 )
-                if grace > 0.0:
-                    await asyncio.sleep(grace)
+                readiness = await asyncio.gather(
+                    *(
+                        connection.wait_for_scene_transition(ready_timeout)
+                        for connection in connections
+                    ),
+                    return_exceptions=True,
+                )
+                ready_connections = []
+                failed_connections = list(loading_connections)
+                for connection, outcome in zip(connections, readiness):
+                    if outcome is True:
+                        ready_connections.append(connection)
+                        continue
+                    failed_connections.append(connection)
+                    logger.warning(
+                        "client did not acknowledge transition loader at %s; "
+                        "withholding InitialInfo",
+                        getattr(
+                            getattr(connection, "peer", None),
+                            "address",
+                            "unknown",
+                        ),
+                    )
+                    connection.disconnect(
+                        reason=int(DISCONNECT.ERROR_MATCH_ENDED)
+                    )
 
                 server.reset_round_runtime()
                 repair = getattr(server, "terrain_repair", None)
@@ -371,17 +399,18 @@ class MatchTransitionService:
                 server.mode = mode_class(server)
                 await server.mode.on_mode_start()
 
-                # Each retained peer now receives the same loader ordering as
-                # an initial join.  Requiring MapDataValidation is important:
-                # it proves that peer actually entered LoadingMenu.  A clean
-                # stock client without the compatibility hook is retired
-                # individually instead of receiving VXL bytes in GameScene.
+                # Each acknowledged peer now receives the normal initial-join
+                # loader ordering. MapDataValidation is the second-phase proof
+                # that InitialInfo was parsed and the advertised VXL can be
+                # synchronized; unacknowledged clients never reach this line.
                 reloads = await asyncio.gather(
-                    *(connection.reload_scene() for connection in connections),
+                    *(
+                        connection.reload_scene()
+                        for connection in ready_connections
+                    ),
                     return_exceptions=True,
                 )
-                failed_connections = list(loading_connections)
-                for connection, outcome in zip(connections, reloads):
+                for connection, outcome in zip(ready_connections, reloads):
                     if outcome is True:
                         continue
                     failed_connections.append(connection)

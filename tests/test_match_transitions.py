@@ -16,7 +16,17 @@ class _Connection:
         self.player = None
         self.reload_calls = 0
         self.reload_result = True
+        self.transition_ready = True
+        self.transition_arms = 0
+        self.transition_waits: list[float] = []
         self.disconnect_reasons: list[int] = []
+
+    def arm_scene_transition(self) -> None:
+        self.transition_arms += 1
+
+    async def wait_for_scene_transition(self, timeout: float) -> bool:
+        self.transition_waits.append(timeout)
+        return self.transition_ready
 
     async def reload_scene(self) -> bool:
         self.reload_calls += 1
@@ -182,32 +192,41 @@ def test_map_change_prepares_world_before_gating_clients(monkeypatch) -> None:
     assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
 
 
-def test_scene_transition_holds_reload_until_after_mapended_grace(
+def test_scene_transition_requires_loader_ack_before_reload(
     monkeypatch,
 ) -> None:
     server = _Server()
     server.config.transition_grace_seconds = 0.75
     service = MatchTransitionService(server)
     candidate = SimpleNamespace(map_name="HallwayPin", config=None)
-    sleeps: list[float] = []
-
-    async def observed_sleep(seconds: float) -> None:
-        assert 52 in [
-            packet[0] for packet in server.broadcast_packets if packet
-        ]
-        assert all(connection.reload_calls == 0 for connection in server.connections.values())
-        sleeps.append(seconds)
-
     monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
     monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
-    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
 
     result = asyncio.run(service.change_map("HallwayPin"))
 
     assert result.ok is True
-    assert sleeps == [0.75]
+    assert all(connection.transition_arms == 1 for connection in server.connections.values())
+    assert all(connection.transition_waits == [0.75] for connection in server.connections.values())
     assert all(connection.reload_calls == 1 for connection in server.connections.values())
     assert all(connection.disconnect_reasons == [] for connection in server.connections.values())
+
+
+def test_unacknowledged_client_never_receives_scene_handshake(monkeypatch) -> None:
+    server = _Server()
+    connections = list(server.connections.values())
+    connections[0].transition_ready = False
+    service = MatchTransitionService(server)
+    candidate = SimpleNamespace(map_name="HallwayPin", config=None)
+    monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
+    monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+
+    result = asyncio.run(service.change_map("HallwayPin"))
+
+    assert result.ok is True
+    assert result.reconnect_required is True
+    assert connections[0].reload_calls == 0
+    assert connections[0].disconnect_reasons == [18]
+    assert connections[1].reload_calls == 1
 
 
 def test_voted_map_preflights_then_holds_scores_before_mapended(

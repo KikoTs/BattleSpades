@@ -61,6 +61,24 @@ def _retail_localised_text(
     return repr((identifier, arguments))
 
 
+def _retail_dynamic_text(value: object) -> str:
+    """Encode operator-authored text for the retail vote HUD.
+
+    ``GenericVotingHUD`` does not accept plain strings: it literal-evaluates
+    every title, description *and candidate name* as ``(identifier, args)``.
+    Unknown identifiers are returned verbatim by the retail string table, so
+    an ordinary map name can safely be used as the identifier.  Braces are
+    doubled because the HUD subsequently calls ``str.format`` on that value.
+    """
+
+    text = str(value)
+    if not text or "\x00" in text or "\r" in text or "\n" in text:
+        raise ValueError("invalid retail dynamic vote text")
+    if len(text) > 128:
+        raise ValueError("retail dynamic vote text is too long")
+    return repr((text.replace("{", "{{").replace("}", "}}"), ()))
+
+
 class VoteManager:
     """Own at most one bounded retail vote overlay at a time."""
 
@@ -317,7 +335,7 @@ class VoteManager:
         self._cast_index(voter, 0 if yes else 1)
 
     def cast_candidate(self, voter, candidate) -> None:
-        """Record the exact candidate returned by the retail vote packet."""
+        """Record an internal/raw candidate name (compatibility API)."""
 
         if not self.active:
             return
@@ -333,6 +351,28 @@ class VoteManager:
                 ),
                 -1,
             )
+        self._cast_index(voter, index)
+
+    def cast_wire_candidate(self, voter, candidate) -> None:
+        """Record a candidate exactly as advertised to the retail client.
+
+        The native client echoes the selected candidate record from packet 47.
+        Compare that opaque token against this ballot's own wire values rather
+        than evaluating client-controlled Python literals or accepting a raw
+        name that was never displayed.
+        """
+
+        if not self.active:
+            return
+        token = str(candidate)
+        index = next(
+            (
+                position
+                for position, name in enumerate(self.candidates)
+                if self._wire_candidate_name(position, name) == token
+            ),
+            -1,
+        )
         self._cast_index(voter, index)
 
     def _cast_index(self, voter, index: int) -> None:
@@ -470,6 +510,17 @@ class VoteManager:
     def _broadcast(self, message_type: int, target) -> None:
         self.server.broadcast(bytes(self._build_packet(message_type).generate()))
 
+    def _wire_candidate_name(self, index: int, name: str) -> str:
+        """Return one crash-safe label consumed and echoed by the vote HUD."""
+
+        if self.kind == "kick":
+            # Stock strings avoid exposing the target name twice and preserve
+            # the retail Yes/No wording for every installed language.
+            return _retail_localised_text(
+                "KICK_YES" if int(index) == 0 else "KICK_NO"
+            )
+        return _retail_dynamic_text(name)
+
     def _build_packet(self, message_type: int) -> GenericVoteMessage:
         """Build one literal-safe retail vote packet for broadcast or replay."""
 
@@ -480,7 +531,10 @@ class VoteManager:
         packet.message_type = int(message_type)
         counts = self._candidate_counts()
         packet.candidates = [
-            {"name": name, "votes": counts[index]}
+            {
+                "name": self._wire_candidate_name(index, name),
+                "votes": counts[index],
+            }
             for index, name in enumerate(self.candidates)
         ]
         # The client literal-evaluates these fields into (id, arguments).

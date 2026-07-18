@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 release fallback
 
 import toml
 
-from server.launcher import _emit_check_report, _run_server
+from server.launcher import _emit_check_report, _parse_port, _run_server, _select_config
 from server.release_check import CheckItem, CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, read_version
 from server.ugc_project import (
@@ -49,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate the server plus all retail UGC baseplates and prefabs",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="load a TOML file for this process without changing config.toml",
+    )
+    parser.add_argument(
         "--project",
         default=None,
         help=(
@@ -56,10 +62,19 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: [map_creator].project or MyUGCMap)"
         ),
     )
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
         "--output-dir",
         default=None,
         help="directory for new project triplets (default: ugc-projects)",
+    )
+    destination.add_argument(
+        "--publish-root",
+        default=None,
+        help=(
+            "retail hosted_ugc catalog root; projects are saved under its "
+            "maps/ child so the stock Publish Map menu can discover them"
+        ),
     )
     parser.add_argument(
         "--terrain",
@@ -88,9 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port",
-        type=int,
+        type=_parse_port,
         default=None,
         help="override config.toml's UDP port for this editor process",
+    )
+    parser.add_argument(
+        "--control-stdin",
+        action="store_true",
+        help="stop cleanly on parent stdin 'shutdown' or EOF",
     )
     return parser
 
@@ -129,8 +149,34 @@ def apply_map_creator_config(arguments, paths: RuntimePaths):
         return fallback if value in (None, "") else value
 
     arguments.project = str(configured("project", "MyUGCMap"))
-    output_dir = configured("output_dir", None)
+    # Destination switches are one logical choice.  A CLI choice takes
+    # precedence over the other destination's portable-config default; this
+    # lets the client launcher pass --publish-root even though the distributable
+    # config documents the standalone ``ugc-projects`` fallback.
+    cli_output_dir = arguments.output_dir not in (None, "")
+    cli_publish_root = arguments.publish_root not in (None, "")
+    if cli_output_dir:
+        output_dir = arguments.output_dir
+        publish_root = None
+    elif cli_publish_root:
+        output_dir = None
+        publish_root = arguments.publish_root
+    else:
+        output_dir = values.get("output_dir")
+        publish_root = values.get("publish_root")
+        output_dir = None if output_dir in (None, "") else output_dir
+        publish_root = None if publish_root in (None, "") else publish_root
+        if output_dir is not None and publish_root is not None:
+            raise ValueError(
+                "map_creator.output_dir and map_creator.publish_root are "
+                "mutually exclusive"
+            )
     arguments.output_dir = None if output_dir is None else str(output_dir)
+    arguments.publish_root = (
+        None
+        if publish_root is None
+        else str(paths.resolve_configured_path(str(publish_root)))
+    )
     terrain = configured("terrain", None)
     if terrain is not None:
         terrain = str(terrain).strip().casefold()
@@ -165,8 +211,18 @@ def resolve_project_paths(
     paths: RuntimePaths,
     project_value: str,
     output_dir: str | Path | None,
+    publish_root: str | Path | None = None,
 ) -> tuple[str, Path, Path, Path]:
-    """Resolve one portable VXL/TXT/UGC project triplet."""
+    """Resolve one portable VXL/TXT/UGC project triplet.
+
+    ``publish_root`` is deliberately the retail ``hosted_ugc`` directory, not
+    its ``maps`` child.  Keeping that boundary explicit prevents a launcher
+    typo from producing ``maps/maps`` or placing author files among subscribed
+    Workshop content.
+    """
+
+    if output_dir not in (None, "") and publish_root not in (None, ""):
+        raise ValueError("--output-dir and --publish-root are mutually exclusive")
 
     supplied = Path(project_value).expanduser()
     is_path = supplied.suffix.casefold() == ".ugc" or supplied.parent != Path(".")
@@ -178,13 +234,42 @@ def resolve_project_paths(
         directory = sidecar.parent
     else:
         slug = project_slug(project_value)
-        directory = (
-            paths.root / "ugc-projects"
-            if output_dir is None
-            else paths.resolve_configured_path(output_dir)
-        )
+        if publish_root not in (None, ""):
+            directory = resolve_publish_root(paths, publish_root) / "maps"
+        else:
+            directory = (
+                paths.root / "ugc-projects"
+                if output_dir is None
+                else paths.resolve_configured_path(output_dir)
+            )
         sidecar = directory / f"{slug}.ugc"
     return slug, directory, directory / f"{slug}.vxl", sidecar
+
+
+def resolve_publish_root(
+    paths: RuntimePaths,
+    value: str | Path,
+) -> Path:
+    """Validate and resolve the stock client's authored-map catalog root.
+
+    The recovered ``aoslib.ugc_data.get_hosted_ugc_map_names`` routine always
+    enumerates ``./hosted_ugc/maps`` relative to the client runtime.  Accepting
+    only a directory named ``hosted_ugc`` makes the server/client contract
+    unambiguous and keeps authored maps separate from ``subscribed_maps``.
+    """
+
+    root = paths.resolve_configured_path(value).resolve()
+    if root.name.casefold() != "hosted_ugc":
+        raise ValueError(
+            "--publish-root must name the client's hosted_ugc directory "
+            f"(received {root})"
+        )
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"--publish-root is not a directory: {root}")
+    maps = root / "maps"
+    if maps.exists() and not maps.is_dir():
+        raise ValueError(f"retail authored-map catalog is not a directory: {maps}")
+    return root
 
 
 def prepare_ugc_project(
@@ -195,7 +280,10 @@ def prepare_ugc_project(
     """Load an existing project or atomically create it from a baseplate."""
 
     slug, directory, vxl_path, sidecar_path = resolve_project_paths(
-        paths, arguments.project, arguments.output_dir
+        paths,
+        arguments.project,
+        arguments.output_dir,
+        getattr(arguments, "publish_root", None),
     )
     metadata_path = directory / f"{slug}.txt"
     if sidecar_path.is_file() and not arguments.overwrite:
@@ -379,6 +467,11 @@ def run(
         print(f"BattleSpades Map Creator {read_version(runtime_paths.root)}")
         return 0
     try:
+        runtime_paths = _select_config(runtime_paths, arguments.config)
+    except (OSError, ValueError) as exc:
+        print(f"Map Creator startup failed: {exc}", file=sys.stderr)
+        return 1
+    try:
         arguments = apply_map_creator_config(arguments, runtime_paths)
     except ValueError as exc:
         print(f"Map Creator startup failed: {exc}", file=sys.stderr)
@@ -419,6 +512,7 @@ def run(
             port=arguments.port,
         ),
         banner="BattleSpades Map Creator - reconstructed retail UGC host",
+        control_stdin=arguments.control_stdin,
     )
 
 
@@ -427,6 +521,7 @@ __all__ = [
     "apply_map_creator_config",
     "configure_ugc_runtime",
     "prepare_ugc_project",
+    "resolve_publish_root",
     "resolve_project_paths",
     "run",
 ]

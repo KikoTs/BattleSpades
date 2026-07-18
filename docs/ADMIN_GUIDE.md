@@ -98,8 +98,9 @@ directories, and external Steam tooling.
   `terrain_collapse_repair_delay_ticks`: faster exact-air confirmation for
   server-derived unsupported collapses. The stock checked Damage animation is
   still sent first; these values only bound the stale-geometry safety net.
-- `transition_grace_seconds`: time between `MapEnded(52)` and disconnect reason
-  18 during a map/mode rollover.
+- `transition_grace_seconds`: maximum wait for the maintained client's
+  post-`MapEnded(52)` loader-ready acknowledgement. A peer that does not enter
+  `LoadingMenu` in time is disconnected with reason 18 before `InitialInfo`.
 
 ### `[game]` and `[lobby]`
 

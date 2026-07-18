@@ -480,7 +480,11 @@ def create_project_files(
     vxl_path = destination / f"{safe_slug}.vxl"
     metadata_path = destination / f"{safe_slug}.txt"
     sidecar_path = destination / f"{safe_slug}.ugc"
-    if not overwrite and any(path.exists() for path in (vxl_path, metadata_path, sidecar_path)):
+    # Retail ``delete_ugc_file`` removes the authored VXL/UGC/PNG files but
+    # leaves our optional atmosphere TXT behind. A lone TXT is not a live
+    # project, so allow same-name recreation and replace it from the selected
+    # baseplate. VXL or UGC still fail closed to protect authored work.
+    if not overwrite and any(path.exists() for path in (vxl_path, sidecar_path)):
         raise FileExistsError(f"UGC project already exists: {destination / safe_slug}")
     source_vxl, source_metadata = assets.terrain_files(project.terrain)
     shutil.copyfile(source_vxl, vxl_path)

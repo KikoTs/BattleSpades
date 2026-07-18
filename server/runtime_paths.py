@@ -88,6 +88,27 @@ class RuntimePaths:
             return configured.resolve()
         return (self.root / configured).resolve()
 
+    def with_config(self, config: str | Path) -> "RuntimePaths":
+        """Return this portable layout with an explicit configuration file.
+
+        Command-line configuration files are resolved against the caller's
+        working directory, matching normal CLI path semantics.  Only the TOML
+        file moves: relative map, prefab, plugin, and state paths remain
+        anchored to ``root`` so a temporary local-host config cannot make a
+        frozen server depend on the launcher's current directory.
+        """
+
+        selected = Path(config).expanduser().resolve()
+        return RuntimePaths(
+            root=self.root,
+            config=selected,
+            maps=self.maps,
+            prefabs=self.prefabs,
+            plugins=self.plugins,
+            logs=self.logs,
+            bans=self.bans,
+        )
+
 
 def read_version(root: str | Path | None = None) -> str:
     """Read and validate the canonical release version from ``VERSION``."""

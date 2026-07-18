@@ -8,6 +8,16 @@ BattleSpades Portable Alpha
    exposing the server publicly.
 4. Run the same launcher without arguments.
 
+Per-session local hosting
+-------------------------
+
+All three launchers accept `--config <path>` without modifying the editable
+`config.toml` beside the executable. Relative map, prefab, plugin, and state
+paths in that temporary TOML still resolve from this extracted server folder.
+The normal server also accepts `--port <1..65535>` as an in-memory override;
+Tutorial and Map Creator support the same port override. This is the contract
+used by the maintained retail client when it starts a hidden local server.
+
 Retail tutorial
 ---------------
 
@@ -28,11 +38,18 @@ Ace of Spades directory containing `ugc/maps` and `ugc/kv6`:
     BattleSpadesMapCreator.exe --check --retail-root C:\Games\AceOfSpades
     BattleSpadesMapCreator.exe --project MyMap --terrain grassland --target-mode ctf --retail-root C:\Games\AceOfSpades
 
+To make an authored map appear in the stock Publish Map menu, pass the client
+catalog root (the `hosted_ugc` directory, not its `maps` child):
+
+    BattleSpadesMapCreator.exe --project MyMap --publish-root C:\Games\AceOfSpades\hosted_ugc --retail-root C:\Games\AceOfSpades
+
 Projects are saved as sibling `.vxl`, `.txt`, and `.ugc` files under
-`ugc-projects/` unless `--output-dir` or a project path is supplied. Supported
-terrains are desert, lunar, mountain, grassland, temple, urban, marsh, snowy,
-and water. The retail baseplates and KV6 catalog are proprietary client assets
-and are deliberately not included in this archive.
+`ugc-projects/` unless `--output-dir` or a project path is supplied.
+`--publish-root` is mutually exclusive with `--output-dir`; it saves the same
+triplet under `hosted_ugc/maps`, which is the retail authored-map catalog.
+Supported terrains are desert, lunar, mountain, grassland, temple, urban,
+marsh, snowy, and water. The retail baseplates and KV6 catalog are proprietary
+client assets and are deliberately not included in this archive.
 
 The default game listener uses UDP port 27015. Allow that UDP port through the
 host firewall and router when accepting players from outside the local network.

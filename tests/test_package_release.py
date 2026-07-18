@@ -62,7 +62,7 @@ def test_invalid_release_target_is_rejected() -> None:
 def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> None:
     """Maps/prefabs ship, while unrelated root executables never enter output."""
 
-    target = ReleaseTarget("windows", "x86_64", "0.0.2-alpha.1")
+    target = ReleaseTarget("windows", "x86_64", "0.0.3-alpha.1")
 
     staged = stage_release(
         PROJECT_ROOT,
@@ -171,7 +171,7 @@ def test_checksum_cli_runs_without_installed_project_dependencies(
 ) -> None:
     """The publish job can verify assets without installing server packages."""
 
-    for name in expected_archive_names("0.0.2-alpha.1"):
+    for name in expected_archive_names("0.0.3-alpha.1"):
         (tmp_path / name).write_bytes(name.encode("utf-8"))
 
     completed = subprocess.run(
