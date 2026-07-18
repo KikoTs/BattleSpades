@@ -282,6 +282,52 @@ def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
     assert closed.can_vote == 0
 
 
+def test_every_outbound_vote_packet_uses_crash_safe_retail_text():
+    """Packet 47 must never send prose or the historical one-item tuple."""
+
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+
+    for kind in ("map", "kick"):
+        vm.kind = kind
+        vm.candidates = ("First", "Second")
+        for message_type in (
+            voting.VOTE_START,
+            voting.VOTE_UPDATE,
+            voting.VOTE_CLOSED,
+        ):
+            packet = GenericVoteMessage(
+                ByteReader(bytes(vm._build_packet(message_type).generate())[1:])
+            )
+            for encoded in (packet.title, packet.description):
+                decoded = ast.literal_eval(encoded)
+                assert isinstance(decoded, tuple)
+                assert len(decoded) == 2
+                assert decoded[0]
+                assert isinstance(decoded[1], tuple)
+
+
+def test_retail_vote_text_rejects_unsafe_or_ambiguous_values():
+    assert voting._retail_localised_text("VOTE_MAP_TITLE") == repr(
+        ("VOTE_MAP_TITLE", ())
+    )
+
+    for invalid in ("", "Vote title", "VOTE-MAP-TITLE"):
+        try:
+            voting._retail_localised_text(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe localization identifier was accepted")
+
+    try:
+        voting._retail_localised_text("VOTE_MAP_TITLE", [])
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("non-tuple localization arguments were accepted")
+
+
 def test_map_vote_rejects_empty_unsafe_and_unavailable_candidates():
     srv = _vote_server(2)
     vm = voting.VoteManager(srv)
