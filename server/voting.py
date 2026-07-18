@@ -37,7 +37,9 @@ MAP_VOTE_LEAD_SECONDS = 60.0
 VOTE_COOLDOWN = 60.0
 
 
-def _retail_localised_text(identifier: str) -> str:
+def _retail_localised_text(
+    identifier: str, arguments: tuple[object, ...] = ()
+) -> str:
     """Encode one string for ``GenericVotingHUD.decode_string``.
 
     The retail HUD literal-evaluates the field and unconditionally reads both
@@ -47,7 +49,16 @@ def _retail_localised_text(identifier: str) -> str:
     still needs an explicit empty argument tuple.
     """
 
-    return repr((str(identifier), ()))
+    identifier = str(identifier)
+    if (
+        not identifier
+        or identifier.upper() != identifier
+        or not identifier.replace("_", "").isalnum()
+    ):
+        raise ValueError("invalid retail localization identifier")
+    if not isinstance(arguments, tuple):
+        raise TypeError("retail localization arguments must be a tuple")
+    return repr((identifier, arguments))
 
 
 class VoteManager:
