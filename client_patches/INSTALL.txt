@@ -5,7 +5,9 @@ The stock retail MapEnded(52) handler freezes GameScene, but it does not open
 the map loader and disconnect reason 18 does not reconnect this client build.
 BattleSpades reloads maps and modes over the existing authenticated connection.
 The included session_transition_patch.py moves the frozen scene into
-LoadingMenu so the normal InitialInfo and VXL validation handshake can run.
+LoadingMenu and sends ClientInMenu(110) as a loader-ready acknowledgement.
+The server withholds InitialInfo until this acknowledgement arrives, so a
+missing or late hook cannot receive a new-scene packet inside GameScene.
 
 The stock EditBoxControl also has no clipboard keyboard handler. The included
 clipboard_input_patch.py adds Unicode Ctrl+V insertion at the current caret,

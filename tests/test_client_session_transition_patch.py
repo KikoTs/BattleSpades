@@ -35,6 +35,14 @@ def _load_patch(monkeypatch):
         loading_module,
     )
 
+    packet_module = ModuleType("shared.packet")
+
+    class ClientInMenu:
+        in_menu = 0
+
+    packet_module.ClientInMenu = ClientInMenu
+    monkeypatch.setitem(sys.modules, "shared.packet", packet_module)
+
     spec = importlib.util.spec_from_file_location("_session_transition_patch_test", PATCH_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -50,11 +58,15 @@ def test_mapended_pause_flags_open_loading_menu_once(monkeypatch) -> None:
         pause_particles=True,
     )
     calls = []
+    sent = []
 
     class GameManager:
         def __init__(self):
             self.game_scene = scene
-            self.client = SimpleNamespace(disconnected=False)
+            self.client = SimpleNamespace(
+                disconnected=False,
+                send_packet=lambda packet: sent.append(packet),
+            )
 
         def set_menu(self, menu, **kwargs):
             calls.append((menu, kwargs))
@@ -64,6 +76,7 @@ def test_mapended_pause_flags_open_loading_menu_once(monkeypatch) -> None:
     patch._enter_loading_menu(manager)
 
     assert calls == [(loading_menu, {"from_server_menu": False})]
+    assert [packet.in_menu for packet in sent] == [1]
 
     # The manager reuses its GameScene singleton. Clearing the native pause
     # flags must arm the hook for a later map epoch.
@@ -72,6 +85,7 @@ def test_mapended_pause_flags_open_loading_menu_once(monkeypatch) -> None:
     scene.pause_players = scene.pause_entities = scene.pause_particles = True
     patch._enter_loading_menu(manager)
     assert len(calls) == 2
+    assert [packet.in_menu for packet in sent] == [1, 1]
 
 
 def test_disconnected_client_never_opens_transition_loader(monkeypatch) -> None:

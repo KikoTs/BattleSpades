@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import zlib
 
+import pytest
+
 import shared.constants as C
 from modes import get_mode_class
 from modes.ugc import UGCMode
@@ -24,6 +26,9 @@ from server.ugc_launcher import (
     apply_map_creator_config,
     build_parser,
     configure_ugc_runtime,
+    prepare_ugc_project,
+    resolve_project_paths,
+    resolve_publish_root,
 )
 from server.ugc_project import (
     COMMON_MODE,
@@ -157,6 +162,37 @@ def test_retail_assets_create_byte_exact_project_triplet(tmp_path: Path) -> None
     skybox, colors = read_baseplate_presentation(metadata)
     assert skybox == "User_Grassland.txt"
     assert colors == [(1, 2, 3, 4), (5, 6, 7, 8)]
+
+
+def test_recreate_project_replaces_txt_orphan_left_by_retail_delete(
+    tmp_path: Path,
+) -> None:
+    """Stock Publish Map deletion leaves TXT; it must not reserve the slug."""
+
+    layout = _fake_retail_assets(tmp_path)
+    projects = tmp_path / "hosted_ugc" / "maps"
+    projects.mkdir(parents=True)
+    orphan = projects / "ReusedName.txt"
+    orphan.write_text("fog_color = (255, 0, 255)\n", encoding="utf-8")
+    project = UGCProject(
+        title="Reused Name",
+        description="Recreated after retail deletion",
+        author="Builder",
+        baseplate="grassland",
+        target_mode="tdm",
+    )
+
+    vxl, metadata, sidecar = create_project_files(
+        project,
+        projects,
+        "ReusedName",
+        layout,
+    )
+
+    _, source_metadata = layout.terrain_files(project.terrain)
+    assert vxl.is_file()
+    assert sidecar.is_file()
+    assert metadata.read_bytes() == source_metadata.read_bytes()
 
 
 def test_txt_atmosphere_and_ugc_placements_layer_for_published_game(
@@ -540,6 +576,58 @@ def test_host_skybox_and_water_settings_replicate_and_persist(
     assert mode.set_ground_colors(player, [(999, 2, 3, 4)]) is False
 
 
+def test_local_title_survives_authoritative_final_sidecar_save(
+    tmp_path: Path,
+) -> None:
+    """Server shutdown cannot overwrite the title edited in UGC Settings."""
+
+    project = _complete_ctf_project()
+    server = _EditorServer(project, tmp_path)
+    server.world_manager.map = SimpleNamespace(
+        generate_vxl=lambda _include_underwater: b"edited-vxl",
+    )
+    mode = UGCMode(server)
+    host = _Connection()
+    server.connections[1] = host
+    mode.configure_initial_info_for(host, SimpleNamespace())
+    player = SimpleNamespace(connection=host, id=1, name="Host")
+
+    assert mode.set_title(player, "  Rebuilt Jungle  ") is True
+    assert mode.set_title(player, "x" * 81) is False
+    assert mode.set_title(player, "bad\nname") is False
+    mode._save_complete_project()
+
+    sidecar = json.loads((tmp_path / "map.ugc").read_text(encoding="utf-8"))
+    assert sidecar["title"] == "Rebuilt Jungle"
+    assert (tmp_path / "map.vxl").read_bytes() == b"edited-vxl"
+
+
+def test_preview_upload_sets_persisted_overhead_image_flag(tmp_path: Path) -> None:
+    """A successfully written preview remains enabled in the final sidecar."""
+
+    project = _complete_ctf_project()
+    server = _EditorServer(project, tmp_path)
+    mode = UGCMode(server)
+    host = _Connection()
+    server.connections[1] = host
+    mode.configure_initial_info_for(host, SimpleNamespace())
+    player = SimpleNamespace(connection=host, id=1, name="Host")
+    png = b"\x89PNG\r\n\x1a\npreview"
+
+    async def upload() -> None:
+        assert await mode.receive_preview(player, png) is True
+        assert mode._preview_task is not None
+        await mode._preview_task
+
+    asyncio.run(upload())
+    project.save(tmp_path / "map.ugc")
+
+    sidecar = json.loads((tmp_path / "map.ugc").read_text(encoding="utf-8"))
+    assert (tmp_path / "map.png").read_bytes() == png
+    assert sidecar["use_overhead_image"] is True
+    assert mode._metadata_dirty is True
+
+
 class _PrefabModel:
     def get_points(self):
         return (
@@ -906,6 +994,138 @@ def test_map_creator_config_selects_project_and_portable_save_root(
 
     assert arguments.project == "CommunityBuild"
     assert arguments.output_dir == "editor-saves"
+    assert arguments.publish_root is None
     assert arguments.terrain == "urban"
     assert arguments.target_mode == "ctf"
     assert Path(arguments.retail_root) == (tmp_path / "retail-client").resolve()
+
+
+def test_publish_root_resolves_exact_retail_authored_catalog(tmp_path: Path) -> None:
+    """The stock Publish Map menu scans hosted_ugc/maps, not ugc/maps."""
+
+    paths = RuntimePaths.from_root(tmp_path / "server")
+    publish_root = tmp_path / "client" / "hosted_ugc"
+    publish_root.mkdir(parents=True)
+
+    resolved = resolve_publish_root(paths, publish_root)
+    slug, directory, vxl, sidecar = resolve_project_paths(
+        paths,
+        "My Published Map",
+        None,
+        resolved,
+    )
+
+    assert resolved == publish_root.resolve()
+    assert slug == "My_Published_Map"
+    assert directory == publish_root.resolve() / "maps"
+    assert vxl == directory / "My_Published_Map.vxl"
+    assert sidecar == directory / "My_Published_Map.ugc"
+
+
+@pytest.mark.parametrize(
+    "invalid_leaf",
+    ("client", "maps", "subscribed_maps"),
+)
+def test_publish_root_rejects_ambiguous_catalog_paths(
+    tmp_path: Path,
+    invalid_leaf: str,
+) -> None:
+    paths = RuntimePaths.from_root(tmp_path / "server")
+
+    with pytest.raises(ValueError, match="hosted_ugc"):
+        resolve_publish_root(paths, tmp_path / invalid_leaf)
+
+
+def test_cli_publish_root_overrides_standalone_output_config(tmp_path: Path) -> None:
+    """The client launcher can override the documented ugc-projects default."""
+
+    paths = RuntimePaths.from_root(tmp_path)
+    paths.config.write_text(
+        "[map_creator]\n"
+        'output_dir = "ugc-projects"\n',
+        encoding="utf-8",
+    )
+    publish_root = tmp_path / "client" / "hosted_ugc"
+    arguments = apply_map_creator_config(
+        build_parser().parse_args(["--publish-root", str(publish_root)]),
+        paths,
+    )
+
+    assert arguments.output_dir is None
+    assert Path(arguments.publish_root) == publish_root.resolve()
+
+
+def test_config_rejects_two_map_creator_destinations(tmp_path: Path) -> None:
+    paths = RuntimePaths.from_root(tmp_path)
+    paths.config.write_text(
+        "[map_creator]\n"
+        'output_dir = "ugc-projects"\n'
+        'publish_root = "client/hosted_ugc"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        apply_map_creator_config(build_parser().parse_args([]), paths)
+
+
+def test_publish_catalog_project_survives_reopen(tmp_path: Path) -> None:
+    """Create and reopen the exact triplet consumed by retail Publish Map."""
+
+    assets = _fake_retail_assets(tmp_path)
+    paths = RuntimePaths.from_root(tmp_path / "server")
+    publish_root = tmp_path / "client" / "hosted_ugc"
+    arguments = build_parser().parse_args(
+        [
+            "--project",
+            "PersistentBuild",
+            "--publish-root",
+            str(publish_root),
+            "--terrain",
+            "grassland",
+            "--target-mode",
+            "ctf",
+            "--title",
+            "Persistent Build",
+        ]
+    )
+    arguments = apply_map_creator_config(arguments, paths)
+
+    project, vxl, metadata, sidecar = prepare_ugc_project(
+        paths,
+        arguments,
+        assets,
+    )
+
+    catalog = publish_root / "maps"
+    assert (vxl, metadata, sidecar) == (
+        catalog / "PersistentBuild.vxl",
+        catalog / "PersistentBuild.txt",
+        catalog / "PersistentBuild.ugc",
+    )
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["title"] == (
+        "Persistent Build"
+    )
+
+    # A second launch with the same slug loads the authored state rather than
+    # copying a fresh baseplate over it.
+    project.place(12, 34, 220, int(C.UGC_ITEM_HEALTH_DROP_POINT))
+    project.save(sidecar)
+    reopened_arguments = apply_map_creator_config(
+        build_parser().parse_args(
+            [
+                "--project",
+                "PersistentBuild",
+                "--publish-root",
+                str(publish_root),
+            ]
+        ),
+        paths,
+    )
+    reopened, reopened_vxl, reopened_metadata, reopened_sidecar = (
+        prepare_ugc_project(paths, reopened_arguments, assets)
+    )
+
+    assert reopened_vxl == vxl
+    assert reopened_metadata == metadata
+    assert reopened_sidecar == sidecar
+    assert reopened.placements[-1].position == (12, 34, 220)

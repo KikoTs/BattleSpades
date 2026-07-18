@@ -257,6 +257,16 @@ from the native per-mode minimum/maximum tables. Small sidecar and preview
 writes use atomic background checkpoints; the full VXL is serialized only at
 explicit shutdown, never from the 60 Hz tick.
 
+Standalone authoring defaults to `ugc-projects/`. A client-integrated launcher
+passes `--publish-root <client>/hosted_ugc`; this resolves strictly to the
+`maps/` child enumerated by retail `aoslib.ugc_data`. The authored `.ugc`,
+`.vxl`, `.txt`, and optional `.png` therefore survive temp-config deletion and
+appear in Publish Map on its next refresh. The hidden child process must stop
+gracefully so `deactivate()` can atomically serialize the final VXL.
+Retail deletion does not remove the optional atmosphere `.txt`; project
+creation recognizes that lone file as an orphan and refreshes it, while an
+existing `.ugc` or `.vxl` remains protected from accidental overwrite.
+
 The dedicated-client flow is:
 
 1. `InitialInfo(114)` advertises the UGC client role.

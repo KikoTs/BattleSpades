@@ -17,6 +17,10 @@ steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 [map_creator]
 project = "MyUGCMap"
 output_dir = "ugc-projects"
+# Alternative to output_dir for client-launched authoring. Set exactly one of
+# them: publish_root is the client's `hosted_ugc` directory, and maps are saved
+# into its `maps/` child so the stock Publish Map screen discovers them.
+publish_root = ""
 terrain = ""          # blank = grassland for new maps; or desert/lunar/mountain/grassland/temple/urban/marsh/snowy/water
 target_mode = ""      # blank = preserve existing / tdm for new; or tdm/ctf/dem/mh/oc/tc/vip/zom/dia
 retail_root = ""      # blank = auto-discover; otherwise AoS directory containing ugc/maps and ugc/kv6

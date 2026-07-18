@@ -111,4 +111,6 @@ async def handle_set_color(server, player, packet) -> None:
 async def handle_client_in_menu(server, player, packet) -> None:
     """Track menu state used by safe round and class transitions."""
     if player.connection:
-        player.connection.in_menu = bool(packet.in_menu)
+        in_menu = bool(packet.in_menu)
+        player.connection.in_menu = in_menu
+        player.connection.note_scene_transition_menu(in_menu)

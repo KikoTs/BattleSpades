@@ -90,12 +90,12 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 44 | MinimapZoneClear | — | Planned | Clear minimap zones (minimap). |
 | 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). Prefab and entity catalog lengths are signed little-endian 16-bit counts, not padded bytes; this carries all 373 native UGC items. VIP sends gangster locks and ZOM sends phase-aware team/class locks. |
 | 46 | KillAction | S→C | Sent | Broadcast kill/death event. `kill_count` is the killer's current-life streak for the retail multikill HUD; it resets on death/round transition and is not the cumulative scoreboard kill total. |
-| 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact candidate records; the retail client binds the first three to F1/F2/F3. Title/description is exactly `repr((string_id, arguments_tuple))`: native `GenericVotingHUD.decode_string` unconditionally indexes both elements and crashes on the historical one-item tuple. |
+| 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact opaque candidate records; the retail client binds the first three to F1/F2/F3. Title, description, **and every candidate** are exactly `repr((string_id, arguments_tuple))`: native `GenericVotingHUD.decode_string` literal-evaluates and indexes both elements, so a raw map name or historical one-item tuple crashes or is misread as `KICK_PLAYER`. |
 | 48 | InitiateKickMessage | C→S | Handled | Client starts a kick vote → VoteManager (server/voting.py). |
 | 49 | ChatMessage | both | Handled+Sent | Player chat uses types 0/1; private system replies use type 2. Global server/mode announcements use `CHAT_BIG` type 3 and render at the top of every retail HUD. |
 | 50 | LocalisedMessage | S→C | Sent | Top-screen string-table announcement. Resolves `string_id`, optionally resolves every positional parameter as another localization ID (for example `TEAM1_COLOR`), formats `{0}`/`{1}`/`{2}`, and supports replace-previous behavior. See Broadcast templates below. |
 | 51 | SkyboxData | S→C | Sent | Null-terminated retail mesh-environment filename (sent at join, prefix 0x30). It comes from the active VXL's validated sidecar `skybox_texture`/`skybox_name`; `[world].default_skybox` is the missing-metadata fallback. |
-| 52 | MapEnded | S→C | Sent | Native full-scene rollover trigger. It freezes the compiled `GameScene`; the compatibility hook opens `LoadingMenu`, then the server sends a fresh validated loader handshake over the same authenticated peer. Same-map score presentation deliberately omits it. |
+| 52 | MapEnded | S→C | Sent | Native full-scene rollover trigger. It freezes the compiled `GameScene`; the compatibility hook opens `LoadingMenu` and acknowledges readiness with `ClientInMenu(110)`. Only then may the server send a fresh loader handshake over the same authenticated peer. Same-map score presentation deliberately omits it. |
 | 53 | ShowGameStats | S→C | Sent | Opens `GameScene.show_game_statistics(False)`. Used only after voted-map preflight and only for maps with a bundled retail level screenshot; custom maps and same-map restarts omit it. |
 | 54 | MapDataStart | S→C | Sent | Opens the native UGC source-map transfer before MapDataValidation. |
 | 55 | MapSyncStart | S→C | Sent | Bare-id map sync start (prefix 0x32). |
@@ -299,7 +299,11 @@ and MinimapZoneClear (44) remain planned.
 `GenericVoteMessage(47)` drives both majority kick ballots and the stock
 next-map overlay. Candidate text is an identity field, not a yes/no string:
 the server accepts only an exact advertised candidate and rejects forged or
-missing records. The map catalog is captured at startup, and the final-minute
+missing records. Title, description, and candidate rows all use the retail
+localized-literal shape `repr((string_id, arguments_tuple))`; candidate rows
+must never contain a raw map/player name. The CAST reply is matched against
+the exact advertised wire token, then resolved to the server-side candidate.
+The map catalog is captured at startup, and the final-minute
 vote offers at most three maps in deterministic rotation order. A vote merely
 stages `VoteManager.next_map`; the round lifecycle consumes it at the safe
 scene boundary. A sudden score-limit ending waits for an unresolved ballot's
@@ -330,7 +334,11 @@ Replacing the VXL or mode then sends and flushes `MapEnded(52)`, detaches the
 old server-side `Player`, commits the new runtime, and retains each settled
 authenticated ENet peer. The client compatibility
 hook selects `LoadingMenu(identifier=None)`, which deliberately reuses the
-current `GameClient`. The server then sends `InitialInfo`; only after receiving
+current `GameClient`, and sends `ClientInMenu(110)` as the explicit scene-ready
+acknowledgement. The server arms that acknowledgement before packet 52 and
+does not infer readiness from a fixed delay. Only acknowledged peers receive
+`InitialInfo`; non-acknowledging peers are retired with reason 18 before any
+crash-sensitive loader packet. Only after receiving
 the matching `MapDataValidation` response does it stream the VXL and finish the
 normal `MapSync`/`StateData`/roster sequence. A peer that does not enter the
 loader is retired with reason 18 without affecting compatible peers. Invalid
@@ -423,6 +431,20 @@ Packets 97/98 own the 19 authored object types, packet 68 mirrors exact mode
 requirements, packet 118 carries the ground/water palette, and packet 102
 exchanges an optional preview PNG. Project state checkpoints as the retail
 `.vxl`/`.txt`/`.ugc` triplet.
+
+The stock Publish Map screen enumerates only `./hosted_ugc/maps/*.ugc`; it does
+not inspect `ugc/maps` or the server's standalone `ugc-projects` directory.
+Client-launched authoring therefore supplies `--publish-root` pointing to the
+client's `hosted_ugc` directory. Same-stem VXL/sidecar/preview files remain in
+that catalog across sessions and are consumed directly by `aoslib.ugc_data`.
+
+Retail stores the editable project title in its Steam lobby and exposes no
+dedicated title packet. The maintained local client therefore sends the private
+`ChatMessage(49)` command `/__local_ugc_title <text>`. The server must consume
+this command without broadcasting or passing it to public command dispatch,
+and accept it only from the current isolated-UGC host (80 characters maximum).
+This bridge keeps the final server-side project checkpoint from overwriting the
+title selected in the stock settings screen.
 
 The two prefab actions are intentionally asymmetric on the wire:
 

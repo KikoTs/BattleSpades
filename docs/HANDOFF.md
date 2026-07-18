@@ -221,13 +221,17 @@ its packet and map-sync investigation history is still valuable.
   scene; reason 18 is terminal and the retail build does not auto-reconnect.
   Map and mode replacement now preflight first, flush packet 52, retain the
   authenticated peer, and perform the fresh loader handshake after
-  `client_patches/session_transition_patch.py` opens `LoadingMenu`. Invalid map
-  names do not disturb the current GameScene.
+  `client_patches/session_transition_patch.py` opens `LoadingMenu` and sends
+  ClientInMenu(110). `InitialInfo` is withheld until that acknowledgement;
+  invalid map names do not disturb the current GameScene.
 - `GenericVoteMessage(47)` is also the stock map-vote path. The retail client
   binds the first three advertised records to F1/F2/F3; IDA places the receive
   path near `0x1017B780` and the cast sender near `0x1017C6C0`. The server now
-  accepts exact candidate records instead of the former `starts with y`
-  heuristic, stages the winning map, and consumes it only after the end screen.
+  encodes title, description, and every candidate name as a literal
+  `(identifier, arguments_tuple)`, then accepts only the exact echoed wire
+  token instead of the former `starts with y` heuristic. Raw map names crash
+  `GenericVotingHUD.decode_string`; the client guard's old fallback rendered
+  them as `KICK_PLAYER`. The winner is consumed only after the end screen.
   The map catalog is cached at startup, so the 60 Hz tick performs no glob I/O.
 - Focused water/transition/vote/end-sequence checks and the adjacent bot/mode
   suite pass. A clean retail client live-validated CityOfChicago -> ArcticBase

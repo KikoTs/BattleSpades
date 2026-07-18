@@ -18,6 +18,7 @@ import sys
 
 _installed = False
 _transition_scene = None
+_transition_ready_sent = False
 
 
 def _manager_from_callback(callback):
@@ -33,12 +34,13 @@ def _manager_from_callback(callback):
 
 def _enter_loading_menu(manager):
     """Open the same-connection loader once for one frozen GameScene."""
-    global _transition_scene
+    global _transition_scene, _transition_ready_sent
 
     scene = getattr(manager, 'game_scene', None)
     client = getattr(manager, 'client', None)
     if scene is None or client is None or getattr(client, 'disconnected', True):
         _transition_scene = None
+        _transition_ready_sent = False
         return
 
     ended = (
@@ -50,18 +52,38 @@ def _enter_loading_menu(manager):
         # GameScene is a manager-owned singleton and is reinitialized for the
         # next map.  Its pause flags, not object identity, delimit epochs.
         _transition_scene = None
-        return
-    if _transition_scene is scene:
+        _transition_ready_sent = False
         return
 
-    _transition_scene = scene
+    if _transition_scene is not scene:
+        try:
+            from aoslib.scenes.ingame_menus.loadingMenu import LoadingMenu
+            # identifier=None is intentional: LoadingMenu must reuse the
+            # current GameClient, not create a second ENet connection.
+            manager.set_menu(LoadingMenu, from_server_menu=False)
+            _transition_scene = scene
+            _transition_ready_sent = False
+        except Exception:
+            _transition_scene = None
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+            return
+
+    if _transition_ready_sent:
+        return
     try:
-        from aoslib.scenes.ingame_menus.loadingMenu import LoadingMenu
-        # identifier=None is intentional: LoadingMenu must reuse the current
-        # GameClient, not create a second ENet connection.
-        manager.set_menu(LoadingMenu, from_server_menu=False)
+        from shared.packet import ClientInMenu
+        ready = ClientInMenu()
+        ready.in_menu = 1
+        # This existing reliable packet is the server's proof that InitialInfo
+        # will be consumed by LoadingMenu rather than the retired GameScene.
+        client.send_packet(ready)
+        _transition_ready_sent = True
     except Exception:
-        _transition_scene = None
+        # Keep the loader installed and retry the acknowledgement next frame.
         try:
             import traceback
             traceback.print_exc()

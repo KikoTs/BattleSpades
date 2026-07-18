@@ -256,10 +256,10 @@ def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
     )
     start = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
     assert start.message_type == voting.VOTE_START
-    assert [candidate["name"] for candidate in start.candidates] == [
-        "ArcticBase",
-        "CastleWars",
-        "CityOfChicago",
+    assert [ast.literal_eval(candidate["name"]) for candidate in start.candidates] == [
+        ("ArcticBase", ()),
+        ("CastleWars", ()),
+        ("CityOfChicago", ()),
     ]
     assert start.title == repr(("VOTE_MAP_TITLE", ()))
     assert start.description == repr(("VOTE_MAP_DESCRIPTION", ()))
@@ -299,7 +299,11 @@ def test_every_outbound_vote_packet_uses_crash_safe_retail_text():
             packet = GenericVoteMessage(
                 ByteReader(bytes(vm._build_packet(message_type).generate())[1:])
             )
-            for encoded in (packet.title, packet.description):
+            encoded_fields = [packet.title, packet.description]
+            encoded_fields.extend(
+                candidate["name"] for candidate in packet.candidates
+            )
+            for encoded in encoded_fields:
                 decoded = ast.literal_eval(encoded)
                 assert isinstance(decoded, tuple)
                 assert len(decoded) == 2
@@ -326,6 +330,18 @@ def test_retail_vote_text_rejects_unsafe_or_ambiguous_values():
         pass
     else:
         raise AssertionError("non-tuple localization arguments were accepted")
+
+    assert ast.literal_eval(voting._retail_dynamic_text("Map {alpha}")) == (
+        "Map {{alpha}}",
+        (),
+    )
+    for invalid in ("", "bad\x00name", "line\nbreak"):
+        try:
+            voting._retail_dynamic_text(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe dynamic vote text was accepted")
 
 
 def test_map_vote_rejects_empty_unsafe_and_unavailable_candidates():
@@ -435,5 +451,35 @@ def test_generic_candidate_cast_maps_kick_choice_by_exact_candidate_name():
 
     vm.cast_candidate(srv.players[1], "Kick P3")
 
+    assert vm.active is False
+    assert srv.players[3].disconnected == 2
+
+
+def test_retail_wire_candidate_round_trips_and_forged_names_are_rejected():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("ArcticBase", "CastleWars"), now=100.0)
+    packet = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+
+    # Raw names and arbitrary literals were not present in the overlay.
+    vm.cast_wire_candidate(srv.players[0], "CastleWars")
+    vm.cast_wire_candidate(srv.players[0], repr(("London", ())))
+    assert vm.votes == {}
+
+    vm.cast_wire_candidate(srv.players[0], packet.candidates[1]["name"])
+    assert vm.votes == {0: 1}
+
+
+def test_kick_vote_wire_candidates_use_stock_localized_yes_no_labels():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+    vm.start_kick(srv.players[0], srv.players[3], voting.KICK_ABUSE, now=100.0)
+    packet = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+
+    assert [ast.literal_eval(item["name"]) for item in packet.candidates] == [
+        ("KICK_YES", ()),
+        ("KICK_NO", ()),
+    ]
+    vm.cast_wire_candidate(srv.players[1], packet.candidates[0]["name"])
     assert vm.active is False
     assert srv.players[3].disconnected == 2

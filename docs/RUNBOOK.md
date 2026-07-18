@@ -35,6 +35,11 @@ py -3.12 run_map_creator.py --check `
 py -3.12 run_map_creator.py --project MyMap --terrain grassland `
   --target-mode ctf --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
 
+# Client-integrated authoring. Pass hosted_ugc, not hosted_ugc/maps.
+py -3.12 run_map_creator.py --project MyMap --terrain grassland `
+  --target-mode ctf --retail-root G:\AoSRevival\aos-nonsteam\src `
+  --publish-root G:\AoSRevival\aos-nonsteam\src\hosted_ugc
+
 # Game client (from AceOfSpades_no_steam_new; MUST use the bundled py2!)
 .\python\python.exe launcher.py +s
 
@@ -58,11 +63,19 @@ entry.
 
 The Map Creator launcher creates or resumes a sibling `.vxl`/`.txt`/`.ugc`
 project triplet. New projects default to `ugc-projects/`; pass an explicit
-`.ugc` path or `--output-dir` to change that location. `--overwrite` replaces
+`.ugc` path or `--output-dir` to change that location. For a client-launched
+editor, pass `--publish-root <client>/hosted_ugc`; the launcher writes to its
+`maps/` child, which is the only authored-map catalog enumerated by the stock
+Publish Map screen. `--overwrite` replaces
 the triplet from the selected retail baseplate. The normal server mode registry
 intentionally contains no `ugc` entry, and editor startup disables bots,
 plugins, voting, rotation, Steam registration, damage, and competitive round
 rules in memory.
+
+The retail Delete action removes `.ugc`, `.vxl`, and `.png`, but ignores the
+server-only atmosphere `.txt`. The launcher treats a lone same-stem `.txt` as
+an orphan and safely replaces it from the selected baseplate when that project
+name is created again; an existing `.ugc` or `.vxl` still blocks replacement.
 
 The persistent launcher defaults live in `config.toml`:
 
@@ -70,6 +83,7 @@ The persistent launcher defaults live in `config.toml`:
 [map_creator]
 project = "MyUGCMap"       # project name, or a path to an existing .ugc
 output_dir = "ugc-projects"
+publish_root = ""          # alternative: exact client hosted_ugc directory
 terrain = ""               # blank/new = grassland; see --help for all nine
 target_mode = ""           # blank = preserve existing; new projects use tdm
 retail_root = ""           # AoS directory containing ugc/maps and ugc/kv6
@@ -77,7 +91,9 @@ retail_root = ""           # AoS directory containing ugc/maps and ugc/kv6
 
 Command-line values take precedence over this table. Relative project and
 output paths are resolved from the application root, not the terminal's
-current directory. For example, either of these reopens the same authored map:
+current directory. `output_dir` and `publish_root` are mutually exclusive; an
+explicit CLI destination overrides the other config default. For example,
+either of these reopens the same authored map:
 
 ```powershell
 py -3.12 run_map_creator.py --project MyUGCMap
@@ -615,9 +631,11 @@ each scene boundary:
 Before this test, install `client_patches/session_transition_patch.py` as
 documented in `client_patches/INSTALL.txt` and restart the client once. The stock
 packet-52 handler only freezes `GameScene`; disconnect reason 18 is terminal
-and is not a reconnect mechanism. The server requires the client's
-`MapDataValidation` reply before sending VXL bytes, so an unpatched client is
-retired individually instead of receiving loader packets in an old scene.
+and is not a reconnect mechanism. The hook sends ClientInMenu(110) only after
+installing `LoadingMenu`; the server requires that acknowledgement before
+sending `InitialInfo`, then requires `MapDataValidation` before VXL bytes. An
+unpatched client is retired individually without receiving loader packets in
+an old scene.
 
 Reject a lifecycle patch if a new `aos_crash_*.dmp` appears, the client log
 contains a traceback/invalid entity warning, or a transition tick exceeds the
@@ -628,7 +646,8 @@ editing files does not hot-reload the running server.
 
 To validate retail map voting, lower the round time on the isolated server or
 wait until its final minute. The localized next-map overlay must expose one to
-three candidates on F1/F2/F3. Cast from two clients, confirm the chosen map is
+three correctly named candidates on F1/F2/F3—never `Kick Player`. Cast from
+two clients, confirm the chosen map is
 announced on the HUD, and let the end sequence finish. On an official map the
 client must receive final `GameStats(67)`, show the packet-53 scores/credits
 screen for `lobby.end_screen_seconds`, and only then enter the packet-52 loader.

@@ -100,7 +100,7 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.2-alpha.1` is packaged as six standalone server archives. Each archive
+`0.0.3-alpha.1` is packaged as six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 
@@ -156,6 +156,11 @@ py -3.12 run_map_creator.py --check --retail-root G:\AoSRevival\AceOfSpades_no_s
 py -3.12 run_map_creator.py --project MyMap --terrain grassland `
   --target-mode ctf --retail-root G:\AoSRevival\AceOfSpades_no_steam_new
 
+# Save into the catalog used by Main Menu -> Map Creator -> Publish Map.
+py -3.12 run_map_creator.py --project MyMap --terrain grassland `
+  --target-mode ctf --retail-root G:\AoSRevival\aos-nonsteam\src `
+  --publish-root G:\AoSRevival\aos-nonsteam\src\hosted_ugc
+
 # Portable Windows release (use ./BattleSpadesMapCreator elsewhere)
 .\BattleSpadesMapCreator.exe --project MyMap --terrain grassland `
   --target-mode ctf --retail-root C:\Games\AceOfSpades
@@ -165,9 +170,11 @@ New projects may use `desert`, `lunar`, `mountain`, `grassland`, `temple`,
 `urban`, `marsh`, `snowy`, or `water`. Publish validation supports `tdm`,
 `ctf`, `dem`, `mh`, `oc`, `tc`, `vip`, `zom`, and `dia`. The launcher creates
 and continuously checkpoints a portable `.vxl`/`.txt`/`.ugc` triplet under
-`ugc-projects/` by default. It requires the operator's legally installed
-retail `ugc/maps` and `ugc/kv6` assets; BattleSpades does not redistribute
-those proprietary baseplates or models.
+`ugc-projects/` by default. `--publish-root <client>/hosted_ugc` instead writes
+that triplet into the exact `maps/` catalog enumerated by the stock Publish Map
+menu; an optional same-stem `.png` is its Workshop preview. It requires the
+operator's legally installed retail `ugc/maps` and `ugc/kv6` assets;
+BattleSpades does not redistribute those proprietary baseplates or models.
 
 No system Python or compiler is needed. Change the default admin password
 `changeme` before exposing UDP port 27015. Verify the downloaded zip against

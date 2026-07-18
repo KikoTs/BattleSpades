@@ -119,14 +119,16 @@ jobs:
           if ($null -eq $bundle) { throw "staged release directory is missing" }
           Push-Location -LiteralPath $env:RUNNER_TEMP
           try {
+            $sessionConfig = Join-Path $env:RUNNER_TEMP "battlespades-session.toml"
+            Copy-Item -LiteralPath "$($bundle.FullName)\config.toml" -Destination $sessionConfig
             & "$($bundle.FullName)\BattleSpades.exe" --version
             if ($LASTEXITCODE -ne 0) { throw "packaged --version failed" }
-            & "$($bundle.FullName)\BattleSpades.exe" --check
-            if ($LASTEXITCODE -ne 0) { throw "packaged --check failed" }
+            & "$($bundle.FullName)\BattleSpades.exe" --check --config $sessionConfig
+            if ($LASTEXITCODE -ne 0) { throw "packaged external-config check failed" }
             & "$($bundle.FullName)\BattleSpadesTutorial.exe" --version
             if ($LASTEXITCODE -ne 0) { throw "tutorial --version failed" }
-            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --check
-            if ($LASTEXITCODE -ne 0) { throw "tutorial --check failed" }
+            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --check --config $sessionConfig
+            if ($LASTEXITCODE -ne 0) { throw "tutorial external-config check failed" }
             & "$($bundle.FullName)\BattleSpadesMapCreator.exe" --version
             if ($LASTEXITCODE -ne 0) { throw "map creator --version failed" }
           } finally {
@@ -140,10 +142,11 @@ jobs:
           bundle="$(find "$GITHUB_WORKSPACE/release-dist" -mindepth 1 -maxdepth 1 -type d -name 'BattleSpades-*' -print -quit)"
           test -n "$bundle"
           cd "$RUNNER_TEMP"
+          cp "$bundle/config.toml" "$RUNNER_TEMP/battlespades-session.toml"
           "$bundle/BattleSpades" --version
-          "$bundle/BattleSpades" --check
+          "$bundle/BattleSpades" --check --config "$RUNNER_TEMP/battlespades-session.toml"
           "$bundle/BattleSpadesTutorial" --version
-          "$bundle/BattleSpadesTutorial" --check
+          "$bundle/BattleSpadesTutorial" --check --config "$RUNNER_TEMP/battlespades-session.toml"
           "$bundle/BattleSpadesMapCreator" --version
 
       - name: Upload native zip

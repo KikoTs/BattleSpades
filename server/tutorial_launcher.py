@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from server.launcher import _emit_check_report, _run_server
+from server.launcher import _emit_check_report, _parse_port, _run_server, _select_config
 from server.release_check import CheckItem, CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, read_version
 
@@ -40,10 +40,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate the release plus the byte-exact Training.vxl asset",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="load a TOML file for this process without changing config.toml",
+    )
+    parser.add_argument(
         "--port",
-        type=int,
+        type=_parse_port,
         default=None,
         help="override config.toml's UDP port for this tutorial process",
+    )
+    parser.add_argument(
+        "--control-stdin",
+        action="store_true",
+        help="stop cleanly on parent stdin 'shutdown' or EOF",
     )
     return parser
 
@@ -164,6 +175,11 @@ def run(
     if arguments.version:
         print(f"BattleSpades Tutorial {read_version(runtime_paths.root)}")
         return 0
+    try:
+        runtime_paths = _select_config(runtime_paths, arguments.config)
+    except (OSError, ValueError) as exc:
+        print(f"Tutorial startup failed: {exc}", file=sys.stderr)
+        return 1
     if arguments.check:
         return _emit_check_report(_tutorial_check(runtime_paths))
 
@@ -188,6 +204,7 @@ def run(
             port=arguments.port,
         ),
         banner="BattleSpades Tutorial - reconstructed retail training level",
+        control_stdin=arguments.control_stdin,
     )
 
 

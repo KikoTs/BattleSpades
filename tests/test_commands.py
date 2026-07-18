@@ -223,6 +223,77 @@ def test_muted_player_can_still_dispatch_unmute_command(monkeypatch):
     assert dispatched == [(server, player, "unmute Admin")]
 
 
+def test_local_ugc_title_bridge_is_private_host_only(monkeypatch):
+    """The local settings bridge never leaks into commands or public chat."""
+
+    player = FakePlayer("Builder")
+    calls = []
+    dispatched = []
+
+    class Mode:
+        def __init__(self, host):
+            self.host = host
+
+        def is_host(self, candidate):
+            return candidate is self.host
+
+        def set_title(self, candidate, title):
+            calls.append((candidate, title))
+            return True
+
+    async def fake_handle_command(*args):
+        dispatched.append(args)
+
+    monkeypatch.setattr("commands.handle_command", fake_handle_command)
+    server = SimpleNamespace(
+        config=SimpleNamespace(ugc_runtime=True),
+        mode=Mode(player),
+    )
+    packet = SimpleNamespace(
+        value="/__local_ugc_title Edited City",
+        chat_type=0,
+    )
+
+    run(handle_chat(server, player, packet))
+
+    assert calls == [(player, "Edited City")]
+    assert dispatched == []
+
+
+def test_local_ugc_title_bridge_rejects_non_ugc_and_guest(monkeypatch):
+    """Forged private controls are swallowed without mutating either server."""
+
+    host = FakePlayer("Host")
+    guest = FakePlayer("Guest")
+    calls = []
+    dispatched = []
+
+    mode = SimpleNamespace(
+        is_host=lambda player: player is host,
+        set_title=lambda player, title: calls.append((player, title)),
+    )
+
+    async def fake_handle_command(*args):
+        dispatched.append(args)
+
+    monkeypatch.setattr("commands.handle_command", fake_handle_command)
+    packet = SimpleNamespace(value="/__local_ugc_title Forged", chat_type=0)
+
+    ordinary = SimpleNamespace(
+        config=SimpleNamespace(ugc_runtime=False),
+        mode=mode,
+    )
+    editor = SimpleNamespace(
+        config=SimpleNamespace(ugc_runtime=True),
+        mode=mode,
+    )
+    run(handle_chat(ordinary, host, packet))
+    run(handle_chat(editor, guest, packet))
+
+    assert calls == []
+    assert dispatched == []
+
+
 def test_bots_status_reports_worker_health(captured, tmp_path):
     server = FakeServer(BanManager(str(tmp_path / "bans.json")))
     server.bots = SimpleNamespace(

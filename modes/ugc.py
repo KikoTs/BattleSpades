@@ -120,13 +120,13 @@ class UGCMode(BaseMode):
                 unsubscribe(token)
         self._mutation_listener_token = None
         task = self._checkpoint_task
-        if task is not None and not task.done():
+        if task is not None:
             try:
                 await task
             except (OSError, asyncio.CancelledError):
                 logger.warning("UGC metadata checkpoint did not finish", exc_info=True)
         preview_task = self._preview_task
-        if preview_task is not None and not preview_task.done():
+        if preview_task is not None:
             try:
                 await preview_task
             except (OSError, asyncio.CancelledError):
@@ -512,6 +512,28 @@ class UGCMode(BaseMode):
         self.send_objectives()
         return True
 
+    def set_title(self, player: "Player", value: str) -> bool:
+        """Persist one bounded title from the maintained local UGC settings UI."""
+
+        if not self.is_host(player):
+            return False
+        title = str(value)
+        if (
+            not title.strip()
+            or len(title) > 80
+            or "\x00" in title
+            or "\r" in title
+            or "\n" in title
+        ):
+            return False
+        title = title.strip()
+        if title == self.project.title:
+            return True
+        self.project.title = title
+        self.project.modified_since_publish = True
+        self._metadata_dirty = True
+        return True
+
     def set_skybox(self, player: "Player", value: str) -> bool:
         """Commit one host-selected retail skydome and relay packet 51."""
 
@@ -578,7 +600,7 @@ class UGCMode(BaseMode):
         destination = Path(self.server.config.ugc_preview_path)
         payload = bytes(data)
         self._preview_task = asyncio.create_task(
-            asyncio.to_thread(_atomic_write_bytes, destination, payload)
+            self._persist_preview(destination, payload)
         )
         packet = UGCMapInfo()
         packet.png_data = payload
@@ -589,6 +611,14 @@ class UGCMode(BaseMode):
             record_mutation=False,
         )
         return True
+
+    async def _persist_preview(self, destination: Path, payload: bytes) -> None:
+        """Write one PNG, then commit its sidecar flag on the event loop."""
+
+        await asyncio.to_thread(_atomic_write_bytes, destination, payload)
+        self.project.use_overhead_image = True
+        self.project.modified_since_publish = True
+        self._metadata_dirty = True
 
     def send_preview(self, connection: "Connection") -> bool:
         """Send the optional overhead PNG through packet 102 with a size cap."""

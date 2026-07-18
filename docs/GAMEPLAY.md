@@ -79,7 +79,9 @@ death, elimination, sub-round score, role reset, and gangster class menus.
 
 Every mode uses the same crash-safe end sequence and session transition
 service. A map or mode change validates and preloads its replacement before
-the old scene receives `MapEnded(52)` and reconnect reason 18.
+the old scene receives `MapEnded(52)`. Maintained clients acknowledge
+`LoadingMenu` and reload over the retained connection; incompatible clients
+receive reason 18 without being sent new-scene packets.
 
 ## Classes, equipment, and construction
 
