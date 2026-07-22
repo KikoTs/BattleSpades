@@ -6,7 +6,7 @@ import copy
 import logging
 import queue
 from dataclasses import dataclass
-from logging.handlers import QueueHandler, QueueListener
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 
 
@@ -82,8 +82,16 @@ def configure_logging(config, log_dir: Path | str = "logs") -> LoggingRuntime:
     if not configured_file.is_absolute():
         configured_file = log_dir / configured_file
     configured_file.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(
-        configured_file, mode="a", encoding="utf-8", errors="replace"
+    file_handler = RotatingFileHandler(
+        configured_file,
+        mode="a",
+        maxBytes=max(
+            1024 * 1024,
+            int(getattr(config, "log_max_bytes", 16 * 1024 * 1024)),
+        ),
+        backupCount=max(1, int(getattr(config, "log_backup_count", 3))),
+        encoding="utf-8",
+        errors="replace",
     )
     file_handler.setFormatter(formatter)
     sinks.append(file_handler)

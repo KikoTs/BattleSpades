@@ -3,59 +3,79 @@
 from __future__ import annotations
 
 import asyncio
-from io import BytesIO, StringIO
+import os
 import threading
 
 from server import launcher, tutorial_launcher, ugc_launcher
 
 
-class _ImmediateLoop:
-    """Small call_soon_threadsafe recorder used by the daemon-reader tests."""
+async def _run_pipe_monitor(payload: bytes, *, close_writer: bool) -> list[str]:
+    """Feed one real OS pipe through the production non-blocking poller."""
 
-    def __init__(self) -> None:
-        self.caller_threads: list[int] = []
-
-    def call_soon_threadsafe(self, callback, *args) -> None:
-        self.caller_threads.append(threading.get_ident())
-        callback(*args)
+    read_fd, write_fd = os.pipe()
+    reasons: list[str] = []
+    try:
+        with os.fdopen(read_fd, "rb", buffering=0) as stream:
+            os.write(write_fd, payload)
+            if close_writer:
+                os.close(write_fd)
+                write_fd = -1
+            monitor = launcher._start_control_stdin_monitor(
+                asyncio.get_running_loop(),
+                reasons.append,
+                stream=stream,
+            )
+            await asyncio.wait_for(monitor, timeout=1.0)
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+    return reasons
 
 
 def test_control_stdin_accepts_only_exact_shutdown_line() -> None:
     """Whitespace, suffixes, and case variants cannot become commands."""
 
-    loop = _ImmediateLoop()
-    reasons: list[str] = []
     main_thread = threading.get_ident()
-    stream = StringIO(" shutdown\nshutdown now\nSHUTDOWN\nshutdown\n")
-
-    monitor = launcher._start_control_stdin_monitor(
-        loop,
-        reasons.append,
-        stream=stream,
-    )
-    monitor.join(timeout=1.0)
-
-    assert not monitor.is_alive()
-    assert reasons == ["parent requested shutdown on stdin"]
-    assert all(thread_id != main_thread for thread_id in loop.caller_threads)
-
-
-def test_control_stdin_eof_requests_shutdown_for_text_and_binary_pipes() -> None:
-    """Closing either Popen pipe representation gracefully retires the child."""
-
-    for stream in (StringIO(""), BytesIO(b"ignored\n")):
-        loop = _ImmediateLoop()
-        reasons: list[str] = []
-
-        monitor = launcher._start_control_stdin_monitor(
-            loop,
-            reasons.append,
-            stream=stream,
+    reasons = asyncio.run(
+        _run_pipe_monitor(
+            b" shutdown\nshutdown now\nSHUTDOWN\nshutdown\n",
+            close_writer=False,
         )
-        monitor.join(timeout=1.0)
+    )
 
-        assert not monitor.is_alive()
-        assert reasons == ["parent stdin reached EOF"]
+    assert reasons == ["parent requested shutdown on stdin"]
+    assert threading.get_ident() == main_thread
+
+
+def test_control_stdin_eof_requests_shutdown_after_ignored_input() -> None:
+    """Closing the parent pipe gracefully retires the child."""
+
+    reasons = asyncio.run(
+        _run_pipe_monitor(b"ignored\n", close_writer=True)
+    )
+
+    assert reasons == ["parent stdin reached EOF"]
+
+
+def test_control_stdin_accepts_unterminated_shutdown_at_eof() -> None:
+    """EOF completes an exact final line just like buffered ``readline`` did."""
+
+    reasons = asyncio.run(_run_pipe_monitor(b"shutdown", close_writer=True))
+
+    assert reasons == ["parent requested shutdown on stdin"]
+
+
+def test_control_stdin_decoder_bounds_unterminated_input() -> None:
+    """A huge malformed line cannot grow memory or expose a suffix command."""
+
+    decoder = launcher._ControlLineDecoder()
+
+    assert not decoder.feed(b"x" * 5000)
+    assert decoder.discarding_line
+    assert not decoder.pending
+    assert not decoder.feed(b"shutdown\n")
+    assert not decoder.discarding_line
+    assert decoder.feed(b"shutdown\r\n")
 
 
 def test_serve_awaits_parent_requested_stop_to_completion(monkeypatch) -> None:
@@ -88,21 +108,30 @@ def test_serve_awaits_parent_requested_stop_to_completion(monkeypatch) -> None:
         "server.telemetry.TelemetryService",
         lambda _runtime: object(),
     )
+    # Startup GC hardening is covered separately; never freeze pytest's graph.
+    monkeypatch.setattr(launcher, "_freeze_import_graph_for_gc", lambda: True)
     monkeypatch.setattr(launcher.signal, "signal", lambda *_args: None)
-    start_monitor = launcher._start_control_stdin_monitor
+    monitor_tasks = []
+
+    def start_monitor(loop, callback):
+        async def deliver_shutdown() -> None:
+            await asyncio.sleep(0)
+            callback("parent requested shutdown on stdin")
+
+        task = loop.create_task(deliver_shutdown())
+        monitor_tasks.append(task)
+        return task
+
     monkeypatch.setattr(
         launcher,
         "_start_control_stdin_monitor",
-        lambda loop, callback: start_monitor(
-            loop,
-            callback,
-            stream=StringIO("shutdown\n"),
-        ),
+        start_monitor,
     )
 
     asyncio.run(launcher._serve(object(), object(), control_stdin=True))
 
     assert len(instances) == 1
+    assert len(monitor_tasks) == 1
     assert events[-1] == "stop-complete"
     assert events.count("stop-started") == 1
 

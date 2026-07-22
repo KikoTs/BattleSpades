@@ -7,6 +7,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
+from heapq import nsmallest
 from typing import TYPE_CHECKING
 
 import shared.constants as C
@@ -68,6 +69,15 @@ _LOCK_SETTLE_TIME = 1.2
 # per-tick cap so the 60 Hz gameplay thread never runs unbounded raycasts.
 _WALL_PROBE_INTERVAL = 0.10
 _WALL_PROBE_TICK_BUDGET = 4
+# The retail protocol accepts up to 255 players, but one bot only needs its
+# local/strategic cohort for a 10 Hz decision. Bounding this tuple keeps every
+# PerceptionFrame below the frozen Windows pipe-record ceiling even on a full
+# custom server; the authoritative server still owns and simulates all peers.
+_MAX_PERCEPTION_PLAYERS = 32
+# A PerceptionFrame is one multiprocessing pipe record. Keep enough room for
+# the bounded player cohort and control metadata instead of allowing a dense
+# custom map to recreate the frozen Windows large-write deadlock.
+_MAX_PERCEPTION_ENTITIES = 192
 _WALK_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0)
 )
@@ -652,7 +662,11 @@ class BotDirector:
                     observer_generation=runtime.generation,
                     created_at=now,
                     mode_id=mode_id,
-                    players=players,
+                    players=self._players_for_observer(
+                        players,
+                        observer_id=int(bot.id),
+                        objectives=objectives,
+                    ),
                     profile=runtime.profile,
                     entities=entities,
                     objectives=objectives,
@@ -668,6 +682,64 @@ class BotDirector:
                     ),
                 )
             )
+
+    @staticmethod
+    def _players_for_observer(
+        players: tuple[PlayerSnapshot, ...],
+        *,
+        observer_id: int,
+        objectives: tuple[ObjectiveSnapshot, ...],
+    ) -> tuple[PlayerSnapshot, ...]:
+        """Select one bounded strategic cohort for a bot perception frame.
+
+        The observer, every server-owned bot, and objective carriers outrank
+        ordinary peers. Remaining slots are the nearest live participants,
+        with player id as a deterministic tie-breaker.
+        """
+
+        if len(players) <= _MAX_PERCEPTION_PLAYERS:
+            return players
+        observer = next(
+            (
+                player
+                for player in players
+                if int(player.player_id) == int(observer_id)
+            ),
+            None,
+        )
+        origin = observer.position if observer is not None else (0.0, 0.0, 0.0)
+        carriers = {
+            int(objective.carrier_id)
+            for objective in objectives
+            if int(objective.carrier_id) >= 0
+        }
+
+        def priority(player: PlayerSnapshot) -> tuple[float, float, int]:
+            player_id = int(player.player_id)
+            if player_id == int(observer_id):
+                rank = 0.0
+            elif player_id in carriers:
+                rank = 1.0
+            elif bool(player.is_bot):
+                rank = 2.0
+            elif bool(player.alive) and bool(player.spawned):
+                rank = 3.0
+            else:
+                rank = 4.0
+            distance = (
+                (player.position[0] - origin[0]) ** 2
+                + (player.position[1] - origin[1]) ** 2
+                + (player.position[2] - origin[2]) ** 2
+            )
+            return rank, distance, player_id
+
+        return tuple(
+            nsmallest(
+                _MAX_PERCEPTION_PLAYERS,
+                players,
+                key=priority,
+            )
+        )
 
     def _snapshot_players(self) -> tuple[PlayerSnapshot, ...]:
         snapshots: list[PlayerSnapshot] = []
@@ -779,6 +851,10 @@ class BotDirector:
             # replication and would make bots dodge a stale location.
             if kind == "projectile":
                 continue
+            # Dead pickups remain registered while waiting to respawn. They
+            # are neither visible nor usable and only inflate every bot frame.
+            if not bool(getattr(entity, "alive", True)):
+                continue
             position = getattr(entity, "position", None)
             if position is None:
                 position = (
@@ -861,7 +937,57 @@ class BotDirector:
                     ),
                 )
             )
-        return tuple(result)
+        if len(result) <= _MAX_PERCEPTION_ENTITIES:
+            return tuple(result)
+
+        carried_ids = {
+            int(pickup_id)
+            for player in tuple(players.values())
+            for pickup_id in (getattr(player, "pickup_id", None),)
+            if pickup_id is not None
+        }
+        live_positions = tuple(
+            tuple(float(value) for value in player.position)
+            for player in tuple(players.values())
+            if bool(getattr(player, "alive", False))
+            and bool(getattr(player, "spawned", False))
+            and getattr(player, "position", None) is not None
+        )
+
+        def priority(snapshot: EntitySnapshot) -> tuple[float, float, int]:
+            kind = snapshot.kind.lower()
+            if snapshot.hazardous:
+                rank = 0.0
+            elif snapshot.entity_id in carried_ids:
+                rank = 1.0
+            elif kind in {"objective", "intel", "base"}:
+                rank = 2.0
+            elif kind == "projectile":
+                rank = 3.0
+            elif kind in {"pickup", "crate", "resource"}:
+                rank = 4.0
+            else:
+                rank = 5.0
+            distance = min(
+                (
+                    (snapshot.position[0] - position[0]) ** 2
+                    + (snapshot.position[1] - position[1]) ** 2
+                    + (snapshot.position[2] - position[2]) ** 2
+                    for position in live_positions
+                ),
+                default=0.0,
+            )
+            return rank, distance, int(snapshot.entity_id)
+
+        selected = nsmallest(
+            _MAX_PERCEPTION_ENTITIES,
+            result,
+            key=priority,
+        )
+        metrics = getattr(self.server, "metrics", None)
+        if metrics is not None:
+            metrics.bot_perception_entity_overflow += len(result) - len(selected)
+        return tuple(selected)
 
     def _snapshot_objectives(self) -> tuple[ObjectiveSnapshot, ...]:
         mode = getattr(self.server, "mode", None)

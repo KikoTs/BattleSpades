@@ -126,6 +126,9 @@ def stage_release(
         root / "client_patches" / "clipboard_input_patch.py": (
             "client_patches/clipboard_input_patch.py"
         ),
+        root / "client_patches" / "character_jump_smoothing.py": (
+            "client_patches/character_jump_smoothing.py"
+        ),
     }
     missing = [str(path) for path in required_files if not path.is_file()]
     if missing:

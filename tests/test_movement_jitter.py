@@ -863,6 +863,8 @@ def test_replication_forgets_cadence_and_transition_state_before_id_reuse():
     replication._jetpack_owner_handoff_deadline[3] = 912
     replication._jetpack_owner_handoff_target[3] = True
     replication._jetpack_owner_release_settle_deadline[3] = 906
+    replication._last_owner_airborne[3] = True
+    replication._landing_owner_handoff_deadline[3] = 904
 
     replication.forget_player(3)
 
@@ -871,6 +873,31 @@ def test_replication_forgets_cadence_and_transition_state_before_id_reuse():
     assert 3 not in replication._jetpack_owner_handoff_deadline
     assert 3 not in replication._jetpack_owner_handoff_target
     assert 3 not in replication._jetpack_owner_release_settle_deadline
+    assert 3 not in replication._last_owner_airborne
+    assert 3 not in replication._landing_owner_handoff_deadline
+
+
+def test_landing_owner_row_waits_for_two_accepted_inputs() -> None:
+    """A grounded server row must not correct an owner still finishing fall."""
+    player = SimpleNamespace(
+        id=3,
+        airborne=True,
+        _input_receive_sequence=100,
+    )
+    server = SimpleNamespace(
+        config=SimpleNamespace(landing_owner_handoff_input_frames=2)
+    )
+    replication = ReplicationService(server)
+
+    assert replication._landing_owner_handoff_active(player) is False
+
+    player.airborne = False
+    player._input_receive_sequence = 101
+    assert replication._landing_owner_handoff_active(player) is True
+    player._input_receive_sequence = 102
+    assert replication._landing_owner_handoff_active(player) is True
+    player._input_receive_sequence = 103
+    assert replication._landing_owner_handoff_active(player) is False
 
 
 def test_spawn_resets_owner_replication_state_for_the_new_life():

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import faulthandler
+import functools
+import gc
 import logging
 import multiprocessing
+import os
+import select
 import signal
 import sys
-import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -123,45 +128,189 @@ def _configure_console_encoding() -> None:
                 continue
 
 
-def _control_stdin_worker(stream, loop, request_shutdown: Callable[[str], None]) -> None:
-    """Block on a parent-owned pipe without touching the gameplay thread.
+_CONTROL_STDIN_POLL_SECONDS = 0.025
+_CONTROL_STDIN_READ_BYTES = 4096
+_CONTROL_STDIN_MAX_LINE_BYTES = 4096
+_WINDOWS_PIPE_EOF_ERRORS = frozenset({109, 232, 233})
 
-    Only an exact ``shutdown`` line (with the platform line ending removed by
-    comparison, not arbitrary whitespace stripping) or EOF has meaning.  All
-    other input is ignored so this opt-in channel cannot become an accidental
-    command parser.
+
+@dataclass(slots=True)
+class _ControlLineDecoder:
+    """Recognize only an exact ASCII ``shutdown`` line from bounded chunks."""
+
+    pending: bytearray = field(default_factory=bytearray)
+    discarding_line: bool = False
+
+    def feed(self, data: bytes) -> bool:
+        """Return true once one complete exact shutdown line is received."""
+
+        remaining = bytes(data)
+        while remaining:
+            newline = remaining.find(b"\n")
+            if newline < 0:
+                if not self.discarding_line:
+                    self.pending.extend(remaining)
+                    if len(self.pending) > _CONTROL_STDIN_MAX_LINE_BYTES:
+                        # A launcher control line has one legal eight-byte
+                        # value. Bound malformed input until its next newline.
+                        self.pending.clear()
+                        self.discarding_line = True
+                return False
+
+            segment = remaining[: newline + 1]
+            remaining = remaining[newline + 1 :]
+            if not self.discarding_line:
+                self.pending.extend(segment)
+                if bytes(self.pending) in (b"shutdown\n", b"shutdown\r\n"):
+                    return True
+            self.pending.clear()
+            self.discarding_line = False
+        return False
+
+    def finish(self) -> bool:
+        """Recognize the sole legal unterminated line when the pipe closes."""
+
+        return not self.discarding_line and bytes(self.pending) == b"shutdown"
+
+
+def _control_stream_fd(stream) -> int:
+    """Return the redirected control stream descriptor or raise clearly."""
+
+    if stream is None:
+        raise EOFError("parent stdin is unavailable")
+    try:
+        descriptor = int(stream.fileno())
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise OSError("parent stdin has no pollable file descriptor") from exc
+    if descriptor < 0:
+        raise OSError("parent stdin file descriptor is closed")
+    if sys.platform == "win32":
+        # CRT text translation may read ahead after a trailing carriage return,
+        # defeating the byte count returned by PeekNamedPipe. This descriptor
+        # is a dedicated ASCII control channel, so raw binary reads are exact.
+        import msvcrt
+
+        msvcrt.setmode(descriptor, os.O_BINARY)
+    return descriptor
+
+
+def _poll_windows_control_pipe(descriptor: int) -> tuple[bytes | None, bool]:
+    """Poll one Windows anonymous/named pipe without starting a reader thread."""
+
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(descriptor)
+    peek_named_pipe, ctypes, wintypes = _windows_peek_named_pipe()
+    available = wintypes.DWORD()
+    if not peek_named_pipe(
+        handle,
+        None,
+        0,
+        None,
+        ctypes.byref(available),
+        None,
+    ):
+        error = ctypes.get_last_error()
+        if error in _WINDOWS_PIPE_EOF_ERRORS:
+            return b"", True
+        raise ctypes.WinError(error)
+    if available.value <= 0:
+        return None, False
+    data = os.read(
+        descriptor,
+        min(int(available.value), _CONTROL_STDIN_READ_BYTES),
+    )
+    return data, not data
+
+
+@functools.lru_cache(maxsize=1)
+def _windows_peek_named_pipe():
+    """Resolve ``PeekNamedPipe`` once instead of rebuilding ctypes per tick."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    peek_named_pipe = kernel32.PeekNamedPipe
+    peek_named_pipe.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    )
+    peek_named_pipe.restype = wintypes.BOOL
+    return peek_named_pipe, ctypes, wintypes
+
+
+def _poll_posix_control_pipe(descriptor: int) -> tuple[bytes | None, bool]:
+    """Poll a POSIX pipe/file descriptor without blocking the event loop."""
+
+    readable, _writable, _exceptional = select.select(
+        (descriptor,),
+        (),
+        (),
+        0.0,
+    )
+    if not readable:
+        return None, False
+    data = os.read(descriptor, _CONTROL_STDIN_READ_BYTES)
+    return data, not data
+
+
+async def _control_stdin_monitor(
+    stream,
+    request_shutdown: Callable[[str], None],
+) -> None:
+    """Poll the parent pipe without leaving a thread alive during AI spawns.
+
+    PyInstaller's frozen Windows runtime can lose multiprocessing queue records
+    when a different Python thread is already blocked in ``stdin.readline`` at
+    ``spawn`` time. AI workers may restart throughout a match, so merely
+    delaying that thread is insufficient. ``PeekNamedPipe`` keeps every poll
+    non-blocking and entirely on the event-loop thread.
     """
 
-    shutdown_lines = {
-        "shutdown",
-        "shutdown\n",
-        "shutdown\r\n",
-        b"shutdown",
-        b"shutdown\n",
-        b"shutdown\r\n",
-    }
+    decoder = _ControlLineDecoder()
+    try:
+        descriptor = _control_stream_fd(stream)
+    except EOFError:
+        request_shutdown("parent stdin reached EOF")
+        return
+    except OSError:
+        logging.getLogger("BattleSpades").warning(
+            "Parent stdin control channel failed",
+            exc_info=True,
+        )
+        return
+
+    poll = (
+        _poll_windows_control_pipe
+        if sys.platform == "win32"
+        else _poll_posix_control_pipe
+    )
     while True:
         try:
-            line = stream.readline()
+            data, eof = poll(descriptor)
         except (OSError, ValueError):
             logging.getLogger("BattleSpades").warning(
                 "Parent stdin control channel failed",
                 exc_info=True,
             )
             return
-        if line in ("", b""):
-            reason = "parent stdin reached EOF"
-        elif line in shutdown_lines:
-            reason = "parent requested shutdown on stdin"
-        else:
-            continue
-        try:
-            loop.call_soon_threadsafe(request_shutdown, reason)
-        except RuntimeError:
-            # The event loop can close between a parent pipe EOF and this
-            # daemon reader waking. Shutdown has already completed in that case.
-            pass
-        return
+        if eof:
+            reason = (
+                "parent requested shutdown on stdin"
+                if decoder.finish()
+                else "parent stdin reached EOF"
+            )
+            request_shutdown(reason)
+            return
+        if data and decoder.feed(data):
+            request_shutdown("parent requested shutdown on stdin")
+            return
+        await asyncio.sleep(_CONTROL_STDIN_POLL_SECONDS)
 
 
 def _start_control_stdin_monitor(
@@ -169,17 +318,42 @@ def _start_control_stdin_monitor(
     request_shutdown: Callable[[str], None],
     *,
     stream=None,
-) -> threading.Thread:
-    """Start the opt-in daemon that owns all blocking stdin reads."""
+) -> asyncio.Task:
+    """Schedule the opt-in, thread-free stdin control monitor."""
 
-    monitor = threading.Thread(
-        target=_control_stdin_worker,
-        args=(sys.stdin if stream is None else stream, loop, request_shutdown),
+    return loop.create_task(
+        _control_stdin_monitor(
+            sys.stdin if stream is None else stream,
+            request_shutdown,
+        ),
         name="BattleSpades-stdin-control",
-        daemon=True,
     )
-    monitor.start()
-    return monitor
+
+
+def _freeze_import_graph_for_gc() -> bool:
+    """Move the stable import graph out of later generation-2 scans.
+
+    This must run after gameplay modules are imported and immediately before
+    the server object is constructed.  Objects created for maps, players,
+    workers, and matches therefore retain normal garbage-collection behavior.
+
+    Returns:
+        ``True`` when the runtime supports and completed ``gc.freeze``;
+        otherwise ``False``.  Alternative Python runtimes may omit the API.
+    """
+
+    freeze = getattr(gc, "freeze", None)
+    if not callable(freeze):
+        return False
+
+    # Retire import-time cycles before moving the remaining long-lived graph
+    # to CPython's permanent generation.  This pause happens before gameplay.
+    gc.collect()
+    try:
+        freeze()
+    except (AttributeError, NotImplementedError):
+        return False
+    return True
 
 
 async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> None:
@@ -189,14 +363,19 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
     from server.telemetry import TelemetryService
 
     logger = logging.getLogger("BattleSpades")
+    loop = asyncio.get_running_loop()
+
+    # Keep this directly beside construction: freezing later would retain
+    # gameplay state forever, while freezing earlier would miss lazy imports.
+    _freeze_import_graph_for_gc()
     server = BattleSpadesServer(
         config,
         telemetry=TelemetryService(logging_runtime),
     )
-    loop = asyncio.get_running_loop()
 
     server_task = asyncio.create_task(server.start(), name="BattleSpades-server")
     shutdown_task: asyncio.Task | None = None
+    control_task: asyncio.Task | None = None
 
     async def stop_after_start_boundary() -> None:
         # A parent can close its pipe immediately after spawning us. Avoid
@@ -228,7 +407,7 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
             )
 
     if control_stdin:
-        _start_control_stdin_monitor(loop, request_shutdown)
+        control_task = _start_control_stdin_monitor(loop, request_shutdown)
 
     try:
         await server_task
@@ -240,6 +419,11 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
             await shutdown_task
         else:
             await server.stop()
+        if control_task is not None:
+            if not control_task.done():
+                control_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await control_task
 
 
 def _run_server(

@@ -7,7 +7,8 @@ worker from accidentally becoming another gameplay authority.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from typing import TypeAlias
 
@@ -92,8 +93,11 @@ class VoxelChange:
 class MapSnapshot:
     """Complete navigation base for one map epoch.
 
-    ``raw_vxl`` is serialized only by the bridge thread.  The gameplay thread
-    merely publishes the already-owned immutable bytes object.
+    The gameplay thread publishes ``raw_vxl`` without transforming it. Before
+    crossing the Windows multiprocessing pipe, the bridge replaces that field
+    with level-1 ``compressed_vxl`` and records ``raw_vxl_size``. This keeps
+    multi-megabyte VXL payloads out of the pipe while preserving one immutable
+    pickle-safe record.
     """
 
     map_epoch: int
@@ -102,6 +106,72 @@ class MapSnapshot:
     mode_id: str
     map_name: str = ""
     changed_cells: tuple[VoxelChange, ...] = ()
+    compressed_vxl: bytes = b""
+    raw_vxl_size: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MapSnapshotTransferStart:
+    """Versioned header for a bounded, chunked map-snapshot transfer.
+
+    A complete :class:`MapSnapshot` can be several megabytes.  Sending that
+    object through one Windows multiprocessing pipe write can deadlock a
+    frozen child before it enters the worker loop.  The bridge therefore
+    sends this small header followed by ordered 48 KiB chunks.
+    """
+
+    format_version: int
+    transfer_id: int
+    payload_size: int
+    decoded_size: int
+    chunk_count: int
+    digest: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class MapSnapshotTransferChunk:
+    """One immutable, ordered fragment of a map-snapshot transfer."""
+
+    transfer_id: int
+    chunk_index: int
+    data: bytes
+
+
+def compress_map_snapshot(snapshot: MapSnapshot) -> MapSnapshot:
+    """Return the level-1 zlib transport form of ``snapshot``.
+
+    Caller context matters: production invokes this only on ``BotAIBridge``,
+    never on the authoritative gameplay thread. Already encoded and empty
+    snapshots are returned unchanged.
+    """
+
+    if snapshot.compressed_vxl or not snapshot.raw_vxl:
+        return snapshot
+    raw = bytes(snapshot.raw_vxl)
+    return replace(
+        snapshot,
+        raw_vxl=b"",
+        compressed_vxl=zlib.compress(raw, level=1),
+        raw_vxl_size=len(raw),
+    )
+
+
+def map_snapshot_vxl_bytes(snapshot: MapSnapshot) -> bytes:
+    """Decode and validate a map snapshot's canonical VXL bytes."""
+
+    if not snapshot.compressed_vxl:
+        return bytes(snapshot.raw_vxl)
+    try:
+        raw = zlib.decompress(snapshot.compressed_vxl)
+    except zlib.error as exc:
+        raise ValueError("invalid compressed bot map snapshot") from exc
+    expected = int(snapshot.raw_vxl_size)
+    if expected <= 0 or len(raw) != expected:
+        raise ValueError(
+            "bot map snapshot size mismatch: "
+            f"expected {expected}, decoded {len(raw)}"
+        )
+    return raw
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,5 +398,29 @@ class WorkerShutdown:
     reason: str = "server shutdown"
 
 
-WorkerInput: TypeAlias = MapSnapshot | WorldDelta | PerceptionFrame | WorkerShutdown
-WorkerOutput: TypeAlias = BotIntent
+@dataclass(frozen=True, slots=True)
+class WorkerHeartbeat:
+    """Acknowledge one completely processed child-worker input batch.
+
+    ``processed_frame_id`` is the greatest perception frame consumed by the
+    batch, including frames intentionally discarded as stale or producing no
+    intent.  This distinction lets the supervisor detect a genuinely wedged
+    path query without treating normal zero-intent states as worker failure.
+    """
+
+    batch_id: int
+    processed_frame_id: int = -1
+    map_epoch: int = -1
+    topology_version: int = -1
+    snapshot_transfer_id: int = -1
+
+
+WorkerInput: TypeAlias = (
+    MapSnapshot
+    | MapSnapshotTransferStart
+    | MapSnapshotTransferChunk
+    | WorldDelta
+    | PerceptionFrame
+    | WorkerShutdown
+)
+WorkerOutput: TypeAlias = BotIntent | WorkerHeartbeat

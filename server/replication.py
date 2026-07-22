@@ -43,6 +43,8 @@ class ReplicationService:
         self._jetpack_owner_handoff_deadline: dict[int, int] = {}
         self._jetpack_owner_handoff_target: dict[int, bool] = {}
         self._jetpack_owner_release_settle_deadline: dict[int, int] = {}
+        self._last_owner_airborne: dict[int, bool] = {}
+        self._landing_owner_handoff_deadline: dict[int, int] = {}
 
     def forget_player(self, player_id: int) -> None:
         """Discard recipient state at disconnect or a new-life boundary.
@@ -59,6 +61,8 @@ class ReplicationService:
         self._jetpack_owner_handoff_deadline.pop(player_id, None)
         self._jetpack_owner_handoff_target.pop(player_id, None)
         self._jetpack_owner_release_settle_deadline.pop(player_id, None)
+        self._last_owner_airborne.pop(player_id, None)
+        self._landing_owner_handoff_deadline.pop(player_id, None)
 
     def broadcast_world_updates(self) -> None:
         """Send one grouped snapshot at the configured retail cadence."""
@@ -136,6 +140,7 @@ class ReplicationService:
                     player.id in urgent_player_ids
                     or (
                         not self._jetpack_owner_handoff_active(player)
+                        and not self._landing_owner_handoff_active(player)
                         and self._should_send_self_row(
                             player.id,
                             max(
@@ -578,6 +583,41 @@ class ReplicationService:
         if last_loop is None:
             return True
         return (self.server.loop_count - last_loop) >= interval
+
+    def _landing_owner_handoff_active(self, player) -> bool:
+        """Suppress one early owner row at the airborne-to-ground boundary.
+
+        Foreground Python 2 captures show the authoritative body can report
+        grounded/zero vertical velocity one recurrence before the owner's
+        movement history lands. Sending that inseparable position row starts
+        a visible correction exactly as the camera touches terrain. Observers
+        still receive the authoritative row; only the owner's correction row
+        waits for a tiny accepted-input handoff.
+        """
+        player_id = int(player.id)
+        airborne = bool(getattr(player, "airborne", False))
+        was_airborne = self._last_owner_airborne.get(player_id, airborne)
+        self._last_owner_airborne[player_id] = airborne
+        received = int(getattr(player, "_input_receive_sequence", 0))
+
+        if was_airborne and not airborne:
+            settle_frames = max(0, min(6, int(getattr(
+                getattr(self.server, "config", None),
+                "landing_owner_handoff_input_frames",
+                2,
+            ))))
+            if settle_frames > 0:
+                self._landing_owner_handoff_deadline[player_id] = (
+                    received + settle_frames
+                )
+
+        deadline = self._landing_owner_handoff_deadline.get(player_id)
+        if deadline is None:
+            return False
+        if received < deadline:
+            return True
+        self._landing_owner_handoff_deadline.pop(player_id, None)
+        return False
 
     def build_world_update_packet(
         self,

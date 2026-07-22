@@ -22,6 +22,10 @@ ENet peer
 Only the simulation thread mutates gameplay state. File and console logging run
 on a listener thread through a bounded queue. Diagnostic capture must follow the
 same rule: it may observe gameplay, but must never make the simulation wait.
+At process startup, after lazy gameplay imports but before server construction,
+the launcher collects import-time cycles and moves the stable import graph to
+CPython's permanent GC generation. Map, player, worker, and match objects are
+created afterward and retain ordinary garbage-collection behavior.
 
 ## Service boundaries
 
@@ -134,6 +138,8 @@ dependency while retaining `server.metrics` as a compatibility alias.
   thread. A full queue drops diagnostic records instead of gameplay frames.
 - Packet parsing and hex dumps require both DEBUG logging and
   `logging.packet_trace=true`.
+- The background file sink rotates at `logging.max_bytes` and retains at most
+  `logging.backup_count` archives, so diagnostics remain disk-bounded.
 - Physics parity, movement snapshots, stack sampling, and self-row capture are
   development tools. Production defaults must leave them disabled.
 - Diagnostic producers are rate-limited to ten samples/second per session,
@@ -179,6 +185,14 @@ queue at 128, and the director drains at most 12 intents per simulation tick.
 Results carry bot generation, frame, map/mode epoch, topology version, and a
 250 ms expiry; any mismatch is discarded.
 
+Full map snapshots are serialized and level-1 compressed on the bridge, then
+sent as versioned, Blake2-validated records no larger than 48 KiB. Frames and
+terrain cannot overtake an incomplete transfer. Terrain deltas contain at most
+1,024 cells and equal-version batches are idempotent in the worker. A transfer
+lease begins with the first queued header and is renewed only by child
+heartbeats, so a dead reader is restarted even when a large custom map fills
+the 64-record queue before any perception frame can be sent.
+
 The bridge retains a coalesced canonical terrain overlay in addition to the
 immutable base VXL. Worker restart and the 65,536-cell overflow rebase compose
 `base + overlay` on the bridge thread. This prevents a restarted navigator
@@ -191,19 +205,32 @@ boundary. A slow worker therefore receives the newest perception for every
 concrete bot life instead of making decisions from an obsolete FIFO backlog;
 the 64-entry bound applies to unique bot lives and overflow remains observable.
 
+Each frame contains at most 32 prioritized players and 192 live entities. The
+observer, server-owned bots, objective carriers, explosives, projectiles, and
+nearby resources win deterministic priority. Dead respawning pickups are not
+serialized; overflow is counted in runtime metrics. This prevents dense custom
+maps and the protocol's optional 255-player configuration from producing one
+unbounded Windows pipe write.
+
 The worker uses `py_trees` at 8 Hz, perception at 10 Hz per staggered bot, and
 a token bucket capped at 24 path requests/second for the default 12-bot roster.
 Native Recast/Detour v1.6.0 is vendored under its Zlib license. A bounded
 layered A* remains the source-only fallback. The native bridge owns a persistent
 DetourCrowd instance (64-agent cap) and returns obstacle-avoiding desired
 steering only; native `Player` physics still executes every movement input.
-Live steering never calls Detour's synchronous `find_path` fallback. A corrupt
-multi-tile corridor can leave that native query alive but unable to return;
-zero crowd steering therefore falls through to bounded voxel A*. The supervisor
-also treats unanswered live-bot frames as a heartbeat lease: after startup
-grace, five seconds without any intent terminates and restarts only the AI
-child. `/bots status` exposes both `stalls` and current intent `silence` so an
-alive-but-wedged worker is distinguishable from ordinary local route recovery.
+Live steering never calls Detour's synchronous `find_path` fallback. Expensive
+native corridor warming is limited to one 32x32 tile per worker batch; bounded
+voxel A* remains available while later batches warm the rest. Full-map water
+escape is also resumable in 128-node slices rather than scanning a 512x512 sea
+inside one decision. The worker emits a processed-frame heartbeat even when a
+valid frame intentionally produces no intent. The supervisor clears a live
+frame lease only for that frame or a newer one, so countdown/cadence states do
+not cause false restarts and an old map-only acknowledgement cannot hide a real
+wedge. The first snapshot/frame has an eight-second cold lease; after one
+processed frame, five seconds without a result terminates and restarts only the
+AI child. `/bots status` exposes stalls, current intent silence, awaited frame,
+snapshot transfer, and heartbeat progress so an alive-but-wedged worker is
+distinguishable from ordinary local route recovery.
 Class-filtered jump, crouch, safe-drop, and fuel-gated jetpack transitions are
 represented by an explicit affordance layer above the ground mesh. Immediate
 waypoints are rechecked against the live VXL whenever the body voxel or

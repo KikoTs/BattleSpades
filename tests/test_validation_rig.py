@@ -5,7 +5,7 @@ from scripts.parity_artifact import ParityArtifact
 from scripts.parity_clients import DEFAULT_CLIENT_DIR, build_client_specs
 from scripts.run_validation_server import parse_args
 from scripts.scenarios.movement_baseline import analyze_movement_samples
-from server.config import ServerConfig
+from server.config import BotConfig, ServerConfig
 from server.validation import build_validation_config
 
 
@@ -14,6 +14,8 @@ def test_validation_config_overrides_runtime_values_without_mutating_source():
         port=27015,
         default_map="CityOfChicago",
         default_mode="tdm",
+        bot_count=4,
+        bots=BotConfig(configured=True, enabled=True, max_bots=12),
     )
 
     result = build_validation_config(
@@ -27,8 +29,12 @@ def test_validation_config_overrides_runtime_values_without_mutating_source():
     assert result.default_map == "ArcticBase"
     assert result.default_mode == "tdm"
     assert result.name.endswith("[VALIDATION]")
+    assert result.bot_count == 0
+    assert result.bots.enabled is False
     assert source.port == 27015
     assert source.default_map == "CityOfChicago"
+    assert source.bot_count == 4
+    assert source.bots.enabled is True
 
 
 def test_validation_config_refuses_public_port():

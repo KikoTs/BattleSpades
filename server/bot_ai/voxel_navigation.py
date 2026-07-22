@@ -62,6 +62,17 @@ class VoxelActionStep:
     topology_version: int = -1
 
 
+@dataclass(slots=True)
+class _WaterSearchState:
+    """Resumable breadth-first water escape search for one start column."""
+
+    start: SurfaceSample
+    radius: int
+    frontier: deque[tuple[int, int]]
+    came_from: dict[tuple[int, int], tuple[int, int] | None]
+    samples: dict[tuple[int, int], SurfaceSample]
+
+
 class VoxelTerrain:
     """Classify bounded local surfaces through a fail-closed solid query."""
 
@@ -266,6 +277,7 @@ class VoxelActionPlanner:
         self._water_goal: dict[tuple[int, int], SurfaceSample] = {}
         self._water_dead_ends: set[tuple[int, int]] = set()
         self._water_route_columns: set[tuple[int, int]] = set()
+        self._water_searches: dict[tuple[int, int], _WaterSearchState] = {}
 
     def invalidate_water_routes(
         self,
@@ -282,6 +294,15 @@ class VoxelActionPlanner:
         """
 
         self._water_dead_ends.clear()
+        if changed_columns is None:
+            self._water_searches.clear()
+        else:
+            # Preserve wide searches when an unrelated firefight changes a
+            # distant column. A search only retains classified samples, so an
+            # unvisited changed column is read canonically when reached.
+            for start_key, search in tuple(self._water_searches.items()):
+                if not search.came_from.keys().isdisjoint(changed_columns):
+                    self._water_searches.pop(start_key, None)
         if (
             changed_columns is not None
             and self._water_route_columns.isdisjoint(changed_columns)
@@ -296,14 +317,18 @@ class VoxelActionPlanner:
         position: Vector3,
         *,
         search_radius: int = MAP_X,
+        max_nodes: int | None = None,
     ) -> VoxelActionStep | None:
         """Return the first recovery step toward the nearest dry surface.
 
         Water nodes are legal only inside this recovery search.  The search is
         bounded to the map and accepts at most a two-voxel shore climb,
         matching the base jump affordance. Successful paths seed a cached
-        flow field for their water cells. A blocked or taller shore returns no
-        step so the worker can escalate to breach or construction.
+        flow field for their water cells. ``max_nodes`` makes the wide search
+        resumable across worker batches; ``None`` preserves the synchronous
+        behavior used by focused offline navigation fixtures. A blocked or
+        taller shore returns no step so the worker can escalate to breach or
+        construction.
         """
 
         start = self.terrain.classify(
@@ -337,15 +362,30 @@ class VoxelActionPlanner:
         if start_key in self._water_dead_ends:
             return None
 
-        frontier: deque[tuple[int, int]] = deque((start_key,))
-        came_from: dict[tuple[int, int], tuple[int, int] | None] = {
-            start_key: None
-        }
-        samples: dict[tuple[int, int], SurfaceSample] = {start_key: start}
         radius = max(1, min(MAP_X, int(search_radius)))
+        search = self._water_searches.get(start_key)
+        if search is None or search.radius != radius:
+            if len(self._water_searches) >= 32:
+                self._water_searches.pop(next(iter(self._water_searches)))
+            search = _WaterSearchState(
+                start=start,
+                radius=radius,
+                frontier=deque((start_key,)),
+                came_from={start_key: None},
+                samples={start_key: start},
+            )
+            self._water_searches[start_key] = search
+        frontier = search.frontier
+        came_from = search.came_from
+        samples = search.samples
+        node_budget = (
+            None if max_nodes is None else max(1, int(max_nodes))
+        )
+        processed = 0
 
-        while frontier:
+        while frontier and (node_budget is None or processed < node_budget):
             current_key = frontier.popleft()
+            processed += 1
             current = samples[current_key]
             if not current.water:
                 path = [current_key]
@@ -363,6 +403,7 @@ class VoxelActionPlanner:
                     self._water_route_columns.add(water_key)
                     self._water_route_columns.add(path[index + 1])
                 self._water_route_columns.add((current.x, current.y))
+                self._water_searches.pop(start_key, None)
                 return self._water_step(
                     position, samples[path[1]], current
                 )
@@ -398,6 +439,11 @@ class VoxelActionPlanner:
                 came_from[neighbor_key] = current_key
                 samples[neighbor_key] = neighbor
                 frontier.append(neighbor_key)
+        if frontier:
+            # A healthy worker may emit no intention while this bounded slice
+            # is pending; its processed-frame heartbeat keeps supervision live.
+            return None
+        self._water_searches.pop(start_key, None)
         self._water_dead_ends.add(start_key)
         return None
 

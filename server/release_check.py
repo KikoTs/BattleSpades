@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import multiprocessing
+import queue
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -67,47 +69,208 @@ class CheckReport:
         return tuple(item.line for item in self.items)
 
 
-def _worker_echo(connection, token: str) -> None:
-    """Reply from a spawned interpreter, proving child bootstrap works."""
+def _check_worker_spawn(
+    default_map: Path,
+    *,
+    cold_timeout: float = 30.0,
+    intent_timeout: float = 10.0,
+) -> str:
+    """Prove cold full-map bootstrap and a separate real AI decision.
 
-    try:
-        connection.send(token)
-    finally:
-        connection.close()
+    The first phase reproduces production ordering with the staged default
+    VXL as the worker's first message. The second empty-map phase is separate
+    so a heartbeat cannot substitute for proving :class:`BotBrain` emitted a
+    genuine intention. No gameplay listener is opened.
+    """
 
+    from server.bot_ai.messages import (
+        BotIntent,
+        MapSnapshot,
+        PerceptionFrame,
+        PlayerSnapshot,
+        WorkerHeartbeat,
+        WorkerShutdown,
+    )
+    from server.bot_ai.profiles import ProfileFactory
+    from server.bot_ai.snapshot_transport import encode_map_snapshot
+    from server.bot_ai.worker import run_worker
+    from server.game_constants import DEFAULT_WEAPON_TOOL
 
-def _check_worker_spawn(timeout: float = 10.0) -> str:
-    """Start and reap a Windows-safe spawned process."""
+    map_path = Path(default_map)
+    if not map_path.is_file():
+        raise OSError(f"default map is missing: {map_path}")
+    raw_vxl = map_path.read_bytes()
+    if not raw_vxl:
+        raise ValueError(f"default map is empty: {map_path}")
 
     context = multiprocessing.get_context("spawn")
-    receiver, sender = context.Pipe(duplex=False)
-    token = "battlespades-worker-ok"
+    worker_input = context.Queue(maxsize=8)
+    worker_output = context.Queue(maxsize=8)
     process = context.Process(
-        target=_worker_echo,
-        args=(sender, token),
+        target=run_worker,
+        args=(worker_input, worker_output, 11, 8.0, 24.0),
         name="BattleSpadesReleaseCheck",
     )
     try:
         process.start()
-        sender.close()
-        if not receiver.poll(timeout):
-            raise TimeoutError(f"child did not respond within {timeout:.1f}s")
-        response = receiver.recv()
-        process.join(timeout)
+
+        def send(message, phase: str) -> None:
+            try:
+                worker_input.put(message, timeout=2.0)
+            except queue.Full as exc:
+                raise TimeoutError(
+                    f"AI child input queue blocked during {phase}"
+                ) from exc
+
+        def send_snapshot(snapshot: MapSnapshot, transfer_id: int) -> None:
+            encoded = encode_map_snapshot(
+                snapshot,
+                transfer_id=transfer_id,
+            )
+            for message in encoded.messages:
+                send(message, f"snapshot transfer {transfer_id}")
+
+        observer = PlayerSnapshot(
+            player_id=1,
+            generation=1,
+            team=2,
+            class_id=0,
+            alive=True,
+            spawned=True,
+            position=(0.0, 0.0, 0.0),
+            eye=(0.0, 0.0, 0.0),
+            orientation=(1.0, 0.0, 0.0),
+            velocity=(0.0, 0.0, 0.0),
+            health=100,
+            tool=DEFAULT_WEAPON_TOOL,
+            blocks=50,
+            ammo_clip=10,
+            ammo_reserve=50,
+            is_bot=True,
+        )
+        enemy = PlayerSnapshot(
+            player_id=2,
+            generation=1,
+            team=3,
+            class_id=0,
+            alive=True,
+            spawned=True,
+            position=(10.0, 0.0, 0.0),
+            eye=(10.0, 0.0, 0.0),
+            orientation=(-1.0, 0.0, 0.0),
+            velocity=(0.0, 0.0, 0.0),
+            health=100,
+            tool=DEFAULT_WEAPON_TOOL,
+            blocks=50,
+            ammo_clip=10,
+            ammo_reserve=50,
+            is_bot=False,
+        )
+        profile = ProfileFactory(seed=11).create("normal")
+
+        def frame(frame_id: int, map_epoch: int) -> PerceptionFrame:
+            return PerceptionFrame(
+                frame_id=frame_id,
+                map_epoch=map_epoch,
+                mode_epoch=1,
+                topology_version=0,
+                observer_id=1,
+                observer_generation=1,
+                created_at=time.monotonic(),
+                mode_id="tdm",
+                players=(observer, enemy),
+                profile=profile,
+            )
+
+        # Phase one: this must be the cold child's first navigation snapshot.
+        send_snapshot(
+            MapSnapshot(1, 0, raw_vxl, "tdm", map_path.stem),
+            1,
+        )
+        send(
+            frame(1, 1),
+            "full-map frame",
+        )
+        full_map_heartbeat = None
+        deadline = time.monotonic() + max(0.1, float(cold_timeout))
+        while time.monotonic() < deadline and full_map_heartbeat is None:
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                message = worker_output.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if (
+                isinstance(message, WorkerHeartbeat)
+                and int(message.map_epoch) == 1
+                and int(message.processed_frame_id) >= 1
+                and int(message.snapshot_transfer_id) == 1
+            ):
+                full_map_heartbeat = message
+        if full_map_heartbeat is None:
+            raise TimeoutError(
+                "AI child returned no full-map frame heartbeat for "
+                f"{map_path.name} within {cold_timeout:.1f}s"
+            )
+
+        # Phase two: reset to a collision-less map and require a real intent,
+        # independent from the full-map heartbeat accepted above.
+        send_snapshot(
+            MapSnapshot(2, 0, b"", "tdm", "release-check-intent"),
+            2,
+        )
+        send(frame(2, 2), "intent-phase frame")
+        intent_heartbeat = None
+        intent = None
+        deadline = time.monotonic() + max(0.1, float(intent_timeout))
+        while time.monotonic() < deadline and (
+            intent_heartbeat is None or intent is None
+        ):
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                message = worker_output.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if (
+                isinstance(message, WorkerHeartbeat)
+                and int(message.map_epoch) == 2
+                and int(message.processed_frame_id) >= 2
+                and int(message.snapshot_transfer_id) == 2
+            ):
+                intent_heartbeat = message
+            elif isinstance(message, BotIntent) and int(message.frame_id) == 2:
+                intent = message
+        if intent_heartbeat is None or intent is None:
+            missing = []
+            if intent_heartbeat is None:
+                missing.append("intent-phase heartbeat")
+            if intent is None:
+                missing.append("bot intent")
+            raise TimeoutError(
+                f"AI child returned no {' or '.join(missing)} during separate "
+                f"intent phase within {intent_timeout:.1f}s"
+            )
+
+        send(WorkerShutdown(), "shutdown")
+        process.join(max(2.0, float(intent_timeout)))
         if process.is_alive():
-            raise TimeoutError(f"child did not exit within {timeout:.1f}s")
+            raise TimeoutError(
+                f"AI child did not exit within {intent_timeout:.1f}s"
+            )
         if process.exitcode != 0:
             raise RuntimeError(f"child exited with status {process.exitcode}")
-        if response != token:
-            raise RuntimeError(f"child returned unexpected token {response!r}")
-        return f"spawned child exited {process.exitcode}"
+        return (
+            f"AI child processed full map {map_path.name} "
+            f"(heartbeat batch={full_map_heartbeat.batch_id}); "
+            f"intent frame={intent.frame_id}; exited {process.exitcode}"
+        )
     finally:
-        receiver.close()
-        sender.close()
         if process.is_alive():
             process.terminate()
             process.join(timeout=2.0)
         process.close()
+        for process_queue in (worker_input, worker_output):
+            process_queue.cancel_join_thread()
+            process_queue.close()
 
 
 def _attempt(name: str, operation: Callable[[], str]) -> CheckItem:
@@ -206,5 +369,18 @@ def run_release_check(paths: RuntimePaths) -> CheckReport:
         return f"{len(files)} KV6 files"
 
     items.append(_attempt("prefabs", check_prefabs))
-    items.append(_attempt("worker spawn", _check_worker_spawn))
+
+    maps_root = Path(config.maps_path)
+    default_name = str(config.default_map)
+    default_map = maps_root / (
+        default_name
+        if default_name.lower().endswith(".vxl")
+        else f"{default_name}.vxl"
+    )
+    items.append(
+        _attempt(
+            "worker spawn",
+            lambda: _check_worker_spawn(default_map),
+        )
+    )
     return CheckReport(tuple(items))

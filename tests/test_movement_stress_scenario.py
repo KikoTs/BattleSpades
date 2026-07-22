@@ -378,7 +378,9 @@ def test_yaw_ramp_uses_one_client_clock_schedule_and_one_cleanup_rpc():
     assert "clock.schedule(_stress_yaw_tick)" in start
     assert "_stress_yaw_elapsed += max(0.0, float(dt))" in start
     assert "nonlocal" not in start  # generated code runs under Python 2.7
-    assert "manager.scene.player.character.yaw = _yaw" in start
+    assert "_player.character.yaw = _yaw" in start
+    assert "if _player is None" in start
+    assert "unschedule(_stress_yaw_tick)" in start
     assert "_stress_yaw_delta = 90.000000000" in start
     assert "set_orientation" not in start
 

@@ -100,7 +100,7 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.3-alpha.1` is packaged as six standalone server archives. Each archive
+`0.0.3-alpha.2` is packaged as six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 

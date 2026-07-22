@@ -659,6 +659,17 @@ class _ZeroCrowdNavigator:
         raise AssertionError("live worker must use bounded voxel A* fallback")
 
 
+class _ForwardCrowdNavigator:
+    """Return one stable direction while recording native query cadence."""
+
+    def __init__(self) -> None:
+        self.crowd_calls = 0
+
+    def crowd_steer(self, *_args, **_kwargs):
+        self.crowd_calls += 1
+        return (1.0, 0.0, 0.0)
+
+
 def test_recast_tile_omits_the_universal_waterbed_surface() -> None:
     world = WorkerVoxelWorld()
     navigator = _RecordingNavigator()
@@ -772,6 +783,41 @@ def test_zero_native_crowd_steering_skips_unbounded_find_path_fallback() -> None
 
     assert direction == (0.0, 0.0, 0.0)
     assert navigator.find_path_calls == 0
+
+
+def test_native_corridor_warms_only_one_expensive_tile_per_worker_batch() -> None:
+    world = WorkerVoxelWorld()
+    navigator = _ForwardCrowdNavigator()
+    start = (1.5, 1.5, 7.75)
+    goal = (127.5, 1.5, 7.75)
+    corridor = world._tile_corridor(start, goal)
+    rebuilt: list[tuple[int, int]] = []
+    world._vxl = object()
+    world._native_nav = navigator
+
+    def rebuild(tile_x: int, tile_y: int) -> None:
+        tile = tile_x, tile_y
+        rebuilt.append(tile)
+        world._built_tiles.add(tile)
+        world._dirty_tiles.discard(tile)
+
+    world._rebuild_native_tile = rebuild
+
+    for expected_count in range(1, len(corridor) + 1):
+        world.begin_batch()
+        direction = world._native_path_direction(
+            start,
+            goal,
+            agent_id=4,
+            velocity=(0.0, 0.0, 0.0),
+        )
+        assert len(rebuilt) == expected_count
+        if expected_count < len(corridor):
+            assert direction == (0.0, 0.0, 0.0)
+            assert navigator.crowd_calls == 0
+
+    assert direction == (1.0, 0.0, 0.0)
+    assert navigator.crowd_calls == 1
 
 
 def test_worker_proposes_one_block_line_across_water_gap() -> None:
@@ -1334,6 +1380,26 @@ def test_water_exit_selects_the_nearest_dry_body_clear_surface() -> None:
     assert shore is not None
     assert shore.waypoint == (11.5, 8.5, 234.75)
     assert shore.affordance is MovementAffordance.JUMP
+
+
+def test_water_exit_resumes_a_bounded_search_across_worker_batches() -> None:
+    columns = {(x, 8): {239} for x in range(8, 24)}
+    columns[(24, 8)] = {237}
+    planner = VoxelActionPlanner(VoxelTerrain(_solid_columns(columns)))
+    position = (8.5, 8.5, 236.75)
+
+    assert planner.water_exit(position, max_nodes=2) is None
+    assert (8, 8) in planner._water_searches
+
+    for _ in range(128):
+        step = planner.water_exit(position, max_nodes=2)
+        if step is not None:
+            break
+    else:
+        raise AssertionError("resumable water search never reached dry land")
+
+    assert step.goal == (24.5, 8.5, 234.75)
+    assert (8, 8) not in planner._water_searches
 
 
 def test_water_exit_corrects_cross_track_drift_toward_cell_center() -> None:
