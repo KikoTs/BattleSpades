@@ -157,11 +157,28 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 111 | Password | — | Planned | Password packet (auth). |
 | 112 | PasswordNeeded | — | Planned | Server requests a password (auth). |
 | 113 | PasswordProvided | — | Planned | Client submits a password (auth). |
-| 114 | InitialInfo | S→C | Sent | First join packet: map filename, checksum, movement multipliers, and a null-terminated `texture_skin` string. VIP sends `mafia`; the empty string selects the normal skin. |
+| 114 | InitialInfo | S→C | Sent | First join packet: map filename, checksum, direct per-class movement scales, and a null-terminated `texture_skin` string. Each movement value is the complete 1/64-rounded authority scale; clients must not divide it by the class baseline. VIP sends `mafia`; the empty string selects the normal skin. |
 | 115 | ForceTeamJoin | S→C | Sent | Map Creator sends team 2/instant 0 after loading so Start opens the native prefab/Game Data selector. |
 | 116 | PositionData | C→S | Handled | Handler registered, but the 1.x client does NOT send it (no-op path). |
 | 117 | TeamProgress | — | Planned | Team objective progress bar (territory/mode rules). |
 | 118 | SetGroundColors | both | Handled+Sent | Complete UGC terrain/water palette from the host, persisted and replayed to editor guests. |
+
+### Continuous movement phase and acknowledgement
+
+Retail sends `ClientData(4)` reliably. IDA of
+`GameScene.send_client_data` (`gameScene.pyd:0x1016AAE0`) passes true to
+`send_packet`, whose network branch selects `PACKET_FLAG_RELIABLE`. The
+handshake sends loop zero; a promoted gameplay connection must continue from
+the session's next loop and never reuse zero.
+
+With the production default `movement_input_latch_frames=1`, frame L applies
+locomotion, jump, sneak, and sprint sampled at L-1 while crouch and orientation
+apply from L. `WorldUpdate(2).pong` is the accepted ClientData loop represented
+by that owner row. Prediction must compare the row with the journaled state for
+that exact loop, not with the current render transform. InitialInfo movement
+entries are direct scales after all rule multipliers are composed and rounded
+once to 1/64; authority calls the same `speed_scale(class, rule_multiplier)`
+function so custom speed rules cannot create server/client drift.
 
 ### Snowball Damage/Destroy ordering
 
@@ -538,11 +555,15 @@ non-colliding geometry. Cells rebuilt before confirmation are dropped. Packet
 `BlockManager.send_block_manager_state`/`receive_block_manager_state` shows
 damage, occupancy, and user-block dictionaries rather than world topology.
 
-Melee terrain Damage is type-dependent. Type 2 expands to the centered
-three-cell z column; type 3 expands to a centered, axis-aligned 3x3x3 Super
-Spade cube; pickaxe-family types are exact-cell. The server mirrors that
-footprint and sends one area packet—never one expanding packet per removed
-cell.
+Melee terrain Damage is type-dependent. Types 2 and 4 expand to the centered
+three-cell z column; types 3, 17, and 31 expand to a centered, axis-aligned
+3x3x3 Super Spade/Zombie volume; types 35 and the accumulated machete action
+use a two-cell z column. Drill/explosive area types 10, 16, 33, and 41 expand
+to the radius-two integer footprint `dx²+dy²+dz² <= 6` (81 candidate cells).
+Pickaxe-family types are exact-cell. The server mirrors the footprint and
+sends one area packet—never one expanding packet per removed cell. Clients
+emit one presentation impact per received live Damage even if no cell reaches
+zero health; late-join catch-up must suppress those historical effects.
 
 ### Pickups
 PickPickup (70) is server-to-client only. DropPickup (71) is handled and

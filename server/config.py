@@ -349,9 +349,6 @@ class ServerConfig:
     # frame clocks. Six ticks was the highest measured cadence that reduced
     # correction chatter without approaching the 60-entry retail history cap.
     worldupdate_airborne_self_row_interval: int = 6
-    # The server can resolve terrain contact one recurrence before the retail
-    # owner's movement history. Delay only the first grounded correction row.
-    landing_owner_handoff_input_frames: int = 2
     # WorldUpdate is the retail owner's only jetpack-active signal.  Because
     # ClientData has no application acknowledgement, ordinary position rows
     # are withheld after the reliable transition row while GameScene crosses
@@ -961,12 +958,6 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.worldupdate_airborne_self_row_interval = max(1, int(dbg.get(
             "worldupdate_airborne_self_row_interval",
             config.worldupdate_airborne_self_row_interval,
-        )))
-        config.landing_owner_handoff_input_frames = max(0, min(6, int(
-            dbg.get(
-                "landing_owner_handoff_input_frames",
-                config.landing_owner_handoff_input_frames,
-            )
         )))
         config.jetpack_owner_handoff_input_frames = max(0, min(120, int(
             dbg.get(

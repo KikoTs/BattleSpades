@@ -101,7 +101,7 @@ def test_version_does_not_import_native_server(
 
     assert run(["--version"], paths=RuntimePaths.from_root(PROJECT_ROOT)) == 0
 
-    assert capsys.readouterr().out.strip() == "BattleSpades 0.0.3-alpha.2"
+    assert capsys.readouterr().out.strip() == "BattleSpades 0.0.3-alpha.3"
     assert "server.main" not in sys.modules
 
 

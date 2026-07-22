@@ -329,6 +329,25 @@ def test_one_client_loop_vertical_restore_is_still_reported():
     assert any(event["kind"] == "visible_vertical_snap" for event in events)
 
 
+def test_one_voxel_grounded_collision_step_is_not_a_vertical_snap():
+    rows = [
+        sample(0, segment="block_sprint_jump", airborne=True, z=208.044754),
+        sample(1, segment="block_sprint_jump", airborne=False, z=207.480408),
+    ]
+    rows[1].update(
+        matched_loop_error=0.002485,
+        velocity=(0.21, -0.44, 0.0),
+    )
+
+    analysis, _segments, events = movement_stress.analyze_stress_samples(
+        rows,
+        interval=0.05,
+    )
+
+    assert analysis.visible_rollback_count == 0
+    assert not any(event["kind"] == "visible_vertical_snap" for event in events)
+
+
 def test_missing_terrain_coverage_is_reported():
     rows = [
         sample(0, segment="slope_diagonal", z=20.0),

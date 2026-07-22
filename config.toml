@@ -432,10 +432,6 @@ worldupdate_self_row_interval = 2
 # Airborne anchors stay within the retail 60-entry history while avoiding the
 # correction replay that a 30 Hz vertical phase mismatch causes.
 worldupdate_airborne_self_row_interval = 6
-# A real-client landing trace shows the server can publish grounded/vz=0 one
-# recurrence before the owner's history lands. Withhold only that first local
-# correction row; observers keep the normal authoritative 30 Hz stream.
-landing_owner_handoff_input_frames = 2
 # Retail never acknowledges applying the jetpack-active WorldUpdate. Suppress
 # only the owner's ordinary correction row while thrust is active; observers
 # and authoritative hitboxes keep receiving the server snapshot at 30 Hz.
