@@ -16,6 +16,7 @@ from modes.lobby_skeletons import (
     TerritoryControlMode,
 )
 from server.builders.initial_info import build_initial_info
+from server import class_data
 from server.class_selection import normalize_server_selection
 from server.config import ServerConfig, load_config
 from server.game_rules import GameRules, RULE_DEFINITIONS
@@ -90,6 +91,9 @@ def test_config_rules_drive_initial_info_and_selection(tmp_path):
     assert packet.enable_deathcam == 0
     assert int(C.CLASS_ENGINEER) in packet.disabled_classes
     assert int(C.AUTO_SHOTGUN_TOOL) in packet.disabled_tools
+    assert packet.movement_speed_multipliers[int(C.CLASS_SOLDIER)] == pytest.approx(
+        class_data.speed_scale(int(C.CLASS_SOLDIER), 1.5)
+    )
 
     selection = normalize_server_selection(
         config,
@@ -97,6 +101,25 @@ def test_config_rules_drive_initial_info_and_selection(tmp_path):
         (int(C.AUTO_SHOTGUN_TOOL),),
     )
     assert int(C.AUTO_SHOTGUN_TOOL) not in selection.loadout
+
+
+def test_zombie_class_speed_rule_is_identical_on_wire_and_authority(tmp_path):
+    path = tmp_path / "zombie.toml"
+    path.write_text(textwrap.dedent("""
+        [game]
+        default_mode = "zom"
+
+        [game_rules]
+        RULE_CHARACTER_SPEED = "150%"
+        RULE_CLASS_SPEED = "200%"
+    """), encoding="utf-8")
+
+    config = load_config(path)
+    packet = build_initial_info(BattleSpadesServer(config))
+    combined_rule = 1.5 * 2.0
+    assert packet.movement_speed_multipliers[int(C.CLASS_ZOMBIE)] == pytest.approx(
+        class_data.speed_scale(int(C.CLASS_ZOMBIE), combined_rule)
+    )
 
 
 def test_lobby_config_validates_lengths_and_normalizes_rotation(tmp_path):

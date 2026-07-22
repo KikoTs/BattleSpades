@@ -1,0 +1,57 @@
+# Isolated deterministic profile used by BattleSpadesClient's live parity rig.
+# It never registers publicly, loads plugins, or spawns bots.
+
+[server]
+name = "BattleSpades Protocol Parity"
+port = 32768
+max_players = 4
+tick_rate = 60
+
+[steam]
+enabled = false
+
+[revival]
+enabled = false
+
+[game]
+default_mode = "tdm"
+default_map = "MayanJungle"
+bot_count = 0
+movement_authority = "server"
+map_sync_mode = "full"
+same_team_collision = false
+friendly_fire = false
+fall_damage = true
+build_damage = true
+
+[bots]
+enabled = false
+population_mode = "fixed"
+fill_target = 0
+max_bots = 0
+reserve_human_slots = 0
+worker = "process"
+
+[world]
+maps_path = "maps"
+prefabs_path = "prefabs"
+map_size_x = 512
+map_size_y = 512
+map_size_z = 240
+water_level = 238
+
+[plugins]
+enabled = false
+
+[logging]
+level = "INFO"
+file = "parity-server.log"
+console = true
+packet_trace = false
+
+[debug]
+movement_input_latch_frames = 1
+broadcast_world_updates = true
+worldupdate_broadcast_interval = 2
+worldupdate_include_self = true
+debug_parity = false

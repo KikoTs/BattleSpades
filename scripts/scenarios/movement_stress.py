@@ -990,11 +990,29 @@ def analyze_stress_samples(
                 and bool(sample.get("airborne", False))
                 and vertical_velocity < 0.0
             )
+            # Native collision resolution can climb one voxel in a single
+            # rendered loop.  It is distinguishable from a stale owner-row
+            # restore: the body is grounded with zero vertical velocity, the
+            # step is at most one block, and the server row still matches the
+            # client's history to within a tiny fraction of a block.  The
+            # packaged release gate captured exactly this shape (0.564 block,
+            # 0.002485 matched error, no reconciliation counter increment).
+            try:
+                matched_error = float(sample.get("matched_loop_error"))
+            except (TypeError, ValueError):
+                matched_error = float("inf")
+            explained_ground_step = (
+                not bool(sample.get("airborne", False))
+                and abs(vertical_velocity) <= 1e-6
+                and vertical_step <= 1.05
+                and matched_error <= min(0.02, thresholds.max_matched_error * 0.2)
+            )
             if (
                 vertical_step_per_loop
                 > thresholds.max_vertical_step_per_client_loop
                 and not explained_fall
                 and not explained_jetpack_climb
+                and not explained_ground_step
             ):
                 events.append({
                     "kind": "visible_vertical_snap",

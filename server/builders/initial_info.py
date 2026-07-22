@@ -130,10 +130,15 @@ def _map_checksum(server: 'BattleSpadesServer') -> int:
 
 
 def _movement_speed_multipliers(server: 'BattleSpadesServer') -> list[float]:
-    multiplier = float(get_rules(server.config).get("RULE_CHARACTER_SPEED"))
+    rules = get_rules(server.config)
+    multiplier = float(rules.get("RULE_CHARACTER_SPEED"))
+    if str(getattr(server.config, "game_mode", "")).lower() in (
+        "zom", "zombie"
+    ):
+        multiplier *= float(rules.get("RULE_CLASS_SPEED"))
     return [
-        float(value) * multiplier
-        for value in class_data.initial_info_movement_multipliers()
+        class_data.speed_scale(class_id, multiplier)
+        for class_id in range(len(class_data.initial_info_movement_multipliers()))
     ]
 
 

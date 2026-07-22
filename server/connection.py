@@ -237,17 +237,10 @@ class Connection:
              comp_hex = ' '.join(f'{b:02X}' for b in prefixed_data)
              logger.debug(f"Compressed Hex Data: {comp_hex}")
         
-        # ENet silently promotes an oversized flags=0 packet to reliable
-        # fragments.  WorldUpdate is a replaceable snapshot stream, so that
-        # promotion creates head-of-line blocking: one lost fragment holds
-        # every newer movement snapshot behind an obsolete one.  Explicitly
-        # request unreliable fragmentation so an incomplete old snapshot is
-        # discarded and the next 30 Hz update can still be applied.
-        flags = (
-            enet.PACKET_FLAG_RELIABLE
-            if reliable
-            else enet.PACKET_FLAG_UNRELIABLE_FRAGMENT
-        )
+        # Match the known-good retail transport path. ENet flag zero keeps
+        # ordinary WorldUpdate packets sequenced but unreliable; reliable
+        # delivery is reserved for explicit transitions and control traffic.
+        flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
         packet = enet.Packet(prefixed_data, flags)
         self.peer.send(0, packet)
         

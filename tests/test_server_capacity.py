@@ -121,22 +121,19 @@ def test_packet_details_are_not_parsed_when_trace_is_disabled():
     assert len(connection.peer.sent) == 1
 
 
-def test_unreliable_snapshot_send_allows_unreliable_fragmentation():
-    import enet
-
+def test_unreliable_snapshot_send_uses_known_good_zero_flag():
     connection = Connection.__new__(Connection)
     connection.peer = _Peer()
     connection.server = SimpleNamespace(
         config=SimpleNamespace(log_suppress_packets=[], packet_trace=False)
     )
 
-    # Twenty-four player rows cross ENet's effective fragment payload on the
-    # default 1400-byte MTU once the retail LZF framing is added.  A zero flag
-    # would make ENet promote this replaceable snapshot to reliable fragments.
+    # Keep parity with the last smooth retail build. Explicit unreliable
+    # fragmentation changed delivery semantics and regressed movement feel.
     connection.send(bytes(7 + 56 * 24), reliable=False)
 
     _channel, packet = connection.peer.sent[0]
-    assert packet.flags == enet.PACKET_FLAG_UNRELIABLE_FRAGMENT
+    assert packet.flags == 0
 
 
 def test_reliable_send_keeps_reliable_transport_flag():

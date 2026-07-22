@@ -197,7 +197,7 @@ def wire_round(value: float) -> float:
     return round(float(value) * 64.0) / 64.0
 
 
-def speed_scale(class_id: int) -> float:
+def speed_scale(class_id: int, rule_multiplier: float = 1.0) -> float:
     """The per-class speed scale sent in InitialInfo, as the client decodes
     it (wire-rounded).
 
@@ -210,7 +210,12 @@ def speed_scale(class_id: int) -> float:
     (jump_multiplier is NOT scaled — confirmed by the measured -0.36*1.2
     jump impulse.)
     """
-    return wire_round(get_movement(class_id).sprint_multiplier)
+    # InitialInfo serializes the composed value to 1/64 fixed point. Apply
+    # rules before rounding so authority uses the exact number prediction
+    # receives (round(base) * rule is measurably different for e.g. 150%).
+    return wire_round(
+        get_movement(class_id).sprint_multiplier * float(rule_multiplier)
+    )
 
 
 def initial_info_movement_multipliers() -> list[float]:

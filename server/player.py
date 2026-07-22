@@ -69,12 +69,10 @@ INPUT_DELAY_TICKS = 1
 INPUT_HISTORY_LIMIT = 128
 PENDING_VELOCITY_IMPULSE_LIMIT = 64
 OWNER_ANCHOR_HISTORY_LIMIT = 128
-# The patched retail client keeps its current predicted position when a
-# grounded jump would otherwise restore an owner row more than this distance
-# away.  Character.update_alive's stock restore is useful for small phase
-# corrections, but a stale airborne row can move a buffered re-jump by more
-# than a whole voxel.  Keep this value byte-for-byte in sync with
-# ``aoslib/character_jump_smoothing.py`` in the maintained client.
+# Keep the server's jump launch anchor within the sub-voxel phase range proven
+# by foreground stock-client captures. Character.update_alive's cached-anchor
+# restore remains untouched in the client; this server guard only prevents an
+# already-stale owner row from becoming the next authoritative launch state.
 JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE = 0.25
 JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE_SQ = (
     JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE ** 2
@@ -586,18 +584,19 @@ class Player:
         # InitialInfo speed scale (wire-rounded); the server simulation must
         # use identical effective values or prediction drifts (rubber-band).
         from server.class_data import speed_scale
-        scale = speed_scale(self._class_id)
+        rule_multiplier = 1.0
         server = self.connection.server if self.connection else None
         config = getattr(server, "config", None)
         if config is not None:
             from server.game_rules import get_rules
 
             rules = get_rules(config)
-            scale *= float(rules.get("RULE_CHARACTER_SPEED"))
-            if str(getattr(config, "default_mode", "")).lower() in (
+            rule_multiplier *= float(rules.get("RULE_CHARACTER_SPEED"))
+            if str(getattr(config, "game_mode", "")).lower() in (
                 "zom", "zombie"
             ):
-                scale *= float(rules.get("RULE_CLASS_SPEED"))
+                rule_multiplier *= float(rules.get("RULE_CLASS_SPEED"))
+        scale = speed_scale(self._class_id, rule_multiplier)
         world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier * scale)
         world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier * scale)
         world_object.set_class_jump_multiplier(self.movement_profile.jump_multiplier)
@@ -1924,11 +1923,10 @@ class Player:
                 (float(anchor[index]) - float(pre_position[index])) ** 2
                 for index in range(3)
             )
-            # The maintained client has the same guard around Character.update.
             # Preserve retail's cached-anchor behavior for ordinary sub-voxel
-            # phase correction, but never mirror a stale row into a visible
-            # launch teleport. Velocity/airborne state still come from the
-            # native physics step in either branch.
+            # phase correction, but never promote a stale row into the next
+            # authoritative launch state. Velocity/airborne state still come
+            # from the native physics step in either branch.
             launch_position = (
                 pre_position
                 if anchor_error_sq
