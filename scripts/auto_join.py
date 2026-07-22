@@ -47,6 +47,35 @@ def wait_for(console: GameConsole, code: str, timeout: float, what: str,
     raise TimeoutError(f"timed out waiting for {what}; last={last}")
 
 
+def run_when_responsive(
+    console: GameConsole,
+    code: str,
+    timeout: float,
+    what: str,
+    interval: float = 1.0,
+) -> str:
+    """Run a command once the native game tick can service console work.
+
+    The tracer socket starts before the retail client finishes loading its
+    models and frontend.  During that window it accepts requests but the game
+    thread can temporarily miss the tracer's five-second service deadline.
+    Treat that timeout as startup backpressure instead of aborting an otherwise
+    healthy acceptance run.
+    """
+
+    deadline = time.monotonic() + timeout
+    last_error: ConsoleError | None = None
+    while time.monotonic() < deadline:
+        try:
+            return console.run(code)
+        except ConsoleError as exc:
+            last_error = exc
+            time.sleep(interval)
+    raise TimeoutError(
+        f"timed out waiting for {what}; last_error={last_error}"
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default="127.0.0.1:27015")
@@ -79,9 +108,13 @@ def main() -> int:
              what="GameManager (game boot)")
     print("checking connection state")
 
-    connected = console.run(
+    connected = run_when_responsive(
+        console,
         "bool(getattr(manager, 'client', None)) and "
-        "not manager.client.disconnected")
+        "not manager.client.disconnected",
+        timeout=args.wait,
+        what="responsive GameManager connection state",
+    )
     if connected != "True":
         print(f"not connected (client={connected}); starting connect to {args.server}")
         console.run(

@@ -121,6 +121,39 @@ def test_packet_details_are_not_parsed_when_trace_is_disabled():
     assert len(connection.peer.sent) == 1
 
 
+def test_unreliable_snapshot_send_allows_unreliable_fragmentation():
+    import enet
+
+    connection = Connection.__new__(Connection)
+    connection.peer = _Peer()
+    connection.server = SimpleNamespace(
+        config=SimpleNamespace(log_suppress_packets=[], packet_trace=False)
+    )
+
+    # Twenty-four player rows cross ENet's effective fragment payload on the
+    # default 1400-byte MTU once the retail LZF framing is added.  A zero flag
+    # would make ENet promote this replaceable snapshot to reliable fragments.
+    connection.send(bytes(7 + 56 * 24), reliable=False)
+
+    _channel, packet = connection.peer.sent[0]
+    assert packet.flags == enet.PACKET_FLAG_UNRELIABLE_FRAGMENT
+
+
+def test_reliable_send_keeps_reliable_transport_flag():
+    import enet
+
+    connection = Connection.__new__(Connection)
+    connection.peer = _Peer()
+    connection.server = SimpleNamespace(
+        config=SimpleNamespace(log_suppress_packets=[], packet_trace=False)
+    )
+
+    connection.send(b"\x55", reliable=True)
+
+    _channel, packet = connection.peer.sent[0]
+    assert packet.flags == enet.PACKET_FLAG_RELIABLE
+
+
 def test_log_queue_drops_instead_of_blocking_when_sink_falls_behind():
     target = queue.Queue(maxsize=1)
     handler = NonBlockingQueueHandler(target)

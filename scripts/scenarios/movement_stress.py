@@ -112,11 +112,18 @@ _stress_yaw_start = {start:.9f}
 _stress_yaw_delta = {delta:.9f}
 def _stress_yaw_tick(dt):
     global _stress_yaw_elapsed
+    _scene = getattr(manager, 'scene', None)
+    _player = getattr(_scene, 'player', None)
+    if _player is None or getattr(_player, 'character', None) is None:
+        # A disconnect/menu transition can race the controller's explicit
+        # STOP request.  Never let a diagnostic callback take down the game.
+        _stress_pyglet.clock.unschedule(_stress_yaw_tick)
+        return
     _stress_yaw_elapsed += max(0.0, float(dt))
     _progress = min(1.0, _stress_yaw_elapsed / max(0.001, _stress_yaw_duration))
     _yaw = _stress_yaw_start + _stress_yaw_delta * _progress
-    manager.scene.player.character.yaw = _yaw
-    manager.scene.player.character.update_orientation()
+    _player.character.yaw = _yaw
+    _player.character.update_orientation()
     if _progress >= 1.0:
         _stress_pyglet.clock.unschedule(_stress_yaw_tick)
 _stress_pyglet.clock.schedule(_stress_yaw_tick)

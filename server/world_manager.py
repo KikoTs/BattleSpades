@@ -935,6 +935,12 @@ class WorldManager:
         neighbors = self.COLLAPSE_NEIGHBORS
         chunks = []
         visited = set()
+        # Grounded searches intentionally stop as soon as they reach the base
+        # plane.  Remember the discovered branch so another boundary cell can
+        # prove support by touching it instead of walking to the base again.
+        # Budget-exhausted branches are protected too: collapse detection is
+        # fail-safe and must never return a partial component on a later start.
+        safe = set()
         for (sx, sy, sz) in removed_positions:
             for dx, dy, dz in neighbors:
                 start = (sx + dx, sy + dy, sz + dz)
@@ -948,7 +954,7 @@ class WorldManager:
                 work = 0
                 while stack:
                     cx, cy, cz = stack.pop()
-                    if cz > 238:
+                    if (cx, cy, cz) in safe or cz > 238:
                         grounded = True
                         break
                     comp.append((cx, cy, cz))
@@ -959,11 +965,19 @@ class WorldManager:
                             stack.clear()
                             break
                         nxt = (cx + ddx, cy + ddy, cz + ddz)
+                        if nxt in safe:
+                            grounded = True
+                            stack.clear()
+                            break
                         if nxt not in comp_seen and self.get_solid(*nxt):
                             comp_seen.add(nxt)
                             stack.append(nxt)
+                    if grounded:
+                        break
                 visited |= comp_seen
-                if not grounded and not exhausted and comp:
+                if grounded or exhausted:
+                    safe |= comp_seen
+                elif comp:
                     chunks.append(comp)
         return chunks
 

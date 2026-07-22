@@ -203,7 +203,8 @@ visible and hidden entries.
   paths. Map metadata overrides atmosphere and authored entities.
 - `[plugins]`: `enabled`, `path`, `allowlist`, `denylist`.
 - `[admin]`: password and command logging.
-- `[logging]`: level, file, console, packet-trace opt-in, queue capacity, and
+- `[logging]`: level, file, console, packet-trace opt-in, queue capacity,
+  rotating-file `max_bytes`/`backup_count`, and
   suppressed packet IDs.
 - `[debug]`: reverse-engineering-only parity, reconciliation, capture, and
   WorldUpdate cadence controls. Keep the shipped values in production.

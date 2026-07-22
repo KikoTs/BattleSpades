@@ -1949,3 +1949,90 @@ not a single protocol defect. The broken Zombie team semantics and mode state
 were fixed here, but long-match navigation and human-like behavior remain an
 ongoing bot-AI workstream and should not be marked complete from these focused
 compatibility tests.
+
+## Packaged bot freeze and server tail latency (2026-07-18)
+
+- Retail acceptance proved the four configured bots were already real server
+  `Player` objects: A2S reported 4 players/4 bots before join and 5/4 after a
+  human joined. The client's own player table contained every bot with its
+  replicated firearm. The missing behavior was therefore the AI intent stream,
+  not `CreatePlayer`, loadout, or roster replication.
+- The packaged worker was killed at the exact eight-second watchdog boundary.
+  A processed frame that intentionally returned no intent (cadence skip,
+  countdown, stale frame, or transition state) was incorrectly treated as a
+  dead child. `WorkerHeartbeat` now acknowledges the greatest fully processed
+  frame in every batch. Only an acknowledgement for the awaited frame or a
+  newer one clears its lease, so an old snapshot heartbeat cannot conceal a
+  genuine native-navigation wedge.
+- Two real sources of long child work were fixed rather than hidden by a larger
+  timeout. Recast corridor warming now builds at most one 32x32 tile per worker
+  batch and uses bounded voxel fallback until the corridor is warm. Full-map
+  water escape retains a mutation-safe frontier and advances at most 128 nodes
+  per bot decision instead of synchronously scanning an authored sea.
+- The packaged release check now launches the actual AI worker, sends a map and
+  live perception frame, requires both a processed-frame heartbeat and a
+  `BotIntent`, requests orderly shutdown, and verifies exit status. A trivial
+  child-process echo can no longer certify a bundle missing working bot logic.
+- A final 12-bot Zombie rollover across Training, GreatWall, and Trenches kept
+  one worker PID, moved throughout, and reported zero ordinary or stalled
+  restarts. CastleWars fault injection placed eight bots in real water; all
+  reached dry ground in 0.72--0.88 seconds with zero worker restarts.
+- This is not a Python 2 server limitation. BattleSpades and its AI child run
+  on Python 3.12; Python 2.7 belongs only to the retail client. A paired 12-bot
+  profile held 60 Hz at roughly 0.60 CPU core. Automatic generation-2 scans of
+  the large import graph caused a rare 13.8 ms tail pause despite collecting
+  no objects. Startup now performs `gc.collect(); gc.freeze()` after lazy
+  imports and immediately before server construction, leaving all gameplay
+  objects normally collectible. The A/B maximum tick fell from 15.96 ms to
+  7.67 ms; steady bot p99 remains about 2.1 ms and still merits future hot-path
+  work rather than being misreported as solved by GC tuning.
+
+### Frozen-worker transport and collapse stabilization (2026-07-19)
+
+- The packaged bot failure was reproduced as an IPC failure, not missing bot
+  admission. With the client host's `--control-stdin` path, the old Python
+  reader thread was blocked in `stdin.readline()` before Windows spawned the
+  AI child. The child stayed alive in `input_queue.get`, received no record or
+  heartbeat, and was killed at the exact eight-second watchdog boundary. A
+  2x2 A/B proved redirected stdin and hidden-window flags were healthy by
+  themselves; only the blocking monitor caused the failure. The launcher now
+  polls a binary pipe without a reader thread (`PeekNamedPipe` on Windows,
+  `select` on POSIX), preserving exact shutdown/EOF and safe future restarts.
+- A complete VXL snapshot is no longer one multiprocessing record. The bridge
+  emits a versioned compressed header plus ordered <=48 KiB chunks with a
+  Blake2 digest and decoded-size bounds. A child heartbeat is the only transfer
+  progress proof. WorldDelta records are capped at 1,024 cells; frames wait for
+  all prior chunks/deltas; partial streams are replayed from the canonical map
+  after restart. Perception is capped to 32 strategic players and 192
+  prioritized live entities, excluding dead respawn placeholders.
+- The other visible hitch was authoritative collapse discovery after drill and
+  chemical damage. Repeated boundary searches independently traversed the same
+  grounded structure. `find_unsupported_chunks` now reuses per-call grounded
+  proof while preserving the 18-neighbor order, ground threshold, work cap,
+  and fail-safe exhaustion behavior. Randomized parity matched the old result
+  in 1,000/1,000 scenes. The large grounded benchmark fell from 38.754 ms and
+  188,466 voxel queries to 1.183 ms and 5,520 queries; measured AncientEgypt
+  drill footprints fell from 7.39-16.90 ms to 0.91-1.09 ms.
+- Final source acceptance: 1,138 tests passed; a 12-bot AncientEgypt smoke moved
+  every bot with one worker and zero restarts. The 30-second capacity run held
+  59.998 Hz, 2.315 ms tick p99, 8.807 ms max, about 0.60 server CPU core, and
+  zero packet/mode/mutation drops. Bot main-thread p99 remains 1.669 ms versus
+  the aspirational 0.75 ms subsystem target, while the complete tick stays far
+  below its 12 ms release limit.
+- Final frozen acceptance used `release-dist-botfix7-20260719-014100`: packaged
+  full-map check passed; all four stdin/window combinations passed; ten cold
+  controlled starts each kept one worker and zero restarts; AncientEgypt to
+  MayanJungle kept the same worker; and a retail client saw all four bot tools
+  and movement. A2S changed 4/4 to 5/4, the 40-second hold had zero stalls or
+  dumps, and live tick windows averaged 0.61-0.64 ms with a 3.47 ms maximum.
+  Release ZIP SHA-256 is
+  `3bbff8d9157804f3e074e4a301d3663a5115aa0a50909e125e75b49a70d57887`.
+- The accepted 286-file server tree was hash-verified inside the isolated
+  `exe.win32-2.7-botfix-20260719-002154` client first. Normal hosting,
+  Tutorial, and Map Creator each passed a hidden 12-second
+  `--control-stdin` A2S/clean-shutdown smoke. That exact tree was then promoted
+  to `aos-nonsteam/build/exe.win32-2.7/server`; the previous tree remains as
+  `server-pre-botfix7-20260719`. The installed executable SHA-256 is
+  `51E487B2E5D5E19DF7AC26122CF0A38482F7D4377C157022A8809780714FD29B`, and its
+  post-install full-map check passed. Existing debugger/Portal 2 processes
+  were not stopped or modified.

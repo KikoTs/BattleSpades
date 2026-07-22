@@ -13,13 +13,23 @@ The stock EditBoxControl also has no clipboard keyboard handler. The included
 clipboard_input_patch.py adds Unicode Ctrl+V insertion at the current caret,
 including the Join by IP field, without polling or background work.
 
+character_jump_smoothing.py prevents a stale owner row from visibly restoring
+the camera during a buffered jump. It also routes the configured hover key
+(Z by default) through the client's existing ClientData action bit when the
+normal parachute is equipped, allowing the server to deploy it explicitly.
+
 Install in each retail client:
 
 1. Copy session_transition_patch.py and clipboard_input_patch.py beside the
-   client's launcher.
+   client's launcher. Copy character_jump_smoothing.py into client/aoslib/.
 2. In aoslib/run.py, import session_transition_patch before BootClass() creates
    the game manager. Import clipboard_input_patch after aoslib.gui is imported.
-3. Restart the retail client once.
+3. Immediately after GameManager construction in aoslib/run.py, add:
+
+       from aoslib.character_jump_smoothing import install
+       install(self.manager)
+
+4. Restart the retail client once.
 
 Both hooks are Python 2 compatible. They create no thread, perform no
 update-loop file I/O, and open no second connection.

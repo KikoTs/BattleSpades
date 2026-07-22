@@ -308,6 +308,12 @@ class ServerConfig:
     # not add serialization work to the gameplay thread.
     packet_trace: bool = False
     log_queue_capacity: int = 8192
+    # Logging runs behind a bounded queue, but the sink must be bounded too.
+    # Old packet tracing produced multi-hundred-megabyte server.log files on
+    # long-lived hosts; rotating in the listener thread keeps both disk usage
+    # and gameplay-thread latency independent of server uptime.
+    log_max_bytes: int = 16 * 1024 * 1024
+    log_backup_count: int = 3
 
     # Debug
     # Physics parity capture is an invasive reverse-engineering tool.  It owns
@@ -343,6 +349,9 @@ class ServerConfig:
     # frame clocks. Six ticks was the highest measured cadence that reduced
     # correction chatter without approaching the 60-entry retail history cap.
     worldupdate_airborne_self_row_interval: int = 6
+    # The server can resolve terrain contact one recurrence before the retail
+    # owner's movement history. Delay only the first grounded correction row.
+    landing_owner_handoff_input_frames: int = 2
     # WorldUpdate is the retail owner's only jetpack-active signal.  Because
     # ClientData has no application acknowledgement, ordinary position rows
     # are withheld after the reliable transition row while GameScene crosses
@@ -912,6 +921,17 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.packet_trace = bool(lg.get("packet_trace", config.packet_trace))
         config.log_queue_capacity = max(256, int(lg.get(
             "queue_capacity", config.log_queue_capacity)))
+        config.log_max_bytes = max(
+            1024 * 1024,
+            min(
+                1024 * 1024 * 1024,
+                int(lg.get("max_bytes", config.log_max_bytes)),
+            ),
+        )
+        config.log_backup_count = max(
+            1,
+            min(10, int(lg.get("backup_count", config.log_backup_count))),
+        )
         if "suppress_packets" in lg:
             config.log_suppress_packets = lg["suppress_packets"]
 
@@ -941,6 +961,12 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.worldupdate_airborne_self_row_interval = max(1, int(dbg.get(
             "worldupdate_airborne_self_row_interval",
             config.worldupdate_airborne_self_row_interval,
+        )))
+        config.landing_owner_handoff_input_frames = max(0, min(6, int(
+            dbg.get(
+                "landing_owner_handoff_input_frames",
+                config.landing_owner_handoff_input_frames,
+            )
         )))
         config.jetpack_owner_handoff_input_frames = max(0, min(120, int(
             dbg.get(

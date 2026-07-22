@@ -34,6 +34,7 @@ class RuntimeMetrics:
     terrain_repair_queue_peak: int = 0
     dropped_terrain_repairs: int = 0
     failed_terrain_repair_sends: int = 0
+    bot_perception_entity_overflow: int = 0
 
     def record_tick(self, elapsed_ms: float) -> None:
         self.tick_samples_ms.append(float(elapsed_ms))
@@ -77,6 +78,9 @@ class RuntimeMetrics:
             "terrain_repair_queue_peak": self.terrain_repair_queue_peak,
             "dropped_terrain_repairs": self.dropped_terrain_repairs,
             "failed_terrain_repair_sends": self.failed_terrain_repair_sends,
+            "bot_perception_entity_overflow": (
+                self.bot_perception_entity_overflow
+            ),
         }
         for name, samples in sorted(self.subsystem_samples_ms.items()):
             subsystem_values = sorted(samples)

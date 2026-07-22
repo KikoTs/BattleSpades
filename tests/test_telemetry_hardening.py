@@ -2,12 +2,14 @@
 
 import queue
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import server.config as server_config
 from server.config import ServerConfig
 from server.debug_parity import DebugParityManager, DebugParitySession
+from server.logging_runtime import configure_logging
 from server.telemetry import TelemetryService
 
 
@@ -124,3 +126,26 @@ def test_telemetry_service_combines_bounded_metrics_and_log_drop_count():
     assert snapshot["tick_samples"] == 1
     assert snapshot["tick_avg_ms"] == 2.5
     assert snapshot["logging_dropped_records"] == 7
+
+
+def test_server_log_sink_rotates_and_remains_bounded(tmp_path):
+    """A long-lived host cannot grow one unbounded packet/debug log."""
+
+    config = ServerConfig(
+        log_console=False,
+        log_file="server.log",
+        log_max_bytes=1024 * 1024,
+        log_backup_count=2,
+    )
+    runtime = configure_logging(config, tmp_path)
+    logger = logging.getLogger("tests.rotating-server-log")
+    try:
+        payload = "x" * 4096
+        for _ in range(400):
+            logger.info(payload)
+    finally:
+        runtime.stop()
+
+    files = sorted(tmp_path.glob("server.log*"))
+    assert [path.name for path in files] == ["server.log", "server.log.1"]
+    assert all(path.stat().st_size <= config.log_max_bytes + 8192 for path in files)

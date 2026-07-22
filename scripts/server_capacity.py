@@ -43,7 +43,11 @@ class SyntheticConnection:
         import enet
 
         wire = bytes([prefix]) + lzf_compress(data)
-        flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
+        flags = (
+            enet.PACKET_FLAG_RELIABLE
+            if reliable
+            else enet.PACKET_FLAG_UNRELIABLE_FRAGMENT
+        )
         enet.Packet(wire, flags)
         self.packets += 1
         self.bytes += len(wire)

@@ -707,12 +707,18 @@ one core, and report zero gameplay/mode/world-mutation drops.
 For a report that every bot froze at once while the server tick stayed healthy,
 run `/bots status`. A running worker with growing `silence` and no new actions
 is a worker-wide stall, not twelve simultaneous navigation failures. Production
-supervision waits through the eight-second startup grace, then automatically
-replaces a child that leaves a live-bot frame unanswered for five seconds;
-`stalls` records those watchdog restarts. If profiling is available, capture
-the child before restarting it; a stack inside `recast*.pyd` from
-`WorkerVoxelWorld._native_path_direction` is the known synchronous Detour
-signature. Do not stop the authoritative server to recover this condition.
+supervision gives the first snapshot/frame an eight-second cold lease, then
+automatically replaces a child that leaves a live-bot frame unprocessed for
+five seconds. Snapshot progress is acknowledged by child heartbeats, never by
+local queue writes; a transfer that fills the queue with no reader is therefore
+also restarted. Zero-intent countdown and cadence frames still return a control
+heartbeat and are healthy. `stalls`, `awaiting_frame`, `awaiting_snapshot`, and
+the heartbeat fields distinguish each state. If profiling is available,
+capture the child before restarting it; a stack inside `recast*.pyd` from
+`WorkerVoxelWorld._native_path_direction` indicates native tile work, while a
+stack in `VoxelActionPlanner.water_exit` indicates water-search work. Both are
+bounded in current builds. Do not stop the authoritative server to recover a
+worker fault.
 
 `bot_city_soak.py` loads the real CityOfChicago VXL and advances worker policy
 time without sleeping. It prints each bot's position, role, action, affordance,
@@ -765,6 +771,23 @@ pickup/drop, and no new crash dump. Kill the `BattleSpadesAI` child only (never
 an unrelated Python process), confirm players and 58+ Hz simulation survive,
 then wait for the 1/2/5/30-second supervised restart and verify movement
 recovers without stale traversal through edited terrain.
+
+For a frozen or client-bundled release, source smokes are not sufficient. Run
+the packaged executable's full-map check, then launch it through the same
+redirected stdin contract used by the client host:
+
+```powershell
+.\BattleSpades.exe --check
+.\BattleSpades.exe --config .\config.toml --control-stdin
+# After A2S and bot movement are visible, write exactly "shutdown\n" to stdin.
+```
+
+Repeat the hidden controlled launch ten times. Every run must show one worker
+PID, a full-map heartbeat in under eight seconds, zero restart/stall markers,
+and exit cleanly on stdin shutdown. Then change to a different real VXL while
+bots are active: the map epoch must advance without replacing the worker. The
+final retail gate requires A2S bot accounting, visible bot movement/tools, a
+40-second hold, no dump, and no leaked server, worker, or client process.
 
 Bot administration is available after `/admin <password>`:
 

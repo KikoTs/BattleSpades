@@ -93,3 +93,8 @@ aceofspades/
 # game files aren't committed by accident.
 /maps/*.txtc
 /maps/*.png
+
+
+# ── Builds ─────────────────────────────────────────────────
+
+release-*

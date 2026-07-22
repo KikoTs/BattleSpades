@@ -380,6 +380,10 @@ class Player:
         self._last_damage_source_position = None
         self.parachute_id: int = 0
         self.parachute_active: bool = False
+        # The retail client's default ``hover`` binding is Z (key code 122).
+        # Keep a separate edge latch because jump and hover are independent
+        # ClientData bits and UGC jetpacks also consume hover.
+        self._parachute_deploy_last_held: bool = False
         self.disguised: bool = False        # specialist disguise toggle
         self.mounted_entity_id = None        # mounted MACHINE_GUN entity, if any
         self.on_fire: bool = False          # authoritative Molotov burn state
@@ -1110,6 +1114,7 @@ class Player:
             else 0
         )
         self.parachute_active = False
+        self._parachute_deploy_last_held = False
         self.disguised = False
         self.on_fire = False
         self.pickup_id = None
@@ -2098,20 +2103,23 @@ class Player:
             self._note_jetpack_physics_started()
 
     def _update_parachute(self) -> None:
-        """Open the Commando parachute on a second airborne SPACE press.
+        """Open the Commando parachute from the retail Z/hover input.
 
-        The December 2015 release note is explicit: "Press SPACE again after
-        jumping to open the Parachute."  The first rising edge launches the
-        jump from the ground; a later rising edge while airborne deploys it.
-        Once open it remains open until landing/water instead of activating
-        automatically at the top of every fall.
+        The maintained 1.x client binds ``hover`` to Z by default and sends it
+        as ClientData action bit 0x80.  Parachute deployment is an airborne
+        rising edge of that explicit action; SPACE remains ordinary jump.
+        Once open it stays open until landing/water.
         """
+        deploy_held = bool(self.input.hover)
+        deploy_pressed = bool(
+            deploy_held and not self._parachute_deploy_last_held
+        )
+        self._parachute_deploy_last_held = deploy_held
         equipped = self.alive and self.parachute_id == int(C.A370)
         if not equipped or not self.airborne or self.wade:
             self.parachute_active = False
             return
-        jump_pressed = bool(self.jump_held and not self.jump_last_held)
-        if jump_pressed:
+        if deploy_pressed:
             self.parachute_active = True
 
     def update_input(

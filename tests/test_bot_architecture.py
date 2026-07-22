@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import pickle
 import random
 import queue
 import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import shared.constants as C
 from modes.zombie import ZombieMode, ZombiePhase
 from shared.bytes import ByteReader
@@ -26,6 +28,8 @@ from server.bot_ai.messages import (
     EntitySnapshot,
     LookIntent,
     MapSnapshot,
+    MapSnapshotTransferChunk,
+    MapSnapshotTransferStart,
     MovementAffordance,
     MovementIntent,
     ObjectiveSnapshot,
@@ -33,9 +37,19 @@ from server.bot_ai.messages import (
     PlayerSnapshot,
     StimulusKind,
     VoxelChange,
+    WorkerHeartbeat,
+    WorldDelta,
+    compress_map_snapshot,
+    map_snapshot_vxl_bytes,
 )
 from server.bot_ai.prefab_policy import BOT_PREFAB_BLOCK_COUNTS
 from server.bot_ai.profiles import ProfileFactory
+from server.bot_ai.snapshot_transport import (
+    SNAPSHOT_CHUNK_BYTES,
+    MapSnapshotAssembler,
+    SnapshotTransportError,
+    encode_map_snapshot,
+)
 from server.bot_ai.supervisor import AIWorkerSupervisor
 from server.bot_ai.stimuli import BotStimulusBus
 from server.bot_ai.worker import (
@@ -50,6 +64,7 @@ from server.game_constants import DEFAULT_WEAPON_TOOL
 from server.config import ServerConfig
 from server.main import BattleSpadesServer
 from server.game_constants import TEAM1, TEAM2
+from server.metrics import RuntimeMetrics
 from server.simulation_runtime import SimulationRuntime
 
 
@@ -1559,6 +1574,58 @@ def test_supervisor_detects_alive_worker_that_stops_returning_intents() -> None:
     supervisor = AIWorkerSupervisor(seed=1)
     observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
     enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    first_frame = _frame(9, observer, enemy)
+    wedged_frame = _frame(10, observer, enemy)
+    started_at = 100.0
+    with supervisor._status_lock:
+        supervisor._running = True
+        supervisor._worker_started_at = started_at
+        supervisor._last_intent_at = started_at
+
+    supervisor._note_frame_sent(first_frame, started_at + 0.1)
+    output = queue.Queue()
+    output.put(
+        WorkerHeartbeat(
+            batch_id=1,
+            processed_frame_id=first_frame.frame_id,
+            map_epoch=first_frame.map_epoch,
+            topology_version=first_frame.topology_version,
+        )
+    )
+    supervisor._receive_intents(output)
+
+    # After one real frame acknowledgement, retain the strict five-second
+    # lease which catches a native query wedging later in the same process.
+    supervisor._note_frame_sent(wedged_frame, started_at + 1.0)
+
+    assert not supervisor._worker_is_stalled(started_at + 5.9)
+    assert supervisor._worker_is_stalled(started_at + 6.1)
+
+    output.put(
+        BotIntent(
+            bot_id=observer.player_id,
+            bot_generation=observer.generation,
+            frame_id=wedged_frame.frame_id,
+            map_epoch=wedged_frame.map_epoch,
+            mode_epoch=wedged_frame.mode_epoch,
+            topology_version=wedged_frame.topology_version,
+            created_at=started_at + 6.1,
+            expires_at=started_at + 7.1,
+            movement=MovementIntent(),
+        )
+    )
+    supervisor._receive_intents(output)
+
+    assert not supervisor._worker_is_stalled(started_at + 20.0)
+    assert supervisor.drain_intents(limit=1)[0].frame_id == wedged_frame.frame_id
+
+
+def test_supervisor_retains_strict_cold_worker_startup_boundary() -> None:
+    """Chunked VXL transport must not hide a cold worker for 30 seconds."""
+
+    supervisor = AIWorkerSupervisor(seed=1)
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
     frame = _frame(10, observer, enemy)
     started_at = 100.0
     with supervisor._status_lock:
@@ -1568,32 +1635,101 @@ def test_supervisor_detects_alive_worker_that_stops_returning_intents() -> None:
 
     supervisor._note_frame_sent(frame, started_at + 0.1)
 
-    assert not supervisor._worker_is_stalled(started_at + 4.9)
-    assert supervisor._worker_is_stalled(started_at + 8.1)
+    assert not supervisor._worker_is_stalled(started_at + 7.9)
+    assert supervisor._worker_is_stalled(started_at + 8.2)
 
+
+def test_supervisor_heartbeat_accepts_live_zero_intent_frame() -> None:
+    """Cadence/countdown frames are healthy even when no action is emitted."""
+
+    supervisor = AIWorkerSupervisor(seed=1)
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    frame = _frame(10, observer, enemy)
+    started_at = 100.0
+    with supervisor._status_lock:
+        supervisor._running = True
+        supervisor._worker_started_at = started_at
+        supervisor._last_intent_at = started_at
+
+    supervisor._note_frame_sent(frame, started_at + 0.1)
     output = queue.Queue()
     output.put(
-        BotIntent(
-            bot_id=observer.player_id,
-            bot_generation=observer.generation,
-            frame_id=frame.frame_id,
+        WorkerHeartbeat(
+            batch_id=7,
+            processed_frame_id=frame.frame_id,
             map_epoch=frame.map_epoch,
-            mode_epoch=frame.mode_epoch,
             topology_version=frame.topology_version,
-            created_at=started_at + 8.1,
-            expires_at=started_at + 9.1,
-            movement=MovementIntent(),
         )
     )
     supervisor._receive_intents(output)
 
     assert not supervisor._worker_is_stalled(started_at + 20.0)
-    assert supervisor.drain_intents(limit=1)[0].frame_id == frame.frame_id
+    assert supervisor.drain_intents() == []
+
+
+def test_supervisor_map_heartbeat_cannot_ack_newer_transition_frame() -> None:
+    """Snapshot activity alone must not hide a wedged post-transition frame."""
+
+    supervisor = AIWorkerSupervisor(seed=1)
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    frame = replace(
+        _frame(41, observer, enemy),
+        map_epoch=9,
+        topology_version=0,
+    )
+    started_at = 100.0
+    with supervisor._status_lock:
+        supervisor._running = True
+        supervisor._worker_started_at = started_at
+        supervisor._last_intent_at = started_at
+        supervisor._worker_has_processed_frame = True
+
+    supervisor._note_frame_sent(frame, started_at + 0.1)
+    output = queue.Queue()
+    output.put(
+        WorkerHeartbeat(
+            batch_id=8,
+            processed_frame_id=-1,
+            map_epoch=9,
+            topology_version=0,
+        )
+    )
+    supervisor._receive_intents(output)
+
+    status = supervisor.status()
+    assert status.awaiting_frame_id == frame.frame_id
+    assert status.last_acknowledged_frame_id == -1
+    assert status.last_heartbeat_batch_id == 8
+    assert status.last_heartbeat_frame_id == -1
+    assert supervisor._worker_is_stalled(started_at + 5.2)
+
+    output.put(
+        WorkerHeartbeat(
+            batch_id=9,
+            processed_frame_id=frame.frame_id,
+            map_epoch=9,
+            topology_version=0,
+        )
+    )
+    supervisor._receive_intents(output)
+    status = supervisor.status()
+    assert status.awaiting_frame_id is None
+    assert status.last_acknowledged_frame_id == frame.frame_id
+    assert status.last_heartbeat_batch_id == 9
+    assert status.last_heartbeat_frame_id == frame.frame_id
+    assert not supervisor._worker_is_stalled(started_at + 20.0)
 
 
 def test_worker_restart_snapshot_replays_every_committed_terrain_overlay() -> None:
     supervisor = AIWorkerSupervisor(seed=1)
-    supervisor.publish_map(MapSnapshot(3, 0, b"base", "tdm", "fixture"))
+    raw_vxl = b"base" * 4096
+    supervisor.publish_map(MapSnapshot(3, 0, raw_vxl, "tdm", "fixture"))
+    # publish_map is called by the gameplay thread and must stay transform-free.
+    assert supervisor._latest_snapshot is not None
+    assert supervisor._latest_snapshot.raw_vxl == raw_vxl
+    assert supervisor._latest_snapshot.compressed_vxl == b""
     first = VoxelChange(1, 2, 3, True, 0x112233)
     second = VoxelChange(4, 5, 6, False, 0)
     supervisor.publish_world_change(first, map_epoch=3, topology_version=1)
@@ -1605,11 +1741,271 @@ def test_worker_restart_snapshot_replays_every_committed_terrain_overlay() -> No
 
     restarted_input = queue.Queue()
     serial = supervisor._send_snapshot_if_needed(restarted_input, sent_serial=-1)
-    snapshot = restarted_input.get_nowait()
+    transport_messages = []
+    while not restarted_input.empty():
+        transport_messages.append(restarted_input.get_nowait())
+    assembler = MapSnapshotAssembler()
+    decoded = assembler.consume(transport_messages)
 
     assert serial >= 0
+    assert len(decoded) == 1
+    snapshot = decoded[0]
+    assert isinstance(snapshot, MapSnapshot)
     assert snapshot.topology_version == 2
     assert set(snapshot.changed_cells) == {first, second}
+    # The outer chunk transport compresses the complete pickle (VXL plus
+    # overlay); the decoded worker-facing record remains the canonical form.
+    assert snapshot.raw_vxl == raw_vxl
+    assert snapshot.compressed_vxl == b""
+    assert map_snapshot_vxl_bytes(snapshot) == raw_vxl
+
+
+def test_bot_map_snapshot_transport_rejects_corruption_and_size_mismatch() -> None:
+    raw_vxl = (b"voxel-column-data" * 8192) + b"tail"
+    encoded = compress_map_snapshot(MapSnapshot(7, 2, raw_vxl, "ctf"))
+
+    assert encoded.raw_vxl == b""
+    assert map_snapshot_vxl_bytes(encoded) == raw_vxl
+    with pytest.raises(ValueError, match="invalid compressed"):
+        map_snapshot_vxl_bytes(replace(encoded, compressed_vxl=b"not-zlib"))
+    with pytest.raises(ValueError, match="size mismatch"):
+        map_snapshot_vxl_bytes(replace(encoded, raw_vxl_size=len(raw_vxl) + 1))
+
+
+def test_bot_map_snapshot_transport_chunks_and_round_trips_complete_state() -> None:
+    rng = random.Random(17)
+    raw_vxl = rng.randbytes((SNAPSHOT_CHUNK_BYTES * 4) + 719)
+    overlay = (
+        VoxelChange(1, 2, 3, True, 0x112233),
+        VoxelChange(4, 5, 6, False, 0),
+    )
+    snapshot = MapSnapshot(7, 11, raw_vxl, "ctf", "generated", overlay)
+
+    encoded = encode_map_snapshot(snapshot, transfer_id=19)
+
+    assert encoded.start.transfer_id == 19
+    assert len(encoded.chunks) > 1
+    assert all(len(chunk.data) <= SNAPSHOT_CHUNK_BYTES for chunk in encoded.chunks)
+    assembler = MapSnapshotAssembler()
+    assert assembler.consume(encoded.messages) == [snapshot]
+    assert assembler.last_completed_transfer_id == 19
+    assert not assembler.pending
+
+
+def test_bot_map_snapshot_transport_rejects_interleaving_and_corruption() -> None:
+    snapshot = MapSnapshot(2, 0, b"map" * 80_000, "tdm", "fixture")
+    encoded = encode_map_snapshot(snapshot, transfer_id=3)
+    assembler = MapSnapshotAssembler()
+
+    assert assembler.consume((encoded.start,)) == []
+    with pytest.raises(SnapshotTransportError, match="non-snapshot"):
+        assembler.consume((WorldDelta(2, 1, ()),))
+
+    corrupted = replace(
+        encoded.chunks[-1],
+        data=encoded.chunks[-1].data[:-1] + b"x",
+    )
+    assembler = MapSnapshotAssembler()
+    with pytest.raises(SnapshotTransportError, match="digest"):
+        assembler.consume((encoded.start, *encoded.chunks[:-1], corrupted))
+
+
+def test_supervisor_resumes_snapshot_chunks_and_gates_deltas_and_frames() -> None:
+    supervisor = AIWorkerSupervisor(seed=1)
+    raw_vxl = random.Random(23).randbytes(SNAPSHOT_CHUNK_BYTES * 5)
+    supervisor.publish_map(MapSnapshot(4, 0, raw_vxl, "tdm", "generated"))
+    mutation = VoxelChange(8, 9, 10, True, 0x445566)
+    supervisor.publish_world_change(
+        mutation,
+        map_epoch=4,
+        topology_version=1,
+    )
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    supervisor.submit_frame(replace(_frame(12, observer, enemy), map_epoch=4))
+
+    process_input = queue.Queue(maxsize=2)
+    sent_serial = supervisor._send_snapshot_if_needed(process_input, -1)
+
+    assert sent_serial == -1
+    assert supervisor._outbound_snapshot is not None
+    assert not supervisor._snapshot_stream_ready(sent_serial)
+    queued = []
+    while sent_serial < 0:
+        while not process_input.empty():
+            queued.append(process_input.get_nowait())
+        sent_serial = supervisor._send_snapshot_if_needed(
+            process_input,
+            sent_serial,
+        )
+    while not process_input.empty():
+        queued.append(process_input.get_nowait())
+
+    assert isinstance(queued[0], MapSnapshotTransferStart)
+    assert all(
+        isinstance(item, (MapSnapshotTransferStart, MapSnapshotTransferChunk))
+        for item in queued
+    )
+    decoded = MapSnapshotAssembler().consume(queued)
+    assert len(decoded) == 1
+    assert set(decoded[0].changed_cells) == {mutation}
+    assert supervisor._snapshot_stream_ready(sent_serial)
+    assert supervisor._incremental_stream_ready(sent_serial)
+
+    supervisor._send_frames(process_input)
+    assert process_input.get_nowait().frame_id == 12
+
+
+def test_supervisor_restart_discards_partial_cursor_and_replays_latest_map() -> None:
+    supervisor = AIWorkerSupervisor(seed=1)
+    snapshot = MapSnapshot(
+        5,
+        0,
+        random.Random(31).randbytes(SNAPSHOT_CHUNK_BYTES * 4),
+        "zom",
+        "custom",
+    )
+    supervisor.publish_map(snapshot)
+    first_queue = queue.Queue(maxsize=1)
+
+    assert supervisor._send_snapshot_if_needed(first_queue, -1) == -1
+    first_header = first_queue.get_nowait()
+    assert isinstance(first_header, MapSnapshotTransferStart)
+    first_transfer_id = first_header.transfer_id
+
+    supervisor._discard_outbound_snapshot()
+    restarted_queue = queue.Queue()
+    serial = supervisor._send_snapshot_if_needed(restarted_queue, -1)
+    replay = []
+    while not restarted_queue.empty():
+        replay.append(restarted_queue.get_nowait())
+
+    assert serial >= 0
+    assert replay[0].transfer_id > first_transfer_id
+    assert MapSnapshotAssembler().consume(replay) == [snapshot]
+
+
+def test_snapshot_watchdog_covers_more_than_one_full_queue_without_a_reader() -> None:
+    """A child that consumes no chunks cannot hide before frames are queued."""
+
+    supervisor = AIWorkerSupervisor(seed=1)
+    # Incompressible bytes force more than 64 bounded transport records, so the
+    # local multiprocessing-style queue fills before perception can be sent.
+    snapshot = MapSnapshot(
+        8,
+        0,
+        random.Random(41).randbytes(SNAPSHOT_CHUNK_BYTES * 70),
+        "tdm",
+        "large-custom-map",
+    )
+    supervisor.publish_map(snapshot)
+    process_input = queue.Queue(maxsize=64)
+
+    assert supervisor._send_snapshot_if_needed(process_input, -1) == -1
+    assert process_input.full()
+    assert supervisor._outbound_snapshot is not None
+    transfer_id = supervisor._outbound_snapshot.transfer_id
+    with supervisor._status_lock:
+        started_at = supervisor._snapshot_progress_at
+    assert started_at is not None
+    assert supervisor.status().awaiting_snapshot_transfer_id == transfer_id
+    assert not supervisor._worker_is_stalled(started_at + 7.9)
+    assert supervisor._worker_is_stalled(started_at + 8.1)
+
+    # Retrying local Queue.put while it is full is not evidence of child work.
+    supervisor._send_snapshot_if_needed(process_input, -1)
+    with supervisor._status_lock:
+        assert supervisor._snapshot_progress_at == started_at
+
+    # A heartbeat proves the child consumed one complete input batch and renews
+    # the transfer lease even though the final chunk has not arrived yet.
+    supervisor._acknowledge_processed_frame(
+        -1,
+        started_at + 7.0,
+        heartbeat_batch_id=1,
+        snapshot_transfer_id=-1,
+    )
+    assert not supervisor._worker_is_stalled(started_at + 14.9)
+    assert supervisor._worker_is_stalled(started_at + 15.1)
+
+    supervisor._acknowledge_processed_frame(
+        -1,
+        started_at + 15.1,
+        heartbeat_batch_id=2,
+        snapshot_transfer_id=transfer_id,
+    )
+    assert supervisor.status().awaiting_snapshot_transfer_id is None
+    assert not supervisor._worker_is_stalled(started_at + 100.0)
+
+
+def test_world_deltas_are_bounded_and_frames_wait_for_every_batch() -> None:
+    supervisor = AIWorkerSupervisor(seed=1)
+    supervisor.publish_map(MapSnapshot(6, 0, b"base", "tdm", "fixture"))
+    snapshot_queue = queue.Queue()
+    serial = supervisor._send_snapshot_if_needed(snapshot_queue, -1)
+    assert serial >= 0
+    while not snapshot_queue.empty():
+        snapshot_queue.get_nowait()
+
+    for index in range(2_500):
+        supervisor.publish_world_change(
+            VoxelChange(
+                index % 512,
+                index // 512,
+                20,
+                True,
+                0x123456,
+            ),
+            map_epoch=6,
+            topology_version=9,
+        )
+    observer = _player_snapshot(1, 2, (1.0, 1.0, 1.0), is_bot=True)
+    enemy = _player_snapshot(2, 3, (4.0, 1.0, 1.0))
+    supervisor.submit_frame(replace(_frame(15, observer, enemy), map_epoch=6))
+
+    delivered: list[WorldDelta] = []
+    process_input = queue.Queue()
+    while supervisor.status().pending_terrain_cells:
+        supervisor._send_pending_terrain(process_input)
+        message = process_input.get_nowait()
+        assert isinstance(message, WorldDelta)
+        assert 0 < len(message.changed_cells) <= 1_024
+        assert len(pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)) < SNAPSHOT_CHUNK_BYTES
+        delivered.append(message)
+        if supervisor.status().pending_terrain_cells:
+            assert not supervisor._incremental_stream_ready(serial)
+
+    assert [len(delta.changed_cells) for delta in delivered] == [1_024, 1_024, 452]
+    assert supervisor._incremental_stream_ready(serial)
+    supervisor._send_frames(process_input)
+    assert process_input.get_nowait().frame_id == 15
+
+
+def test_worker_applies_equal_version_world_delta_batches_idempotently() -> None:
+    class RecordingVxl:
+        def __init__(self) -> None:
+            self.points: dict[tuple[int, int, int], int] = {}
+
+        def set_point(self, x: int, y: int, z: int, color: int) -> None:
+            self.points[(x, y, z)] = color
+
+        def remove_point_nochecks(self, x: int, y: int, z: int) -> None:
+            self.points.pop((x, y, z), None)
+
+    world = WorkerVoxelWorld()
+    world.map_epoch = 7
+    world.topology_version = 3
+    world._vxl = RecordingVxl()
+    world.tactical = SimpleNamespace(mark_dirty=lambda _x, _y: None)
+    first = WorldDelta(7, 4, (VoxelChange(1, 2, 3, True, 0x010203),))
+    second = WorldDelta(7, 4, (VoxelChange(4, 5, 6, True, 0xA0B0C0),))
+
+    world.apply(first)
+    world.apply(second)
+    world.apply(first)
+
+    assert world.topology_version == 4
+    assert set(world._vxl.points) == {(1, 2, 3), (4, 5, 6)}
 
 
 def test_worker_visibility_fails_closed_without_collision_world() -> None:
@@ -1822,6 +2218,145 @@ def test_entity_snapshot_publishes_live_explosive_hazards() -> None:
     assert thrown.position == (11.0, 12.0, 13.0)
     assert thrown.velocity == (1.0, 2.0, 3.0)
     assert thrown.hazardous is True
+
+
+def test_entity_snapshot_is_bounded_and_prioritizes_live_gameplay_state() -> None:
+    """Dense custom maps cannot create another oversized worker pipe record."""
+
+    registry = EntityRegistry()
+    ordinary = [
+        registry.place(
+            int(C.HEALTH_CRATE),
+            1000.0 + index,
+            0.0,
+            0.0,
+            kind="crate",
+        )
+        for index in range(320)
+    ]
+    dead = registry.place(
+        int(C.HEALTH_CRATE),
+        1.0,
+        0.0,
+        0.0,
+        kind="pickup",
+    )
+    dead.alive = False
+    hazard = registry.place(
+        int(C.DYNAMITE_ENTITY),
+        5000.0,
+        0.0,
+        0.0,
+        state=TEAM1,
+        kind="deployable",
+        player_id=7,
+        behavior=SimpleNamespace(blast_radius=5.0),
+    )
+    grenade = SimpleNamespace(
+        entity_id=None,
+        spec=PROJECTILE_SPECS[int(C.GRENADE_TOOL)],
+        tool=int(C.GRENADE_TOOL),
+        x=6000.0,
+        y=0.0,
+        z=0.0,
+        vx=0.0,
+        vy=0.0,
+        vz=0.0,
+        explode_at=123.0,
+        lifespan_at=0.0,
+        thrower_id=8,
+    )
+    players = {
+        7: SimpleNamespace(
+            team=TEAM1,
+            alive=True,
+            spawned=True,
+            position=(0.0, 0.0, 0.0),
+            pickup_id=ordinary[-1].entity_id,
+        ),
+        8: SimpleNamespace(
+            team=TEAM2,
+            alive=True,
+            spawned=True,
+            position=(10.0, 0.0, 0.0),
+            pickup_id=None,
+        ),
+    }
+    server = SimpleNamespace(
+        entity_registry=registry,
+        projectile_engine=SimpleNamespace(projectiles=[grenade]),
+        players=players,
+        metrics=RuntimeMetrics(),
+    )
+
+    snapshots = BotDirector._snapshot_entities(SimpleNamespace(server=server))
+    ids = {item.entity_id for item in snapshots}
+
+    assert len(snapshots) == 192
+    assert dead.entity_id not in ids
+    assert hazard.entity_id in ids
+    assert ordinary[-1].entity_id in ids
+    assert any(item.kind == "projectile" for item in snapshots)
+    assert server.metrics.bot_perception_entity_overflow == 130
+
+    observer = replace(
+        _player_snapshot(1, TEAM1, (0.0, 0.0, 0.0), is_bot=True),
+        loadout=tuple(range(32)),
+        prefabs=("long_prefab_a" * 3, "long_prefab_b" * 3, "long_prefab_c" * 3),
+        oriented_stock=tuple((tool, 999) for tool in range(32)),
+        last_action_kind="build_line",
+        last_action_position=(1.0, 2.0, 3.0),
+        last_damage_source_position=(2.0, 3.0, 4.0),
+    )
+    all_players = tuple(
+        replace(
+            observer,
+            player_id=index,
+            is_bot=index < 12,
+            position=(float(index), 0.0, 0.0),
+            eye=(float(index), 0.0, 0.0),
+            prefabs=(
+                f"prefab_{index}_a",
+                f"prefab_{index}_b",
+                f"prefab_{index}_c",
+            ),
+        )
+        for index in range(255)
+    )
+    objective = ObjectiveSnapshot(
+        kind="intel",
+        team=TEAM2,
+        position=(254.0, 0.0, 0.0),
+        carrier_id=254,
+    )
+    bounded_players = BotDirector._players_for_observer(
+        all_players,
+        observer_id=7,
+        objectives=(objective,),
+    )
+    bounded_ids = {player.player_id for player in bounded_players}
+
+    assert len(bounded_players) == 32
+    assert 7 in bounded_ids
+    assert 254 in bounded_ids
+    assert set(range(12)).issubset(bounded_ids)
+
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=1,
+        observer_id=7,
+        observer_generation=1,
+        created_at=1.0,
+        mode_id="tdm",
+        players=bounded_players,
+        entities=snapshots,
+        objectives=(objective,),
+    )
+    assert len(pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)) < (
+        SNAPSHOT_CHUNK_BYTES
+    )
 
 
 def test_bot_retreats_from_nearby_live_explosive_before_combat() -> None:

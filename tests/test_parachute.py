@@ -37,24 +37,24 @@ def test_active_parachute_is_replicated_in_world_update_state():
     assert player.pack_state_flags() & 0x01
 
 
-def test_parachute_requires_second_airborne_space_press():
+def test_parachute_deploys_from_airborne_z_hover_press():
     player = make_player()
-    # First SPACE press is the ground jump and must not deploy it.
+    # SPACE remains ordinary jump and must not deploy the parachute.
     player.airborne = False
     player.update_input(False, False, False, False, True, False, False, False)
     player._update_parachute()
     assert player.parachute_active is False
 
-    # Release after launch, then press SPACE a second time in the air.
+    # The retail client's default Z binding arrives as the hover action bit.
     player.airborne = True
-    player.update_input(False, False, False, False, False, False, False, False)
+    player.update_action_input(False, False, hover=False)
     player._update_parachute()
     assert player.parachute_active is False
-    player.update_input(False, False, False, False, True, False, False, False)
+    player.update_action_input(False, False, hover=True)
     player._update_parachute()
     assert player.parachute_active is True
 
-    # Holding SPACE keeps it open without retriggering; landing closes it.
+    # Holding Z keeps it open without retriggering; landing closes it.
     player._update_parachute()
     assert player.parachute_active is True
     player.airborne = False
@@ -62,7 +62,7 @@ def test_parachute_requires_second_airborne_space_press():
     assert player.parachute_active is False
 
 
-def test_falling_without_second_press_does_not_auto_deploy():
+def test_falling_without_z_press_does_not_auto_deploy():
     player = make_player()
     player.airborne = True
     player.vz = 5.0
@@ -70,6 +70,23 @@ def test_falling_without_second_press_does_not_auto_deploy():
     player.jump_last_held = False
     player._update_parachute()
     assert player.parachute_active is False
+
+
+def test_z_must_be_pressed_after_becoming_airborne():
+    player = make_player()
+    player.airborne = False
+    player.update_action_input(False, False, hover=True)
+    player._update_parachute()
+
+    player.airborne = True
+    player._update_parachute()
+    assert player.parachute_active is False
+
+    player.update_action_input(False, False, hover=False)
+    player._update_parachute()
+    player.update_action_input(False, False, hover=True)
+    player._update_parachute()
+    assert player.parachute_active is True
 
 
 def test_world_parachute_matches_stock_gravity():

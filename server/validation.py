@@ -28,4 +28,8 @@ def build_validation_config(
     config.default_mode = str(mode)
     config.name = f"{source.name} [VALIDATION]"
     config.bot_count = 0
+    # An explicit [bots] table supersedes the legacy count. Validation must
+    # disable both sources or a production backfill target silently injects
+    # combat traffic into supposedly isolated movement captures.
+    config.bots.enabled = False
     return config

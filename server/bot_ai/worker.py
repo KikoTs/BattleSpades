@@ -31,14 +31,24 @@ from .messages import (
     PerceptionFrame,
     PlayerSnapshot,
     Vector3,
+    WorkerHeartbeat,
     WorkerShutdown,
     WorldDelta,
+    map_snapshot_vxl_bytes,
 )
 from .combat_profiles import envelope_for
 from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
 from .policies import ModeBotDecision, _formation_point, objective_decision_for
+from .snapshot_transport import MapSnapshotAssembler, SnapshotTransportError
 from .voxel_navigation import VoxelActionPlanner, VoxelTerrain, WATERBED_SUPPORT_Z
 from server.projectiles import PROJECTILE_SPECS
+
+# Extracting a layered 32x32 Recast tile performs roughly 300k voxel probes.
+# A cross-map objective may span sixteen tiles and one worker batch may carry
+# twelve bots; warming every corridor synchronously starves all intentions for
+# several seconds.  Build one tile per coalesced batch and use bounded voxel
+# A* until the native corridor is ready.
+_NATIVE_TILE_BUILDS_PER_BATCH = 1
 
 # Position-holding/assault roles whose goals may shift onto commanding
 # terrain; carriers, hunters, and escorts always keep their exact goals.
@@ -364,6 +374,7 @@ class WorkerVoxelWorld:
         self._native_nav = None
         self._built_tiles: set[tuple[int, int]] = set()
         self._dirty_tiles: set[tuple[int, int]] = set()
+        self._native_tile_build_budget = _NATIVE_TILE_BUILDS_PER_BATCH
         self._last_affordance: dict[int, MovementAffordance] = {}
         # Resolve ``self.solid`` at call time so source-only fixtures and live
         # VXL reloads share exactly the same surface semantics.
@@ -377,6 +388,11 @@ class WorkerVoxelWorld:
     def ready(self) -> bool:
         return self._vxl is not None
 
+    def begin_batch(self) -> None:
+        """Renew bounded native-navigation work for one worker input batch."""
+
+        self._native_tile_build_budget = _NATIVE_TILE_BUILDS_PER_BATCH
+
     def load(self, snapshot: MapSnapshot) -> None:
         """Build a private native VXL from immutable snapshot bytes."""
 
@@ -387,13 +403,24 @@ class WorkerVoxelWorld:
         self._native_nav = None
         self._built_tiles.clear()
         self._dirty_tiles.clear()
+        self._native_tile_build_budget = _NATIVE_TILE_BUILDS_PER_BATCH
         self._last_affordance.clear()
-        if not snapshot.raw_vxl:
+        try:
+            raw_vxl = map_snapshot_vxl_bytes(snapshot)
+        except ValueError:
+            # A corrupt or truncated process message must not leave an old
+            # collision map attached to tactical perception. The supervisor
+            # watchdog will replace this child if it cannot answer live frames.
+            logger.exception("AI worker could not decode navigation VXL")
+            self.tactical.attach(None)
+            return
+        if not raw_vxl:
+            self.tactical.attach(None)
             return
         try:
             from server.bot_ai.compact_vxl import CompactVoxelMap
 
-            self._vxl = CompactVoxelMap(snapshot.raw_vxl)
+            self._vxl = CompactVoxelMap(raw_vxl)
             # The bridge retains a canonical overlay for worker restarts and
             # overflow rebases. Applying it while loading yields one coherent
             # current navigation snapshot without serializing VXL on the game
@@ -426,11 +453,14 @@ class WorkerVoxelWorld:
         self.tactical.attach(self._vxl)
 
     def apply(self, delta: WorldDelta) -> None:
-        """Apply a monotonically newer canonical terrain delta."""
+        """Apply one monotonically nondecreasing canonical terrain batch."""
 
         if int(delta.map_epoch) != self.map_epoch:
             return
-        if int(delta.topology_version) <= self.topology_version:
+        # One canonical topology commit may be split into several bounded
+        # pipe records. Reapplying an equal version is safe because voxel
+        # writes/removals are idempotent; only genuinely older deltas fail.
+        if int(delta.topology_version) < self.topology_version:
             return
         # A bridge can create a shore and a collapse can remove the next
         # escape cell. Invalidate only routes whose columns were touched so a
@@ -1032,7 +1062,14 @@ class WorkerVoxelWorld:
         tiles = self._tile_corridor(start, goal)
         for tile in tiles:
             if tile not in self._built_tiles or tile in self._dirty_tiles:
+                if self._native_tile_build_budget <= 0:
+                    # The voxel A* fallback remains immediately available;
+                    # later batches incrementally warm the rest of Recast.
+                    return 0.0, 0.0, 0.0
+                self._native_tile_build_budget -= 1
                 self._rebuild_native_tile(*tile)
+                if tile not in self._built_tiles or tile in self._dirty_tiles:
+                    return 0.0, 0.0, 0.0
         native_start = (start[0], -(start[2] + 2.25), start[1])
         native_end = (goal[0], -(goal[2] + 2.25), goal[1])
         try:
@@ -2029,7 +2066,13 @@ class BotBrain:
 
         if not observer.wade:
             return None
-        step = self.world.action_planner.water_exit(observer.position)
+        # Authored seas may contain tens of thousands of connected columns.
+        # Resume that global search in small slices so twelve swimmers cannot
+        # pin the single decision worker and starve every bot heartbeat.
+        step = self.world.action_planner.water_exit(
+            observer.position,
+            max_nodes=128,
+        )
         if step is None:
             return None
         state.last_path_direction = step.direction
@@ -5146,6 +5189,8 @@ def run_worker(
         decision_hz=decision_hz,
         path_requests_per_second=path_requests_per_second,
     )
+    snapshot_assembler = MapSnapshotAssembler()
+    batch_id = 0
     while True:
         try:
             first = input_queue.get(timeout=0.25)
@@ -5161,13 +5206,54 @@ def run_worker(
                 messages.append(input_queue.get_nowait())
             except queue.Empty:
                 break
-        shutdown, intents = _process_worker_batch(world, brain, messages)
+        try:
+            decoded_messages = snapshot_assembler.consume(messages)
+        except SnapshotTransportError:
+            # The parent will observe this non-zero child exit, discard its
+            # partial queue, and resend the latest canonical map to a clean
+            # assembler. Continuing with an old collision world is unsafe.
+            logger.exception("AI worker rejected map snapshot transport")
+            raise
+        processed_frame_id = max(
+            (
+                int(message.frame_id)
+                for message in decoded_messages
+                if isinstance(message, PerceptionFrame)
+            ),
+            default=-1,
+        )
+        world.begin_batch()
+        shutdown, intents = _process_worker_batch(
+            world,
+            brain,
+            decoded_messages,
+        )
         if shutdown:
             return
         # Between batches, advance the incremental tactical layer a bounded
         # step so a full map summarizes within a couple of seconds without
         # ever competing with perception or pathfinding work.
         world.tactical.rebuild(64)
+        batch_id += 1
+        heartbeat = WorkerHeartbeat(
+            batch_id=batch_id,
+            processed_frame_id=processed_frame_id,
+            map_epoch=int(world.map_epoch),
+            topology_version=int(world.topology_version),
+            snapshot_transfer_id=(
+                snapshot_assembler.last_completed_transfer_id
+            ),
+        )
+        try:
+            # Control acknowledgements precede lossy intentions.  A healthy
+            # zero-intent state (countdown, cadence skip, stale frame) must
+            # still renew the supervisor's watchdog lease.
+            output_queue.put(heartbeat, timeout=0.05)
+        except queue.Full:
+            # The bridge drains this bounded queue every 5 ms. If its process
+            # is briefly descheduled, the next batch acknowledgement catches
+            # up without allowing stale gameplay intentions to accumulate.
+            pass
         for intent in intents:
             try:
                 output_queue.put_nowait(intent)
