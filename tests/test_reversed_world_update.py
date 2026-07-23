@@ -445,6 +445,21 @@ def test_packet_handler_reads_live_client_data_unsigned_orientation_and_float_ya
     assert player.pack_action_flags() == 0x51
 
 
+def test_runtime_client_data_decodes_native_sign_magnitude_orientation():
+    """Lock the decoder to bytes emitted by the retail Python 2 packet type."""
+    from protocol.runtime_packets import decode_client_data_payload
+
+    # shared.packet.pyd generated this complete ClientData payload:
+    # o_x=-1.0 -> 00 C0, o_y=-0.25 -> 00 88, o_z=0.5 -> 00 10.
+    payload = bytes.fromhex("07000000030000c0008800100000000000")
+
+    packet = decode_client_data_payload(payload)
+
+    assert math.isclose(packet.o_x, -1.0, abs_tol=1e-6)
+    assert math.isclose(packet.o_y, -0.25, abs_tol=1e-6)
+    assert math.isclose(packet.o_z, 0.5, abs_tol=1e-6)
+
+
 def test_world_update_snapshot_packs_remote_disguise_and_water_state():
     player, _ = make_player()
     player.disguised = True

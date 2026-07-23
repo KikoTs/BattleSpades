@@ -476,6 +476,7 @@ class Player:
         self.last_landed: bool = False
         self.last_step_delta: float = 0.0
         self.last_trigger_jump: bool = False
+        self._jump_anchor_consumed_for_hold: bool = False
         self.last_buffered_jump_active: bool = False
         self.last_collision_count: int = 0
         self.last_collision_preview: list[tuple[float, float, float, float]] = []
@@ -1134,6 +1135,7 @@ class Player:
         self.last_landed = False
         self.last_step_delta = 0.0
         self.last_trigger_jump = False
+        self._jump_anchor_consumed_for_hold = False
         self.last_buffered_jump_active = False
         self.last_collision_count = 0
         self.last_collision_preview = []
@@ -1864,7 +1866,17 @@ class Player:
         # the world object's jump flag every frame the player is grounded —
         # no edge detection, no queue, no buffer. The buffered-jump-on-
         # landing behavior emerges naturally (key still held when landing).
+        if not bool(self.input.jump):
+            self._jump_anchor_consumed_for_hold = False
         trigger_jump = bool(self.input.jump) and not bool(world_object.airborne)
+        # The cached owner row belongs to the current physical key press.
+        # Reusing it after the same hold auto-relaunches on landing produces
+        # the block-edge rollback observed in the retail Python 2 trace.
+        restore_launch_anchor = bool(
+            trigger_jump and not self._jump_anchor_consumed_for_hold
+        )
+        if trigger_jump:
+            self._jump_anchor_consumed_for_hold = True
         self.last_trigger_jump = bool(trigger_jump)
         positions = self._build_player_collision_positions()
         server = self.connection.server if self.connection else None
@@ -1897,7 +1909,7 @@ class Player:
             trigger_jump=trigger_jump, collisions=positions
         )
         result = world_object.update(dt, positions)
-        if trigger_jump and not self.is_bot:
+        if restore_launch_anchor and not self.is_bot:
             # Reconciliation is keyed to Character.movement_history[L], which
             # retail snapshots *before* its native physics call.  ClientData L
             # arrives afterward. Character.update_alive then unconditionally
