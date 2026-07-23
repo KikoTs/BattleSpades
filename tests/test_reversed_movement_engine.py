@@ -405,6 +405,38 @@ def test_authoritative_jump_keeps_small_retail_anchor_correction():
     assert player.airborne is True
 
 
+def test_held_landing_relaunch_does_not_reuse_the_press_anchor():
+    """One continuous SPACE hold consumes its cached anchor only once."""
+    player = make_player()
+    advance_player(player, 4)
+    player.update_input(
+        True, False, False, False, True, False, False, True
+    )
+    asyncio.run(player.update(1.0 / 60.0))
+    assert player.airborne is True
+
+    for _ in range(240):
+        asyncio.run(player.update(1.0 / 60.0))
+        if player.grounded:
+            break
+    else:
+        pytest.fail("held jump never returned to the ground")
+
+    before_relaunch = player.position
+    stale_anchor = (
+        before_relaunch[0] - 0.10,
+        before_relaunch[1],
+        before_relaunch[2],
+    )
+    player.last_advertised_owner_position = stale_anchor
+
+    asyncio.run(player.update(1.0 / 60.0))
+
+    assert player.last_trigger_jump is True
+    assert player.airborne is True
+    assert player.position != pytest.approx(stale_anchor, abs=1e-6)
+
+
 def test_authoritative_jump_uses_owner_anchor_strictly_before_input_source():
     """A row stamped with the launch loop was queued too late for that launch.
 
