@@ -165,6 +165,13 @@ class DeployableActionService:
             blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)),
             force_destroy=False,
             detection_layers=int(getattr(C, "LANDMINE_DETECTION_LAYERS", 3)),
+            health=float(getattr(C, "LANDMINE_HEALTH", 1.0)),
+            vertical_offset=float(getattr(
+                C,
+                "LANDMINE_EXPLOSION_AND_DETECTION_VERTICAL_OFFSET",
+                -0.5,
+            )),
+            damage_type=int(getattr(C, "LANDMINE_DAMAGE", 15)),
         )
         entity = self.server.entity_registry.place(
             int(getattr(C, "LANDMINE_ENTITY", 9)),

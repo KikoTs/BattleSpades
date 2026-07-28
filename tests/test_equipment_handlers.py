@@ -231,6 +231,25 @@ def test_team_change_to_spectator_does_not_schedule_blue_respawn():
     assert create_packets[-1].team == TEAM_SPECTATOR
 
 
+def test_spectator_can_rejoin_a_playable_team_and_schedule_respawn():
+    server, player, _connection = _server_player(
+        C.RIFLE_TOOL, [C.RIFLE_TOOL]
+    )
+    handler = PacketHandler(server)
+    spectate = ChangeTeam()
+    spectate.team = TEAM_SPECTATOR
+    asyncio.run(handler.handle(player, bytes(spectate.generate())))
+
+    rejoin = ChangeTeam()
+    rejoin.team = internal_team_to_wire(TEAM2)
+    asyncio.run(handler.handle(player, bytes(rejoin.generate())))
+
+    assert player.team == TEAM2
+    assert player.alive is False
+    assert player.spawned is False
+    assert player.death_time > 0.0
+
+
 def test_radar_packet_creates_real_entity_and_enables_team_visibility():
     server, player, connection = _server_player(
         C.RADAR_STATION_TOOL, [C.RADAR_STATION_TOOL]

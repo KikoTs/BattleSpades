@@ -518,6 +518,13 @@ class BattleSpadesServer:
             blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)),
             force_destroy=False,
             detection_layers=int(getattr(C, "LANDMINE_DETECTION_LAYERS", 3)),
+            health=float(getattr(C, "LANDMINE_HEALTH", 1.0)),
+            vertical_offset=float(getattr(
+                C,
+                "LANDMINE_EXPLOSION_AND_DETECTION_VERTICAL_OFFSET",
+                -0.5,
+            )),
+            damage_type=int(getattr(C, "MINE_LAUNCHER_DAMAGE", 40)),
         )
         ent = self.entity_registry.place(
             int(getattr(C, "LANDMINE_ENTITY", 9)),
@@ -662,7 +669,8 @@ class BattleSpadesServer:
                      self_knockback_min=None, self_knockback_max=None,
                      prediction_frame_delay: int | None = None,
                      native_damage_type: int | None = None,
-                     causer_entity_id: int | None = None) -> None:
+                     causer_entity_id: int | None = None,
+                     ignore_player_los: bool = False) -> None:
         """Shared explosion: crater a cube of `crater_radius` and damage nearby
         players with the live-verified falloff. Used by projectiles AND
         deployables (dynamite/landmine/C4)."""
@@ -730,7 +738,10 @@ class BattleSpadesServer:
             sq = dx * dx + dy * dy + dz * dz
             if sq >= float(blast_radius) ** 2:
                 continue
-            if self._blocked_los(gx, gy, gz, target.x, target.y, target.z):
+            if (
+                not ignore_player_los
+                and self._blocked_los(gx, gy, gz, target.x, target.y, target.z)
+            ):
                 continue
             from server.explosions import explosion_impulse
             target_knockback_min = float(knockback_min)

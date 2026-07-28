@@ -53,8 +53,8 @@ def test_disconnect_clears_combat_cadence_before_player_id_reuse():
     assert 7 not in combat._minigun_runs
 
 
-def test_spade_block_hit_sends_remote_positioned_audio_once():
-    """Damage alone is silent for observers; the actor predicts its own cue."""
+def test_spade_block_hit_sends_positioned_audio_to_actor_too():
+    """The swing is predicted, but the successful block-hit cue is not."""
 
     server = DummyServer()
     player = SimpleNamespace(id=7)
@@ -76,7 +76,7 @@ def test_spade_block_hit_sends_remote_positioned_audio_once():
     assert sounds[0].sound_id == 33
     assert sounds[0].positioned
     assert (sounds[0].x, sounds[0].y, sounds[0].z) == (100.0, 101.0, 55.0)
-    assert server.broadcast_excludes[-1] is player
+    assert server.broadcast_excludes[-1] is None
 
 
 def test_kill_action_count_resets_when_the_killer_dies():
@@ -1330,6 +1330,14 @@ def test_block_build_consumes_inventory_and_clears_old_damage():
     broadcast_packet = BlockBuild(ByteReader(build_packets[-1][1:]))
     assert broadcast_packet.block_type == BLOCK_ACTION_BUILD
     assert (broadcast_packet.x, broadcast_packet.y, broadcast_packet.z) == block
+    sounds = [
+        PlaySound(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data[0] == PlaySound.id
+    ]
+    assert len(sounds) == 1
+    assert sounds[0].sound_id == 46
+    assert server.broadcast_excludes[-1] is None
 
 
 def test_rejected_predicted_build_is_queued_for_canonical_repair():
@@ -1463,6 +1471,14 @@ def test_block_tool_destroy_waits_for_its_originating_movement_loop():
     assert server.world_mutations.commit_ready() == 1
     assert server.world_manager.get_solid(*block) is False
     assert player.blocks == 5
+    sounds = [
+        PlaySound(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data[0] == PlaySound.id
+    ]
+    assert len(sounds) == 1
+    assert sounds[0].sound_id == 33
+    assert server.broadcast_excludes[-1] is None
 
 
 def test_block_line_replicates_as_explicit_colored_cells():
@@ -1513,7 +1529,7 @@ def test_block_line_replicates_as_explicit_colored_cells():
     assert len(sounds) == 1
     assert sounds[0].sound_id == 46
     assert sounds[0].positioned
-    assert server.broadcast_excludes[-1] is player
+    assert server.broadcast_excludes[-1] is None
     assert len(connection.sent_packets) == 1
     own_echo = BlockLine(ByteReader(connection.sent_packets[0][1:]))
     assert own_echo.loop_count == packet.loop_count

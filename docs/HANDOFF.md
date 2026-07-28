@@ -192,8 +192,9 @@ its packet and map-sync investigation history is still valuable.
   Local loops bootstrap at the listener so the media manager cannot reject a
   distant initial source; the native controller then moves the loop to the
   closest authored point.
-- Remote block-tool observers now receive a positioned `PlaySound(23)` cue.
-  The actor is excluded because the retail client predicts its own impact.
+- Every block-tool observer, including the actor, receives a positioned
+  `PlaySound(23)` cue. The recovered client predicts the swing/miss action but
+  does not reliably play the successful placement or block-impact sample.
   Spade, pickaxe, knife, Super Spade, zombie hands, crowbar, UGC mining tools,
   and the safe machete fallback use recovered `SOUND_MAP` IDs.
 - Isolated Mayan Jungle retail validation created two live non-closed media
