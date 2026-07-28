@@ -9,12 +9,50 @@ from __future__ import annotations
 import logging
 
 from protocol.handler_registry import register_handler
+import shared.constants as C
 from server.class_selection import normalize_server_selection
 from server.game_rules import get_rules
 from server.game_constants import KILL_CLASS_CHANGE
 from shared.packet import SetClassLoadout
 
 logger = logging.getLogger(__name__)
+
+
+def _matches_active_selection(player, selection) -> bool:
+    """Return whether ``selection`` already describes the current life."""
+
+    return (
+        int(selection.class_id) == int(player.class_id)
+        and tuple(selection.loadout) == tuple(getattr(player, "loadout", ()) or ())
+        and tuple(selection.prefabs) == tuple(getattr(player, "prefabs", ()) or ())
+        and tuple(selection.ugc_tools)
+        == tuple(getattr(player, "ugc_tools", ()) or ())
+    )
+
+
+def _allows_live_ugc_selection(server, player, selection) -> bool:
+    """Keep live backpack editing isolated to the Map Creator runtime."""
+
+    return (
+        bool(getattr(server.config, "ugc_runtime", False))
+        and int(player.class_id) == int(C.CLASS_UGCBUILDER)
+        and int(selection.class_id) == int(C.CLASS_UGCBUILDER)
+    )
+
+
+def _broadcast_live_selection(server, player, selection) -> None:
+    """Publish a normalized live UGC backpack selection to the client."""
+
+    acknowledgement = SetClassLoadout()
+    acknowledgement.player_id = int(player.id)
+    acknowledgement.class_id = int(selection.class_id)
+    acknowledgement.instant = 1
+    acknowledgement.loadout = list(selection.loadout)
+    acknowledgement.prefabs = list(selection.prefabs)
+    acknowledgement.ugc_tools = list(selection.ugc_tools)
+    broadcast = getattr(server, "broadcast", None)
+    if callable(broadcast):
+        broadcast(bytes(acknowledgement.generate()), reliable=True)
 
 
 @register_handler(13)  # SetClassLoadout
@@ -37,35 +75,23 @@ async def handle_set_class_loadout(server, player, packet) -> None:
         logger.debug("Ignoring mode-locked loadout change from %s", player.name)
         return
     instant = bool(getattr(packet, "instant", 0))
-    same_live_class = (
-        player.alive and selection.class_id == int(player.class_id)
-    )
-    if instant or same_live_class:
-        # Committing all fields synchronously prevents the Miner/Medic
-        # split-brain that used to authorize packet 90 after switching class.
+    if _matches_active_selection(player, selection):
+        logger.debug("Ignoring unchanged class/loadout from %s", player.name)
+        return
+    if _allows_live_ugc_selection(server, player, selection):
+        # Map Creator changes its active Constructs backpack without creating a
+        # new playable life. Keep that exception isolated from normal matches.
         player.apply_class_selection(selection)
         player.pending_selection = None
         player.pending_class_id = None
         player.pending_loadout = None
-        # The menu updates a temporary GameClass, not the live Character.  A
-        # normalized server echo with instant=1 is therefore required for the
-        # stock client's process_packet_change_class_loadout path to replace
-        # its active prefab/UGC backpack without waiting for a respawn.  This
-        # is especially visible in Map Creator when switching from Constructs
-        # to spawn/base/crate placement tools.
-        acknowledgement = SetClassLoadout()
-        acknowledgement.player_id = int(player.id)
-        acknowledgement.class_id = int(selection.class_id)
-        acknowledgement.instant = 1
-        acknowledgement.loadout = list(selection.loadout)
-        acknowledgement.prefabs = list(selection.prefabs)
-        acknowledgement.ugc_tools = list(selection.ugc_tools)
-        broadcast = getattr(server, "broadcast", None)
-        if callable(broadcast):
-            broadcast(bytes(acknowledgement.generate()), reliable=True)
+        _broadcast_live_selection(server, player, selection)
     else:
+        # A same-class equipment swap still needs a new life. Committing it on
+        # the live Character gives the replacement tool zero charges because
+        # its CreatePlayer/restock path never ran.
         player.stage_class_selection(selection)
-        if selection.class_id != int(player.class_id) and player.alive:
+        if player.alive:
             player.die(kill_type=KILL_CLASS_CHANGE)
     logger.info(
         "LOADOUT %s -> class=%d loadout=%s instant=%s",

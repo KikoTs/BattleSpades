@@ -217,6 +217,10 @@ def test_mine_launcher_replaces_flying_visual_with_armed_landmine():
     assert [entity.type for entity in server.entity_registry.all()] == [
         C.LANDMINE_ENTITY
     ]
+    deployed = server.entity_registry.all()[0]
+    assert deployed.behavior.takes_damage is True
+    assert deployed.behavior.health == float(C.LANDMINE_HEALTH)
+    assert deployed.behavior.damage_type == int(C.MINE_LAUNCHER_DAMAGE)
     destroyed = [
         DestroyEntity(ByteReader(data[1:])).entity_id
         for data in observer_connection.sent

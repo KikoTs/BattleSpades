@@ -14,7 +14,6 @@ from server.config import ServerConfig
 from server.class_data import default_client_loadout
 from server.game_constants import TEAM1
 from server.player import Player
-from shared.bytes import ByteReader
 from shared.packet import ChangeClass, SetClassLoadout
 
 
@@ -201,7 +200,7 @@ def test_change_class_then_set_loadout_replaces_defaults_without_second_death():
     assert C.C4_TOOL in player.pending_selection.loadout
 
 
-def test_instant_selection_commits_class_and_loadout_without_split_state():
+def test_untrusted_instant_selection_still_waits_for_competitive_respawn():
     player = _live_medic()
     handler = _handler()
 
@@ -210,14 +209,14 @@ def test_instant_selection_commits_class_and_loadout_without_split_state():
         _loadout_packet(C.CLASS_MINER, [C.SHOTGUN_TOOL, C.DYNAMITE_TOOL], 1),
     ))
 
-    assert player.deaths == 0
-    assert player.class_id == C.CLASS_MINER
-    assert C.DYNAMITE_TOOL in player.loadout
-    assert C.MEDPACK_TOOL not in player.loadout
-    assert player.pending_selection is None
+    assert player.deaths == 1
+    assert player.class_id == C.CLASS_MEDIC
+    assert C.MEDPACK_TOOL in player.loadout
+    assert player.pending_selection.class_id == C.CLASS_MINER
+    assert C.DYNAMITE_TOOL in player.pending_selection.loadout
 
 
-def test_same_class_live_loadout_change_commits_without_forcing_death():
+def test_same_class_live_loadout_change_stages_and_forces_respawn():
     player = _live_medic()
     handler = _handler()
 
@@ -229,17 +228,62 @@ def test_same_class_live_loadout_change_commits_without_forcing_death():
         ),
     ))
 
-    assert player.deaths == 0
+    assert player.deaths == 1
     assert player.class_id == C.CLASS_MEDIC
-    assert C.SHOTGUN2_TOOL in player.loadout
+    assert C.SHOTGUN2_TOOL not in player.loadout
+    assert C.SHOTGUN2_TOOL in player.pending_selection.loadout
+    assert handler.server.broadcasts == []
+
+
+def test_map_creator_same_class_backpack_change_remains_live():
+    player = Player(3, "UGCBuilder", TEAM1, C.BLOCK_TOOL, None)
+    player.apply_class_selection(normalize_class_selection(
+        C.CLASS_UGCBUILDER,
+    ))
+    player.spawn(100.5, 100.5, 60.0)
+    handler = _handler()
+    handler.server.config.ugc_runtime = True
+    handler.server.config.ugc_prefabs = ["Bunker", "Tent"]
+
+    packet = SetClassLoadout()
+    packet.player_id = player.id
+    packet.class_id = C.CLASS_UGCBUILDER
+    packet.instant = 0  # The retail send_class_loadout method writes zero.
+    packet.loadout = list(player.loadout)
+    packet.prefabs = ["Tent"]
+    packet.ugc_tools = list(player.ugc_tools)
+    asyncio.run(handler.handle(player, bytes(packet.generate())))
+
+    assert player.deaths == 0
+    assert player.prefabs == ["Tent"]
     assert player.pending_selection is None
-    acknowledgement = SetClassLoadout(
-        ByteReader(handler.server.broadcasts[-1][1:])
-    )
-    assert acknowledgement.player_id == player.id
-    assert acknowledgement.class_id == C.CLASS_MEDIC
-    assert acknowledgement.instant == 1
-    assert acknowledgement.loadout == player.loadout
+    assert len(handler.server.broadcasts) == 1
+
+
+def test_scout_mine_to_locator_swap_receives_a_new_life_boundary():
+    player = Player(3, "ScoutSwap", TEAM1, C.SNIPER_TOOL, None)
+    player.apply_class_selection(normalize_class_selection(
+        C.CLASS_SCOUT,
+        [C.SNIPER_TOOL, C.LANDMINE_TOOL, C.PICKAXE_TOOL],
+    ))
+    player.spawn(100.5, 100.5, 60.0)
+    handler = _handler()
+
+    asyncio.run(handler.handle(
+        player,
+        _loadout_packet(
+            C.CLASS_SCOUT,
+            [C.SNIPER_TOOL, C.RADAR_STATION_TOOL, C.PICKAXE_TOOL],
+        ),
+    ))
+
+    assert player.deaths == 1
+    assert C.LANDMINE_TOOL in player.loadout
+    assert C.RADAR_STATION_TOOL not in player.loadout
+    assert C.RADAR_STATION_TOOL in player.pending_selection.loadout
+    player.apply_pending_selection()
+    assert C.RADAR_STATION_TOOL in player.loadout
+    assert C.LANDMINE_TOOL not in player.loadout
 
 
 def test_deployable_authorization_requires_matching_active_class_and_loadout():

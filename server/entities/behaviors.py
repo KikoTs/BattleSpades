@@ -312,14 +312,24 @@ class TimedExplosiveBehavior(EntityBehavior):
         return _attached_face_center(ent)
 
 
-class ProximityMineBehavior(EntityBehavior):
+class ProximityMineBehavior(DamageableEntityBehavior):
     """Landmine: arms after a short delay, then detonates when an ENEMY (not
-    the placer's team) enters the trigger radius."""
+    the placer's team) enters the trigger radius.
+
+    Retail gives the placed entity one health, so weapon/explosion damage
+    detonates it instead of leaving an indestructible shell.
+    """
 
     def __init__(self, thrower_id, team, damage, block_damage, crater_radius,
                  kill_type, trigger_radius=2.5, arm_delay=1.0,
                  blast_radius=16.0, force_destroy=True, detection_layers=3,
-                 knockback_min=None, knockback_max=None):
+                 knockback_min=None, knockback_max=None, health=None,
+                 vertical_offset=None, damage_type=None):
+        import shared.constants as C
+        super().__init__(
+            getattr(C, "LANDMINE_HEALTH", 1.0)
+            if health is None else health
+        )
         self.thrower_id = int(thrower_id)
         self.team = int(team)
         self.damage = float(damage)
@@ -331,7 +341,22 @@ class ProximityMineBehavior(EntityBehavior):
         self.trigger_radius = float(trigger_radius)
         self.arm_delay = float(arm_delay)
         self.detection_layers = int(detection_layers)
-        import shared.constants as C
+        self.vertical_offset = float(
+            getattr(
+                C,
+                "LANDMINE_EXPLOSION_AND_DETECTION_VERTICAL_OFFSET",
+                -0.5,
+            )
+            if vertical_offset is None else vertical_offset
+        )
+        self.damage_type = (
+            int(getattr(C, "LANDMINE_DAMAGE", 15))
+            if damage_type is None else int(damage_type)
+        )
+        # Mines explicitly detect through three rebuilt layers. Applying the
+        # generic grenade LOS gate from inside those layers would detect the
+        # player and then discard all HP damage.
+        self.ignore_player_los = True
         self.knockback_min = float(
             getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MIN", 0.75)
             if knockback_min is None else knockback_min
@@ -342,6 +367,21 @@ class ProximityMineBehavior(EntityBehavior):
         )
         self._armed_at = None
 
+    def _mine_center(self, ent):
+        """Return the rendered/explosion center from its placed voxel."""
+
+        return (
+            float(ent.x) + 0.5,
+            float(ent.y) + 0.5,
+            float(ent.z) + self.vertical_offset,
+        )
+
+    def get_hit_center(self, ent):
+        return self._mine_center(ent)
+
+    def get_explosion_center(self, ent):
+        return self._mine_center(ent)
+
     def on_tick(self, ent, dt, ctx) -> None:
         if self._armed_at is None:
             self._armed_at = ctx.now + self.arm_delay
@@ -349,11 +389,12 @@ class ProximityMineBehavior(EntityBehavior):
         if ctx.now < self._armed_at:
             return
         r2 = self.trigger_radius ** 2
+        mine_x, mine_y, mine_z = self._mine_center(ent)
         for player in ctx.players:
             if getattr(player, "team", None) == self.team:
                 continue  # own team never trips it
-            dx = player.x - ent.x
-            dy = player.y - ent.y
+            dx = player.x - mine_x
+            dy = player.y - mine_y
             # Detection is column/layer based in the stock game: a mine may be
             # re-buried two blocks deep and must still trigger. Compare the
             # player's feet to the mine vertically, but use the 2.5 range in
@@ -370,9 +411,17 @@ class ProximityMineBehavior(EntityBehavior):
             except Exception:
                 feet_offset = 1.35 if crouched else 2.25
             feet_z = player.z + feet_offset
-            if (dx * dx + dy * dy) <= r2 and abs(feet_z - ent.z) <= self.detection_layers:
+            if (
+                (dx * dx + dy * dy) <= r2
+                and abs(feet_z - mine_z) <= self.detection_layers
+            ):
                 _detonate_deployable(self, ent, ctx)
                 return
+
+    def on_destroyed(self, ent, source, ctx) -> None:
+        """A shot mine explodes through the same authoritative blast path."""
+
+        _detonate_deployable(self, ent, ctx)
 
 
 class RemoteChargeBehavior(DamageableEntityBehavior):
@@ -479,6 +528,9 @@ def _detonate_deployable(behavior, ent, ctx) -> None:
             knockback_max=getattr(behavior, "knockback_max", 0.0),
             native_damage_type=getattr(behavior, "damage_type", None),
             causer_entity_id=int(ent.entity_id),
+            ignore_player_los=bool(
+                getattr(behavior, "ignore_player_los", False)
+            ),
         )
     if ctx.destroy is not None:
         ctx.destroy(ent.entity_id)

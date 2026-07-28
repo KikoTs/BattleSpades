@@ -529,6 +529,9 @@ def test_landmine_triggers_on_enemy_not_teammate():
     assert not e.alive
     assert len(srv.blasts) == 1
     assert srv.blasts[0][3] == 100.0
+    assert srv.blasts[0][:3] == (100.5, 100.5, 59.5)
+    assert srv.blast_kwargs[0]["ignore_player_los"] is True
+    assert srv.blast_kwargs[0]["native_damage_type"] == int(C.LANDMINE_DAMAGE)
 
 
 def test_landmine_detects_enemy_reburied_two_layers_deep():
@@ -551,6 +554,40 @@ def test_landmine_detects_enemy_reburied_two_layers_deep():
     reg.tick(deploy_ctx(srv, [enemy], now=1004.1))
 
     assert not e.alive
+    assert len(srv.blasts) == 1
+
+
+def test_landmine_has_stock_health_and_detonates_when_shot():
+    from server.entities.behaviors import ProximityMineBehavior
+
+    reg = EntityRegistry()
+    srv = FakeServer()
+    srv.entity_registry = reg
+    behavior = ProximityMineBehavior(
+        thrower_id=7,
+        team=2,
+        damage=100.0,
+        block_damage=15.0,
+        crater_radius=1,
+        kill_type=14,
+    )
+    entity = reg.place(
+        C.LANDMINE_ENTITY,
+        100.0,
+        100.0,
+        60.0,
+        behavior=behavior,
+    )
+    context = deploy_ctx(srv, [], now=1000.0)
+
+    assert behavior.takes_damage is True
+    assert behavior.health == float(C.LANDMINE_HEALTH)
+    assert behavior.get_hit_center(entity) == (100.5, 100.5, 59.5)
+
+    reg.damage_entity(entity.entity_id, C.LANDMINE_HEALTH, None, context)
+
+    assert reg.get(entity.entity_id) is None
+    assert context._destroyed == [entity.entity_id]
     assert len(srv.blasts) == 1
 
 

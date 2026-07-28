@@ -143,10 +143,10 @@ def _build_melee_profiles():
 MELEE_DIG_PROFILES = _build_melee_profiles()
 DEFAULT_MELEE_PROFILE = (2, 5.0, DIG_COLUMN)   # spade fallback
 
-# PlaySound(23) is needed for remote observers. The acting retail client plays
-# its own melee impact immediately, but Damage(37) alone does not consistently
-# produce the matching sample for another player (and bots have no local
-# client at all). Values are the live constants_audio SOUND_MAP ids.
+# PlaySound(23) is needed for every observer, including the actor.  The retail
+# tool source plays its swing/miss cue immediately, but neither that prediction
+# nor Damage(37) reliably produces the successful block-impact sample.  Values
+# are the live constants_audio SOUND_MAP ids.
 _BLOCK_HIT_SOUND_BY_DAMAGE = {
     int(getattr(C, "PICKAXE_DAMAGE", 0)): 36,
     int(getattr(C, "KNIFE_DAMAGE", 1)): 35,
@@ -532,13 +532,12 @@ class CombatSystem:
         self._broadcast_block_mutation(
             player, position, BLOCK_ACTION_BUILD, loop_count=action_loop
         )
-        # The actor predicts its own placement sample. Build packets do not
-        # trigger that Character sound for remote observers.
+        # BlockTool sends the line but does not play BUILD_SOUND on success.
+        # Include the actor so a solo builder receives the authoritative cue.
         play_sound(
             self.server,
             SND_BUILD,
             position=position,
-            exclude=player,
         )
 
     # Longest line the server will accept. The client regenerates the cells
@@ -688,7 +687,6 @@ class CombatSystem:
                 self.server,
                 SND_BUILD,
                 position=successful_cells[0],
-                exclude=player,
             )
 
     def block_line_cells(self, a, b):
@@ -1224,7 +1222,6 @@ class CombatSystem:
             self.server,
             SND_DIG_HIT_BLOCK,
             position=position,
-            exclude=player,
         )
 
     def _broadcast_entity_hit(self, entity, position) -> None:
@@ -1372,7 +1369,6 @@ class CombatSystem:
                 self.server,
                 sound_id,
                 position=block_pos,
-                exclude=player,
             )
 
     def record_exact_block_destroy_catchup(self, player, positions,
