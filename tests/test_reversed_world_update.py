@@ -87,6 +87,9 @@ def make_player(server=None, cell_x=100, cell_y=100):
     flatten_patch(server.world_manager, cell_x, cell_y)
     connection = DummyConnection(server)
     player = Player(0, "KikoTs", TEAM1, C.RIFLE_TOOL, connection)
+    # Isolated protocol players do not pass through Connection._on_new_player,
+    # so give them the small committed inventory that real joins always have.
+    player.loadout = [int(C.RIFLE_TOOL), int(C.BLOCK_TOOL)]
     connection.player = player
     server.players[player.id] = player
     player.spawn(*make_spawn(server.world_manager, cell_x, cell_y))
@@ -345,6 +348,7 @@ def test_client_data_updates_player_state_and_flags():
         loop_count=321,
     )
     player, _ = make_player(server)
+    player.loadout.append(int(C.MINIGUN_TOOL))
 
     packet = ClientData()
     packet.loop_count = 1
@@ -1062,6 +1066,106 @@ def test_self_world_update_keeps_anchor_but_uses_noop_tool_sentinel():
 
     assert owner_packet.player_updates[owner.id][9] == 0xFF
     assert owner_packet.player_updates[observer.id][9] == observer.tool
+
+
+def test_forged_unmounted_mg_tool_is_rejected_and_never_replicated():
+    """A naked tool 15 must not reach the retail MGWeapon constructor."""
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    player, _connection = make_player(server)
+    player.input.can_display_weapon = True
+    player.input.primary_fire = True
+
+    packet = ClientData()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.tool_id = C.MG_TOOL
+    packet.o_x, packet.o_y, packet.o_z = (1.0, 0.0, 0.0)
+    packet.ooo = 0
+    packet.primary = True
+    packet.can_display_weapon = True
+    packet.weapon_deployment_yaw = 0.0
+
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.tool == C.RIFLE_TOOL
+    assert player.rejected_tool_updates == 1
+
+    # Defense in depth: even direct internal corruption is neutralized at the
+    # outbound trust boundary before it can poison every observer.
+    player.tool = C.MG_TOOL
+    data = server.build_world_update_data()
+    update = WorldUpdate(ByteReader(data[1:])).player_updates[player.id]
+    assert update[9] == 0xFF
+    assert update[7] & 0xD3 == 0
+
+
+def test_mounted_mg_is_authorized_but_world_update_uses_entity_transition():
+    """A real mounted MG remains usable without racing naked tool 15."""
+
+    from server.entities.machine_gun import MachineGunBehavior
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    player, _connection = make_player(server)
+    behavior = MachineGunBehavior(player.id, player.team)
+    entity = server.entity_registry.place(
+        C.MACHINE_GUN,
+        player.x,
+        player.y,
+        player.z,
+        kind="machine_gun",
+        player_id=0xFF,
+        behavior=behavior,
+    )
+    assert behavior.mount(entity, player, server)
+
+    packet = ClientData()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.tool_id = C.MG_TOOL
+    packet.o_x, packet.o_y, packet.o_z = (1.0, 0.0, 0.0)
+    packet.ooo = 0
+    packet.primary = True
+    packet.can_display_weapon = True
+    packet.is_weapon_deployed = True
+    packet.weapon_deployment_yaw = 0.0
+    asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
+
+    assert player.tool == C.MG_TOOL
+    assert player.rejected_tool_updates == 0
+
+    data = server.build_world_update_data()
+    update = WorldUpdate(ByteReader(data[1:])).player_updates[player.id]
+    assert update[9] == 0xFF
+    # ChangeEntity initializes the MG model; action bits can still animate it.
+    assert update[7] & 0x91 == 0x91
+
+
+def test_world_update_tool_sanitizer_covers_every_wire_byte():
+    """No forged byte outside the committed loadout is reflected to clients."""
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager = make_world_manager()
+    player, _connection = make_player(server)
+    player.input.primary_fire = True
+    player.input.secondary_fire = True
+    player.input.can_display_weapon = True
+    player.input.zoom = True
+    player.input.is_weapon_deployed = True
+    weapon_action_mask = 0xD3
+
+    for forged_tool in range(256):
+        player.tool = forged_tool
+        data = server.build_world_update_data()
+        update = WorldUpdate(ByteReader(data[1:])).player_updates[player.id]
+        if forged_tool in (int(C.RIFLE_TOOL), int(C.BLOCK_TOOL)):
+            assert update[9] == forged_tool
+            assert update[7] & weapon_action_mask == weapon_action_mask
+        else:
+            assert update[9] == 0xFF
+            assert update[7] & weapon_action_mask == 0
 
 
 def test_world_header_clock_is_independent_from_each_player_row_pong():

@@ -451,6 +451,7 @@ class Player:
         self.input_frames_overflow: int = 0
         self.input_frames_applied: int = 0
         self.input_starved_ticks: int = 0
+        self.rejected_tool_updates: int = 0
         self.last_reported_position: Optional[Tuple[float, float, float]] = None
         # The client loop_count of the input frame the simulation last
         # consumed — the ONLY correct stamp for this player's WorldUpdate
@@ -656,7 +657,15 @@ class Player:
         world_object.jump = bool(self.input.jump)
         world_object.sneak = self.input.sneak
         world_object.sprint = self.input.sprint
-        world_object.hover = self.input.hover
+        # ``hover`` is the UGC Builder pack's toggled Z ability.  The same
+        # ClientData bit is also used as the Commando parachute deploy key,
+        # but feeding it into every native player skips gravity entirely.
+        # Retail only applies the mover flag for pack 69; parachutes use their
+        # separate replicated state and 0.05-gravity branch below.
+        world_object.hover = bool(
+            self.input.hover
+            and self.jetpack_id == int(C.JETPACK_UGCBUILDER)
+        )
         world_object.burdened = bool(self.pickup_burdensome)
         # Jetpack: concrete pack id + whether thrust is firing this tick.  The
         # stock mover applies pack-specific SPACE thrust and its high-friction
@@ -1355,6 +1364,94 @@ class Player:
             return True
         return False
 
+    def _simulate_dead_corpse_tick(self, dt: float) -> None:
+        """Advance the retail native mover during a jetpack death fuse."""
+
+        if self.alive or dt <= 0.0:
+            return
+        world_object = self._ensure_world_object()
+        if world_object is None:
+            return
+        try:
+            world_object.update(
+                float(dt),
+                self._build_player_collision_positions(),
+            )
+            self._sync_cached_vectors()
+        except Exception:
+            logger.debug("dead corpse physics failed", exc_info=True)
+
+    def _spawn_death_grave(self) -> None:
+        """Create the stock falling GraveEntity at the corpse's live state."""
+
+        server = self.connection.server if self.connection else None
+        if server is None:
+            return
+        reg = getattr(server, "entity_registry", None)
+        if reg is None or not getattr(server.config, "entities_wire_ready", False):
+            return
+        existing = reg.get(self._grave_entity_id)
+        if existing is not None and bool(getattr(existing, "alive", False)):
+            return
+
+        try:
+            from server.entities.behaviors import GraveBehavior
+            from server.game_rules import get_rules
+
+            grave_x, grave_y, grave_z = self.position
+            grave_velocity = tuple(float(value) for value in self.velocity)
+            world = getattr(server, "world_manager", None)
+            explosion_center = (grave_x, grave_y, grave_z)
+            if world is not None:
+                explosion_center = world.dry_surface_anchor(
+                    grave_x,
+                    grave_y,
+                    search=0,
+                )
+            team = server.teams.get(self.team)
+            grave_color = tuple(team.color) if team is not None else None
+            corpse_explosion = get_rules(server.config).enabled(
+                "RULE_ENABLE_CORPSE_EXPLOSION"
+            )
+            grave = reg.place(
+                int(getattr(C, "GRAVE_ENTITY", 11)),
+                grave_x,
+                grave_y,
+                grave_z,
+                state=int(self.team),
+                color=grave_color,
+                kind="grave",
+                player_id=self.id,
+                vel=grave_velocity,
+                behavior=GraveBehavior(
+                    thrower_id=self.id,
+                    fuse=float(getattr(C, "GRAVE_EXPLOSION_FUSE", 7.0)),
+                    damage=(
+                        float(getattr(C, "GRAVE_EXPLOSION_DAMAGE", 25.0))
+                        if corpse_explosion
+                        else 0.0
+                    ),
+                    block_damage=(
+                        float(
+                            getattr(C, "GRAVE_EXPLOSION_BLOCK_DAMAGE", 3.0)
+                        )
+                        if corpse_explosion
+                        else 0.0
+                    ),
+                    blast_radius=(
+                        float(getattr(C, "GRAVE_EXPLOSION_RADIUS", 3.0))
+                        if corpse_explosion
+                        else 0.0
+                    ),
+                    kill_type=int(getattr(C.KILL, "GRAVE_KILL", 13)),
+                    explosion_center=explosion_center,
+                ),
+            )
+            self._grave_entity_id = grave.entity_id
+            server.broadcast_create_entity(grave)
+        except Exception:
+            logger.debug("grave spawn failed", exc_info=True)
+
     def die(self, killer: Optional["Player"] = None, kill_type: int = 0):
         # Idempotent per death: guard on `alive` alone. The old
         # `not alive and not spawned` let a death slip through for an
@@ -1393,6 +1490,17 @@ class Player:
         world_object = self._ensure_world_object()
         if world_object is not None:
             world_object.set_dead(True)
+            # KillAction removes player control but preserves momentum. Keep
+            # the server's one-second jetpack corpse prediction on the same
+            # uncontrolled native branch as the retail Character.
+            world_object.set_walk(False, False, False, False)
+            world_object.jump = False
+            world_object.sneak = False
+            world_object.sprint = False
+            world_object.hover = False
+            world_object.jetpack_active = False
+            world_object.jetpack_passive = False
+            world_object.parachute_active = False
             self._sync_cached_vectors()
 
         kill_count = 0
@@ -1429,63 +1537,18 @@ class Player:
                 callable(on_player_death) and on_player_death(self)
             )
 
-            # Spawn the stock team-coloured grave on the supporting surface.
-            # GraveEntity is a moving client object; feeding it the player's
-            # eye/body Z made it fall and tumble while the death camera tracked
-            # it.  A stable surface anchor restores the intended mouse-orbit
-            # camera.  Its delayed explosion is server-authoritative via
-            # GraveBehavior and intentionally outlives the 5s respawn timer.
-            reg = getattr(server, "entity_registry", None)
             from server.game_rules import get_rules
             grave_enabled = get_rules(server.config).enabled(
                 "RULE_ENABLE_GRAVESTONES"
             )
-            if (
-                not uses_classic_corpse
-                and grave_enabled
-                and reg is not None
-                and getattr(server.config, "entities_wire_ready", False)
-            ):
-                try:
-                    from server.entities.behaviors import GraveBehavior
-                    world = getattr(server, "world_manager", None)
-                    grave_x, grave_y, grave_z = self.x, self.y, self.z
-                    if world is not None:
-                        grave_x, grave_y, grave_z = world.dry_surface_anchor(
-                            self.x, self.y, search=0
-                        )
-                    team = server.teams.get(self.team)
-                    grave_color = tuple(team.color) if team is not None else None
-                    corpse_explosion = get_rules(server.config).enabled(
-                        "RULE_ENABLE_CORPSE_EXPLOSION"
-                    )
-                    grave = reg.place(
-                        int(getattr(C, "GRAVE_ENTITY", 11)),
-                        grave_x, grave_y, grave_z,
-                        state=int(self.team), color=grave_color,
-                        kind="grave", player_id=self.id,
-                        behavior=GraveBehavior(
-                            thrower_id=self.id,
-                            fuse=float(getattr(C, "GRAVE_EXPLOSION_FUSE", 7.0)),
-                            damage=(
-                                float(getattr(C, "GRAVE_EXPLOSION_DAMAGE", 25.0))
-                                if corpse_explosion else 0.0
-                            ),
-                            block_damage=(
-                                float(getattr(C, "GRAVE_EXPLOSION_BLOCK_DAMAGE", 3.0))
-                                if corpse_explosion else 0.0
-                            ),
-                            blast_radius=(
-                                float(getattr(C, "GRAVE_EXPLOSION_RADIUS", 3.0))
-                                if corpse_explosion else 0.0
-                            ),
-                            kill_type=int(getattr(C.KILL, "GRAVE_KILL", 13)),
-                        ),
-                    )
-                    self._grave_entity_id = grave.entity_id
-                    server.broadcast_create_entity(grave)
-                except Exception:
-                    logger.debug("grave spawn failed", exc_info=True)
+            if not uses_classic_corpse:
+                schedule_normal = getattr(
+                    corpse_lifecycle,
+                    "schedule_normal_death",
+                    None,
+                )
+                if callable(schedule_normal):
+                    schedule_normal(self, grave_enabled=grave_enabled)
 
         # Notify the active mode (drained next tick, never inline-async). Every
         # death fires on_player_death; a CROSS-TEAM kill by another player also
@@ -2546,7 +2609,10 @@ class Player:
 
         world_object = self._ensure_world_object()
         if world_object is not None:
-            world_object.hover = hover
+            world_object.hover = bool(
+                hover
+                and self.jetpack_id == int(C.JETPACK_UGCBUILDER)
+            )
             self._sync_cached_vectors()
 
     def _apply_client_authority_pin(self):
@@ -2666,9 +2732,9 @@ class Player:
             byte |= 0x02
         # 0x04 = jetpack active (display + pack-specific flight on the client).
         # SAFE here ONLY because it is gated on jetpack_active: the server's fuel
-        # model (driven by the client's hover/Z bit) sets this True only while
-        # the player is actually firing the jetpack with fuel, and clears it the
-        # instant they release Z or run dry. That is the OPPOSITE of the old
+        # model uses held SPACE for packs 66-68 and hover/Z for UGC pack 69,
+        # setting this only while the pack is firing with fuel and clearing it
+        # on physical release or exhaustion. That is the OPPOSITE of the old
         # jump-stuck bug, which came from 0x08/0x10 being set UNCONDITIONALLY
         # (echoed from always-on ClientData bits) so the client believed it was
         # perma-jetpacking and skipped gravity forever. A transient, truthful
@@ -2703,6 +2769,14 @@ class Player:
             byte |= 0x01
         if self.disguised:
             byte |= 0x02
+        # GameScene.process_packet_world_update line 3310 sends this bit to
+        # Character.set_hover.  It is the UGC Builder's toggled Z state, not
+        # the raw ClientData hover/deploy key shared by the parachute.
+        if (
+            self.jetpack_id == int(C.JETPACK_UGCBUILDER)
+            and self.input.hover
+        ):
+            byte |= 0x04
         if self.wade:
             byte |= 0x08
         return byte

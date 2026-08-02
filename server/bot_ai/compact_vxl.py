@@ -189,6 +189,11 @@ class CompactVoxelMap:
             return MAP_HEIGHT
         return (mask & -mask).bit_length() - 1
 
+    def iter_column_masks(self):
+        """Yield immutable integer masks for off-thread map preprocessing."""
+
+        return iter(self._columns)
+
     def set_solid(self, x: int, y: int, z: int, value: bool) -> None:
         """Apply one canonical live terrain delta."""
 

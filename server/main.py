@@ -8,10 +8,12 @@ Uses ENet for networking with asyncio integration.
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+import errno
 import logging
+import socket
 import sys
 import time
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from shared.packet import (
     ChatMessage,
@@ -72,6 +74,68 @@ logger = logging.getLogger(__name__)
 _SNOWBALL_PREDICTION_OBSERVED_FRAMES = 3
 
 
+class ServerBindError(RuntimeError):
+    """Raised when the configured ENet UDP endpoint cannot be acquired."""
+
+
+def _assert_udp_port_available(port: int) -> None:
+    """Fail with an actionable error before ENet obscures a bind failure.
+
+    The vendored pyenet binding raises ``MemoryError`` whenever
+    ``enet_host_create`` returns ``NULL``.  That native result also covers
+    ordinary socket bind failures, including a second server using the port.
+    Probe the endpoint first so operators see the real problem.
+    """
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        if sys.platform == "win32":
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(("", int(port)))
+    except OSError as exc:
+        error_code = getattr(exc, "winerror", None) or exc.errno
+        if error_code in (errno.EACCES, errno.EADDRINUSE, 10013, 10048):
+            raise ServerBindError(
+                f"Cannot start BattleSpades: UDP port {port} is already in "
+                "use or reserved. Stop the other server using that port, "
+                f"change server.port in config.toml, or launch with --port "
+                f"{int(port) + 1}."
+            ) from exc
+        raise ServerBindError(
+            f"Cannot start BattleSpades: UDP port {port} could not be bound: "
+            f"{exc}"
+        ) from exc
+    finally:
+        probe.close()
+
+
+def _create_enet_host(
+    enet_module: Any,
+    *,
+    port: int,
+    max_connections: int,
+) -> Any:
+    """Create the native host while translating pyenet's false MemoryError."""
+
+    _assert_udp_port_available(port)
+    address = enet_module.Address(b"", int(port))
+    try:
+        return enet_module.Host(
+            address,
+            peerCount=int(max_connections),
+            channelLimit=1,
+            incomingBandwidth=0,
+            outgoingBandwidth=0,
+        )
+    except MemoryError as exc:
+        raise RuntimeError(
+            f"ENet could not create its UDP host on port {port}. The native "
+            "binding reports both late bind collisions and resource failures "
+            "as MemoryError; verify the port is still free and that "
+            f"max_connections={max_connections} is valid."
+        ) from exc
+
+
 @dataclass
 class _MapCellReplayLease:
     """Stable exact-cell batch retained across a failed reliable send."""
@@ -105,6 +169,14 @@ class BattleSpadesServer:
     ):
         self.config = config
         self.running = False
+        # ENet peers borrow memory owned by ``self.host``.  Shutdown must make
+        # every Python send path inert before dropping that final Host
+        # reference, otherwise a delayed coroutine can call into a freed
+        # ENetPeer and terminate the process with a native access violation.
+        self._stopping = False
+        self._stopped = False
+        self._stop_lock = asyncio.Lock()
+        self._connection_tasks: set[asyncio.Task] = set()
         set_movement_authority(config.movement_authority)
         if config.movement_authority == "client":
             logger.warning(
@@ -1228,6 +1300,9 @@ class BattleSpadesServer:
         """Initialize and start the server."""
         import enet
 
+        if self._stopping or self._stopped:
+            raise RuntimeError("a stopped BattleSpadesServer cannot be restarted")
+
         # Windows default timer granularity is ~15.6ms, which makes
         # asyncio.sleep bursty and the 60Hz tick/broadcast jittery (the
         # client sees irregular WorldUpdate spacing as movement jank).
@@ -1242,14 +1317,12 @@ class BattleSpadesServer:
 
         logger.info(f"Starting BattleSpades server on port {self.config.port}")
         
-        # Create ENet host - matching reference pattern
-        address = enet.Address(b"", self.config.port)
-        self.host = enet.Host(
-            address,
-            peerCount=self.config.max_connections,
-            channelLimit=1,  # Reference uses 1 channel
-            incomingBandwidth=0,
-            outgoingBandwidth=0,
+        # pyenet reports bind collisions as MemoryError. Probe and translate
+        # host creation so an operator sees the real endpoint failure.
+        self.host = _create_enet_host(
+            enet,
+            port=self.config.port,
+            max_connections=self.config.max_connections,
         )
         
         # Enable compression like reference
@@ -1311,45 +1384,145 @@ class BattleSpadesServer:
             self._game_loop(),
         )
     
-    async def stop(self):
-        """Stop the server."""
-        if not self.running:
-            # Steam registration starts before optional plugins and bots so
-            # its public identity is complete before logon.  If either later
-            # startup stage raises, ``stop`` must still reap the helper and
-            # stop heartbeats even though the gameplay loops never ran.
-            await self.steam_master.close()
-            await self.revival_master.close()
-            self.prefab_actions.close()
+    async def stop(self) -> None:
+        """Stop gameplay and retire all ENet borrowers before the host."""
+
+        async with self._stop_lock:
+            if self._stopped:
+                return
+
+            logger.info("Stopping server...")
+            # This is the native ownership gate.  It is intentionally raised
+            # before the first await so cancellation callbacks and delayed
+            # mode/handshake work cannot enqueue another packet while cleanup
+            # is in progress.
+            self._stopping = True
+            self.running = False
+
+            try:
+                await self._deactivate_mode_for_shutdown()
+                await self._cancel_connection_tasks()
+
+                if self.bots is not None:
+                    try:
+                        await self.bots.close()
+                    except Exception:
+                        logger.exception("Bot runtime shutdown failed")
+                    finally:
+                        self.bots = None
+
+                for name, service in (
+                    ("Steam master", self.steam_master),
+                    ("Revival master", self.revival_master),
+                ):
+                    try:
+                        await service.close()
+                    except Exception:
+                        logger.exception("%s shutdown failed", name)
+
+                if self.debug_parity is not None:
+                    try:
+                        self.debug_parity.close()
+                    except Exception:
+                        logger.exception("Debug parity shutdown failed")
+
+                try:
+                    self.prefab_actions.close()
+                except Exception:
+                    logger.exception("Prefab runtime shutdown failed")
+            finally:
+                # This block is synchronous on purpose: even cancellation of
+                # stop() itself must not leave a live Python Connection beside
+                # a destroyed native Host.
+                self._retire_network_for_shutdown()
+                self._stopped = True
+
+            logger.info("Server stopped")
+
+    async def _deactivate_mode_for_shutdown(self) -> None:
+        """Cancel delayed match work and retire the mode without victory UI."""
+
+        mode = self.mode
+        if mode is None:
             return
-        
-        logger.info("Stopping server...")
-        self.running = False
 
-        if self.bots is not None:
-            await self.bots.close()
-            self.bots = None
+        cancel = getattr(mode, "cancel_end_sequence", None)
+        if callable(cancel):
+            try:
+                await cancel()
+            except Exception:
+                logger.exception("Mode end-sequence cancellation failed")
 
-        await self.steam_master.close()
-        await self.revival_master.close()
-        
-        if self.mode:
-            await self.mode.on_mode_end()
+        deactivate = getattr(mode, "deactivate", None)
+        if callable(deactivate):
+            try:
+                await deactivate()
+            except Exception:
+                logger.exception("Mode deactivation failed")
 
-        if self.debug_parity is not None:
-            self.debug_parity.close()
+    async def _cancel_connection_tasks(self) -> None:
+        """Cancel pre-join receive/handshake work owned by this server."""
 
-        self.prefab_actions.close()
-        
-        # Disconnect all players
-        for peer in list(self.connections.keys()):
-            peer.disconnect()
-        
-        if self.host:
-            self.host.flush()
-            self.host = None
-        
-        logger.info("Server stopped")
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in self._connection_tasks
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._connection_tasks.clear()
+
+    def _retire_network_for_shutdown(self) -> None:
+        """Detach connections, then flush and release their owning ENet host."""
+
+        connection_items = tuple(self.connections.items())
+        # Clear the authoritative registry first.  Broadcasts are already
+        # gated by ``_stopping``, and no late task can rediscover a Connection
+        # after its peer's memory is released.
+        self.connections.clear()
+        self._pending_ingame_packets.clear()
+        self._mode_events.clear()
+        self.reserved_player_ids.clear()
+
+        for peer, connection in connection_items:
+            player = getattr(connection, "player", None)
+            if (
+                player is not None
+                and getattr(player, "connection", None) is connection
+            ):
+                player.connection = None
+            retire = getattr(connection, "retire_for_server_shutdown", None)
+            if callable(retire):
+                retire()
+            try:
+                # The Host still owns peer memory at this point.
+                peer.disconnect()
+            except Exception:
+                logger.debug("ENet peer disconnect failed during shutdown", exc_info=True)
+
+        self.players.clear()
+        for team in self.teams.values():
+            team.players.clear()
+            team.intel_holder = None
+
+        # Drop the local Peer/Connection tuple before the Host.  External
+        # references remain harmless because Connection.send/disconnect are
+        # guarded by ``_stopping``.
+        if connection_items:
+            del peer, connection, player, retire
+        connection_items = ()
+        host = self.host
+        if host is not None:
+            try:
+                host.flush()
+            except Exception:
+                logger.debug("ENet host flush failed during shutdown", exc_info=True)
+            finally:
+                self.host = None
+        host = None
     
     def _intercept(self, address, data: bytes):
         """Intercept raw UDP packets for A2S/LAN queries."""
@@ -1394,7 +1567,12 @@ class BattleSpadesServer:
                     else:
                         # Pre-join flows (handshake, map transfer) can be
                         # slow — keep them off the simulation path.
-                        asyncio.create_task(self._on_receive_data(peer, data))
+                        task = asyncio.create_task(
+                            self._on_receive_data(peer, data),
+                            name="BattleSpades-prejoin-receive",
+                        )
+                        self._connection_tasks.add(task)
+                        task.add_done_callback(self._connection_tasks.discard)
                     
             except Exception as e:
                 logger.error(f"Error in net_update: {e}", exc_info=True)
@@ -1620,6 +1798,9 @@ class BattleSpadesServer:
         ephemeral packets that share a terrain packet id but must never be
         replayed to a MapSync joiner (for example Snowball Damage(37)).
         """
+        if getattr(self, "_stopping", False):
+            return
+
         packet_id = data[0] if len(data) > 0 else -1
         # SetColor (11) is player palette state and is snapshotted separately
         # during reveal; replaying it after MapSync can restore a stale colour.
@@ -1796,7 +1977,20 @@ class BattleSpadesServer:
         _color: int,
         _topology_version: int,
     ) -> None:
-        """Retain one committed cell only while a MapSync join needs it."""
+        """Apply terrain-coupled entity lifecycles and retain join catch-up."""
+
+        if not _solid:
+            # Placement support is indexed by exact canonical voxel. This is
+            # synchronous with the committed removal, so mines/turrets explode
+            # and passive gadgets disappear before another simulation frame can
+            # replicate them floating in air. Build one context only when that
+            # support bucket is non-empty.
+            cell = (int(x), int(y), int(z))
+            if self.entity_registry.has_support_at(cell):
+                self.entity_registry.support_removed(
+                    cell,
+                    self._build_entity_ctx(),
+                )
 
         # This cursor is deliberately per cell, not WorldManager's per-batch
         # topology version. A collapse publishes many cells under one topology

@@ -19,6 +19,9 @@ from scripts.verify_release_assets import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRACKED_MAPS = sorted(path.name for path in (PROJECT_ROOT / "maps").glob("*.vxl"))
+TRACKED_NAVIGATION = sorted(
+    path.name for path in (PROJECT_ROOT / "maps").glob("*.botnav")
+)
 TRACKED_PREFABS = sorted(
     path.name for path in (PROJECT_ROOT / "prefabs").glob("*.kv6")
 )
@@ -62,7 +65,7 @@ def test_invalid_release_target_is_rejected() -> None:
 def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> None:
     """Maps/prefabs ship, while unrelated root executables never enter output."""
 
-    target = ReleaseTarget("windows", "x86_64", "0.0.3-alpha.5")
+    target = ReleaseTarget("windows", "x86_64", "0.0.3-alpha.6")
 
     staged = stage_release(
         PROJECT_ROOT,
@@ -76,15 +79,21 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert (staged / "BattleSpadesMapCreator.exe").is_file()
     assert (staged / "_internal" / "runtime.dll").is_file()
     assert (staged / "config.toml").is_file()
+    assert (staged / "fleet.toml").is_file()
+    assert (staged / "configs" / "official-tdm.toml").is_file()
     assert (staged / "LICENSE").is_file()
     assert (staged / "VERSION").read_text(encoding="utf-8").strip() == target.version
     assert sorted(path.name for path in (staged / "maps").glob("*.vxl")) == TRACKED_MAPS
+    assert sorted(
+        path.name for path in (staged / "maps").glob("*.botnav")
+    ) == TRACKED_NAVIGATION
     assert sorted(path.name for path in (staged / "prefabs").glob("*.kv6")) == TRACKED_PREFABS
     assert (staged / "plugins" / "README.txt").is_file()
     assert (staged / "steam-runtime" / "README.txt").is_file()
     assert (staged / "client_patches" / "INSTALL.txt").is_file()
     assert (staged / "client_patches" / "session_transition_patch.py").is_file()
     assert (staged / "client_patches" / "clipboard_input_patch.py").is_file()
+    assert (staged / "client_patches" / "prefab_menu_patch.py").is_file()
     assert (staged / "client_patches" / "parachute_key_patch.py").is_file()
     assert not (staged / "client_patches" / "character_jump_smoothing.py").exists()
     assert not (staged / "codex-command-runner.exe").exists()
@@ -173,7 +182,7 @@ def test_checksum_cli_runs_without_installed_project_dependencies(
 ) -> None:
     """The publish job can verify assets without installing server packages."""
 
-    for name in expected_archive_names("0.0.3-alpha.5"):
+    for name in expected_archive_names("0.0.3-alpha.6"):
         (tmp_path / name).write_bytes(name.encode("utf-8"))
 
     completed = subprocess.run(

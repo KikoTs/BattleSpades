@@ -74,6 +74,16 @@ class MachineGunBehavior(EntityBehavior):
         self.health -= max(0.0, float(amount))
         if self.health > 0.0 or not ent.alive:
             return
+        self._destroy(ent, source, ctx)
+
+    def on_support_lost(self, ent, ctx) -> None:
+        self._destroy(ent, None, ctx)
+
+    def _destroy(self, ent, source, ctx) -> None:
+        """Run the mounted gun's normal explosive destruction exactly once."""
+
+        if not ent.alive:
+            return
         if self.carrier_id is not None and ctx.server is not None:
             self.unmount(ent, ctx.server)
         # Blast routing also damages nearby entities. Mark this gun dead first

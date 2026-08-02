@@ -244,6 +244,77 @@ def normalize_server_selection(
     return selection
 
 
+def _mounted_machine_gun_authorized(player: _DeployablePlayer, server) -> bool:
+    """Return whether ``player`` is attached to a live server-owned MG.
+
+    ``MG_TOOL`` is not an inventory item.  The retail client selects it only
+    after a reliable ChangeEntity packet attaches the Character to a mounted
+    gun.  Accepting the same byte from an unattached client is unsafe: the
+    stock MGWeapon constructor has no entity models and indexes an empty list.
+    """
+
+    mounted_id = getattr(player, "mounted_entity_id", None)
+    registry = getattr(server, "entity_registry", None)
+    if mounted_id is None or registry is None:
+        return False
+    try:
+        entity = registry.get(int(mounted_id))
+    except (TypeError, ValueError):
+        return False
+    if (
+        entity is None
+        or not bool(getattr(entity, "alive", False))
+        or int(getattr(entity, "type", -1)) != int(C.MACHINE_GUN)
+        or int(getattr(entity, "player_id", -1)) != int(getattr(player, "id", -2))
+    ):
+        return False
+    behavior = getattr(entity, "behavior", None)
+    return int(getattr(behavior, "carrier_id", -1)) == int(
+        getattr(player, "id", -2)
+    )
+
+
+def equipped_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:
+    """Validate one untrusted held-tool byte for the current Character life.
+
+    A globally enabled tool is not automatically owned by every player.  The
+    byte must identify a real retail-selectable tool in the committed loadout,
+    except for the mounted MG's server-owned entity transition.
+    """
+
+    tool_id = int(tool_id)
+    if not 0 <= tool_id < int(C.NUMBER_OF_WEAPONS):
+        return False
+    if not bool(getattr(player, "alive", False)) or not bool(
+        getattr(player, "spawned", False)
+    ):
+        return False
+
+    server = getattr(getattr(player, "connection", None), "server", None)
+    if server is not None:
+        from server.game_rules import get_rules
+
+        if not get_rules(server.config).is_tool_enabled(tool_id):
+            return False
+        mode_gate = getattr(
+            getattr(server, "mode", None), "allows_equipped_tool", None
+        )
+        if callable(mode_gate) and not bool(mode_gate(player, tool_id)):
+            return False
+
+    committed_loadout = {
+        int(tool) for tool in (getattr(player, "loadout", ()) or ())
+    }
+    if tool_id == int(C.MG_TOOL):
+        # Some isolated/custom modes expose MG_TOOL as the placement item.
+        # Once placed, any nearby class can also enter the server-owned gun.
+        return tool_id in committed_loadout or (
+            server is not None
+            and _mounted_machine_gun_authorized(player, server)
+        )
+    return tool_id in committed_loadout
+
+
 def active_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:
     """Return whether an alive player may act with ``tool_id`` right now.
 
@@ -254,17 +325,9 @@ def active_tool_authorized(player: _DeployablePlayer, tool_id: int) -> bool:
     """
 
     tool_id = int(tool_id)
-    server = getattr(getattr(player, "connection", None), "server", None)
-    if server is not None:
-        from server.game_rules import get_rules
-
-        if not get_rules(server.config).is_tool_enabled(tool_id):
-            return False
     return (
-        bool(getattr(player, "alive", False))
-        and bool(getattr(player, "spawned", False))
+        equipped_tool_authorized(player, tool_id)
         and int(getattr(player, "tool", -1)) == tool_id
-        and tool_id in {int(tool) for tool in (getattr(player, "loadout", ()) or ())}
     )
 
 

@@ -79,7 +79,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 33 | BlockBuildColored | S→C | Sent | Per-block colored placement for prefabs, ordinary-build observers, terrain repair, and persistent Block Cannon impacts; recorded for MapSync catch-up when a join is active. |
 | 34 | BlockOccupy | — | Planned | Mark a block occupied (building). |
 | 35 | BlockLiberate | C→S | Handled | Block destroy request (spade dig). |
-| 36 | ExplodeCorpse | S→C | Sent | Three bytes: player id and effect flag. Classic CTF uses KillAction to create the client-owned `ClassicCorpse` Character, then packet 36 with flag 1 for an authoritative corpse hit or flag 0 for silent cleanup before respawn/late-join repair. It is not entity type 12. |
+| 36 | ExplodeCorpse | S→C | Sent | Three bytes: player id and effect flag. A normal death sends it after the retail corpse fuse (0s, or 1.0s with a selected jetpack) before creating the falling entity-11 grave; this activates the native controllable death camera. Classic CTF retains its client-owned `ClassicCorpse` until a hit (flag 1) or silent cleanup (flag 0). It is not entity type 12. |
 | 37 | Damage | S→C | Sent | Block/player damage broadcast. Snowball sends one reliable zero-damage type-20 event at impact before DestroyEntity(19), allowing the native explosion manager to predict impulse. |
 | 38 | BlockManagerState | — | Planned | Three BlockManager dictionaries: damaged, occupied, and user-owned blocks. It is not a VXL topology/removed-voxel resync packet. Non-empty entry encoding remains unverified. |
 | 39 | ServerBlockAction | — | Planned | Server-authoritative block op; client-side no-op stub today. |
@@ -618,6 +618,20 @@ excluded from packet 8: their classes implement `use_primary()` but no
 bit `0x01`; peerless bot pulses are held for three 60 Hz loops so the 30 Hz
 replication stream cannot miss the state. `Damage(37)` remains the canonical
 terrain hit/removal.
+
+Normal Battle Builder death is an ordered three-stage transition. `KillAction`
+creates the dead Character; `ExplodeCorpse(36)` changes `Character.exploded`
+and activates `DeathController`; then `CreateEntity(21)` introduces the
+player-bound `GRAVE_ENTITY` at the corpse's current position and velocity. The
+ordinary corpse fuse is zero. Any selected jetpack uses the recovered 1.0s
+fuse while retail `world.Player.update` applies its dead-body upward corkscrew
+branch. During that bounded fuse, the server retains the otherwise-dead player
+row in `WorldUpdate`; the native client accepts position/velocity updates for
+the dead Character and therefore displays the flight before packet 36. The row
+is removed at the corpse-to-grave handoff. `GraveEntity` then performs gravity,
+bouncing, and collision locally; the server keeps a separate dry-surface
+center for its seven-second blast.
+
 Classic CTF deliberately bypasses the normal entity-11 gravestone. `KillAction`
 changes the existing native Character into `ClassicCorpse.kv6`; no
 `CreateEntity(21)` packet is involved and the server allocates no entity id.
@@ -629,8 +643,8 @@ radius 3, player damage 0, block damage 1, knockback 0.05–0.1, and kill reason
 12. Disabling `RULE_ENABLE_CORPSE_EXPLOSION` leaves the corpse visible but not
 hittable.
 
-Packet 36 is never sent at death because it removes the Character corpse that
-`KillAction` just created. A surviving corpse is removed with effect flag 0
+For this Classic representation, packet 36 is never sent at death because it
+removes the Character corpse that `KillAction` just created. A surviving corpse is removed with effect flag 0
 before the same numeric player id receives its next `CreatePlayer`. Roster
 catch-up records death separately from life creation: a joining GameScene sees
 `CreatePlayer -> SetColor -> KillAction` exactly once, and if the corpse

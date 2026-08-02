@@ -276,16 +276,16 @@ RULE_MAX_ACTIVE_BOMBS = 1
 RULE_BOMB_FUSE_TIME = 10
 
 [bots]
-# Advanced server-owned bots run decisions/pathfinding in a supervised child
-# process. The authoritative 60 Hz server only snapshots state and applies
-# validated, expiring intentions.
+# Bot decisions and bounded direct-VXL pathfinding run on one owner thread.
+# Set worker = "process" only when you need crash-isolation diagnostics. The
+# authoritative 60 Hz server applies validated, expiring intentions.
 enabled = true
 population_mode = "backfill"
 fill_target = 12
 max_bots = 12
 reserve_human_slots = 2
 difficulty = "mixed"
-worker = "process"
+worker = "thread"
 perception_hz = 10
 decision_hz = 8
 path_requests_per_second = 24

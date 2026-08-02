@@ -256,6 +256,61 @@ def test_bot_primary_action_pulse_survives_one_replication_interval() -> None:
     assert not (bot.pack_action_flags() & 0x01)
 
 
+def test_bot_jetpack_motor_uses_each_recovered_pack_input_split() -> None:
+    """Engineer/Rocketeer hold SPACE; only UGC Builder toggles Z hover."""
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="JetBot",
+            class_id=int(C.CLASS_ENGINEER),
+        )
+    )
+    assert bot is not None
+    # Bot loadouts are randomized among valid equipment; pin the recovered
+    # Engineer pack so this test targets motor semantics rather than selection.
+    bot.jetpack_id = int(C.JETPACK_ENGINEER)
+    bot.jetpack_fuel = 100.0
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+
+    def flight_intent(frame_id: int) -> BotIntent:
+        return BotIntent(
+            bot_id=bot.id,
+            bot_generation=runtime.generation,
+            frame_id=frame_id,
+            map_epoch=1,
+            mode_epoch=1,
+            topology_version=0,
+            created_at=now,
+            expires_at=now + 1.0,
+            movement=MovementIntent(
+                direction=(1.0, 0.0, -1.0),
+                affordance=MovementAffordance.JETPACK,
+            ),
+        )
+
+    runtime.intent = flight_intent(1)
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert bot.jetpack_id == int(C.JETPACK_ENGINEER)
+    assert bot.input.jump is True
+    assert bot.input.hover is False
+    assert bot.input.primary_fire is False
+
+    bot.jetpack_id = int(C.JETPACK_UGCBUILDER)
+    runtime.intent = flight_intent(2)
+    director._apply_motor(runtime, now + 0.01, 1.0 / 60.0)
+
+    assert bot.input.jump is False
+    assert bot.input.hover is True
+    assert bot.input.primary_fire is False
+    assert bot.pack_state_flags() & 0x04
+
+
 def test_rejected_world_action_is_published_back_to_worker_snapshot() -> None:
     server = BattleSpadesServer(ServerConfig())
     server.world_manager.generate_flat_map()
@@ -371,6 +426,49 @@ def test_combat_intent_preempts_a_pending_terrain_swing() -> None:
 
     assert runtime.pending_action is None
     assert bot.tool == int(bot.weapon)
+
+
+def test_walk_replan_cancels_same_priority_completed_breach() -> None:
+    server, director, bot, runtime = _facing_fixture()
+    now = time.monotonic()
+    runtime.pending_action = BotAction(
+        BotActionKind.MELEE,
+        tool_id=int(C.SUPERSPADE_TOOL),
+        position=(bot.x + 1.0, bot.y, bot.z),
+    )
+    runtime.pending_action_priority = BotIntentPriority.TRAVERSAL
+    runtime.pending_action_deadline = now + 1.0
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=100,
+        map_epoch=director._map_epoch,
+        mode_epoch=director._mode_epoch,
+        topology_version=director._topology_version,
+        created_at=now,
+        expires_at=now + 0.25,
+        movement=MovementIntent(affordance=MovementAffordance.BREACH),
+        priority=BotIntentPriority.TRAVERSAL,
+    )
+    replan = replace(
+        runtime.intent,
+        frame_id=101,
+        movement=MovementIntent(
+            direction=(1.0, 0.0, 0.0),
+            affordance=MovementAffordance.WALK,
+        ),
+    )
+
+    class _Supervisor:
+        @staticmethod
+        def drain_intents(limit: int = 12):
+            return [replan][:limit]
+
+    director.supervisor = _Supervisor()
+    director._drain_intents(now)
+
+    assert runtime.pending_action is None
+    assert runtime.intent is replan
 
 
 def test_scoped_bot_state_replicates_and_marks_shot_secondary() -> None:
@@ -510,6 +608,46 @@ def test_melee_dig_waits_for_aim_convergence_before_executing() -> None:
 
     tolerance = math.cos(math.atan2(0.45, max(distance, 0.75)) + 0.03)
     assert cos_error >= tolerance - 1e-6
+    assert runtime.pending_action is None
+
+
+def test_planned_breach_waits_until_ray_hits_the_selected_voxel() -> None:
+    """A broad facing tolerance must not swing into the wrong wall layer."""
+
+    server, director, bot, runtime = _facing_fixture()
+    eye = tuple(float(value) for value in bot.eye)
+    target = (eye[0] + 2.5, eye[1], eye[2])
+    expected = tuple(int(value // 1) for value in target)
+    now = time.monotonic()
+    intent = _melee_intent(
+        bot,
+        runtime,
+        now,
+        target=target,
+        expires=now + 2.0,
+        position=target,
+    )
+    runtime.intent = replace(
+        intent,
+        movement=MovementIntent(affordance=MovementAffordance.BREACH),
+    )
+    executed: list[BotAction] = []
+    director.gateway.execute = lambda _player, action: (
+        executed.append(action) or True
+    )
+    server.world_manager.raycast = lambda *_args: (
+        expected[0], expected[1], expected[2] - 1
+    )
+
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert executed == []
+    assert runtime.pending_action is not None
+
+    server.world_manager.raycast = lambda *_args: expected
+    director._apply_motor(runtime, now + 1.0 / 60.0, 1.0 / 60.0)
+
+    assert len(executed) == 1
     assert runtime.pending_action is None
 
 
@@ -1227,6 +1365,42 @@ def test_fortify_builds_a_closed_two_high_perimeter_when_sealing() -> None:
     hold = brain._fortify_hold_intent(frame, observer, site, now)
     assert hold.debug_role == "fortify_hold"
     assert hold.movement.crouch is True
+
+
+def test_fortify_never_builds_over_atlas_main_passages() -> None:
+    from server.bot_ai.messages import ObjectiveSnapshot
+    from server.bot_ai.worker import _BrainState
+
+    world = _fortify_region_world()
+    world.navigation_context = lambda _position: SimpleNamespace(
+        chokepoint=True,
+        underground=False,
+        main_ground=True,
+    )
+    brain = BotBrain(world, seed=4)
+    site = (100.0, 100.0, 7.75)
+    observer = replace(
+        _player_snapshot(1, 2, site, is_bot=True),
+        loadout=(DEFAULT_WEAPON_TOOL, int(C.BLOCK_TOOL)),
+        blocks=400,
+    )
+    frame = replace(
+        _frame(1, observer, _player_snapshot(2, 3, (200.0, 200.0, 7.75))),
+        mode_id="zom",
+        mode_phase="countdown",
+        objectives=(ObjectiveSnapshot("team_anchor", 2, site),),
+        players=(observer,),
+    )
+
+    intent = brain._fortify_build_intent(
+        frame,
+        observer,
+        _BrainState(),
+        site,
+        time.monotonic(),
+    )
+
+    assert intent is None
 
 
 def test_fortify_waiting_phase_keeps_an_entry_for_distant_teammates() -> None:

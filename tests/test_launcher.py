@@ -1,6 +1,7 @@
 """CLI and packaged health-check behavior."""
 
 import asyncio
+import io
 from pathlib import Path
 import sys
 
@@ -8,11 +9,27 @@ import pytest
 
 from server import launcher
 from server.launcher import run
-from server.release_check import run_release_check
+from server.release_check import CheckItem, CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_check_report_reconfigures_a_narrow_console_for_unicode_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CP1252 frozen console cannot crash while reporting Unicode paths."""
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", write_through=True)
+    monkeypatch.setattr(sys, "stdout", stream)
+    report = CheckReport(
+        (CheckItem("config.toml", True, r"C:\\Сървър\\настройка.toml"),)
+    )
+
+    assert launcher._emit_check_report(report) == 0
+    assert "Сървър" in raw.getvalue().decode("utf-8")
 
 
 def test_import_graph_gc_hardening_collects_then_freezes_once(
@@ -101,7 +118,7 @@ def test_version_does_not_import_native_server(
 
     assert run(["--version"], paths=RuntimePaths.from_root(PROJECT_ROOT)) == 0
 
-    assert capsys.readouterr().out.strip() == "BattleSpades 0.0.3-alpha.5"
+    assert capsys.readouterr().out.strip() == "BattleSpades 0.0.3-alpha.6"
     assert "server.main" not in sys.modules
 
 

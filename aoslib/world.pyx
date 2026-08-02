@@ -1294,9 +1294,6 @@ cdef class Player(Object):
         return float(_CUBE_SQ_DISTANCE)
 
     def update(self, dt, positions):
-        if not self._alive:
-            return None
-
         dt = float(dt)
         map_obj = self._parent.map if self._parent is not None else None
         # wade is NOT recomputed here: the live engine holds the previous
@@ -1435,6 +1432,19 @@ cdef class Player(Object):
             horizontal_divisor = (dt * _movement_override("air_friction")) + 1.0
         self._velocity.x /= horizontal_divisor
         self._velocity.y /= horizontal_divisor
+
+        # Retail world.pyd Player.update @ 0x10013011..0x1001308D keeps dead
+        # jetpack bodies in the native mover.  After ordinary gravity/drag it
+        # applies a 3.0 upward acceleration plus the small corkscrew drift,
+        # then runs the same player/voxel collision pass below.  Character
+        # keeps this corpse alive for CORPSE_EXPLOSION_JETPACK_FUSE (1.0s)
+        # before packet 36 replaces it with the falling grave.  Returning at
+        # the top of update made server-side death prediction static and left
+        # the grave at the original ground-level death position.
+        if not self._alive and 1 <= self._jetpack <= 4:
+            self._velocity.z -= dt * 3.0
+            self._velocity.x += _math.sin(self._velocity.z * 10.0) * dt
+            self._velocity.y += _math.cos(self._velocity.z * 10.0) * dt
 
         _collide_with_players(self, positions, dt)
         landing_speed = self._velocity.z

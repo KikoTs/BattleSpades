@@ -100,7 +100,7 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.3-alpha.5` is packaged as six standalone server archives. Each archive
+`0.0.3-alpha.6` is packaged as six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 
@@ -333,6 +333,28 @@ For local tweaks that shouldn't be committed, use `config.local.toml` (gitignore
 python run_server.py
 ```
 
+One executable can supervise several isolated configs. The included
+[`fleet.toml`](fleet.toml) launches TDM, CTF, Classic CTF, and Zombie profiles;
+VIP is present but disabled until its `enabled` flag is changed:
+
+```powershell
+# Source checkout
+py -3.12 run_server.py --fleet fleet.toml
+
+# Portable Windows release
+.\BattleSpades.exe --fleet fleet.toml
+```
+
+Each [`configs/`](configs/) profile owns a unique game/query port pair and log
+file. Config paths are resolved beside the fleet manifest, including paths
+containing non-English characters. The launcher validates every config and
+rejects duplicate names or UDP ports before starting anything. Ctrl+C sends a
+clean `shutdown` command to every child and terminates only a child that
+exceeds the configured shutdown timeout. Public registry and Steam publishing
+are disabled in the examples; enable them per profile only after assigning
+unique public identities and forwarding each listed UDP port (plus its query
+port when Steam is enabled).
+
 To host directly, forward **UDP `27015`** (or your configured game port) and set
 a real `admin.password`. The ENet socket answers direct A2S/LAN queries. The
 optional `[steam]` bridge registers app `224540` with Valve's current registry;
@@ -376,6 +398,8 @@ IDs, and the recovered template variables are documented in
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): service ownership and data flow.
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md): packets, retail evidence, and the
   reverse-engineering workflow.
+- [`docs/BOT_NAVIGATION.md`](docs/BOT_NAVIGATION.md): VXL semantic atlas,
+  safe cache format, map-matrix simulation, and water/stuck recovery.
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release.
 - [`docs/HANDOFF.md`](docs/HANDOFF.md): current state, known gaps, and evidence.
 

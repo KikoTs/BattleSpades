@@ -37,6 +37,13 @@ from .messages import (
     map_snapshot_vxl_bytes,
 )
 from .combat_profiles import envelope_for
+from .navigation_atlas import (
+    ColumnFlag,
+    NO_SUPPORT,
+    NavigationAtlas,
+    NavigationContext,
+    load_or_build_atlas,
+)
 from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
 from .policies import ModeBotDecision, _formation_point, objective_decision_for
 from .snapshot_transport import MapSnapshotAssembler, SnapshotTransportError
@@ -372,6 +379,9 @@ class WorkerVoxelWorld:
         self.topology_version = -1
         self._vxl = None
         self._native_nav = None
+        self.navigation_atlas: NavigationAtlas | None = None
+        self.navigation_cache_hit = False
+        self._atlas_dirty_columns: set[tuple[int, int]] = set()
         self._built_tiles: set[tuple[int, int]] = set()
         self._dirty_tiles: set[tuple[int, int]] = set()
         self._native_tile_build_budget = _NATIVE_TILE_BUILDS_PER_BATCH
@@ -398,9 +408,12 @@ class WorkerVoxelWorld:
 
         self.map_epoch = int(snapshot.map_epoch)
         self.topology_version = int(snapshot.topology_version)
-        self.action_planner.invalidate_water_routes()
+        self.action_planner.attach_navigation_atlas(None)
         self._vxl = None
         self._native_nav = None
+        self.navigation_atlas = None
+        self.navigation_cache_hit = False
+        self._atlas_dirty_columns.clear()
         self._built_tiles.clear()
         self._dirty_tiles.clear()
         self._native_tile_build_budget = _NATIVE_TILE_BUILDS_PER_BATCH
@@ -437,6 +450,24 @@ class WorkerVoxelWorld:
                     self._vxl.remove_point_nochecks(
                         int(change.x), int(change.y), int(change.z)
                     )
+            # A restart snapshot with an overlay no longer matches a cache of
+            # the authored base map, so derive its atlas from the already
+            # patched worker copy. Normal map loads consume the content-hashed
+            # precomputed cache shipped beside the VXL.
+            cacheable = not snapshot.changed_cells
+            self.navigation_atlas, self.navigation_cache_hit = (
+                load_or_build_atlas(
+                    self._vxl,
+                    raw_vxl,
+                    map_name=snapshot.map_name if cacheable else "",
+                    map_directory=(
+                        snapshot.map_directory if cacheable else ""
+                    ),
+                )
+            )
+            self.action_planner.attach_navigation_atlas(
+                self.navigation_atlas
+            )
             try:
                 from server.bot_ai.recast import RecastNavigator
 
@@ -450,6 +481,8 @@ class WorkerVoxelWorld:
             # must not claim visual contact or request a shot.
             logger.exception("AI worker could not load navigation VXL")
             self._vxl = None
+            self.navigation_atlas = None
+            self.action_planner.attach_navigation_atlas(None)
         self.tactical.attach(self._vxl)
 
     def apply(self, delta: WorldDelta) -> None:
@@ -468,6 +501,7 @@ class WorkerVoxelWorld:
         changed_columns = frozenset(
             (int(change.x), int(change.y)) for change in delta.changed_cells
         )
+        self._atlas_dirty_columns.update(changed_columns)
         self.action_planner.invalidate_water_routes(changed_columns)
         if self._vxl is None:
             self.topology_version = int(delta.topology_version)
@@ -504,6 +538,23 @@ class WorkerVoxelWorld:
             return bool(self._vxl.get_solid(x, y, z))
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return True
+
+    def navigation_context(
+        self, position: Vector3
+    ) -> NavigationContext | None:
+        """Return cached ground/water/layer/passage semantics at a position."""
+
+        if self.navigation_atlas is None:
+            return None
+        x = int(math.floor(position[0]))
+        y = int(math.floor(position[1]))
+        if (x, y) in self._atlas_dirty_columns:
+            return None
+        return self.navigation_atlas.context(
+            x,
+            y,
+            int(round(float(position[2]) + 2.25)),
+        )
 
     def has_line_of_sight(self, origin: Vector3, target: Vector3) -> bool:
         """DDA eye ray that reveals nothing when collision queries fail."""
@@ -1260,6 +1311,31 @@ class WorkerVoxelWorld:
         vertical_span: int = 3,
         clearance: int = 2,
     ) -> tuple[int, int, int] | None:
+        x, y = int(x), int(y)
+        atlas = self.navigation_atlas
+        if (
+            atlas is not None
+            and (x, y) not in self._atlas_dirty_columns
+            and 0 <= x < atlas.width
+            and 0 <= y < atlas.height
+            and 1 <= int(clearance) <= 2
+        ):
+            expected_support = int(round(float(current_player_z) + 2.25))
+            index = y * atlas.width + x
+            primary = int(atlas.primary_support[index])
+            if (
+                primary != NO_SUPPORT
+                and not int(atlas.flags[index]) & int(ColumnFlag.WATER)
+                and int(atlas.layer_count[index]) == 1
+                and abs(primary - expected_support)
+                <= max(0, int(vertical_span))
+            ):
+                # The atlas was built from an exposed support with two clear
+                # body cells. Untouched authored columns therefore need no
+                # repeated VXL vertical scan during A*. Layered/cave columns
+                # deliberately fall through because the closest valid support
+                # can differ from the atlas's upper primary surface.
+                return x, y, primary
         return self._terrain.standing_node(
             x,
             y,
@@ -2074,7 +2150,48 @@ class BotBrain:
             max_nodes=128,
         )
         if step is None:
-            return None
+            bank = self.world.action_planner.assisted_water_bank(
+                observer.position
+            )
+            if bank is None:
+                return None
+            state.last_path_direction = bank.direction
+            state.last_affordance = MovementAffordance.BUILD_STEP
+            state.path_goal = bank.goal
+            state.path_topology_version = int(frame.topology_version)
+            block_tool = int(C.BLOCK_TOOL)
+            build_cell = (
+                self.world.jump_build_cell(observer.position)
+                if (
+                    block_tool in observer.loadout
+                    and observer.blocks > 0
+                )
+                else None
+            )
+            if build_cell is None or now < state.next_world_action_at:
+                # Preserve the high-bank heading for ordinary bounded breach
+                # recovery when this class has no blocks.
+                return None
+            state.next_world_action_at = now + 0.8
+            target = tuple(float(value) for value in build_cell)
+            return self._intent(
+                frame,
+                now,
+                movement=MovementIntent(
+                    direction=bank.direction,
+                    jump=True,
+                    affordance=MovementAffordance.BUILD_STEP,
+                ),
+                look=LookIntent(target, visible=False),
+                tool_id=block_tool,
+                action=BotAction(
+                    BotActionKind.BUILD,
+                    tool_id=block_tool,
+                    position=target,
+                ),
+                priority=BotIntentPriority.SURVIVAL,
+                debug_role="water_bank_build_step",
+            )
         state.last_path_direction = step.direction
         state.last_affordance = step.affordance
         state.path_goal = step.goal
@@ -2275,6 +2392,13 @@ class BotBrain:
         if base_node is None:
             return None
         base_support = base_node[2]
+        context_reader = getattr(self.world, "navigation_context", None)
+        anchor_start = (base[0], base[1], float(base_support) - 2.25)
+        base_context = (
+            context_reader(anchor_start)
+            if callable(context_reader)
+            else None
+        )
         teammates = [
             player
             for player in frame.players
@@ -2310,6 +2434,28 @@ class BotBrain:
                     + 1.0 * nearby
                     - 0.15 * radius
                 )
+                context = (
+                    context_reader((float(x), float(y), player_z))
+                    if callable(context_reader)
+                    else None
+                )
+                if context is not None:
+                    # Forts should overlook traffic, not close the only
+                    # traversable lane. Keep a team anchored to the same
+                    # above/underground surface system where possible.
+                    if context.chokepoint:
+                        score -= 12.0
+                    if (
+                        base_context is not None
+                        and context.underground != base_context.underground
+                    ):
+                        score -= 16.0
+                    if (
+                        base_context is not None
+                        and base_context.main_ground
+                        and not context.main_ground
+                    ):
+                        score -= 6.0
                 candidates.append(
                     (score, (float(x), float(y), player_z), support)
                 )
@@ -2317,7 +2463,6 @@ class BotBrain:
         # approaches): accept the best candidate the team can actually walk
         # to from its anchor, checking only a bounded few.
         candidates.sort(key=lambda row: row[0], reverse=True)
-        anchor_start = (base[0], base[1], float(base_support) - 2.25)
         best: Vector3 | None = None
         for score, position, support in candidates[:6]:
             if self._fortify_reachable(anchor_start, position, support):
@@ -2444,6 +2589,12 @@ class BotBrain:
         if site_node is None:
             return None
         support = site_node[2]
+        context_reader = getattr(self.world, "navigation_context", None)
+        site_context = (
+            context_reader((float(x), float(y), float(support) - 2.25))
+            if callable(context_reader)
+            else None
+        )
         open_angles = self._open_approaches(site_node)
         phase = str(frame.mode_phase).lower()
         keep_door = phase in ("", "waiting") and any(
@@ -2466,6 +2617,25 @@ class BotBrain:
                 floor = self._fortify_floor(wx, wy, support)
                 if floor is None or floor <= support - 2:
                     # No reachable floor, or nature already walls this cell.
+                    continue
+                context = (
+                    context_reader(
+                        (float(wx), float(wy), float(floor) - 2.25)
+                    )
+                    if callable(context_reader)
+                    else None
+                )
+                if (
+                    context is not None
+                    and (
+                        context.chokepoint
+                        or (
+                            site_context is not None
+                            and context.underground
+                            != site_context.underground
+                        )
+                    )
+                ):
                     continue
                 if self._column_occupied_by_team(frame, observer, wx, wy):
                     continue

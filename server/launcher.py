@@ -45,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate configuration, assets, native modules, and worker spawn",
     )
+    action.add_argument(
+        "--fleet",
+        type=Path,
+        default=None,
+        help="launch all enabled [[instances]] from a fleet TOML manifest",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -110,6 +116,7 @@ def _apply_port_override(config: object, port: int | None) -> object:
 def _emit_check_report(report: CheckReport) -> int:
     """Print one complete health report to stdout on success or stderr on failure."""
 
+    _configure_console_encoding()
     stream = sys.stdout if report.ok else sys.stderr
     for line in report.lines:
         print(line, file=stream)
@@ -454,7 +461,8 @@ def _run_server(
     paths.logs.mkdir(parents=True, exist_ok=True)
     logging_runtime = configure_logging(config, paths.logs)
     logger = logging.getLogger("BattleSpades")
-    fault_file = paths.logs / "faulthandler.log"
+    log_stem = Path(str(getattr(config, "log_file", "server.log"))).stem
+    fault_file = paths.logs / f"{log_stem or 'server'}.fault.log"
 
     try:
         with fault_file.open("a", encoding="utf-8") as fault_stream:
@@ -497,6 +505,7 @@ def run(
     """Dispatch a normal start, version query, or bounded release check."""
 
     multiprocessing.freeze_support()
+    _configure_console_encoding()
     try:
         arguments = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -506,6 +515,30 @@ def run(
     if arguments.version:
         print(f"BattleSpades {read_version(runtime_paths.root)}")
         return 0
+    if arguments.fleet is not None:
+        if (
+            arguments.config is not None
+            or arguments.port is not None
+            or arguments.control_stdin
+        ):
+            print(
+                "Server startup failed: --fleet cannot be combined with "
+                "--config, --port, or --control-stdin",
+                file=sys.stderr,
+            )
+            return 2
+        from server.fleet_launcher import run_fleet
+
+        _configure_console_encoding()
+        try:
+            return run_fleet(
+                arguments.fleet,
+                runtime_root=runtime_paths.root,
+                source_entry=SOURCE_ENTRYPOINT,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Fleet startup failed: {exc}", file=sys.stderr)
+            return 1
     try:
         runtime_paths = _select_config(runtime_paths, arguments.config)
     except (OSError, ValueError) as exc:

@@ -115,6 +115,7 @@ class BaseMode(ABC):
 
     async def deactivate(self):
         """Retire this mode without starting the normal victory sequence."""
+        await self.cancel_end_sequence()
         self.started = False
         self.ended = True
 
@@ -314,7 +315,7 @@ class BaseMode(ABC):
 
         Runs once per end. The whole thing is fire-and-forget on the event
         loop so the caller (a mode hook on the game thread) isn't blocked."""
-        if self._end_sequence_running:
+        if self._end_sequence_running or getattr(self.server, "_stopping", False):
             return
         self._end_sequence_running = True
         import asyncio

@@ -35,3 +35,9 @@ def test_flare_block_is_hidden_from_the_retail_prefab_selection_page():
     packet = build_initial_info(BattleSpadesServer(ServerConfig()))
 
     assert C.FLAREBLOCK_TOOL in packet.disabled_tools
+
+
+def test_normal_matches_do_not_advertise_map_creator_prefab_sets():
+    packet = build_initial_info(BattleSpadesServer(ServerConfig()))
+
+    assert packet.ugc_prefab_sets == []

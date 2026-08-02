@@ -219,6 +219,7 @@ def test_jump_build_placement_is_not_counted_as_jump_spam() -> None:
         position=(10.0, 10.0, 12.0),
     )
 
+    enemy = _player_snapshot(2, TEAM2, (14.0, 10.0, 10.0))
     for index in range(5):
         monitor.observe(
             float(index) * 0.5,
@@ -230,10 +231,11 @@ def test_jump_build_placement_is_not_counted_as_jump_spam() -> None:
                 jump=True,
                 affordance=MovementAffordance.BUILD_STEP,
             ),
-            (observer,),
+            (observer, enemy),
         )
 
     assert monitor.summary()["jump_loops"] == 0
+    assert monitor.summary()["priority_violations"] == 0
 
 
 def test_accelerated_soak_settles_actor_after_support_collapse() -> None:

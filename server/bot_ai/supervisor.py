@@ -20,7 +20,7 @@ from .messages import (
     WorldDelta,
 )
 from .snapshot_transport import encode_map_snapshot
-from .worker import run_worker
+from .simple_worker import run_worker
 
 
 logger = logging.getLogger(__name__)

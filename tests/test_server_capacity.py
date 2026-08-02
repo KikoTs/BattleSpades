@@ -475,10 +475,11 @@ def test_same_stamp_serializes_once_and_patches_only_each_owner_tool():
     players = {
         player_id: SimpleNamespace(
             id=player_id,
-            alive=True,
-            spawned=True,
-            tool=tool,
-            last_applied_input_loop=100,
+                alive=True,
+                spawned=True,
+                tool=tool,
+                loadout=[tool],
+                last_applied_input_loop=100,
             wu_ack_loop=0,
             world_update_snapshot=lambda tool=tool: snapshot(tool),
         )
@@ -566,10 +567,11 @@ def test_owner_override_changes_only_the_local_tool_byte():
 
     players = {
         player_id: SimpleNamespace(
-            id=player_id,
-            alive=True,
-            spawned=True,
-            world_update_snapshot=(
+                id=player_id,
+                alive=True,
+                spawned=True,
+                loadout=[tool],
+                world_update_snapshot=(
                 lambda player_id=player_id, tool=tool:
                 snapshot(player_id, tool)
             ),

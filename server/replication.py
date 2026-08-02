@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from typing import Optional, TYPE_CHECKING
 
+import shared.constants as C
 from shared.packet import WorldUpdate
+
+from server.class_selection import equipped_tool_authorized
 
 if TYPE_CHECKING:
     from .main import BattleSpadesServer
@@ -25,6 +28,9 @@ _WORLD_UPDATE_HEADER_SIZE = 7
 _WORLD_UPDATE_PLAYER_ROW_SIZE = 56
 _WORLD_UPDATE_PLAYER_TOOL_OFFSET = 48
 _WORLD_UPDATE_TRAILER_MIN_SIZE = 4  # entity count + turret count
+# Fire, aim/display, and deployed-state bits must not be paired with a rejected
+# tool. Jetpack (0x04) and on-fire (0x20) are independent display state.
+_WORLD_UPDATE_WEAPON_ACTION_MASK = 0x01 | 0x02 | 0x10 | 0x40 | 0x80
 
 
 class ReplicationService:
@@ -602,12 +608,26 @@ class ReplicationService:
             # prediction uses each row's pong (Player.wu_ack_loop) instead.
             world_update.loop_count = max(0, server.loop_count)
 
+        corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+        should_replicate_corpse = getattr(
+            corpse_lifecycle,
+            "should_replicate_normal_corpse",
+            None,
+        )
         for player_id, player in server.players.items():
             if player_id == exclude_player_id:
                 continue
-            if not player.alive or not player.spawned:
+            is_live = bool(player.alive and player.spawned)
+            is_flying_corpse = bool(
+                not is_live
+                and callable(should_replicate_corpse)
+                and should_replicate_corpse(player)
+            )
+            if not is_live and not is_flying_corpse:
                 continue
-            snapshot = player.world_update_snapshot()
+            snapshot = self._sanitize_player_snapshot(
+                player, player.world_update_snapshot()
+            )
             if player_id == local_player_id:
                 snapshot = snapshot[:9] + (0xFF,) + snapshot[10:]
             world_update[player_id] = snapshot
@@ -617,6 +637,42 @@ class ReplicationService:
             turret.world_update() for turret in server.rocket_turrets.values()
         ]
         return world_update
+
+    @staticmethod
+    def _sanitize_player_snapshot(player, snapshot: tuple) -> tuple:
+        """Return a WorldUpdate row that cannot construct an invalid weapon.
+
+        The retail client calls ``Player.set_tool`` for every remote row.  In
+        particular, a naked MG_TOOL constructs ``MGWeapon`` without the entity
+        models supplied by ChangeEntity and crashes at ``entity_display[0]``.
+        Mounted-gun selection is therefore represented only by its reliable
+        entity transition; its WorldUpdate tool byte is always the proven
+        invalid/no-op sentinel.
+
+        Other tools must still agree with the live, normalized loadout.  This
+        outbound boundary is deliberate defense in depth: even accidental
+        internal state corruption cannot be reflected into every client.
+        """
+
+        try:
+            tool_id = int(snapshot[9])
+        except (IndexError, TypeError, ValueError):
+            tool_id = -1
+        authorized = equipped_tool_authorized(player, tool_id)
+        mounted_mg = tool_id == int(C.MG_TOOL) and authorized
+        if authorized and not mounted_mg:
+            return snapshot
+
+        action = int(snapshot[7]) & 0xFF
+        if not mounted_mg:
+            action &= ~_WORLD_UPDATE_WEAPON_ACTION_MASK
+        return (
+            snapshot[:7]
+            + (action,)
+            + snapshot[8:9]
+            + (0xFF,)
+            + snapshot[10:]
+        )
 
     def build_world_update_data(
         self,

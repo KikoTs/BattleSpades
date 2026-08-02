@@ -10,8 +10,10 @@ from .director import BotDirector
 from .gateway import BotActionGateway
 from .messages import BotIntent, BotProfile, PerceptionFrame
 from .supervisor import AIWorkerSupervisor
+from .thread_supervisor import AIThreadSupervisor
 
 __all__ = [
+    "AIThreadSupervisor",
     "AIWorkerSupervisor",
     "BotActionGateway",
     "BotDirector",

@@ -17,12 +17,18 @@ parachute_key_patch.py routes the configured hover key (Z by default) through
 the client's existing ClientData action bit when the normal parachute is
 equipped. It does not replace Character.update or alter movement prediction.
 
+The stock prefab selector expands each prefab list and then accidentally adds
+that list's numeric ID again as a weapon. prefab_menu_patch.py removes those
+weapon rows while preserving named prefabs and the optional flare-block tile.
+
 Install in each retail client:
 
-1. Copy session_transition_patch.py and clipboard_input_patch.py beside the
-   client's launcher. Copy parachute_key_patch.py into client/aoslib/.
+1. Copy session_transition_patch.py, clipboard_input_patch.py, and
+   prefab_menu_patch.py beside the client's launcher. Copy
+   parachute_key_patch.py into client/aoslib/.
 2. In aoslib/run.py, import session_transition_patch before BootClass() creates
-   the game manager. Import clipboard_input_patch after aoslib.gui is imported.
+   the game manager. Import clipboard_input_patch after aoslib.gui is imported,
+   and import prefab_menu_patch after the SelectClass module is available.
 3. Immediately after GameManager construction in aoslib/run.py, add:
 
        from aoslib.parachute_key_patch import install

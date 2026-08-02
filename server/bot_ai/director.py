@@ -7,7 +7,6 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from heapq import nsmallest
 from typing import TYPE_CHECKING
 
 import shared.constants as C
@@ -16,6 +15,7 @@ from shared.packet import PlayerLeft
 from server.class_selection import normalize_class_selection
 from server.game_constants import (
     DEFAULT_WEAPON_TOOL,
+    MELEE_RANGE,
     SPADE_TOOL_IDS,
     TEAM1,
     TEAM2,
@@ -41,6 +41,7 @@ from .messages import (
 from .prefab_policy import bot_prefab_is_suitable, is_zombie_prefab
 from .profiles import ProfileFactory
 from .supervisor import AIWorkerSupervisor, WorkerStatus
+from .thread_supervisor import AIThreadSupervisor
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
+_MOTOR_PHASE_COUNT = 6
 # A latched FIRE/MELEE/ORIENTED action may outlive its 400 ms intent TTL by
 # this grace period while the aim motor finishes converging on the target.
 _ACTION_CONVERGENCE_GRACE = 0.15
@@ -69,11 +71,30 @@ _LOCK_SETTLE_TIME = 1.2
 # per-tick cap so the 60 Hz gameplay thread never runs unbounded raycasts.
 _WALL_PROBE_INTERVAL = 0.10
 _WALL_PROBE_TICK_BUDGET = 4
+# Local collision steering does not need to rerun at the 60 Hz body rate.
+# The worker already plans a corridor ahead, and the live probe covers at
+# least 1.25 blocks (up to five while sprinting). Reusing the chosen steering
+# vector for a few physics ticks removes the largest bot cost on the gameplay
+# thread while topology edits and meaningful travel still invalidate it.
+_STEERING_PROBE_INTERVAL = 0.05
+_STEERING_PROBE_MAX_TRAVEL = 1.25
+_STEERING_PROBE_DEFER_TRAVEL = 1.75
+_MOVEMENT_PROBE_TICK_BUDGET = 1
 # The retail protocol accepts up to 255 players, but one bot only needs its
 # local/strategic cohort for a 10 Hz decision. Bounding this tuple keeps every
 # PerceptionFrame below the frozen Windows pipe-record ceiling even on a full
 # custom server; the authoritative server still owns and simulates all peers.
 _MAX_PERCEPTION_PLAYERS = 32
+# Snapshot construction is linear in the live roster. Bound each gameplay
+# tick's share so a 50-bot capacity run cannot turn one 10 Hz refresh into a
+# millisecond-scale spike; the completed tuple is still immutable for every
+# observer frame in that perception generation.
+_PERCEPTION_SNAPSHOT_BATCH = 12
+# A BotDirector update also drains intents and, on non-perception ticks, runs a
+# motor phase. Stop starting additional observer frames before consuming the
+# entire configured director budget; the final frame and update bookkeeping
+# need the remaining headroom to keep the measured p99 inside that contract.
+_PERCEPTION_PUBLISH_BUDGET_SHARE = 0.55
 # A PerceptionFrame is one multiprocessing pipe record. Keep enough room for
 # the bounded player cohort and control metadata instead of allowing a dense
 # custom map to recreate the frozen Windows large-write deadlock.
@@ -151,6 +172,34 @@ def _choose_bot_prefabs(
     return tuple(selected)
 
 
+def _choose_bot_loadout(
+    class_id: int,
+    rng: random.Random,
+    *,
+    disabled_tools: frozenset[int] = frozenset(),
+) -> tuple[int, ...]:
+    """Choose one enabled item from every selectable class slot.
+
+    The result is still passed through the normal authoritative selection
+    boundary.  Supplying concrete choices here prevents every bot from using
+    the first/default variant in every slot for the whole match.
+    """
+
+    class_items = C.CLASS_ITEMS.get(int(class_id), {})
+    selected: list[int] = []
+    for slot in range(int(C.CLASS_NOOF_SELECTABLE_ITEMS)):
+        if slot == int(C.CLASS_PREFABS):
+            continue
+        options = tuple(
+            int(tool)
+            for tool in class_items.get(slot, ())
+            if int(tool) not in disabled_tools
+        )
+        if options:
+            selected.append(int(rng.choice(options)))
+    return tuple(selected)
+
+
 class _BotConnection:
     """Active peerless connection owned by the server rather than ENet."""
 
@@ -213,6 +262,10 @@ class _RuntimeBot:
     movement_input: tuple[bool, bool, bool, bool, bool, bool, bool, bool] | None = None
     waypoint_probe_key: tuple | None = None
     waypoint_probe_result: bool = False
+    steering_cache_key: tuple | None = None
+    steering_cache_direction: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    steering_cache_position: tuple[float, float, float] | None = None
+    steering_cache_until: float = 0.0
     was_alive: bool = True
     # Orientation-dependent action latched until the aim motor converges.
     pending_action: BotAction | None = None
@@ -252,13 +305,22 @@ class BotDirector:
         self.server = server
         config = self._config
         seed = int(getattr(config, "seed", 0))
-        self.supervisor = supervisor or AIWorkerSupervisor(
-            seed=seed,
-            decision_hz=float(getattr(config, "decision_hz", 8.0)),
-            path_requests_per_second=float(
-                getattr(config, "path_requests_per_second", 24.0)
-            ),
-        )
+        if supervisor is not None:
+            self.supervisor = supervisor
+        else:
+            supervisor_type = (
+                AIWorkerSupervisor
+                if str(getattr(config, "worker", "thread")).lower()
+                == "process"
+                else AIThreadSupervisor
+            )
+            self.supervisor = supervisor_type(
+                seed=seed,
+                decision_hz=float(getattr(config, "decision_hz", 8.0)),
+                path_requests_per_second=float(
+                    getattr(config, "path_requests_per_second", 24.0)
+                ),
+            )
         self.gateway = BotActionGateway(server)
         self.profile_factory = ProfileFactory(seed=seed)
         self._rng = random.Random(seed)
@@ -278,6 +340,17 @@ class BotDirector:
         self._started = False
         self._mutation_subscription = None
         self._wall_probes_this_tick = 0
+        self._movement_probes_this_tick = 0
+        self._pending_gateway_actions: dict[
+            int, tuple[int, BotAction, float]
+        ] = {}
+        self._perception_cache_until = 0.0
+        self._perception_players: tuple[PlayerSnapshot, ...] = ()
+        self._perception_entities: tuple[EntitySnapshot, ...] = ()
+        self._perception_objectives: tuple[ObjectiveSnapshot, ...] = ()
+        self._perception_build_players: tuple[Player, ...] = ()
+        self._perception_build_snapshots: list[PlayerSnapshot] = []
+        self._perception_build_index = 0
 
     @property
     def _config(self):
@@ -318,6 +391,7 @@ class BotDirector:
             unsubscribe(self._mutation_subscription)
         self._mutation_subscription = None
         self.supervisor.close()
+        self._pending_gateway_actions.clear()
         self._started = False
 
     async def add_bot(
@@ -373,8 +447,23 @@ class BotDirector:
             self._rng,
         )
         from server.class_selection import normalize_server_selection
+        from server.game_rules import get_rules
+
+        selected_loadout = _choose_bot_loadout(
+            selected_class,
+            self._rng,
+            disabled_tools=frozenset(
+                int(tool)
+                for tool in get_rules(
+                    self.server.config
+                ).selection_disabled_tools()
+            ),
+        )
         selection = normalize_server_selection(
-            self.server.config, selected_class, prefabs=selected_prefabs
+            self.server.config,
+            selected_class,
+            loadout=selected_loadout,
+            prefabs=selected_prefabs,
         )
         prepare_selection = getattr(self.server.mode, "prepare_join_selection", None)
         if callable(prepare_selection):
@@ -462,6 +551,7 @@ class BotDirector:
         if not force and not self._safe_to_retire(bot):
             return False
         runtime = self._runtime.pop(int(bot.id), None)
+        self._pending_gateway_actions.pop(int(bot.id), None)
         self.bots.remove(bot)
         self.server.round_lifecycle.forget_player(bot)
         if bot.team in self.server.teams:
@@ -490,18 +580,57 @@ class BotDirector:
         self._refresh_epochs()
         # Population work is a one-Hz policy. Avoid creating/awaiting a
         # coroutine on the other 59 fixed ticks each second.
+        population_maintained = False
         if now >= self._next_population_at:
             await self._maintain_population(now)
+            population_maintained = True
+        section_started = time.perf_counter()
         self._drain_intents(now)
-        self._publish_due_perception(now)
+        self.server.metrics.record_subsystem(
+            "bots_intents",
+            (time.perf_counter() - section_started) * 1000.0,
+        )
+        if population_maintained:
+            # Population changes are an independent one-Hz job. Held inputs
+            # remain live for this tick; perception and motors resume on the
+            # next fixed step instead of stacking three scheduling classes.
+            return
+        section_started = time.perf_counter()
+        perception_refreshed = self._publish_due_perception(now)
+        self.server.metrics.record_subsystem(
+            "bots_perception",
+            (time.perf_counter() - section_started) * 1000.0,
+        )
+        if perception_refreshed:
+            return
         fixed_dt = float(dt)
         self._wall_probes_this_tick = 0
+        self._movement_probes_this_tick = 0
+        motor_phase = (
+            int(getattr(self.server, "loop_count", 0))
+            % _MOTOR_PHASE_COUNT
+        )
+        section_started = time.perf_counter()
         # None of the motor calls mutates the runtime dictionary. Iterating its
         # live values avoids allocating a 12-row tuple at 60 Hz.
         for runtime in self._runtime.values():
             if runtime.was_alive != bool(runtime.player.alive):
                 self._update_class_lifetime(runtime)
-            self._apply_motor(runtime, now, fixed_dt)
+            # Player physics consumes held inputs at 60 Hz. Refresh two of 12
+            # controller motors per tick (10 Hz) and integrate the complete
+            # elapsed interval; client interpolation keeps the 30 Hz observer
+            # stream smooth while the gameplay-thread work stays bounded.
+            if int(runtime.player.id) % _MOTOR_PHASE_COUNT != motor_phase:
+                continue
+            self._apply_motor(
+                runtime,
+                now,
+                fixed_dt * _MOTOR_PHASE_COUNT,
+            )
+        self.server.metrics.record_subsystem(
+            "bots_motors",
+            (time.perf_counter() - section_started) * 1000.0,
+        )
 
     def status(self) -> WorkerStatus:
         """Expose the worker portion of operational status."""
@@ -554,11 +683,13 @@ class BotDirector:
             self._map_signature = map_signature
             self._map_epoch += 1
             self._topology_version = int(getattr(world, "topology_version", 0))
+            self._perception_cache_until = 0.0
             if self._started and not force:
                 self.supervisor.publish_map(self._make_map_snapshot(current=False))
         if force or mode_signature != self._mode_signature:
             self._mode_signature = mode_signature
             self._mode_epoch += 1
+            self._perception_cache_until = 0.0
 
     def _make_map_snapshot(self, *, current: bool) -> MapSnapshot:
         world = self.server.world_manager
@@ -569,6 +700,7 @@ class BotDirector:
             raw_vxl=raw,
             mode_id=self._mode_id(),
             map_name=str(getattr(world, "map_name", "")),
+            map_directory=str(getattr(world, "maps_path", "")),
         )
 
     def _on_world_mutation(
@@ -630,26 +762,86 @@ class BotDirector:
             if await self.remove_bot(candidate):
                 excess -= 1
 
-    def _publish_due_perception(self, now: float) -> None:
+    def _publish_due_perception(self, now: float) -> bool:
         if not self.bots:
-            return
+            return False
         interval = 1.0 / max(1.0, float(getattr(self._config, "perception_hz", 10)))
-        due = [
-            (bot, self._runtime.get(int(bot.id)))
-            for bot in tuple(self.bots)
-            if (
-                self._runtime.get(int(bot.id)) is not None
-                and now >= self._runtime[int(bot.id)].next_perception_at
-            )
-        ]
+        due = sorted(
+            [
+                (bot, self._runtime.get(int(bot.id)))
+                for bot in self.bots
+                if (
+                    self._runtime.get(int(bot.id)) is not None
+                    and now >= self._runtime[int(bot.id)].next_perception_at
+                )
+            ],
+            key=lambda item: (
+                float(item[1].next_perception_at),
+                int(item[0].id),
+            ),
+        )
         if not due:
-            return
-        players = self._snapshot_players()
-        entities = self._snapshot_entities()
-        objectives = self._snapshot_objectives()
+            return False
+        budget_seconds = max(
+            0.0001,
+            float(getattr(self._config, "main_thread_budget_ms", 0.75))
+            / 1000.0,
+        )
+        publish_budget_seconds = max(
+            0.00005,
+            budget_seconds * _PERCEPTION_PUBLISH_BUDGET_SHARE,
+        )
+        started_at = time.perf_counter()
+        if now >= self._perception_cache_until or self._perception_build_players:
+            if not self._perception_build_players:
+                self._perception_build_players = tuple(
+                    self.server.players.values()
+                )
+                self._perception_build_snapshots = []
+                self._perception_build_index = 0
+            stop = min(
+                len(self._perception_build_players),
+                self._perception_build_index + _PERCEPTION_SNAPSHOT_BATCH,
+            )
+            for player in self._perception_build_players[
+                self._perception_build_index:stop
+            ]:
+                self._perception_build_snapshots.append(
+                    self._snapshot_player(player)
+                )
+            self._perception_build_index = stop
+            if stop < len(self._perception_build_players):
+                return True
+            self._perception_players = tuple(
+                self._perception_build_snapshots
+            )
+            self._perception_entities = self._snapshot_entities()
+            self._perception_objectives = self._snapshot_objectives()
+            self._perception_build_players = ()
+            self._perception_build_snapshots = []
+            self._perception_build_index = 0
+            self._perception_cache_until = now + min(interval, 0.1)
+            # Snapshotting the shared roster and constructing observer frames
+            # are separate bounded jobs. Publishing the due frames on the next
+            # 60 Hz tick avoids stacking both allocations with the same motor
+            # phase. Very large bot rosters trade a few ticks of perception age
+            # for a hard gameplay-thread cost bound.
+            return True
+        players = self._perception_players
+        entities = self._perception_entities
+        objectives = self._perception_objectives
         mode_id = self._mode_id()
         mode_phase = self._mode_phase()
-        for bot, runtime in due:
+        for published, (bot, runtime) in enumerate(due):
+            # Always publish at least one overdue observer. Further catch-up
+            # frames wait for later ticks once the configured gameplay-thread
+            # budget is spent, retaining fairness via the due-time sort above.
+            if (
+                published > 0
+                and time.perf_counter() - started_at
+                >= publish_budget_seconds
+            ):
+                break
             runtime.next_perception_at = now + interval
             self._frame_id += 1
             self.supervisor.submit_frame(
@@ -682,6 +874,7 @@ class BotDirector:
                     ),
                 )
             )
+        return False
 
     @staticmethod
     def _players_for_observer(
@@ -733,21 +926,22 @@ class BotDirector:
             )
             return rank, distance, player_id
 
-        return tuple(
-            nsmallest(
-                _MAX_PERCEPTION_PLAYERS,
-                players,
-                key=priority,
-            )
-        )
+        # At the retail-scale bound (at most 255 rows and k=32), CPython's
+        # Timsort is materially cheaper than maintaining heapq.nsmallest's
+        # decorated max-heap. Preserve the exact priority order while keeping
+        # 50-bot perception-frame construction inside its per-tick budget.
+        return tuple(sorted(players, key=priority)[:_MAX_PERCEPTION_PLAYERS])
 
     def _snapshot_players(self) -> tuple[PlayerSnapshot, ...]:
-        snapshots: list[PlayerSnapshot] = []
-        for player in tuple(self.server.players.values()):
-            generation = self._player_generation(player)
-            runtime = self._runtime.get(int(player.id))
-            snapshots.append(
-                PlayerSnapshot(
+        return tuple(
+            self._snapshot_player(player)
+            for player in tuple(self.server.players.values())
+        )
+
+    def _snapshot_player(self, player: "Player") -> PlayerSnapshot:
+        generation = self._player_generation(player)
+        runtime = self._runtime.get(int(player.id))
+        return PlayerSnapshot(
                     player_id=int(player.id),
                     generation=generation,
                     team=int(getattr(player, "team", -1)),
@@ -831,17 +1025,28 @@ class BotDirector:
                     ),
                     life_id=int(getattr(player, "deaths", 0)),
                 )
-            )
-        return tuple(snapshots)
 
     def _snapshot_entities(self) -> tuple[EntitySnapshot, ...]:
         registry = getattr(self.server, "entity_registry", None)
         if registry is None:
             return ()
-        explosive_types = {
+        entity_tools = {
             int(getattr(C, "DYNAMITE_ENTITY", 10)): int(C.DYNAMITE_TOOL),
             int(getattr(C, "LANDMINE_ENTITY", 9)): int(C.LANDMINE_TOOL),
             int(getattr(C, "C4_ENTITY", 38)): int(C.C4_TOOL),
+            int(getattr(C, "MEDPACK_ENTITY", 30)): int(C.MEDPACK_TOOL),
+            int(getattr(C, "RADAR_STATION_ENTITY", 36)): int(
+                C.RADAR_STATION_TOOL
+            ),
+            int(getattr(C, "ROCKET_TURRET_ENTITY", 8)): int(
+                C.ROCKET_TURRET_TOOL
+            ),
+            int(getattr(C, "MACHINE_GUN", 7)): int(C.MG_TOOL),
+        }
+        explosive_types = {
+            int(getattr(C, "DYNAMITE_ENTITY", 10)),
+            int(getattr(C, "LANDMINE_ENTITY", 9)),
+            int(getattr(C, "C4_ENTITY", 38)),
         }
         result: list[EntitySnapshot] = []
         for entity in tuple(registry.all()):
@@ -879,7 +1084,7 @@ class BotDirector:
                     position=tuple(float(value) for value in position),
                     alive=bool(getattr(entity, "alive", True)),
                     kind=kind,
-                    tool_id=explosive_types.get(entity_type, -1),
+                    tool_id=entity_tools.get(entity_type, -1),
                     velocity=tuple(
                         float(value)
                         for value in getattr(entity, "vel", (0.0, 0.0, 0.0))
@@ -979,11 +1184,7 @@ class BotDirector:
             )
             return rank, distance, int(snapshot.entity_id)
 
-        selected = nsmallest(
-            _MAX_PERCEPTION_ENTITIES,
-            result,
-            key=priority,
-        )
+        selected = sorted(result, key=priority)[:_MAX_PERCEPTION_ENTITIES]
         metrics = getattr(self.server, "metrics", None)
         if metrics is not None:
             metrics.bot_perception_entity_overflow += len(result) - len(selected)
@@ -1125,6 +1326,18 @@ class BotDirector:
                 # A pending dig/breach is allowed a short aim-convergence
                 # grace, but it must never survive a newer combat or survival
                 # interrupt and re-select the old terrain tool afterwards.
+                self._clear_pending_action(runtime)
+            elif (
+                runtime.pending_action is not None
+                and runtime.intent is not None
+                and runtime.intent.movement.affordance
+                is MovementAffordance.BREACH
+                and intent.movement.affordance
+                is not MovementAffordance.BREACH
+            ):
+                # The authoritative terrain delta made the old wall action
+                # obsolete. A same-priority walk replan must cancel it instead
+                # of letting the stale swing steal aim for its grace period.
                 self._clear_pending_action(runtime)
             runtime.intent = intent
             runtime.last_intent_frame = int(intent.frame_id)
@@ -1273,6 +1486,7 @@ class BotDirector:
             runtime,
             intent.movement.direction,
             intent.movement.affordance,
+            now=now,
         )
         forward = (float(player.o_x), float(player.o_y))
         side = (-forward[1], forward[0])
@@ -1284,6 +1498,11 @@ class BotDirector:
             and int(getattr(player, "jetpack_id", 0)) > 0
             and float(getattr(player, "jetpack_fuel", 0.0)) > 0.0
         )
+        jetpack_uses_hover = (
+            int(getattr(player, "jetpack_id", 0))
+            == int(C.JETPACK_UGCBUILDER)
+        )
+        jetpack_jump_held = jetpack_requested and not jetpack_uses_hover
         primary_latched = (
             int(getattr(self.server, "loop_count", 0))
             <= runtime.action_primary_until_loop
@@ -1293,11 +1512,17 @@ class BotDirector:
             or affordance is MovementAffordance.JUMP
         )
         current_loop = int(getattr(self.server, "loop_count", 0))
-        wading_jump = bool(getattr(player, "wade", False)) and jump_requested
-        if wading_jump:
+        wading_ascent = (
+            bool(getattr(player, "wade", False))
+            and jump_requested
+            and affordance is not MovementAffordance.JUMP
+        )
+        if wading_ascent:
             # Native swimming needs held ascent. Ground jumps remain bounded
-            # pulses, but pulsing only a few ticks per worker frame made bots
-            # bob and crawl across large water maps.
+            # pulses, but pulsing open-water movement made bots bob and crawl.
+            # The final water->shore JUMP is deliberately excluded: after a
+            # long swim the native body needs a release/rearm edge to climb a
+            # two-block bank instead of holding jump forever against the wall.
             runtime.jump_until_loop = -1
             runtime.jump_rearm_loop = -1
         elif (
@@ -1310,7 +1535,16 @@ class BotDirector:
             # A release window prevents adjacent worker frames from merging
             # into one native held-key interval.
             runtime.jump_rearm_loop = runtime.jump_until_loop + 2
-        jump_held = wading_jump or current_loop <= runtime.jump_until_loop
+        # Retail packs 66-68 sustain thrust with held SPACE. Only the UGC
+        # Builder pack 69 uses the toggled hover/Z action. The old motor sent
+        # every JETPACK affordance as hover+primary, which accidentally relied
+        # on the server's former all-class zero-gravity bug and never activated
+        # an Engineer/Rocketeer pack's real fuel/thrust state.
+        jump_held = (
+            jetpack_jump_held
+            or wading_ascent
+            or current_loop <= runtime.jump_until_loop
+        )
         self._set_movement_state(runtime, (
             forward_amount > 0.25,
             forward_amount < -0.25,
@@ -1325,11 +1559,10 @@ class BotDirector:
         ))
         self._set_action_state(
             runtime,
-            primary=jetpack_requested
-            or primary_latched,
+            primary=primary_latched,
             secondary=bool(intent.secondary_fire),
             zoom=bool(intent.zoom),
-            hover=jetpack_requested,
+            hover=jetpack_requested and jetpack_uses_hover,
         )
 
     @staticmethod
@@ -1503,9 +1736,13 @@ class BotDirector:
             else:
                 reference = runtime.pending_action_look
                 visible = runtime.pending_action_visible
-        if action.kind is BotActionKind.FIRE and not visible:
-            # FIRE stays gated on a fresh visible perception sample; hold and
-            # let the deadline drop it if visibility never returns.
+        if (
+            action.kind in (BotActionKind.FIRE, BotActionKind.ORIENTED)
+            and not visible
+        ):
+            # Player-target attacks stay gated on a fresh visible perception
+            # sample; hold and let the deadline drop them if visibility never
+            # returns. A stale last-seen point never authorizes a rocket.
             # CombatSystem performs the final authoritative ray/terrain test.
             return
         if reference is None:
@@ -1526,11 +1763,52 @@ class BotDirector:
             + float(player.o_z) * dz
         ) / distance
         if cos_error >= self._facing_threshold(runtime, action, distance):
-            if action.kind is BotActionKind.FIRE and not self._fire_lane_clear(
-                runtime, (dx, dy, dz), distance, now
+            if not self._breach_ray_hits_target(runtime, action):
+                return
+            if (
+                action.kind in (BotActionKind.FIRE, BotActionKind.ORIENTED)
+                and not self._fire_lane_clear(
+                    runtime, (dx, dy, dz), distance, now
+                )
             ):
                 return
             self._execute_pending(runtime, action, now)
+
+    def _breach_ray_hits_target(
+        self,
+        runtime: _RuntimeBot,
+        action: BotAction,
+    ) -> bool:
+        """Require a planned dig ray to hit its selected voxel, not a neighbor."""
+
+        intent = runtime.intent
+        if (
+            action.kind is not BotActionKind.MELEE
+            or action.position is None
+            or intent is None
+            or intent.movement.affordance is not MovementAffordance.BREACH
+        ):
+            return True
+        player = runtime.player
+        raycast = getattr(self.server.world_manager, "raycast", None)
+        if not callable(raycast):
+            return False
+        try:
+            hit = raycast(
+                float(player.eye_x),
+                float(player.eye_y),
+                float(player.eye_z),
+                float(player.o_x),
+                float(player.o_y),
+                float(player.o_z),
+                float(MELEE_RANGE),
+            )
+        except (TypeError, ValueError):
+            return False
+        expected = tuple(
+            int(math.floor(float(value))) for value in action.position
+        )
+        return hit is not None and tuple(int(value) for value in hit) == expected
 
     @staticmethod
     def _facing_threshold(
@@ -1565,7 +1843,60 @@ class BotDirector:
     def _execute_pending(
         self, runtime: _RuntimeBot, action: BotAction, now: float
     ) -> None:
+        """Queue one converged action for bounded fixed-step commitment."""
+
+        if not self._started:
+            # Focused motor fixtures intentionally exercise this private
+            # boundary without a SimulationRuntime to drain staged actions.
+            # Every live director is started and always uses the bounded queue.
+            self._commit_pending_action(runtime, action, now)
+            return
+        player_id = int(runtime.player.id)
+        if player_id in self._pending_gateway_actions:
+            return
+        self._pending_gateway_actions[player_id] = (
+            int(runtime.generation),
+            action,
+            float(now),
+        )
+
+    def drain_actions(self, limit: int = 1) -> int:
+        """Commit a bounded number of queued authoritative bot actions."""
+
+        selected = tuple(self._pending_gateway_actions.items())[
+            :max(0, int(limit))
+        ]
+        committed = 0
+        for player_id, (generation, action, queued_at) in selected:
+            self._pending_gateway_actions.pop(player_id, None)
+            runtime = self._runtime.get(int(player_id))
+            if (
+                runtime is None
+                or int(runtime.generation) != int(generation)
+                or runtime.pending_action is not action
+                or not runtime.player.alive
+                or not runtime.player.spawned
+            ):
+                continue
+            self._commit_pending_action(
+                runtime,
+                action,
+                max(float(queued_at), time.monotonic()),
+            )
+            committed += 1
+        return committed
+
+    def _commit_pending_action(
+        self, runtime: _RuntimeBot, action: BotAction, now: float
+    ) -> None:
+        """Execute one previously converged action on the gameplay thread."""
+
+        gateway_started = time.perf_counter()
         accepted = self.gateway.execute(runtime.player, action)
+        self.server.metrics.record_subsystem(
+            "bots_gateway",
+            (time.perf_counter() - gateway_started) * 1000.0,
+        )
         self._record_action_result(runtime, action, accepted, now)
         if accepted and action.kind is BotActionKind.FIRE:
             self._apply_recoil(runtime)
@@ -1856,43 +2187,142 @@ class BotDirector:
         runtime: _RuntimeBot,
         direction,
         affordance: MovementAffordance = MovementAffordance.WALK,
+        *,
+        now: float | None = None,
     ) -> tuple[float, float, float]:
         """Return requested locomotion or the nearest body-clear walk vector.
 
         Worker navigation owns the route. This is only local collision
         steering, analogous to sliding along a wall: special traversal edges
         stay fail-closed because rotating a jump or drop can invalidate its
-        authored landing.
+        authored landing. Ordinary walking reuses one validated steering
+        vector for at most 50 ms or 0.75 blocks. This preserves the 60 Hz input
+        stream without repeating the same VXL shoulder/braking probes on every
+        physics frame.
         """
 
         requested = tuple(float(value) for value in direction)
-        if BotDirector._waypoint_is_live(runtime, requested, affordance):
-            return requested
-        if affordance not in {
+        ordinary_walk = affordance in {
             MovementAffordance.WALK,
             MovementAffordance.CROUCH,
-        }:
-            return (0.0, 0.0, 0.0)
-        length = math.hypot(requested[0], requested[1])
-        if length <= 1e-6:
-            return (0.0, 0.0, 0.0)
-        dx, dy = requested[0] / length, requested[1] / length
-        identity = int(getattr(runtime.player, "id", 0)) + int(
-            getattr(runtime, "generation", 0)
+        }
+        current_time = time.monotonic() if now is None else float(now)
+        player = getattr(runtime, "player", None)
+        world = getattr(
+            getattr(getattr(player, "connection", None), "server", None),
+            "world_manager",
+            None,
         )
-        preferred_sign = -1.0 if identity & 1 else 1.0
-        for magnitude in _WALK_STEER_ANGLES:
-            for sign in (preferred_sign, -preferred_sign):
-                angle = magnitude * sign
-                cosine, sine = math.cos(angle), math.sin(angle)
-                candidate = (
-                    (dx * cosine - dy * sine) * length,
-                    (dx * sine + dy * cosine) * length,
-                    requested[2],
+        cache_key = (
+            int(round(requested[0] * 100.0)),
+            int(round(requested[1] * 100.0)),
+            int(round(requested[2] * 100.0)),
+            affordance.value,
+            int(getattr(world, "topology_version", -1)),
+            bool(getattr(player, "wade", False)),
+        )
+        cached_position = getattr(runtime, "steering_cache_position", None)
+        current_position = (
+            float(getattr(player, "x", 0.0)),
+            float(getattr(player, "y", 0.0)),
+            float(getattr(player, "z", 0.0)),
+        )
+        cached_travel = (
+            math.dist(cached_position, current_position)
+            if cached_position is not None
+            else math.inf
+        )
+        if (
+            ordinary_walk
+            and getattr(runtime, "steering_cache_key", None) == cache_key
+            and current_time < float(
+                getattr(runtime, "steering_cache_until", 0.0)
+            )
+            and cached_position is not None
+            and cached_travel <= _STEERING_PROBE_MAX_TRAVEL
+        ):
+            return tuple(
+                float(value)
+                for value in getattr(
+                    runtime,
+                    "steering_cache_direction",
+                    (0.0, 0.0, 0.0),
                 )
-                if BotDirector._waypoint_is_live(runtime, candidate, affordance):
-                    return candidate
-        return (0.0, 0.0, 0.0)
+            )
+
+        owner = getattr(
+            getattr(getattr(player, "connection", None), "server", None),
+            "bots",
+            None,
+        )
+        cache_compatible = (
+            ordinary_walk
+            and getattr(runtime, "steering_cache_key", None) == cache_key
+            and cached_position is not None
+            and cached_travel <= _STEERING_PROBE_DEFER_TRAVEL
+        )
+        if (
+            cache_compatible
+            and owner is not None
+            and int(getattr(owner, "_movement_probes_this_tick", 0))
+            >= _MOVEMENT_PROBE_TICK_BUDGET
+        ):
+            # The same direction, affordance, topology and water state was
+            # recently validated. Defer this refresh by one physics tick so a
+            # burst of worker intents cannot turn into a 12-bot VXL spike.
+            return tuple(
+                float(value)
+                for value in getattr(
+                    runtime,
+                    "steering_cache_direction",
+                    (0.0, 0.0, 0.0),
+                )
+            )
+        if owner is not None:
+            owner._movement_probes_this_tick = (
+                int(getattr(owner, "_movement_probes_this_tick", 0)) + 1
+            )
+
+        result = (0.0, 0.0, 0.0)
+        if BotDirector._waypoint_is_live(runtime, requested, affordance):
+            result = requested
+        elif ordinary_walk:
+            length = math.hypot(requested[0], requested[1])
+            if length > 1e-6:
+                dx, dy = requested[0] / length, requested[1] / length
+                identity = int(getattr(player, "id", 0)) + int(
+                    getattr(runtime, "generation", 0)
+                )
+                preferred_sign = -1.0 if identity & 1 else 1.0
+                for magnitude in _WALK_STEER_ANGLES:
+                    for sign in (preferred_sign, -preferred_sign):
+                        angle = magnitude * sign
+                        cosine, sine = math.cos(angle), math.sin(angle)
+                        candidate = (
+                            (dx * cosine - dy * sine) * length,
+                            (dx * sine + dy * cosine) * length,
+                            requested[2],
+                        )
+                        if BotDirector._waypoint_is_live(
+                            runtime, candidate, affordance
+                        ):
+                            result = candidate
+                            break
+                    if result != (0.0, 0.0, 0.0):
+                        break
+
+        if ordinary_walk:
+            runtime.steering_cache_key = cache_key
+            runtime.steering_cache_direction = result
+            runtime.steering_cache_position = (
+                float(getattr(player, "x", 0.0)),
+                float(getattr(player, "y", 0.0)),
+                float(getattr(player, "z", 0.0)),
+            )
+            runtime.steering_cache_until = (
+                current_time + _STEERING_PROBE_INTERVAL
+            )
+        return result
 
     @staticmethod
     def _probe_surface_is_live(
@@ -2056,9 +2486,22 @@ class BotDirector:
                     runtime.rng,
                 )
                 from server.class_selection import normalize_server_selection
+                from server.game_rules import get_rules
+
+                selected_loadout = _choose_bot_loadout(
+                    selected_class,
+                    runtime.rng,
+                    disabled_tools=frozenset(
+                        int(tool)
+                        for tool in get_rules(
+                            self.server.config
+                        ).selection_disabled_tools()
+                    ),
+                )
                 selection = normalize_server_selection(
                     self.server.config,
                     selected_class,
+                    loadout=selected_loadout,
                     prefabs=selected_prefabs,
                 )
                 mode = getattr(self.server, "mode", None)

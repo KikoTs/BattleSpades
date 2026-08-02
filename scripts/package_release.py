@@ -114,6 +114,7 @@ def stage_release(
 
     required_files = {
         root / "config.toml": "config.toml",
+        root / "fleet.toml": "fleet.toml",
         root / "LICENSE": "LICENSE",
         root / "VERSION": "VERSION",
         root / "release" / "README.txt": "README.txt",
@@ -125,6 +126,9 @@ def stage_release(
         ),
         root / "client_patches" / "clipboard_input_patch.py": (
             "client_patches/clipboard_input_patch.py"
+        ),
+        root / "client_patches" / "prefab_menu_patch.py": (
+            "client_patches/prefab_menu_patch.py"
         ),
         root / "client_patches" / "parachute_key_patch.py": (
             "client_patches/parachute_key_patch.py"
@@ -144,10 +148,16 @@ def stage_release(
 
         map_count = _copy_files(root / "maps", destination / "maps", "*.vxl")
         _copy_files(root / "maps", destination / "maps", "*.json")
+        _copy_files(root / "maps", destination / "maps", "*.botnav")
         prefab_count = _copy_files(
             root / "prefabs",
             destination / "prefabs",
             "*.kv6",
+        )
+        fleet_config_count = _copy_files(
+            root / "configs",
+            destination / "configs",
+            "*.toml",
         )
         _copy_files(
             root / "release" / "plugins",
@@ -158,6 +168,8 @@ def stage_release(
             raise ValueError("release must contain at least one VXL map")
         if prefab_count == 0:
             raise ValueError("release must contain at least one KV6 prefab")
+        if fleet_config_count == 0:
+            raise ValueError("release must contain at least one fleet config")
         if not (destination / "plugins" / "README.txt").is_file():
             raise FileNotFoundError("release plugin instructions are missing")
     except Exception:

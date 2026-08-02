@@ -209,6 +209,13 @@ class Connection:
     
     def send(self, data: bytes, reliable: bool = True, prefix: int = 0x30):
         """Send packet to this connection."""
+        # ENetPeer storage belongs to the server's ENet Host.  This check must
+        # precede logging (``peer.address`` also enters the native wrapper),
+        # compression, and packet allocation so a delayed coroutine cannot
+        # touch a peer after server shutdown has begun.
+        if getattr(self.server, "_stopping", False):
+            return
+
         import enet
         
         # Log raw packet (unless suppressed)
@@ -248,7 +255,23 @@ class Connection:
     
     def disconnect(self, reason: int = 0):
         """Disconnect this peer."""
+        if getattr(self.server, "_stopping", False):
+            return
         self.peer.disconnect(reason)
+
+    def retire_for_server_shutdown(self) -> None:
+        """Cancel connection-local waiters without touching the native peer."""
+
+        self.in_game = False
+        for future in tuple(self._waiters.values()):
+            if not future.done():
+                future.cancel()
+        self._waiters.clear()
+        transition_ready = self._scene_transition_ready
+        if transition_ready is not None:
+            transition_ready.set()
+        self._scene_transition_ready = None
+        self.player = None
     
     def decrypt(self, data: bytes) -> bytes:
         """Decrypt packet data using steam key."""
@@ -355,6 +378,8 @@ class Connection:
     
     async def on_receive(self, data: bytes):
         """Handle incoming packet - dispatches to appropriate handler."""
+        if getattr(self.server, "_stopping", False):
+            return
         if len(data) < 2:
             return
         

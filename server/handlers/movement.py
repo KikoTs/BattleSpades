@@ -13,6 +13,7 @@ import time
 import shared.constants as C
 
 from protocol.handler_registry import register_handler
+from server.class_selection import equipped_tool_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +94,7 @@ async def handle_client_data(server, player, packet) -> None:
         packet.hover,
         packet.palette_enabled,
     )
-    from server.game_rules import get_rules
-    tool_allowed = get_rules(server.config).is_tool_enabled(packet.tool_id)
-    mode_gate = getattr(getattr(server, "mode", None), "allows_equipped_tool", None)
-    if tool_allowed and callable(mode_gate):
-        tool_allowed = bool(mode_gate(player, int(packet.tool_id)))
-    if tool_allowed:
+    if equipped_tool_authorized(player, packet.tool_id):
         player.set_tool(packet.tool_id, raw=True)
         # The original UGC host paints its local VXL before packet-7
         # replication.  Direct dedicated-editor clients safely join as UGC
@@ -111,6 +107,13 @@ async def handle_client_data(server, player, packet) -> None:
             from server.combat_runtime import get_combat_system
 
             get_combat_system(server).handle_paintbrush_input(player, packet)
+    elif player.alive and player.spawned:
+        # ClientData is a high-frequency packet, so do not emit attacker-
+        # controlled log spam.  This counter is intentionally cheap and gives
+        # diagnostics/admin tooling a way to identify repeated forged states.
+        player.rejected_tool_updates = int(
+            getattr(player, "rejected_tool_updates", 0)
+        ) + 1
 
     capture = bool(getattr(server.config, "movement_debug_capture", False))
     if capture and logger.isEnabledFor(logging.DEBUG):

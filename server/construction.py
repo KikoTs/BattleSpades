@@ -15,7 +15,7 @@ from typing import Callable, Iterable, TYPE_CHECKING
 
 import shared.constants as C
 
-from server.game_constants import TEAM1, TEAM2
+from server.game_constants import MAX_BUILD_Z, MIN_BUILD_Z, TEAM1, TEAM2
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -251,7 +251,7 @@ class ConstructionSafetyService:
                 if not (
                     0 <= x < int(C.MAP_X)
                     and 0 <= y < int(C.MAP_Y)
-                    and 0 <= z <= 238
+                    and MIN_BUILD_Z <= z <= MAX_BUILD_Z
                 ):
                     return frozenset()
                 result.add((x, y, z))

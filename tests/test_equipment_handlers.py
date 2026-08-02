@@ -274,6 +274,14 @@ def test_radar_packet_creates_real_entity_and_enables_team_visibility():
     assert creates
     assert creates[-1].entity.fuse == 35.0
 
+    assert radars[0].support_cell == (101, 100, 62)
+    assert server.world_manager.destroy_blocks([(101, 100, 62)]) == [
+        (101, 100, 62)
+    ]
+    assert server.entity_registry.get(radars[0].entity_id) is None
+    assert player._radar_entity_id is None
+    assert server._radar_station_counts[TEAM1] == 0
+
 
 def test_medpack_packet_creates_retail_type_30_entity():
     server, player, connection = _server_player(
@@ -291,7 +299,17 @@ def test_medpack_packet_creates_retail_type_30_entity():
     ]
     assert len(medpacks) == 1
     assert medpacks[0].type == 30  # retail GameScene.ENTITIES wire index
+    assert medpacks[0].support_cell == (101, 100, 62)
     assert any(packet[0] == 21 for packet in connection.sent)
+
+    # Exercise the canonical VXL mutation listener, not just the registry
+    # callback: destroying the supporting block retires the medpack in the
+    # same commit instead of leaving a floating client entity.
+    assert server.world_manager.destroy_blocks([(101, 100, 62)]) == [
+        (101, 100, 62)
+    ]
+    assert server.entity_registry.get(medpacks[0].entity_id) is None
+    assert any(packet[0] == 19 for packet in connection.sent)
 
 
 def test_bot_gateway_and_packet_handler_share_deployable_service():
@@ -331,6 +349,67 @@ def test_bot_gateway_and_packet_handler_share_deployable_service():
         ),
     ) is False
     assert len(list(server.entity_registry.all())) == 1
+
+
+def test_bot_redeploys_radar_after_expiry_clears_nullable_owner_slot():
+    """An expired radar's ``None`` owner marker is a valid empty state."""
+
+    server, player, _connection = _server_player(
+        C.RADAR_STATION_TOOL,
+        [C.RADAR_STATION_TOOL],
+    )
+    player.is_bot = True
+    gateway = BotActionGateway(server)
+    first_action = BotAction(
+        BotActionKind.DEPLOY,
+        tool_id=C.RADAR_STATION_TOOL,
+        position=(101.0, 100.0, 62.0),
+    )
+
+    assert gateway.execute(player, first_action) is True
+    first = server.entity_registry.get(player._radar_entity_id)
+    assert first is not None
+    first.behavior.on_destroyed(first, None, server._build_entity_ctx())
+    assert player._radar_entity_id is None
+
+    second_action = BotAction(
+        BotActionKind.DEPLOY,
+        tool_id=C.RADAR_STATION_TOOL,
+        position=(102.0, 100.0, 62.0),
+    )
+    assert gateway.execute(player, second_action) is True
+    second = server.entity_registry.get(player._radar_entity_id)
+    assert second is not None
+    assert second.entity_id != first.entity_id
+
+
+def test_bot_gateway_rejects_service_exception_without_stopping_runtime():
+    """One broken bot intention cannot escape the authoritative boundary."""
+
+    server, player, _connection = _server_player(
+        C.MEDPACK_TOOL,
+        [C.MEDPACK_TOOL],
+    )
+    player.is_bot = True
+
+    def fail_placement(*_args, **_kwargs):
+        raise TypeError("simulated nullable deployable state")
+
+    server.deployable_actions.place_medpack = fail_placement
+    action = BotAction(
+        BotActionKind.DEPLOY,
+        tool_id=C.MEDPACK_TOOL,
+        position=(101.0, 100.0, 62.0),
+        face=4,
+    )
+
+    assert BotActionGateway(server).execute(player, action) is False
+
+
+def test_entity_registry_nullable_lookup_represents_no_owned_entity():
+    server, _player, _connection = _server_player(C.RIFLE_TOOL, [C.RIFLE_TOOL])
+
+    assert server.entity_registry.get(None) is None
 
 
 def test_block_sucker_uses_client_block_granting_damage_type():

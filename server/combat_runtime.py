@@ -13,12 +13,23 @@ from typing import Optional
 from aoslib.world import cube_line
 import shared.constants as C
 from server.audio import SND_BUILD, play_sound
+from server.dig_profiles import (
+    DEFAULT_MELEE_PROFILE,
+    DIG_COLUMN,
+    DIG_CUBE,
+    DIG_MACHETE,
+    DIG_SINGLE,
+    MELEE_DIG_PROFILES,
+    melee_dig_positions as _melee_dig_positions,
+)
 from server.game_constants import (
     BLOCK_ACTION_BUILD,
     BLOCK_ACTION_DESTROY,
     DEFAULT_BLOCK_HEALTH,
     KILL_HEADSHOT,
+    MAX_BUILD_Z,
     MELEE_RANGE,
+    build_z_is_safe,
 )
 from shared.packet import (
     BlockBuild,
@@ -83,66 +94,6 @@ _CLASS_HITBOXES[C.CLASS_FAST_ZOMBIE] = _CLASS_HITBOXES[C.CLASS_ZOMBIE]
 _CLASS_HITBOXES[C.CLASS_JUMP_ZOMBIE] = _CLASS_HITBOXES[C.CLASS_ZOMBIE]
 
 
-DIG_SINGLE = "single"
-DIG_COLUMN = "column"
-DIG_CUBE = "cube"
-DIG_MACHETE = "machete_vertical_pair"
-
-
-def _build_melee_profiles():
-    """Per-tool dig behavior. (damage_type, block_damage_per_hit, pattern).
-
-    - damage_type: the client BlockManager self-expands + credits the wallet by
-      this int. LIVE-MEASURED 2026-07-09 cells removed per hit: SPADE_DAMAGE(2)
-      = a 3-tall column (z-1,z,z+1); PICKAXE(0)/KNIFE(1)/CROWBAR(26)/WEAPON(6)
-      = exactly 1 cell. All melee types credit the digger's block wallet.
-    - block_damage_per_hit: how fast blocks break (DEFAULT_BLOCK_HEALTH=5.0).
-      spade 5 (1 hit), pickaxe 9 (1 hit, fast miner), knife 1 (5 hits, weak),
-      crowbar 5, superspade 7.5. This is the user-visible "different damage".
-    - pattern: pickaxes/knives damage one cell, ordinary spades remove the
-      centered z column, the Machete damages (z,z+1), and the Miner Super
-      Spade removes a centered 3x3x3 cube. The latter is
-      orientation-independent: the retail handler
-      subtracts one from all three hit coordinates and passes extent 3 to its
-      block-distance helper.
-    """
-    import shared.constants as C
-
-    def T(name, default):
-        return int(getattr(C, name, default))
-
-    return {
-        T("SPADE_TOOL", 2):        (T("SPADE_DAMAGE", 2),      5.0, DIG_COLUMN),
-        T("CLASSIC_SPADE_TOOL", 4):(T("SPADE_DAMAGE", 2),      3.0, DIG_COLUMN),
-        T("SUPERSPADE_TOOL", 3):   (T("SUPERSPADE_DAMAGE", 3), 7.5, DIG_CUBE),
-        # IDA: BlockManager.handle_zombie_damage at gameScene.pyd
-        # 0x10081340 is structurally identical to handle_superspade_damage at
-        # 0x10082C90: both subtract one from x/y/z and invoke the native 3x3x3
-        # area handler.  Zombie hands differ only in damage type/amount.
-        T("ZOMBIEHAND_TOOL", 24):   (
-            T("ZOMBIE_DAMAGE", 17),
-            float(getattr(C, "ZOMBIEHAND_DAMAGE_AMOUNT", 2.0)),
-            DIG_CUBE,
-        ),
-        T("PICKAXE_TOOL", 0):      (T("PICKAXE_DAMAGE", 0),    9.0, DIG_SINGLE),
-        T("KNIFE_TOOL", 1):        (T("KNIFE_DAMAGE", 1),      1.0, DIG_SINGLE),
-        T("CROWBAR_TOOL", 34):     (T("CROWBAR_DAMAGE", 26),   5.0, DIG_SINGLE),
-        # Native BlockManager.handle_machete_damage applies this one packet to
-        # the hit voxel and the next voxel in VXL z (z and z+1).
-        T("MACHETE_TOOL", 50):     (T("MACHETE_DAMAGE", 35),   2.0, DIG_MACHETE),
-        T("UGC_PICKAXE_TOOL", 44): (T("UGC_PICKAXE_DAMAGE", 28), 9.0, DIG_SINGLE),
-        # UGC Super Spade is dual-use. LMB/type 29 is one block; only
-        # ShootPacket.secondary (RMB/type 31 in this retail build) uses the
-        # large cube handler.
-        T("UGC_SUPERSPADE_TOOL", 45): (
-            T("UGC_SUPERSPADE_DAMAGE", 29), 7.5, DIG_SINGLE
-        ),
-    }
-
-
-MELEE_DIG_PROFILES = _build_melee_profiles()
-DEFAULT_MELEE_PROFILE = (2, 5.0, DIG_COLUMN)   # spade fallback
-
 # PlaySound(23) is needed for every observer, including the actor.  The retail
 # tool source plays its swing/miss cue immediately, but neither that prediction
 # nor Damage(37) reliably produces the successful block-impact sample.  Values
@@ -163,23 +114,6 @@ _BLOCK_HIT_SOUND_BY_DAMAGE = {
     # in PlaySound(23).
     int(getattr(C, "MACHETE_DAMAGE", 35)): 35,
 }
-
-
-def _melee_dig_positions(block_pos, pattern):
-    """Return the exact retail voxel footprint centered on ``block_pos``."""
-    x, y, z = (int(value) for value in block_pos)
-    if pattern == DIG_CUBE:
-        return [
-            (x + dx, y + dy, z + dz)
-            for dx in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-            for dz in (-1, 0, 1)
-        ]
-    if pattern == DIG_COLUMN:
-        return [(x, y, z - 1), (x, y, z), (x, y, z + 1)]
-    if pattern == DIG_MACHETE:
-        return [(x, y, z), (x, y, z + 1)]
-    return [(x, y, z)]
 
 
 def get_combat_system(server):
@@ -435,16 +369,19 @@ class CombatSystem:
     # to accept FLOATING placements the client silently drops. The server then
     # held blocks no client had: builds "didn't appear", the builder lost
     # inventory for nothing, and the server carried collision where every client
-    # saw air (a server-side "invisible wall"). Mirror the client's rule exactly.
+    # saw air (a server-side "invisible wall"). Layer 0 is additionally reserved
+    # as sky: standing on a z=0 block makes the stock movement contact solver
+    # rise and alternate airborne/grounded forever.
     _NEIGHBOR_OFFSETS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
-    MAX_MODIFIABLE_Z = 238
+    # Retain the old public class attribute for plugins/embedders.
+    MAX_MODIFIABLE_Z = MAX_BUILD_Z
 
     def _block_supported(self, x: int, y: int, z: int, pending=()) -> bool:
         """Client-parity placement gate: the cell must FACE-touch an existing
         solid, or a cell committed earlier in this same line (the client's
         add_block loop walks the generated points in order, so a later cell may
         rest on an earlier one)."""
-        if not (0 <= z <= self.MAX_MODIFIABLE_Z):
+        if not build_z_is_safe(z):
             return False
         wm = self.server.world_manager
         for dx, dy, dz in self._NEIGHBOR_OFFSETS:

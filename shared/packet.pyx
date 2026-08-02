@@ -3462,8 +3462,9 @@ cdef class WorldUpdate(Loader): # Fixed
 
             # STATE bitfield byte (NOT the tool id!). MEASURED: the compiled
             # client bit-splits this byte into per-player display state —
-            # 0x01=parachute_active, 0x02=disguise_active, 0x08=touching_goo
-            # (in-water look). It writes NOTHING to the equipped tool from
+            # 0x01=parachute_active, 0x02=disguise_active,
+            # 0x04=UGC jetpack hover, 0x08=touching_goo (in-water look). It
+            # writes NOTHING to the equipped tool from
             # here (the weapon comes from CreatePlayer/loadout). The old code
             # wrote the raw tool id here, so switching weapons set these bits
             # as a side effect of the id's binary value (tool 1 -> parachute,
