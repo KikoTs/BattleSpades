@@ -108,6 +108,7 @@ class MapSnapshot:
     changed_cells: tuple[VoxelChange, ...] = ()
     compressed_vxl: bytes = b""
     raw_vxl_size: int = 0
+    map_directory: str = ""
 
 
 @dataclass(frozen=True, slots=True)

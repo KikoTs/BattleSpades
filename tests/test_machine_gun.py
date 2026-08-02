@@ -188,3 +188,21 @@ def test_machine_gun_health_destruction_uses_recovered_blast_and_despawns():
     assert kwargs["blast_radius"] == float(C.MG_EXPLOSION_RADIUS)
     assert kwargs["knockback_min"] == float(C.MG_EXPLOSION_KNOCKBACK_MIN)
     assert kwargs["knockback_max"] == float(C.MG_EXPLOSION_KNOCKBACK_MAX)
+
+
+def test_machine_gun_support_loss_unmounts_explodes_and_despawns():
+    server, player, _ = _server_player()
+    _place(server, player)
+    gun = server.entity_registry.all()[0]
+    blasts = []
+    server._apply_blast = lambda *args, **kwargs: blasts.append((args, kwargs))
+    assert gun.support_cell == (101, 100, 62)
+    assert gun.behavior.mount(gun, player, server) is True
+
+    assert server.world_manager.destroy_blocks([gun.support_cell]) == [
+        (101, 100, 62)
+    ]
+
+    assert server.entity_registry.get(gun.entity_id) is None
+    assert player.mounted_entity_id is None
+    assert len(blasts) == 1

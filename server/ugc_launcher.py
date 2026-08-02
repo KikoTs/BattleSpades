@@ -15,7 +15,13 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 release fallback
 
 import toml
 
-from server.launcher import _emit_check_report, _parse_port, _run_server, _select_config
+from server.launcher import (
+    _configure_console_encoding,
+    _emit_check_report,
+    _parse_port,
+    _run_server,
+    _select_config,
+)
 from server.release_check import CheckItem, CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, read_version
 from server.ugc_project import (
@@ -458,6 +464,7 @@ def run(
     """Dispatch Map Creator start/version/check without changing run_server."""
 
     multiprocessing.freeze_support()
+    _configure_console_encoding()
     try:
         arguments = build_parser().parse_args(argv)
     except SystemExit as exc:

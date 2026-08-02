@@ -60,6 +60,7 @@ async def run_capacity(
     *,
     mode: str = "tdm",
     map_name: str | None = None,
+    bots_enabled: bool = True,
 ) -> dict:
     import psutil
 
@@ -69,10 +70,10 @@ async def run_capacity(
     config.max_connections = max(config.max_players + 8, 64)
     config.bot_count = 0
     config.bots.configured = True
-    config.bots.enabled = True
+    config.bots.enabled = bool(bots_enabled)
     config.bots.population_mode = "fixed"
-    config.bots.fill_target = players
-    config.bots.max_bots = players
+    config.bots.fill_target = players if bots_enabled else 0
+    config.bots.max_bots = players if bots_enabled else 0
     config.bots.reserve_human_slots = 0
     config.default_mode = str(mode).strip().lower()
     if map_name:
@@ -123,6 +124,10 @@ async def run_capacity(
             synthetic.append(connection)
             server.connections[SyntheticPeer()] = connection
 
+        # Server readiness includes map decoding, bot creation, and AI cold
+        # start. CPU/RSS/tick counts below measure only the requested steady
+        # workload window; timing percentiles must use that same boundary.
+        server.metrics.reset_timing_samples()
         start_loop = server.loop_count
         start_cpu = time.process_time()
         start_wall = time.perf_counter()
@@ -167,6 +172,9 @@ async def run_capacity(
         result = {
             "mode": config.default_mode,
             "map": config.default_map,
+            "bot_worker": (
+                str(config.bots.worker) if bots_enabled else "disabled"
+            ),
             "requested_players": players,
             "spawned_players": spawned,
             "seconds": round(elapsed, 3),
@@ -174,12 +182,18 @@ async def run_capacity(
             "achieved_tick_hz": round(ticks / elapsed, 3),
             "process_cpu_cores": round(cpu_seconds / elapsed, 3),
             "worker_cpu_cores": round(worker_cpu_seconds / elapsed, 3),
+            "total_cpu_cores": round(
+                (cpu_seconds + worker_cpu_seconds) / elapsed, 3
+            ),
             "worker_memory_end_mib": round(worker_end_rss / (1024 * 1024), 3),
             "worker_memory_peak_mib": round(worker_peak_rss / (1024 * 1024), 3),
             "outbound_packets": total_packets,
             "memory_start_mib": round(start_rss / (1024 * 1024), 3),
             "memory_end_mib": round(end_rss / (1024 * 1024), 3),
             "memory_peak_mib": round(peak_rss / (1024 * 1024), 3),
+            "total_memory_peak_mib": round(
+                (peak_rss + worker_peak_rss) / (1024 * 1024), 3
+            ),
             "memory_growth_mib": round(
                 (end_rss - start_rss) / (1024 * 1024), 3
             ),
@@ -250,6 +264,11 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=27016)
     parser.add_argument("--mode", default="tdm")
     parser.add_argument("--map", dest="map_name", default=None)
+    parser.add_argument(
+        "--disable-bots",
+        action="store_true",
+        help="measure the same server/map without starting the bot runtime",
+    )
     args = parser.parse_args(argv)
     result = asyncio.run(run_capacity(
         args.players,
@@ -257,6 +276,7 @@ def main(argv=None) -> int:
         args.port,
         mode=args.mode,
         map_name=args.map_name,
+        bots_enabled=not args.disable_bots,
     ))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["passed"] else 1

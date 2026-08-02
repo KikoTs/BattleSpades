@@ -1,0 +1,34 @@
+# Launch with:
+#   BattleSpades.exe --fleet fleet.toml
+#   py -3.12 run_server.py --fleet fleet.toml
+#
+# Config paths are resolved beside this manifest. Ports are also read from
+# each config; an optional `port = ...` here can override them per instance.
+
+[fleet]
+shutdown_timeout_seconds = 10
+
+[[instances]]
+name = "Official TDM"
+config = "configs/official-tdm.toml"
+enabled = true
+
+[[instances]]
+name = "Official CTF"
+config = "configs/official-ctf.toml"
+enabled = true
+
+[[instances]]
+name = "Official Classic CTF"
+config = "configs/official-cctf.toml"
+enabled = true
+
+[[instances]]
+name = "Official Zombie"
+config = "configs/official-zombie.toml"
+enabled = true
+
+[[instances]]
+name = "Official VIP"
+config = "configs/official-vip.toml"
+enabled = false

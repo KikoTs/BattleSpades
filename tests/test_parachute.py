@@ -1,5 +1,7 @@
 """Commando parachute loadout, activation, replication, and native physics."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from aoslib.world import Player as WorldPlayer
@@ -53,6 +55,20 @@ def test_parachute_deploys_from_airborne_z_hover_press():
     player.update_action_input(False, False, hover=True)
     player._update_parachute()
     assert player.parachute_active is True
+
+    # The shared Z input opens the chute but is not the UGC Builder hover
+    # state.  Passing it through would skip gravity instead of applying the
+    # parachute's recovered 0.05 gravity multiplier.
+    world = SimpleNamespace(
+        set_walk=lambda *args: None,
+        set_crouch=lambda *args: None,
+    )
+    player._apply_input_state_to_world(
+        trigger_jump=False,
+        world_object=world,
+        collisions=[],
+    )
+    assert world.hover is False
 
     # Holding Z keeps it open without retriggering; landing closes it.
     player._update_parachute()

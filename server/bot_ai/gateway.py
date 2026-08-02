@@ -61,7 +61,7 @@ class BotActionGateway:
         self.server = server
 
     def execute(self, player: "Player", action: BotAction) -> bool:
-        """Execute one validated action, returning whether it was accepted."""
+        """Execute one action; domain rejections and errors fail closed."""
 
         if not bool(getattr(player, "is_bot", False)):
             return False
@@ -69,6 +69,24 @@ class BotActionGateway:
             getattr(player, "spawned", False)
         ):
             return False
+        try:
+            return self._execute_validated(player, action)
+        except Exception:
+            # A bot is an untrusted action producer even though it runs inside
+            # the server process.  A stale nullable owner slot, exhausted
+            # entity registry, or future service-contract bug must reject this
+            # one action instead of terminating SimulationRuntime.
+            logger.exception(
+                "Bot action failed closed: player=%s kind=%s tool=%s",
+                getattr(player, "id", "?"),
+                getattr(getattr(action, "kind", None), "value", "unknown"),
+                getattr(action, "tool_id", -1),
+            )
+            return False
+
+    def _execute_validated(self, player: "Player", action: BotAction) -> bool:
+        """Dispatch an already-authorized live bot action to domain services."""
+
         if action.kind is BotActionKind.NONE:
             return False
         if action.kind is BotActionKind.FIRE:
@@ -253,7 +271,8 @@ class BotActionGateway:
         if tool == int(C.RADAR_STATION_TOOL):
             return bool(service.place_radar(player, position))
         if tool == int(C.MEDPACK_TOOL):
-            return bool(service.place_medpack(player, position, face=action.face))
+            face = int(action.face) if 0 <= int(action.face) <= 5 else 4
+            return bool(service.place_medpack(player, position, face=face))
         if tool == int(C.MG_TOOL):
             return bool(service.place_machine_gun(player, position, yaw=action.yaw))
         if tool == int(C.ROCKET_TURRET_TOOL):
@@ -352,8 +371,14 @@ class BotActionGateway:
                 return False
         return True
 
-    def _oriented_launch_safe(self, player: "Player", direction, spec) -> bool:
-        """Revalidate the live muzzle lane before launching an explosive."""
+    def _oriented_launch_safe(
+        self,
+        player: "Player",
+        direction,
+        spec,
+        target=None,
+    ) -> bool:
+        """Revalidate the live muzzle lane and optional direct target ray."""
 
         eye = tuple(float(value) for value in player.eye)
         radius = max(0.0, float(getattr(spec, "blast_radius", 0.0) or 0.0))
@@ -369,6 +394,38 @@ class BotActionGateway:
                     direction[1],
                     direction[2],
                     radius + 3.0,
+                )
+            except (TypeError, ValueError):
+                return False
+            if hit is not None:
+                return False
+
+        direct_target = None
+        if target is not None:
+            try:
+                direct_target = tuple(float(value) for value in target)
+            except (TypeError, ValueError):
+                return False
+            if len(direct_target) != 3 or not all(
+                math.isfinite(value) for value in direct_target
+            ):
+                return False
+            delta = tuple(
+                direct_target[index] - eye[index] for index in range(3)
+            )
+            distance = math.sqrt(sum(value * value for value in delta))
+            if distance <= radius + 3.0 or not callable(raycast):
+                return False
+            target_direction = tuple(value / distance for value in delta)
+            try:
+                hit = raycast(
+                    eye[0],
+                    eye[1],
+                    eye[2],
+                    target_direction[0],
+                    target_direction[1],
+                    target_direction[2],
+                    max(0.0, distance - 1.0),
                 )
             except (TypeError, ValueError):
                 return False
@@ -407,6 +464,15 @@ class BotActionGateway:
             )
             if lateral <= 1.75:
                 return False
+            if (
+                direct_target is not None
+                and sum(
+                    (teammate_eye[index] - direct_target[index]) ** 2
+                    for index in range(3)
+                )
+                <= (radius + 1.5) ** 2
+            ):
+                return False
         return True
 
     def oriented(self, player: "Player", action: BotAction) -> bool:
@@ -421,9 +487,19 @@ class BotActionGateway:
         from server.projectiles import PROJECTILE_SPECS
 
         spec = PROJECTILE_SPECS.get(tool)
+        direct_target = (
+            action.end_position
+            if tool in {int(C.RPG_TOOL), int(C.RPG2_TOOL)}
+            else None
+        )
         if (
             spec is None
-            or not self._oriented_launch_safe(player, direction, spec)
+            or not self._oriented_launch_safe(
+                player,
+                direction,
+                spec,
+                direct_target,
+            )
             or not self.select_tool(player, tool)
         ):
             return False

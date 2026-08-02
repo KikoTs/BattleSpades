@@ -20,6 +20,7 @@ from shared.packet import (
 
 from server import prefabs
 from server.audio import SND_PREFAB_BUILD, play_sound
+from server.game_constants import MAX_BUILD_Z, MIN_BUILD_Z, build_z_is_safe
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -234,10 +235,23 @@ class PrefabActionService:
             return False
 
         world = self.server.world_manager
+        # Reject rather than clip a prefab that reaches the reserved sky layer.
+        # Competitive prefabs would otherwise create the same unstable platform
+        # as ordinary blocks; native UGC packet 30 would also make clients expand
+        # a z=0 voxel that the authoritative server had silently omitted.
+        if any(
+            0 <= int(x) < 512
+            and 0 <= int(y) < 512
+            and int(z) == 0
+            for (x, y, z), _rgb in cells
+        ):
+            return False
         in_world = [
             ((int(x), int(y), int(z)), tuple(int(component) & 0xFF for component in rgb))
             for (x, y, z), rgb in cells
-            if 0 <= int(x) < 512 and 0 <= int(y) < 512 and 0 <= int(z) <= 238
+            if 0 <= int(x) < 512
+            and 0 <= int(y) < 512
+            and build_z_is_safe(int(z))
         ]
         if not in_world or not prefabs.touches_world(world, in_world):
             return False
@@ -511,9 +525,14 @@ class PrefabActionService:
             if not (
                 0 <= coordinate[0] < 512
                 and 0 <= coordinate[1] < 512
-                and 0 <= coordinate[2] <= 238
+                and 0 <= coordinate[2] <= MAX_BUILD_Z
             ):
                 continue
+            if not snapshot.erase and coordinate[2] < MIN_BUILD_Z:
+                # BuildPrefabAction is echoed as one native model range.  A
+                # partial filter would desynchronise every client, so reject
+                # the complete build by returning no prepared cells.
+                return deque(), model_block_count
             color = None if snapshot.erase else (
                 int(red) & 0xFF,
                 int(green) & 0xFF,
@@ -983,7 +1002,7 @@ class PrefabActionService:
         except (AttributeError, RuntimeError, TypeError, ValueError):
             return None
         z = surface_z - int(max_z) - 1
-        if not 0 <= z <= 238:
+        if not build_z_is_safe(z):
             return None
         return anchor[0], anchor[1], z
 
@@ -1027,6 +1046,8 @@ class PrefabActionService:
         """Commit and replicate one cell from an already validated footprint."""
 
         x, y, z = coordinate
+        if not build_z_is_safe(z):
+            return False
         try:
             if not self.server.world_manager.set_block(
                 x, y, z, solid=True, color=color

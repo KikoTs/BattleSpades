@@ -24,7 +24,7 @@ ROCKET_TURRET_TRACKING_RANGE = float(getattr(C, "ROCKET_TURRET_TRACKING_RANGE", 
 ROCKET_TURRET_AIMING_SPEED = float(getattr(C, "ROCKET_TURRET_AIMING_SPEED", 180.0))
 ROCKET_TURRET_TOLERANCE = float(getattr(C, "ROCKET_TURRET_TOLERANCE", 0.1))
 ROCKET_TURRET_SHOOT_INTERVAL = float(getattr(C, "ROCKET_TURRET_SHOOT_INTERVAL", 1.5))
-ROCKET_TURRET_ROCKET_SPEED = 75.0
+ROCKET_TURRET_ROCKET_SPEED = float(getattr(C, "ROCKET_SPEED", 75.0))
 
 ROCKET_TURRET_ROCKET_SPEC = ProjectileSpec(
     "rocket_turret_rocket",
@@ -96,6 +96,17 @@ class RocketTurretBehavior(EntityBehavior):
         if turret.health > 0.0:
             return
 
+        self._destroy(ent, source)
+
+    def on_support_lost(self, ent, ctx) -> None:
+        self._destroy(ent, None)
+
+    def _destroy(self, ent, source) -> None:
+        """Run the stock turret destruction blast and retire its controller."""
+
+        if not ent.alive:
+            return
+
         # Mark dead before applying the stock 100/15 destruction blast so it
         # cannot recursively damage itself through the registry snapshot.
         ent.alive = False
@@ -121,7 +132,14 @@ class RocketTurretController:
     def __init__(self, server):
         self.server = server
 
-    def place(self, player, position, yaw: float, now: float = 0.0):
+    def place(
+        self,
+        player,
+        position,
+        yaw: float,
+        now: float = 0.0,
+        support_cell: tuple[int, int, int] | None = None,
+    ):
         if int(getattr(player, "rocket_turret_stock", 0)) <= 0:
             return None
         x, y, z = (float(v) for v in position)
@@ -130,6 +148,7 @@ class RocketTurretController:
             state=internal_team_to_wire(player.team),
             kind="rocket_turret", player_id=player.id,
             behavior=RocketTurretBehavior(self),
+            support_cell=support_cell,
         )
         turret = RocketTurret(
             entity_id=ent.entity_id,
@@ -160,7 +179,11 @@ class RocketTurretController:
             if target is None:
                 continue
 
-            dx, dy, dz = target.x - turret.x, target.y - turret.y, target.z - turret.z
+            origin = self._aim_origin(turret)
+            target_point = self._target_point(target)
+            dx = target_point[0] - origin[0]
+            dy = target_point[1] - origin[1]
+            dz = target_point[2] - origin[2]
             horizontal = math.hypot(dx, dy)
             desired_yaw = math.degrees(math.atan2(dx, dy))
             desired_pitch = max(-30.0, min(90.0, -math.degrees(math.atan2(dz, horizontal))))
@@ -219,22 +242,33 @@ class RocketTurretController:
     def _valid_target(self, turret, player, radius: float) -> bool:
         if player is None or not player.alive or not player.spawned or player.team == turret.team:
             return False
-        distance_sq = ((player.x - turret.x) ** 2 + (player.y - turret.y) ** 2 +
-                       (player.z - turret.z) ** 2)
+        origin = self._aim_origin(turret)
+        target = self._target_point(player)
+        distance_sq = sum(
+            (target[index] - origin[index]) ** 2 for index in range(3)
+        )
         if distance_sq > radius * radius:
             return False
         blocked = getattr(self.server, "_blocked_los", None)
         return blocked is None or not blocked(
-            turret.x, turret.y, turret.z, player.x, player.y, player.z
+            origin[0], origin[1], origin[2],
+            target[0], target[1], target[2],
         )
 
     def _fire(self, turret: RocketTurret, target, now: float) -> None:
-        dx, dy, dz = target.x - turret.x, target.y - turret.y, target.z - turret.z
+        origin = self._aim_origin(turret)
+        target_point = self._target_point(target)
+        dx = target_point[0] - origin[0]
+        dy = target_point[1] - origin[1]
+        dz = target_point[2] - origin[2]
         length = math.sqrt(dx * dx + dy * dy + dz * dz)
         if length <= 1e-6:
             return
         direction = (dx / length, dy / length, dz / length)
-        pos = (turret.x + direction[0], turret.y + direction[1], turret.z + direction[2])
+        # Spawn one block along the barrel direction. Starting at the packet's
+        # supporting voxel made level rockets intersect the floor/turret before
+        # their first authoritative contact step.
+        pos = tuple(origin[index] + direction[index] for index in range(3))
         vel = tuple(component * ROCKET_TURRET_ROCKET_SPEED for component in direction)
         projectile = self.server.projectile_engine.spawn_spec(
             ROCKET_TURRET_ROCKET_SPEC, pos, vel, turret.owner_id, now=now)
@@ -245,6 +279,36 @@ class RocketTurretController:
         turret.ammo -= 1
         turret.next_shot_at = now + ROCKET_TURRET_SHOOT_INTERVAL
         self._broadcast_properties(turret)
+
+    @staticmethod
+    def _target_point(player) -> tuple[float, float, float]:
+        """Aim at the replicated eye/character origin used by stock movement."""
+
+        eye = getattr(player, "eye", None)
+        if eye is not None:
+            try:
+                return tuple(float(value) for value in eye)
+            except (TypeError, ValueError):
+                pass
+        return (float(player.x), float(player.y), float(player.z))
+
+    @staticmethod
+    def _aim_origin(turret: RocketTurret) -> tuple[float, float, float]:
+        """Return the rendered gun pivot recovered from RocketTurret.set_position.
+
+        The client shifts packet X/Y by -0.5 and, for an upward-facing entity,
+        places the gun at ``z - (0.5 - GUN_MODEL_OFFSET_Z)``. Targeting and LOS
+        must start there as well or a valid turret appears to aim/fire through
+        its own supporting block.
+        """
+
+        return (
+            float(turret.x) - 0.5,
+            float(turret.y) - 0.5,
+            float(turret.z) - (
+                0.5 - float(C.ROCKET_TURRET_GUN_MODEL_OFFSET_Z)
+            ),
+        )
 
     def _broadcast_properties(self, turret) -> None:
         callback = getattr(self.server, "broadcast_turret_properties", None)

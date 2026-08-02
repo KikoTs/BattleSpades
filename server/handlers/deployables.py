@@ -55,6 +55,7 @@ async def handle_place_flare_block(server, player, packet):
         return
 
     import shared.constants as C
+    from server.game_constants import build_z_is_safe
     from server.game_rules import get_rules
     tool = int(C.FLAREBLOCK_TOOL)
     if not get_rules(server.config).enabled("RULE_ENABLE_FLARE_BLOCKS"):
@@ -74,7 +75,7 @@ async def handle_place_flare_block(server, player, packet):
     cell = tuple(int(value) for value in pos)
     x, y, z = cell
     if not (0 <= x < int(C.MAP_X) and 0 <= y < int(C.MAP_Y)
-            and 0 <= z <= int(C.Z_ABOVE_WATERPLANE)):
+            and build_z_is_safe(z)):
         return
 
     registry = server.entity_registry

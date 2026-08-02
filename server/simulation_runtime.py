@@ -94,6 +94,10 @@ class SimulationRuntime:
             await self._measure_async(
                 "bots", lambda: server.bots.update(server.tick_interval)
             )
+            self._measure_sync(
+                "bot_actions",
+                lambda: server.bots.drain_actions(limit=1),
+            )
 
         # Stock GameScene processes incoming Damage(37) before the frame's
         # scene/Character physics (gameScene.pyd update core 0x10149CF0;
@@ -128,6 +132,13 @@ class SimulationRuntime:
                 ),
             ),
         )
+        corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
+        tick_corpses = getattr(corpse_lifecycle, "tick", None)
+        if callable(tick_corpses):
+            self._measure_sync(
+                "corpses",
+                lambda: tick_corpses(server.tick_interval),
+            )
         await self._measure_async("respawns", server._process_respawns)
         def _tick_entities() -> None:
             skipped = server.entity_registry.tick(

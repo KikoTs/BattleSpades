@@ -86,6 +86,17 @@ def test_reservations_expire_without_background_work():
     assert service.active_count == 0
 
 
+def test_construction_reservation_rejects_the_reserved_sky_layer():
+    server = _server()
+
+    token, reason = server.construction.reserve_construction(
+        1, TEAM1, ((30, 30, 0),)
+    )
+
+    assert token is None
+    assert reason == "empty or oversized footprint"
+
+
 def test_construction_rejects_a_living_player_body_overlap():
     server = _server()
     builder = SimpleNamespace(
@@ -174,6 +185,49 @@ def test_prefab_service_uses_colored_observer_and_plain_owner_paths(monkeypatch)
     assert len(placement_sounds) == 1
     assert placement_sounds[0].sound_id == 32
     assert [payload[0] for payload in sent] == [32, 29]
+
+
+def test_prefab_rejects_a_footprint_reaching_the_reserved_sky_layer(monkeypatch):
+    world = _World(solids={(10, 10, 1)})
+    server = _server(world)
+    sent = []
+    player = SimpleNamespace(
+        id=5,
+        name="Builder",
+        team=TEAM1,
+        alive=True,
+        spawned=True,
+        loadout=[int(C.PREFAB_TOOL)],
+        tool=int(C.PREFAB_TOOL),
+        tool_is_raw=True,
+        class_id=int(C.CLASS_SOLDIER),
+        prefabs=["prefab_test"],
+        blocks=10,
+        send=lambda data, **kwargs: sent.append(bytes(data)),
+    )
+    monkeypatch.setattr(prefabs, "prefab_allowed", lambda _player, _name: True)
+    monkeypatch.setattr(
+        prefabs,
+        "get_registry",
+        lambda: SimpleNamespace(get=lambda _name: object()),
+    )
+    monkeypatch.setattr(
+        prefabs,
+        "expand_prefab",
+        lambda *_args, **_kwargs: [((10, 10, 0), (10, 20, 30))],
+    )
+
+    accepted = PrefabActionService(server).place(
+        player,
+        name="prefab_test",
+        position=(10, 10, 0),
+    )
+
+    assert accepted is False
+    assert player.blocks == 10
+    assert not world.get_solid(10, 10, 0)
+    assert sent == []
+    assert server.broadcasts == []
 
 
 def test_bot_gateway_routes_prefab_to_shared_service():

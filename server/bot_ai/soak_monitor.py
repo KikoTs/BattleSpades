@@ -225,8 +225,10 @@ class BotSoakMonitor:
             enemy = self._nearest_living_enemy(observer, players)
             if enemy is not None:
                 distance = self._distance(observer.position, enemy.position)
-                if distance <= self.threat_distance and not self._is_zombie_climb(
-                    observer, enemy, intent
+                if (
+                    distance <= self.threat_distance
+                    and not self._is_zombie_climb(observer, enemy, intent)
+                    and not self._is_committed_escape_build(intent)
                 ):
                     self._priority_violations += 1
 
@@ -304,6 +306,19 @@ class BotSoakMonitor:
             int(observer.class_id) == int(C.CLASS_ZOMBIE)
             and intent.debug_role in {"zombie_build_climb", "zombie_hunt_breach"}
             and enemy.position[2] < observer.position[2] - 2.5
+        )
+
+    @staticmethod
+    def _is_committed_escape_build(intent: BotIntent) -> bool:
+        """Permit the airborne placement phase of an existing escape step."""
+
+        return (
+            intent.debug_role in {
+                "hole_jump_build_place",
+                "water_bank_build_step",
+            }
+            and intent.action.kind is BotActionKind.BUILD
+            and intent.movement.affordance is MovementAffordance.BUILD_STEP
         )
 
     @staticmethod

@@ -1365,6 +1365,36 @@ def test_rejected_predicted_build_is_queued_for_canonical_repair():
     assert player.blocks == 5
 
 
+def test_block_line_rejects_layer_zero_without_spending_inventory():
+    """The retail mover cannot stand or jump reliably on a z=0 voxel."""
+
+    server = DummyServer()
+    repaired = []
+    server.terrain_repair = SimpleNamespace(
+        record_cells=lambda cells: repaired.extend(tuple(cells))
+    )
+    player, _connection = make_player(
+        server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 3.0)
+    )
+    player.set_tool(C.BLOCK_TOOL)
+    player.blocks = 5
+    # z=1 provides valid face support, isolating the sky-ceiling rejection.
+    server.world_manager.set_block(101, 100, 1, True, TEST_COLOR)
+    server.world_manager.set_block(102, 100, 1, True, TEST_COLOR)
+
+    packet = BlockLine()
+    packet.loop_count = 1
+    packet.player_id = player.id
+    packet.x1, packet.y1, packet.z1 = (101, 100, 0)
+    packet.x2, packet.y2, packet.z2 = (102, 100, 0)
+
+    assert get_combat_system(server).handle_block_line(player, packet) is False
+    assert player.blocks == 5
+    assert not server.world_manager.get_solid(101, 100, 0)
+    assert not server.world_manager.get_solid(102, 100, 0)
+    assert repaired == [(101, 100, 0), (102, 100, 0)]
+
+
 def test_block_build_waits_for_its_originating_movement_loop():
     from server.metrics import RuntimeMetrics
     from server.world_mutations import WorldMutationService

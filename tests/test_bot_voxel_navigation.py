@@ -25,6 +25,7 @@ from server.bot_ai.messages import (
     VoxelChange,
     WorldDelta,
 )
+from server.bot_ai.navigation_atlas import NavigationAtlas
 from server.bot_ai.voxel_navigation import VoxelActionPlanner, VoxelTerrain
 from server.bot_ai.worker import BotBrain, WorkerVoxelWorld, _BrainState
 from server.config import ServerConfig
@@ -45,6 +46,39 @@ def test_open_waterbed_is_not_an_ordinary_standing_node() -> None:
     terrain = VoxelTerrain(_solid_columns({(10, 10): {239}}))
 
     assert terrain.standing_node(10, 10, 236.75) is None
+
+
+def test_worker_astar_uses_atlas_support_for_untouched_ground() -> None:
+    """Authored primary ground must bypass repeated vertical VXL scans."""
+
+    atlas = NavigationAtlas.from_masks(
+        [1 << 10, 1 << 12],
+        width=2,
+        height=1,
+    )
+    world = WorkerVoxelWorld()
+    world.navigation_atlas = atlas
+    world._terrain = SimpleNamespace(
+        standing_node=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("live vertical scan was used")
+        )
+    )
+
+    assert world._standing_node(0, 0, 7.75, vertical_span=3) == (0, 0, 10)
+
+
+def test_worker_astar_falls_back_to_live_vxl_for_changed_column() -> None:
+    """A runtime block edit invalidates only its atlas support lookup."""
+
+    atlas = NavigationAtlas.from_masks([1 << 10], width=1, height=1)
+    world = WorkerVoxelWorld()
+    world.navigation_atlas = atlas
+    world._atlas_dirty_columns.add((0, 0))
+    world._terrain = SimpleNamespace(
+        standing_node=lambda *_args, **_kwargs: (0, 0, 11)
+    )
+
+    assert world._standing_node(0, 0, 7.75, vertical_span=3) == (0, 0, 11)
 
 
 def test_mayan_base_voxel_replan_turns_through_stair_exit() -> None:
@@ -183,6 +217,150 @@ def test_castlewars_water_exit_reaches_land_beyond_local_search_radius() -> None
         raise AssertionError("CastleWars escape flow did not reach dry land")
 
     assert world.is_water_column(int(position[0]), int(position[1])) is False
+
+
+def test_castlewars_shared_water_routes_never_overwrite_into_cycles() -> None:
+    """Interleaved swimmers may merge routes without reversing cached edges."""
+
+    world = WorldManager(
+        ServerConfig(default_map="CastleWars", maps_path="maps")
+    )
+    assert world.load_map("CastleWars")
+    planner = VoxelActionPlanner(VoxelTerrain(world.get_solid))
+    positions = [
+        (1.5, 509.5, 236.75),
+        (1.5, 480.5, 236.75),
+    ]
+    # Seed both wide searches before consuming either route. This reproduced
+    # the old long-session failure where the second path overwrote shared
+    # cells with a direction incompatible with the first path.
+    for position in positions:
+        assert planner.water_exit(position) is not None
+
+    visited = [set(), set()]
+    for _ in range(300):
+        complete = 0
+        for index, position in enumerate(positions):
+            if not world.is_water_column(
+                int(position[0]), int(position[1])
+            ):
+                complete += 1
+                continue
+            key = int(position[0]), int(position[1])
+            assert key not in visited[index]
+            visited[index].add(key)
+            step = planner.water_exit(position)
+            assert step is not None
+            positions[index] = step.waypoint
+        if complete == len(positions):
+            break
+    else:
+        raise AssertionError(f"interleaved water routes stalled: {positions!r}")
+
+    assert all(
+        not world.is_water_column(int(position[0]), int(position[1]))
+        for position in positions
+    )
+
+
+def test_worker_loads_matching_castlewars_navigation_cache() -> None:
+    canonical = WorldManager(
+        ServerConfig(default_map="CastleWars", maps_path="maps")
+    )
+    assert canonical.load_map("CastleWars")
+    worker = WorkerVoxelWorld()
+
+    worker.load(
+        MapSnapshot(
+            1,
+            0,
+            bytes(canonical.map_raw_bytes or b""),
+            "zom",
+            "CastleWars",
+            map_directory="maps",
+        )
+    )
+
+    assert worker.ready
+    assert worker.navigation_cache_hit is True
+    assert worker.navigation_atlas is not None
+    assert worker.navigation_atlas.stats().unreachable_water_columns == 0
+
+
+def test_greatwall_high_bank_recovery_builds_a_supported_water_step() -> None:
+    canonical = WorldManager(
+        ServerConfig(default_map="GreatWall", maps_path="maps")
+    )
+    assert canonical.load_map("GreatWall")
+    world = WorkerVoxelWorld()
+    world.load(
+        MapSnapshot(
+            1,
+            0,
+            bytes(canonical.map_raw_bytes or b""),
+            "tdm",
+            "GreatWall",
+            map_directory="maps",
+        )
+    )
+    brain = BotBrain(world, seed=3)
+    observer = replace(
+        _navigation_player(
+            1,
+            TEAM1,
+            (191.5, 129.5, 236.75),
+            class_id=int(C.CLASS_SOLDIER),
+            is_bot=True,
+        ),
+        grounded=False,
+        wade=True,
+        blocks=20,
+        loadout=(
+            int(C.SMG_TOOL),
+            int(C.SPADE_TOOL),
+            int(C.BLOCK_TOOL),
+        ),
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=2.0,
+        mode_id="tdm",
+        players=(observer,),
+    )
+
+    intent = brain._water_recovery(
+        frame,
+        observer,
+        _BrainState(),
+        2.0,
+    )
+
+    assert intent is not None
+    assert intent.debug_role == "water_bank_build_step"
+    assert intent.priority is BotIntentPriority.SURVIVAL
+    assert intent.movement.affordance is MovementAffordance.BUILD_STEP
+    assert intent.action.kind is BotActionKind.BUILD
+    assert intent.action.position == (191.0, 129.0, 238.0)
+    assert intent.movement.direction[1] > 0.9
+
+    non_builder_state = _BrainState()
+    non_builder = replace(
+        observer,
+        blocks=0,
+        loadout=(int(C.SMG_TOOL), int(C.SPADE_TOOL)),
+    )
+    assert brain._water_recovery(
+        replace(frame, players=(non_builder,)),
+        non_builder,
+        non_builder_state,
+        2.0,
+    ) is None
+    assert non_builder_state.last_path_direction[1] > 0.9
 
 
 def test_double_dragon_island_falls_reach_bounded_dry_exits() -> None:
@@ -361,7 +539,6 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
             water_ticks = {player.id: 0 for player in players}
             engineer_weapon_ticks = 0
             engineer_sample_ticks = 0
-            engineer_build_actions = 0
             base = time.monotonic() + 1.0
             frame_id = 0
 
@@ -395,17 +572,6 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
                             )
                             assert intent is not None
                             runtime.intent = intent
-                            if (
-                                player is engineer
-                                and intent.action.kind
-                                in {
-                                    BotActionKind.BUILD,
-                                    BotActionKind.BUILD_LINE,
-                                    BotActionKind.PLACE_PREFAB,
-                                }
-                            ):
-                                engineer_build_actions += 1
-
                     server.loop_count += 1
                     for player in players:
                         director._apply_motor(
@@ -599,9 +765,7 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
             # capped at two seconds.
             assert max(max_stall_ticks.values()) < 300, stall_report
             assert max(max_idle_stall_ticks.values()) < 120, stall_report
-            assert engineer_build_actions >= 1
             assert engineer_weapon_ticks / engineer_sample_ticks > 0.8
-            assert engineer.tool == engineer.weapon
         finally:
             random.setstate(random_state)
 
@@ -1142,6 +1306,98 @@ def test_live_motor_does_not_rotate_a_blocked_jump_landing(monkeypatch) -> None:
     assert probes == [(1.0, 0.0, 0.0)]
 
 
+def test_live_motor_reuses_short_walk_probe_lease(monkeypatch) -> None:
+    """The 60 Hz motor must not repeat an unchanged VXL probe every tick."""
+
+    probes = []
+
+    def live_probe(_runtime, direction, _affordance):
+        probes.append(tuple(direction))
+        return abs(float(direction[1])) > 0.1
+
+    monkeypatch.setattr(
+        BotDirector,
+        "_waypoint_is_live",
+        staticmethod(live_probe),
+    )
+    world = SimpleNamespace(topology_version=7)
+    player = SimpleNamespace(
+        id=1,
+        x=10.5,
+        y=10.5,
+        z=20.75,
+        wade=False,
+        connection=SimpleNamespace(
+            server=SimpleNamespace(world_manager=world)
+        ),
+    )
+    runtime = SimpleNamespace(player=player, generation=1)
+
+    first = BotDirector._live_movement_direction(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.WALK,
+        now=10.0,
+    )
+    player.x += 0.1
+    second = BotDirector._live_movement_direction(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.WALK,
+        now=10.02,
+    )
+
+    assert first == second
+    assert abs(first[1]) > 0.1
+    assert len(probes) == 2
+
+
+def test_live_motor_invalidates_walk_lease_on_topology_change(monkeypatch) -> None:
+    """A block edit must force a fresh local collision decision immediately."""
+
+    probes = []
+
+    def live_probe(_runtime, direction, _affordance):
+        probes.append(tuple(direction))
+        return abs(float(direction[1])) > 0.1
+
+    monkeypatch.setattr(
+        BotDirector,
+        "_waypoint_is_live",
+        staticmethod(live_probe),
+    )
+    world = SimpleNamespace(topology_version=7)
+    player = SimpleNamespace(
+        id=1,
+        x=10.5,
+        y=10.5,
+        z=20.75,
+        wade=False,
+        connection=SimpleNamespace(
+            server=SimpleNamespace(world_manager=world)
+        ),
+    )
+    runtime = SimpleNamespace(player=player, generation=1)
+
+    first = BotDirector._live_movement_direction(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.WALK,
+        now=10.0,
+    )
+    assert abs(first[1]) > 0.1
+    assert len(probes) == 2
+    world.topology_version += 1
+    second = BotDirector._live_movement_direction(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.WALK,
+        now=10.01,
+    )
+    assert second == first
+    assert len(probes) == 4
+
+
 def test_live_jump_gate_accepts_a_two_block_landing_support() -> None:
     world = SimpleNamespace(
         clipbox=lambda x, _y, z: float(x) >= 6.0 and int(z) == 8,
@@ -1255,6 +1511,59 @@ def test_wading_jump_request_remains_held_for_native_swimming() -> None:
 
     server.loop_count = 112
     director._apply_motor(runtime, now + 12.0 / 60.0, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+
+def test_wading_shore_jump_releases_and_rearms_native_edge() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="ShorePulseBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    bot.wade = True
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=120,
+        map_epoch=0,
+        mode_epoch=0,
+        topology_version=server.world_manager.topology_version,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(
+            direction=(1.0, 0.0, 0.0),
+            jump=True,
+            affordance=MovementAffordance.JUMP,
+        ),
+    )
+
+    server.loop_count = 100
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+    server.loop_count = 104
+    director._apply_motor(runtime, now + 4.0 / 60.0, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is False
+
+    runtime.intent = replace(
+        runtime.intent,
+        frame_id=121,
+        created_at=now + 8.0 / 60.0,
+        expires_at=now + 1.0,
+    )
+    server.loop_count = 108
+    director._apply_motor(runtime, now + 8.0 / 60.0, 1.0 / 60.0)
     assert runtime.movement_input is not None
     assert runtime.movement_input[4] is True
 

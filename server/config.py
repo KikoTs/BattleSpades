@@ -58,7 +58,7 @@ class BotConfig:
     max_bots: int = 12
     reserve_human_slots: int = 2
     difficulty: str = "mixed"
-    worker: str = "process"
+    worker: str = "thread"
     perception_hz: float = 10.0
     decision_hz: float = 8.0
     path_requests_per_second: int = 24
@@ -628,8 +628,10 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         difficulty = str(b.get("difficulty", config.bots.difficulty)).lower()
         if difficulty in ("casual", "normal", "hard", "mixed"):
             config.bots.difficulty = difficulty
-        # The architecture intentionally supports only an isolated process.
-        config.bots.worker = "process"
+        worker = str(b.get("worker", config.bots.worker)).lower()
+        config.bots.worker = (
+            worker if worker in ("thread", "process") else "thread"
+        )
         config.bots.perception_hz = min(
             30.0,
             max(1.0, float(b.get("perception_hz", config.bots.perception_hz))),

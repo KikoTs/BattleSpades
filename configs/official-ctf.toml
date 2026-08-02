@@ -1,0 +1,33 @@
+[server]
+name = "AoS Revival Official CTF"
+port = 27017
+max_players = 24
+tick_rate = 60
+
+[game]
+default_mode = "ctf"
+default_map = "TokyoNeon"
+movement_authority = "server"
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 12
+max_bots = 12
+reserve_human_slots = 2
+difficulty = "mixed"
+perception_hz = 8
+decision_hz = 8
+path_requests_per_second = 24
+main_thread_budget_ms = 1.5
+
+[revival]
+enabled = false
+
+[steam]
+enabled = false
+
+[logging]
+level = "INFO"
+file = "official-ctf.log"
+console = false

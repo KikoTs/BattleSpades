@@ -17,6 +17,7 @@ from typing import Iterable
 import shared.constants as C
 
 from .messages import MovementAffordance, Vector3, VoxelCoordinate
+from .navigation_atlas import NavigationAtlas
 
 
 SolidQuery = Callable[[int, int, int], bool]
@@ -275,9 +276,26 @@ class VoxelActionPlanner:
         # swimming bot does not repeat the wide search every decision tick.
         self._water_next: dict[tuple[int, int], tuple[int, int]] = {}
         self._water_goal: dict[tuple[int, int], SurfaceSample] = {}
+        self._water_distance: dict[tuple[int, int], int] = {}
         self._water_dead_ends: set[tuple[int, int]] = set()
         self._water_route_columns: set[tuple[int, int]] = set()
         self._water_searches: dict[tuple[int, int], _WaterSearchState] = {}
+        self._navigation_atlas: NavigationAtlas | None = None
+        self._atlas_disabled: set[tuple[int, int]] = set()
+
+    def attach_navigation_atlas(
+        self, atlas: NavigationAtlas | None
+    ) -> None:
+        """Attach immutable map-wide flow and discard prior-map route state."""
+
+        self._navigation_atlas = atlas
+        self._atlas_disabled.clear()
+        self._water_next.clear()
+        self._water_goal.clear()
+        self._water_distance.clear()
+        self._water_dead_ends.clear()
+        self._water_route_columns.clear()
+        self._water_searches.clear()
 
     def invalidate_water_routes(
         self,
@@ -295,8 +313,13 @@ class VoxelActionPlanner:
 
         self._water_dead_ends.clear()
         if changed_columns is None:
+            self._atlas_disabled.clear()
             self._water_searches.clear()
         else:
+            # The atlas describes the immutable base VXL. Current and future
+            # route cells are still checked against live collision data, but a
+            # changed start column uses the dynamic search immediately.
+            self._atlas_disabled.update(changed_columns)
             # Preserve wide searches when an unrelated firefight changes a
             # distant column. A search only retains classified samples, so an
             # unvisited changed column is read canonically when reached.
@@ -310,6 +333,7 @@ class VoxelActionPlanner:
             return
         self._water_next.clear()
         self._water_goal.clear()
+        self._water_distance.clear()
         self._water_route_columns.clear()
 
     def water_exit(
@@ -342,6 +366,59 @@ class VoxelActionPlanner:
             return None
 
         start_key = start.x, start.y
+        atlas = self._navigation_atlas
+        if atlas is not None and start_key not in self._atlas_disabled:
+            route = atlas.water_route(start.x, start.y)
+            if route is not None:
+                # The atlas also routes otherwise inescapable water components
+                # to a deterministic high bank. Stop at its final water cell;
+                # the worker's normal bounded jump/build recovery owns the
+                # physical climb and may never receive a fictitious jump edge.
+                if route.distance == 1 and not route.climbable:
+                    return None
+                next_key = route.next_x, route.next_y
+                goal_key = route.goal_x, route.goal_y
+                next_sample = self.terrain.classify(
+                    route.next_x,
+                    route.next_y,
+                    start.player_position[2],
+                    allow_water=True,
+                    vertical_span=3,
+                )
+                goal_sample = self.terrain.classify(
+                    route.goal_x,
+                    route.goal_y,
+                    float(route.goal_support_z) - PLAYER_STANDING_OFFSET,
+                    allow_water=False,
+                    vertical_span=1,
+                )
+                next_is_expected = (
+                    next_sample is not None
+                    and abs(next_sample.support_z - start.support_z) <= 2
+                    and (
+                        (route.distance > 1 and next_sample.water)
+                        or (route.distance == 1 and not next_sample.water)
+                    )
+                )
+                goal_is_expected = (
+                    goal_sample is not None
+                    and not goal_sample.water
+                    and goal_sample.support_z == route.goal_support_z
+                )
+                if (
+                    next_key not in self._atlas_disabled
+                    and goal_key not in self._atlas_disabled
+                    and next_is_expected
+                    and goal_is_expected
+                ):
+                    return self._water_step(
+                        position, next_sample, goal_sample
+                    )
+            # A topology edit may invalidate an upstream atlas edge without
+            # touching this exact column. Fall back to live bounded search for
+            # this start instead of repeatedly retrying stale metadata.
+            self._atlas_disabled.add(start_key)
+
         cached_next = self._water_next.get(start_key)
         cached_goal = self._water_goal.get(start_key)
         if cached_next is not None and cached_goal is not None:
@@ -358,7 +435,9 @@ class VoxelActionPlanner:
                 )
             # A caller using a mutable terrain without explicit invalidation
             # still fails closed instead of steering into a newly blocked cell.
-            self.invalidate_water_routes()
+            self._water_next.pop(start_key, None)
+            self._water_goal.pop(start_key, None)
+            self._water_distance.pop(start_key, None)
         if start_key in self._water_dead_ends:
             return None
 
@@ -397,11 +476,29 @@ class VoxelActionPlanner:
                 path.reverse()
                 if len(path) < 2:
                     return None
-                for index, water_key in enumerate(path[:-1]):
-                    self._water_next[water_key] = path[index + 1]
-                    self._water_goal[water_key] = current
+                # Populate from shore back toward the start and retain only
+                # shorter flows. Every cached water edge therefore has a
+                # strictly decreasing distance, even when routes from many
+                # bots merge. The old unconditional writes let a later search
+                # reverse an existing shared edge and form persistent cycles.
+                for index in range(len(path) - 2, -1, -1):
+                    water_key = path[index]
+                    next_key = path[index + 1]
+                    next_distance = self._water_distance.get(next_key)
+                    distance = (
+                        next_distance + 1
+                        if next_distance is not None
+                        else len(path) - 1 - index
+                    )
+                    known_distance = self._water_distance.get(water_key)
+                    if known_distance is None or distance < known_distance:
+                        self._water_next[water_key] = next_key
+                        self._water_goal[water_key] = (
+                            self._water_goal.get(next_key, current)
+                        )
+                        self._water_distance[water_key] = distance
                     self._water_route_columns.add(water_key)
-                    self._water_route_columns.add(path[index + 1])
+                    self._water_route_columns.add(next_key)
                 self._water_route_columns.add((current.x, current.y))
                 self._water_searches.pop(start_key, None)
                 return self._water_step(
@@ -446,6 +543,68 @@ class VoxelActionPlanner:
         self._water_searches.pop(start_key, None)
         self._water_dead_ends.add(start_key)
         return None
+
+    def assisted_water_bank(
+        self,
+        position: Vector3,
+    ) -> VoxelActionStep | None:
+        """Return the adjacent high-bank hint for physical build recovery.
+
+        The returned edge is deliberately ``BUILD_STEP``, never ``JUMP``.
+        Callers may use its heading to place a supported step or breach the
+        bank, but must not treat the tall dry goal as directly traversable.
+        """
+
+        atlas = self._navigation_atlas
+        if atlas is None:
+            return None
+        start = self.terrain.classify(
+            int(math.floor(position[0])),
+            int(math.floor(position[1])),
+            float(position[2]),
+            allow_water=True,
+            vertical_span=4,
+        )
+        if start is None or not start.water:
+            return None
+        start_key = start.x, start.y
+        if start_key in self._atlas_disabled:
+            return None
+        route = atlas.water_route(start.x, start.y)
+        if route is None or route.distance != 1 or route.climbable:
+            return None
+        goal_key = route.goal_x, route.goal_y
+        if goal_key in self._atlas_disabled:
+            return None
+        goal = self.terrain.classify(
+            route.goal_x,
+            route.goal_y,
+            float(route.goal_support_z) - PLAYER_STANDING_OFFSET,
+            allow_water=False,
+            vertical_span=1,
+        )
+        if (
+            goal is None
+            or goal.water
+            or goal.support_z != route.goal_support_z
+        ):
+            self._atlas_disabled.add(start_key)
+            return None
+        dx = float(goal.x) + 0.5 - float(position[0])
+        dy = float(goal.y) + 0.5 - float(position[1])
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return None
+        return VoxelActionStep(
+            direction=(dx / length, dy / length, 0.0),
+            waypoint=goal.player_position,
+            goal=goal.player_position,
+            affordance=MovementAffordance.BUILD_STEP,
+            cells=(
+                (start.x, start.y, start.support_z),
+                (goal.x, goal.y, goal.support_z),
+            ),
+        )
 
     @staticmethod
     def _water_step(

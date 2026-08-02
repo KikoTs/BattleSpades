@@ -65,6 +65,40 @@ class DeployableActionService:
             return None
         return x, y, z
 
+    def find_support_cell(
+        self,
+        position: Vector3,
+        *,
+        search_depth: int = 4,
+    ) -> tuple[int, int, int] | None:
+        """Resolve the solid voxel supporting a retail placement coordinate.
+
+        Face-attached charges send the support voxel itself and use depth zero.
+        Floor gadgets do not share one model origin: notably the tall rocket
+        turret can send a point above its base.  A short +Z-down column search
+        recovers that base without ever accepting an object suspended over a
+        real gap.
+        """
+
+        x, y, z = (int(math.floor(float(value))) for value in position)
+        if not (
+            0 <= x < int(C.MAP_X)
+            and 0 <= y < int(C.MAP_Y)
+            and 0 <= z < int(C.MAP_Z)
+        ):
+            return None
+        world = getattr(self.server, "world_manager", None)
+        get_solid = getattr(world, "get_solid", None)
+        if not callable(get_solid):
+            # Lightweight controller tests may not construct a map. Production
+            # always has WorldManager, so lack of a terrain oracle is not
+            # treated as proof of unsupported placement here.
+            return (x, y, z)
+        for candidate_z in range(z, min(int(C.MAP_Z), z + search_depth + 1)):
+            if get_solid(x, y, candidate_z):
+                return (x, y, candidate_z)
+        return None
+
     def place_medpack(
         self, player: "Player", position: Vector3, *, face: int = 4
     ) -> bool:
@@ -79,6 +113,9 @@ class DeployableActionService:
         )
         if pos is None or not 0 <= int(face) <= 5:
             return False
+        support_cell = self.find_support_cell(pos)
+        if support_cell is None:
+            return False
         entity = self.server.entity_registry.place(
             int(getattr(C, "MEDPACK_ENTITY", 30)),
             *pos,
@@ -92,6 +129,7 @@ class DeployableActionService:
                 uses=int(getattr(C, "MEDPACK_USES", 3)),
                 health=float(getattr(C, "MEDPACK_HEALTH", 1.0)),
             ),
+            support_cell=support_cell,
         )
         self.server.broadcast_create_entity(entity)
         logger.info("MEDPACK id=%d placed by %s at %s", entity.entity_id, player.name, pos)
@@ -118,6 +156,9 @@ class DeployableActionService:
         )
         if pos is None:
             return False
+        support_cell = self.find_support_cell(pos, search_depth=0)
+        if support_cell is None:
+            return False
         behavior = TimedExplosiveBehavior(
             player.id,
             fuse=float(getattr(C, "DYNAMITE_EXPLOSION_FUSE", 7.0)),
@@ -136,6 +177,7 @@ class DeployableActionService:
             player_id=player.id,
             face=int(face),
             behavior=behavior,
+            support_cell=support_cell,
         )
         self.server.broadcast_create_entity(entity)
         logger.info("DYNAMITE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
@@ -152,6 +194,9 @@ class DeployableActionService:
             max_distance=float(getattr(C, "LANDMINE_FAR_RADIUS", 5.0)),
         )
         if pos is None:
+            return False
+        support_cell = self.find_support_cell(pos)
+        if support_cell is None:
             return False
         behavior = ProximityMineBehavior(
             player.id,
@@ -180,6 +225,7 @@ class DeployableActionService:
             kind="deployable",
             player_id=player.id,
             behavior=behavior,
+            support_cell=support_cell,
         )
         self.server.broadcast_create_entity(entity)
         logger.info("LANDMINE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
@@ -198,6 +244,9 @@ class DeployableActionService:
             max_distance=float(getattr(C, "C4_FAR_RADIUS", 5.0)),
         )
         if pos is None:
+            return False
+        support_cell = self.find_support_cell(pos, search_depth=0)
+        if support_cell is None:
             return False
         live_ids: list[int] = []
         for entity_id in list(getattr(player, "_c4_entity_ids", ()) or ()):
@@ -223,6 +272,7 @@ class DeployableActionService:
             player_id=player.id,
             face=int(face),
             behavior=behavior,
+            support_cell=support_cell,
         )
         live_ids.append(entity.entity_id)
         player._c4_entity_ids = live_ids
@@ -262,7 +312,15 @@ class DeployableActionService:
 
         if not deployable_authorized(player, C.RADAR_STATION_TOOL):
             return False
-        old = self.server.entity_registry.get(getattr(player, "_radar_entity_id", -1))
+        # Radar expiry and round cleanup deliberately use ``None`` to mean
+        # "no live station".  Do not coerce that nullable owner slot into an
+        # entity id; this path is hit whenever a bot replaces an expired radar.
+        old_entity_id = getattr(player, "_radar_entity_id", None)
+        old = (
+            self.server.entity_registry.get(old_entity_id)
+            if old_entity_id is not None
+            else None
+        )
         if old is not None and old.alive:
             return False
         pos = self.validate_position(
@@ -271,6 +329,9 @@ class DeployableActionService:
             max_distance=float(getattr(C, "RADAR_STATION_FAR_RADIUS", 10.0)),
         )
         if pos is None:
+            return False
+        support_cell = self.find_support_cell(pos)
+        if support_cell is None:
             return False
         lifetime = float(
             getattr(
@@ -294,6 +355,7 @@ class DeployableActionService:
                 lifetime=lifetime,
                 health=float(getattr(C, "RADAR_STATION_HEALTH", 45.0)),
             ),
+            support_cell=support_cell,
         )
         player._radar_entity_id = entity.entity_id
         self.server._radar_station_added(player.team)
@@ -315,6 +377,9 @@ class DeployableActionService:
         )
         if pos is None:
             return False
+        support_cell = self.find_support_cell(pos)
+        if support_cell is None:
+            return False
         if any(
             entity.alive
             and isinstance(entity.behavior, MachineGunBehavior)
@@ -330,6 +395,7 @@ class DeployableActionService:
             kind="machine_gun",
             player_id=0xFF,
             behavior=MachineGunBehavior(player.id, player.team),
+            support_cell=support_cell,
         )
         self.server.broadcast_create_entity(entity)
         logger.info(
@@ -357,8 +423,15 @@ class DeployableActionService:
         )
         if pos is None:
             return False
+        support_cell = self.find_support_cell(pos)
+        if support_cell is None:
+            return False
         turret = self.server.rocket_turret_controller.place(
-            player, pos, float(yaw), now=time.monotonic()
+            player,
+            pos,
+            float(yaw),
+            now=time.monotonic(),
+            support_cell=support_cell,
         )
         if turret is None:
             return False

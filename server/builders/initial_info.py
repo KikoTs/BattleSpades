@@ -24,7 +24,7 @@ _DEFAULT_GROUND_COLORS: list[tuple[int, int, int, int]] = [
     (59, 58, 55, 238),  # default dirt-edge
     (40, 54, 64, 239),
 ]
-_DEFAULT_UGC_PREFAB_SETS: list[int] = [0, 1]
+_DEFAULT_UGC_PREFAB_SETS: list[int] = []
 
 
 def _server_steam_id(server: 'BattleSpadesServer') -> int:

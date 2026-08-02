@@ -82,6 +82,11 @@ class MapEntity:
     terrain_support_z: Optional[int] = None
     terrain_offset_z: float = 0.0
     terrain_check_at: float = 0.0
+    # Runtime-only voxel which physically supports an attached/placed gadget.
+    # Placement packets name this solid cell (medpacks use half-cell X/Y and
+    # are normalised by the placement service).  The registry indexes it so a
+    # terrain removal can resolve support loss without scanning every entity.
+    support_cell: Optional[Tuple[int, int, int]] = None
 
     def to_wire_entity(self) -> Entity:
         ent = Entity()
@@ -107,6 +112,7 @@ class EntityRegistry:
 
     def __init__(self):
         self._entities: dict[int, MapEntity] = {}
+        self._support_index: dict[Tuple[int, int, int], set[int]] = {}
         self._next_id: int = 0
         self._tick_cursor: int = 0
 
@@ -125,7 +131,13 @@ class EntityRegistry:
               vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
               radius: float = 0.0, face: int = _FACE_UP,
               fuse: float = 0.0, yaw: float = 0.0,
-              wire_visible: bool = True) -> MapEntity:
+              wire_visible: bool = True,
+              support_cell: Optional[Tuple[int, int, int]] = None) -> MapEntity:
+        normalized_support = (
+            None
+            if support_cell is None
+            else tuple(int(value) for value in support_cell)
+        )
         ent = MapEntity(
             entity_id=self.allocate_id(), type=int(type),
             x=float(x), y=float(y), z=float(z),
@@ -135,14 +147,30 @@ class EntityRegistry:
             home=(float(x), float(y), float(z)), behavior=behavior,
             vel=tuple(float(v) for v in vel), radius=float(radius),
             fuse=float(fuse), wire_visible=bool(wire_visible),
+            support_cell=normalized_support,
         )
         self._entities[ent.entity_id] = ent
+        if normalized_support is not None:
+            self._support_index.setdefault(normalized_support, set()).add(
+                ent.entity_id
+            )
         return ent
 
     def remove(self, entity_id: int) -> Optional[MapEntity]:
-        return self._entities.pop(int(entity_id), None)
+        ent = self._entities.pop(int(entity_id), None)
+        if ent is not None and ent.support_cell is not None:
+            ids = self._support_index.get(ent.support_cell)
+            if ids is not None:
+                ids.discard(ent.entity_id)
+                if not ids:
+                    self._support_index.pop(ent.support_cell, None)
+        return ent
 
-    def get(self, entity_id: int) -> Optional[MapEntity]:
+    def get(self, entity_id: int | None) -> Optional[MapEntity]:
+        """Return an entity, treating a nullable owner slot as unassigned."""
+
+        if entity_id is None:
+            return None
         return self._entities.get(int(entity_id))
 
     def all(self) -> List[MapEntity]:
@@ -157,7 +185,42 @@ class EntityRegistry:
 
     def clear(self) -> None:
         self._entities.clear()
+        self._support_index.clear()
         self._next_id = 0
+
+    def support_removed(
+        self,
+        cell: Tuple[int, int, int],
+        ctx: EntityContext,
+    ) -> int:
+        """Resolve every live gadget attached to one removed terrain voxel.
+
+        The support bucket is detached before callbacks run because an
+        explosion can synchronously publish more terrain removals.  Behaviors
+        mark/remove their entity through the ordinary lifecycle, so each
+        gadget acts at most once even under a cascading blast.
+        """
+
+        normalized = tuple(int(value) for value in cell)
+        entity_ids = tuple(self._support_index.pop(normalized, ()))
+        handled = 0
+        for entity_id in entity_ids:
+            ent = self._entities.get(entity_id)
+            if ent is None or not ent.alive or ent.support_cell != normalized:
+                continue
+            ent.support_cell = None
+            behavior = ent.behavior
+            if behavior is None:
+                continue
+            behavior.on_support_lost(ent, ctx)
+            handled += 1
+        return handled
+
+    def has_support_at(self, cell: Tuple[int, int, int]) -> bool:
+        """Return whether any placed entity is indexed on one terrain voxel."""
+
+        normalized = tuple(int(value) for value in cell)
+        return bool(self._support_index.get(normalized))
 
     def due_respawns(self, now: Optional[float] = None) -> List[MapEntity]:
         """Dead entities whose respawn timer has elapsed (caller re-creates)."""

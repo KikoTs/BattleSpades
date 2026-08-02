@@ -62,6 +62,11 @@ class EntityBehavior:
     def on_damage(self, ent, amount, source, ctx) -> None:
         pass
 
+    def on_support_lost(self, ent, ctx) -> None:
+        """Remove a passive placed entity whose supporting voxel vanished."""
+
+        _remove_entity(ent, ctx)
+
     def get_hit_center(self, ent):
         """World-space center used by hitscan and explosion damage."""
         ox, oy, oz = self.hit_center_offset
@@ -216,7 +221,8 @@ class GraveBehavior(EntityBehavior):
     """
 
     def __init__(self, thrower_id, fuse=7.0, damage=25.0,
-                 block_damage=3.0, blast_radius=3.0, kill_type=13):
+                 block_damage=3.0, blast_radius=3.0, kill_type=13,
+                 explosion_center=None):
         self.thrower_id = int(thrower_id)
         self.fuse = float(fuse)
         self.damage = float(damage)
@@ -225,10 +231,28 @@ class GraveBehavior(EntityBehavior):
         self.crater_radius = 1
         self.kill_type = int(kill_type)
         self.force_destroy = False
+        self.explosion_center = (
+            None
+            if explosion_center is None
+            else tuple(float(value) for value in explosion_center)
+        )
         import shared.constants as C
         self.knockback_min = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MIN", 0.5))
         self.knockback_max = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MAX", 1.0))
         self._detonate_at = None
+
+    def get_explosion_center(self, ent):
+        """Return the grave's settled blast point without freezing its model.
+
+        GraveEntity performs gravity and collision locally, so its packet must
+        retain the airborne death position.  The seven-second authoritative
+        blast occurs after that fall has settled and therefore uses the dry
+        supporting surface captured by the server at creation time.
+        """
+
+        if self.explosion_center is not None:
+            return self.explosion_center
+        return (ent.x, ent.y, ent.z)
 
     def on_tick(self, ent, dt, ctx) -> None:
         if self._detonate_at is None:
@@ -310,6 +334,9 @@ class TimedExplosiveBehavior(EntityBehavior):
         """Use the rendered attachment center, outside its support voxel."""
 
         return _attached_face_center(ent)
+
+    def on_support_lost(self, ent, ctx) -> None:
+        _detonate_deployable(self, ent, ctx)
 
 
 class ProximityMineBehavior(DamageableEntityBehavior):
@@ -423,6 +450,11 @@ class ProximityMineBehavior(DamageableEntityBehavior):
 
         _detonate_deployable(self, ent, ctx)
 
+    def on_support_lost(self, ent, ctx) -> None:
+        # Removing the voxel under a mine is the same stock destruction event
+        # as shooting its one-point shell; it must not remain armed in mid-air.
+        _detonate_deployable(self, ent, ctx)
+
 
 class RemoteChargeBehavior(DamageableEntityBehavior):
     """Placed C4: inert until its owner sends DetonateC4."""
@@ -449,6 +481,15 @@ class RemoteChargeBehavior(DamageableEntityBehavior):
         if ent.alive:
             _detonate_deployable(self, ent, ctx)
 
+    def _forget_owner(self, ent, ctx) -> None:
+        owner = ctx.server.players.get(ent.player_id) if ctx.server else None
+        if owner is not None:
+            owner._c4_entity_ids = [
+                entity_id for entity_id in
+                list(getattr(owner, "_c4_entity_ids", []) or [])
+                if int(entity_id) != int(ent.entity_id)
+            ]
+
     def get_hit_center(self, ent):
         # PlaceC4 coordinates name the supporting voxel.  ``face`` selects the
         # exposed face on which the model is centered (client C4Weapon ghost
@@ -461,14 +502,12 @@ class RemoteChargeBehavior(DamageableEntityBehavior):
         return _attached_face_center(ent)
 
     def on_destroyed(self, ent, source, ctx) -> None:
-        owner = ctx.server.players.get(ent.player_id) if ctx.server else None
-        if owner is not None:
-            owner._c4_entity_ids = [
-                entity_id for entity_id in
-                list(getattr(owner, "_c4_entity_ids", []) or [])
-                if int(entity_id) != int(ent.entity_id)
-            ]
+        self._forget_owner(ent, ctx)
         super().on_destroyed(ent, source, ctx)
+
+    def on_support_lost(self, ent, ctx) -> None:
+        self._forget_owner(ent, ctx)
+        self.detonate(ent, ctx)
 
 
 class RadarStationBehavior(DamageableEntityBehavior):
@@ -499,10 +538,22 @@ class RadarStationBehavior(DamageableEntityBehavior):
         if ctx.server is not None:
             ctx.server._radar_station_removed(self.team)
             owner = ctx.server.players.get(ent.player_id)
-            if (owner is not None
-                    and int(getattr(owner, "_radar_entity_id", -1)) == int(ent.entity_id)):
+            owner_entity_id = (
+                getattr(owner, "_radar_entity_id", None)
+                if owner is not None
+                else None
+            )
+            if (
+                owner_entity_id is not None
+                and int(owner_entity_id) == int(ent.entity_id)
+            ):
                 owner._radar_entity_id = None
         super().on_destroyed(ent, source, ctx)
+
+    def on_support_lost(self, ent, ctx) -> None:
+        # Radar has no destructive action; use its normal teardown so team
+        # visibility and the owner's one-live-station slot are released too.
+        self.on_destroyed(ent, None, ctx)
 
 
 def _detonate_deployable(behavior, ent, ctx) -> None:

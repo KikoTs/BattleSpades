@@ -419,6 +419,100 @@ def test_medpack_health_is_server_authoritative_and_one_hit_destroys_it():
     assert c._destroyed == [ent.entity_id]
 
 
+def test_lost_support_despawns_medpack_without_an_explosion():
+    """Passive gadgets must not remain suspended after their voxel vanishes."""
+
+    from server.entities.behaviors import MedpackBehavior
+
+    reg = EntityRegistry()
+    srv = FakeServer()
+    srv.entity_registry = reg
+    support = (10, 20, 31)
+    ent = reg.place(
+        C.MEDPACK_ENTITY, 10, 20, 30,
+        behavior=MedpackBehavior(team=2),
+        support_cell=support,
+    )
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    assert reg.support_removed(support, c) == 1
+    assert reg.get(ent.entity_id) is None
+    assert c._destroyed == [ent.entity_id]
+    assert srv.blasts == []
+    assert not reg.has_support_at(support)
+
+
+def test_lost_support_detonates_landmine_once_and_clears_index_first():
+    """A blast may remove neighbouring supports synchronously; never re-enter."""
+
+    from server.entities.behaviors import ProximityMineBehavior
+
+    reg = EntityRegistry()
+    srv = FakeServer()
+    srv.entity_registry = reg
+    support = (100, 100, 61)
+    behavior = ProximityMineBehavior(
+        thrower_id=7,
+        team=2,
+        damage=100.0,
+        block_damage=15.0,
+        crater_radius=1,
+        kill_type=14,
+    )
+    ent = reg.place(
+        C.LANDMINE_ENTITY, 100, 100, 60,
+        behavior=behavior,
+        support_cell=support,
+    )
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    assert reg.support_removed(support, c) == 1
+    assert reg.support_removed(support, c) == 0
+    assert reg.get(ent.entity_id) is None
+    assert c._destroyed == [ent.entity_id]
+    assert len(srv.blasts) == 1
+
+
+def test_lost_support_detonates_c4_and_forgets_owner_charge():
+    from server.entities.behaviors import RemoteChargeBehavior
+
+    reg = EntityRegistry()
+    owner = SimpleNamespace(_c4_entity_ids=[])
+    srv = FakeServer()
+    srv.players[7] = owner
+    srv.entity_registry = reg
+    support = (10, 20, 30)
+    ent = reg.place(
+        C.C4_ENTITY, *support,
+        player_id=7,
+        face=4,
+        behavior=RemoteChargeBehavior(thrower_id=7),
+        support_cell=support,
+    )
+    owner._c4_entity_ids = [ent.entity_id]
+    c = deploy_ctx(srv, [], now=1000.0)
+
+    assert reg.support_removed(support, c) == 1
+    assert reg.get(ent.entity_id) is None
+    assert owner._c4_entity_ids == []
+    assert c._destroyed == [ent.entity_id]
+    assert len(srv.blasts) == 1
+
+
+def test_ordinary_entity_removal_clears_support_index():
+    reg = EntityRegistry()
+    support = (10, 20, 31)
+    ent = reg.place(
+        C.MEDPACK_ENTITY, 10, 20, 30,
+        behavior=EntityBehavior(),
+        support_cell=support,
+    )
+
+    assert reg.has_support_at(support)
+    assert reg.remove(ent.entity_id) is ent
+    assert not reg.has_support_at(support)
+
+
 def test_radar_station_uses_recovered_45_health_and_releases_visibility_once():
     from server.entities.behaviors import RadarStationBehavior
 

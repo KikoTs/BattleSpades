@@ -295,6 +295,37 @@ def test_ugc_builder_keeps_toggle_hover_activation():
     assert p.jetpack_active is True
 
 
+def test_world_hover_is_only_enabled_for_the_ugc_builder_pack():
+    """Z is also parachute deploy; it must not cancel gravity for all classes."""
+
+    p = make_player(class_id=int(C.CLASS_ENGINEER))
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    p.input.hover = True
+    world = SimpleNamespace(
+        set_walk=lambda *args: None,
+        set_crouch=lambda *args: None,
+    )
+    p._apply_input_state_to_world(
+        trigger_jump=False,
+        world_object=world,
+        collisions=[],
+    )
+
+    assert world.hover is False
+    assert not (p.pack_state_flags() & 0x04)
+
+    p.class_id = int(C.CLASS_UGCBUILDER)
+    p.jetpack_id = int(C.JETPACK_UGCBUILDER)
+    p._apply_input_state_to_world(
+        trigger_jump=False,
+        world_object=world,
+        collisions=[],
+    )
+
+    assert world.hover is True
+    assert p.pack_state_flags() & 0x04
+
+
 def test_damage_pauses_regen():
     import time
     p = make_player()

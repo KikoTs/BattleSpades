@@ -47,6 +47,12 @@ class RuntimeMetrics:
             self.subsystem_samples_ms[name] = samples
         samples.append(float(elapsed_ms))
 
+    def reset_timing_samples(self) -> None:
+        """Start a new measurement window without erasing event counters."""
+
+        self.tick_samples_ms.clear()
+        self.subsystem_samples_ms.clear()
+
     def record_world_packet(self, size: int, recipients: int) -> None:
         self.world_serializations += 1
         self.world_sends += int(recipients)

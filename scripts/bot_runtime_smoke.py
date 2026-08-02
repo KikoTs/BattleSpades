@@ -28,6 +28,7 @@ async def _run(
     map_name: str | None = None,
     water_spawn_bots: int = 0,
     restart_worker_at: float | None = None,
+    progress_every: float = 0.0,
 ) -> None:
     config = load_config(ROOT / "config.toml")
     config.default_mode = str(mode_name).lower()
@@ -35,6 +36,9 @@ async def _run(
         config.default_map = str(map_name)
     config.bots.population_mode = "admin"
     config.bots.max_bots = max(1, int(bot_count))
+    if restart_worker_at is not None:
+        # Killing a child is specifically a process-backend acceptance.
+        config.bots.worker = "process"
     server = BattleSpadesServer(config)
     if not server.world_manager.load_map(config.default_map):
         raise RuntimeError("smoke map did not load")
@@ -97,15 +101,24 @@ async def _run(
     max_requested_stall_ticks = {bot.id: 0 for bot in director.bots}
     water_exit_seconds: dict[int, float] = {}
     worker_deadline = asyncio.get_running_loop().time() + 10.0
-    original_pid = director.status().process_id
-    while original_pid is None and asyncio.get_running_loop().time() < worker_deadline:
+    status = director.status()
+    original_pid = status.process_id
+    while not status.running and asyncio.get_running_loop().time() < worker_deadline:
         await asyncio.sleep(0.02)
-        original_pid = director.status().process_id
-    if original_pid is None:
-        raise RuntimeError("worker did not publish a process id")
+        status = director.status()
+        original_pid = status.process_id
+    if not status.running:
+        raise RuntimeError("worker did not become ready")
     restart_requested = False
     restart_observed = False
+    loop = asyncio.get_running_loop()
+    next_tick_at = loop.time()
     try:
+        progress_steps = (
+            max(1, int(float(progress_every) / server.tick_interval))
+            if progress_every > 0.0
+            else 0
+        )
         for step in range(max(1, int(float(seconds) / server.tick_interval))):
             elapsed = step * server.tick_interval
             if (
@@ -121,6 +134,7 @@ async def _run(
                 restart_requested = True
             server.loop_count += 1
             await director.update(server.tick_interval)
+            director.drain_actions(limit=1)
             await server.simulation_runtime._simulate_players()
             now = asyncio.get_running_loop().time()
             for bot in director.bots:
@@ -170,7 +184,17 @@ async def _run(
                 and status.process_id != original_pid
             ):
                 restart_observed = True
-            await asyncio.sleep(server.tick_interval)
+            if progress_steps and step > 0 and step % progress_steps == 0:
+                print(
+                    "runtime_progress",
+                    f"simulated_seconds={elapsed:.1f}",
+                    f"restarts={status.restarts}",
+                    "max_requested_stall_ticks="
+                    f"{max(max_requested_stall_ticks.values(), default=0)}",
+                    flush=True,
+                )
+            next_tick_at += server.tick_interval
+            await asyncio.sleep(max(0.0, next_tick_at - loop.time()))
         moved = {
             bot.id: math.dist(starts[bot.id], bot.position)
             for bot in director.bots
@@ -188,8 +212,41 @@ async def _run(
             if ticks >= int(5.0 / server.tick_interval)
         }
         if excessive_stalls:
+            details = {}
+            for bot_id, ticks in excessive_stalls.items():
+                bot = next(
+                    (candidate for candidate in director.bots if candidate.id == bot_id),
+                    None,
+                )
+                runtime = director._runtime.get(bot_id)
+                intent = runtime.intent if runtime is not None else None
+                details[bot_id] = {
+                    "ticks": ticks,
+                    "position": bot.position if bot is not None else None,
+                    "velocity": (
+                        (
+                            float(getattr(bot, "vx", 0.0)),
+                            float(getattr(bot, "vy", 0.0)),
+                            float(getattr(bot, "vz", 0.0)),
+                        )
+                        if bot is not None
+                        else None
+                    ),
+                    "role": intent.debug_role if intent is not None else None,
+                    "goal": intent.debug_goal if intent is not None else None,
+                    "affordance": (
+                        intent.movement.affordance.value
+                        if intent is not None
+                        else None
+                    ),
+                    "direction": (
+                        intent.movement.direction
+                        if intent is not None
+                        else None
+                    ),
+                }
             raise RuntimeError(
-                f"requested bot movement stalled for >=5s: {excessive_stalls}"
+                f"requested bot movement stalled for >=5s: {details}"
             )
         water_remaining = {
             bot.id: bot.position
@@ -216,7 +273,7 @@ async def _run(
             f"mode={config.default_mode}",
             f"map={config.default_map}",
             f"bots={len(director.bots)}",
-            f"pid={status.process_id}",
+            f"worker={status.process_id or 'thread'}",
             f"restarts={status.restarts}",
             f"world_mutations={server.metrics.committed_world_mutations}",
             f"moved={moved}",
@@ -247,6 +304,12 @@ if __name__ == "__main__":
         default=None,
         help="terminate this match's owned AI child after N seconds",
     )
+    parser.add_argument(
+        "--progress-every",
+        type=float,
+        default=0.0,
+        help="print a flushed progress line every N simulated seconds",
+    )
     args = parser.parse_args()
     asyncio.run(
         _run(
@@ -256,5 +319,6 @@ if __name__ == "__main__":
             map_name=args.map,
             water_spawn_bots=args.water_spawn_bots,
             restart_worker_at=args.restart_worker_at,
+            progress_every=args.progress_every,
         )
     )

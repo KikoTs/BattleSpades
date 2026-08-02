@@ -41,6 +41,25 @@ PLAYER_HEIGHT = PLAYER_STANDING_POS_ABOVE_GROUND + PLAYER_WIDTH_HALF
 PLAYER_CROUCH_HEIGHT = PLAYER_CROUCHING_POS_ABOVE_GROUND + PLAYER_WIDTH_HALF
 WATER_LEVEL = int(C.Z_ABOVE_WATERPLANE)
 
+# VXL z grows downward, so layer 0 is the sky ceiling.  The stock mover cannot
+# stand on a layer-0 voxel: its contact probes repeatedly treat the player as
+# embedded, lift the body by ~0.053 blocks per tick, then alternate grounded and
+# airborne.  Reserving that one layer keeps the highest playable platform at
+# z=1, where standing and jumping are stable.  This is a live-build boundary;
+# authored map data and erase operations may still address z=0.
+MIN_BUILD_Z = 1
+MAX_BUILD_Z = WATER_LEVEL
+
+
+def build_z_is_safe(z: int) -> bool:
+    """Return whether a voxel layer is safe for a live block placement."""
+
+    try:
+        value = int(z)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return MIN_BUILD_Z <= value <= MAX_BUILD_Z
+
 DEFAULT_TEAM_CLASSES = list(C.DEFAULT_TEAM_CLASSES)
 
 BLOCK_TOOL_IDS = frozenset({int(C.BLOCK_TOOL), int(getattr(C, "FLAREBLOCK_TOOL", C.BLOCK_TOOL))})

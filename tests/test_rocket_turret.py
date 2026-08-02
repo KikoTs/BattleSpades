@@ -73,6 +73,7 @@ class Server:
         self.changed = []
         self.destroyed = []
         self.blasts = []
+        self.los_queries = []
 
     def broadcast_create_entity(self, ent):
         self.created.append(ent)
@@ -88,6 +89,10 @@ class Server:
 
     def _apply_blast(self, *args, **kwargs):
         self.blasts.append((args, kwargs))
+
+    def _blocked_los(self, *coordinates):
+        self.los_queries.append(coordinates)
+        return False
 
 
 def test_engineer_places_visible_turret_and_consumes_stock():
@@ -118,12 +123,18 @@ def test_turret_acquires_enemy_and_fires_authoritative_rocket():
     assert turret.target_id == enemy.id
     assert turret.ammo == ROCKET_TURRET_AMMO - 1
     assert len(server.projectile_engine.spawned) == 1
-    spec, _pos, vel, thrower_id, _now, projectile = server.projectile_engine.spawned[0]
+    spec, pos, vel, thrower_id, _now, projectile = server.projectile_engine.spawned[0]
     assert spec is ROCKET_TURRET_ROCKET_SPEC
     assert spec.damage == 50 and spec.block_damage == 10
     assert thrower_id == owner.id
     assert vel[0] > 0.0
     assert projectile.entity_id == 99
+    # The recovered client model places its gun above the support packet's
+    # voxel.  A raw support-voxel origin makes horizontal rockets hit the
+    # terrain/turret on their first authoritative collision step.
+    assert pos[2] < turret.z
+    assert server.los_queries
+    assert server.los_queries[0][:3] == controller._aim_origin(turret)
 
 
 def test_turret_ignores_teammates_and_out_of_detection_range():
@@ -225,3 +236,27 @@ def test_turret_takes_authoritative_damage_and_uses_stock_destruction_blast():
         float(C.ROCKET_TURRET_EXPLOSION_BLOCK_DAMAGE),
     )
     assert kwargs["blast_radius"] == float(C.ROCKET_TURRET_EXPLOSION_RADIUS)
+
+
+def test_turret_lost_support_uses_normal_destruction_explosion():
+    server = Server()
+    owner = Player(1, 2, (10.0, 10.0, 10.0))
+    controller = RocketTurretController(server)
+    turret = controller.place(
+        owner,
+        (10.0, 10.0, 10.0),
+        yaw=0.0,
+        now=0.0,
+        support_cell=(10, 10, 11),
+    )
+    entity = server.entity_registry.get(turret.entity_id)
+
+    entity.behavior.on_support_lost(
+        entity,
+        SimpleNamespace(server=server),
+    )
+
+    assert turret.entity_id not in server.rocket_turrets
+    assert server.entity_registry.get(turret.entity_id) is None
+    assert server.destroyed == [turret.entity_id]
+    assert len(server.blasts) == 1

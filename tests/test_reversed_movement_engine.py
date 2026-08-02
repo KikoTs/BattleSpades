@@ -16,7 +16,11 @@ from aoslib.vxl import VXL
 from shared.glm import Vector3
 
 from server.config import ServerConfig
-from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1
+from server.game_constants import (
+    MIN_BUILD_Z,
+    PLAYER_STANDING_POS_ABOVE_GROUND,
+    TEAM1,
+)
 from server.player import Player, _JETPACK_PROPERTIES
 from server.world_manager import WorldManager
 
@@ -85,6 +89,41 @@ def make_player(world_manager=None, cell_x=100, cell_y=100, flatten=True):
 def advance_player(player, ticks, step=1.0 / 60.0):
     for _ in range(ticks):
         asyncio.run(player.update(step))
+
+
+def test_highest_live_build_layer_has_stable_ground_and_jump_contact():
+    """Layer 0 triggers the stock mover's ceiling-contact oscillation.
+
+    The authoritative live-build ceiling must therefore leave layer 0 as air.
+    Pin the actual highest allowed layer here so lowering the boundary silently
+    cannot reintroduce the public-server jitter and missed jump requests.
+    """
+
+    world_manager = make_world_manager()
+    for x in range(97, 104):
+        for y in range(97, 104):
+            world_manager.map.set_point(x, y, MIN_BUILD_Z, True, TEST_COLOR)
+
+    native = NativeWorldPlayer(world_manager.world)
+    native.set_orientation((1.0, 0.0, 0.0))
+    rest_z = float(MIN_BUILD_Z) - PLAYER_STANDING_POS_ABOVE_GROUND
+    native.set_position(100.5, 100.5, rest_z)
+    native.set_velocity(0.0, 0.0, 0.0)
+
+    observed = []
+    for _ in range(120):
+        native.update(1.0 / 60.0, ())
+        observed.append(float(native.position.z))
+
+    assert max(observed) - min(observed) < 1e-6
+    assert native.airborne is False
+
+    native.jump = True
+    native.update(1.0 / 60.0, ())
+
+    assert native.airborne is True
+    assert native.position.z < rest_z
+    assert native.velocity.z < 0.0
 
 
 def test_direction_mapping_does_not_skew_axes():

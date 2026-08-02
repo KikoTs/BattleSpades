@@ -142,6 +142,17 @@ def test_flare_block_is_allowed_on_retail_water_plane():
     assert (flare.x, flare.y, flare.z) == (108.0, 100.0, 238.0)
 
 
+def test_flare_block_rejects_the_reserved_sky_layer():
+    server, player, _ = _server_player()
+    player.set_position(104.5, 100.5, -1.25)
+    server.world_manager.set_block(108, 100, 1, True, 0x123456)
+
+    _place(server, player, x=108, y=100, z=0)
+
+    assert server.entity_registry.all() == []
+    assert player.blocks == 50
+
+
 def test_flare_destruction_removes_registry_entity_and_broadcasts_light_cleanup():
     server, player, connection = _server_player()
     _place(server, player)
