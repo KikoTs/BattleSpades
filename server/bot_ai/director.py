@@ -291,6 +291,7 @@ class _RuntimeBot:
     last_jump_frame: int = -1
     jump_until_loop: int = -1
     jump_rearm_loop: int = -1
+    wade_observed_until: float = 0.0
 
 
 class BotDirector:
@@ -1147,7 +1148,14 @@ class BotDirector:
                     jetpack_id=int(getattr(player, "jetpack_id", 0)),
                     jetpack_fuel=float(getattr(player, "jetpack_fuel", 0.0)),
                     grounded=bool(getattr(player, "grounded", False)),
-                    wade=bool(getattr(player, "wade", False)),
+                    wade=bool(
+                        getattr(player, "wade", False)
+                        or (
+                            runtime is not None
+                            and time.monotonic()
+                            < float(runtime.wade_observed_until)
+                        )
+                    ),
                     reloading=bool(getattr(player, "reloading", False)),
                     last_action_kind=(
                         runtime.feedback_action_kind if runtime is not None else ""
@@ -1655,6 +1663,16 @@ class BotDirector:
     def _apply_motor(self, runtime: _RuntimeBot, now: float, dt: float) -> None:
         player = runtime.player
         intent = runtime.intent
+        if bool(getattr(player, "wade", False)):
+            # Native movement is integrated at 60 Hz, perception at 8-10 Hz.
+            # Keep a short authoritative lease so a shoreline body cannot be
+            # sampled dry at every decision phase and alternate water recovery
+            # with a stale dry breach route. The lease expires quickly after
+            # a real landing and therefore cannot pin ordinary land movement.
+            runtime.wade_observed_until = max(
+                float(runtime.wade_observed_until),
+                float(now) + 0.5,
+            )
         if not player.alive or not player.spawned:
             self._clear_pending_action(runtime)
         if (
@@ -1761,11 +1779,68 @@ class BotDirector:
             intent.movement.affordance,
             now=now,
         )
+        affordance = intent.movement.affordance
+        if (
+            bool(getattr(player, "wade", False))
+            and math.hypot(direction[0], direction[1]) <= 0.1
+            and affordance
+            not in {
+                MovementAffordance.SWIM,
+                MovementAffordance.BUILD_STEP,
+                MovementAffordance.JUMP,
+            }
+            and not str(getattr(intent, "debug_role", "")).startswith(
+                "water_"
+            )
+        ):
+            # Worker frames are sampled below the authoritative 60 Hz physics
+            # cadence. A body at a modified shoreline can therefore become
+            # wading after the decision frame while a zero-motion dry breach
+            # replan remains leased. Never let that stale intent own a live
+            # swimmer: steer toward its strategic goal using the current VXL
+            # probes, first as a swim and then as a concrete bank jump.
+            goal = getattr(intent, "debug_goal", None)
+            fallback = (
+                (
+                    float(goal[0]) - float(player.x),
+                    float(goal[1]) - float(player.y),
+                    0.0,
+                )
+                if goal is not None
+                else (
+                    float(getattr(player, "o_x", 1.0)),
+                    float(getattr(player, "o_y", 0.0)),
+                    0.0,
+                )
+            )
+            fallback_length = math.hypot(fallback[0], fallback[1])
+            if fallback_length > 1e-6:
+                fallback = (
+                    fallback[0] / fallback_length,
+                    fallback[1] / fallback_length,
+                    0.0,
+                )
+                direction = self._live_movement_direction(
+                    runtime,
+                    fallback,
+                    MovementAffordance.SWIM,
+                    now=now,
+                )
+                if math.hypot(direction[0], direction[1]) > 0.1:
+                    affordance = MovementAffordance.SWIM
+                else:
+                    direction = self._live_movement_direction(
+                        runtime,
+                        fallback,
+                        MovementAffordance.JUMP,
+                        now=now,
+                    )
+                    if math.hypot(direction[0], direction[1]) > 0.1:
+                        affordance = MovementAffordance.JUMP
         forward = (float(player.o_x), float(player.o_y))
         side = (-forward[1], forward[0])
         forward_amount = direction[0] * forward[0] + direction[1] * forward[1]
         side_amount = direction[0] * side[0] + direction[1] * side[1]
-        affordance = intent.movement.affordance
         jetpack_requested = (
             affordance is MovementAffordance.JETPACK
             and int(getattr(player, "jetpack_id", 0)) > 0

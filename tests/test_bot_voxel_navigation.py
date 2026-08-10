@@ -1904,6 +1904,81 @@ def test_wading_jump_request_remains_held_for_native_swimming() -> None:
     assert runtime.movement_input[4] is True
 
 
+def test_authoritative_wade_overrides_stale_zero_motion_dry_intent() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="WadeLeaseRecoveryBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    bot.wade = True
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=111,
+        map_epoch=0,
+        mode_epoch=0,
+        topology_version=server.world_manager.topology_version,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(),
+        debug_goal=(float(bot.x) + 10.0, float(bot.y), float(bot.z)),
+        debug_role="combat_pursuit:breach_replan",
+    )
+
+    server.loop_count = 100
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert runtime.movement_input is not None
+    assert any(runtime.movement_input[:4])
+    assert runtime.movement_input[4] is True
+
+
+def test_motor_wade_lease_survives_the_next_perception_phase() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="WadePerceptionLeaseBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=112,
+        map_epoch=0,
+        mode_epoch=0,
+        topology_version=server.world_manager.topology_version,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(
+            direction=(1.0, 0.0, 0.0),
+            affordance=MovementAffordance.SWIM,
+        ),
+    )
+    bot.wade = True
+
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+    bot.wade = False
+
+    assert director._snapshot_player(bot).wade is True
+    runtime.wade_observed_until = time.monotonic() - 1.0
+    assert director._snapshot_player(bot).wade is False
+
+
 def test_swim_affordance_supplies_native_ascent_without_tactical_jump() -> None:
     server = BattleSpadesServer(ServerConfig())
     server.world_manager.generate_flat_map()
