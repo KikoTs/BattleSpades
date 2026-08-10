@@ -1541,6 +1541,34 @@ class SimpleBotBrain:
                 debug_role=f"{active_goal.role}:arrived",
             )
 
+        if (
+            state.route_index < len(state.route)
+            and state.route[state.route_index].affordance
+            is not MovementAffordance.BREACH
+            and float(now) - float(state.navigation_window_at)
+            >= _NAVIGATION_WINDOW_SECONDS
+        ):
+            # Queueing behind a digger and crowd detours are evaluated before
+            # ordinary route execution. They must not postpone the hard
+            # physical-progress contract indefinitely: macOS ARM reproduced
+            # a live WALK edge that remained trapped for nine seconds because
+            # those early branches kept bypassing the later timeout.
+            self._invalidate_current_edge(state, observer.position, now)
+            self._clear_route(state, now)
+            state.navigation_progress_position = observer.position
+            state.navigation_progress_at = float(now)
+            state.navigation_window_position = observer.position
+            state.navigation_window_at = float(now)
+            return self._intent(
+                frame,
+                movement=MovementIntent(),
+                look=None,
+                tool_id=_weapon_tool(observer),
+                priority=BotIntentPriority.TRAVERSAL,
+                debug_goal=active_goal.position,
+                debug_role=f"{active_goal.role}:physical_edge_blocked",
+            )
+
         crowd_detour = self._crowd_detour_intent(
             frame,
             observer,
@@ -2524,6 +2552,27 @@ class SimpleBotBrain:
                 preferred_goal=preferred_goal,
                 blocked_edges=frozenset(state.blocked_edges),
             )
+            if force_block_edge and bank is not None:
+                # The map-wide four-block swim timer owns this recovery even
+                # when the normal water flow has no direct step and falls back
+                # to an assisted build/breach bank. Ignoring the flag on this
+                # branch let a valid but slow shoreline excavation hold a
+                # swimmer beyond the ten-second hard limit.
+                self._block_water_step(
+                    state,
+                    observer.position,
+                    bank,
+                    now,
+                )
+                return self._intent(
+                    frame,
+                    movement=MovementIntent(),
+                    look=None,
+                    tool_id=_weapon_tool(observer),
+                    priority=BotIntentPriority.SURVIVAL,
+                    debug_goal=bank.waypoint,
+                    debug_role="water_exit:cycle_blocked",
+                )
             block_tool = int(C.BLOCK_TOOL)
             build_cell = (
                 self.world.jump_build_cell(observer.position)
