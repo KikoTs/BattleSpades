@@ -66,8 +66,10 @@ _WAYPOINT_STALL_SECONDS = 1.75
 _GOAL_STALL_SECONDS = 8.0
 _NAVIGATION_PROGRESS_SECONDS = 2.5
 _NAVIGATION_PROGRESS_DISTANCE = 0.5
-_NAVIGATION_WINDOW_SECONDS = 6.0
+_NAVIGATION_WINDOW_SECONDS = 5.0
 _NAVIGATION_WINDOW_DISTANCE = 3.0
+_WATER_ESCAPE_PROGRESS_SECONDS = 4.5
+_WATER_ESCAPE_PROGRESS_DISTANCE = 4.0
 _BLOCKED_EDGE_SECONDS = 60.0
 _JUMP_BLOCKED_EDGE_SECONDS = 12.0
 _WATER_BLOCKED_EDGE_SECONDS = 20.0
@@ -207,6 +209,8 @@ class _BotState:
     water_recovery: bool = False
     water_committed: bool = False
     water_goal_reached: bool = False
+    water_escape_position: Vector3 | None = None
+    water_escape_at: float = 0.0
     combat_progress_position: Vector3 | None = None
     combat_progress_at: float = 0.0
     combat_last_at: float = 0.0
@@ -301,6 +305,33 @@ class SimpleBotBrain:
         if state.water_committed:
             state.navigation_progress_position = None
             state.navigation_progress_at = now
+            force_water_edge = False
+            if observer.wade:
+                if state.water_escape_position is None:
+                    state.water_escape_position = observer.position
+                    state.water_escape_at = now
+                elif math.hypot(
+                    float(observer.position[0])
+                    - float(state.water_escape_position[0]),
+                    float(observer.position[1])
+                    - float(state.water_escape_position[1]),
+                ) >= _WATER_ESCAPE_PROGRESS_DISTANCE:
+                    state.water_escape_position = observer.position
+                    state.water_escape_at = now
+                elif (
+                    now - float(state.water_escape_at)
+                    >= _WATER_ESCAPE_PROGRESS_SECONDS
+                ):
+                    # A route can alternate several individually valid swim
+                    # steps inside one small basin. Per-step timers reset on
+                    # every alternation, so blacklist the currently selected
+                    # edge when the body fails the map-level four-block swim
+                    # contract across the whole window.
+                    state.water_escape_position = observer.position
+                    state.water_escape_at = now
+                    state.water_recovery = True
+                    self._clear_route(state, now)
+                    force_water_edge = True
             water_edge_blocked = any(
                 int(source[2]) >= int(C.Z_ABOVE_WATERPLANE) + 1
                 for source, _target in state.blocked_edges
@@ -370,6 +401,7 @@ class SimpleBotBrain:
                 observer,
                 water_step,
                 now,
+                force_block_edge=force_water_edge,
             )
 
         state.water_step_key = None
@@ -377,6 +409,8 @@ class SimpleBotBrain:
         state.water_progress_at = now
         state.water_recovery = False
         state.water_goal_reached = False
+        state.water_escape_position = None
+        state.water_escape_at = now
 
         mode_decision = objective_decision_for(frame, observer)
         visible_target = self._visible_target(
@@ -2463,6 +2497,8 @@ class SimpleBotBrain:
         observer: PlayerSnapshot,
         step: RouteStep | None,
         now: float,
+        *,
+        force_block_edge: bool = False,
     ) -> BotIntent:
         """Give wading survival sole ownership of locomotion."""
 
@@ -2586,6 +2622,17 @@ class SimpleBotBrain:
             float(step.waypoint[0]) - float(observer.position[0]),
             float(step.waypoint[1]) - float(observer.position[1]),
         )
+        if force_block_edge:
+            self._block_water_step(state, observer.position, step, now)
+            return self._intent(
+                frame,
+                movement=MovementIntent(),
+                look=None,
+                tool_id=_weapon_tool(observer),
+                priority=BotIntentPriority.SURVIVAL,
+                debug_goal=step.waypoint,
+                debug_role="water_exit:cycle_blocked",
+            )
         if state.water_step_key != step_key:
             state.water_step_key = step_key
             state.water_best_distance = distance
@@ -2594,33 +2641,7 @@ class SimpleBotBrain:
             state.water_best_distance = distance
             state.water_progress_at = now
         elif now - state.water_progress_at >= _WAYPOINT_STALL_SECONDS:
-            current = self.world.surface(
-                int(math.floor(observer.position[0])),
-                int(math.floor(observer.position[1])),
-                float(observer.position[2]),
-                vertical_span=8,
-                allow_water=True,
-            )
-            target = self.world.surface(
-                int(math.floor(step.waypoint[0])),
-                int(math.floor(step.waypoint[1])),
-                float(step.waypoint[2]),
-                vertical_span=8,
-                allow_water=True,
-            )
-            if current is not None and target is not None:
-                self._remember_blocked_edge(
-                    state,
-                    (
-                        (current.x, current.y, current.support_z),
-                        (target.x, target.y, target.support_z),
-                    ),
-                    now,
-                    lifetime=_WATER_BLOCKED_EDGE_SECONDS,
-                )
-            state.water_step_key = None
-            state.water_best_distance = math.inf
-            state.water_progress_at = now
+            self._block_water_step(state, observer.position, step, now)
             return self._intent(
                 frame,
                 movement=MovementIntent(),
@@ -2655,6 +2676,43 @@ class SimpleBotBrain:
             debug_path=(observer.position, step.waypoint),
             debug_role="water_exit",
         )
+
+    def _block_water_step(
+        self,
+        state: _BotState,
+        position: Vector3,
+        step: RouteStep,
+        now: float,
+    ) -> None:
+        """Blacklist one failed swim/shore edge and reset its local timer."""
+
+        current = self.world.surface(
+            int(math.floor(position[0])),
+            int(math.floor(position[1])),
+            float(position[2]),
+            vertical_span=8,
+            allow_water=True,
+        )
+        target = self.world.surface(
+            int(math.floor(step.waypoint[0])),
+            int(math.floor(step.waypoint[1])),
+            float(step.waypoint[2]),
+            vertical_span=8,
+            allow_water=True,
+        )
+        if current is not None and target is not None:
+            self._remember_blocked_edge(
+                state,
+                (
+                    (current.x, current.y, current.support_z),
+                    (target.x, target.y, target.support_z),
+                ),
+                now,
+                lifetime=_WATER_BLOCKED_EDGE_SECONDS,
+            )
+        state.water_step_key = None
+        state.water_best_distance = math.inf
+        state.water_progress_at = now
 
     def _landed_on_dry_surface(self, observer: PlayerSnapshot) -> bool:
         """Return whether a former swimmer has a stable dry foothold.

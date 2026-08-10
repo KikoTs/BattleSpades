@@ -835,6 +835,43 @@ def test_fallback_water_exit_blacklists_its_own_stalled_edge() -> None:
     assert state.blocked_edges
 
 
+def test_alternating_water_steps_cannot_reset_whole_swim_progress() -> None:
+    left_step = RouteStep(
+        (9.5, 10.5, 235.75),
+        MovementAffordance.JUMP,
+    )
+    upper_step = RouteStep(
+        (10.5, 9.5, 236.75),
+        MovementAffordance.SWIM,
+    )
+    world = _TacticalWorld(water_step=left_step)
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        1,
+        TEAM1,
+        (10.5, 10.5, 236.75),
+        is_bot=True,
+        grounded=False,
+        wade=True,
+    )
+    frame = _frame(observer, created_at=100.0)
+
+    intent = brain.decide(frame)
+    for index in range(1, 6):
+        world._water_step = upper_step if index % 2 else left_step
+        intent = brain.decide(replace(
+            frame,
+            frame_id=index + 1,
+            created_at=100.0 + float(index),
+        ))
+
+    assert intent is not None
+    assert intent.debug_role == "water_exit:cycle_blocked"
+    state = brain._states[(observer.player_id, observer.generation)]
+    assert state.water_recovery is True
+    assert state.blocked_edges
+
+
 def test_stagnant_crowd_follower_blacklists_its_edge_and_replans() -> None:
     route_step = RouteStep(
         (11.5, 10.5, 17.75),
@@ -1002,7 +1039,7 @@ def test_navigation_cycle_inside_three_blocks_forces_replan() -> None:
         goal,
         frame.created_at,
     )
-    for index in range(1, 7):
+    for index in range(1, 6):
         position = (
             11.1 if index % 2 else 10.5,
             10.5,
