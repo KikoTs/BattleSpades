@@ -2586,6 +2586,28 @@ class SimpleBotBrain:
                     breach,
                     now,
                 )
+            if bank is not None:
+                # This concrete bank has neither a supported build cell nor a
+                # safe solid melee target (for example, a one-block lip where
+                # an ordinary spade would also remove the waterbed). Exclude
+                # it before asking the shore flow again; returning a zero
+                # vector here forever pinned London swimmers to the same
+                # already-cleared air target.
+                self._block_water_step(
+                    state,
+                    observer.position,
+                    bank,
+                    now,
+                )
+                return self._intent(
+                    frame,
+                    movement=MovementIntent(),
+                    look=None,
+                    tool_id=_weapon_tool(observer),
+                    priority=BotIntentPriority.SURVIVAL,
+                    debug_goal=bank.waypoint,
+                    debug_role="water_bank:unusable_edge",
+                )
             return self._intent(
                 frame,
                 movement=MovementIntent(

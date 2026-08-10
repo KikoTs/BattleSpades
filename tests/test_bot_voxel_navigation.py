@@ -1979,6 +1979,33 @@ def test_motor_wade_lease_survives_the_next_perception_phase() -> None:
     assert director._snapshot_player(bot).wade is False
 
 
+def test_post_physics_wade_lease_survives_missed_motor_phase() -> None:
+    """The 60 Hz physics result must reach AI even between motor samples."""
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    server.bots = director
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="PostPhysicsWadeLeaseBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+
+    bot.wade = True
+    director.observe_player_physics(bot, now)
+    bot.wade = False
+
+    assert runtime.wade_observed_until == now + 0.5
+    with patch.object(time, "monotonic", return_value=now + 0.1):
+        assert director._snapshot_player(bot).wade is True
+
+
 def test_swim_affordance_supplies_native_ascent_without_tactical_jump() -> None:
     server = BattleSpadesServer(ServerConfig())
     server.world_manager.generate_flat_map()

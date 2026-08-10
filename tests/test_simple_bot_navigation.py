@@ -248,9 +248,10 @@ def test_production_bot_breaches_level_two_cell_high_passage() -> None:
     assert plan.reached_segment_goal is True
     assert plan.steps[0].affordance is MovementAffordance.BREACH
     assert plan.steps[0].breach is not None
-    # The recovered vertical-spade handler aims one cell below the overhang;
-    # its authoritative dig column includes the blocking z=17 voxel.
-    assert plan.steps[0].breach.target_cell == (11, 10, 18)
+    # Aim at the actual overhang voxel. The vertical-spade footprint still
+    # clears the same passage, while the motor's exact-ray gate can now
+    # authorize the swing instead of waiting on an air-cell target.
+    assert plan.steps[0].breach.target_cell == (11, 10, 17)
     assert plan.steps[0].breach.blocking_cells == ((11, 10, 17),)
 
 
@@ -736,6 +737,24 @@ def test_zombie_hand_can_carve_a_waterline_exit_through_a_high_bank() -> None:
         step.breach.target_cell,
         profile.pattern,
     )
+
+
+def test_spade_never_targets_air_above_a_one_block_water_lip() -> None:
+    """A safe bank dig needs a solid ray target and must preserve its floor."""
+
+    world = _world({(11, 10, 238), (11, 10, 239)})
+    profile = _dig_profile(
+        SimpleNamespace(loadout=(int(C.SPADE_TOOL),))
+    )
+
+    target, swings = world._clearance_target(
+        ((11, 10, 238),),
+        239,
+        profile,
+    )
+
+    assert target is None
+    assert swings == 0
 
 
 def test_adjacent_high_bank_skips_redundant_water_component_search(
