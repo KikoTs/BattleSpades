@@ -294,7 +294,8 @@ class SimpleBotBrain:
         self._prune_blocked_edges(state, now)
 
         profile = frame.profile or _fallback_profile(observer.player_id)
-        if observer.wade:
+        water_contact = self._water_contact(observer)
+        if water_contact:
             state.water_committed = True
         elif state.water_committed and self._landed_on_dry_surface(observer):
             state.water_committed = False
@@ -306,7 +307,7 @@ class SimpleBotBrain:
             state.navigation_progress_position = None
             state.navigation_progress_at = now
             force_water_edge = False
-            if observer.wade:
+            if water_contact:
                 if state.water_escape_position is None:
                     state.water_escape_position = observer.position
                     state.water_escape_at = now
@@ -2736,6 +2737,37 @@ class SimpleBotBrain:
             # held at the lip. A live dry support directly under the capsule
             # is sufficient to return locomotion to ordinary navigation; an
             # airborne bob over water still has no dry support in its column.
+            and abs(
+                float(surface.position[2]) - float(observer.position[2])
+            ) <= _DRY_BANK_RELEASE_VERTICAL
+        )
+
+    def _water_contact(self, observer: PlayerSnapshot) -> bool:
+        """Return whether native state or live VXL geometry owns water motion.
+
+        Native physics updates ``wade`` at 60 Hz while bot decisions are
+        sampled at a lower cadence. On ARM runners a body balanced at the
+        London bank could report a dry bit at every decision phase, then
+        become wading again after the same tick's physics step. That alias
+        left a zero-motion breach intent in control forever. The body-clear
+        water support directly under the capsule is a stable second signal;
+        the tight vertical bound prevents distant water or roofs from
+        claiming an ordinary dry player.
+        """
+
+        if observer.wade:
+            return True
+        surface = self.world.surface(
+            int(math.floor(observer.position[0])),
+            int(math.floor(observer.position[1])),
+            float(observer.position[2]),
+            vertical_span=3,
+            allow_water=True,
+        )
+        return bool(
+            surface is not None
+            and int(surface.support_z)
+            >= int(C.Z_ABOVE_WATERPLANE) + 1
             and abs(
                 float(surface.position[2]) - float(observer.position[2])
             ) <= _DRY_BANK_RELEASE_VERTICAL
