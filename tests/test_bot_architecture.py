@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import shared.constants as C
+from modes.tdm import TDMMode
 from modes.zombie import ZombieMode, ZombiePhase
 from shared.bytes import ByteReader
 from shared.packet import CreatePlayer
@@ -51,6 +52,7 @@ from server.bot_ai.snapshot_transport import (
     encode_map_snapshot,
 )
 from server.bot_ai.supervisor import AIWorkerSupervisor
+from server.bot_ai.thread_supervisor import AIThreadSupervisor
 from server.bot_ai.stimuli import BotStimulusBus
 from server.bot_ai.worker import (
     BotBrain,
@@ -66,6 +68,7 @@ from server.main import BattleSpadesServer
 from server.game_constants import TEAM1, TEAM2
 from server.metrics import RuntimeMetrics
 from server.simulation_runtime import SimulationRuntime
+from server.world_manager import WorldManager
 
 
 def _profile() -> BotProfile:
@@ -140,6 +143,224 @@ def test_peerless_bot_connection_is_an_active_server_owned_player() -> None:
     assert connection.in_game is True
     assert connection.peer is None
     assert connection.send(b"owner-only") is None
+
+
+def test_diamond_mining_intent_digs_adjacent_surface_not_own_support() -> None:
+    class _MiningWorld:
+        @staticmethod
+        def solid(x, y, z):
+            return (x, y, z) == (102, 100, 52)
+
+    observer = replace(
+        _player_snapshot(8, TEAM1, (100.0, 100.0, 50.0), is_bot=True),
+        loadout=(int(C.PICKAXE_TOOL),),
+    )
+    frame = PerceptionFrame(
+        frame_id=1,
+        map_epoch=1,
+        mode_epoch=1,
+        topology_version=0,
+        observer_id=observer.player_id,
+        observer_generation=observer.generation,
+        created_at=100.0,
+        mode_id="dia",
+        players=(observer,),
+        profile=_profile(),
+    )
+    brain = BotBrain(_MiningWorld(), seed=1)
+
+    intent = brain._diamond_mine_intent(
+        frame, observer, _BrainState(), 100.0
+    )
+
+    assert intent is not None
+    assert intent.action.kind is BotActionKind.MELEE
+    assert intent.action.position == (102.5, 100.5, 52.5)
+    assert intent.action.position[:2] != observer.position[:2]
+
+
+def test_match_transition_reanchors_retained_bots_and_rebinds_worker_world() -> None:
+    """A replacement VXL must never inherit bot bodies or listeners from London."""
+
+    class _Supervisor:
+        def __init__(self) -> None:
+            self.maps: list[str] = []
+            self.timeline_discards = 0
+            self.requested_restarts = 0
+
+        def start(self, snapshot) -> None:
+            self.maps.append(str(snapshot.map_name))
+
+        def publish_map(self, snapshot) -> None:
+            self.maps.append(str(snapshot.map_name))
+            self.discard_timeline()
+
+        def discard_timeline(self) -> None:
+            self.timeline_discards += 1
+
+        def request_restart(self) -> None:
+            self.requested_restarts += 1
+
+        def close(self) -> None:
+            pass
+
+    async def scenario():
+        config = ServerConfig(
+            default_map="London",
+            default_mode="tdm",
+            maps_path="maps",
+        )
+        server = BattleSpadesServer(config)
+        assert server.world_manager.load_map("London")
+        server.mode = TDMMode(server)
+        await server.mode.on_mode_start()
+
+        supervisor = _Supervisor()
+        director = BotDirector(server, supervisor=supervisor)
+        server.bots = director
+        await director.start(initial_count=8)
+        old_world = server.world_manager
+
+        replacement = WorldManager(config)
+        assert replacement.load_map("MayanJungle")
+        stale_positions = tuple(bot.position for bot in director.bots)
+        assert any(
+            not replacement.spawn_position_is_safe(position)
+            for position in stale_positions
+        )
+
+        result = await server.match_transition._rollover(
+            map_name="MayanJungle",
+            mode_name="tdm",
+            candidate_world=replacement,
+        )
+        return result, server, director, supervisor, old_world, replacement
+
+    result, server, director, supervisor, old_world, replacement = asyncio.run(
+        scenario()
+    )
+
+    assert result.ok is True
+    assert server.world_manager is replacement
+    assert supervisor.maps == ["London", "MayanJungle"]
+    assert director._mutation_world is replacement
+    assert director._mutation_subscription in replacement._mutation_listeners
+    assert old_world._mutation_listeners == {}
+    assert all(
+        replacement.spawn_position_is_safe(bot.position)
+        for bot in director.bots
+    )
+    assert all(
+        director._runtime[int(bot.id)].intent is None
+        for bot in director.bots
+    )
+    assert supervisor.timeline_discards == 1
+    assert supervisor.requested_restarts == 0
+
+
+def test_three_game_cycle_rebuilds_bot_state_and_restarts_only_ai_worker() -> None:
+    """Round restarts must not carry paths, coordination, or stuck state forward."""
+
+    class _Supervisor:
+        def __init__(self) -> None:
+            self.timeline_discards = 0
+            self.requested_restarts = 0
+
+        def start(self, _snapshot) -> None:
+            pass
+
+        def discard_timeline(self) -> None:
+            self.timeline_discards += 1
+
+        def request_restart(self) -> None:
+            self.requested_restarts += 1
+
+        def close(self) -> None:
+            pass
+
+    async def scenario():
+        config = ServerConfig(default_map="London", default_mode="tdm")
+        config.bots.clean_slate_games = 3
+        server = BattleSpadesServer(config)
+        assert server.world_manager.load_map("London")
+        server.mode = TDMMode(server)
+        await server.mode.on_mode_start()
+
+        supervisor = _Supervisor()
+        director = BotDirector(server, supervisor=supervisor)
+        server.bots = director
+        await director.start(initial_count=4)
+
+        epochs = [director._mode_epoch]
+        runtimes = [tuple(director._runtime.values())]
+        for _ in range(3):
+            result = await server.match_transition.restart_round()
+            assert result.ok
+            epochs.append(director._mode_epoch)
+            runtimes.append(tuple(director._runtime.values()))
+            assert all(
+                server.world_manager.spawn_position_is_safe(bot.position)
+                for bot in director.bots
+            )
+            assert all(runtime.intent is None for runtime in director._runtime.values())
+        return director, supervisor, epochs, runtimes
+
+    director, supervisor, epochs, runtimes = asyncio.run(scenario())
+
+    assert epochs == list(range(epochs[0], epochs[0] + 4))
+    assert all(
+        all(old is not new for old, new in zip(before, after))
+        for before, after in zip(runtimes, runtimes[1:])
+    )
+    assert supervisor.timeline_discards == 3
+    assert supervisor.requested_restarts == 1
+    assert director._games_since_deep_reset == 0
+
+
+@pytest.mark.parametrize("supervisor_type", (AIWorkerSupervisor, AIThreadSupervisor))
+def test_supervisor_game_boundary_discards_queued_old_timeline(supervisor_type) -> None:
+    """Neither worker implementation may replay a completed game's output."""
+
+    supervisor = supervisor_type(seed=3)
+    snapshot = MapSnapshot(4, 0, b"", "tdm", "LifecycleTest")
+    if isinstance(supervisor, AIWorkerSupervisor):
+        with supervisor._frame_lock:
+            supervisor._frames[(1, 1)] = object()
+        supervisor._intents.put_nowait(object())
+        supervisor._awaiting_intent_since = 1.0
+        supervisor._awaiting_frame_id = 9
+    else:
+        with supervisor._lock:
+            supervisor._frames[(1, 1)] = object()
+            supervisor._intents.append(object())
+            supervisor._awaiting_frame_id = 9
+
+    supervisor.publish_map(snapshot)
+    status = supervisor.status()
+
+    assert status.queued_frames == 0
+    assert status.queued_intents == 0
+    assert status.awaiting_frame_id is None
+
+
+@pytest.mark.parametrize("supervisor_type", (AIWorkerSupervisor, AIThreadSupervisor))
+def test_supervisor_clean_slate_restart_is_non_blocking(supervisor_type) -> None:
+    """The gameplay thread only requests a recycle; it never joins a worker."""
+
+    supervisor = supervisor_type(seed=5)
+    snapshot = MapSnapshot(7, 0, b"", "zom", "LifecycleTest")
+    supervisor.publish_map(snapshot)
+
+    started = time.perf_counter()
+    supervisor.request_restart()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.05
+    if isinstance(supervisor, AIWorkerSupervisor):
+        assert supervisor._restart_request.is_set()
+    else:
+        assert supervisor._snapshot_serial == 2
+        assert supervisor.status().restarts == 1
 
 
 def test_spawned_bot_advertises_real_weapon_and_remote_display_bit() -> None:

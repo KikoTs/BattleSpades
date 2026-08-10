@@ -578,6 +578,20 @@ class BattleSpadesServer:
             if self.entity_registry.remove(flight_id) is not None:
                 self.broadcast_destroy_entity(flight_id)
 
+        support_cell = getattr(event, "support_cell", None)
+        if (
+            support_cell is None
+            or not self.world_manager.get_solid(*support_cell)
+        ):
+            # Bounds expiry and stale contacts are not placements.  The old
+            # path converted either into a permanent unsupported landmine.
+            logger.debug(
+                "MINE LAUNCHER discarded unsupported deployment for %s at %s",
+                owner.name,
+                support_cell,
+            )
+            return
+
         behavior = ProximityMineBehavior(
             owner.id,
             owner.team,
@@ -603,6 +617,7 @@ class BattleSpadesServer:
             event.x, event.y, event.z,
             state=internal_team_to_wire(owner.team),
             kind="deployable", player_id=owner.id, behavior=behavior,
+            support_cell=support_cell,
         )
         self.broadcast_create_entity(ent)
         logger.info(
@@ -1059,17 +1074,10 @@ class BattleSpadesServer:
             connection.send(bytes(packet.generate()), reliable=True)
 
         if getattr(self.config, "entities_wire_ready", False):
-            from shared.packet import CreateEntity
+            from server.entities.registry import send_create_entity_to
             for ent in self.entity_registry.static_entities():
                 try:
-                    pkt = CreateEntity()
-                    pkt.set_entity(ent.to_wire_entity())
-                    connection.send(bytes(pkt.generate()), reliable=True)
-                    known = getattr(connection, "known_entity_ids", None)
-                    if known is None:
-                        known = set()
-                        connection.known_entity_ids = known
-                    known.add(int(ent.entity_id))
+                    send_create_entity_to(connection, ent)
                 except Exception:
                     logger.debug("reveal entity send failed", exc_info=True)
 
@@ -1132,20 +1140,11 @@ class BattleSpadesServer:
             # Legacy objective markers can exist for authoritative mode logic
             # without being legal packet-21 entities in the retail client.
             return
-        from shared.packet import CreateEntity
-        pkt = CreateEntity()
-        pkt.set_entity(map_entity.to_wire_entity())
-        data = bytes(pkt.generate())
-        entity_id = int(map_entity.entity_id)
+        from server.entities.registry import send_create_entity_to
         for connection in tuple(self.connections.values()):
             if not bool(getattr(connection, "in_game", False)):
                 continue
-            connection.send(data, reliable=True)
-            known = getattr(connection, "known_entity_ids", None)
-            if known is None:
-                known = set()
-                connection.known_entity_ids = known
-            known.add(entity_id)
+            send_create_entity_to(connection, map_entity)
 
     def broadcast_known_entity_packet(
         self,

@@ -45,7 +45,12 @@ from .navigation_atlas import (
     load_or_build_atlas,
 )
 from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
-from .policies import ModeBotDecision, _formation_point, objective_decision_for
+from .policies import (
+    ModeBotDecision,
+    _formation_point,
+    mode_decision_allows_combat,
+    objective_decision_for,
+)
 from .snapshot_transport import MapSnapshotAssembler, SnapshotTransportError
 from .voxel_navigation import VoxelActionPlanner, VoxelTerrain, WATERBED_SUPPORT_Z
 from server.projectiles import PROJECTILE_SPECS
@@ -1628,8 +1633,20 @@ class BotBrain:
             if damage_reaction is not None:
                 return damage_reaction
 
-        contact = self._best_contact(observer, state, now)
         mode_decision = self._objective_decision(frame, observer)
+        if target is not None and not mode_decision_allows_combat(
+            mode_decision,
+            observer,
+            target,
+            now=now,
+        ):
+            target = None
+        contact = self._best_contact(observer, state, now)
+        if (
+            mode_decision is not None
+            and mode_decision.objective_priority >= 0.7
+        ):
+            contact = None
         mode_objective = (
             mode_decision.position if mode_decision is not None else None
         )
@@ -1681,7 +1698,14 @@ class BotBrain:
         ).startswith("zombie_hunt_")
         resource = (
             None
-            if zombie_hunt or target is not None
+            if (
+                zombie_hunt
+                or target is not None
+                or (
+                    mode_decision is not None
+                    and mode_decision.objective_priority >= 0.7
+                )
+            )
             else self._resource_goal(frame, observer, state=state, now=now)
         )
         if observer.carried_entity_id >= 0:
@@ -1719,6 +1743,17 @@ class BotBrain:
         maintenance = self._maintenance_intent(frame, observer, now)
         if maintenance is not None:
             return maintenance
+
+        if (
+            target is None
+            and mode_decision is not None
+            and str(getattr(mode_decision, "directive", "")) == "mine"
+        ):
+            mining = self._diamond_mine_intent(
+                frame, observer, state, now
+            )
+            if mining is not None:
+                return mining
 
         recovery_active = (
             state.escape_build_cell is not None
@@ -3381,6 +3416,66 @@ class BotBrain:
             ),
             priority=BotIntentPriority.TRAVERSAL,
             debug_role=str(role),
+        )
+
+    def _diamond_mine_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BrainState,
+        now: float,
+    ) -> BotIntent | None:
+        """Excavate a nearby surface ring without removing the bot's support.
+
+        Diamond Mine rolls only after committed melee terrain removals.  The
+        worker therefore chooses one solid top cell 1.5-2.5 blocks away, aims
+        at its center, and submits the ordinary validated melee action.  It
+        never digs its own support column, preventing the objective behavior
+        from recreating the old underground bot pile-up.
+        """
+
+        if now < state.next_breach_at:
+            return None
+        melee = self._preferred_melee_tool(observer)
+        if melee is None:
+            return None
+        base_x = int(math.floor(observer.position[0]))
+        base_y = int(math.floor(observer.position[1]))
+        surface_z = int(round(observer.position[2] + 2.25))
+        phase = (int(observer.player_id) + int(now * 2.0)) & 7
+        offsets = (
+            (2, 0), (2, 1), (0, 2), (-1, 2),
+            (-2, 0), (-2, -1), (0, -2), (1, -2),
+        )
+        cell = None
+        for offset in range(len(offsets)):
+            dx, dy = offsets[(phase + offset) % len(offsets)]
+            candidate = base_x + dx, base_y + dy, surface_z
+            if self.world.solid(*candidate):
+                cell = candidate
+                break
+        if cell is None:
+            return None
+        state.next_breach_at = now + max(
+            0.35,
+            float(getattr(C, "PICKAXE_SHOOT_INTERVAL", 0.4)),
+        )
+        target = tuple(float(value) + 0.5 for value in cell)
+        return self._intent(
+            frame,
+            now,
+            movement=MovementIntent(
+                crouch=True,
+                affordance=MovementAffordance.BREACH,
+            ),
+            look=LookIntent(target, visible=False),
+            tool_id=melee,
+            action=BotAction(
+                BotActionKind.MELEE,
+                tool_id=melee,
+                position=target,
+            ),
+            debug_role="diamond_mine_blocks",
         )
 
     def _stuck_recovery(

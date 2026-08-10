@@ -48,6 +48,16 @@ def make_world_manager():
     return world_manager
 
 
+def test_world_refresh_applies_the_same_canonical_gravity_as_state_data():
+    world_manager = WorldManager(ServerConfig())
+    world_manager.map = VXL(-1, b"", 0, 2)
+    world_manager.map_metadata.gravity = 26.0 / 64.0
+
+    world_manager._refresh_world()
+
+    assert world_manager.world.get_gravity() == 26.0 / 64.0
+
+
 class DummyConnection:
     def __init__(self, server=None, player=None):
         self.server = server

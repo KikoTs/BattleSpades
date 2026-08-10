@@ -15,6 +15,7 @@ from server.game_constants import (
     PLAYER_STANDING_POS_ABOVE_GROUND,
     TEAM1,
     TEAM2,
+    TEAM_NEUTRAL,
 )
 
 from .base_mode import BaseMode
@@ -298,9 +299,12 @@ class CTFMode(BaseMode):
 
         x0, x1, y0, y1, z0, z1 = self.base_bounds[team]
         packet = MinimapZone()
-        # The native HUD stores this byte as ``visible_team``. Sending both
-        # team-owned zones lets the same snapshot survive a later team switch.
-        packet.key = int(team)
+        # The native HUD stores this byte as ``visible_team``. CTF objectives
+        # are shared map knowledge: every player needs both coloured bases so
+        # they can route a stolen intel home and identify the enemy target.
+        # TEAM_NEUTRAL is the retail shared-visibility key; using ``team`` here
+        # hid the opposing base and left each side with only half the HUD.
+        packet.key = int(TEAM_NEUTRAL)
         packet.color = tuple(int(value) for value in self.server.teams[team].color)
         packet.A2018, packet.A2019 = x0, x1
         packet.A2020, packet.A2021 = y0, y1

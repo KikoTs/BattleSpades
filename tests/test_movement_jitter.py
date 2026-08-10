@@ -1008,8 +1008,8 @@ def test_jetpack_activation_sends_an_immediate_owner_row_off_cadence() -> None:
     assert sent == [(b"2:None", False), (b"3:0", True)]
 
 
-def test_jetpack_handoff_excludes_only_owner_row_during_active_thrust() -> None:
-    """Independent native clocks must not reconcile in the middle of flight."""
+def test_jetpack_handoff_bounds_active_flight_with_causal_checkpoints() -> None:
+    """Long flight cannot hide clock drift until one release-time hard snap."""
     sent: list[tuple[bytes, bool]] = []
     player = SimpleNamespace(
         id=0,
@@ -1067,22 +1067,29 @@ def test_jetpack_handoff_excludes_only_owner_row_during_active_thrust() -> None:
     server.loop_count = 4
     replication.broadcast_world_updates()
 
-    # Accepted input 12 reaches the fallback deadline, but the pack remains
-    # active. The owner row stays excluded; observer snapshots are unchanged.
+    # Accepted input 12 reaches the checkpoint boundary. Exactly one owner row
+    # is admitted before the next quiet window; observer snapshots remain on
+    # their ordinary cadence.
     player._input_receive_sequence = 12
     player.last_applied_input_loop = 104
     server.loop_count = 6
+    replication.broadcast_world_updates()
+
+    # A new snapshot at the same accepted input cannot duplicate the
+    # checkpoint because the next deadline was installed atomically.
+    server.loop_count = 8
     replication.broadcast_world_updates()
 
     assert sent == [
         (b"exclude=None:local=None:loop=2", False),
         (b"exclude=None:local=0:loop=3", True),
         (b"exclude=0:local=None:loop=4", False),
-        (b"exclude=0:local=None:loop=6", False),
+        (b"exclude=None:local=None:loop=6", False),
+        (b"exclude=0:local=None:loop=8", False),
     ]
 
 
-def test_active_jetpack_handoff_clears_after_pack_becomes_inactive() -> None:
+def test_active_jetpack_checkpoint_window_clears_after_pack_becomes_inactive() -> None:
     server = SimpleNamespace(
         config=SimpleNamespace(jetpack_owner_handoff_input_frames=2)
     )
@@ -1095,9 +1102,12 @@ def test_active_jetpack_handoff_clears_after_pack_becomes_inactive() -> None:
 
     replication._begin_jetpack_owner_handoff(player)
     player._input_receive_sequence = 100
+    assert replication._jetpack_owner_handoff_active(player) is False
+    # The same accepted input is inside the newly installed quiet window.
     assert replication._jetpack_owner_handoff_active(player) is True
 
     player.jetpack_active = False
+    player._input_receive_sequence = 102
     assert replication._jetpack_owner_handoff_active(player) is False
 
 

@@ -67,9 +67,12 @@
   values fail validation. `InitialInfo`, class/loadout normalization, tool
   gates, combat, movement multipliers, block health/wallets, spawn protection,
   crates, CTF, VIP, Zombie, and voting consume the shared catalog.
-- Multi-Hill, Territory Control, Diamond Mine, Demolition, and Occupation are
-  registered scene-safe skeletons in `modes/lobby_skeletons.py`. Objective
-  entities/scoring remain intentionally incomplete; do not call them playable.
+- Multi-Hill and Demolition are playable objective modes in
+  `modes/multi_hill.py` and `modes/demolition.py`. They use the recovered
+  MinimapZone, TeamProgress, LockToZone, rotation/build timers, and airstrike
+  behavior; authored UGC/legacy objective volumes take precedence over safe
+  stock-map fallbacks. Territory Control, Diamond Mine, and Occupation remain
+  scene-safe skeletons in `modes/lobby_skeletons.py`.
 - Plugin discovery now has an operator enable switch plus allow/deny lists.
 - Project documentation is consolidated into eight maintained documents:
   README, CONTRIBUTING, ADMIN_GUIDE, ARCHITECTURE, GAMEPLAY, PROTOCOL, RUNBOOK,
@@ -589,12 +592,13 @@ its packet and map-sync investigation history is still valuable.
 - IDA proved the retail client has no jetpack application ACK. WorldUpdate is
   the sole runtime writer of native `world.Player+0xB0`; ClientData has no
   active/fuel echo, and `ooo == (loop + 7) & 15` in 448/448 captured rows.
-- Replication now keeps only the active owner's correction row suppressed for
-  the finite fuel burn. A fixed 30-input expiry was unstable: one clean run
-  resumed mid-flight with a 0.230469-block pre-correction error. Observer
-  snapshots, hitboxes, fuel, and authoritative movement remain at 30 Hz. The
-  release transition then uses the bounded held-key/settle/ground gate with a
-  600-input cap.
+- Replication gives the active owner a 30-accepted-input quiet transition
+  window, then publishes one causal checkpoint per window during sustained
+  flight. Indefinite suppression let long Glide Jetpack burns accumulate the
+  independent client/server frame-clock error until release, where it could
+  cross retail's hard-SNAP threshold. Observer snapshots, hitboxes, fuel, and
+  authoritative movement remain at 30 Hz. The release transition still uses
+  the bounded held-key/settle/ground gate with a 600-input cap.
 - Retail artifact
   `logs/movement/engineer_exhaust_release_20260714/movement-stress-20260714T025324.993061Z.json`
   passed with 291 samples, 145 airborne, zero SNAP/ADJUST/rollback/stall, and

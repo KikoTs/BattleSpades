@@ -31,25 +31,41 @@ def entity_occupies_cell(registry, cell, *, ignore_entity_id=None) -> bool:
 
 
 def flare_is_supported(world, registry, cell, *, ignore_entity_id=None) -> bool:
-    """Flare blocks must touch terrain or another flare block.
+    """Return whether a flare component has a path to real terrain.
 
     Water placement remains legal: at the retail water plane (z=238), the
     engine's solid waterbed at z=239 satisfies this same contact rule.  This is
     deliberately independent of ``WorldManager.can_build``, whose ordinary
     voxel rules reject water placement.
+
+    Merely touching another flare is insufficient: after the only terrain
+    anchor is destroyed, a connected flare group must not support itself in a
+    cycle and remain floating forever.
     """
-    x, y, z = cell
-    for dx, dy, dz in _NEIGHBORS:
-        neighbor = (x + dx, y + dy, z + dz)
-        if world.get_solid(*neighbor):
-            return True
-        for ent in registry.all():
-            if not ent.alive or ent.kind != "flare_block":
-                continue
-            if ignore_entity_id is not None and ent.entity_id == ignore_entity_id:
-                continue
-            if flare_cell(ent) == neighbor:
+    flares_by_cell = {
+        flare_cell(ent): ent
+        for ent in registry.all()
+        if ent.alive
+        and ent.kind == "flare_block"
+        and (
+            ignore_entity_id is None
+            or int(ent.entity_id) != int(ignore_entity_id)
+        )
+    }
+    pending = [tuple(int(value) for value in cell)]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        x, y, z = current
+        for dx, dy, dz in _NEIGHBORS:
+            neighbor = (x + dx, y + dy, z + dz)
+            if world.get_solid(*neighbor):
                 return True
+            if neighbor in flares_by_cell and neighbor not in visited:
+                pending.append(neighbor)
     return False
 
 

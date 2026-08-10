@@ -13,6 +13,7 @@ from shared.packet import (  # noqa: E402
     PlayAmbientSound,
     PlayMusic,
     PlaySound,
+    StopSound,
 )
 from server import audio, voting  # noqa: E402
 
@@ -60,6 +61,29 @@ def test_play_sound_to_single_player():
     pkt = PlaySound(ByteReader(p.sent[0][1:]))
     assert pkt.sound_id == audio.SND_EVENT_POSITIVE
     assert not pkt.positioned
+
+
+def test_stop_sound_uses_retail_loop_identity_for_server_and_player():
+    srv = FakeServer()
+    player = FakePlayer(1)
+
+    audio.stop_sound(srv, 7)
+    audio.stop_sound_to(player, 9)
+
+    # Clean retail Python 2 packet.pyd vectors: 19 07 and 19 09.
+    assert srv.sent == [b"\x19\x07"]
+    assert player.sent == [b"\x19\x09"]
+    assert StopSound(ByteReader(srv.sent[0][1:])).loop_id == 7
+
+
+def test_stop_sound_rejects_ids_that_cannot_fit_on_wire():
+    for loop_id in (-1, 256):
+        try:
+            audio._stop_sound_bytes(loop_id)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range loop id was serialized")
 
 
 def test_play_timeout_music_sends_stop_then_specific_ending():

@@ -107,6 +107,36 @@ class MapEntity:
         return ent
 
 
+def send_create_entity_to(connection, map_entity: MapEntity) -> bool:
+    """Reveal one live entity exactly once to one retail GameScene.
+
+    Objective entities can be created before a joining client reaches the
+    GameScene.  Keeping the per-connection known-id check here lets the normal
+    world reveal and a mode-specific safety replay share one implementation
+    without ever sending a duplicate CreateEntity for the same id.
+    """
+
+    if not bool(getattr(map_entity, "alive", True)):
+        return False
+    if not bool(getattr(map_entity, "wire_visible", True)):
+        return False
+    entity_id = int(map_entity.entity_id)
+    known = getattr(connection, "known_entity_ids", None)
+    if known is None:
+        known = set()
+        connection.known_entity_ids = known
+    if entity_id in known:
+        return False
+
+    from shared.packet import CreateEntity
+
+    packet = CreateEntity()
+    packet.set_entity(map_entity.to_wire_entity())
+    connection.send(bytes(packet.generate()), reliable=True)
+    known.add(entity_id)
+    return True
+
+
 class EntityRegistry:
     """Owns placed map entities and a monotonic id allocator."""
 

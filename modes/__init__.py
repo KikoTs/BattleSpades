@@ -12,13 +12,11 @@ from .tdm import TDMMode
 from .arena import ArenaMode
 from .vip import VIPMode
 from .zombie import ZombieMode
-from .lobby_skeletons import (
-    DemolitionMode,
-    DiamondMineMode,
-    MultiHillMode,
-    OccupationMode,
-    TerritoryControlMode,
-)
+from .multi_hill import MultiHillMode
+from .demolition import DemolitionMode
+from .diamond_mine import DiamondMineMode
+from .occupation import OccupationMode
+from .territory_control import TerritoryControlMode
 
 
 # Mode registry

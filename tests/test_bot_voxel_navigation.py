@@ -1,13 +1,16 @@
 """Regression tests for semantic bot traversal of the live voxel world."""
 
 import asyncio
+from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 import math
 import random
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import shared.constants as C
 
 from modes.tdm import TDMMode
@@ -26,6 +29,8 @@ from server.bot_ai.messages import (
     WorldDelta,
 )
 from server.bot_ai.navigation_atlas import NavigationAtlas
+from server.bot_ai.simple_navigation import SimpleVoxelWorld
+from server.bot_ai.simple_worker import SimpleBotBrain
 from server.bot_ai.voxel_navigation import VoxelActionPlanner, VoxelTerrain
 from server.bot_ai.worker import BotBrain, WorkerVoxelWorld, _BrainState
 from server.config import ServerConfig
@@ -779,6 +784,346 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("seed", (0, 1, 7, 23))
+def test_mayan_production_bots_do_not_collapse_into_green_tunnel(
+    seed: int,
+) -> None:
+    """Replay the reported six-green-bot pile on the canonical Mayan VXL."""
+
+    async def scenario() -> None:
+        random_state = random.getstate()
+        random.seed(seed)
+        try:
+            config = ServerConfig(
+                default_map="MayanJungle",
+                default_mode="tdm",
+                maps_path="maps",
+            )
+            config.bots.seed = seed
+            config.bots.max_bots = 12
+            server = BattleSpadesServer(config)
+            assert server.world_manager.load_map("MayanJungle")
+            server.mode = TDMMode(server)
+            await server.mode.on_mode_start()
+            director = BotDirector(server, supervisor=SimpleNamespace())
+            for player_id in range(12):
+                bot = await director.add_bot(
+                    team=TEAM1 if player_id % 2 == 0 else TEAM2,
+                    name=f"MayanRegression{player_id}",
+                    class_id=int(C.CLASS_SOLDIER),
+                )
+                assert bot is not None
+
+            players = tuple(director.bots)
+            green = tuple(
+                player for player in players if int(player.team) == TEAM2
+            )
+            starts = {player.id: player.position for player in players}
+            assert len(green) == 6
+            assert all(
+                server.world_manager.spawn_position_is_safe(player.position)
+                for player in players
+            )
+
+            worker_world = SimpleVoxelWorld()
+            worker_world.load(director._make_map_snapshot(current=False))
+            brain = SimpleBotBrain(worker_world, decision_hz=8.0)
+            pending_deltas: dict[int, list[VoxelChange]] = {}
+
+            def remember_delta(x, y, z, solid, color, version) -> None:
+                pending_deltas.setdefault(int(version), []).append(
+                    VoxelChange(x, y, z, solid, color)
+                )
+
+            subscription = server.world_manager.subscribe_mutations(
+                remember_delta
+            )
+            previous = dict(starts)
+            position_history = {
+                player.id: deque(
+                    (tuple(player.position),),
+                    maxlen=60 * 8 + 1,
+                )
+                for player in green
+            }
+            terrain_events: deque[tuple[int, int, int]] = deque()
+            stall_ticks = {player.id: 0 for player in players}
+            max_stall_ticks = {player.id: 0 for player in players}
+            stall_report: dict[int, dict[str, object]] = {}
+            congestion_ticks = 0
+            max_congestion_ticks = 0
+            congestion_report: dict[str, object] = {}
+            base = time.monotonic() + 1.0
+            simulated_clock = [base]
+            frame_id = 0
+            monotonic_patcher = patch.object(
+                time,
+                "monotonic",
+                side_effect=lambda: simulated_clock[0],
+            )
+            monotonic_patcher.start()
+
+            try:
+                for tick in range(60 * 35):
+                    now = base + tick / 60.0
+                    simulated_clock[0] = now
+                    if tick % 8 == 0:
+                        snapshots = director._snapshot_players()
+                        entities = director._snapshot_entities()
+                        objectives = director._snapshot_objectives()
+                        for player in players:
+                            runtime = director._runtime[player.id]
+                            frame_id += 1
+                            intent = brain.decide(
+                                PerceptionFrame(
+                                    frame_id=frame_id,
+                                    map_epoch=0,
+                                    mode_epoch=0,
+                                    topology_version=(
+                                        server.world_manager.topology_version
+                                    ),
+                                    observer_id=player.id,
+                                    observer_generation=runtime.generation,
+                                    created_at=now,
+                                    mode_id="tdm",
+                                    players=snapshots,
+                                    profile=runtime.profile,
+                                    entities=entities,
+                                    objectives=objectives,
+                                    mode_phase=director._mode_phase(),
+                                )
+                            )
+                            if intent is not None:
+                                runtime.intent = intent
+
+                    server.loop_count += 1
+                    motor_phase = server.loop_count % 6
+                    for player in players:
+                        if int(player.id) % 6 != motor_phase:
+                            continue
+                        director._apply_motor(
+                            director._runtime[player.id],
+                            now,
+                            6.0 / 60.0,
+                        )
+                    await server.simulation_runtime._simulate_players()
+                    server.world_mutations.commit_ready()
+                    server.prefab_actions.tick()
+                    for version, changes in sorted(pending_deltas.items()):
+                        worker_world.apply(
+                            WorldDelta(
+                                map_epoch=0,
+                                topology_version=version,
+                                changed_cells=tuple(changes),
+                            )
+                        )
+                        terrain_events.extend(
+                            (tick, int(change.x), int(change.y))
+                            for change in changes
+                        )
+                    pending_deltas.clear()
+                    while (
+                        terrain_events
+                        and terrain_events[0][0] < tick - 60 * 2
+                    ):
+                        terrain_events.popleft()
+
+                    for player in players:
+                        runtime = director._runtime[player.id]
+                        intent = runtime.intent
+                        requested = (
+                            player.alive
+                            and player.spawned
+                            and intent is not None
+                            and intent.expires_at > now
+                            and math.hypot(
+                                intent.movement.direction[0],
+                                intent.movement.direction[1],
+                            ) > 0.1
+                        )
+                        moved = math.hypot(
+                            player.x - previous[player.id][0],
+                            player.y - previous[player.id][1],
+                        )
+                        stall_ticks[player.id] = (
+                            stall_ticks[player.id] + 1
+                            if requested and moved < 1e-5
+                            else 0
+                        )
+                        if stall_ticks[player.id] > max_stall_ticks[player.id]:
+                            max_stall_ticks[player.id] = stall_ticks[player.id]
+                            stall_report[player.id] = {
+                                "tick": tick,
+                                "ticks": stall_ticks[player.id],
+                                "position": tuple(
+                                    round(value, 3)
+                                    for value in player.position
+                                ),
+                                "role": (
+                                    intent.debug_role
+                                    if intent is not None else "idle"
+                                ),
+                                "affordance": (
+                                    intent.movement.affordance.value
+                                    if intent is not None else "walk"
+                                ),
+                                "direction": (
+                                    intent.movement.direction
+                                    if intent is not None else None
+                                ),
+                                "path": (
+                                    tuple(
+                                        tuple(round(value, 2) for value in point)
+                                        for point in intent.debug_path[:3]
+                                    )
+                                    if intent is not None else ()
+                                ),
+                                "grounded": bool(player.grounded),
+                                "wade": bool(player.wade),
+                                "local_solids": tuple(
+                                    (dx, dy, dz)
+                                    for dx in (-1, 0, 1)
+                                    for dy in (-1, 0, 1)
+                                    for dz in (-2, -1, 0, 1, 2)
+                                    if worker_world.solid(
+                                        int(math.floor(player.x)) + dx,
+                                        int(math.floor(player.y)) + dy,
+                                        int(math.floor(player.z + 2.25)) + dz,
+                                    )
+                                ),
+                            }
+                        previous[player.id] = player.position
+                        if player.id in position_history:
+                            position_history[player.id].append(
+                                tuple(player.position)
+                            )
+
+                    dense = []
+                    if tick >= 60 * 15:
+                        for anchor in green:
+                            cohort = [
+                                player for player in green
+                                if math.hypot(
+                                    player.x - anchor.x,
+                                    player.y - anchor.y,
+                                ) <= 7.0
+                            ]
+                            if len(cohort) > len(dense):
+                                dense = cohort
+                    far = []
+                    for player in dense:
+                        intent = director._runtime[player.id].intent
+                        if intent is None or intent.debug_goal is None:
+                            continue
+                        if math.hypot(
+                            intent.debug_goal[0] - player.x,
+                            intent.debug_goal[1] - player.y,
+                        ) >= 40.0:
+                            far.append(player)
+                    stagnant = [
+                        player
+                        for player in far
+                        if (
+                            len(position_history[player.id]) >= 60 * 8
+                            and math.hypot(
+                                player.x
+                                - position_history[player.id][0][0],
+                                player.y
+                                - position_history[player.id][0][1],
+                            )
+                            <= 3.0
+                        )
+                    ]
+                    nearby_terrain_progress = any(
+                        any(
+                            math.hypot(
+                                float(change_x) - player.x,
+                                float(change_y) - player.y,
+                            )
+                            <= 9.0
+                            for player in dense
+                        )
+                        for _change_tick, change_x, change_y in terrain_events
+                    )
+                    if (
+                        len(dense) >= 4
+                        and len(far) >= 3
+                        and len(stagnant) >= 3
+                        and not nearby_terrain_progress
+                    ):
+                        congestion_ticks += 1
+                        if congestion_ticks > max_congestion_ticks:
+                            max_congestion_ticks = congestion_ticks
+                            congestion_report = {
+                                "tick": tick,
+                                "ids": tuple(player.id for player in dense),
+                                "positions": {
+                                    player.id: tuple(
+                                        round(value, 2)
+                                        for value in player.position
+                                    )
+                                    for player in dense
+                                },
+                                "roles": {
+                                    player.id: director._runtime[
+                                        player.id
+                                    ].intent.debug_role
+                                    for player in dense
+                                },
+                                "displacement": {
+                                    player.id: round(
+                                        math.hypot(
+                                            player.x
+                                            - position_history[player.id][0][0],
+                                            player.y
+                                            - position_history[player.id][0][1],
+                                        ),
+                                        3,
+                                    )
+                                    for player in dense
+                                },
+                            }
+                    else:
+                        congestion_ticks = 0
+            finally:
+                monotonic_patcher.stop()
+                server.world_manager.unsubscribe_mutations(subscription)
+
+            moved = {
+                player.id: math.dist(starts[player.id], player.position)
+                for player in green
+            }
+            assert max_congestion_ticks < 60 * 8, congestion_report
+            worst_stall_id = max(
+                max_stall_ticks,
+                key=max_stall_ticks.__getitem__,
+            )
+            worst_details = stall_report.get(worst_stall_id, {})
+            # This accelerated harness refreshes motors in production phases
+            # without wall-clock worker interleaving, so a collision timeout
+            # can span two synthetic route leases. The real-time smoke below
+            # retains the stricter five-second gate; here reject only a
+            # persistent ten-second navigation wedge while the team-progress
+            # oracle independently catches the reported eight-second pile.
+            assert max_stall_ticks[worst_stall_id] < 60 * 10, (
+                f"bot={worst_stall_id} "
+                f"ticks={max_stall_ticks[worst_stall_id]} "
+                f"position={worst_details.get('position')} "
+                f"role={worst_details.get('role')} "
+                f"affordance={worst_details.get('affordance')} "
+                f"direction={worst_details.get('direction')} "
+                f"path={worst_details.get('path')} "
+                f"grounded={worst_details.get('grounded')} "
+                f"wade={worst_details.get('wade')} "
+                f"local_solids={worst_details.get('local_solids')}"
+            )
+            assert sum(distance > 60.0 for distance in moved.values()) >= 5, moved
+        finally:
+            random.setstate(random_state)
+
+    asyncio.run(scenario())
+
+
 def test_remote_terrain_delta_does_not_discard_cached_water_escape() -> None:
     terrain = VoxelTerrain(
         _solid_columns(
@@ -1054,6 +1399,13 @@ def test_live_motor_rejects_open_water_ahead_for_a_dry_bot() -> None:
 
     assert BotDirector._waypoint_is_live(runtime, (1.0, 0.0, 0.0)) is False
 
+    runtime.waypoint_probe_key = None
+    assert BotDirector._waypoint_is_live(
+        runtime,
+        (1.0, 0.0, 0.0),
+        MovementAffordance.SWIM,
+    ) is True
+
 
 def test_live_motor_allows_a_wading_bot_to_follow_its_escape_flow() -> None:
     world = SimpleNamespace(
@@ -1313,6 +1665,32 @@ def test_live_motor_does_not_rotate_a_blocked_jump_landing(monkeypatch) -> None:
     assert probes == [(1.0, 0.0, 0.0)]
 
 
+def test_live_motor_can_align_a_wading_jump_with_shore_opening(
+    monkeypatch,
+) -> None:
+    probes = []
+
+    def live_probe(_runtime, direction, _affordance):
+        probes.append(tuple(direction))
+        return float(direction[1]) > 0.95
+
+    monkeypatch.setattr(
+        BotDirector,
+        "_waypoint_is_live",
+        staticmethod(live_probe),
+    )
+    player = SimpleNamespace(id=1, wade=True)
+
+    direction = BotDirector._live_movement_direction(
+        SimpleNamespace(player=player, generation=1),
+        (-1.0, 0.0, 0.0),
+        MovementAffordance.JUMP,
+    )
+
+    assert direction[1] > 0.95
+    assert len(probes) > 1
+
+
 def test_live_motor_reuses_short_walk_probe_lease(monkeypatch) -> None:
     """The 60 Hz motor must not repeat an unchanged VXL probe every tick."""
 
@@ -1518,6 +1896,59 @@ def test_wading_jump_request_remains_held_for_native_swimming() -> None:
 
     server.loop_count = 112
     director._apply_motor(runtime, now + 12.0 / 60.0, 1.0 / 60.0)
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+
+def test_swim_affordance_supplies_native_ascent_without_tactical_jump() -> None:
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    director = BotDirector(server, supervisor=SimpleNamespace())
+    bot = asyncio.run(
+        director.add_bot(
+            team=TEAM1,
+            name="StraightSwimBot",
+            class_id=int(C.CLASS_SOLDIER),
+        )
+    )
+    assert bot is not None
+    bot.wade = True
+    runtime = director._runtime[bot.id]
+    now = time.monotonic()
+    runtime.intent = BotIntent(
+        bot_id=bot.id,
+        bot_generation=runtime.generation,
+        frame_id=115,
+        map_epoch=0,
+        mode_epoch=0,
+        topology_version=server.world_manager.topology_version,
+        created_at=now,
+        expires_at=now + 1.0,
+        movement=MovementIntent(
+            direction=(1.0, 0.0, 0.0),
+            jump=False,
+            affordance=MovementAffordance.SWIM,
+        ),
+    )
+
+    server.loop_count = 100
+    director._apply_motor(runtime, now, 1.0 / 60.0)
+
+    assert runtime.intent.movement.jump is False
+    assert runtime.movement_input is not None
+    assert runtime.movement_input[4] is True
+
+    runtime.intent = replace(
+        runtime.intent,
+        frame_id=116,
+        movement=replace(
+            runtime.intent.movement,
+            affordance=MovementAffordance.BREACH,
+        ),
+    )
+    server.loop_count = 101
+    director._apply_motor(runtime, now + 1.0 / 60.0, 1.0 / 60.0)
+    assert runtime.intent.movement.jump is False
     assert runtime.movement_input is not None
     assert runtime.movement_input[4] is True
 

@@ -1,6 +1,7 @@
 import logging
 import queue
 import asyncio
+import sys
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -8,7 +9,11 @@ from unittest.mock import patch
 
 from shared.bytes import ByteReader
 from shared.packet import ChatMessage, LocalisedMessage, WorldUpdate
-from server.connection import Connection, logger as connection_logger
+from server.connection import (
+    Connection,
+    logger as connection_logger,
+    outbound_packet_is_safe,
+)
 from server.config import ServerConfig
 from server.main import BattleSpadesServer
 from server.logging_runtime import NonBlockingQueueHandler
@@ -189,6 +194,39 @@ def test_literal_packet_framing_round_trips_large_world_update():
 
     assert lzf_decompress(encoded) == payload
     assert len(encoded) == len(payload) + (len(payload) + 31) // 32
+
+
+def test_unused_entity_updates_packet_cannot_reach_retail_transport(
+    monkeypatch,
+):
+    """Packet 3 without its short count caused the reported VIP client crash."""
+
+    class _Packet:
+        def __init__(self, data, flags):
+            self.data = bytes(data)
+            self.flags = int(flags)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "enet",
+        SimpleNamespace(PACKET_FLAG_RELIABLE=1, Packet=_Packet),
+    )
+    peer = _Peer()
+    server = SimpleNamespace(
+        _stopping=False,
+        config=SimpleNamespace(log_suppress_packets=set(), packet_trace=False),
+    )
+    connection = Connection(peer, server)
+
+    malformed = b"\x03\x01\x00\x00\x00"
+    assert outbound_packet_is_safe(malformed) is False
+    connection.send(malformed)
+    assert peer.sent == []
+
+    world_update = b"\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    assert outbound_packet_is_safe(world_update) is True
+    connection.send(world_update)
+    assert len(peer.sent) == 1
 
 
 def test_production_defaults_admit_fifty_players_with_headroom():

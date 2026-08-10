@@ -58,6 +58,8 @@ def _server_player(tool, loadout):
         int(C.DYNAMITE_TOOL): int(C.CLASS_MINER),
         int(C.BLOCK_SUCKER_TOOL): int(C.CLASS_MINER),
         int(C.ROCKET_TURRET_TOOL): int(C.CLASS_ENGINEER),
+        int(C.LANDMINE_TOOL): int(C.CLASS_SCOUT),
+        int(C.MG_TOOL): int(C.CLASS_SOLDIER),
         int(C.MEDPACK_TOOL): int(C.CLASS_MEDIC),
         int(C.RADAR_STATION_TOOL): int(C.CLASS_SCOUT),
         int(C.DISGUISE_TOOL): int(C.CLASS_ENGINEER),
@@ -184,6 +186,83 @@ def test_human_placed_rocket_turret_acquires_and_fires_at_an_enemy():
     assert turret.target_id == enemy.id
     assert turret.ammo == int(C.ROCKET_TURRET_AMMO) - 1
     assert len(server.projectile_engine.projectiles) == 1
+
+
+def test_packet_placed_explosives_act_immediately_when_support_is_removed():
+    """Exercise packet decode, placement, VXL mutation, blast, and teardown."""
+
+    placements = (
+        (
+            C.DYNAMITE_TOOL,
+            bytes([1]) + struct.pack("<IHHHB", 10, 101, 100, 62, 3),
+            C.DYNAMITE_ENTITY,
+        ),
+        (
+            C.LANDMINE_TOOL,
+            bytes([89]) + struct.pack("<IBHHH", 10, 0, 101, 100, 62),
+            C.LANDMINE_ENTITY,
+        ),
+        (
+            C.C4_TOOL,
+            bytes([92]) + struct.pack("<IHHHB", 10, 101, 100, 62, 2),
+            C.C4_ENTITY,
+        ),
+    )
+    for tool, packet, entity_type in placements:
+        server, player, _connection = _server_player(tool, [tool])
+        blasts = []
+        server._apply_blast = lambda *args, **kwargs: blasts.append(
+            (args, kwargs)
+        )
+
+        asyncio.run(PacketHandler(server).handle(player, packet))
+        entity = next(
+            item for item in server.entity_registry.all()
+            if item.type == int(entity_type)
+        )
+        assert entity.support_cell == (101, 100, 62)
+        support = entity.support_cell
+
+        assert server.world_manager.destroy_blocks([support]) == [support]
+        assert len(blasts) == 1
+        assert server.entity_registry.get(entity.entity_id) is None
+
+
+def test_packet_placed_turrets_and_machine_guns_explode_on_support_loss():
+    placements = (
+        (
+            C.ROCKET_TURRET_TOOL,
+            bytes([88])
+            + struct.pack("<IBHHHh", 10, 0, 102, 100, 60, 0),
+            C.ROCKET_TURRET_ENTITY,
+        ),
+        (
+            C.MG_TOOL,
+            bytes([87])
+            + struct.pack("<IBHHHh", 10, 0, 102, 100, 60, 0),
+            C.MACHINE_GUN,
+        ),
+    )
+    for tool, packet, entity_type in placements:
+        server, player, _connection = _server_player(tool, [tool])
+        blasts = []
+        server._apply_blast = lambda *args, **kwargs: blasts.append(
+            (args, kwargs)
+        )
+
+        asyncio.run(PacketHandler(server).handle(player, packet))
+        entity = next(
+            item for item in server.entity_registry.all()
+            if item.type == int(entity_type)
+        )
+        assert entity.support_cell is not None
+        support = entity.support_cell
+
+        assert server.world_manager.destroy_blocks([support]) == [support]
+        assert len(blasts) == 1
+        assert server.entity_registry.get(entity.entity_id) is None
+        if int(entity_type) == int(C.ROCKET_TURRET_ENTITY):
+            assert entity.entity_id not in server.rocket_turrets
 
 
 def test_team_change_retires_owner_turret_before_allegiance_changes():

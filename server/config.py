@@ -65,6 +65,9 @@ class BotConfig:
     main_thread_budget_ms: float = 0.75
     seed: int = 0
     debug_visualization: bool = False
+    # Recycle the isolated planner after this many completed game boundaries.
+    # Zero disables the periodic deep reset; per-round state still resets.
+    clean_slate_games: int = 3
     configured: bool = False
 
 
@@ -352,9 +355,10 @@ class ServerConfig:
     # WorldUpdate is the retail owner's only jetpack-active signal.  Because
     # ClientData has no application acknowledgement, ordinary position rows
     # are withheld after the reliable transition row while GameScene crosses
-    # that asynchronous boundary. Active thrust remains owner-row-free until
-    # release; this frame count is the inactive-transition safety fallback.
-    # Observer rows remain unaffected.
+    # that asynchronous boundary. During sustained flight this accepted-input
+    # interval also bounds periodic causal checkpoints so a long Glide Jetpack
+    # burn cannot accumulate into one release-time hard snap. Observer rows
+    # remain unaffected.
     jetpack_owner_handoff_input_frames: int = 30
     # Fuel exhaustion while SPACE remains held changes the native client back
     # to ballistic movement asynchronously. Keep the owner row quiet through
@@ -661,6 +665,10 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.bots.seed = int(b.get("seed", config.bots.seed))
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
+        )
+        config.bots.clean_slate_games = max(
+            0,
+            int(b.get("clean_slate_games", config.bots.clean_slate_games)),
         )
 
     if "steam" in data:

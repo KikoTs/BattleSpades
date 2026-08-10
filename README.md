@@ -100,7 +100,7 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.3-alpha.8` is packaged as six standalone server archives. Each archive
+`0.0.3-alpha.9` is packaged as six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 
@@ -295,7 +295,7 @@ max_players = 32
 tick_rate = 60          # server simulation rate — keep at 60 (client-paired, physics-calibrated)
 
 [game]
-default_mode = "tdm"    # tdm | ctf | cctf | arena | vip | zombie
+default_mode = "tdm"    # tdm | ctf | cctf | zom | vip | mh | tc | dia | dem | oc
 default_map = "ArcticBase"
 respawn_time = 5.0
 friendly_fire = false
@@ -313,6 +313,7 @@ decision_hz = 8
 path_requests_per_second = 24
 main_thread_budget_ms = 0.75
 seed = 0
+clean_slate_games = 3  # recycle only the isolated planner every 3 games
 
 [teams]
 team1_name = "TEAM1_COLOR"   # string-table IDs the client localizes (renders "Blue"/"Green")
@@ -334,8 +335,24 @@ python run_server.py
 ```
 
 One executable can supervise several isolated configs. The included
-[`fleet.toml`](fleet.toml) launches TDM, CTF, Classic CTF, and Zombie profiles;
-VIP is present but disabled until its `enabled` flag is changed:
+[`fleet.toml`](fleet.toml) launches all ten recovered public Match Lobby modes:
+
+| Server | Mode | Game UDP | Query UDP |
+|---|---:|---:|---:|
+| Official TDM | `tdm` | 27015 | 27016 |
+| Official CTF | `ctf` | 27017 | 27018 |
+| Official Classic CTF | `cctf` | 27019 | 27020 |
+| Official Zombie | `zom` | 27021 | 27022 |
+| Official VIP | `vip` | 27023 | 27024 |
+| Official Multi-Hill | `mh` | 27025 | 27026 |
+| Official Territory Control | `tc` | 27027 | 27028 |
+| Official Diamond Mine | `dia` | 27029 | 27030 |
+| Official Demolition | `dem` | 27031 | 27032 |
+| Official Occupation | `oc` | 27033 | 27034 |
+
+Every profile uses the recovered retail-compatible map rotation and duration.
+Backfill is capped at six bots per empty instance so launching the complete
+fleet does not immediately allocate the old 120-bot worst case:
 
 ```powershell
 # Source checkout
@@ -345,15 +362,15 @@ py -3.12 run_server.py --fleet fleet.toml
 .\BattleSpades.exe --fleet fleet.toml
 ```
 
-Each [`configs/`](configs/) profile owns a unique game/query port pair and log
-file. Config paths are resolved beside the fleet manifest, including paths
-containing non-English characters. The launcher validates every config and
-rejects duplicate names or UDP ports before starting anything. Ctrl+C sends a
-clean `shutdown` command to every child and terminates only a child that
-exceeds the configured shutdown timeout. Public registry and Steam publishing
-are disabled in the examples; enable them per profile only after assigning
-unique public identities and forwarding each listed UDP port (plus its query
-port when Steam is enabled).
+Each [`configs/`](configs/) profile owns a unique game/query/Steam-init port
+set and log file. Config paths are resolved beside the fleet manifest,
+including paths containing non-English characters. The launcher validates
+every config and rejects duplicate names or game UDP ports before starting
+anything. Ctrl+C sends a clean `shutdown` command to every child and terminates
+only a child that exceeds the configured shutdown timeout. Public Revival
+registry and Steam publishing are disabled in the examples; enable them per
+profile only after assigning unique public identities and forwarding the
+listed game/query ports plus Steam-init UDP ports 8766–8775.
 
 To host directly, forward **UDP `27015`** (or your configured game port) and set
 a real `admin.password`. The ENet socket answers direct A2S/LAN queries. The

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from shared.bytes import ByteReader
+from shared.packet import StateData
 from server.builders.state_data import build_state_data
 from server.config import ServerConfig
 from server.game_constants import TEAM1, TEAM2
@@ -30,6 +32,18 @@ def test_state_data_uses_active_map_fog():
     packet = build_state_data(_server((69, 76, 39)), player_id=7)
 
     assert packet.fog_color == (69, 76, 39)
+
+
+def test_state_data_uses_the_authoritative_map_gravity():
+    server = _server((69, 76, 39))
+    server.world_manager.map_metadata.gravity = 26.0 / 64.0
+
+    packet = build_state_data(server, player_id=7)
+
+    assert packet.gravity == 26.0 / 64.0
+    wire = bytes(packet.generate())
+    decoded = StateData(ByteReader(wire[1:]))
+    assert decoded.gravity == 26.0 / 64.0
 
 
 def test_runtime_admin_fog_override_wins_over_map_metadata():

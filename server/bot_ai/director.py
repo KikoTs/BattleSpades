@@ -19,6 +19,7 @@ from server.game_constants import (
     SPADE_TOOL_IDS,
     TEAM1,
     TEAM2,
+    TEAM_NEUTRAL,
     WEAPON_PROFILES,
 )
 
@@ -101,6 +102,9 @@ _PERCEPTION_PUBLISH_BUDGET_SHARE = 0.55
 _MAX_PERCEPTION_ENTITIES = 192
 _WALK_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0)
+)
+_WATER_STEER_ANGLES = tuple(
+    math.radians(value) for value in (20.0, 40.0, 60.0, 80.0)
 )
 _DEFAULT_CLASSES = tuple(
     int(value)
@@ -336,9 +340,12 @@ class BotDirector:
         )
         self._map_signature = None
         self._mode_signature = None
+        self._games_since_deep_reset = 0
+        self._clean_slate_resets = 0
         self._next_population_at = 0.0
         self._started = False
         self._mutation_subscription = None
+        self._mutation_world = None
         self._wall_probes_this_tick = 0
         self._movement_probes_this_tick = 0
         self._pending_gateway_actions: dict[
@@ -364,9 +371,7 @@ class BotDirector:
         self._started = True
         self._refresh_epochs(force=True)
         self.supervisor.start(self._make_map_snapshot(current=False))
-        subscribe = getattr(self.server.world_manager, "subscribe_mutations", None)
-        if callable(subscribe):
-            self._mutation_subscription = subscribe(self._on_world_mutation)
+        self._bind_world_mutations()
 
         if initial_count is None:
             population_mode = str(
@@ -386,13 +391,170 @@ class BotDirector:
 
         for bot in list(self.bots):
             await self.remove_bot(bot, force=True)
-        unsubscribe = getattr(self.server.world_manager, "unsubscribe_mutations", None)
-        if callable(unsubscribe) and self._mutation_subscription is not None:
-            unsubscribe(self._mutation_subscription)
-        self._mutation_subscription = None
+        self._unbind_world_mutations()
         self.supervisor.close()
         self._pending_gateway_actions.clear()
         self._started = False
+
+    def rebind_after_match_transition(self) -> None:
+        """Move retained bots into the replacement map and reset their AI epoch.
+
+        ENet players are detached during a full scene rollover, but peerless
+        bots deliberately retain their ids and profiles.  Their Character and
+        worker state are map-owned nevertheless: carrying either across the
+        swap leaves the bot at an old-map coordinate and keeps terrain edits
+        subscribed to the retired VXL.
+
+        This boundary runs after the replacement mode has initialized and
+        before any client receives its new StateData/player roster.
+        """
+
+        if not self._started:
+            return
+
+        self._bind_world_mutations()
+        self._clear_local_timeline()
+        self._refresh_epochs()
+
+        now = time.monotonic()
+        perception_hz = max(
+            1.0, float(getattr(self._config, "perception_hz", 10))
+        )
+        maximum = max(1, int(getattr(self._config, "max_bots", 12)))
+        for index, bot in enumerate(tuple(self.bots)):
+            connection = getattr(bot, "connection", None)
+            if connection is not None:
+                connection.in_game = True
+                known_entities = getattr(connection, "known_entity_ids", None)
+                if known_entities is not None:
+                    known_entities.clear()
+
+            self.server.round_lifecycle.respawn_player(bot)
+            self._replace_runtime(
+                bot,
+                now=now,
+                phase=(float(index) / perception_hz) / maximum,
+            )
+
+        self._record_game_boundary()
+
+        logger.info(
+            "Re-anchored %d bot(s) for map=%s epoch=%d",
+            len(self.bots),
+            getattr(self.server.world_manager, "map_name", ""),
+            self._map_epoch,
+        )
+
+    def reset_after_round_restart(self) -> None:
+        """Start a same-map game with no path, coordination, or motor history.
+
+        A same-map restart retains the mode and VXL objects, so signature-based
+        epoch detection cannot see it. Advance the decision epoch explicitly,
+        discard queued old-game work, and replace every authoritative motor
+        record after the ordinary respawn path has created the new bodies.
+        """
+
+        if not self._started:
+            return
+        self._mode_epoch += 1
+        self._clear_local_timeline()
+        discard = getattr(self.supervisor, "discard_timeline", None)
+        if callable(discard):
+            discard()
+
+        now = time.monotonic()
+        perception_hz = max(
+            1.0, float(getattr(self._config, "perception_hz", 10))
+        )
+        maximum = max(1, int(getattr(self._config, "max_bots", 12)))
+        for index, bot in enumerate(tuple(self.bots)):
+            self._replace_runtime(
+                bot,
+                now=now,
+                phase=(float(index) / perception_hz) / maximum,
+            )
+        self._record_game_boundary()
+        logger.info(
+            "Reset %d bot(s) for same-map game epoch=%d",
+            len(self.bots),
+            self._mode_epoch,
+        )
+
+    def _clear_local_timeline(self) -> None:
+        """Discard server-thread caches stamped against the previous game."""
+
+        self._pending_gateway_actions.clear()
+        self._perception_cache_until = 0.0
+        self._perception_players = ()
+        self._perception_entities = ()
+        self._perception_objectives = ()
+        self._perception_build_players = ()
+        self._perception_build_snapshots = []
+        self._perception_build_index = 0
+
+    def _replace_runtime(
+        self,
+        bot: "Player",
+        *,
+        now: float,
+        phase: float,
+    ) -> None:
+        """Replace all per-game controller state for one retained bot life."""
+
+        previous = self._runtime.get(int(bot.id))
+        if previous is None:
+            return
+        yaw = math.atan2(float(bot.o_y), float(bot.o_x))
+        runtime = _RuntimeBot(
+            player=bot,
+            generation=previous.generation,
+            profile=previous.profile,
+            motor=_AimMotor(yaw=yaw),
+            rng=random.Random(self._rng.randrange(0, 2**31)),
+        )
+        runtime.next_perception_at = float(now) + max(0.0, float(phase))
+        self._runtime[int(bot.id)] = runtime
+
+    def _record_game_boundary(self) -> None:
+        """Recycle the isolated planner at the configured clean-slate cadence."""
+
+        self._games_since_deep_reset += 1
+        interval = max(
+            0,
+            int(getattr(self._config, "clean_slate_games", 3)),
+        )
+        if interval <= 0 or self._games_since_deep_reset < interval:
+            return
+        restart = getattr(self.supervisor, "request_restart", None)
+        if callable(restart):
+            restart()
+            self._clean_slate_resets += 1
+            logger.info(
+                "Recycling isolated bot planner after %d game(s)", interval
+            )
+        self._games_since_deep_reset = 0
+
+    def _bind_world_mutations(self) -> None:
+        """Subscribe exactly once to the currently authoritative VXL world."""
+
+        world = self.server.world_manager
+        if self._mutation_world is world and self._mutation_subscription is not None:
+            return
+        self._unbind_world_mutations()
+        subscribe = getattr(world, "subscribe_mutations", None)
+        if callable(subscribe):
+            self._mutation_subscription = subscribe(self._on_world_mutation)
+            self._mutation_world = world
+
+    def _unbind_world_mutations(self) -> None:
+        """Release the listener from the world that issued its token."""
+
+        world = self._mutation_world
+        unsubscribe = getattr(world, "unsubscribe_mutations", None)
+        if callable(unsubscribe) and self._mutation_subscription is not None:
+            unsubscribe(self._mutation_subscription)
+        self._mutation_subscription = None
+        self._mutation_world = None
 
     async def add_bot(
         self,
@@ -1196,6 +1358,117 @@ class BotDirector:
             return ()
         result: list[ObjectiveSnapshot] = []
 
+        active_hills = getattr(mode, "active_zones", None)
+        hill_owners = getattr(mode, "zone_owner", None)
+        hill_contested = getattr(mode, "zone_contested", None)
+        if isinstance(active_hills, list) and isinstance(hill_owners, dict):
+            for zone in active_hills:
+                owner = hill_owners.get(int(zone.index))
+                result.append(ObjectiveSnapshot(
+                    "mh_hill",
+                    int(owner) if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                    tuple(float(value) for value in zone.center),
+                    state=int(bool(
+                        hill_contested.get(int(zone.index), False)
+                        if isinstance(hill_contested, dict) else False
+                    )),
+                ))
+
+        territories = getattr(mode, "territories", None)
+        if (
+            str(getattr(mode, "mode_code", "")).lower() == "tc"
+            and isinstance(territories, list)
+        ):
+            for territory in territories:
+                zone = getattr(territory, "zone", None)
+                if zone is None:
+                    continue
+                owner = int(getattr(territory, "owner", TEAM_NEUTRAL))
+                result.append(ObjectiveSnapshot(
+                    "tc_territory",
+                    owner if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                    tuple(float(value) for value in zone.center),
+                    state=int(bool(getattr(territory, "contested", False))),
+                ))
+
+        if str(getattr(mode, "mode_code", "")).lower() == "dia":
+            for dropoff in tuple(getattr(mode, "active_dropoffs", ()) or ()):
+                zone = getattr(dropoff, "zone", None)
+                if zone is None:
+                    continue
+                team = int(getattr(dropoff, "team", TEAM_NEUTRAL))
+                result.append(ObjectiveSnapshot(
+                    "dia_dropoff",
+                    team if team in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                    tuple(float(value) for value in zone.center),
+                    state=max(0, int(getattr(dropoff, "remaining", 0))),
+                ))
+            for diamond in tuple(
+                getattr(mode, "ground_diamonds", {}).values()
+            ):
+                result.append(ObjectiveSnapshot(
+                    "dia_diamond",
+                    TEAM_NEUTRAL,
+                    tuple(float(value) for value in diamond.position),
+                ))
+            for player_id in tuple(getattr(mode, "carriers", {})):
+                carrier = self.server.players.get(int(player_id))
+                if carrier is None:
+                    continue
+                result.append(ObjectiveSnapshot(
+                    "dia_diamond",
+                    int(carrier.team),
+                    tuple(float(value) for value in carrier.position),
+                    carrier_id=int(carrier.id),
+                    state=1,
+                ))
+
+        if str(getattr(mode, "mode_code", "")).lower() == "oc":
+            target = getattr(mode, "target_zone", None)
+            if target is not None:
+                result.append(ObjectiveSnapshot(
+                    "oc_target",
+                    TEAM2,
+                    tuple(float(value) for value in target.center),
+                ))
+            for bomb in tuple(getattr(mode, "bombs", {}).values()):
+                carrier = (
+                    self.server.players.get(int(bomb.carrier_id))
+                    if getattr(bomb, "carrier_id", None) is not None
+                    else None
+                )
+                position = carrier.position if carrier is not None else bomb.position
+                result.append(ObjectiveSnapshot(
+                    "oc_bomb",
+                    int(getattr(carrier, "team", TEAM_NEUTRAL)),
+                    tuple(float(value) for value in position),
+                    carrier_id=int(getattr(carrier, "id", -1)),
+                    state=int(bool(getattr(bomb, "armed", False))),
+                ))
+
+        demolition_zones = getattr(mode, "base_zones", None)
+        if (
+            str(getattr(mode, "mode_code", "")).lower() == "dem"
+            and isinstance(demolition_zones, dict)
+        ):
+            destroyed = getattr(mode, "destroyed_cells", {})
+            objectives = getattr(mode, "objective_cells", {})
+            for team in _PLAYABLE_TEAMS:
+                zone = demolition_zones.get(team)
+                if zone is None:
+                    continue
+                total = max(1, len(objectives.get(team, ())))
+                damage_percent = min(
+                    100,
+                    int(100 * len(destroyed.get(team, ())) / total),
+                )
+                result.append(ObjectiveSnapshot(
+                    "dem_base",
+                    team,
+                    tuple(float(value) for value in zone.center),
+                    state=damage_percent,
+                ))
+
         base_positions = getattr(mode, "base_positions", None)
         intel_positions = getattr(mode, "intel_positions", None)
         intel_holders = getattr(mode, "intel_holder", None)
@@ -1514,12 +1787,22 @@ class BotDirector:
         current_loop = int(getattr(self.server, "loop_count", 0))
         wading_ascent = (
             bool(getattr(player, "wade", False))
-            and jump_requested
+            and (
+                jump_requested
+                or affordance
+                in {
+                    MovementAffordance.SWIM,
+                    MovementAffordance.BREACH,
+                }
+            )
             and affordance is not MovementAffordance.JUMP
         )
         if wading_ascent:
-            # Native swimming needs held ascent. Ground jumps remain bounded
-            # pulses, but pulsing open-water movement made bots bob and crawl.
+            # The retail movement engine uses its ascent bit as part of SWIM
+            # locomotion. Keep that low-level requirement inside the motor so
+            # worker SWIM intents do not masquerade as tactical jump requests.
+            # Ground jumps remain bounded pulses; pulsing open-water ascent
+            # made bodies sink/bob against the waterbed and crawl.
             # The final water->shore JUMP is deliberately excluded: after a
             # long swim the native body needs a release/rearm edge to climb a
             # two-block bank instead of holding jump forever against the wall.
@@ -2208,6 +2491,12 @@ class BotDirector:
         }
         current_time = time.monotonic() if now is None else float(now)
         player = getattr(runtime, "player", None)
+        water_steering = bool(
+            getattr(player, "wade", False)
+            and affordance
+            in {MovementAffordance.SWIM, MovementAffordance.JUMP}
+        )
+        steerable = ordinary_walk or water_steering
         world = getattr(
             getattr(getattr(player, "connection", None), "server", None),
             "world_manager",
@@ -2286,7 +2575,7 @@ class BotDirector:
         result = (0.0, 0.0, 0.0)
         if BotDirector._waypoint_is_live(runtime, requested, affordance):
             result = requested
-        elif ordinary_walk:
+        elif steerable:
             length = math.hypot(requested[0], requested[1])
             if length > 1e-6:
                 dx, dy = requested[0] / length, requested[1] / length
@@ -2294,7 +2583,12 @@ class BotDirector:
                     getattr(runtime, "generation", 0)
                 )
                 preferred_sign = -1.0 if identity & 1 else 1.0
-                for magnitude in _WALK_STEER_ANGLES:
+                steering_angles = (
+                    _WATER_STEER_ANGLES
+                    if water_steering
+                    else _WALK_STEER_ANGLES
+                )
+                for magnitude in steering_angles:
                     for sign in (preferred_sign, -preferred_sign):
                         angle = magnitude * sign
                         cosine, sine = math.cos(angle), math.sin(angle)
@@ -2350,9 +2644,15 @@ class BotDirector:
         # waypoint and can freeze it in open water forever.
         wading = bool(getattr(player, "wade", False))
         water_column = bool(world.is_water_column(cell_x, cell_y))
-        if not wading and water_column:
+        if (
+            not wading
+            and water_column
+            and affordance is not MovementAffordance.SWIM
+        ):
             return False
-        if wading and water_column:
+        if water_column and (
+            wading or affordance is MovementAffordance.SWIM
+        ):
             return True
 
         expected_support = int(round(float(player.z) + 2.25))

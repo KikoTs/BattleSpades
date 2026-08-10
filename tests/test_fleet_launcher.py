@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 
 from server import launcher
+from server.config import load_config
 from server.fleet_launcher import (
     FleetInstance,
     instance_command,
     load_fleet_manifest,
 )
+from server.lobby import LOBBY_MODES
 from server.runtime_paths import RuntimePaths
 
 
@@ -139,3 +141,32 @@ def test_server_cli_rejects_fleet_mixed_with_single_instance_flags(
 
     assert result == 2
     assert "--fleet cannot be combined" in capsys.readouterr().err
+
+
+def test_shipped_fleet_covers_every_public_mode_with_unique_ports() -> None:
+    """The operator fleet must not silently omit or alias a retail mode."""
+
+    project_root = Path(__file__).resolve().parents[1]
+    manifest = load_fleet_manifest(project_root / "fleet.toml")
+    configs = tuple(load_config(instance.config) for instance in manifest.instances)
+
+    assert tuple(config.default_mode for config in configs) == tuple(LOBBY_MODES)
+    assert tuple(instance.port for instance in manifest.instances) == tuple(
+        range(27015, 27035, 2)
+    )
+    assert len({config.steam.query_port for config in configs}) == len(configs)
+    assert len({config.steam.steam_port for config in configs}) == len(configs)
+    assert len({config.log_file.casefold() for config in configs}) == len(configs)
+
+    for instance, config in zip(manifest.instances, configs, strict=True):
+        definition = LOBBY_MODES[config.default_mode]
+        assert instance.port == config.port
+        assert config.steam.query_port == config.port + 1
+        assert config.default_map in definition.maps
+        assert tuple(config.map_rotation) == definition.maps
+        assert config.match_length_minutes == int(definition.default_seconds / 60)
+        assert config.bots.enabled is True
+        assert config.bots.fill_target == 6
+        assert config.bots.max_bots == 6
+        assert config.bots.worker == "process"
+        assert config.bots.clean_slate_games == 3

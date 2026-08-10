@@ -23,6 +23,7 @@ from shared.packet import (
     PlayMusic,
     PlaySound,
     StopMusic,
+    StopSound,
 )
 
 # --- SOUND_ID table (extracted from the live client constants_audio) --------
@@ -113,6 +114,35 @@ def play_sound_to(player, sound_id: int, *, volume: float = 1.0,
                   position=None, attenuation: float = 1.0) -> None:
     """Play a one-shot sound for a single player (personal stingers)."""
     player.send(_sound_packet(sound_id, volume, position, attenuation))
+
+
+def _stop_sound_bytes(loop_id: int) -> bytes:
+    """Build the retail packet-25 loop teardown.
+
+    ``loop_id`` is the byte-sized identity assigned by PlaySound(23) or
+    PlayAmbientSound(24).  The native receiver looks the id up in its media
+    manager and deliberately ignores a missing id, so callers may use this for
+    idempotent cleanup without probing client state.
+    """
+
+    loop_id = int(loop_id)
+    if not 0 <= loop_id <= 0xFF:
+        raise ValueError("sound loop_id must fit in one byte")
+    packet = StopSound()
+    packet.loop_id = loop_id
+    return bytes(packet.generate())
+
+
+def stop_sound(server, loop_id: int) -> None:
+    """Stop one server-owned looping sound on every connected client."""
+
+    server.broadcast(_stop_sound_bytes(loop_id))
+
+
+def stop_sound_to(player, loop_id: int) -> None:
+    """Stop one server-owned looping sound for a single client."""
+
+    player.send(_stop_sound_bytes(loop_id))
 
 
 def _stop_music_bytes() -> bytes:

@@ -33,6 +33,9 @@ Statuses:
 - **Sent** — server constructs it and calls `.generate()`.
 - **Handled+Sent** — both.
 - **Planned** — defined in `packet.pyx` but neither handled nor sent yet.
+- **Reversed/unused** — behavior is understood but deliberately not emitted.
+- **Reversed/blocked** — behavior is understood, but the retail wire/runtime
+  cannot complete a safe lifecycle and the packet must not be emitted yet.
 
 Direction: **C→S** (client→server, we handle), **S→C** (server→client, we send),
 **both**, or **—** (neither yet).
@@ -54,7 +57,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 8 | ShootFeedbackPacket | S→C | Sent | Remote firearm shot only. Sent to observers (not the already-predicting human shooter); the native handler verifies the visible character's tool and calls `character.shoot(seed)`, producing gun audio/muzzle effects. Never send for spades/melee: those tools have no `shoot` method and use WorldUpdate action bit `0x01`. |
 | 9 | ShootResponse | S→C | Sent | Authoritative player-hit response. Broadcast with `damage_by=shooter_id`; native clients show blood to observers but play the hit-confirm sound/crosshair only for the matching local shooter. |
 | 10 | UseOrientedItem | both | Handled+Sent | Validates active normalized tool, cadence, and stock. Legacy grenade-family objects are relayed to observers; entity-backed projectiles use CreateEntity instead. Never relay GL tool 55 into the retail client's stale `GLGrenade` packet constructor. |
-| 11 | SetColor | both | Handled+Sent | Palette state for block, flare, and Block Cannon tools (5/22/29/48); broadcast only to observers because the sender already applied the UI choice. |
+| 11 | SetColor | both | Handled+Sent | Palette state for block, flare, and Block Cannon tools (5/22/29/48). Every new life starts from its configured team RGB and publishes that snapshot after CreatePlayer; later UI choices are broadcast only to observers because the sender already applied them locally. |
 | 12 | SetUGCEditMode | C→S | Handled | Isolated editor host changes the target validation mode; ordinary servers reject it. |
 | 13 | SetClassLoadout | both | Handled+Sent | Normalized atomically at life boundaries and acknowledged with instant=1 when the class is unchanged. Retail may omit the trailing zero UGC-count byte; the bounded decoder accepts only that optional empty tail. UGC preserves one shared five-item prefab/Game Data backpack. |
 | 14 | ExistingPlayer | — | Planned | Roster entry format; imported but NOT sent — roster goes out as CreatePlayer(28) on purpose (client stores ExistingPlayer.pickup verbatim as pickup_id, no 0xFF sentinel). |
@@ -68,7 +71,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 22 | CreateAmbientSound | S→C | Sent | Registers a map-owned ambient controller. Empty points are a global bed; authored points define local emitters. Must precede packet 24 with the same loop ID. LIVE-VERIFIED. |
 | 23 | PlaySound | S→C | Sent | One-shot positional/UI sound: pickups, round/kill cues, and observer-only block-tool impacts. The actor predicts its own mining sound and is excluded. LIVE-VERIFIED. |
 | 24 | PlayAmbientSound | S→C | Sent | Allocates the streaming ambient `GameSound` registered by packet 22. Global beds are unpositioned; local loops bootstrap at the listener and are moved by the native point controller. LIVE-VERIFIED. |
-| 25 | StopSound | — | Planned | Stop a playing sound (sounds). |
+| 25 | StopSound | S→C | Sent | Byte-sized loop-id teardown for server-owned PlaySound/PlayAmbientSound streams. The shared helper validates 0–255; the native receiver treats an unknown id as an idempotent no-op. |
 | 26 | PlayMusic | S→C | Sent | Music track (server/audio.py — last-minute game_ending track at 61s remaining). |
 | 27 | StopMusic | S→C | Sent | Stop the current music track (server/audio.py). |
 | 28 | CreatePlayer | S→C | Sent | Spawns a player on clients; also carries the roster. Loadout and all three selected prefab names come from the same committed ClassSelection. Every live player name must be unique before this packet is emitted; the packet direction contains no movement-owner identity field. |
@@ -87,7 +90,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 41 | MinimapBillboard | — | Planned | Place a minimap billboard/icon (minimap). |
 | 42 | MinimapBillboardClear | — | Planned | Clear minimap billboards (minimap). |
 | 43 | MinimapZone | S→C | Sent | CTF team-base zone and icon. Six signed-short fields are raw voxel min/max bounds for X/Y/Z; `key` is native `visible_team`, and icon 6 is `ZONE_ICON_CTF`. Sent at mode start and late join. |
-| 44 | MinimapZoneClear | — | Planned | Clear minimap zones (minimap). |
+| 44 | MinimapZoneClear | S→C | Sent | Clears a packet-43 zone by its exact six-coordinate identity; used by objective-mode phase/lifecycle cleanup. Retail Python 2 wire vector verified. |
 | 45 | StateData | S→C | Sent | Per-spawn game/team/lighting snapshot (sent at join, prefix 0x31). Prefab and entity catalog lengths are signed little-endian 16-bit counts, not padded bytes; this carries all 373 native UGC items. VIP sends gangster locks and ZOM sends phase-aware team/class locks. |
 | 46 | KillAction | S→C | Sent | Broadcast kill/death event. `kill_count` is the killer's current-life streak for the retail multikill HUD; it resets on death/round transition and is not the cumulative scoreboard kill total. |
 | 47 | GenericVoteMessage | both | Handled+Sent | Kick and next-map vote overlay open/update/close plus client CAST. The server sends exact opaque candidate records; the retail client binds the first three to F1/F2/F3. Title, description, **and every candidate** are exactly `repr((string_id, arguments_tuple))`: native `GenericVotingHUD.decode_string` literal-evaluates and indexes both elements, so a raw map name or historical one-item tuple crashes or is misread as `KICK_PLAYER`. |
@@ -108,7 +111,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 62 | PackResponse | — | Planned | Client ack for pack transfer (network buffering). |
 | 63 | PackChunk | — | Planned | Resource-pack chunk (network buffering). |
 | 64 | PlayerLeft | S→C | Sent | Announce a player disconnect. |
-| 65 | ProgressBar | — | Planned | UI progress bar (capture/build progress). |
+| 65 | ProgressBar | — | Reversed/blocked | Active fixed16 progress/rate encoding is verified, but the receiver's legacy hide branch still expects NaN. The 1.x writer cannot encode that sentinel, so a bar cannot be safely dismissed. |
 | 66 | RankUps | — | Planned | XP/rank changes at map end (match lifecycle/progression). |
 | 67 | GameStats | S→C | Sent | End-of-round scoreboard widget (server/scoreboard.py, on_mode_end). |
 | 68 | UGCObjectives | S→C | Sent | Exact current/min/max/priority rows for shared and target-mode Map Creator requirements. |
@@ -149,10 +152,10 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 103 | VoiceData | — | Planned | Voice-chat audio frames (voice). |
 | 104 | PlaceFlareBlock | C→S | Handled | Flare tool 22 only; raw voxel-short coordinates, ten-block cost, contact/range validation, and coloured entity type 13 with late-join persistence. A successful `FLARE BLOCK` log is this packet, not ordinary BlockLine(40). |
 | 105 | SteamSessionTicket | C→S | — | Steam auth ticket; received in handshake (not via register_handler). |
-| 106 | TerritoryBaseState | — | Planned | Territory/base capture state (territory control). |
+| 106 | TerritoryBaseState | S→C | Sent | Territory owner, attacker, action, and fixed16 capture amount; replayed on join and updated during capture. Retail Python 2 wire vector verified. |
 | 107 | DebugDraw | — | Planned | Debug draw primitives (dev tooling). |
-| 108 | LockToZone | — | Planned | Lock player to a zone (mode rules). |
-| 109 | HelpMessage | — | Planned | Help/tutorial text (UI). |
+| 108 | LockToZone | S→C | Sent | Six-short native movement clamp used for Demolition's build phase. Retail Python 2 wire vector verified. |
+| 109 | HelpMessage | S→C | Sent | Localized tutorial HelpPanel rows with the packet's exceptional big-endian float delay. Retail Python 2 wire vector verified. |
 | 110 | ClientInMenu | C→S | Handled | Client reports it's in a menu (handshake/idle gating). |
 | 111 | Password | — | Planned | Password packet (auth). |
 | 112 | PasswordNeeded | — | Planned | Server requests a password (auth). |
@@ -160,7 +163,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 114 | InitialInfo | S→C | Sent | First join packet: map filename, checksum, direct per-class movement scales, and a null-terminated `texture_skin` string. Each movement value is the complete 1/64-rounded authority scale; clients must not divide it by the class baseline. VIP sends `mafia`; the empty string selects the normal skin. |
 | 115 | ForceTeamJoin | S→C | Sent | Map Creator sends team 2/instant 0 after loading so Start opens the native prefab/Game Data selector. |
 | 116 | PositionData | C→S | Handled | Handler registered, but the 1.x client does NOT send it (no-op path). |
-| 117 | TeamProgress | — | Planned | Team objective progress bar (territory/mode rules). |
+| 117 | TeamProgress | S→C | Sent | Flag-controlled numerator/denominator or fixed16-percent objective row; Demolition sends authoritative base health. Retail Python 2 wire vector verified. |
 | 118 | SetGroundColors | both | Handled+Sent | Complete UGC terrain/water palette from the host, persisted and replayed to editor guests. |
 
 ### Continuous movement phase and acknowledgement
@@ -302,14 +305,17 @@ The active and remaining packet families are grouped here with their recovered
 ordering and native-client hazards.
 
 ### Sounds
-CreateAmbientSound (22), PlaySound (23), PlayAmbientSound (24), PlayMusic (26),
-and StopMusic (27) are sent. StopSound (25) remains planned.
+CreateAmbientSound (22), PlaySound (23), PlayAmbientSound (24), StopSound (25),
+PlayMusic (26), and StopMusic (27) are implemented. Packet 25 stops a
+server-owned loop by byte-sized loop id; its native missing-id path is a safe
+no-op, so cleanup may be idempotent.
 
 ### Minimap / POI
 
 CTF base zones use MinimapZone (43), and radar uses TeamMapVisibility (83).
-POIFocus (18), standalone MinimapBillboard (41), MinimapBillboardClear (42),
-and MinimapZoneClear (44) remain planned.
+Objective modes clear packet-43 bounds with MinimapZoneClear (44). POIFocus
+(18), standalone MinimapBillboard (41), and MinimapBillboardClear (42) remain
+unused until a mode needs their distinct point/icon semantics.
 
 ### Voting / kick
 
@@ -427,11 +433,16 @@ custom wire format:
 The 600-second survival clock starts when Patient Zero is selected. Time spent
 waiting for enough players is not round time.
 
-### Territory control / mode rules (planned)
-TimeScale (75), LockTeam (79), TeamLockClass (80), TeamLockScore (81),
-TeamInfiniteBlocks (82), LockToZone (108), TerritoryBaseState (106),
-TeamProgress (117), ProgressBar (65). ForceTeamJoin(115) is already active in
-the isolated Map Creator.
+### Territory control / mode rules
+
+TerritoryBaseState (106) is active in Territory Control. LockToZone (108) and
+TeamProgress (117) are active in Demolition, while MinimapZoneClear (44) is
+shared by the objective-mode lifecycle. TimeScale (75), LockTeam (79),
+TeamLockClass (80), TeamLockScore (81), and TeamInfiniteBlocks (82) remain
+unused until a mode needs a runtime rule transition; StateData remains the
+correct join/spawn snapshot. ProgressBar (65) is reversed but blocked because
+its 1.x fixed16 codec cannot encode the receiver's legacy NaN stop sentinel.
+ForceTeamJoin (115) remains active in the isolated Map Creator.
 
 ### UGC Map Creator
 
@@ -746,8 +757,9 @@ ChatMessage (49) and LocalisedMessage (50) are active for retail top-screen
 broadcasts. Because packet 49 never performs localization, its shared builder
 resolves `TEAM1_COLOR`, `TEAM2_COLOR`, and `TEAM_NEUTRAL` to canonical display
 text before serialization. ShowTextMessage (73) is fully reversed but intentionally unused for
-free-form text because its byte is a fixed message enum. HelpMessage (109)
-remains planned. The formatter contract and variables are documented below.
+free-form text because its byte is a fixed message enum. HelpMessage (109) is
+active for the localized tutorial HelpPanel. The formatter contract and
+variables are documented below.
 
 ### Voice (planned)
 VoiceData (103).

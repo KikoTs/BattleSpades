@@ -42,3 +42,15 @@ def test_shipped_team_colors_match_the_retail_palette():
 
     assert config.team1_color == (44, 117, 179)
     assert config.team2_color == (137, 179, 44)
+
+
+def test_bot_clean_slate_cadence_is_loaded_and_may_be_disabled(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[bots]\nenabled = true\nclean_slate_games = 0\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.bots.clean_slate_games == 0

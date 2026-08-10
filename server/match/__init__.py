@@ -399,6 +399,19 @@ class MatchTransitionService:
                 server.mode = mode_class(server)
                 await server.mode.on_mode_start()
 
+                # Peerless bots are not part of ``server.connections`` and
+                # therefore survive the human detach loop above. Their player
+                # ids/profiles may persist, but their position, native
+                # Character, AI intents, map snapshot, and mutation listener
+                # all belong to the retired world. Re-anchor them before a
+                # replacement roster is streamed to any client.
+                bots = getattr(server, "bots", None)
+                rebind_bots = getattr(
+                    bots, "rebind_after_match_transition", None
+                )
+                if callable(rebind_bots):
+                    rebind_bots()
+
                 # Each acknowledged peer now receives the normal initial-join
                 # loader ordering. MapDataValidation is the second-phase proof
                 # that InitialInfo was parsed and the advertised VXL can be

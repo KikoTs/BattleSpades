@@ -810,6 +810,38 @@ def test_native_world_glide_jetpack_has_limited_vertical_thrust():
     assert normal_vz < engineer_vz
 
 
+def test_lunar_wire_gravity_drives_jetpack_and_glider_recurrences():
+    """Authority uses the exact 26/64 scalar received by the retail client."""
+    world_manager = make_world_manager()
+    world_manager.map_metadata.gravity = 26.0 / 64.0
+    world_manager._refresh_world()
+    dt = 1.0 / 60.0
+    gravity = 26.0 / 64.0
+
+    def one_airborne_frame(pack_id, thrust):
+        native = NativeWorldPlayer(world_manager.world)
+        native.set_position(100.5, 100.5, 100.0)
+        native.update(dt, [])
+        native.set_velocity(0.0, 0.0, 0.0)
+        native.jetpack = int(pack_id)
+        native.jetpack_active = True
+        native.jump = True
+        native.update(dt, [])
+        expected = (
+            -((gravity + 1.0) * thrust) * 0.5 + dt * gravity
+        ) / (1.0 + dt)
+        return native.velocity.z, expected
+
+    glide_vz, expected_glide = one_airborne_frame(C.JETPACK2, 0.0125)
+    engineer_vz, expected_engineer = one_airborne_frame(
+        C.JETPACK_ENGINEER, 0.020
+    )
+
+    assert world_manager.world.get_gravity() == gravity
+    assert glide_vz == pytest.approx(expected_glide, abs=1e-6)
+    assert engineer_vz == pytest.approx(expected_engineer, abs=1e-6)
+
+
 def test_glide_jetpack_trades_height_for_long_fuel_endurance():
     usable_fuel = 100.0 - 10.0
     glide_seconds = usable_fuel / float(_JETPACK_PROPERTIES[C.JETPACK2][4])

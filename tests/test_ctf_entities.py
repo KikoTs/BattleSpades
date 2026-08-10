@@ -7,7 +7,7 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 import shared.constants as C  # noqa: E402
 from modes.ctf import CTFMode  # noqa: E402
 from server.entities.registry import EntityRegistry  # noqa: E402
-from server.game_constants import TEAM1, TEAM2  # noqa: E402
+from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL  # noqa: E402
 from server.map_metadata import MapZone  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
@@ -88,7 +88,11 @@ def test_ctf_places_team_tents_and_flags_at_entity_surface_height():
                for e in server.entity_registry.static_entities())
     zones = _packets(server, MinimapZone)
     assert len(zones) == 2
-    assert {zone.key for zone in zones} == {TEAM1, TEAM2}
+    assert {zone.key for zone in zones} == {TEAM_NEUTRAL}
+    assert {zone.color for zone in zones} == {
+        server.teams[TEAM1].color,
+        server.teams[TEAM2].color,
+    }
     assert all(zone.icon_id == 6 for zone in zones)
     assert {(zone.A2018, zone.A2019) for zone in zones} == {
         (59, 69), (443, 453)
@@ -206,8 +210,10 @@ def test_ctf_minimap_and_capture_use_authored_base_zone_bounds():
 
     asyncio.run(mode.on_mode_start())
 
-    blue_zone = next(zone for zone in _packets(server, MinimapZone)
-                     if zone.key == TEAM1)
+    blue_zone = next(
+        zone for zone in _packets(server, MinimapZone)
+        if zone.color == server.teams[TEAM1].color
+    )
     assert (
         blue_zone.A2018, blue_zone.A2019,
         blue_zone.A2020, blue_zone.A2021,
