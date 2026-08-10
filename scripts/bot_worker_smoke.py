@@ -45,7 +45,7 @@ def _player(player_id: int, team: int, x: float, *, bot: bool) -> PlayerSnapshot
     )
 
 
-def main(*, restart: bool = False) -> int:
+def main(*, restart: bool = False, clean_slate: bool = False) -> int:
     """Start, exercise, and cleanly reap one spawned worker."""
 
     supervisor = AIWorkerSupervisor(seed=11)
@@ -57,12 +57,15 @@ def main(*, restart: bool = False) -> int:
         if not supervisor.status().running:
             raise RuntimeError("AI worker did not start")
         original_pid = supervisor.status().process_id
-        if restart:
+        if restart or clean_slate:
             if original_pid is None:
                 raise RuntimeError("worker has no process id")
-            # The PID came from this supervisor; never enumerate or terminate
-            # unrelated Python processes in this acceptance probe.
-            os.kill(original_pid, signal.SIGTERM)
+            if clean_slate:
+                supervisor.request_restart()
+            else:
+                # The PID came from this supervisor; never enumerate or terminate
+                # unrelated Python processes in this acceptance probe.
+                os.kill(original_pid, signal.SIGTERM)
             restart_deadline = time.monotonic() + 10.0
             while time.monotonic() < restart_deadline:
                 status = supervisor.status()
@@ -78,6 +81,7 @@ def main(*, restart: bool = False) -> int:
                 raise RuntimeError(
                     f"AI worker did not restart: {supervisor.status()}"
                 )
+            deadline = time.monotonic() + 8.0
 
         observer = _player(1, 2, 0.0, bot=True)
         enemy = _player(2, 3, 10.0, bot=False)
@@ -117,5 +121,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--restart", action="store_true", help="terminate and verify one supervised restart"
     )
+    parser.add_argument(
+        "--clean-slate",
+        action="store_true",
+        help="request and verify one non-blocking clean-slate recycle",
+    )
     args = parser.parse_args()
-    raise SystemExit(main(restart=args.restart))
+    raise SystemExit(main(restart=args.restart, clean_slate=args.clean_slate))

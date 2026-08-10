@@ -503,12 +503,14 @@ class ReplicationService:
 
         Progress is measured in accepted ClientData frames instead of wall
         time, so a stalled client cannot make the server guess that GameScene
-        advanced.  An active pack keeps the owner row suppressed for the
-        finite fuel burn: retail and the server have independent native frame
-        clocks, so resuming at an arbitrary input count causes a mid-flight
-        correction.  Observers still receive the authoritative row. Release
-        uses the bounded settle/deadline path below, and lifecycle cleanup
-        removes reused player ids.
+        advanced.  The transition gets a quiet handoff window, then an active
+        flight receives one bounded checkpoint per window.  Suppressing every
+        owner row for an entire Glide Jetpack burn lets independent native
+        frame clocks accumulate several blocks of error and turns the eventual
+        release row into a retail hard SNAP.  Periodic causal checkpoints keep
+        that error in the soft-adjust range while observers continue receiving
+        the authoritative row at normal cadence.  Release uses the bounded
+        settle/deadline path below, and lifecycle cleanup removes reused ids.
         """
         player_id = int(player.id)
         deadline = self._jetpack_owner_handoff_deadline.get(player_id)
@@ -519,7 +521,21 @@ class ReplicationService:
         if target_active is True and bool(
             getattr(player, "jetpack_active", False)
         ):
-            return True
+            if received < deadline:
+                return True
+            # Permit exactly one ordinary owner row at this accepted-input
+            # boundary, then start the next quiet window.  Do not clear the
+            # active target: a repeated call at the same input must suppress
+            # rather than duplicate the checkpoint.
+            checkpoint_frames = max(1, min(120, int(getattr(
+                getattr(self.server, "config", None),
+                "jetpack_owner_handoff_input_frames",
+                30,
+            ))))
+            self._jetpack_owner_handoff_deadline[player_id] = (
+                received + checkpoint_frames
+            )
+            return False
         if (
             target_active is True
             and not bool(getattr(player, "jetpack_active", False))

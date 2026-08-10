@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+from collections import Counter
 import math
 import os
+import random
 import signal
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,6 +21,9 @@ from modes import get_mode_class
 from server.bot_ai import BotDirector
 from server.config import load_config
 from server.main import BattleSpadesServer
+
+if TYPE_CHECKING:
+    from server.player import Player
 
 
 async def _run(
@@ -29,13 +35,23 @@ async def _run(
     water_spawn_bots: int = 0,
     restart_worker_at: float | None = None,
     progress_every: float = 0.0,
+    trace_state: bool = False,
+    seed: int | None = None,
+    detect_team_congestion: bool = False,
 ) -> None:
+    if seed is not None:
+        # WorldManager deliberately uses the module RNG when shuffling authored
+        # spawn candidates. Seed both that path and the bot profile factory so
+        # a field report can be reduced to one replayable match.
+        random.seed(int(seed))
     config = load_config(ROOT / "config.toml")
     config.default_mode = str(mode_name).lower()
     if map_name is not None:
         config.default_map = str(map_name)
     config.bots.population_mode = "admin"
     config.bots.max_bots = max(1, int(bot_count))
+    if seed is not None:
+        config.bots.seed = int(seed)
     if restart_worker_at is not None:
         # Killing a child is specifically a process-backend acceptance.
         config.bots.worker = "process"
@@ -97,8 +113,16 @@ async def _run(
         water_started[bot.id] = anchor
 
     previous_positions = {bot.id: bot.position for bot in director.bots}
+    progress_positions = dict(previous_positions)
     requested_stall_ticks = {bot.id: 0 for bot in director.bots}
     max_requested_stall_ticks = {bot.id: 0 for bot in director.bots}
+    max_requested_stall_details: dict[int, dict[str, object]] = {}
+    congestion_ticks = 0
+    max_congestion_ticks = 0
+    congestion_details: dict[str, object] = {}
+    position_history: dict[int, list[tuple[float, tuple[float, float, float]]]] = {
+        bot.id: [] for bot in director.bots
+    }
     water_exit_seconds: dict[int, float] = {}
     worker_deadline = asyncio.get_running_loop().time() + 10.0
     status = director.status()
@@ -157,11 +181,44 @@ async def _run(
                     requested_stall_ticks[bot.id] += 1
                 else:
                     requested_stall_ticks[bot.id] = 0
-                max_requested_stall_ticks[bot.id] = max(
-                    max_requested_stall_ticks[bot.id],
-                    requested_stall_ticks[bot.id],
-                )
+                if (
+                    requested_stall_ticks[bot.id]
+                    > max_requested_stall_ticks[bot.id]
+                ):
+                    max_requested_stall_ticks[bot.id] = (
+                        requested_stall_ticks[bot.id]
+                    )
+                    max_requested_stall_details[bot.id] = {
+                        "ticks": requested_stall_ticks[bot.id],
+                        "position": bot.position,
+                        "velocity": (
+                            float(getattr(bot, "vx", 0.0)),
+                            float(getattr(bot, "vy", 0.0)),
+                            float(getattr(bot, "vz", 0.0)),
+                        ),
+                        "role": (
+                            intent.debug_role if intent is not None else None
+                        ),
+                        "goal": (
+                            intent.debug_goal if intent is not None else None
+                        ),
+                        "affordance": (
+                            intent.movement.affordance.value
+                            if intent is not None
+                            else None
+                        ),
+                        "direction": (
+                            intent.movement.direction
+                            if intent is not None
+                            else None
+                        ),
+                    }
                 previous_positions[bot.id] = bot.position
+                history = position_history[bot.id]
+                history.append((elapsed, bot.position))
+                cutoff = elapsed - 8.0
+                while len(history) > 1 and history[1][0] <= cutoff:
+                    del history[0]
                 if (
                     bot.id in water_started
                     and bot.id not in water_exit_seconds
@@ -170,6 +227,81 @@ async def _run(
                     )
                 ):
                     water_exit_seconds[bot.id] = elapsed
+
+            # Reproduce the field failure, not merely a stationary individual:
+            # four or more green bots converge on the same narrow excavation
+            # lane, keep requesting a distant goal, and shuffle enough that a
+            # per-tick "did it move?" check incorrectly passes.  Ignore match
+            # opening and require a persistent eight-second rolling collapse.
+            green_bots = [
+                bot for bot in director.bots
+                if int(bot.team) == 3 and bot.alive and bot.spawned
+            ]
+            dense_green: list[Player] = []
+            if detect_team_congestion and elapsed >= 15.0 and len(green_bots) >= 4:
+                for anchor in green_bots:
+                    cohort = [
+                        bot for bot in green_bots
+                        if math.hypot(bot.x - anchor.x, bot.y - anchor.y) <= 7.0
+                    ]
+                    if len(cohort) > len(dense_green):
+                        dense_green = cohort
+                stalled = []
+                far_goal = []
+                for bot in dense_green:
+                    history = position_history[int(bot.id)]
+                    displacement = (
+                        math.hypot(
+                            bot.x - history[0][1][0],
+                            bot.y - history[0][1][1],
+                        )
+                        if history
+                        else 0.0
+                    )
+                    if displacement < 5.0:
+                        stalled.append((int(bot.id), round(displacement, 2)))
+                    runtime = director._runtime.get(int(bot.id))
+                    intent = runtime.intent if runtime is not None else None
+                    if intent is not None and intent.debug_goal is not None:
+                        goal_distance = math.hypot(
+                            float(intent.debug_goal[0]) - bot.x,
+                            float(intent.debug_goal[1]) - bot.y,
+                        )
+                        if goal_distance >= 40.0:
+                            far_goal.append((int(bot.id), round(goal_distance, 1)))
+                # Do not require literal immobility here. The Mayan failure
+                # consists of four bots shuffling around the same entrance;
+                # that movement is precisely how the old single-bot stall
+                # assertion missed it. Persistent density plus distant active
+                # goals is the team-level invariant we care about.
+                collapsed = len(dense_green) >= 4 and len(far_goal) >= 3
+                if collapsed:
+                    congestion_ticks += 1
+                    if congestion_ticks > max_congestion_ticks:
+                        max_congestion_ticks = congestion_ticks
+                        congestion_details = {
+                            "elapsed": round(elapsed, 2),
+                            "cohort": [int(bot.id) for bot in dense_green],
+                            "positions": {
+                                int(bot.id): tuple(round(value, 2) for value in bot.position)
+                                for bot in dense_green
+                            },
+                            "rolling_displacement": stalled,
+                            "goal_distance": far_goal,
+                            "roles": {
+                                int(bot.id): (
+                                    director._runtime[int(bot.id)].intent.debug_role
+                                    if director._runtime.get(int(bot.id)) is not None
+                                    and director._runtime[int(bot.id)].intent is not None
+                                    else "idle"
+                                )
+                                for bot in dense_green
+                            },
+                        }
+                else:
+                    congestion_ticks = 0
+            else:
+                congestion_ticks = 0
             # Match the production ordering boundary: bot action suggestions
             # arrive before physics; their shared terrain mutations commit
             # only after that tick's native Player simulation.
@@ -185,14 +317,106 @@ async def _run(
             ):
                 restart_observed = True
             if progress_steps and step > 0 and step % progress_steps == 0:
+                roles = Counter()
+                cells: dict[tuple[int, int, int], list[int]] = {}
+                interval_movement: dict[int, float] = {}
+                for bot in director.bots:
+                    runtime = director._runtime.get(bot.id)
+                    intent = runtime.intent if runtime is not None else None
+                    roles[
+                        intent.debug_role if intent is not None else "idle"
+                    ] += 1
+                    cell = (
+                        int(math.floor(bot.x)),
+                        int(math.floor(bot.y)),
+                        int(math.floor(bot.z)),
+                    )
+                    cells.setdefault(cell, []).append(int(bot.id))
+                    interval_movement[int(bot.id)] = math.dist(
+                        progress_positions.get(bot.id, bot.position),
+                        bot.position,
+                    )
+                    progress_positions[bot.id] = bot.position
+                overlaps = {
+                    cell: ids
+                    for cell, ids in cells.items()
+                    if len(ids) > 1
+                }
+                breaches = []
+                for bot in director.bots:
+                    runtime = director._runtime.get(bot.id)
+                    intent = runtime.intent if runtime is not None else None
+                    if (
+                        intent is None
+                        or intent.movement.affordance.value != "breach"
+                    ):
+                        continue
+                    breaches.append(
+                        {
+                            "id": int(bot.id),
+                            "position": tuple(
+                                round(value, 2) for value in bot.position
+                            ),
+                            "path": intent.debug_path,
+                            "action": intent.action.kind.value,
+                            "action_position": intent.action.position,
+                            "feedback": (
+                                runtime.feedback_action_kind,
+                                runtime.feedback_action_accepted,
+                                runtime.feedback_action_position,
+                                runtime.feedback_action_frame,
+                            ),
+                            "pending": (
+                                runtime.pending_action.kind.value
+                                if runtime.pending_action is not None
+                                else "none"
+                            ),
+                        }
+                    )
                 print(
                     "runtime_progress",
                     f"simulated_seconds={elapsed:.1f}",
                     f"restarts={status.restarts}",
                     "max_requested_stall_ticks="
                     f"{max(max_requested_stall_ticks.values(), default=0)}",
+                    f"world_mutations={server.metrics.committed_world_mutations}",
+                    f"roles={dict(roles)}",
+                    f"overlaps={overlaps}",
+                    f"breaches={breaches}",
+                    "interval_movement="
+                    f"{interval_movement if trace_state else min(interval_movement.values(), default=0.0):}",
                     flush=True,
                 )
+                if trace_state:
+                    rows = []
+                    for bot in director.bots:
+                        runtime = director._runtime.get(bot.id)
+                        intent = runtime.intent if runtime is not None else None
+                        rows.append(
+                            {
+                                "id": int(bot.id),
+                                "team": int(bot.team),
+                                "position": tuple(round(value, 2) for value in bot.position),
+                                "role": intent.debug_role if intent is not None else "idle",
+                                "goal": intent.debug_goal if intent is not None else None,
+                                "affordance": (
+                                    intent.movement.affordance.value
+                                    if intent is not None
+                                    else "walk"
+                                ),
+                                "action": (
+                                    intent.action.kind.value
+                                    if intent is not None
+                                    else "none"
+                                ),
+                                "action_position": (
+                                    intent.action.position
+                                    if intent is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    print("runtime_bot_state", rows, flush=True)
             next_tick_at += server.tick_interval
             await asyncio.sleep(max(0.0, next_tick_at - loop.time()))
         moved = {
@@ -214,6 +438,10 @@ async def _run(
         if excessive_stalls:
             details = {}
             for bot_id, ticks in excessive_stalls.items():
+                historical = max_requested_stall_details.get(bot_id)
+                if historical is not None:
+                    details[bot_id] = historical
+                    continue
                 bot = next(
                     (candidate for candidate in director.bots if candidate.id == bot_id),
                     None,
@@ -248,6 +476,13 @@ async def _run(
             raise RuntimeError(
                 f"requested bot movement stalled for >=5s: {details}"
             )
+        congestion_limit = max(1, int(8.0 / server.tick_interval))
+        if detect_team_congestion and max_congestion_ticks >= congestion_limit:
+            raise RuntimeError(
+                "green team persistently converged in one excavation lane: "
+                f"seed={seed} ticks={max_congestion_ticks} "
+                f"details={congestion_details}"
+            )
         water_remaining = {
             bot.id: bot.position
             for bot in director.bots
@@ -268,6 +503,11 @@ async def _run(
                 f"bot world mutations expired: "
                 f"{server.metrics.expired_world_mutations}"
             )
+        bot_metrics = {
+            key: value
+            for key, value in server.metrics.snapshot().items()
+            if key.startswith("subsystem_bots_")
+        }
         print(
             "runtime_ok",
             f"mode={config.default_mode}",
@@ -280,6 +520,8 @@ async def _run(
             f"water_started={water_started}",
             f"water_exit_seconds={water_exit_seconds}",
             f"max_requested_stall_ticks={max_requested_stall_ticks}",
+            f"max_congestion_ticks={max_congestion_ticks}",
+            f"bot_metrics={bot_metrics}",
             f"entities={[(entity.type, entity.player_id) for entity in server.entity_registry.all()]}",
         )
     finally:
@@ -310,6 +552,22 @@ if __name__ == "__main__":
         default=0.0,
         help="print a flushed progress line every N simulated seconds",
     )
+    parser.add_argument(
+        "--trace-state",
+        action="store_true",
+        help="include per-bot goals, actions, and positions in progress output",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="seed authored spawn shuffling and bot profiles for replay",
+    )
+    parser.add_argument(
+        "--detect-team-congestion",
+        action="store_true",
+        help="fail if green bots persistently collapse into one excavation lane",
+    )
     args = parser.parse_args()
     asyncio.run(
         _run(
@@ -320,5 +578,8 @@ if __name__ == "__main__":
             water_spawn_bots=args.water_spawn_bots,
             restart_worker_at=args.restart_worker_at,
             progress_every=args.progress_every,
+            trace_state=args.trace_state,
+            seed=args.seed,
+            detect_team_congestion=args.detect_team_congestion,
         )
     )

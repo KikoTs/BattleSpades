@@ -1050,6 +1050,7 @@ class Player:
         # compatibility facade for legacy mode spawn paths, so reset the
         # replication service here until every mode delegates to RoundLifecycle.
         server = self.connection.server if self.connection else None
+        self.reset_block_color_for_spawn()
         corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
         before_player_spawn = getattr(
             corpse_lifecycle, "before_player_spawn", None
@@ -1783,8 +1784,27 @@ class Player:
             self.reloading = False
             self.reload_end_time = 0.0
 
-    def set_color(self, color: int):
-        self.block_color = color
+    def reset_block_color_for_spawn(self) -> int:
+        """Reset the held-block palette to the current team's RGB color.
+
+        Players may still select another palette color while alive. Every new
+        life starts from the configured team color so the authoritative voxel
+        color and the native held-block preview share the same initial state.
+        Spectators and detached test players retain their neutral/current
+        color because they have no playable team definition.
+        """
+
+        server = self.connection.server if self.connection else None
+        team = getattr(server, "teams", {}).get(self.team) if server else None
+        color = getattr(team, "color", None)
+        if color is None or len(color) < 3:
+            return int(self.block_color) & 0xFFFFFF
+        red, green, blue = (int(channel) & 0xFF for channel in color[:3])
+        self.block_color = (red << 16) | (green << 8) | blue
+        return self.block_color
+
+    def set_color(self, color: int) -> None:
+        self.block_color = int(color) & 0xFFFFFF
 
     def record_owner_anchor(
         self,

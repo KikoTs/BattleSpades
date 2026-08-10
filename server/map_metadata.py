@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +86,21 @@ class MapMetadata:
     # client presentation assets (sky mesh and ambience); it is never a map-
     # synchronization shortcut.
     official_map: bool = False
+    # StateData carries gravity as signed 1.6 fixed point.  Store the
+    # wire-canonical value here and apply this same scalar to the server's
+    # native World; otherwise an authored value such as Lunar's 0.4 becomes
+    # 0.40625 on the retail client while authority continues integrating 0.4.
+    gravity: float = 1.0
+    # Stock VXL files do not embed their original spawn rectangles.  Most use
+    # Blue/TEAM1 on the west side and Green/TEAM2 on the east side, but Tokyo
+    # Neon is authored the other way around.  These regions are used only when
+    # explicit sidecar/UGC spawn zones are absent.
+    fallback_spawn_regions: dict[int, tuple[int, int, int, int]] = field(
+        default_factory=lambda: {
+            TEAM1: (64, 128, 192, 384),
+            TEAM2: (320, 128, 448, 384),
+        }
+    )
     # Packet 51 is a client mesh-environment filename, not a map basename.
     # The original feature server called this ``skybox_texture`` while UGC
     # JSON exports call it ``skybox_name``.
@@ -109,6 +125,30 @@ class MapMetadata:
     )
     base_zones: dict[int, list[MapZone]] = field(
         default_factory=lambda: {TEAM1: [], TEAM2: []}
+    )
+    # Neutral objective volumes are authored by the Map Creator for modes
+    # such as Multi-Hill, Territory Control, and Diamond Mine.  They are not
+    # team bases: the retail UGC schema deliberately assigns them
+    # TEAM_NEUTRAL and lets the active ruleset decide ownership at runtime.
+    neutral_base_zones: list[MapZone] = field(default_factory=list)
+    # Occupation is deliberately asymmetric in the retail rules: Green owns
+    # one defended base while bombs spawn at authored points for Blue to
+    # retrieve.  Keep those placements distinct from ordinary team bases so
+    # CTF/Demolition cannot accidentally consume Occupation geometry.
+    occupation_base_zone: MapZone | None = None
+    occupation_bomb_points: list[tuple[float, float, float]] = field(
+        default_factory=list
+    )
+    # Diamond Mine drop-offs have a per-zone team restriction and capacity.
+    # The parallel capacity array mirrors the original sidecar format while
+    # MapZone retains the canonical volume/team representation used on wire.
+    diamond_base_zones: list[MapZone] = field(default_factory=list)
+    diamond_base_capacities: list[int] = field(default_factory=list)
+    # Demolition's legacy map description can require a minimum number of
+    # objective voxels before a team base is accepted.  Preserve the value so
+    # the mode can validate/fallback without reparsing an inert sidecar.
+    base_min_destruction: dict[int, int] = field(
+        default_factory=lambda: {TEAM1: 0, TEAM2: 0}
     )
     entities: list[MapEntitySpec] = field(default_factory=list)
 
@@ -177,6 +217,20 @@ STOCK_MAP_SKYBOXES = {
     "ww1": "WW1.txt",
 }
 
+# Recovered stock rules which are not carried by the VXL voxel stream.  Lunar
+# uses the same 0.4 authored value as the shipped LunarBaseplate metadata.
+# Tokyo's blue chroma base is at x ~= 393 and its green base at x ~= 147, so
+# its fallback team regions are deliberately reversed from the common layout.
+_STOCK_MAP_GRAVITY = {
+    "lunarbase": 0.4,
+}
+_STOCK_FALLBACK_SPAWN_REGIONS = {
+    "tokyoneon": {
+        TEAM1: (320, 128, 448, 384),
+        TEAM2: (64, 128, 192, 384),
+    },
+}
+
 # The stock editor's shipped GrasslandBaseplate metadata defines the two
 # chroma-marker families even when a finished map does not retain its sidecar:
 # green markers use slot 0 and blue markers use slot 1.  Individual stock-map
@@ -231,7 +285,7 @@ _SKYBOX_AMBIENTS = {
 }
 
 _LEGACY_ENVIRONMENT_KEYS = frozenset((
-    "skybox_texture", "skybox_name", "skybox", "fog_color",
+    "skybox_texture", "skybox_name", "skybox", "fog_color", "gravity",
     "light_color", "light_direction", "back_light_color",
     "back_light_direction", "ambient_light_color",
     "ambient_light_intensity", "ambient_sounds",
@@ -241,7 +295,31 @@ _LEGACY_ENVIRONMENT_KEYS = frozenset((
     "team_one_spawn_area", "team_two_spawn_area",
     "team_one_base_point", "team_one_base_w_h_d",
     "team_two_base_point", "team_two_base_w_h_d",
+    "team_one_min_destruction", "team_two_min_destruction",
+    "mh_base_points", "mh_base_w_h_d",
+    "occupation_base_point", "occupation_base_w_h_d",
+    "occupation_bomb_points",
+    "diamond_base_points", "diamond_base_w_h_d",
+    "diamond_base_teams", "diamond_base_capacity",
 ))
+
+
+def canonical_gravity(value: object, fallback: float = 1.0) -> float:
+    """Return a safe StateData 1.6-fixed gravity scalar.
+
+    Map metadata is trusted only as inert data.  Reject non-finite or extreme
+    values, then quantize exactly as ``shared.packet.StateData`` does for the
+    positive gameplay range.  The authoritative native world consumes this
+    returned value too, keeping prediction and authority bit-identical.
+    """
+
+    try:
+        gravity = float(value)
+    except (TypeError, ValueError):
+        gravity = float(fallback)
+    if not math.isfinite(gravity) or not 0.0 < gravity <= 8.0:
+        gravity = float(fallback)
+    return math.floor(gravity * 64.0 + 0.5) / 64.0
 
 
 def _candidate_sidecars(map_path: Path) -> Iterable[Path]:
@@ -435,6 +513,104 @@ def _append_legacy_team_zones(result: MapMetadata, payload: dict[str, object]) -
                 "base", team, *center, extents, f"{prefix}_base_point",
             ))
 
+        try:
+            minimum = int(payload.get(f"{prefix}_min_destruction", 0))
+        except (TypeError, ValueError):
+            minimum = 0
+        result.base_min_destruction[team] = max(0, minimum)
+
+
+def _append_legacy_neutral_zones(
+    result: MapMetadata,
+    payload: dict[str, object],
+) -> None:
+    """Translate the stock ``mh_base_points``/``mh_base_w_h_d`` arrays.
+
+    The original assignment-format sidecars keep the two arrays parallel.
+    Malformed rows are ignored independently and the protocol-facing mode
+    applies the retail 2..10 count bound after fallbacks are considered.
+    """
+
+    points = payload.get("mh_base_points", ())
+    dimensions = payload.get("mh_base_w_h_d", ())
+    if not isinstance(points, (list, tuple)) or not isinstance(
+        dimensions, (list, tuple)
+    ):
+        return
+    for index, (point, size) in enumerate(zip(points, dimensions)):
+        center = _point3(point)
+        extents = _centered_extents(size)
+        if center is None or extents is None:
+            continue
+        result.neutral_base_zones.append(MapZone(
+            "base",
+            int(C.TEAM_NEUTRAL),
+            *center,
+            extents,
+            f"mh_base_points[{index}]",
+        ))
+
+
+def _append_legacy_occupation(result: MapMetadata, payload: dict[str, object]) -> None:
+    """Translate the retail Occupation base and bomb spawn placements."""
+
+    center = _point3(payload.get("occupation_base_point"))
+    extents = _centered_extents(payload.get("occupation_base_w_h_d"))
+    if center is not None and extents is not None:
+        result.occupation_base_zone = MapZone(
+            "base",
+            TEAM2,
+            *center,
+            extents,
+            "occupation_base_point",
+        )
+
+    rows = payload.get("occupation_bomb_points", ())
+    if isinstance(rows, (list, tuple)):
+        result.occupation_bomb_points.extend(
+            point for point in (_point3(row) for row in rows) if point is not None
+        )
+
+
+def _append_legacy_diamond_zones(
+    result: MapMetadata,
+    payload: dict[str, object],
+) -> None:
+    """Translate Diamond Mine's parallel point/size/team/capacity arrays."""
+
+    points = payload.get("diamond_base_points", ())
+    dimensions = payload.get("diamond_base_w_h_d", ())
+    teams = payload.get("diamond_base_teams", ())
+    capacities = payload.get("diamond_base_capacity", ())
+    if not isinstance(points, (list, tuple)) or not isinstance(
+        dimensions, (list, tuple)
+    ):
+        return
+
+    for index, (point, size) in enumerate(zip(points, dimensions)):
+        center = _point3(point)
+        extents = _centered_extents(size)
+        if center is None or extents is None:
+            continue
+        try:
+            team = int(teams[index])
+        except (IndexError, TypeError, ValueError):
+            team = int(C.TEAM_NEUTRAL)
+        if team not in (TEAM1, TEAM2, int(C.TEAM_NEUTRAL)):
+            team = int(C.TEAM_NEUTRAL)
+        try:
+            capacity = max(1, int(capacities[index]))
+        except (IndexError, TypeError, ValueError):
+            capacity = 1
+        result.diamond_base_zones.append(MapZone(
+            "base",
+            team,
+            *center,
+            extents,
+            f"diamond_base_points[{index}]",
+        ))
+        result.diamond_base_capacities.append(capacity)
+
 
 def _safe_metadata_literal(node: ast.AST, depth: int = 0) -> object:
     """Evaluate inert metadata literals plus bounded numeric arithmetic.
@@ -601,6 +777,18 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     result = MapMetadata(
         source=sidecar,
         official_map=official_map,
+        gravity=canonical_gravity(
+            payload.get("gravity", _STOCK_MAP_GRAVITY.get(map_key, 1.0))
+        ),
+        fallback_spawn_regions=dict(
+            _STOCK_FALLBACK_SPAWN_REGIONS.get(
+                map_key,
+                {
+                    TEAM1: (64, 128, 192, 384),
+                    TEAM2: (320, 128, 448, 384),
+                },
+            )
+        ),
         skybox_name=skybox_name,
         fog_color=fog_color,
         light_color=normalize_rgb(payload.get("light_color")),
@@ -615,6 +803,9 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     )
     _append_legacy_drop_points(result, payload)
     _append_legacy_team_zones(result, payload)
+    _append_legacy_neutral_zones(result, payload)
+    _append_legacy_occupation(result, payload)
+    _append_legacy_diamond_zones(result, payload)
     rows = payload.get("ugc_entities", [])
     if not isinstance(rows, list):
         logger.warning("Ignoring malformed ugc_entities in %s", sidecar)
@@ -637,6 +828,10 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
             result.entities.append(MapEntitySpec(drop[0], drop[1], x, y, z, item))
             continue
 
+        if item == "ugc_bomb_drop":
+            result.occupation_bomb_points.append((x, y, z))
+            continue
+
         if item in _STATIC_FLARE_ITEMS:
             color = normalize_rgb(row.get("color"))
             if color is not None:
@@ -649,8 +844,6 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         if item_id is None or item_id not in C.UGC_ZONE_SIZES:
             continue
         team = int(C.UGC_ENTITY_TEAMS.get(item_id, C.TEAM_NEUTRAL))
-        if team not in (TEAM1, TEAM2):
-            continue
         kind = "spawn" if "_spawn" in item else "base" if "_base" in item else ""
         if not kind:
             continue
@@ -663,12 +856,27 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
             extents=tuple(int(v) for v in C.UGC_ZONE_SIZES[item_id]),
             item=item,
         )
-        target = result.spawn_zones if kind == "spawn" else result.base_zones
-        target[team].append(zone)
+        if team in (TEAM1, TEAM2):
+            target = result.spawn_zones if kind == "spawn" else result.base_zones
+            target[team].append(zone)
+        elif team == int(C.TEAM_NEUTRAL) and kind == "base":
+            result.neutral_base_zones.append(zone)
+            if active_mode.lower() == "dia":
+                result.diamond_base_zones.append(zone)
+                result.diamond_base_capacities.append(1)
+
+        if (
+            active_mode.lower() == "oc"
+            and kind == "base"
+            and team == TEAM2
+            and result.occupation_base_zone is None
+        ):
+            result.occupation_base_zone = zone
 
     logger.info(
         "Loaded map metadata %s (sources %d, official %s, skybox %s, fog %s, ambience %s, static lights %d, "
-        "spawn zones %d/%d, bases %d/%d, entities %d)",
+        "spawn zones %d/%d, bases %d/%d, neutral bases %d, occupation %s/%d, "
+        "diamond bases %d, entities %d)",
         sidecar or "<stock inference>",
         len(contributing_sidecars),
         result.official_map,
@@ -680,6 +888,10 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         len(result.spawn_zones[TEAM2]),
         len(result.base_zones[TEAM1]),
         len(result.base_zones[TEAM2]),
+        len(result.neutral_base_zones),
+        "base" if result.occupation_base_zone is not None else "fallback",
+        len(result.occupation_bomb_points),
+        len(result.diamond_base_zones),
         len(result.entities),
     )
     return result

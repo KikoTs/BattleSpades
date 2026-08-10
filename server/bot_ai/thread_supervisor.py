@@ -138,6 +138,28 @@ class AIThreadSupervisor:
             self._ready = False
         self._wake.set()
 
+    def discard_timeline(self) -> None:
+        """Drop queued frames and results belonging to the prior game."""
+
+        with self._lock:
+            self._frames.clear()
+            self._intents.clear()
+            self._awaiting_frame_id = None
+
+    def request_restart(self) -> None:
+        """Rebuild the private world/brain from canonical state off-thread."""
+
+        with self._lock:
+            if self._latest_snapshot is None:
+                return
+            self._snapshot_serial += 1
+            self._frames.clear()
+            self._intents.clear()
+            self._awaiting_frame_id = None
+            self._ready = False
+            self._restarts += 1
+        self._wake.set()
+
     def publish_world_change(
         self,
         change: VoxelChange,
@@ -268,6 +290,13 @@ class AIThreadSupervisor:
             try:
                 if snapshot is not None:
                     world.load(snapshot)
+                    # Every full snapshot is a clean ownership boundary. A
+                    # periodic same-map recycle has the same map epoch, so a
+                    # guarded reset_for_map alone would retain team caches.
+                    brain = SimpleBotBrain(
+                        world,
+                        decision_hz=self.decision_hz,
+                    )
                     brain.reset_for_map(snapshot.map_epoch)
                     applied_snapshot_serial = snapshot_serial
                     with self._lock:

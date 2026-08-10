@@ -110,6 +110,19 @@ WIRE_TEAM_NEUTRAL = TEAM_NEUTRAL
 DEFAULT_WIRE_TEAM = TEAM1
 SPAWN_HP_DAMAGE_TYPE = 2
 
+# Packet 3 (EntityUpdates) has a recovered reader/writer but no recovered
+# server-owned lifecycle.  The production entity path is packet 21/16/19 and
+# WorldUpdate's embedded entity rows.  Letting an accidental five-byte packet
+# 3 escape makes the retail client read a missing short count and terminate
+# with NoDataLeft, so keep this unused packet closed at the final wire boundary.
+_BLOCKED_OUTBOUND_PACKET_IDS = frozenset({3})
+
+
+def outbound_packet_is_safe(data: bytes) -> bool:
+    """Return whether one complete payload may enter retail transport."""
+
+    return bool(data) and int(data[0]) not in _BLOCKED_OUTBOUND_PACKET_IDS
+
 
 def wire_team_to_internal(team_id: int) -> Optional[int]:
     """Convert wire team IDs into reversed runtime team IDs."""
@@ -214,6 +227,15 @@ class Connection:
         # compression, and packet allocation so a delayed coroutine cannot
         # touch a peer after server shutdown has begun.
         if getattr(self.server, "_stopping", False):
+            return
+
+        if not outbound_packet_is_safe(data):
+            packet_id = data[0] if data else -1
+            logger.error(
+                "Refused unsafe outbound packet id=%s len=%d",
+                packet_id,
+                len(data),
+            )
             return
 
         import enet
@@ -1062,6 +1084,12 @@ class Connection:
         # Add to team
         if player.team in self.server.teams:
             self.server.teams[player.team].add_player(player)
+
+        # CreatePlayer has no palette field. Establish the first life's team
+        # color before the immediately-following SetColor snapshot is built;
+        # Player.spawn repeats this reset for every later life.
+        if not is_spectator:
+            player.reset_block_color_for_spawn()
         
         logger.info(
             "Player %s (ID %s, identity=%s) joined wire team %s as internal team %s",

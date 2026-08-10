@@ -49,7 +49,7 @@ def build_state_data(server: 'BattleSpadesServer',
         or map_fog
         or cfg.fog_color
     )
-    pkt.gravity = 1.0
+    pkt.gravity = float(getattr(metadata, "gravity", 1.0))
     pkt.light_color = (
         getattr(metadata, "light_color", None) or _DEFAULT_LIGHT_COLOR
     )

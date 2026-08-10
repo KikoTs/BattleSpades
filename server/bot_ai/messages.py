@@ -36,6 +36,7 @@ class MovementAffordance(str, Enum):
     """Topology edge selected by worker navigation."""
 
     WALK = "walk"
+    SWIM = "swim"
     CROUCH = "crouch"
     JUMP = "jump"
     DROP = "drop"

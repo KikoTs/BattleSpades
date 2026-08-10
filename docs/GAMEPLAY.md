@@ -18,10 +18,10 @@ sent for every registered mode.
 | `cctf` | Classic CTF | 90 min | playable; CTF scene with classic flag |
 | `zom` | Zombie/Infection | 10 min | playable |
 | `vip` | VIP | 15 min | playable |
-| `mh` | Multi-Hill | 25 min | scene-safe skeleton |
+| `mh` | Multi-Hill | 25 min | rotating shared hills, control score, airstrikes |
 | `tc` | Territory Control | 25 min | scene-safe skeleton |
 | `dia` | Diamond Mine | 15 min | scene-safe skeleton |
-| `dem` | Demolition | 15 min | scene-safe skeleton |
+| `dem` | Demolition | 15 min | build phase, destructible/repairable team bases |
 | `oc` | Occupation | 15 min | scene-safe skeleton |
 
 `arena` is a BattleSpades extension and is not one of the retail hosting rows.

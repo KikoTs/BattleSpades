@@ -1,0 +1,41 @@
+[server]
+name = "AoS Revival Official Territory Control"
+port = 27027
+max_players = 24
+tick_rate = 60
+
+[game]
+default_mode = "tc"
+default_map = "CityOfChicago"
+movement_authority = "server"
+
+[lobby]
+match_length_minutes = 25
+map_rotation = ["Alcatraz", "CityOfChicago"]
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 6
+reserve_human_slots = 2
+difficulty = "mixed"
+perception_hz = 8
+decision_hz = 8
+path_requests_per_second = 24
+main_thread_budget_ms = 1.5
+worker = "process"
+clean_slate_games = 3
+
+[revival]
+enabled = false
+
+[steam]
+enabled = false
+steam_port = 8772
+query_port = 27028
+
+[logging]
+level = "INFO"
+file = "official-territory-control.log"
+console = false

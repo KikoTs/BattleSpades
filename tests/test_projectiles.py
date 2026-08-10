@@ -195,7 +195,16 @@ def test_block_cannon_projectile_snapshots_palette_and_source_loop():
 
 def test_mine_launcher_replaces_flying_visual_with_armed_landmine():
     server = BattleSpadesServer(ServerConfig())
-    owner = SimpleNamespace(id=1, name="engineer", team=0)
+    server.world_manager.generate_flat_map()
+    support = (105, 100, 30)
+    assert server.world_manager.set_block(*support, True, 0x445566)
+    owner = SimpleNamespace(
+        id=1,
+        name="engineer",
+        team=0,
+        alive=True,
+        spawned=True,
+    )
     observer = SimpleNamespace(id=2, name="observer", team=1)
     owner_connection = RecordingConnection(owner)
     observer_connection = RecordingConnection(observer)
@@ -210,6 +219,7 @@ def test_mine_launcher_replaces_flying_visual_with_armed_landmine():
 
     server.spawn_grenade(owner, packet)
     projectile = server.projectile_engine.projectiles[0]
+    projectile.contact_block = support
     flight_id = projectile.entity_id
     server._deploy_launched_mine(ProjectileDeployment(projectile))
 
@@ -221,12 +231,43 @@ def test_mine_launcher_replaces_flying_visual_with_armed_landmine():
     assert deployed.behavior.takes_damage is True
     assert deployed.behavior.health == float(C.LANDMINE_HEALTH)
     assert deployed.behavior.damage_type == int(C.MINE_LAUNCHER_DAMAGE)
+    assert deployed.support_cell == support
     destroyed = [
         DestroyEntity(ByteReader(data[1:])).entity_id
         for data in observer_connection.sent
         if data[0] == DestroyEntity.id
     ]
     assert destroyed == [flight_id]
+
+    blasts = []
+    server._apply_blast = lambda *args, **kwargs: blasts.append((args, kwargs))
+    assert server.world_manager.destroy_blocks([support]) == [support]
+    assert server.entity_registry.get(deployed.entity_id) is None
+    assert len(blasts) == 1
+
+
+def test_mine_launcher_does_not_deploy_without_a_live_terrain_contact():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    owner = SimpleNamespace(id=1, name="engineer", team=0)
+    server.players = {owner.id: owner}
+    server.connections = {}
+    projectile = server.projectile_engine.spawn(
+        int(C.MINE_LAUNCHER_TOOL),
+        (100.0, 100.0, 30.0),
+        (75.0, 0.0, 0.0),
+        0.0,
+        owner.id,
+        now=0.0,
+    )
+
+    server._deploy_launched_mine(ProjectileDeployment(projectile))
+
+    assert not [
+        entity
+        for entity in server.entity_registry.all()
+        if entity.type == C.LANDMINE_ENTITY
+    ]
 
 
 def test_unknown_tool_not_spawned():
@@ -743,6 +784,42 @@ def test_sticky_anchors_on_contact_then_fuse_fires():
     assert stuck_pos is not None, "sticky never stuck"
     assert len(explosions) == 1
     assert 1.9 <= t <= 2.1
+
+
+def test_sticky_explodes_when_its_terrain_attachment_is_removed():
+    class RemovableWall:
+        present = True
+
+        def get_solid(self, x, _y, _z):
+            return self.present and x >= 105
+
+    eng = ProjectileEngine()
+    world = RemovableWall()
+    eng.spawn(
+        int(C.STICKY_GRENADE_TOOL),
+        (100.0, 100.0, 30.0),
+        (40.0, 0.0, 0.0),
+        0.0,
+        1,
+        now=0.0,
+    )
+    now = 0.0
+    for _ in range(60):
+        now += DT
+        assert eng.update(DT, world, now=now) == []
+        if eng.projectiles[0].stuck:
+            break
+
+    projectile = eng.projectiles[0]
+    assert projectile.stuck
+    assert projectile.contact_block is not None
+    world.present = False
+
+    events = eng.update(DT, world, now=now + DT)
+
+    assert len(events) == 1
+    assert events[0].spec.name == "sticky_grenade"
+    assert eng.projectiles == []
 
 
 def test_sticky_attaches_to_and_follows_player_until_stock_fuse():

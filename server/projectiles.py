@@ -380,13 +380,20 @@ class Explosion:
 
 class ProjectileDeployment:
     """A launched mine that contacted terrain and becomes a placed entity."""
-    __slots__ = ("x", "y", "z", "thrower_id", "spec", "entity_id")
+    __slots__ = (
+        "x", "y", "z", "thrower_id", "spec", "entity_id", "support_cell",
+    )
 
     def __init__(self, proj: Projectile):
         self.x, self.y, self.z = proj.x, proj.y, proj.z
         self.thrower_id = proj.thrower_id
         self.spec = proj.spec
         self.entity_id = proj.entity_id
+        self.support_cell = (
+            None
+            if proj.contact_block is None
+            else tuple(int(value) for value in proj.contact_block)
+        )
 
 
 class DrillContact:
@@ -491,6 +498,16 @@ class ProjectileEngine:
                         p.x = float(target.x)
                         p.y = float(target.y)
                         p.z = float(target.z) + 1.0
+                elif (
+                    p.contact_block is not None
+                    and not world.get_solid(*p.contact_block)
+                ):
+                    # A terrain-attached sticky owns the same support lifetime
+                    # as C4/dynamite.  If that exact voxel disappears, execute
+                    # its normal explosion immediately instead of retaining a
+                    # frozen client entity in empty space until the fuse ends.
+                    explosions.append(Explosion(p))
+                    continue
                 still.append(p)
                 continue
 
@@ -546,6 +563,7 @@ class ProjectileEngine:
         hit = False
         if world.get_solid(int(nx), int(ny), int(nz)):
             hit = True
+            p.contact_block = (int(nx), int(ny), int(nz))
             bounced = False
             if world.get_solid(int(nx), int(y), int(z)):
                 p.vx = -p.vx; nx = x; bounced = True

@@ -191,8 +191,10 @@ visible and hidden entries.
 
 - `[bots]`: `enabled`; `population_mode` (`backfill`, `fixed`, `admin`);
   `fill_target`; `max_bots`; `reserve_human_slots`; `difficulty` (`casual`,
-  `normal`, `hard`, `mixed`); process worker rates/budgets; `seed`; and bounded
-  `debug_visualization`.
+  `normal`, `hard`, `mixed`); process worker rates/budgets; `seed`;
+  `clean_slate_games` (defaults to `3`, `0` disables only the periodic worker
+  recycle); and bounded `debug_visualization`. Per-round path, coordination,
+  stuck, motor, and queued-intent state is always discarded.
 - `[modes.<code>]`: `time_limit` seconds plus legacy aliases shown in the
   sample. These override `[game_rules]` only for that mode.
 - `[teams]`: localized team-name string IDs, RGB colors, automatic balance and

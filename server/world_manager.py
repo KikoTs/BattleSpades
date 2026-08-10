@@ -231,6 +231,10 @@ class WorldManager:
             self.world = None
             return
         self.world = World(self.map)
+        # StateData and authoritative physics must consume one canonical map
+        # scalar.  This matters on LunarBase and for every jetpack recurrence,
+        # whose thrust formula includes the global gravity value.
+        self.world.set_gravity(float(self.map_metadata.gravity))
     
     def get_solid(self, x: int, y: int, z: int) -> bool:
         """Check if block at position is solid."""
@@ -441,7 +445,55 @@ class WorldManager:
         cell_x, cell_y = int(math.floor(x)), int(math.floor(y))
         if self.map is None or self.is_water_column(cell_x, cell_y):
             return False
-        return not self.clipbox(x, y, z) and not self.clipbox(x, y, z + 1.0)
+        return self._player_body_is_clear(x, y, z) and self._player_has_support(
+            x, y, z
+        )
+
+    def _player_has_support(self, x: float, y: float, z: float) -> bool:
+        """Return whether the standing capsule has terrain under either foot.
+
+        Body clearance alone accepts arbitrary air pockets and coordinates
+        above the visible VXL. That made a stale map-transition position look
+        valid until native gravity exposed the bot underneath the new map.
+        Spawn points may begin half a block above equilibrium, so probe the
+        complete initial-settle band rather than one exact floating value.
+        """
+
+        radius = float(getattr(C, "PLAYER_RADIUS", 0.45)) * 0.75
+        probes = (
+            (x, y),
+            (x - radius, y),
+            (x + radius, y),
+            (x, y - radius),
+            (x, y + radius),
+        )
+        foot_z = float(z) + PLAYER_STANDING_POS_ABOVE_GROUND
+        return any(
+            self.clipbox(probe_x, probe_y, foot_z + settle)
+            for probe_x, probe_y in probes
+            for settle in (0.0, 0.25, 0.5, 0.75)
+        )
+
+    def _player_body_is_clear(self, x: float, y: float, z: float) -> bool:
+        """Validate the full standing capsule footprint, not only its center."""
+
+        radius = float(getattr(C, "PLAYER_RADIUS", 0.45))
+        probes = (
+            (x, y),
+            (x - radius, y),
+            (x + radius, y),
+            (x, y - radius),
+            (x, y + radius),
+            (x - radius, y - radius),
+            (x - radius, y + radius),
+            (x + radius, y - radius),
+            (x + radius, y + radius),
+        )
+        return all(
+            not self.clipbox(probe_x, probe_y, z + height)
+            for probe_x, probe_y in probes
+            for height in (0.0, 1.0, 2.0)
+        )
 
     def _nearest_safe_spawn_point(
         self, x: float, y: float, *, search: int
@@ -597,10 +649,9 @@ class WorldManager:
         return self.get_solid(x, y, solid_z)
     
     def _spawn_region(self, team: int) -> tuple[int, int, int, int]:
-        if team == TEAM1:
-            return 64, 128, 192, 384
-        if team == TEAM2:
-            return 320, 128, 448, 384
+        region = self.map_metadata.fallback_spawn_regions.get(int(team))
+        if region is not None:
+            return region
         return 192, 192, 320, 320
 
     def _safe_spawn_column(
@@ -657,6 +708,17 @@ class WorldManager:
                 ground_reference = ring[(len(ring) * 3) // 4]
                 if ground_reference - surface_z > 4:
                     return False
+        spawn_z = (
+            float(surface_z)
+            - PLAYER_STANDING_POS_ABOVE_GROUND
+            - 0.5
+        )
+        if not self._player_body_is_clear(
+            float(x) + 0.5,
+            float(y) + 0.5,
+            spawn_z,
+        ):
+            return False
         return True
 
     def _zone_spawn_candidates(self, team: int) -> list[tuple[int, int]]:

@@ -1340,12 +1340,19 @@ class CombatSystem:
                                  causer_id: int = None):
         """Guaranteed removal on all clients: kill-damage Damage(37) per cell
         (a no-op for cells the client already removed on its own)."""
+        positions = tuple(tuple(int(value) for value in pos) for pos in positions)
         for pos in positions:
             self._broadcast_block_damage(
                 player, pos, self._BLOCK_KILL_DAMAGE,
                 damage_type=damage_type, causer_id=causer_id,
             )
         self._collapse_unsupported(player, positions)
+        if player is not None and positions:
+            is_spade = getattr(player, "is_spade_tool", None)
+            mined = bool(is_spade()) if callable(is_spade) else False
+            queue = getattr(self.server, "queue_mode_event", None)
+            if callable(queue):
+                queue("on_blocks_destroyed", player, positions, mined)
 
     def broadcast_native_radius_destroy(
         self,

@@ -107,6 +107,7 @@ class AIWorkerSupervisor:
         self._next_snapshot_transfer_id = 1
         self._outbound_snapshot: _OutboundSnapshotTransfer | None = None
         self._stop_event = threading.Event()
+        self._restart_request = threading.Event()
         self._thread: threading.Thread | None = None
         self._status_lock = threading.Lock()
         self._running = False
@@ -142,6 +143,7 @@ class AIWorkerSupervisor:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._restart_request.clear()
         self._thread = threading.Thread(
             target=self._bridge_main,
             name="BotAIBridge",
@@ -170,6 +172,27 @@ class AIWorkerSupervisor:
                 self._terrain_map_epoch = int(snapshot.map_epoch)
                 self._terrain_version = int(snapshot.topology_version)
                 self._snapshot_required = False
+        self.discard_timeline()
+
+    def discard_timeline(self) -> None:
+        """Drop queued frames/results belonging to a completed game epoch."""
+
+        with self._frame_lock:
+            self._frames.clear()
+        while True:
+            try:
+                self._intents.get_nowait()
+            except queue.Empty:
+                break
+        with self._status_lock:
+            self._awaiting_intent_since = None
+            self._awaiting_frame_id = None
+
+    def request_restart(self) -> None:
+        """Request a non-blocking clean child recycle on the bridge thread."""
+
+        self.discard_timeline()
+        self._restart_request.set()
 
     def publish_world_change(
         self,
@@ -295,6 +318,39 @@ class AIWorkerSupervisor:
         try:
             while not self._stop_event.is_set():
                 now = time.monotonic()
+                if self._restart_request.is_set():
+                    self._restart_request.clear()
+                    if process is not None:
+                        if process.is_alive():
+                            try:
+                                process_input.put_nowait(WorkerShutdown())
+                            except (AttributeError, OSError, queue.Full):
+                                pass
+                            process.join(timeout=0.15)
+                            if process.is_alive():
+                                process.terminate()
+                                process.join(timeout=0.5)
+                        self._close_process_queues(
+                            process_input,
+                            process_output,
+                        )
+                    process = None
+                    process_input = None
+                    process_output = None
+                    sent_snapshot_serial = -1
+                    failure_count = 0
+                    next_start_at = 0.0
+                    self._discard_outbound_snapshot()
+                    with self._status_lock:
+                        self._running = False
+                        self._process_id = None
+                        self._restarts += 1
+                        self._awaiting_intent_since = None
+                        self._awaiting_frame_id = None
+                        self._awaiting_snapshot_transfer_id = None
+                        self._snapshot_progress_at = None
+                        self._worker_has_processed_frame = False
+                    logger.info("AI worker clean-slate recycle requested")
                 if process is None or not process.is_alive():
                     if process is not None:
                         exit_code = process.exitcode

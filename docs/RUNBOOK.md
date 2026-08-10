@@ -688,6 +688,7 @@ py scripts\bot_runtime_smoke.py --seconds 12 --bots 12 --restart-worker-at 2
 py scripts\bot_city_soak.py --mode tdm --bots 12 --sim-seconds 60 --report-every 10
 py scripts\bot_city_soak.py --mode zom --bots 12 --sim-seconds 60 --report-every 10
 py scripts\bot_city_soak.py --map CastleWars --mode zom --bots 2 --sim-seconds 60 --report-every 30 --strand-water-bots 2
+py scripts\bot_transition_soak.py --games-per-session 4 --bots 6 --json validation-reports\bot-transition.json
 py scripts\server_capacity.py --players 12 --seconds 30 --port 27016
 
 # Exercise every implemented mode through the same real worker/native physics.
@@ -719,6 +720,14 @@ capture the child before restarting it; a stack inside `recast*.pyd` from
 stack in `VoxelActionPlanner.water_exit` indicates water-search work. Both are
 bounded in current builds. Do not stop the authoritative server to recover a
 worker fault.
+
+`bot_transition_soak.py` keeps one production server and bot roster alive while
+crossing every shipped VXL/mode pair. Before every full rollover and same-map
+restart it deliberately injects unsupported coordinates plus stale path,
+feedback, motor, and pending-action state. The gate requires a supported spawn,
+new native world owner, new controller record, empty old-timeline queues, and
+one isolated-planner recycle per `bots.clean_slate_games`. It never exercises
+or enables bot-only idle/hibernation behavior.
 
 `bot_city_soak.py` loads the real CityOfChicago VXL and advances worker policy
 time without sleeping. It prints each bot's position, role, action, affordance,

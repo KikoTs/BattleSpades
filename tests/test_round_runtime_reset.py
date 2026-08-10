@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from server.main import BattleSpadesServer
 from server.game_constants import TEAM1, TEAM2
+from server.config import ServerConfig
+from server.world_manager import WorldManager
 
 
 class _Registry:
@@ -125,3 +127,17 @@ def test_round_respawn_applies_pending_class_and_loadout_before_create_player():
     assert player.pending_class_id is None
     assert player.pending_loadout is None
     assert created == [(3, [5, 3, 9, 63, 21], (128.5, 256.5, 223.75))]
+
+
+def test_spawn_safety_rejects_clear_but_unsupported_under_map_anchor():
+    """A clear capsule without terrain under its feet is not a valid spawn."""
+
+    world = WorldManager(ServerConfig())
+    world.generate_flat_map()
+    grounded = world.dry_ground_anchor(128.0, 128.0)
+    unsupported = (grounded[0], grounded[1], grounded[2] - 24.0)
+
+    assert world._player_body_is_clear(*unsupported)
+    assert not world.spawn_position_is_safe(unsupported)
+    assert world.spawn_position_is_safe(grounded)
+    assert world.sanitize_spawn_point(unsupported, TEAM1) != unsupported

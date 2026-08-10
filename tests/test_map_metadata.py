@@ -11,6 +11,7 @@ from server.map_metadata import (  # noqa: E402
     STOCK_STATIC_LIGHT_COLORS,
     MapMetadata,
     MapZone,
+    canonical_gravity,
     load_map_metadata,
 )
 from server.config import ServerConfig  # noqa: E402
@@ -58,6 +59,27 @@ def test_loads_skybox_from_original_and_ugc_metadata_keys(tmp_path: Path):
     assert load_map_metadata(vxl, "tdm").skybox_name == "User_Grassland.txt"
 
 
+def test_authored_gravity_is_wire_canonical_and_invalid_values_are_safe(
+    tmp_path: Path,
+):
+    vxl = tmp_path / "lunar_custom.vxl"
+    vxl.write_bytes(b"")
+    vxl.with_suffix(".txt").write_text("gravity = 0.4\n", encoding="utf-8")
+
+    assert load_map_metadata(vxl, "tdm").gravity == 26.0 / 64.0
+    assert canonical_gravity(float("nan")) == 1.0
+    assert canonical_gravity(-2.0) == 1.0
+
+
+def test_stock_lunar_gravity_and_tokyo_team_orientation_are_recovered():
+    lunar = load_map_metadata(Path("maps") / "LunarBase.vxl", "tdm")
+    tokyo = load_map_metadata(Path("maps") / "TokyoNeon.vxl", "tdm")
+
+    assert lunar.gravity == 26.0 / 64.0
+    assert tokyo.fallback_spawn_regions[TEAM1] == (320, 128, 448, 384)
+    assert tokyo.fallback_spawn_regions[TEAM2] == (64, 128, 192, 384)
+
+
 def test_loads_skybox_from_legacy_python_assignment_without_executing_it(
     tmp_path: Path,
 ):
@@ -91,6 +113,9 @@ def test_loads_stock_environment_lights_and_resource_points(tmp_path: Path):
             "team_two_spawn_area = [((400, 410, 221), (10, 20, 30))]",
             "team_one_base_point = (90, 100, 222)",
             "team_one_base_w_h_d = (12, 14, 16)",
+            "team_one_min_destruction = 10",
+            "mh_base_points = [(200, 210, 220), (300, 310, 221)]",
+            "mh_base_w_h_d = [(6, 8, 10), (12, 14, 16)]",
             # This must never execute while parsing the trusted scalar subset.
             "raise RuntimeError('metadata parser executed map code')",
         )),
@@ -104,6 +129,11 @@ def test_loads_stock_environment_lights_and_resource_points(tmp_path: Path):
     assert metadata.spawn_zones[TEAM1][0].xy_bounds() == (90, 110, 95, 125)
     assert metadata.spawn_zones[TEAM2][0].xy_bounds() == (395, 405, 400, 420)
     assert metadata.base_zones[TEAM1][0].xy_bounds() == (84, 96, 93, 107)
+    assert metadata.base_min_destruction[TEAM1] == 10
+    assert [zone.xy_bounds() for zone in metadata.neutral_base_zones] == [
+        (197, 203, 206, 214),
+        (294, 306, 303, 317),
+    ]
     assert [
         (entity.entity_type, entity.kind, entity.x, entity.y, entity.z)
         for entity in metadata.entities
@@ -112,6 +142,76 @@ def test_loads_stock_environment_lights_and_resource_points(tmp_path: Path):
         (int(C.HEALTH_CRATE), "health", 11.0, 21.0, 31.0),
         (int(C.BLOCK_CRATE), "block", 12.0, 22.0, 32.0),
     ]
+
+
+def test_loads_legacy_occupation_and_diamond_objectives(tmp_path: Path):
+    vxl = tmp_path / "objectives.vxl"
+    vxl.write_bytes(b"")
+    vxl.with_suffix(".txt").write_text(
+        "\n".join((
+            "occupation_base_point = (400, 250, 220)",
+            "occupation_base_w_h_d = (20, 30, 40)",
+            "occupation_bomb_points = [(100, 110, 221), (120, 130, 222)]",
+            "diamond_base_points = [(200, 210, 220), (300, 310, 221)]",
+            "diamond_base_w_h_d = [(6, 8, 10), (12, 14, 16)]",
+            "diamond_base_teams = [0, 3]",
+            "diamond_base_capacity = [1, 4]",
+        )),
+        encoding="utf-8",
+    )
+
+    metadata = load_map_metadata(vxl, "dia")
+
+    assert metadata.occupation_base_zone is not None
+    assert metadata.occupation_base_zone.team == TEAM2
+    assert metadata.occupation_base_zone.xy_bounds() == (390, 410, 235, 265)
+    assert metadata.occupation_bomb_points == [
+        (100.0, 110.0, 221.0),
+        (120.0, 130.0, 222.0),
+    ]
+    assert [zone.xy_bounds() for zone in metadata.diamond_base_zones] == [
+        (197, 203, 206, 214),
+        (294, 306, 303, 317),
+    ]
+    assert [zone.team for zone in metadata.diamond_base_zones] == [
+        int(C.TEAM_NEUTRAL), TEAM2
+    ]
+    assert metadata.diamond_base_capacities == [1, 4]
+
+
+def test_ugc_occupation_bomb_point_and_green_base_are_mode_owned(tmp_path: Path):
+    vxl = tmp_path / "occupation.vxl"
+    vxl.write_bytes(b"")
+    vxl.with_suffix(".ugc").write_text(json.dumps({"ugc_entities": [
+        {"position": [80, 90, 230], "mode": "oc", "item": "ugc_bomb_drop"},
+        {"position": [420, 250, 225], "mode": "oc", "item": "ugc_basegreen_med"},
+        {"position": [10, 20, 220], "mode": "ctf", "item": "ugc_bomb_drop"},
+    ]}), encoding="utf-8")
+
+    metadata = load_map_metadata(vxl, "oc")
+
+    assert metadata.occupation_bomb_points == [(80.0, 90.0, 230.0)]
+    assert metadata.occupation_base_zone is not None
+    assert metadata.occupation_base_zone.team == TEAM2
+
+
+def test_recovered_stock_objectives_are_present_without_executing_txtc():
+    occupation = load_map_metadata(Path("maps") / "MayanJungle.vxl", "oc")
+    diamond = load_map_metadata(Path("maps") / "MayanJungle.vxl", "dia")
+
+    assert occupation.occupation_base_zone is not None
+    assert (
+        occupation.occupation_base_zone.x,
+        occupation.occupation_base_zone.y,
+        occupation.occupation_base_zone.z,
+    ) == (439.0, 269.0, 260.0)
+    assert occupation.occupation_bomb_points == [
+        (262.0, 311.0, 223.0),
+        (264.0, 243.0, 230.0),
+        (212.0, 254.0, 226.0),
+    ]
+    assert len(diamond.diamond_base_zones) == 5
+    assert diamond.diamond_base_capacities == [1, 1, 1, 1, 1]
 
 
 def test_skybox_catalog_supplies_fog_when_sidecar_omits_it(tmp_path: Path):
@@ -319,6 +419,16 @@ def test_voxel_only_map_base_anchor_is_nearest_safe_team_region_center():
     x, y, _z = wm.team_base_anchor(TEAM1)
 
     assert (x, y) == (128.5, 256.5)
+
+
+def test_tokyo_fallback_regions_put_blue_right_and_green_left():
+    wm = WorldManager(ServerConfig())
+    wm.map_metadata = load_map_metadata(
+        Path("maps") / "TokyoNeon.vxl", "tdm"
+    )
+
+    assert wm._spawn_region(TEAM1) == (320, 128, 448, 384)
+    assert wm._spawn_region(TEAM2) == (64, 128, 192, 384)
 
 
 def test_voxel_only_map_spawns_stay_clustered_around_team_base(monkeypatch):

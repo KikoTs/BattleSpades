@@ -276,9 +276,10 @@ RULE_MAX_ACTIVE_BOMBS = 1
 RULE_BOMB_FUSE_TIME = 10
 
 [bots]
-# Bot decisions and bounded direct-VXL pathfinding run on one owner thread.
-# Set worker = "process" only when you need crash-isolation diagnostics. The
-# authoritative 60 Hz server applies validated, expiring intentions.
+# Bot decisions and bounded direct-VXL pathfinding run outside gameplay.
+# "thread" uses less memory for one casual instance; "process" isolates a
+# native/pathfinding worker fault and is used by every shipped fleet profile.
+# The authoritative 60 Hz server applies validated, expiring intentions.
 enabled = true
 population_mode = "backfill"
 fill_target = 12
@@ -292,6 +293,9 @@ path_requests_per_second = 24
 main_thread_budget_ms = 0.75
 seed = 0
 debug_visualization = false
+# Purge all per-game bot state every round; additionally recycle the isolated
+# planner after this many completed game/map boundaries. Zero disables recycle.
+clean_slate_games = 3
 
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.
@@ -432,10 +436,11 @@ worldupdate_self_row_interval = 2
 # Airborne anchors stay within the retail 60-entry history while avoiding the
 # correction replay that a 30 Hz vertical phase mismatch causes.
 worldupdate_airborne_self_row_interval = 6
-# Retail never acknowledges applying the jetpack-active WorldUpdate. Suppress
-# only the owner's ordinary correction row while thrust is active; observers
-# and authoritative hitboxes keep receiving the server snapshot at 30 Hz.
-# This accepted-ClientData bound remains the inactive-transition fallback.
+# Retail never acknowledges applying the jetpack-active WorldUpdate. Give the
+# owner this many accepted input frames of quiet transition time, then publish
+# one causal active-flight checkpoint and repeat. This bounds long Glide
+# Jetpack drift below the hard-snap range while observers and authoritative
+# hitboxes continue receiving the server snapshot at 30 Hz.
 jetpack_owner_handoff_input_frames = 30
 # Exhaustion can leave SPACE held while the owner falls. Resume after release,
 # settle, and ground contact; this cap prevents an indefinite local-row holdoff.

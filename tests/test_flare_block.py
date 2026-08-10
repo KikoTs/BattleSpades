@@ -180,3 +180,26 @@ def test_flare_loses_support_and_uses_same_destroy_entity_cleanup_path():
 
     assert server.entity_registry.get(flare.entity_id) is None
     assert any(data[0] == 19 for data in connection.sent)
+
+
+def test_connected_flare_group_cannot_support_itself_after_anchor_breaks():
+    server, player, connection = _server_player()
+    _place(server, player, z=61)
+    _place(server, player, z=60, loop_count=11)
+    flares = [
+        entity
+        for entity in server.entity_registry.all()
+        if entity.kind == "flare_block"
+    ]
+    assert len(flares) == 2
+    connection.sent.clear()
+
+    assert server.world_manager.set_block(104, 100, 62, False)
+    server.entity_registry.tick(server._build_entity_ctx())
+
+    assert not [
+        entity
+        for entity in server.entity_registry.all()
+        if entity.kind == "flare_block"
+    ]
+    assert sum(packet[0] == 19 for packet in connection.sent) == 2

@@ -31,4 +31,29 @@ enabled = true
 [[instances]]
 name = "Official VIP"
 config = "configs/official-vip.toml"
-enabled = false
+enabled = true
+
+[[instances]]
+name = "Official Multi-Hill"
+config = "configs/official-multi-hill.toml"
+enabled = true
+
+[[instances]]
+name = "Official Territory Control"
+config = "configs/official-territory-control.toml"
+enabled = true
+
+[[instances]]
+name = "Official Diamond Mine"
+config = "configs/official-diamond-mine.toml"
+enabled = true
+
+[[instances]]
+name = "Official Demolition"
+config = "configs/official-demolition.toml"
+enabled = true
+
+[[instances]]
+name = "Official Occupation"
+config = "configs/official-occupation.toml"
+enabled = true

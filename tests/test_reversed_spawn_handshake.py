@@ -238,15 +238,15 @@ def test_malformed_lzf_disconnects_only_the_sending_peer():
     assert connection.pending_selection is None
 
 
-def test_pre_join_constructor_palette_noise_is_ignored():
+def test_pre_join_constructor_palette_noise_does_not_override_team_spawn_color():
     server = DummyServer()
     connection = make_connection(server)
     connection.send = lambda data, reliable=True, prefix=0x30: None
 
     # Captured retail startup sequence.  Constructing the colour-using tools
     # emits their defaults before NewPlayerConnection; none represents a user
-    # palette choice.  The recovered server rejects SetColor until a live
-    # BlockTool is selected, so the new player's colour stays neutral grey.
+    # palette choice. The server rejects SetColor until a live BlockTool is
+    # selected, then initializes the actual life from the configured team.
     for value in (0x707070, 0xFF0000, 0xFFFF00):
         color = SetColor()
         color.player_id = 0
@@ -261,7 +261,22 @@ def test_pre_join_constructor_palette_noise_is_ignored():
     join.name = "Painter"
     asyncio.run(connection._on_new_player(join))
 
-    assert connection.player.block_color == 0x707070
+    assert connection.player.block_color == server.teams[TEAM1].color_int
+
+
+def test_each_spawn_resets_block_palette_to_the_current_team_color():
+    server = DummyServer()
+    connection = make_connection(server)
+    player = Player(0, "Builder", TEAM1, C.BLOCK_TOOL, connection)
+    player.block_color = 0x123456
+
+    player.spawn(100.5, 100.5, 59.75)
+    assert player.block_color == server.teams[TEAM1].color_int
+
+    player.set_color(0xABCDEF)
+    player.team = TEAM2
+    player.spawn(110.5, 100.5, 59.75)
+    assert player.block_color == server.teams[TEAM2].color_int
 
 
 def test_world_manager_height_scans_surface_from_solids():
@@ -370,12 +385,17 @@ def test_spawn_uses_cached_loadout_and_sends_hp():
     announced_color = SetColor(ByteReader(server.broadcast_packets[1][1:]))
     assert announced_color.player_id == connection.player.id
     assert announced_color.value == connection.player.block_color
+    assert announced_color.value == server.teams[TEAM2].color_int
 
     # The joiner also receives its OWN CreatePlayer directly (gameplay
     # broadcasts are gated until it's in-game, so the spawn echo can't ride
     # the broadcast). It binds the local player to the server id.
     own_create = CreatePlayer(ByteReader(sent_packets[0][1:]))
     assert own_create.player_id == connection.player.id
+    own_color_data = next(p for p in sent_packets if p and p[0] == SetColor.id)
+    own_color = SetColor(ByteReader(own_color_data[1:]))
+    assert own_color.player_id == connection.player.id
+    assert own_color.value == server.teams[TEAM2].color_int
 
     # SetHP follows — locate it by id rather than a fixed index.
     set_hp_data = next(p for p in sent_packets if p and p[0] == SetHP.id)

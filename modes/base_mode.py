@@ -198,6 +198,20 @@ class BaseMode(ABC):
     async def on_block_destroy(self, player: 'Player', x: int, y: int, z: int):
         """Called when a player destroys a block."""
         pass
+
+    async def on_blocks_destroyed(
+        self,
+        player: 'Player',
+        positions: tuple[tuple[int, int, int], ...],
+        mined: bool,
+    ):
+        """Called once for an authoritative bulk terrain removal.
+
+        ``mined`` is captured synchronously at removal time so delayed mode
+        event processing cannot mistake a later tool swap for the action that
+        actually removed the voxels.
+        """
+        pass
     
     async def on_block_line(self, player: 'Player', x1: int, y1: int, z1: int, 
                             x2: int, y2: int, z2: int):
@@ -254,6 +268,29 @@ class BaseMode(ABC):
             parameters,
             localise_parameters=localise_parameters,
             override_previous=override_previous,
+        )
+
+    def send_localised_message_to(
+        self,
+        connection,
+        string_id: str,
+        parameters=(),
+        *,
+        localise_parameters: bool = False,
+        override_previous: bool = False,
+    ) -> None:
+        """Send one retail string-table announcement to one GameScene."""
+
+        from server.announcements import build_localised_overlay
+
+        connection.send(
+            build_localised_overlay(
+                string_id,
+                parameters,
+                localise_parameters=localise_parameters,
+                override_previous=override_previous,
+            ),
+            reliable=True,
         )
     
     async def check_win_condition(self) -> Optional[int]:
@@ -453,3 +490,13 @@ class BaseMode(ABC):
                 logging.getLogger(__name__).debug(
                     "restart respawn failed for %s", getattr(player, "id", "?"),
                     exc_info=True)
+
+        # The mode and VXL object identities survive this in-place restart, so
+        # BotDirector cannot discover the new game through its ordinary map /
+        # mode signature check. Reset after every new body exists: no path,
+        # stuck timer, squad assignment, held action, or worker result from the
+        # completed game is allowed to drive the next one.
+        bots = getattr(self.server, "bots", None)
+        reset_bots = getattr(bots, "reset_after_round_restart", None)
+        if callable(reset_bots):
+            reset_bots()

@@ -37,6 +37,20 @@ class RoofMap:
         return 0
 
 
+class ShoulderWallMap:
+    """Flat support with a wall clipping only the standing body's edge."""
+
+    def get_solid(self, x, _y, z):
+        if int(x) == 10:
+            return int(z) >= 20
+        if int(x) == 11:
+            return int(z) >= 18
+        return int(z) >= 20
+
+    def get_color(self, x, y, z):
+        return 0
+
+
 def test_spawn_rejects_small_player_built_platform_with_air_below():
     wm = WorldManager(ServerConfig())
     wm.map = RoofMap(1)
@@ -47,6 +61,16 @@ def test_spawn_rejects_large_roof_even_when_ring_samples_hit_roof():
     wm = WorldManager(ServerConfig())
     wm.map = RoofMap(20)
     assert not wm._safe_spawn_column(100, 100)
+
+
+def test_spawn_rejects_wall_intersecting_only_the_player_radius() -> None:
+    wm = WorldManager(ServerConfig())
+    wm.map = ShoulderWallMap()
+    position = (10.6, 10.5, 17.25)
+
+    assert not wm.clipbox(position[0], position[1], position[2])
+    assert not wm.clipbox(position[0], position[1], position[2] + 1.0)
+    assert wm.spawn_position_is_safe(position) is False
 
 
 def test_team_base_anchor_is_resolved_once_per_loaded_map():
@@ -114,6 +138,7 @@ def test_stock_maps_have_safe_spawn_candidates_for_both_teams():
                     int(x), int(y), authored_zone=authored,
                     reject_roofs=authored is None,
                 )
+                assert wm.spawn_position_is_safe((x, y, z))
 
 
 def test_double_dragon_water_life_candidates_relocate_nearby_to_dry_ground():
