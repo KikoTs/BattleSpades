@@ -22,7 +22,7 @@ from server.bot_ai.messages import (
     PerceptionFrame,
     PlayerSnapshot,
 )
-from server.bot_ai.simple_navigation import RoutePlan, RouteStep
+from server.bot_ai.simple_navigation import BreachPlan, RoutePlan, RouteStep
 from server.bot_ai.simple_worker import SimpleBotBrain, _BotState, _Goal
 from server.class_selection import normalize_class_selection
 from server.game_constants import TEAM1, TEAM2
@@ -37,6 +37,8 @@ class _TacticalWorld:
         water_step: RouteStep | None = None,
         route_step: RouteStep | None = None,
         route_steps_by_water: dict[bool, RouteStep | None] | None = None,
+        assisted_water_step: RouteStep | None = None,
+        water_bank_breach: RouteStep | None = None,
         bridge_line: (
             tuple[tuple[int, int, int], tuple[int, int, int]] | None
         ) = None,
@@ -45,6 +47,8 @@ class _TacticalWorld:
         self._water_step = water_step
         self._route_step = route_step
         self._route_steps_by_water = route_steps_by_water
+        self._assisted_water_step = assisted_water_step
+        self._water_bank_breach = water_bank_breach
         self._bridge_line = bridge_line
         self.plan_calls: list[bool] = []
         self.water_step_calls: list[dict[str, object]] = []
@@ -55,6 +59,15 @@ class _TacticalWorld:
     def water_step(self, _position, **kwargs) -> RouteStep | None:
         self.water_step_calls.append(dict(kwargs))
         return self._water_step
+
+    def assisted_water_step(self, _position, **_kwargs) -> RouteStep | None:
+        return self._assisted_water_step
+
+    def water_bank_breach(self, _position, _profile, **_kwargs):
+        return self._water_bank_breach
+
+    def jump_build_cell(self, _position):
+        return None
 
     def surface(self, x, y, _z, **_kwargs):
         support_z = 239 if int(x) >= 10 else 238
@@ -618,6 +631,95 @@ def test_airborne_bank_lip_releases_water_commitment_on_live_dry_support() -> No
     assert second is not None
     assert second.debug_role != "water_exit"
     assert state.water_committed is False
+
+
+def test_grounded_dry_landing_releases_water_without_point_surface() -> None:
+    """Native capsule support may come from a neighboring bank column."""
+
+    shore_step = RouteStep(
+        (9.5, 10.5, 235.75),
+        MovementAffordance.JUMP,
+    )
+    world = _TacticalWorld(water_step=shore_step)
+    brain = SimpleBotBrain(world)
+    swimmer = _player(
+        1,
+        TEAM1,
+        (10.5, 10.5, 236.75),
+        is_bot=True,
+        grounded=False,
+        wade=True,
+    )
+    first_frame = _frame(swimmer, created_at=100.0)
+    assert brain.decide(first_frame) is not None
+
+    # Neither the dry nor water point-column probe sees the neighboring
+    # support used by the native capsule, but grounded is authoritative.
+    world.surface = lambda *_args, **_kwargs: None
+    landed = replace(swimmer, wade=False, grounded=True)
+    brain.decide(replace(
+        first_frame,
+        frame_id=2,
+        created_at=100.2,
+        players=(landed,),
+    ))
+
+    state = brain._states[(swimmer.player_id, swimmer.generation)]
+    assert state.water_committed is False
+
+
+def test_rejected_water_bank_breach_blacklists_exact_shore_edge() -> None:
+    breach_plan = BreachPlan(
+        source=(126, 213, 239),
+        destination=(127, 213, 239),
+        target_cell=(127, 213, 237),
+        blocking_cells=((127, 213, 237),),
+        tool_id=int(C.SPADE_TOOL),
+        secondary=False,
+        fire_interval=0.4,
+        estimated_swings=40,
+    )
+    bank = RouteStep(
+        (127.5, 213.5, 236.75),
+        MovementAffordance.JUMP,
+    )
+    breach = RouteStep(
+        bank.waypoint,
+        MovementAffordance.BREACH,
+        breach_plan,
+    )
+    world = _TacticalWorld(
+        water_step=None,
+        assisted_water_step=bank,
+        water_bank_breach=breach,
+    )
+    brain = SimpleBotBrain(world)
+    observer = replace(
+        _player(
+            2,
+            TEAM1,
+            (126.55, 213.89, 237.54),
+            is_bot=True,
+            grounded=False,
+            wade=True,
+        ),
+        last_action_kind=BotActionKind.MELEE.value,
+        last_action_accepted=False,
+        last_action_position=breach_plan.target,
+        last_action_at=99.9,
+    )
+    frame = _frame(observer, created_at=100.0)
+
+    intent = brain.decide(frame)
+
+    state = brain._states[(observer.player_id, observer.generation)]
+    edge = (breach_plan.source, breach_plan.destination)
+    assert intent is not None
+    assert intent.debug_role == "water_bank:water_breach_rejected"
+    assert intent.action.kind is BotActionKind.NONE
+    assert intent.movement.direction == (0.0, 0.0, 0.0)
+    assert edge in state.blocked_edges
+    assert state.water_recovery is True
 
 
 def test_raised_jump_above_built_water_step_releases_water_commitment() -> None:

@@ -2578,6 +2578,46 @@ class SimpleBotBrain:
                     1.0,
                     False,
                 )
+                plan = breach.breach
+                rejected_target = observer.last_action_position
+                if (
+                    plan is not None
+                    and str(observer.last_action_kind)
+                    == BotActionKind.MELEE.value
+                    and not bool(observer.last_action_accepted)
+                    and rejected_target is not None
+                    and 0.0
+                    <= float(now) - float(observer.last_action_at)
+                    <= 0.8
+                    and math.dist(plan.target, rejected_target) <= 0.25
+                ):
+                    # The gameplay gateway has already proved that this exact
+                    # bank face cannot accept the planned swing. Retrying it
+                    # until the normal (potentially long) excavation timeout
+                    # pins a swimmer against one shoreline forever. Exclude
+                    # only that directed edge and let the water flow choose a
+                    # different bank; ordinary dry breaches keep their normal
+                    # transient-cooldown tolerance.
+                    self._remember_blocked_edge(
+                        state,
+                        (plan.source, plan.destination),
+                        now,
+                        lifetime=_WATER_BLOCKED_EDGE_SECONDS,
+                    )
+                    self._clear_route(state, now)
+                    state.water_step_key = None
+                    state.water_best_distance = math.inf
+                    state.water_progress_at = now
+                    state.water_recovery = True
+                    return self._intent(
+                        frame,
+                        movement=MovementIntent(),
+                        look=None,
+                        tool_id=_weapon_tool(observer),
+                        priority=BotIntentPriority.SURVIVAL,
+                        debug_goal=bank.waypoint,
+                        debug_role=f"{goal.role}:water_breach_rejected",
+                    )
                 return self._breach_intent(
                     frame,
                     observer,
@@ -2744,6 +2784,14 @@ class SimpleBotBrain:
         bank. Releasing water ownership on that bit alone made London bots
         alternate SWIM/JUMP against the same wall forever.
         """
+
+        # This method is reached only after native and live-VXL water-contact
+        # checks are both clear. At that point the authoritative grounded bit
+        # is sufficient evidence of a dry landing even when the capsule is
+        # supported by a neighboring column that the point surface probe
+        # below cannot see (reproduced on London's irregular banks).
+        if observer.grounded:
+            return True
 
         surface = self.world.surface(
             int(math.floor(observer.position[0])),
