@@ -335,7 +335,7 @@ def test_combat_pursuit_preserves_swim_without_promoting_it_to_jump() -> None:
     observer = _player(
         3,
         TEAM1,
-        (10.5, 10.5, 236.75),
+        (9.5, 10.5, 235.75),
         is_bot=True,
     )
     teammate = replace(observer, player_id=1)
@@ -553,6 +553,32 @@ def test_airborne_false_wade_frame_does_not_release_water_commitment() -> None:
     state = brain._states[(observer.player_id, observer.generation)]
     assert first is not None and first.debug_role == "water_exit"
     assert second is not None and second.debug_role == "water_exit"
+    assert state.water_committed is True
+
+
+def test_false_wade_frame_on_water_starts_water_commitment() -> None:
+    """A decision-phase wade alias cannot leave dry navigation in control."""
+
+    shore_step = RouteStep(
+        (9.5, 10.5, 235.75),
+        MovementAffordance.JUMP,
+    )
+    world = _TacticalWorld(water_step=shore_step)
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        1,
+        TEAM1,
+        (10.5, 10.5, 237.7),
+        is_bot=True,
+        grounded=True,
+        wade=False,
+    )
+
+    intent = brain.decide(_frame(observer, created_at=100.0))
+
+    assert intent is not None
+    assert intent.debug_role == "water_exit"
+    state = brain._states[(observer.player_id, observer.generation)]
     assert state.water_committed is True
 
 
