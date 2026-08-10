@@ -934,6 +934,121 @@ def test_wading_segment_completion_hands_off_to_shore_recovery() -> None:
     assert world.water_step_calls[-1]["preferred_goal"] is None
 
 
+def test_whole_swim_timeout_blocks_assisted_bank_before_breaching() -> None:
+    bank = RouteStep(
+        (9.5, 10.5, 235.75),
+        MovementAffordance.JUMP,
+    )
+    breach_plan = BreachPlan(
+        source=(10, 10, 239),
+        destination=(9, 10, 238),
+        target_cell=(9, 10, 237),
+        blocking_cells=((9, 10, 237),),
+        tool_id=int(C.SPADE_TOOL),
+        secondary=False,
+        fire_interval=0.4,
+        estimated_swings=40,
+    )
+    breach = RouteStep(
+        bank.waypoint,
+        MovementAffordance.BREACH,
+        breach_plan,
+    )
+    world = _TacticalWorld(
+        assisted_water_step=bank,
+        water_bank_breach=breach,
+    )
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        1,
+        TEAM1,
+        (10.5, 10.5, 236.75),
+        is_bot=True,
+        grounded=False,
+        wade=True,
+    )
+    frame = _frame(observer, created_at=100.0)
+    state = _BotState(
+        map_epoch=frame.map_epoch,
+        mode_epoch=frame.mode_epoch,
+        life_id=observer.life_id,
+        water_committed=True,
+        water_recovery=True,
+    )
+    brain._states[(observer.player_id, observer.generation)] = state
+
+    intent = brain._water_intent(
+        frame,
+        observer,
+        None,
+        frame.created_at,
+        force_block_edge=True,
+    )
+
+    assert intent.debug_role == "water_exit:cycle_blocked"
+    assert intent.action.kind is BotActionKind.NONE
+    assert intent.movement.direction == (0.0, 0.0, 0.0)
+    assert state.blocked_edges
+
+
+def test_physical_route_window_preempts_breach_assist_queue() -> None:
+    route_step = RouteStep(
+        (11.5, 10.5, 17.75),
+        MovementAffordance.WALK,
+    )
+    world = _TacticalWorld(route_step=route_step)
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        3,
+        TEAM1,
+        (10.5, 10.5, 17.75),
+        is_bot=True,
+    )
+    first_frame = _frame(observer, created_at=100.0)
+    goal = _Goal(
+        ("stalled-route",),
+        (100.5, 10.5, 17.75),
+        "stalled_route",
+        1.0,
+        True,
+    )
+    state = _BotState(
+        map_epoch=first_frame.map_epoch,
+        mode_epoch=first_frame.mode_epoch,
+        life_id=observer.life_id,
+    )
+    first = brain._navigation_intent(
+        first_frame,
+        observer,
+        state,
+        goal,
+        first_frame.created_at,
+    )
+    digger = replace(
+        observer,
+        player_id=1,
+        last_action_kind=BotActionKind.MELEE.value,
+        last_action_accepted=True,
+        last_action_position=(11.5, 10.5, 17.5),
+        last_action_at=105.0,
+    )
+    stalled_frame = _frame(observer, digger, created_at=105.1)
+
+    stalled = brain._navigation_intent(
+        stalled_frame,
+        observer,
+        state,
+        goal,
+        stalled_frame.created_at,
+    )
+
+    assert first.debug_role == "stalled_route"
+    assert stalled.debug_role == "stalled_route:physical_edge_blocked"
+    assert stalled.action.kind is BotActionKind.NONE
+    assert stalled.movement.direction == (0.0, 0.0, 0.0)
+    assert not state.route
+
+
 def test_fallback_water_exit_blacklists_its_own_stalled_edge() -> None:
     shore_step = RouteStep(
         (8.5, 10.5, 235.75),
