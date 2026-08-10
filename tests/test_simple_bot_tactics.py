@@ -767,6 +767,45 @@ def test_near_water_goal_stays_in_shore_recovery_until_dry() -> None:
     assert state.water_recovery is True
 
 
+def test_wading_segment_completion_hands_off_to_shore_recovery() -> None:
+    shore_step = RouteStep(
+        (10.5, 11.5, 236.75),
+        MovementAffordance.WALK,
+    )
+    world = _TacticalWorld(water_step=shore_step, route_step=None)
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        1,
+        TEAM1,
+        (10.5, 10.5, 236.75),
+        is_bot=True,
+        grounded=False,
+        wade=True,
+    )
+    frame = _frame(observer)
+    brain.reset_for_map(frame.map_epoch)
+    state = _BotState(
+        map_epoch=frame.map_epoch,
+        mode_epoch=frame.mode_epoch,
+        life_id=observer.life_id,
+        goal=_Goal(
+            ("water-segment",),
+            (100.5, 10.5, 236.75),
+            "water_segment",
+            1.0,
+            True,
+        ),
+    )
+    brain._states[(observer.player_id, observer.generation)] = state
+
+    intent = brain.decide(frame)
+
+    assert intent is not None
+    assert intent.debug_role == "water_exit"
+    assert state.water_recovery is True
+    assert world.water_step_calls[-1]["preferred_goal"] is None
+
+
 def test_fallback_water_exit_blacklists_its_own_stalled_edge() -> None:
     shore_step = RouteStep(
         (8.5, 10.5, 235.75),
@@ -926,6 +965,65 @@ def test_physical_navigation_stall_survives_goal_role_switches() -> None:
     assert first.debug_role == "combat_pursuit"
     assert switched.debug_role == "chase_last_seen"
     assert stalled.debug_role == "combat_pursuit:physical_edge_blocked"
+    assert state.blocked_edges
+
+
+def test_navigation_cycle_inside_three_blocks_forces_replan() -> None:
+    route_step = RouteStep(
+        (9.5, 10.5, 235.75),
+        MovementAffordance.JUMP,
+    )
+    world = _TacticalWorld(route_step=route_step)
+    brain = SimpleBotBrain(world)
+    observer = _player(
+        3,
+        TEAM1,
+        (10.5, 10.5, 236.75),
+        is_bot=True,
+    )
+    frame = _frame(observer, created_at=100.0)
+    state = _BotState(
+        map_epoch=frame.map_epoch,
+        mode_epoch=frame.mode_epoch,
+        life_id=observer.life_id,
+    )
+    goal = _Goal(
+        ("cycle",),
+        (1.5, 10.5, 235.75),
+        "cycle_goal",
+        1.0,
+        True,
+    )
+
+    intent = brain._navigation_intent(
+        frame,
+        observer,
+        state,
+        goal,
+        frame.created_at,
+    )
+    for index in range(1, 7):
+        position = (
+            11.1 if index % 2 else 10.5,
+            10.5,
+            236.75,
+        )
+        moving = replace(observer, position=position)
+        created_at = 100.0 + float(index)
+        intent = brain._navigation_intent(
+            replace(
+                frame,
+                frame_id=index + 1,
+                created_at=created_at,
+                players=(moving,),
+            ),
+            moving,
+            state,
+            goal,
+            created_at,
+        )
+
+    assert intent.debug_role == "cycle_goal:physical_edge_blocked"
     assert state.blocked_edges
 
 

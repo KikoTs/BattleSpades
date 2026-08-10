@@ -66,6 +66,8 @@ _WAYPOINT_STALL_SECONDS = 1.75
 _GOAL_STALL_SECONDS = 8.0
 _NAVIGATION_PROGRESS_SECONDS = 2.5
 _NAVIGATION_PROGRESS_DISTANCE = 0.5
+_NAVIGATION_WINDOW_SECONDS = 6.0
+_NAVIGATION_WINDOW_DISTANCE = 3.0
 _BLOCKED_EDGE_SECONDS = 60.0
 _JUMP_BLOCKED_EDGE_SECONDS = 12.0
 _WATER_BLOCKED_EDGE_SECONDS = 20.0
@@ -218,6 +220,8 @@ class _BotState:
     dry_route_failures: int = 0
     navigation_progress_position: Vector3 | None = None
     navigation_progress_at: float = 0.0
+    navigation_window_position: Vector3 | None = None
+    navigation_window_at: float = 0.0
 
 
 class SimpleBotBrain:
@@ -341,7 +345,7 @@ class SimpleBotBrain:
                         float(strategic.movement.direction[0]),
                         float(strategic.movement.direction[1]),
                     ) > 1e-6
-                ) or strategic.debug_role.endswith(":segment_complete"):
+                ):
                     return strategic
                 # Segment completion, a rejected edge, or an empty strategic
                 # plan hands locomotion to the map-wide shore flow for the
@@ -1471,6 +1475,17 @@ class SimpleBotBrain:
         ) >= _NAVIGATION_PROGRESS_DISTANCE:
             state.navigation_progress_position = observer.position
             state.navigation_progress_at = float(now)
+        if state.navigation_window_position is None:
+            state.navigation_window_position = observer.position
+            state.navigation_window_at = float(now)
+        elif math.hypot(
+            float(observer.position[0])
+            - float(state.navigation_window_position[0]),
+            float(observer.position[1])
+            - float(state.navigation_window_position[1]),
+        ) >= _NAVIGATION_WINDOW_DISTANCE:
+            state.navigation_window_position = observer.position
+            state.navigation_window_at = float(now)
 
         goal_distance = math.hypot(
             float(active_goal.position[0]) - float(observer.position[0]),
@@ -1774,11 +1789,15 @@ class SimpleBotBrain:
         if (
             float(now) - float(state.navigation_progress_at)
             >= _NAVIGATION_PROGRESS_SECONDS
+            or float(now) - float(state.navigation_window_at)
+            >= _NAVIGATION_WINDOW_SECONDS
         ):
             self._invalidate_current_edge(state, observer.position, now)
             self._clear_route(state, now)
             state.navigation_progress_position = observer.position
             state.navigation_progress_at = float(now)
+            state.navigation_window_position = observer.position
+            state.navigation_window_at = float(now)
             return self._intent(
                 frame,
                 movement=MovementIntent(),
