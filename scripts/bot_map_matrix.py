@@ -292,6 +292,11 @@ async def simulate_map(
         server.mode = TDMMode(server)
         await server.mode.on_mode_start()
         director = BotDirector(server, supervisor=SimpleNamespace())
+        # Mirror the production composition boundary so the 60 Hz player
+        # simulation can publish transient native water contact to the bot
+        # director.  Constructing the director only as a local left this soak
+        # blind to the post-physics phase used by a real server.
+        server.bots = director
         for bot_index in range(int(bots)):
             bot = await director.add_bot(
                 team=TEAM1 if bot_index % 2 == 0 else TEAM2,

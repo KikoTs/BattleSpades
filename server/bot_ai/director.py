@@ -1663,16 +1663,7 @@ class BotDirector:
     def _apply_motor(self, runtime: _RuntimeBot, now: float, dt: float) -> None:
         player = runtime.player
         intent = runtime.intent
-        if bool(getattr(player, "wade", False)):
-            # Native movement is integrated at 60 Hz, perception at 8-10 Hz.
-            # Keep a short authoritative lease so a shoreline body cannot be
-            # sampled dry at every decision phase and alternate water recovery
-            # with a stale dry breach route. The lease expires quickly after
-            # a real landing and therefore cannot pin ordinary land movement.
-            runtime.wade_observed_until = max(
-                float(runtime.wade_observed_until),
-                float(now) + 0.5,
-            )
+        self.observe_player_physics(player, now)
         if not player.alive or not player.spawned:
             self._clear_pending_action(runtime)
         if (
@@ -1921,6 +1912,26 @@ class BotDirector:
             secondary=bool(intent.secondary_fire),
             zoom=bool(intent.zoom),
             hover=jetpack_requested and jetpack_uses_hover,
+        )
+
+    def observe_player_physics(self, player: "Player", now: float) -> None:
+        """Retain native water contact across slower AI sampling phases.
+
+        Player physics is authoritative at 60 Hz while perception and each
+        bot's motor are intentionally staggered at lower rates.  A shoreline
+        body can therefore be wading only between both of those phases.  The
+        short lease makes the next worker snapshot consume that real physics
+        fact instead of reacquiring a dry breach at the same bank cell.
+        """
+
+        runtime = self._runtime.get(int(getattr(player, "id", -1)))
+        if runtime is None or runtime.player is not player:
+            return
+        if not bool(getattr(player, "wade", False)):
+            return
+        runtime.wade_observed_until = max(
+            float(runtime.wade_observed_until),
+            float(now) + 0.5,
         )
 
     @staticmethod

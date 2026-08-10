@@ -190,6 +190,10 @@ class SimulationRuntime:
                 # and caused a measurable rollover hitch.
                 continue
             await player.simulate_tick(server.tick_interval)
+            bots = getattr(server, "bots", None)
+            observe_physics = getattr(bots, "observe_player_physics", None)
+            if callable(observe_physics):
+                observe_physics(player, time.monotonic())
 
     async def _tick_mode(self) -> None:
         server = self.server

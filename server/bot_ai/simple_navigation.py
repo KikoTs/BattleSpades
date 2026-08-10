@@ -1720,8 +1720,8 @@ class SimpleVoxelWorld:
             )
         return tuple(result)
 
-    @staticmethod
     def _clearance_target(
+        self,
         blockers: tuple[tuple[int, int, int], ...],
         support_z: int,
         profile: DigProfile,
@@ -1737,13 +1737,30 @@ class SimpleVoxelWorld:
             target = min(blockers, key=lambda cell: cell[2])
             return target, len(blockers) * profile.swings_per_block
 
-        target = (int(x), int(y), int(support_z) - 2)
-        footprint = set(melee_dig_positions(target, profile.pattern))
-        if (int(x), int(y), int(support_z)) in footprint:
+        # A planned melee ray must terminate on a real solid voxel.  Merely
+        # aiming at an air cell whose area footprint would include a blocker
+        # never executes: the motor's exact-ray gate sees a different cell.
+        # This occurs at a one-block London water lip where support-2 is air
+        # and only support-1 is solid.  Evaluate the actual blockers as aim
+        # candidates and reject any footprint that would remove the floor.
+        candidates: list[
+            tuple[int, int, tuple[int, int, int]]
+        ] = []
+        floor = (int(x), int(y), int(support_z))
+        for target in blockers:
+            if not self.solid(*target):
+                continue
+            footprint = set(melee_dig_positions(target, profile.pattern))
+            if floor in footprint:
+                continue
+            covered = sum(cell in footprint for cell in blockers)
+            if covered > 0:
+                # Maximize clearance, then prefer the highest (lowest-z)
+                # reachable face so the next swing is not hidden behind it.
+                candidates.append((covered, -int(target[2]), target))
+        if not candidates:
             return None, 0
-        covered = sum(cell in footprint for cell in blockers)
-        if covered <= 0:
-            return None, 0
+        covered, _height_order, target = max(candidates)
         if profile.pattern in {DIG_CUBE}:
             return target, 1
         if profile.pattern == DIG_MACHETE:
