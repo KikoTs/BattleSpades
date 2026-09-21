@@ -205,12 +205,13 @@ def test_connection_native_calls_are_inert_once_shutdown_starts() -> None:
         def disconnect(self, _reason=0) -> None:
             raise AssertionError("shutdown disconnect reached native peer")
 
-    connection = Connection.__new__(Connection)
-    connection.server = SimpleNamespace(_stopping=True)
-    connection.peer = _PoisonPeer()
+    connection = Connection(_PoisonPeer(), SimpleNamespace(_stopping=True))
+    # Disconnect still invalidates pending map work before its native guard.
+    assert connection._map_sync_generation == 0
 
     connection.send(b"\x01")
     connection.disconnect()
+    assert connection._map_sync_generation == 1
     asyncio.run(connection.on_receive(b"\x30\x01"))
 
 

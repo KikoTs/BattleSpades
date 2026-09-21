@@ -6,7 +6,7 @@ import logging
 import math
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import shared.constants as C
@@ -50,6 +50,11 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _player_life_id(player: "Player") -> int:
+    """Every spawn invalidates work, even when the death count did not change."""
+    return int(getattr(player, "replication_generation", getattr(player, "deaths", 0)))
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
 _MOTOR_PHASE_COUNT = 6
@@ -239,6 +244,12 @@ class _AimMotor:
     pitch_velocity: float = 0.0
     yaw_noise: float = 0.0
     pitch_noise: float = 0.0
+    yaw_acceleration: float = 0.0
+    pitch_acceleration: float = 0.0
+    gaze_purpose: str = ""
+    gaze_yaw: float | None = None
+    gaze_pitch: float | None = None
+    gaze_age: float = 0.0
 
 
 @dataclass(slots=True)
@@ -250,12 +261,21 @@ class _RuntimeBot:
     rng: random.Random
     intent: BotIntent | None = None
     last_intent_frame: int = -1
+    last_motor_at: float = 0.0
     last_action_frame: int = -1
     feedback_action_kind: str = ""
     feedback_action_accepted: bool = True
     feedback_action_position: tuple[float, float, float] | None = None
     feedback_action_frame: int = -1
     feedback_action_at: float = 0.0
+    feedback_request_id: int = 0
+    feedback_reason: str = ""
+    feedback_task_accepted: bool = True
+    feedback_task_at: float = 0.0
+    pending_action_life_id: int = -1
+    committed_requests: dict[tuple[int, int], bool] = field(default_factory=dict)
+    committed_request_life: int = -1
+    committed_request_high_water: int = 0
     next_perception_at: float = 0.0
     class_lives_remaining: int = 3
     action_primary: bool = False
@@ -263,6 +283,7 @@ class _RuntimeBot:
     action_zoom: bool = False
     action_hover: bool = False
     action_primary_until_loop: int = -1
+    action_primary_kind: BotActionKind = BotActionKind.NONE
     movement_input: tuple[bool, bool, bool, bool, bool, bool, bool, bool] | None = None
     waypoint_probe_key: tuple | None = None
     waypoint_probe_result: bool = False
@@ -271,6 +292,8 @@ class _RuntimeBot:
     steering_cache_position: tuple[float, float, float] | None = None
     steering_cache_until: float = 0.0
     was_alive: bool = True
+    buried_since: float | None = None
+    buried_anchor: tuple[float, float] | None = None
     # Orientation-dependent action latched until the aim motor converges.
     pending_action: BotAction | None = None
     pending_action_look: tuple[float, float, float] | None = None
@@ -292,6 +315,7 @@ class _RuntimeBot:
     jump_until_loop: int = -1
     jump_rearm_loop: int = -1
     wade_observed_until: float = 0.0
+    water_landed_at: float = -math.inf
 
 
 class BotDirector:
@@ -343,12 +367,15 @@ class BotDirector:
         self._mode_signature = None
         self._games_since_deep_reset = 0
         self._clean_slate_resets = 0
+        self._reconnect_count: int | None = None
+        self.terrain_recoveries = 0
         self._next_population_at = 0.0
         self._started = False
         self._mutation_subscription = None
         self._mutation_world = None
         self._wall_probes_this_tick = 0
         self._movement_probes_this_tick = 0
+        self._next_motor_phase = 0
         self._pending_gateway_actions: dict[
             int, tuple[int, BotAction, float]
         ] = {}
@@ -395,88 +422,70 @@ class BotDirector:
         self._unbind_world_mutations()
         self.supervisor.close()
         self._pending_gateway_actions.clear()
+        self._reconnect_count = None
         self._started = False
 
-    def rebind_after_match_transition(self) -> None:
-        """Move retained bots into the replacement map and reset their AI epoch.
+    async def prepare_for_game_transition(self) -> None:
+        """Disconnect the old bot roster before the mode resets its state.
 
-        ENet players are detached during a full scene rollover, but peerless
-        bots deliberately retain their ids and profiles.  Their Character and
-        worker state are map-owned nevertheless: carrying either across the
-        swap leaves the bot at an old-map coordinate and keeps terrain edits
-        subscribed to the retired VXL.
-
-        This boundary runs after the replacement mode has initialized and
-        before any client receives its new StateData/player roster.
+        A fresh Player resets every match statistic, native Character, and
+        inventory reservation. Keep only generation counters and RNG streams,
+        so late worker results cannot drive a reused id and new personalities
+        are reproducible without repeating the previous game's profiles.
         """
+
+        if not self._started or self._reconnect_count is not None:
+            return
+        self._reconnect_count = len(self.bots)
+        self._clear_local_timeline()
+        for bot in tuple(self.bots):
+            # The whole mode is being reset. Live departure hooks can replace
+            # Patient Zero, infect a human, or schedule another victory while
+            # this synthetic roster is disappearing; none belongs here.
+            await self.remove_bot(bot, force=True, notify_mode=False)
+
+    async def rebind_after_match_transition(self) -> None:
+        """Join a fresh bot roster after the replacement mode is initialized."""
 
         if not self._started:
             return
 
+        await self.prepare_for_game_transition()
         self._bind_world_mutations()
         self._clear_local_timeline()
         self._refresh_epochs()
-
-        now = time.monotonic()
-        perception_hz = max(
-            1.0, float(getattr(self._config, "perception_hz", 10))
-        )
-        maximum = max(1, int(getattr(self._config, "max_bots", 12)))
-        for index, bot in enumerate(tuple(self.bots)):
-            connection = getattr(bot, "connection", None)
-            if connection is not None:
-                connection.in_game = True
-                known_entities = getattr(connection, "known_entity_ids", None)
-                if known_entities is not None:
-                    known_entities.clear()
-
-            self.server.round_lifecycle.respawn_player(bot)
-            self._replace_runtime(
-                bot,
-                now=now,
-                phase=(float(index) / perception_hz) / maximum,
-            )
-
+        await self._reconnect_roster()
         self._record_game_boundary()
 
         logger.info(
-            "Re-anchored %d bot(s) for map=%s epoch=%d",
+            "Reconnected %d fresh bot(s) for map=%s epoch=%d",
             len(self.bots),
             getattr(self.server.world_manager, "map_name", ""),
             self._map_epoch,
         )
 
-    def reset_after_round_restart(self) -> None:
-        """Start a same-map game with no path, coordination, or motor history.
+    async def reset_after_round_restart(self) -> None:
+        """Start a same-map game with new identities, scores, and AI history.
 
         A same-map restart retains the mode and VXL objects, so signature-based
         epoch detection cannot see it. Advance the decision epoch explicitly,
-        discard queued old-game work, and replace every authoritative motor
-        record after the ordinary respawn path has created the new bodies.
+        discard queued old-game work, then join a replacement roster through
+        the ordinary CreatePlayer path without rebuilding any human's scene.
         """
 
         if not self._started:
             return
+        await self.prepare_for_game_transition()
         self._mode_epoch += 1
         self._clear_local_timeline()
         discard = getattr(self.supervisor, "discard_timeline", None)
         if callable(discard):
             discard()
 
-        now = time.monotonic()
-        perception_hz = max(
-            1.0, float(getattr(self._config, "perception_hz", 10))
-        )
-        maximum = max(1, int(getattr(self._config, "max_bots", 12)))
-        for index, bot in enumerate(tuple(self.bots)):
-            self._replace_runtime(
-                bot,
-                now=now,
-                phase=(float(index) / perception_hz) / maximum,
-            )
+        await self._reconnect_roster()
         self._record_game_boundary()
         logger.info(
-            "Reset %d bot(s) for same-map game epoch=%d",
+            "Reconnected %d fresh bot(s) for same-map game epoch=%d",
             len(self.bots),
             self._mode_epoch,
         )
@@ -493,28 +502,21 @@ class BotDirector:
         self._perception_build_snapshots = []
         self._perception_build_index = 0
 
-    def _replace_runtime(
-        self,
-        bot: "Player",
-        *,
-        now: float,
-        phase: float,
-    ) -> None:
-        """Replace all per-game controller state for one retained bot life."""
+    async def _reconnect_roster(self) -> None:
+        """Restore the previous population using fresh mode-aware joins."""
 
-        previous = self._runtime.get(int(bot.id))
-        if previous is None:
-            return
-        yaw = math.atan2(float(bot.o_y), float(bot.o_x))
-        runtime = _RuntimeBot(
-            player=bot,
-            generation=previous.generation,
-            profile=previous.profile,
-            motor=_AimMotor(yaw=yaw),
-            rng=random.Random(self._rng.randrange(0, 2**31)),
-        )
-        runtime.next_perception_at = float(now) + max(0.0, float(phase))
-        self._runtime[int(bot.id)] = runtime
+        from server.scoreboard import send_player_score
+
+        count = int(self._reconnect_count or 0)
+        for _ in range(count):
+            bot = await self.add_bot()
+            if bot is None:
+                break
+            # Explicitly clear the retail scoreboard's numeric-id cache after
+            # PlayerLeft/CreatePlayer. No new protocol extension is required.
+            send_player_score(self.server, bot)
+        self._reconnect_count = None
+        self._next_population_at = time.monotonic() + 1.0
 
     def _record_game_boundary(self) -> None:
         """Recycle the isolated planner at the configured clean-slate cadence."""
@@ -706,7 +708,9 @@ class BotDirector:
         )
         return player
 
-    async def remove_bot(self, bot: "Player", *, force: bool = False) -> bool:
+    async def remove_bot(
+        self, bot: "Player", *, force: bool = False, notify_mode: bool = True
+    ) -> bool:
         """Retire one bot after objective-safe checks and full cleanup."""
 
         if bot not in self.bots:
@@ -727,7 +731,7 @@ class BotDirector:
         packet = PlayerLeft()
         packet.player_id = int(bot.id)
         self.server.broadcast(bytes(packet.generate()))
-        if self.server.mode is not None:
+        if notify_mode and self.server.mode is not None:
             await self.server.mode.on_player_leave(bot)
         if runtime is not None:
             self.profile_factory.release_name(runtime.profile.name)
@@ -737,7 +741,7 @@ class BotDirector:
     async def update(self, dt: float) -> None:
         """Drain intentions, publish staggered frames, and run cheap motors."""
 
-        if not self._started:
+        if not self._started or self._reconnect_count is not None:
             return
         now = time.monotonic()
         self._refresh_epochs()
@@ -745,6 +749,9 @@ class BotDirector:
         # coroutine on the other 59 fixed ticks each second.
         population_maintained = False
         if now >= self._next_population_at:
+            recover = getattr(self.supervisor, "recover_if_stopped", None)
+            if callable(recover):
+                recover()
             await self._maintain_population(now)
             population_maintained = True
         section_started = time.perf_counter()
@@ -769,10 +776,11 @@ class BotDirector:
         fixed_dt = float(dt)
         self._wall_probes_this_tick = 0
         self._movement_probes_this_tick = 0
-        motor_phase = (
-            int(getattr(self.server, "loop_count", 0))
-            % _MOTOR_PHASE_COUNT
-        )
+        # Advance only when motors actually run. Tying this to loop_count
+        # starved id % 6 forever when a 10 Hz perception refresh repeatedly
+        # returned early on that same phase.
+        motor_phase = self._next_motor_phase
+        self._next_motor_phase = (motor_phase + 1) % _MOTOR_PHASE_COUNT
         section_started = time.perf_counter()
         # None of the motor calls mutates the runtime dictionary. Iterating its
         # live values avoids allocating a 12-row tuple at 60 Hz.
@@ -785,10 +793,16 @@ class BotDirector:
             # stream smooth while the gameplay-thread work stays bounded.
             if int(runtime.player.id) % _MOTOR_PHASE_COUNT != motor_phase:
                 continue
+            motor_dt = (
+                min(0.25, max(fixed_dt, now - runtime.last_motor_at))
+                if runtime.last_motor_at > 0.0
+                else fixed_dt * _MOTOR_PHASE_COUNT
+            )
+            runtime.last_motor_at = now
             self._apply_motor(
                 runtime,
                 now,
-                fixed_dt * _MOTOR_PHASE_COUNT,
+                motor_dt,
             )
         self.server.metrics.record_subsystem(
             "bots_motors",
@@ -855,6 +869,8 @@ class BotDirector:
             self._perception_cache_until = 0.0
 
     def _make_map_snapshot(self, *, current: bool) -> MapSnapshot:
+        from .prefab_policy import BOT_PREFAB_BLOCK_COUNTS, load_bot_prefab_geometry
+
         world = self.server.world_manager
         raw = bytes(getattr(world, "map_raw_bytes", b"") or b"")
         return MapSnapshot(
@@ -864,6 +880,7 @@ class BotDirector:
             mode_id=self._mode_id(),
             map_name=str(getattr(world, "map_name", "")),
             map_directory=str(getattr(world, "maps_path", "")),
+            prefab_geometry=load_bot_prefab_geometry(BOT_PREFAB_BLOCK_COUNTS),
         )
 
     def _on_world_mutation(
@@ -883,6 +900,8 @@ class BotDirector:
         )
 
     async def _maintain_population(self, now: float) -> None:
+        if self._reconnect_count is not None:
+            return
         if now < self._next_population_at:
             return
         self._next_population_at = now + 1.0
@@ -1026,6 +1045,9 @@ class BotDirector:
                     entities=entities,
                     objectives=objectives,
                     mode_phase=mode_phase,
+                    behavior_version=self.server.config.bots.behavior_version,
+                    friendly_mischief=self.server.config.bots.friendly_mischief,
+                    local_safety_complete=len(players) <= 32,
                     stimuli=(
                         self.server.bot_stimuli.perceive(
                             tuple(float(value) for value in bot.position),
@@ -1193,8 +1215,25 @@ class BotDirector:
                         is not None
                         else None
                     ),
-                    life_id=int(getattr(player, "deaths", 0)),
+                    life_id=_player_life_id(player),
+                    deployable_stock=self._deployable_snapshot(player),
+                    last_action_request_id=(runtime.feedback_request_id if runtime else 0),
+                    last_action_reason=(runtime.feedback_reason if runtime else ""),
+                    last_task_accepted=(runtime.feedback_task_accepted if runtime else True),
+                    last_task_at=(runtime.feedback_task_at if runtime else 0.0),
+                    can_shoot=self._can_shoot(player),
                 )
+
+    def _can_shoot(self, player: "Player") -> bool:
+        """Mirror CombatRuntime's authoritative burdensome-carrier rule."""
+        return (not bool(getattr(player, "pickup_burdensome", False))
+                or bool(getattr(getattr(self.server, "mode", None), "shoot_with_intel", False)))
+
+    @staticmethod
+    def _deployable_snapshot(player: "Player") -> tuple[tuple[int, int], ...]:
+        from server.deployable_inventory import deployable_inventory_snapshot
+
+        return deployable_inventory_snapshot(player)
 
     def _snapshot_entities(self) -> tuple[EntitySnapshot, ...]:
         registry = getattr(self.server, "entity_registry", None)
@@ -1241,6 +1280,9 @@ class BotDirector:
                 getattr(entity, "entity_type", getattr(entity, "type", -1))
             )
             behavior = getattr(entity, "behavior", None)
+            turret = getattr(self.server, "rocket_turrets", {}).get(
+                int(getattr(entity, "entity_id", -1)))
+            entity_team = int(getattr(turret, "team", getattr(behavior, "team", getattr(entity, "team", -1))))
             blast_radius = float(getattr(behavior, "blast_radius", 0.0) or 0.0)
             detonate_at = float(
                 getattr(behavior, "_detonate_at", 0.0) or 0.0
@@ -1249,7 +1291,7 @@ class BotDirector:
                 EntitySnapshot(
                     entity_id=int(getattr(entity, "entity_id", -1)),
                     entity_type=entity_type,
-                    team=int(getattr(entity, "team", -1)),
+                    team=entity_team,
                     owner_id=int(getattr(entity, "player_id", -1)),
                     position=tuple(float(value) for value in position),
                     alive=bool(getattr(entity, "alive", True)),
@@ -1260,6 +1302,10 @@ class BotDirector:
                         for value in getattr(entity, "vel", (0.0, 0.0, 0.0))
                     ),
                     blast_radius=blast_radius,
+                    uses_remaining=int(getattr(behavior, "uses", -1)),
+                    hit_position=(tuple(float(value) for value in behavior.get_hit_center(entity))
+                                  if callable(getattr(behavior, "get_hit_center", None)) else None),
+                    hit_radius=float(getattr(behavior, "hit_radius", 0.0)),
                     detonate_at=detonate_at,
                     hazardous=(
                         bool(getattr(entity, "alive", True))
@@ -1535,8 +1581,11 @@ class BotDirector:
 
         vips = getattr(mode, "vips", None)
         if isinstance(vips, dict):
+            vip_alive = getattr(mode, "vip_alive", None)
             for team, vip in vips.items():
-                if vip is not None and bool(getattr(vip, "alive", False)):
+                if (vip is not None and bool(getattr(vip, "alive", False))
+                        and bool(getattr(vip, "spawned", False))
+                        and (not isinstance(vip_alive, dict) or vip_alive.get(team, False))):
                     result.append(
                         ObjectiveSnapshot(
                             "vip",
@@ -1593,13 +1642,18 @@ class BotDirector:
                 continue
             if (
                 intent.bot_generation != runtime.generation
+                or (intent.life_id >= 0 and intent.life_id != _player_life_id(runtime.player))
                 or intent.map_epoch != self._map_epoch
                 or intent.mode_epoch != self._mode_epoch
-                or intent.topology_version != self._topology_version
+                or intent.topology_version > self._topology_version
                 or intent.expires_at <= now
                 or intent.frame_id <= runtime.last_intent_frame
             ):
                 continue
+            # A fresh decision may cross an unrelated terrain commit. Live
+            # motor probes and the shared action gateway validate current
+            # collision/build/dig rules; rejecting every older topology can
+            # starve the fleet during continuous construction or destruction.
             if (
                 runtime.pending_action is not None
                 and int(intent.priority) > int(runtime.pending_action_priority)
@@ -1662,9 +1716,23 @@ class BotDirector:
 
     def _apply_motor(self, runtime: _RuntimeBot, now: float, dt: float) -> None:
         player = runtime.player
+        self._enforce_weapon_capability(runtime)
         intent = runtime.intent
+        if intent is not None and intent.life_id >= 0 and intent.life_id != _player_life_id(player):
+            self._clear_pending_action(runtime)
+            runtime.intent = intent = None
         self.observe_player_physics(player, now)
+        self._recover_buried_bot(runtime, now)
         if not player.alive or not player.spawned:
+            self._clear_pending_action(runtime)
+        if runtime.pending_action is not None and (
+            now > runtime.pending_action_deadline
+            or (runtime.pending_action_life_id >= 0
+                and runtime.pending_action_life_id != _player_life_id(player))
+        ):
+            # Validate before choosing a look target. Checking only in
+            # _try_pending_action let an expired terrain swing turn the head
+            # away from a fresh intention for an entire staggered motor tick.
             self._clear_pending_action(runtime)
         if (
             not player.alive
@@ -1679,8 +1747,11 @@ class BotDirector:
             # nearly-faced dig or shot still lands before the deadline.
             pending_goal = self._pending_look_goal(runtime)
             if pending_goal is not None:
-                self._update_aim(runtime, pending_goal, dt)
+                self._update_aim(runtime, pending_goal, dt,
+                    purpose="precise" if runtime.pending_action.position is not None else "combat")
                 self._try_pending_action(runtime, now)
+            else:
+                self._hold_aim(runtime)
             self._set_movement_state(runtime, (False,) * 8)
             held_primary = (
                 bool(player.alive)
@@ -1729,17 +1800,31 @@ class BotDirector:
             else:
                 # BUILD/PLACE_PREFAB/DEPLOY/RELOAD carry explicit positions
                 # (or need none) and are orientation-independent.
-                accepted = self.gateway.execute(player, intent.action)
+                accepted = self._execute_task_action(runtime, intent.action)
                 self._record_action_result(
                     runtime, intent.action, accepted, now
                 )
+        travel_direction = self._travel_movement_direction(runtime, intent)
         pending = runtime.pending_action
         if pending is not None and pending.position is not None:
             # A world-cell action keeps aim priority over the newest look so
             # the swing converges even while the worker already looks ahead.
-            self._update_aim(runtime, pending.position, dt)
+            self._update_aim(runtime, pending.position, dt, purpose="precise")
         elif intent.look is not None:
-            aim_point, settle = self._live_aim_point(runtime, intent.look, now)
+            if self._has_travel_target(intent):
+                # The worker's ordinary-route gaze is horizontal, but its
+                # frozen eye height becomes wrong after a native step/jump.
+                # Refresh this explicit travel gaze from the live eye only;
+                # construction, combat and flight keep their precise targets.
+                length = math.hypot(*travel_direction[:2])
+                dx, dy = (travel_direction[:2] if length > 1e-6 else
+                          (math.cos(runtime.motor.yaw), math.sin(runtime.motor.yaw)))
+                length = length if length > 1e-6 else 1.0
+                aim_point = (player.eye_x + dx / length * 6.0,
+                             player.eye_y + dy / length * 6.0, player.eye_z)
+                settle = 0.0
+            else:
+                aim_point, settle = self._live_aim_point(runtime, intent.look, now)
             # Skill limits how tightly sustained tracking settles: a casual
             # hand keeps wandering, an expert locks in.
             skill_settle = settle * (
@@ -1750,9 +1835,15 @@ class BotDirector:
                 aim_point,
                 dt,
                 noise_factor=1.0 / (1.0 + 2.0 * skill_settle),
+                purpose=(self._travel_gaze_purpose(intent) if self._has_travel_target(intent) else
+                         "combat" if intent.look.visible else
+                         "precise" if (intent.movement.affordance is MovementAffordance.BREACH
+                                        or intent.action.position is not None) else "focus"),
             )
         elif runtime.pending_action_look is not None:
             self._update_aim(runtime, runtime.pending_action_look, dt)
+        else:
+            self._hold_aim(runtime)
         # Scope/secondary state must be authoritative before a converged FIRE
         # executes below; otherwise the first sniper round is sent as hip fire
         # and remote clients miss the beam for that shot.
@@ -1766,13 +1857,23 @@ class BotDirector:
         self._try_pending_action(runtime, now)
         direction = self._live_movement_direction(
             runtime,
-            intent.movement.direction,
+            travel_direction,
             intent.movement.affordance,
             now=now,
         )
         affordance = intent.movement.affordance
+        completed_water_movement = (
+            float(intent.created_at) <= runtime.water_landed_at
+            and affordance in {MovementAffordance.SWIM, MovementAffordance.JUMP}
+        )
+        balanced_over_water = bool(
+            float(player.z) >= float(C.Z_ABOVE_WATERPLANE) - 4.25
+            and self.server.world_manager.is_water_column(
+                int(math.floor(player.x)), int(math.floor(player.y)),
+            )
+        )
         if (
-            bool(getattr(player, "wade", False))
+            (bool(getattr(player, "wade", False)) or balanced_over_water)
             and math.hypot(direction[0], direction[1]) <= 0.1
             and affordance
             not in {
@@ -1792,6 +1893,9 @@ class BotDirector:
             # probes, first as a swim and then as a concrete bank jump.
             goal = getattr(intent, "debug_goal", None)
             fallback = (
+                tuple(intent.movement.direction)
+                if math.hypot(*intent.movement.direction[:2]) > 1e-6
+                else
                 (
                     float(goal[0]) - float(player.x),
                     float(goal[1]) - float(player.y),
@@ -1829,11 +1933,20 @@ class BotDirector:
                     if math.hypot(direction[0], direction[1]) > 0.1:
                         affordance = MovementAffordance.JUMP
         forward = (float(player.o_x), float(player.o_y))
+        # Movement keys are relative to yaw, independently of aim pitch.
+        # Using the shortened horizontal look vector made every key fall
+        # below the 0.25 input threshold while looking steeply up or down.
+        planar_facing = math.hypot(*forward)
+        if planar_facing > 1e-6:
+            forward = (forward[0] / planar_facing, forward[1] / planar_facing)
+        else:
+            forward = (math.cos(runtime.motor.yaw), math.sin(runtime.motor.yaw))
         side = (-forward[1], forward[0])
         forward_amount = direction[0] * forward[0] + direction[1] * forward[1]
         side_amount = direction[0] * side[0] + direction[1] * side[1]
         jetpack_requested = (
             affordance is MovementAffordance.JETPACK
+            and bool(intent.movement.jetpack_thrust)
             and int(getattr(player, "jetpack_id", 0)) > 0
             and float(getattr(player, "jetpack_fuel", 0.0)) > 0.0
         )
@@ -1847,12 +1960,14 @@ class BotDirector:
             <= runtime.action_primary_until_loop
         )
         jump_requested = (
-            bool(intent.movement.jump)
-            or affordance is MovementAffordance.JUMP
+            not completed_water_movement
+            and (bool(intent.movement.jump)
+                 or affordance is MovementAffordance.JUMP)
         )
         current_loop = int(getattr(self.server, "loop_count", 0))
         wading_ascent = (
-            bool(getattr(player, "wade", False))
+            not completed_water_movement
+            and bool(getattr(player, "wade", False))
             and (
                 jump_requested
                 or affordance
@@ -1890,11 +2005,12 @@ class BotDirector:
         # on the server's former all-class zero-gravity bug and never activated
         # an Engineer/Rocketeer pack's real fuel/thrust state.
         jump_held = (
-            jetpack_jump_held
-            or wading_ascent
-            or current_loop <= runtime.jump_until_loop
+            not completed_water_movement
+            and (jetpack_jump_held
+                 or wading_ascent
+                 or current_loop <= runtime.jump_until_loop)
         )
-        self._set_movement_state(runtime, (
+        self._set_movement_state(runtime, (False,) * 8 if completed_water_movement else (
             forward_amount > 0.25,
             forward_amount < -0.25,
             side_amount < -0.25,
@@ -1906,6 +2022,8 @@ class BotDirector:
             bool(intent.movement.sprint)
             and math.hypot(direction[0], direction[1]) > 0.1,
         ))
+        if completed_water_movement:
+            self._brake_completed_water_movement(runtime, now)
         self._set_action_state(
             runtime,
             primary=primary_latched,
@@ -1913,6 +2031,38 @@ class BotDirector:
             zoom=bool(intent.zoom),
             hover=jetpack_requested and jetpack_uses_hover,
         )
+
+    def _recover_buried_bot(self, runtime: _RuntimeBot, now: float) -> None:
+        """Retire an impossible body below the immutable waterbed after recovery time.
+
+        Ordinary swimming, combat holds, and long excavations never trigger
+        this. A human can respawn after becoming embedded in the unbreakable
+        bottom layer; peerless bots need the same terminal recovery. Use the
+        stock death path so each mode still decides whether/when it respawns.
+        """
+        player = runtime.player
+        world = getattr(self.server, "world_manager", None)
+        solid = getattr(world, "get_solid", None)
+        # Z_ABOVE_WATERPLANE is the editable layer at 238; the permanent
+        # bed is 239. Excavating 238 must not disable this terminal recovery.
+        buried = (player.alive and player.spawned and callable(solid)
+                  and float(player.z) >= float(C.Z_ABOVE_WATERPLANE) - 0.1
+                  and solid(int(math.floor(player.x)), int(math.floor(player.y)),
+                            int(C.Z_ABOVE_WATERPLANE) + 1))
+        if not buried:
+            runtime.buried_since = None
+            runtime.buried_anchor = None
+            return
+        position = (float(player.x), float(player.y))
+        if (runtime.buried_since is None or runtime.buried_anchor is None
+                or math.dist(position, runtime.buried_anchor) >= 2.0):
+            runtime.buried_since, runtime.buried_anchor = now, position
+        elif now - runtime.buried_since >= 6.0:
+            logger.warning("Bot %s remained below solid waterbed at %s; normal death recovery",
+                           player.id, player.position)
+            self.terrain_recoveries += 1
+            runtime.buried_since = None
+            player.die(kill_type=int(C.FALL_KILL))
 
     def observe_player_physics(self, player: "Player", now: float) -> None:
         """Retain native water contact across slower AI sampling phases.
@@ -1927,12 +2077,67 @@ class BotDirector:
         runtime = self._runtime.get(int(getattr(player, "id", -1)))
         if runtime is None or runtime.player is not player:
             return
+        self._enforce_weapon_capability(runtime)
         if not bool(getattr(player, "wade", False)):
+            if (float(runtime.wade_observed_until) > float(now)
+                    and bool(getattr(player, "grounded", False))
+                    and self.server.world_manager.spawn_position_is_safe(player.position)):
+                # A real dry landing supersedes the sampling lease. Otherwise
+                # the next decision can order another shore jump and bounce
+                # the body back into water before that half-second expires.
+                runtime.wade_observed_until = 0.0
+                runtime.water_landed_at = float(now)
+                intent = runtime.intent
+                if (intent is not None and intent.movement.affordance in
+                        {MovementAffordance.SWIM, MovementAffordance.JUMP}):
+                    # This hook runs immediately after each native physics
+                    # tick. Release the held key before the next tick can
+                    # bounce off a one-cell foothold. Slower motor/worker
+                    # updates may still carry the pre-landing command;
+                    # created_at prevents those frames from rearming it.
+                    runtime.jump_until_loop = -1
+                    runtime.jump_rearm_loop = -1
+                    runtime.last_jump_frame = int(intent.frame_id)
+                    self._set_movement_state(runtime, (False,) * 8)
+            self._brake_completed_water_movement(runtime, now)
             return
         runtime.wade_observed_until = max(
             float(runtime.wade_observed_until),
             float(now) + 0.5,
         )
+
+    def _brake_completed_water_movement(self, runtime: _RuntimeBot, now: float) -> None:
+        """Use ordinary keys to stop landing momentum until the next decision."""
+        intent = runtime.intent
+        if (intent is None or float(intent.created_at) > runtime.water_landed_at
+                or intent.movement.affordance not in
+                {MovementAffordance.SWIM, MovementAffordance.JUMP}):
+            return
+        player = runtime.player
+        runtime.jump_until_loop = -1
+        runtime.jump_rearm_loop = -1
+        vx, vy = float(player.vx), float(player.vy)
+        speed = math.hypot(vx, vy)
+        if (float(intent.expires_at) <= now
+                or not player.alive or not player.spawned or not player.grounded
+                or player.wade or speed <= 0.015):
+            self._set_movement_state(runtime, (False,) * 8)
+            return
+        # Neutral input retains enough native momentum to slide off London's
+        # one-cell foothold. Counter the measured velocity without modifying
+        # it; the 60 Hz post-physics hook releases these keys once stopped.
+        dx, dy = -vx / speed, -vy / speed
+        ox, oy = float(player.o_x), float(player.o_y)
+        length = math.hypot(ox, oy)
+        if length > 1e-6:
+            ox, oy = ox / length, oy / length
+        else:
+            ox, oy = math.cos(runtime.motor.yaw), math.sin(runtime.motor.yaw)
+        forward, side = dx * ox + dy * oy, -dx * oy + dy * ox
+        self._set_movement_state(runtime, (
+            forward > 0.25, forward < -0.25, side < -0.25, side > 0.25,
+            False, False, False, False,
+        ))
 
     @staticmethod
     def _clear_pending_action(runtime: _RuntimeBot) -> None:
@@ -1944,10 +2149,50 @@ class BotDirector:
         runtime.pending_action_secondary = False
         runtime.pending_action_zoom = False
 
+    def _enforce_weapon_capability(self, runtime: _RuntimeBot) -> bool:
+        """Retire old weapon work immediately when an objective forbids it."""
+        if self._can_shoot(runtime.player):
+            return True
+        weapon_actions = {BotActionKind.FIRE, BotActionKind.MELEE}
+        pending = runtime.pending_action
+        weapon_pending = pending is not None and pending.kind in weapon_actions
+        if weapon_pending:
+            self._clear_pending_action(runtime)
+        queued = self._pending_gateway_actions.get(int(runtime.player.id))
+        if queued is not None and queued[1].kind in weapon_actions:
+            self._pending_gateway_actions.pop(int(runtime.player.id), None)
+        intent = runtime.intent
+        weapon_intent = intent is not None and intent.action.kind in weapon_actions
+        if intent is not None and (
+            weapon_intent
+            or (intent.action.kind is BotActionKind.NONE
+                and intent.movement.affordance is MovementAffordance.BREACH
+                and (intent.look is not None or intent.tool_id >= 0
+                     or intent.secondary_fire or intent.zoom))
+        ):
+            # Even a cooldown frame can still contain the old dig look. It
+            # must not acquire the camera after the pending action was cleared.
+            # The next worker frame owns a new route using can_shoot=False.
+            runtime.intent = replace(intent, action=BotAction(), look=None,
+                                     tool_id=-1, secondary_fire=False, zoom=False)
+        player = runtime.player
+        if (weapon_pending or weapon_intent or runtime.burst_remaining > 0
+                or runtime.action_primary_kind in weapon_actions
+                or player.is_weapon_tool() or player.is_spade_tool()):
+            runtime.action_primary_until_loop = -1
+            runtime.action_primary_kind = BotActionKind.NONE
+            self._set_action_state(runtime, primary=False, secondary=False,
+                                   zoom=False, hover=runtime.action_hover)
+        runtime.burst_remaining = 0
+        runtime.next_fire_at = 0.0
+        runtime.lock_player_id = -1
+        return False
+
     @staticmethod
     def _latch_action(runtime: _RuntimeBot, intent: BotIntent) -> None:
         look = intent.look
         runtime.pending_action = intent.action
+        runtime.pending_action_life_id = intent.life_id
         runtime.pending_action_look = (
             tuple(float(value) for value in look.target)
             if look is not None
@@ -2071,6 +2316,7 @@ class BotDirector:
         return runtime.wall_probe_clear
 
     def _try_pending_action(self, runtime: _RuntimeBot, now: float) -> None:
+        self._enforce_weapon_capability(runtime)
         action = runtime.pending_action
         if action is None:
             return
@@ -2079,6 +2325,8 @@ class BotDirector:
             not player.alive
             or not player.spawned
             or now > runtime.pending_action_deadline
+            or (runtime.pending_action_life_id >= 0
+                and runtime.pending_action_life_id != _player_life_id(player))
         ):
             # Never execute "because time ran out": a dropped action simply
             # waits for the worker's next decision.
@@ -2214,6 +2462,8 @@ class BotDirector:
     ) -> None:
         """Queue one converged action for bounded fixed-step commitment."""
 
+        if self._reconnect_count is not None:
+            return
         if not self._started:
             # Focused motor fixtures intentionally exercise this private
             # boundary without a SimulationRuntime to drain staged actions.
@@ -2232,6 +2482,8 @@ class BotDirector:
     def drain_actions(self, limit: int = 1) -> int:
         """Commit a bounded number of queued authoritative bot actions."""
 
+        if self._reconnect_count is not None:
+            return 0
         selected = tuple(self._pending_gateway_actions.items())[
             :max(0, int(limit))
         ]
@@ -2245,6 +2497,8 @@ class BotDirector:
                 or runtime.pending_action is not action
                 or not runtime.player.alive
                 or not runtime.player.spawned
+                or (runtime.pending_action_life_id >= 0
+                    and runtime.pending_action_life_id != _player_life_id(runtime.player))
             ):
                 continue
             self._commit_pending_action(
@@ -2260,8 +2514,12 @@ class BotDirector:
     ) -> None:
         """Execute one previously converged action on the gameplay thread."""
 
+        if (action.kind in {BotActionKind.FIRE, BotActionKind.MELEE}
+                and not self._enforce_weapon_capability(runtime)):
+            return
+
         gateway_started = time.perf_counter()
-        accepted = self.gateway.execute(runtime.player, action)
+        accepted = self._execute_task_action(runtime, action)
         self.server.metrics.record_subsystem(
             "bots_gateway",
             (time.perf_counter() - gateway_started) * 1000.0,
@@ -2311,6 +2569,28 @@ class BotDirector:
             runtime.action_primary_until_loop,
             int(getattr(self.server, "loop_count", 0)) + 2,
         )
+        runtime.action_primary_kind = action.kind
+
+    def _execute_task_action(self, runtime: _RuntimeBot, action: BotAction) -> bool:
+        """Deduplicate task commits across perception frames and worker retries."""
+        request_id = int(action.request_id)
+        if request_id <= 0:
+            return self.gateway.execute(runtime.player, action)
+        key = (_player_life_id(runtime.player), request_id)
+        if runtime.committed_request_life != key[0]:
+            runtime.committed_requests.clear()
+            runtime.committed_request_life = key[0]
+            runtime.committed_request_high_water = 0
+        if key in runtime.committed_requests:
+            return runtime.committed_requests[key]
+        if request_id <= runtime.committed_request_high_water:
+            return False
+        accepted = self.gateway.execute(runtime.player, action)
+        runtime.committed_request_high_water = request_id
+        runtime.committed_requests[key] = accepted
+        while len(runtime.committed_requests) > 64:
+            runtime.committed_requests.pop(next(iter(runtime.committed_requests)))
+        return accepted
 
     @staticmethod
     def _record_action_result(
@@ -2330,6 +2610,17 @@ class BotDirector:
         )
         runtime.feedback_action_frame = int(runtime.last_action_frame)
         runtime.feedback_action_at = float(now)
+        if action.request_id > 0:
+            # Keep the most recent task result even if ordinary combat fires
+            # before the next perception publication.
+            runtime.feedback_request_id = int(action.request_id)
+            runtime.feedback_task_accepted = bool(accepted)
+            runtime.feedback_task_at = float(now)
+            runtime.feedback_reason = "accepted" if accepted else "service_rejected"
+            if not accepted and action.kind is BotActionKind.DEPLOY:
+                from server.deployable_inventory import deployable_stock
+                if deployable_stock(runtime.player, action.tool_id) <= 0:
+                    runtime.feedback_reason = "no_stock"
 
     def _apply_recoil(self, runtime: _RuntimeBot) -> None:
         """Kick the aim motor per accepted shot; recoil_control mitigates.
@@ -2469,7 +2760,7 @@ class BotDirector:
             MovementAffordance.CROUCH,
         }
         probe_distance = (
-            min(5.0, max(1.25, 1.0 + speed * 10.0))
+            min(5.0, 0.65 + speed * 10.0)
             if ordinary_walk and not wading
             else 0.65
         )
@@ -2481,6 +2772,7 @@ class BotDirector:
             int(round(dy * 100.0)),
             int(getattr(world, "topology_version", 0)),
             wading,
+            bool(getattr(player, "grounded", False)),
             int(round(probe_distance * 100.0)),
             affordance.value,
         )
@@ -2508,6 +2800,26 @@ class BotDirector:
             )
             for probe_x, probe_y in immediate
         )
+        if (
+            not result and ordinary_walk and speed < 0.1
+            and bool(getattr(player, "grounded", False))
+            and BotDirector._probe_surface_is_live(
+                world, player, *immediate[0], affordance,
+            )
+            and not BotDirector._probe_surface_is_live(
+                world, player, float(player.x), float(player.y), affordance,
+            )
+        ):
+            # Native collision can support a body on a neighbouring corner
+            # while its centre hangs over a hole. Requiring floor beneath
+            # both shoulders then forbids every move back onto the support.
+            # Permit a slow move to a supported centre with clear shoulders;
+            # an ordinary fully supported walker keeps the stricter gate.
+            result = all(
+                not world.clipbox(probe_x, probe_y, float(player.z))
+                and not world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
+                for probe_x, probe_y in immediate[1:]
+            )
         if result and ordinary_walk and not wading and probe_distance > 0.65:
             # The immediate full probe owns walls and step height. Farther
             # samples only own water/void braking: comparing their support
@@ -2550,6 +2862,76 @@ class BotDirector:
         runtime.waypoint_probe_key = probe_key
         runtime.waypoint_probe_result = result
         return result
+
+    @staticmethod
+    def _has_travel_target(intent: BotIntent) -> bool:
+        return (intent.movement.travel_source is not None
+                and intent.movement.travel_waypoint is not None
+                and intent.movement.affordance in {
+                    MovementAffordance.WALK, MovementAffordance.CROUCH,
+                    MovementAffordance.DROP, MovementAffordance.JUMP,
+                }
+                and intent.action.kind is BotActionKind.NONE
+                and not (intent.look is not None and intent.look.visible))
+
+    @staticmethod
+    def _travel_gaze_purpose(intent: BotIntent) -> str:
+        """Short leased steps need prompt, noise-free heading acquisition."""
+
+        movement = intent.movement
+        # Native movement keys are relative to the current yaw. A short
+        # obstacle step can finish before the relaxed travel turn settles,
+        # changing its effective key direction mid-step on a narrow ledge.
+        # Keep the accurate, bounded controller for these local steps. Longer
+        # route segments still get the smoother travel gaze and brief dwell.
+        if (movement.travel_source is not None
+                and movement.travel_waypoint is not None
+                and math.dist(movement.travel_source, movement.travel_waypoint) <= 2.25):
+            return "traverse"
+        return "travel"
+
+    @staticmethod
+    def _travel_movement_direction(
+        runtime: _RuntimeBot, intent: BotIntent,
+    ) -> tuple[float, float, float]:
+        """Refresh only a worker-authorized ordinary route's local heading."""
+
+        movement = intent.movement
+        requested = tuple(float(value) for value in movement.direction)
+        source, waypoint = movement.travel_source, movement.travel_waypoint
+        if not BotDirector._has_travel_target(intent):
+            return requested
+        strength = math.hypot(*requested[:2])
+        if strength <= 1e-6:
+            return requested
+        player = runtime.player
+        initial = (waypoint[0] - source[0], waypoint[1] - source[1])
+        length = math.hypot(*initial)
+        if length <= 1e-6:
+            return requested
+        delta = (waypoint[0] - player.x, waypoint[1] - player.y)
+        remaining = math.hypot(*delta)
+        along = (delta[0] * initial[0] + delta[1] * initial[1]) / length
+        across = abs(delta[0] * initial[1] - delta[1] * initial[0]) / length
+        # Release locomotion once this leased step has been crossed/landed;
+        # the next worker intent owns its continuation. Do not drive farther
+        # away with a frozen vector or immediately reverse back through it.
+        # A lower floor is not arrival at an elevated destination.
+        at_height = float(player.z) <= float(waypoint[2]) + 1.0
+        if at_height and (remaining <= .35 or along <= 0.0 and across <= .55):
+            return (0.0, 0.0, 0.0)
+        if remaining <= 1e-6:
+            return (0.0, 0.0, 0.0)
+        # Crowd separation may have rotated the worker's route direction.
+        # Keep that signed offset while refreshing its base heading from the
+        # current body, rather than silently discarding avoidance behavior.
+        cosine = (initial[0] * requested[0] + initial[1] * requested[1]) / (length * strength)
+        sine = (initial[0] * requested[1] - initial[1] * requested[0]) / (length * strength)
+        return (
+            (delta[0] * cosine - delta[1] * sine) / remaining * strength,
+            (delta[0] * sine + delta[1] * cosine) / remaining * strength,
+            requested[2],
+        )
 
     @staticmethod
     def _live_movement_direction(
@@ -2665,6 +3047,43 @@ class BotDirector:
             length = math.hypot(requested[0], requested[1])
             if length > 1e-6:
                 dx, dy = requested[0] / length, requested[1] / length
+                if ordinary_walk:
+                    # A one-cell bridge fits the body only near its centre.
+                    # Coarse angular alternatives can put one shoulder over
+                    # either edge and reject every direction. Aim the next
+                    # probe at the lane centre before trying those angles.
+                    if hasattr(player, "x") and hasattr(player, "y"):
+                        centre = (
+                            (math.copysign(0.65, dx), math.floor(player.y) + 0.5 - player.y)
+                            if abs(dx) >= abs(dy) else
+                            (math.floor(player.x) + 0.5 - player.x, math.copysign(0.65, dy))
+                        )
+                        centre_length = math.hypot(*centre)
+                        candidate = (centre[0] / centre_length * length,
+                                     centre[1] / centre_length * length, requested[2])
+                        if (math.dist(candidate, requested) > 1e-6
+                                and BotDirector._waypoint_is_live(runtime, candidate, affordance)):
+                            result = candidate
+                    # A narrow voxel corridor can admit an exact axis while
+                    # every 20-degree rotation still clips its wall/ledge.
+                    # Sliding one component to zero preserves the requested
+                    # forward side and uses the same live collision probes.
+                    axes = (
+                        (math.copysign(length, dx), 0.0, requested[2]),
+                        (0.0, math.copysign(length, dy), requested[2]),
+                    )
+                    if abs(dy) > abs(dx):
+                        axes = axes[::-1]
+                    for candidate in axes:
+                        if result != (0.0, 0.0, 0.0):
+                            break
+                        if math.dist(candidate, requested) <= 1e-6:
+                            continue
+                        if candidate[0] * dx + candidate[1] * dy <= 1e-6:
+                            continue
+                        if BotDirector._waypoint_is_live(runtime, candidate, affordance):
+                            result = candidate
+                            break
                 identity = int(getattr(player, "id", 0)) + int(
                     getattr(runtime, "generation", 0)
                 )
@@ -2675,6 +3094,8 @@ class BotDirector:
                     else _WALK_STEER_ANGLES
                 )
                 for magnitude in steering_angles:
+                    if result != (0.0, 0.0, 0.0):
+                        break
                     for sign in (preferred_sign, -preferred_sign):
                         angle = magnitude * sign
                         cosine, sine = math.cos(angle), math.sin(angle)
@@ -2714,6 +3135,42 @@ class BotDirector:
     ) -> bool:
         """Validate one body-width movement probe against current VXL state."""
 
+        cell_x, cell_y = int(math.floor(probe_x)), int(math.floor(probe_y))
+        wading = bool(getattr(player, "wade", False))
+        water_column = bool(world.is_water_column(cell_x, cell_y))
+        if affordance is MovementAffordance.JETPACK:
+            # A committed short flight has a separately checked dry landing.
+            # Requiring support at each intermediate probe cancels horizontal
+            # input above the very gap the pack is meant to cross. Keep the
+            # live body/ceiling collision gate throughout ascent and coasting.
+            return (
+                int(getattr(player, "jetpack_id", 0)) in C.JETPACK_PROPERTIES
+                and not wading
+                and float(player.z) < float(C.Z_ABOVE_WATERPLANE) - 1.0
+                and not any(world.clipbox(probe_x, probe_y, float(player.z) + dz)
+                            for dz in (-1.0, 0.0, 1.0))
+            )
+        if (wading or affordance is MovementAffordance.SWIM) and (
+            water_column or float(player.z) >= float(C.Z_ABOVE_WATERPLANE) - 2.25
+        ):
+            # Explosion impulses and water bob can put the current leg probe
+            # inside the waterbed. Validate the water-plane corridor instead:
+            # rejecting every direction at the low phase traps a live swimmer
+            # even though native ascent and horizontal movement can recover.
+            # A bridge above this corridor makes is_water_column false; the
+            # swimmer still owns the water plane underneath that dry roof.
+            water_z = float(C.Z_ABOVE_WATERPLANE)
+            water_clear = not (
+                world.clipbox(probe_x, probe_y, water_z)
+                or world.clipbox(probe_x, probe_y, water_z - 1.0)
+            )
+            if water_clear:
+                return True
+            if affordance is not MovementAffordance.JUMP:
+                return False
+            # A dry bank blocks the water corridor by definition. A planned
+            # shore jump must still validate its raised landing below.
+
         # On a two-block JUMP the destination support legitimately intersects
         # the bot's *current* leg-height probe.  Validate the raised landing's
         # two clear body cells below instead; treating that support as a wall
@@ -2723,23 +3180,16 @@ class BotDirector:
             or world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
         ):
             return False
-        cell_x, cell_y = int(math.floor(probe_x)), int(math.floor(probe_y))
         # A dry plan may never enter the universal water plane. A swimmer's
         # vertical bob is unrelated to support height, however: comparing its
         # current z against the waterbed intermittently rejects every valid
         # waypoint and can freeze it in open water forever.
-        wading = bool(getattr(player, "wade", False))
-        water_column = bool(world.is_water_column(cell_x, cell_y))
         if (
             not wading
             and water_column
             and affordance is not MovementAffordance.SWIM
         ):
             return False
-        if water_column and (
-            wading or affordance is MovementAffordance.SWIM
-        ):
-            return True
 
         expected_support = int(round(float(player.z) + 2.25))
         climb, drop = {
@@ -2770,12 +3220,27 @@ class BotDirector:
     def _wrap(angle: float) -> float:
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
+    @staticmethod
+    def _hold_aim(runtime: _RuntimeBot) -> None:
+        # No look intention holds the current camera orientation. Its angular
+        # velocity must stop too: retaining it through planning_wait made the
+        # first later travel look resume an old downward/upward swing.
+        runtime.motor.yaw_velocity = 0.0
+        runtime.motor.pitch_velocity = 0.0
+        runtime.motor.yaw_acceleration = 0.0
+        runtime.motor.pitch_acceleration = 0.0
+        runtime.motor.gaze_purpose = ""
+        runtime.motor.gaze_yaw = None
+        runtime.motor.gaze_pitch = None
+
     def _update_aim(
         self,
         runtime: _RuntimeBot,
         target: tuple[float, float, float],
         dt: float,
         noise_factor: float = 1.0,
+        *,
+        purpose: str = "combat",
     ) -> None:
         player = runtime.player
         motor = runtime.motor
@@ -2785,42 +3250,105 @@ class BotDirector:
         dz = float(target[2]) - float(player.eye_z)
         planar = math.hypot(dx, dy)
         if planar <= 1e-6 and abs(dz) <= 1e-6:
+            self._hold_aim(runtime)
             return
-        # Ornstein-Uhlenbeck-like correlated error avoids independent jitter.
-        # noise_factor < 1 models a human settling onto a tracked target.
-        decay = max(0.0, 1.0 - 4.0 * dt)
-        noise_scale = (
-            profile.aim_noise * math.sqrt(max(dt, 1e-6)) * 2.0 * noise_factor
-        )
-        motor.yaw_noise = motor.yaw_noise * decay + runtime.rng.gauss(0.0, noise_scale)
-        motor.pitch_noise = motor.pitch_noise * decay + runtime.rng.gauss(0.0, noise_scale * 0.6)
-        desired_yaw = math.atan2(dy, dx) + motor.yaw_noise
-        desired_pitch = math.atan2(dz, max(planar, 1e-6)) + motor.pitch_noise
-        motor.yaw, motor.yaw_velocity = self._second_order_axis(
-            motor.yaw,
-            motor.yaw_velocity,
-            desired_yaw,
-            profile.turn_speed,
-            profile.turn_acceleration,
-            dt,
-            wrap=True,
-        )
-        motor.pitch, motor.pitch_velocity = self._second_order_axis(
-            motor.pitch,
-            motor.pitch_velocity,
-            desired_pitch,
-            profile.turn_speed * 0.75,
-            profile.turn_acceleration * 0.75,
-            dt,
-            wrap=False,
-        )
+        # Hand error belongs to combat difficulty, not navigation or tool
+        # alignment. Applying it to a straight route produced about 30 head
+        # reversals in 7 seconds with no change of intention.
+        if purpose == "combat":
+            decay = max(0.0, 1.0 - 4.0 * dt)
+            noise_scale = profile.aim_noise * math.sqrt(max(dt, 1e-6)) * 2.0 * noise_factor
+            motor.yaw_noise = motor.yaw_noise * decay + runtime.rng.gauss(0.0, noise_scale)
+            motor.pitch_noise = motor.pitch_noise * decay + runtime.rng.gauss(0.0, noise_scale * .6)
+            yaw_error, pitch_error = motor.yaw_noise, motor.pitch_noise
+        else:
+            motor.yaw_noise *= math.exp(-4.0 * max(0., dt))
+            motor.pitch_noise *= math.exp(-4.0 * max(0., dt))
+            yaw_error = pitch_error = 0.0
+        # Looking directly above/below has no horizontal bearing. atan2(0, 0)
+        # would otherwise command an unrelated turn toward world east.
+        desired_yaw = (math.atan2(dy, dx) + yaw_error
+                       if planar > 1e-6 else motor.yaw)
+        desired_pitch = max(-1.35, min(1.35,
+            math.atan2(dz, max(planar, 1e-6)) + pitch_error))
+        if purpose in {"travel", "focus"}:
+            self._update_purposeful_gaze(runtime, desired_yaw, desired_pitch, dt, purpose)
+        else:
+            # A visible target, selected world cell or short traversal step
+            # immediately takes ownership. Relaxed travel dwell must not
+            # delay a shot/dig ray or outlast a narrow native movement step.
+            motor.gaze_purpose = purpose
+            motor.gaze_yaw = motor.gaze_pitch = None
+            motor.yaw_acceleration = motor.pitch_acceleration = 0.0
+            motor.yaw, motor.yaw_velocity = self._second_order_axis(
+                motor.yaw, motor.yaw_velocity, desired_yaw,
+                profile.turn_speed, profile.turn_acceleration, dt, wrap=True,
+            )
+            motor.pitch, motor.pitch_velocity = self._second_order_axis(
+                motor.pitch, motor.pitch_velocity, desired_pitch,
+                profile.turn_speed * .75, profile.turn_acceleration * .75, dt, wrap=False,
+            )
         motor.pitch = max(-1.35, min(1.35, motor.pitch))
+        if ((motor.pitch >= 1.35 and motor.pitch_velocity > 0.0)
+                or (motor.pitch <= -1.35 and motor.pitch_velocity < 0.0)):
+            # A look limit is a hard stop, not a hidden angular spring. Do
+            # not retain outward momentum after reaching it.
+            motor.pitch_velocity = 0.0
+            motor.pitch_acceleration = 0.0
         cos_pitch = math.cos(motor.pitch)
         player.set_orientation_vector(
             math.cos(motor.yaw) * cos_pitch,
             math.sin(motor.yaw) * cos_pitch,
             math.sin(motor.pitch),
         )
+
+    def _update_purposeful_gaze(self, runtime: _RuntimeBot, yaw: float, pitch: float,
+                               dt: float, purpose: str) -> None:
+        """Commit meaningful gaze changes, with personality-stable brief dwell."""
+        motor, profile = runtime.motor, runtime.profile
+        dwell = .16 + .10 * profile.caution + .06 * (1.0 - profile.skill)
+        if motor.gaze_purpose != purpose or motor.gaze_yaw is None:
+            motor.gaze_yaw, motor.gaze_pitch = motor.yaw, motor.pitch
+            motor.gaze_age = dwell
+            motor.gaze_purpose = purpose
+        motor.gaze_age += max(0., dt)
+        yaw_change = abs(self._wrap(yaw - motor.gaze_yaw))
+        pitch_change = abs(pitch - motor.gaze_pitch)
+        yaw_deadzone = math.radians(2.0 if purpose == "travel" else 1.0)
+        if (max(yaw_change, pitch_change) >= math.radians(12.)
+                or (motor.gaze_age >= dwell
+                    and (yaw_change > yaw_deadzone or pitch_change > math.radians(.6)))):
+            motor.gaze_yaw, motor.gaze_pitch = yaw, pitch
+            motor.gaze_age = 0.0
+        speed = min(profile.turn_speed, 3.4, max(1.8, profile.turn_speed * .70))
+        acceleration = min(profile.turn_acceleration, 10.,
+                           max(5., profile.turn_acceleration * .65))
+        motor.yaw, motor.yaw_velocity, motor.yaw_acceleration = self._smooth_gaze_axis(
+            motor.yaw, motor.yaw_velocity, motor.yaw_acceleration,
+            motor.gaze_yaw, speed, acceleration, dt, wrap=True)
+        motor.pitch, motor.pitch_velocity, motor.pitch_acceleration = self._smooth_gaze_axis(
+            motor.pitch, motor.pitch_velocity, motor.pitch_acceleration,
+            motor.gaze_pitch, speed * .75, acceleration * .75, dt, wrap=False)
+
+    def _smooth_gaze_axis(self, current: float, velocity: float, acceleration: float,
+                          target: float, max_speed: float, max_acceleration: float,
+                          dt: float, *, wrap: bool) -> tuple[float, float, float]:
+        """Critically damped purposeful turns with bounded acceleration changes."""
+        elapsed = max(0., min(.25, dt))
+        steps = max(1, int(math.ceil(elapsed * 60.)))
+        step = elapsed / steps
+        for _ in range(steps):
+            error = self._wrap(target - current) if wrap else target - current
+            desired = max(-max_acceleration, min(max_acceleration, 25. * error - 10. * velocity))
+            jerk_step = max_acceleration * 8. * step
+            acceleration += max(-jerk_step, min(jerk_step, desired - acceleration))
+            velocity = max(-max_speed, min(max_speed, velocity + acceleration * step))
+            current += velocity * step
+            if wrap:
+                current = self._wrap(current)
+            if abs(error) < math.radians(.1) and abs(velocity) < math.radians(.5):
+                velocity = acceleration = 0.0
+        return current, velocity, acceleration
 
     def _second_order_axis(
         self,
@@ -2833,14 +3361,24 @@ class BotDirector:
         *,
         wrap: bool,
     ) -> tuple[float, float]:
-        error = self._wrap(target - current) if wrap else target - current
-        desired_velocity = max(-max_speed, min(max_speed, error * 7.0))
-        velocity_delta = desired_velocity - velocity
-        acceleration_step = max_acceleration * max(dt, 0.0)
-        velocity += max(-acceleration_step, min(acceleration_step, velocity_delta))
-        current += velocity * max(dt, 0.0)
-        if wrap:
-            current = self._wrap(current)
+        # Motors are staggered at about 10 Hz and can receive a 250 ms catch-up
+        # interval. A single Euler step at that interval turns the near-target
+        # error into -0.75*error, visibly alternating pitch even for a fixed
+        # point. Integrate the existing bounded controller at its original
+        # 60 Hz cadence: at most 15 cheap scalar steps per axis, no extra world
+        # probes or orientation publications.
+        elapsed = max(0.0, min(0.25, dt))
+        steps = max(1, int(math.ceil(elapsed * 60.0)))
+        step = elapsed / steps
+        for _ in range(steps):
+            error = self._wrap(target - current) if wrap else target - current
+            desired_velocity = max(-max_speed, min(max_speed, error * 7.0))
+            velocity_delta = desired_velocity - velocity
+            acceleration_step = max_acceleration * step
+            velocity += max(-acceleration_step, min(acceleration_step, velocity_delta))
+            current += velocity * step
+            if wrap:
+                current = self._wrap(current)
         return current, velocity
 
     def _balanced_team(self) -> int:

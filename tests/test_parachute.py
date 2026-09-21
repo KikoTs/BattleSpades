@@ -109,9 +109,9 @@ def test_world_parachute_matches_stock_gravity():
     normal = WorldPlayer(None)
     chute = WorldPlayer(None)
     for body in (normal, chute):
-        # One no-map frame enters the native airborne state; the property is
-        # intentionally read-only, matching the stock extension.
-        body.jump = True
+        # Enter airborne away from the solid map boundary. Jump must not
+        # override the contact result returned by stock boxclipmove.
+        body.set_position(100.5, 100.5, 100.0)
         body.update(DT, [])
         assert body.airborne is True
         body.set_velocity(1.0, 0.0, 0.0)
@@ -127,3 +127,108 @@ def test_world_parachute_matches_stock_gravity():
     expected_chute_vz = (DT * 1.0 * 0.05) / (1.0 + DT)
     assert chute.velocity.z == pytest.approx(expected_chute_vz, abs=1e-6)
     assert chute.velocity.z < normal.velocity.z
+
+
+def test_death_retires_canopy_before_next_replicated_row():
+    player = make_player()
+    player.parachute_active = True
+    player._parachute_deploy_last_held = True
+
+    player.die()
+
+    assert not player.parachute_active
+    assert not player._parachute_deploy_last_held
+    assert player.pack_state_flags() & 0x01 == 0
+
+
+def test_unequipped_player_cannot_deploy_or_keep_a_canopy():
+    player = make_player()
+    player.parachute_id = 0
+    player.airborne = True
+    player.parachute_active = True
+    player.update_action_input(False, False, hover=True)
+    player._update_parachute()
+    assert not player.parachute_active
+
+
+def test_long_fall_deployed_chute_has_retail_descent_and_no_landing_damage():
+    """Original mover: 0.05 gravity, ordinary drag, fall origin reset each tick."""
+    from tests.test_reversed_world_update import make_player as network_player
+
+    player, _ = network_player()
+    player.class_id = int(C.CLASS_SOLDIER)
+    player.loadout = [int(C.MINIGUN_TOOL), int(C.RPG_TOOL), int(C.A370)]
+    player.spawn(100.5, 100.5, 19.75)  # Forty blocks above standing contact.
+    world = player._ensure_world_object()
+    world.update(DT, ())
+    player._sync_cached_vectors()
+    player.update_action_input(False, False, hover=True)
+    player._update_parachute()
+    assert player.parachute_active
+    player._apply_input_state_to_world(False, world, [])
+
+    results = []
+    for frame in range(2400):
+        results.append(world.update(DT, ()))
+        if frame == 599:
+            # v_z tends to 0.05 in native units: 32 * 0.05 = 1.6 blocks/s.
+            assert world.velocity.z == pytest.approx(0.05, abs=0.00001)
+        if not world.airborne:
+            break
+    assert not world.airborne
+    assert 1200 < frame < 1800  # Controlled ~25-second descent, not free fall.
+    assert all(result <= 0 for result in results)
+
+
+def test_landing_retires_canopy_in_same_authority_tick():
+    import asyncio
+    from tests.test_reversed_world_update import make_player as network_player
+
+    player, _ = network_player()
+    player.loadout = [int(C.MINIGUN_TOOL), int(C.RPG_TOOL), int(C.A370)]
+    player.spawn(100.5, 100.5, 59.7)
+    world = player._ensure_world_object()
+    world.set_velocity(0.0, 0.0, 0.1)
+    player.airborne = True
+    player.parachute_active = True
+    asyncio.run(player.update(DT))
+
+    assert not player.airborne
+    assert not player.parachute_active
+    assert not world.parachute_active
+    assert player.pack_state_flags() & 0x01 == 0
+
+
+def test_held_deploy_after_landing_does_not_protect_the_next_fall():
+    """Landing must retire real authority immunity, not just its visual bit."""
+    import asyncio
+    from tests.test_reversed_world_update import make_player as network_player
+
+    async def run():
+        player, _ = network_player()
+        player.loadout = [int(C.MINIGUN_TOOL), int(C.RPG_TOOL), int(C.A370)]
+        player.spawn(100.5, 100.5, 59.7)
+        world = player._ensure_world_object()
+        world.set_velocity(0.0, 0.0, 0.1)
+        player.airborne = True
+        player.update_action_input(False, False, hover=True)
+        await player.update(DT)
+        assert not player.airborne
+        assert not player.parachute_active
+        assert player._parachute_deploy_last_held
+
+        # A second fall while the same key is held has no new deploy edge.
+        # The authoritative native result must report damage, even though the
+        # player still owns equipment 72 and keeps sending the deploy input.
+        player.set_position(100.5, 100.5, 29.75)
+        world.set_velocity(0.0, 0.0, 0.0)
+        for _ in range(360):
+            await player.update(DT)
+            assert not player.parachute_active
+            assert not world.parachute_active
+            if player.last_fall_result > 0:
+                break
+        assert player.last_fall_result > 0
+        assert player.pack_state_flags() & 0x01 == 0
+
+    asyncio.run(run())

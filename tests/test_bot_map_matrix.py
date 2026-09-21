@@ -11,6 +11,13 @@ import pytest
 from scripts.bot_map_matrix import shipped_maps, simulate_map
 
 
+@pytest.mark.parametrize("mode", ("arena", "dia", "tc"))
+def test_mode_specific_london_recovery_survives_knockback_and_compacted_escapes(mode: str) -> None:
+    result = asyncio.run(simulate_map("London", mode_name=mode, seed=19,
+                                     seconds=120.0, bots=12, respawns=True))
+    assert result.passed, json.dumps(asdict(result), indent=2, sort_keys=True)
+
+
 @pytest.mark.parametrize("map_name", shipped_maps())
 def test_shipped_map_avoids_bot_stalls_water_traps_and_team_piles(
     map_name: str,

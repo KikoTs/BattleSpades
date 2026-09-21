@@ -4,9 +4,9 @@ This replaces the legacy behavior-tree worker with a single ownership loop:
 
 ``select goal -> plan segment -> execute edge -> verify progress``.
 
-There are no nested recovery modes, construction side quests, resource
-targets, persistent crowd agents, or competing locomotion owners.  A failed
-edge is temporarily excluded and the same planner searches again.
+Local edge failures are excluded temporarily. A bounded, incremental surface
+search supplies longer detours when local segments stop advancing the goal.
+Construction remains part of traversal and uses ordinary server actions.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ from server.game_constants import (
 from server.projectiles import BASE_GRAVITY, PROJECTILE_SPECS
 
 from .combat_profiles import envelope_for
+from .locomotion import CombatFootwork
+from .cooperative_behavior import CooperativeBehavior
+from .team_tasks import TacticalOrder
 from .messages import (
     BotAction,
     BotActionKind,
@@ -48,11 +51,14 @@ from .messages import (
 )
 from .policies import (
     ModeBotDecision,
+    ModePolicyMemory,
     ModeBotPosture,
     mode_decision_allows_combat,
-    objective_decision_for,
+    mode_objective_committed,
 )
 from .simple_navigation import RoutePlan, RouteStep, SimpleVoxelWorld
+from .surface_corridor import SurfaceCorridorSearch
+from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
 from .snapshot_transport import MapSnapshotAssembler, SnapshotTransportError
 
 
@@ -67,7 +73,9 @@ _GOAL_STALL_SECONDS = 6.0
 _NAVIGATION_PROGRESS_SECONDS = 2.5
 _NAVIGATION_PROGRESS_DISTANCE = 0.5
 _NAVIGATION_WINDOW_SECONDS = 5.0
-_NAVIGATION_WINDOW_DISTANCE = 3.0
+_NAVIGATION_WINDOW_DISTANCE = 4.0
+_NAVIGATION_REVISIT_SECONDS = 8.0
+_NAVIGATION_VISITED_CELLS = 128
 _WATER_ESCAPE_PROGRESS_SECONDS = 4.5
 _WATER_ESCAPE_PROGRESS_DISTANCE = 4.0
 _BLOCKED_EDGE_SECONDS = 60.0
@@ -153,6 +161,7 @@ class _Goal:
     role: str
     arrival_radius: float
     sprint: bool
+    watch_position: Vector3 | None = None
 
 
 class _TraversalStyle(str, Enum):
@@ -189,14 +198,28 @@ class _BotState:
     goal_best_distance: float = math.inf
     goal_progress_at: float = 0.0
     blocked_edges: dict[EdgeKey, float] = field(default_factory=dict)
+    blocked_edge_since: dict[EdgeKey, float] = field(default_factory=dict)
     contact_id: int = -1
     contact_generation: int = -1
     contact_position: Vector3 | None = None
     contact_until: float = 0.0
     acquired_at: float = 0.0
+    flight_step: RouteStep | None = None
+    flight_source: Vector3 | None = None
+    flight_started_at: float = 0.0
+    flight_departed: bool = False
+    next_flight_at: float = 0.0
+    escape_attempts: int = 0
+    escape_search: tuple[tuple[object, ...], tuple[tuple[object, ...], ...], int] | None = None
+    planning_context: tuple[object, ...] | None = None
+    planning_results: dict[tuple[object, ...], RoutePlan] = field(default_factory=dict)
+    planning_wait_at: float | None = None
     next_oriented_at: float = 0.0
     next_support_at: float = 0.0
     next_deploy_at: float = 0.0
+    next_cover_at: float = 0.0
+    next_hop_at: float = 0.0
+    last_hop_damage_at: float = 0.0
     breach_key: tuple[object, ...] | None = None
     breach_started_at: float = 0.0
     next_breach_at: float = 0.0
@@ -204,6 +227,8 @@ class _BotState:
     yielded_breach_started_at: float = 0.0
     next_water_build_at: float = 0.0
     water_step_key: tuple[int, int, int, str] | None = None
+    water_landing_step: RouteStep | None = None
+    water_breach_target: tuple[int, int, int] | None = None
     water_best_distance: float = math.inf
     water_progress_at: float = 0.0
     water_recovery: bool = False
@@ -211,10 +236,19 @@ class _BotState:
     water_goal_reached: bool = False
     water_escape_position: Vector3 | None = None
     water_escape_at: float = 0.0
+    water_search_heading: Vector3 | None = None
+    water_search_until: float = 0.0
+    water_search_origin: Vector3 | None = None
+    water_failed_shores: list[tuple[float, frozenset[EdgeKey]]] = field(default_factory=list)
+    water_last_bank: tuple[float, Vector3] | None = None
     combat_progress_position: Vector3 | None = None
     combat_progress_at: float = 0.0
     combat_last_at: float = 0.0
     combat_stall_stage: int = 0
+    combat_wants_movement: bool = True
+    footwork: CombatFootwork = field(default_factory=CombatFootwork)
+    carried_entity_id: int = -1
+    can_shoot: bool = True
     crowd_anchor: Vector3 | None = None
     crowd_progress_at: float = 0.0
     crowd_detour_goal: Vector3 | None = None
@@ -226,6 +260,41 @@ class _BotState:
     navigation_progress_at: float = 0.0
     navigation_window_position: Vector3 | None = None
     navigation_window_at: float = 0.0
+    navigation_previous_position: Vector3 | None = None
+    navigation_visited: dict[NodeKey, float] = field(default_factory=dict)
+    navigation_coverage_at: float = 0.0
+    navigation_coverage_last_at: float = 0.0
+    navigation_coverage_goal: tuple[object, ...] | None = None
+    navigation_coverage_target: Vector3 | None = None
+    navigation_coverage_best: float = math.inf
+    escape_goal: Vector3 | None = None
+    escape_allow_water: bool = False
+    escape_until: float = 0.0
+    escape_retry_at: float = 0.0
+    corridor_search: SurfaceCorridorSearch | None = None
+    corridor: tuple[Vector3, ...] = ()
+    corridor_index: int = 0
+    corridor_join_index: int = 0
+    corridor_yield_local: bool = False
+    corridor_retry_at: float = 0.0
+    corridor_failed_goal: Vector3 | None = None
+    support_retry_at: float = 0.0
+    support_rejected_goal: Vector3 | None = None
+    support_progress_anchor: Vector3 | None = None
+    support_best_distance: float = math.inf
+    support_no_progress_time: float = 0.0
+    support_last_decision_at: float | None = None
+    support_failed_goal: Vector3 | None = None
+    support_failure_at: float = 0.0
+    support_escape_attempted: bool = False
+    patrol_index: int = 0
+    patrol_position: Vector3 | None = None
+    patrol_arrived_at: float | None = None
+    patrol_started_at: float = 0.0
+    guard_retry_at: float = 0.0
+    guard_target: Vector3 | None = None
+    guard_best_distance: float = math.inf
+    guard_progress_at: float = 0.0
 
 
 class SimpleBotBrain:
@@ -242,6 +311,8 @@ class SimpleBotBrain:
         self._states: dict[tuple[int, int], _BotState] = {}
         self._team_oriented_ready_at: dict[int, float] = {}
         self._map_epoch = -1
+        self.cooperative = CooperativeBehavior(world)
+        self.mode_policy = ModePolicyMemory()
 
     def reset_for_map(self, map_epoch: int) -> None:
         """Discard every controller and route from the previous map."""
@@ -252,6 +323,15 @@ class SimpleBotBrain:
         self._map_epoch = normalized
         self._states.clear()
         self._team_oriented_ready_at.clear()
+        self.cooperative.reset()
+        self.mode_policy.reset()
+
+    def reset_bot(self, player_id: int, generation: int) -> None:
+        """Discard a failed controller without interrupting healthy teammates."""
+
+        self._states.pop((int(player_id), int(generation)), None)
+        self.cooperative.forget(int(player_id), int(generation))
+        self.mode_policy.forget(int(player_id), int(generation))
 
     def decide(self, frame: PerceptionFrame) -> BotIntent | None:
         """Return the newest bounded intention for one observer."""
@@ -278,11 +358,18 @@ class SimpleBotBrain:
             or int(state.map_epoch) != int(frame.map_epoch)
             or int(state.mode_epoch) != int(frame.mode_epoch)
             or int(state.life_id) != int(observer.life_id)
+            or state.carried_entity_id != observer.carried_entity_id
+            or state.can_shoot != observer.can_shoot
         ):
+            # Pickup/drop changes both the winning goal and legal traversal.
+            # Escape continuations are stronger than ordinary goal changes;
+            # none may carry a pre-pickup dig route into an unarmed flag run.
             state = _BotState(
                 map_epoch=int(frame.map_epoch),
                 mode_epoch=int(frame.mode_epoch),
                 life_id=int(observer.life_id),
+                carried_entity_id=observer.carried_entity_id,
+                can_shoot=observer.can_shoot,
             )
             self._states[key] = state
 
@@ -294,6 +381,10 @@ class SimpleBotBrain:
         self._prune_blocked_edges(state, now)
 
         profile = frame.profile or _fallback_profile(observer.player_id)
+        if state.flight_step is not None:
+            flight = self._flight_intent(frame, observer, state, now)
+            if flight is not None:
+                return flight
         water_contact = self._water_contact(observer)
         if water_contact:
             state.water_committed = True
@@ -304,38 +395,62 @@ class SimpleBotBrain:
             state.dry_route_failures = 0
 
         if state.water_committed:
+            if (state.water_breach_target is not None
+                    and not self.world.solid(*state.water_breach_target)):
+                # Excavating the actual exit is progress even while the body
+                # stays in water. A slow tool must finish its finite ledge
+                # instead of retreating just as the final face disappears.
+                # Unchanged geometry and accepted swings alone never renew it.
+                state.water_breach_target = None
+                state.water_escape_at = now
+            if state.goal is not None and state.goal.role == "tdm_squad_support":
+                # This is a moving formation point projected ahead of a
+                # teammate, not a crossing objective. Find a real bank before
+                # resuming support so two swimmers cannot chase its moving
+                # offset around the same patch of water indefinitely.
+                state.water_recovery = True
+            # Keep the progress watchdog through the airborne bank phase;
+            # a false wade bit alone does not mean the shore was reached.
             state.navigation_progress_position = None
             state.navigation_progress_at = now
             force_water_edge = False
-            if water_contact:
-                if state.water_escape_position is None:
-                    state.water_escape_position = observer.position
-                    state.water_escape_at = now
-                elif math.hypot(
-                    float(observer.position[0])
-                    - float(state.water_escape_position[0]),
-                    float(observer.position[1])
-                    - float(state.water_escape_position[1]),
-                ) >= _WATER_ESCAPE_PROGRESS_DISTANCE:
-                    state.water_escape_position = observer.position
-                    state.water_escape_at = now
-                elif (
-                    now - float(state.water_escape_at)
-                    >= _WATER_ESCAPE_PROGRESS_SECONDS
-                ):
-                    # A route can alternate several individually valid swim
-                    # steps inside one small basin. Per-step timers reset on
-                    # every alternation, so blacklist the currently selected
-                    # edge when the body fails the map-level four-block swim
-                    # contract across the whole window.
-                    state.water_escape_position = observer.position
-                    state.water_escape_at = now
-                    state.water_recovery = True
-                    self._clear_route(state, now)
-                    force_water_edge = True
+            if state.water_escape_position is None:
+                state.water_escape_position = observer.position
+                state.water_escape_at = now
+            elif math.hypot(
+                float(observer.position[0])
+                - float(state.water_escape_position[0]),
+                float(observer.position[1])
+                - float(state.water_escape_position[1]),
+            ) >= _WATER_ESCAPE_PROGRESS_DISTANCE:
+                state.water_escape_position = observer.position
+                state.water_escape_at = now
+            elif (
+                now - float(state.water_escape_at)
+                >= _WATER_ESCAPE_PROGRESS_SECONDS
+            ):
+                # A route can alternate several individually valid swim
+                # steps inside one small basin. Per-step timers reset on
+                # every alternation, so blacklist the currently selected
+                # edge when the body fails the map-level four-block swim
+                # contract across the whole window.
+                state.water_escape_position = observer.position
+                state.water_escape_at = now
+                state.water_recovery = True
+                self._clear_route(state, now)
+                force_water_edge = True
+            landing = state.water_landing_step
+            if (landing is not None and not force_water_edge and not observer.grounded
+                    and now - state.water_progress_at < 1.2
+                    and math.dist(observer.position[:2], landing.waypoint[:2]) <= 1.75
+                    and observer.position[2] < landing.waypoint[2] - 0.25):
+                # Finish an airborne shore landing when its dry column no
+                # longer has a water-flow step. Both physical progress clocks
+                # remain authoritative; this cannot renew a failed swim.
+                return self._water_intent(frame, observer, landing, now)
             water_edge_blocked = any(
                 int(source[2]) >= int(C.Z_ABOVE_WATERPLANE) + 1
-                for source, _target in state.blocked_edges
+                for source, _target in self._water_exclusions(state, now)
             )
             water_goal_reached = bool(
                 state.goal is not None
@@ -395,7 +510,7 @@ class SimpleBotBrain:
                     )
                     else None
                 ),
-                blocked_edges=frozenset(state.blocked_edges),
+                blocked_edges=self._water_exclusions(state, now),
             )
             return self._water_intent(
                 frame,
@@ -406,20 +521,62 @@ class SimpleBotBrain:
             )
 
         state.water_step_key = None
+        state.water_landing_step = None
+        state.water_breach_target = None
         state.water_best_distance = math.inf
         state.water_progress_at = now
         state.water_recovery = False
         state.water_goal_reached = False
         state.water_escape_position = None
         state.water_escape_at = now
+        state.water_search_heading = None
+        state.water_search_until = 0.0
+        state.water_search_origin = None
+        # A one-block foothold can briefly clear wade before the body falls
+        # back in. Keep shoreline failure memory through that landing; its
+        # ordinary TTL and the next life/map reset still bound it.
 
-        mode_decision = objective_decision_for(frame, observer)
+        mode_decision = self.mode_policy.decide(frame, observer)
+        if mode_decision is not None and mode_decision.role == "diamond_guard_dropoff":
+            if now >= state.guard_retry_at:
+                distance = math.dist(observer.position, mode_decision.position)
+                if (state.guard_target is None
+                        or math.dist(state.guard_target, mode_decision.position) > 8.0):
+                    state.guard_target = mode_decision.position
+                    state.guard_best_distance = distance
+                    state.guard_progress_at = now
+                elif distance + 1.0 < state.guard_best_distance:
+                    state.guard_best_distance = distance
+                    state.guard_progress_at = now
+            if (now >= state.guard_retry_at and state.guard_target is not None
+                    and now - state.guard_progress_at >= 10.0
+                    and distance > mode_decision.arrival_radius):
+                # Guard duty is optional. A generated drop-off may sit above
+                # a sheer structure with no usable approach from this side.
+                # Contribute by mining before reconsidering that assignment;
+                # do not spend the entire match repeating local detours.
+                state.guard_retry_at = now + 35.0 + observer.player_id % 7
+                state.guard_target = None
+                self._set_goal(state, None, observer.position, now)
+            if now < state.guard_retry_at:
+                mode_decision = replace(
+                    mode_decision, position=observer.position,
+                    role="diamond_mine_blocks", directive="mine",
+                    posture=ModeBotPosture.MINE, arrival_radius=0.5,
+                )
+        else:
+            state.guard_target = None
         visible_target = self._visible_target(
             frame,
             observer,
             state,
             mode_decision,
         )
+        if frame.behavior_version == "cooperative":
+            order = self.cooperative.decide(frame, observer, visible_target, mode_decision)
+            if order is not None:
+                return self._cooperative_intent(frame, observer, state, profile,
+                                                visible_target, order, now)
         if visible_target is not None:
             return self._combat_intent(
                 frame,
@@ -451,10 +608,10 @@ class SimpleBotBrain:
                 state,
                 now,
             )
-            if mode_decision is None
+            if frame.behavior_version != "cooperative" and (mode_decision is None
             or mode_decision.objective_priority < 0.9
             or mode_decision.posture
-            in {ModeBotPosture.DEFEND, ModeBotPosture.ESCORT}
+            in {ModeBotPosture.DEFEND, ModeBotPosture.ESCORT})
             else None
         )
         if support is not None:
@@ -468,9 +625,9 @@ class SimpleBotBrain:
                 now,
                 decision=mode_decision,
             )
-            if mode_decision is None
+            if frame.behavior_version != "cooperative" and (mode_decision is None
             or mode_decision.directive == "fortify"
-            or mode_decision.objective_priority < 0.85
+            or mode_decision.objective_priority < 0.85)
             else None
         )
         if deployable is not None:
@@ -501,6 +658,41 @@ class SimpleBotBrain:
             now,
         )
 
+    def _cooperative_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        profile: BotProfile, visible: PlayerSnapshot | None, order: TacticalOrder,
+        now: float,
+    ) -> BotIntent:
+        """Resolve the single movement/tool owner selected by a team task."""
+        if order.action.kind is not BotActionKind.NONE:
+            return self._intent(frame, movement=MovementIntent(),
+                look=LookIntent(order.look) if order.look is not None else None,
+                tool_id=order.action.tool_id, action=order.action,
+                priority=BotIntentPriority.SURVIVAL if order.urgent else BotIntentPriority.TRAVERSAL,
+                debug_role=order.role, debug_goal=order.goal)
+        if order.tool_id >= 0:
+            return self._intent(frame, movement=MovementIntent(),
+                look=LookIntent(order.look) if order.look is not None else None,
+                tool_id=order.tool_id, debug_role=order.role, debug_goal=order.goal)
+        if visible is not None and order.hold:
+            decision = ModeBotDecision(order.goal, order.role, sprint=False,
+                posture=ModeBotPosture.DEFEND, arrival_radius=order.arrival_radius)
+            intent = self._combat_intent(frame, observer, visible, state, profile, now, decision)
+            # Retain normal weapon/reload/aim cadence, while staying at the
+            # validated firing point. Urgent close threats cancel the project.
+            if intent.action.kind in {BotActionKind.NONE, BotActionKind.FIRE, BotActionKind.RELOAD}:
+                return replace(intent, movement=MovementIntent(crouch=intent.movement.crouch),
+                               debug_role=order.role, debug_goal=order.goal)
+            return intent
+        if order.hold:
+            return self._intent(frame, movement=MovementIntent(),
+                look=LookIntent(order.look) if order.look is not None else None,
+                tool_id=_weapon_tool(observer), debug_role=order.role, debug_goal=order.goal)
+        goal = _Goal(("cooperative", order.task_id, order.role), order.goal,
+                     order.role, order.arrival_radius, False)
+        # Navigation owns aim/tool when it must dig, build, swim or use a pack.
+        return self._navigation_intent(frame, observer, state, goal, now)
+
     def _visible_target(
         self,
         frame: PerceptionFrame,
@@ -510,6 +702,8 @@ class SimpleBotBrain:
     ) -> PlayerSnapshot | None:
         """Select a stable enemy that is alive, in range, and unobscured."""
 
+        if not observer.can_shoot:
+            return None
         candidates: list[PlayerSnapshot] = []
         for player in frame.players:
             if (
@@ -569,7 +763,28 @@ class SimpleBotBrain:
             ),
             None,
         )
-        target = current or min(
+        # Public carrier/crown markers rank only enemies already admitted by
+        # range, field of view and LOS above. A nearby threat still gets urgent
+        # self-defence; a visible VIP should not be ignored for an old decoy.
+        objective_ids = {
+            item.carrier_id for item in frame.objectives
+            if item.carrier_id >= 0 and (
+                frame.mode_id == "vip" and item.kind == "vip" and item.team != observer.team
+                or frame.mode_id == "ctf" and item.kind == "ctf_intel" and item.team == observer.team)
+        }
+        marked = min((player for player in candidates if player.player_id in objective_ids),
+                     key=lambda player: math.dist(observer.position, player.position), default=None)
+        urgent = [player for player in candidates if (
+            math.dist(observer.position, player.position) <= 4.5
+            or observer.last_damage_source_id == player.player_id
+            and observer.last_damage_at > 0
+            and 0 <= frame.created_at - observer.last_damage_at <= 1.0)]
+        # Preserve a tracked urgent opponent, but do not overlook a newly
+        # arrived close threat simply because the old target has a crown.
+        urgent_target = (current if current in urgent else min(
+            urgent, key=lambda player: math.dist(observer.position, player.position),
+            default=None))
+        target = urgent_target or marked or current or min(
             candidates,
             key=lambda player: (
                 math.dist(observer.position, player.position),
@@ -600,8 +815,11 @@ class SimpleBotBrain:
         """Choose exactly one non-combat movement owner."""
 
         if decision is None:
-            decision = objective_decision_for(frame, observer)
-        if decision is not None and decision.objective_priority >= 0.7:
+            decision = self.mode_policy.decide(frame, observer)
+        if decision is not None and (mode_objective_committed(decision)
+                                     or decision.objective_priority >= 0.7):
+            if decision.role in {"team_assault_enemy_side", "arena_elimination_push"}:
+                return self._assault_search_goal(observer, state, decision, now)
             return self._goal_from_mode_decision(decision)
 
         if state.contact_position is not None and now < state.contact_until:
@@ -619,7 +837,131 @@ class SimpleBotBrain:
 
         if decision is None:
             return None
+        decision = self._optional_support_decision(frame, observer, state, decision, now)
+        if decision.role in {"team_assault_enemy_side", "arena_elimination_push"}:
+            return self._assault_search_goal(observer, state, decision, now)
         return self._goal_from_mode_decision(decision)
+
+    @staticmethod
+    def _optional_support_decision(
+        frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        decision: ModeBotDecision, now: float,
+    ) -> ModeBotDecision:
+        """Stop retrying one inaccessible formation point; keep useful team pressure."""
+        if decision.role != "tdm_squad_support":
+            return decision
+        if (not observer.wade
+                and math.dist(observer.position[:2], decision.position[:2]) <= decision.arrival_radius
+                and abs(observer.position[2] - decision.position[2]) <= 3.0):
+            # Arrival bypasses route-progress accounting. Old failed approach
+            # evidence must not abandon a formation point now actually held.
+            state.corridor_failed_goal = None
+            state.support_retry_at = 0.0
+            state.support_rejected_goal = None
+            state.support_progress_anchor = None
+            state.support_no_progress_time = 0.0
+            state.support_last_decision_at = None
+            state.support_failed_goal = None
+            state.support_escape_attempted = False
+            return decision
+        if (state.support_rejected_goal is not None
+                and math.dist(decision.position, state.support_rejected_goal) >= 8.0):
+            state.support_retry_at = 0.0
+            state.support_rejected_goal = None
+        if now >= state.support_retry_at:
+            anchor = state.support_progress_anchor
+            if anchor is None or math.dist(anchor, decision.position) >= 16.0:
+                state.support_progress_anchor = anchor = decision.position
+                state.support_best_distance = math.dist(observer.position, anchor)
+                state.support_no_progress_time = 0.0
+                state.support_failed_goal = None
+                state.support_escape_attempted = False
+            distance = math.dist(observer.position, anchor)
+            if distance + 4.0 <= state.support_best_distance:
+                # Measure the actor against a fixed commitment, not a moving
+                # teammate. Target jitter fabricated progress on London.
+                state.support_best_distance = distance
+                state.support_no_progress_time = 0.0
+                state.support_failed_goal = None
+                state.support_escape_attempted = False
+            elif state.support_last_decision_at is not None:
+                elapsed = now - state.support_last_decision_at
+                step = (state.route[state.route_index]
+                        if state.route_index < len(state.route) else None)
+                if (0.0 <= elapsed <= 1.0
+                        and (step is None or step.affordance is not MovementAffordance.BREACH)):
+                    # Combat/task gaps and committed excavation have their
+                    # own progress contracts; they do not consume this one.
+                    state.support_no_progress_time += elapsed
+        state.support_last_decision_at = now
+        failed = (state.support_no_progress_time >= 15.0
+                  and state.support_escape_attempted
+                  and state.support_failed_goal is not None
+                  and now - state.support_failure_at <= 30.0
+                  and math.dist(decision.position, state.support_failed_goal) <= 3.0)
+        if not failed and now >= state.support_retry_at:
+            return decision
+        enemy_anchor = next((objective for objective in frame.objectives
+                             if objective.kind == "team_anchor"
+                             and objective.team != observer.team), None)
+        if enemy_anchor is None:
+            return decision
+        if failed and now >= state.support_retry_at:
+            state.support_rejected_goal = decision.position
+            state.support_retry_at = now + 30.0
+            state.support_progress_anchor = None
+            state.support_no_progress_time = 0.0
+            state.support_failed_goal = None
+            state.support_escape_attempted = False
+        # This is an optional formation offset, not a carrier, flag or other
+        # winning objective. The authored enemy-side anchor is already legal
+        # policy information; combat/contact ownership remains above this.
+        return ModeBotDecision(enemy_anchor.position, "team_assault_enemy_side",
+                               sprint=True, arrival_radius=5.0,
+                               posture=ModeBotPosture.ASSAULT,
+                               objective_priority=0.6)
+
+    def _assault_search_goal(
+        self,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        decision: ModeBotDecision,
+        now: float,
+    ) -> _Goal:
+        """Search authored enemy-side ground after arrival, using no hidden intel."""
+
+        position = state.patrol_position or decision.position
+        arrived = (math.hypot(position[0] - observer.position[0],
+                              position[1] - observer.position[1]) <= decision.arrival_radius
+                   and abs(position[2] - observer.position[2]) <= 3.0)
+        if not arrived:
+            state.patrol_arrived_at = None
+        elif state.patrol_arrived_at is None:
+            state.patrol_arrived_at = now
+        finished_wait = (state.patrol_arrived_at is not None
+                         and now - state.patrol_arrived_at >= 3.0)
+        expired_search = (state.patrol_position is not None
+                          and now - state.patrol_started_at >= 45.0)
+        if finished_wait or expired_search:
+            # A stable sequence gives different bots different search points;
+            # the target remains fixed throughout each route attempt.
+            state.patrol_index += 1
+            state.patrol_started_at = now
+            state.patrol_arrived_at = None
+            for offset in range(8):
+                angle = (state.patrol_index + observer.player_id * 3 + offset) * math.pi / 4.0
+                radius = 20.0 + (observer.player_id % 3) * 6.0
+                x = min(510, max(1, int(decision.position[0] + math.cos(angle) * radius)))
+                y = min(510, max(1, int(decision.position[1] + math.sin(angle) * radius)))
+                surface = self.world.surface(x, y, decision.position[2],
+                                             vertical_span=12, clearance=3, allow_water=False)
+                if surface is not None:
+                    state.patrol_position = surface.position
+                    break
+        if state.patrol_position is None:
+            return self._goal_from_mode_decision(decision)
+        return _Goal(("assault_search", state.patrol_index), state.patrol_position,
+                     "team_assault_search", decision.arrival_radius, True)
 
     @staticmethod
     def _goal_from_mode_decision(decision: ModeBotDecision) -> _Goal:
@@ -630,13 +972,12 @@ class SimpleBotBrain:
             (
                 "objective",
                 str(decision.role),
-                int(round(position[0] / 4.0)),
-                int(round(position[1] / 4.0)),
             ),
             position,
             str(decision.role),
             max(0.75, float(decision.arrival_radius)),
             bool(decision.sprint),
+            decision.watch_position,
         )
 
     def _combat_intent(
@@ -649,7 +990,7 @@ class SimpleBotBrain:
         now: float,
         mode_decision: ModeBotDecision | None = None,
     ) -> BotIntent:
-        """Chase or fight one visible enemy; no other goal may move the bot."""
+        """Fight a visible enemy while retaining a committed mode route."""
 
         self._update_combat_progress(state, observer.position, now)
 
@@ -668,6 +1009,24 @@ class SimpleBotBrain:
             if mode_decision is not None
             else ModeBotPosture.BALANCED
         )
+        protected_objective = (
+            not zombie and mode_decision is not None
+            and posture in {ModeBotPosture.EVASIVE, ModeBotPosture.SURVIVE,
+                            ModeBotPosture.DEFEND, ModeBotPosture.ESCORT,
+                            ModeBotPosture.BUILD, ModeBotPosture.MINE}
+            and mode_decision.objective_priority >= 0.7
+        )
+        if (not zombie and mode_objective_committed(mode_decision)
+                and mode_decision.posture in {
+                    ModeBotPosture.ASSAULT, ModeBotPosture.BALANCED}):
+            objective_distance = math.dist(observer.position, mode_decision.position)
+            target_offset = math.dist(target.position, mode_decision.position)
+            # Return fire without letting a distant incidental opponent pull
+            # a capture/intercept order off its route. Combat in the objective
+            # area keeps normal range selection and footwork.
+            protected_objective = (
+                objective_distance > max(12.0, mode_decision.arrival_radius * 2)
+                and target_offset > max(16.0, envelope_for(weapon_tool).ideal_max * .8))
 
         action = BotAction()
         movement = direction_to_target
@@ -689,6 +1048,8 @@ class SimpleBotBrain:
             1.5 if zombie else 3.0,
             True,
         )
+        if protected_objective:
+            pursuit_goal = self._goal_from_mode_decision(mode_decision)
 
         if zombie:
             selected_tool = int(melee_tool)
@@ -711,6 +1072,8 @@ class SimpleBotBrain:
                 affordance = pursuit.movement.affordance
         else:
             envelope = envelope_for(weapon_tool)
+            spacing = state.footwork.spacing(
+                distance, float(envelope.ideal_min), float(envelope.ideal_max))
             if observer.reloading:
                 action = BotAction()
             elif observer.ammo_clip <= 0 and observer.ammo_reserve > 0:
@@ -725,7 +1088,8 @@ class SimpleBotBrain:
             ):
                 selected_tool = int(melee_tool)
                 if distance <= 3.0:
-                    self._set_goal(state, None, observer.position, now)
+                    if not protected_objective:
+                        self._set_goal(state, None, observer.position, now)
                     movement = (0.0, 0.0, 0.0)
                     action = BotAction(
                         BotActionKind.MELEE,
@@ -742,7 +1106,7 @@ class SimpleBotBrain:
                     movement = pursuit.movement.direction
                     affordance = pursuit.movement.affordance
             else:
-                if distance > float(envelope.ideal_max):
+                if spacing == "approach":
                     pursuit = self._navigation_intent(
                         frame,
                         observer,
@@ -753,19 +1117,23 @@ class SimpleBotBrain:
                     movement = pursuit.movement.direction
                     affordance = pursuit.movement.affordance
                     sprint = True
-                elif distance < max(2.0, float(envelope.ideal_min) * 0.65):
-                    self._set_goal(state, None, observer.position, now)
+                elif spacing == "retreat":
+                    if not protected_objective:
+                        self._set_goal(state, None, observer.position, now)
                     movement = _normalized_xy(-dx, -dy)
                     sprint = False
                 elif envelope.prefers_stationary:
-                    self._set_goal(state, None, observer.position, now)
+                    if not protected_objective:
+                        self._set_goal(state, None, observer.position, now)
                     movement = (0.0, 0.0, 0.0)
                     crouch = True
                     sprint = False
                 else:
-                    self._set_goal(state, None, observer.position, now)
-                    sign = -1.0 if int(observer.player_id) & 1 else 1.0
-                    movement = _normalized_xy(-dy * sign, dx * sign)
+                    if not protected_objective:
+                        self._set_goal(state, None, observer.position, now)
+                    movement = state.footwork.direction(
+                        observer, target, profile, now,
+                        blocked_stage=state.combat_stall_stage)
                     sprint = False
 
                 oriented = self._oriented_attack_choice(
@@ -820,47 +1188,25 @@ class SimpleBotBrain:
                         burst_pause=pause,
                     )
 
-        if not zombie and mode_decision is not None:
-            objective_goal = self._goal_from_mode_decision(mode_decision)
-            if posture in {
-                ModeBotPosture.EVASIVE,
-                ModeBotPosture.SURVIVE,
-            }:
-                # Carriers and last survivors keep following the authoritative
-                # objective route while returning fire at immediate threats.
+        if not zombie and not protected_objective and (
+                observer.reloading or action.kind is BotActionKind.RELOAD):
+            self._set_goal(state, None, observer.position, now)
+            movement = state.footwork.direction(
+                observer if observer.reloading else replace(observer, reloading=True),
+                target, profile, now, blocked_stage=state.combat_stall_stage)
+            sprint = False
+
+        if protected_objective:
+            # One route owner survives both quiet and combat frames. Clearing
+            # it for a strafe before recreating it reset progress every tick;
+            # nearby enemies also used to pull escorts out of formation.
+            if pursuit is None:
                 pursuit = self._navigation_intent(
-                    frame,
-                    observer,
-                    state,
-                    objective_goal,
-                    now,
-                )
-                movement = pursuit.movement.direction
-                affordance = pursuit.movement.affordance
-                sprint = bool(mode_decision.sprint)
-                crouch = False
-            elif (
-                posture
-                in {
-                    ModeBotPosture.DEFEND,
-                    ModeBotPosture.ESCORT,
-                    ModeBotPosture.BUILD,
-                    ModeBotPosture.MINE,
-                }
-                and distance > float(envelope.ideal_max)
-            ):
-                # Guards fight from the protected area instead of chasing a
-                # visible opponent until their objective is left undefended.
-                pursuit = self._navigation_intent(
-                    frame,
-                    observer,
-                    state,
-                    objective_goal,
-                    now,
-                )
-                movement = pursuit.movement.direction
-                affordance = pursuit.movement.affordance
-                sprint = False
+                    frame, observer, state, pursuit_goal, now)
+            movement = pursuit.movement.direction
+            affordance = pursuit.movement.affordance
+            sprint = bool(mode_decision.sprint)
+            crouch = False
 
         if pursuit is None and math.hypot(movement[0], movement[1]) > 1e-6:
             # A visible target can keep combat ownership indefinitely.  In a
@@ -918,27 +1264,47 @@ class SimpleBotBrain:
             and WEAPON_PROFILES[selected_tool].category == CAT_SNIPER
             and distance >= 18.0
         )
+        if pursuit is not None and (
+            pursuit.action.kind not in {BotActionKind.NONE, BotActionKind.FIRE}
+            or pursuit.movement.affordance in {
+                MovementAffordance.BREACH, MovementAffordance.BUILD_STEP,
+                MovementAffordance.BUILD_BRIDGE, MovementAffordance.PLACE_PREFAB,
+                MovementAffordance.JETPACK,
+            }
+        ):
+            # Seeing an enemy across a wall/river does not make that edge
+            # traversable. Keep the dig/build aim, tool and action together.
+            return replace(pursuit, priority=priority,
+                           debug_role="combat_pursuit:" + pursuit.debug_role)
+        locomotion = (pursuit.movement if pursuit is not None else MovementIntent(
+            direction=movement, jump=affordance is MovementAffordance.JUMP,
+            crouch=crouch, sprint=sprint, affordance=affordance))
+        state.combat_wants_movement = math.hypot(*locomotion.direction[:2]) > 0.1
+        if pursuit is None and not scoped:
+            locomotion = replace(locomotion, jump=self._safe_tactical_hop(
+                frame, observer, state, locomotion, now))
+        if (pursuit is None and not zombie and observer.health < 60
+                and now - observer.last_damage_at < 3.0 and observer.reloading):
+            cover = self._prefab_cover_intent(frame, observer, state, target.position, now)
+            if cover is not None:
+                return cover
         return self._intent(
             frame,
-            movement=MovementIntent(
-                direction=movement,
-                jump=affordance is MovementAffordance.JUMP,
-                crouch=crouch,
-                sprint=sprint,
-                affordance=affordance,
-            ),
+            movement=locomotion,
             look=look,
             tool_id=selected_tool,
             action=action,
             priority=priority,
             secondary_fire=scoped,
             zoom=scoped,
-            debug_goal=target.position,
+            debug_goal=(pursuit.debug_goal if protected_objective and pursuit is not None
+                        else target.position),
             debug_path=(
                 pursuit.debug_path if pursuit is not None else ()
             ),
             debug_role=(
-                "combat_pursuit"
+                "combat_objective:" + mode_decision.role
+                if protected_objective else "combat_pursuit"
                 if pursuit is not None
                 else (
                     "combat_melee"
@@ -958,8 +1324,15 @@ class SimpleBotBrain:
         position: Vector3,
         now: float,
     ) -> None:
-        """Advance the blocked-strafe phase only after measured non-progress."""
-
+        """Advance collision recovery only after intended movement fails."""
+        if not state.combat_wants_movement:
+            # Planting the feet for a burst/holding an objective is intentional,
+            # not terrain failure. Resume the blocked-input clock on departure.
+            state.combat_progress_position = position
+            state.combat_progress_at = now
+            state.combat_last_at = now
+            state.combat_stall_stage = 0
+            return
         interrupted = (
             state.combat_progress_position is None
             or float(now) - float(state.combat_last_at) > 0.75
@@ -1277,6 +1650,84 @@ class SimpleBotBrain:
             now,
         )
 
+    def _safe_tactical_hop(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        movement: MovementIntent, now: float,
+    ) -> bool:
+        """Vary grounded combat movement only over a clear, supported runway."""
+        profile = frame.profile or _fallback_profile(observer.player_id)
+        if (not observer.grounded or observer.wade or movement.crouch
+                or movement.affordance is not MovementAffordance.WALK
+                or profile.aggression < 0.4 or now < state.next_hop_at
+                or observer.reloading or observer.health > 75
+                or observer.last_damage_at <= state.last_hop_damage_at
+                or not 0.0 <= now - observer.last_damage_at <= 0.8
+                or math.hypot(*movement.direction[:2]) < 0.5):
+            return False
+        solid = getattr(self.world, "solid", None)
+        if not callable(solid):
+            return False
+        for distance in (0.0, 1.0, 2.0, 3.0, 4.0):
+            x = observer.position[0] + movement.direction[0] * distance
+            y = observer.position[1] + movement.direction[1] * distance
+            surface = self.world.surface(int(x), int(y), observer.position[2],
+                                         vertical_span=1, allow_water=False)
+            if surface is None or abs(surface.position[2] - observer.position[2]) > 0.3:
+                return False
+            for dx in (-0.45, 0.45):
+                for dy in (-0.45, 0.45):
+                    if any(solid(int(x + dx), int(y + dy), z) for z in
+                           range(surface.support_z - 5, surface.support_z - 1)):
+                        return False
+        # Identity and temperament vary the cadence, never new randomness each
+        # frame. The native motor still owns jump rearming and normal physics.
+        state.last_hop_damage_at = observer.last_damage_at
+        state.next_hop_at = now + 3.5 + profile.caution * 2.0 + (observer.player_id * 0.37) % 0.7
+        return True
+
+    def _prefab_cover_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        towards: Vector3, now: float,
+    ) -> BotIntent | None:
+        """Build affordable cover on open ground without sealing an approach."""
+        if (now < state.next_cover_at or not observer.grounded or observer.wade
+                or int(C.PREFAB_TOOL) not in observer.loadout
+                or int(observer.class_id) in _ZOMBIE_CLASSES):
+            return None
+        names = sorted(name for name in observer.prefabs
+            if "wall" in name and bot_prefab_is_suitable(name, "cover")
+            and (bot_prefab_block_count(name) or 9999) <= observer.blocks)
+        if not names:
+            return None
+        direction = _normalized_xy(towards[0] - observer.position[0], towards[1] - observer.position[1])
+        if math.hypot(*direction[:2]) < 0.1:
+            angle = (observer.player_id * 2.39996) % (2 * math.pi)
+            direction = (math.cos(angle), math.sin(angle), 0.0)
+        target = (observer.position[0] + direction[0] * 3.0,
+                  observer.position[1] + direction[1] * 3.0, observer.position[2])
+        surface = self.world.surface(int(target[0]), int(target[1]), target[2],
+                                     vertical_span=1, allow_water=False)
+        if surface is None or abs(surface.position[2] - target[2]) > 0.5:
+            return None
+        # Require open lateral exits and leave objectives and teammates clear.
+        for sign in (-1, 1):
+            exit_x, exit_y = target[0] - direction[1] * 3 * sign, target[1] + direction[0] * 3 * sign
+            if self.world.surface(int(exit_x), int(exit_y), target[2],
+                                  vertical_span=1, allow_water=False) is None:
+                return None
+        if any(p.player_id != observer.player_id and p.alive
+               and math.dist(p.position, target) < 3.0 for p in frame.players):
+            return None
+        if any(o.kind != "team_anchor" and math.dist(o.position, target) < 4.0 for o in frame.objectives):
+            return None
+        name = names[observer.player_id % len(names)]
+        state.next_cover_at = now + 18.0 + (observer.player_id % 5) * 2.0
+        return self._intent(frame, movement=MovementIntent(crouch=True),
+            look=LookIntent(target, visible=False), tool_id=int(C.PREFAB_TOOL),
+            action=BotAction(BotActionKind.PLACE_PREFAB, tool_id=int(C.PREFAB_TOOL),
+                             position=target, argument=name, yaw=math.atan2(direction[1], direction[0])),
+            priority=BotIntentPriority.TRAVERSAL, debug_role="fortify_prefab_cover")
+
     def _strategic_deploy_intent(
         self,
         frame: PerceptionFrame,
@@ -1291,7 +1742,12 @@ class SimpleBotBrain:
         if now < state.next_deploy_at or not observer.grounded:
             return None
         if decision is None:
-            decision = objective_decision_for(frame, observer)
+            decision = self.mode_policy.decide(frame, observer)
+        if (decision is not None and decision.directive == "fortify"
+                and math.dist(observer.position, decision.position) <= 14.0):
+            cover = self._prefab_cover_intent(frame, observer, state, decision.position, now)
+            if cover is not None:
+                return cover
         if state.contact_position is not None and now < state.contact_until:
             strategic_position = state.contact_position
             strategic_role = "recent_contact"
@@ -1482,6 +1938,10 @@ class SimpleBotBrain:
     ) -> BotIntent:
         """Plan/follow one route and invalidate a concrete failed edge."""
 
+        if state.flight_step is not None:
+            flight = self._flight_intent(frame, observer, state, now)
+            if flight is not None:
+                return flight
         effective_wading = (
             bool(observer.wade)
             if water_context is None
@@ -1489,6 +1949,25 @@ class SimpleBotBrain:
         )
 
         self._set_goal(state, goal, observer.position, now)
+        if state.planning_wait_at is not None:
+            # Pause only scheduling time; denial is not physical progress and
+            # must not postpone strategic corridor guidance indefinitely.
+            delay = max(0.0, now - state.planning_wait_at)
+            state.waypoint_progress_at += delay
+            state.navigation_progress_at += delay
+            state.navigation_window_at += delay
+            state.navigation_coverage_at += delay
+            if state.breach_key is not None:
+                state.breach_started_at += delay
+            state.planning_wait_at = None
+        if state.escape_goal is not None and (
+            now >= state.escape_until
+            or math.dist(observer.position, state.escape_goal) <= 1.25
+        ):
+            state.escape_goal = None
+            self._clear_route(state, now)
+        previous_position = state.navigation_previous_position
+        state.navigation_previous_position = observer.position
         active_goal = state.goal
         if active_goal is None:
             return self._intent(
@@ -1526,20 +2005,70 @@ class SimpleBotBrain:
             float(active_goal.position[0]) - float(observer.position[0]),
             float(active_goal.position[1]) - float(observer.position[1]),
         )
-        if goal_distance <= active_goal.arrival_radius and not effective_wading:
+        if (goal_distance <= active_goal.arrival_radius and not effective_wading
+                and abs(float(active_goal.position[2]) - float(observer.position[2])) <= 3.0):
             if active_goal.role == "chase_last_seen":
                 state.contact_until = 0.0
                 state.contact_position = None
             state.route = ()
             state.route_index = 0
+            watch = active_goal.watch_position
+            watch_look = None
+            if watch is not None:
+                # Watch the public approach from eye height, not the nearby
+                # protected actor's feet or a distant map layer through walls.
+                heading = _normalized_xy(watch[0] - observer.position[0],
+                                         watch[1] - observer.position[1])
+                if math.hypot(*heading[:2]) > 0.1:
+                    watch_look = LookIntent(self._navigation_look_target(observer, heading))
             return self._intent(
                 frame,
                 movement=MovementIntent(),
-                look=None,
+                look=watch_look,
                 tool_id=_weapon_tool(observer),
                 debug_goal=active_goal.position,
                 debug_role=f"{active_goal.role}:arrived",
             )
+
+        repeated_coverage = self._navigation_revisits(state, observer.position, active_goal, now)
+        current_step = (state.route[state.route_index]
+                        if state.route_index < len(state.route) else None)
+        if current_step is not None and current_step.affordance not in {
+                MovementAffordance.WALK, MovementAffordance.CROUCH,
+                MovementAffordance.JUMP, MovementAffordance.DROP}:
+            # Digging/traversal has its own authoritative progress contract.
+            state.navigation_coverage_at = now
+        elif repeated_coverage and state.escape_search is None:
+            # Valid movement can still repeat the same closed loop forever.
+            # Exclude this approach briefly, then use the bounded recovery
+            # planner. Retain visited cells through that escape and goal swaps.
+            self._invalidate_current_edge(state, observer.position, now, lifetime=12.0)
+            self._clear_route(state, now)
+            state.escape_goal = None
+            if state.corridor_search is None or state.corridor_search.done:
+                state.corridor_search = None
+                state.corridor_join_index = 0
+                state.corridor_yield_local = False
+            # _invalidate_current_edge already teaches a pending search this
+            # exclusion. Preserve its frontier: repeated local recovery must
+            # not restart the long detour that can actually leave this shelf.
+            state.corridor_retry_at = now
+            state.navigation_coverage_at = now
+            state.navigation_progress_position = observer.position
+            state.navigation_progress_at = now
+            state.navigation_window_position = observer.position
+            state.navigation_window_at = now
+            self._escape_empty_route(frame, observer, state, now)
+            return self._intent(frame, movement=MovementIntent(), look=None,
+                tool_id=_weapon_tool(observer), priority=BotIntentPriority.TRAVERSAL,
+                debug_goal=active_goal.position, debug_role=active_goal.role + ":route_cycle")
+
+        if state.escape_search is not None:
+            # Resume the next recovery candidate before ordinary routing can
+            # spend this observer's only grant again.
+            self._escape_empty_route(frame, observer, state, now)
+            if state.escape_search is not None:
+                return self._planning_wait_intent(frame, observer, state, active_goal, now)
 
         if (
             state.route_index < len(state.route)
@@ -1559,6 +2088,7 @@ class SimpleBotBrain:
             state.navigation_progress_at = float(now)
             state.navigation_window_position = observer.position
             state.navigation_window_at = float(now)
+            self._escape_empty_route(frame, observer, state, now)
             return self._intent(
                 frame,
                 movement=MovementIntent(),
@@ -1593,20 +2123,28 @@ class SimpleBotBrain:
                 active_digger,
             )
 
+        corridor_goal = self._corridor_segment_goal(state, observer, active_goal, now)
         if goal_distance + 1.0 < state.goal_best_distance:
             state.goal_best_distance = goal_distance
             state.goal_progress_at = now
-        elif now - state.goal_progress_at >= _GOAL_STALL_SECONDS:
-            self._invalidate_current_edge(state, observer.position, now)
-            self._clear_route(state, now)
-            state.goal_best_distance = goal_distance
-            state.goal_progress_at = now
+        # A legitimate route around a wall can move away from its destination
+        # for much longer than six seconds. Lack of straight-line progress
+        # requests map-wide guidance; only failed physical edges are excluded.
 
         topology_changed = (
             bool(state.route)
             and int(state.route_topology_version)
             != int(frame.topology_version)
         )
+        if topology_changed:
+            local_check = getattr(self.world, "route_needs_replan", None)
+            if (callable(local_check)
+                    and not local_check(state.route_topology_version, observer.position,
+                                        state.route[state.route_index:])):
+                # A teammate editing distant terrain does not invalidate this
+                # unchanged walking corridor or spend another planning grant.
+                state.route_topology_version = int(frame.topology_version)
+                topology_changed = False
         if topology_changed and state.breach_key is not None:
             # Removing a planned wall cell is real strategic progress even
             # though the bot has not moved closer to the goal yet.
@@ -1628,7 +2166,6 @@ class SimpleBotBrain:
             previous_breach_key = state.breach_key
             previous_breach_started_at = state.breach_started_at
             previous_next_breach_at = state.next_breach_at
-            self._reset_breach(state, now)
             personality = self._traversal_personality(frame, observer)
             if state.dry_detour_goal is not None and (
                 float(now) >= float(state.dry_detour_until)
@@ -1646,27 +2183,73 @@ class SimpleBotBrain:
                 state.crowd_detour_goal is not None
                 and float(now) < float(state.crowd_detour_until)
             )
-            planning_goal = (
-                state.crowd_detour_goal
-                if crowd_detour_active
-                else (
-                    state.dry_detour_goal
-                    if state.dry_detour_goal is not None
-                    else self._team_lane_segment_goal(
-                        frame,
-                        observer,
-                        active_goal.position,
-                    )
+            planning_goal = state.escape_goal
+            if planning_goal is None:
+                planning_goal = (
+                    state.crowd_detour_goal if crowd_detour_active
+                    else state.dry_detour_goal or corridor_goal
                 )
-            )
+            if planning_goal is None:
+                planning_goal = self._team_lane_segment_goal(
+                    frame, observer, active_goal.position,
+                )
             assert planning_goal is not None
             plan_arguments = {
-                "abilities": _movement_abilities(observer),
+                "abilities": (_movement_abilities(observer) if now >= state.next_flight_at
+                              else _movement_abilities(observer) - {MovementAffordance.JETPACK}),
                 "dig_profile": _dig_profile(observer),
                 "blocked_edges": frozenset(state.blocked_edges),
             }
-            if effective_wading:
-                plan = self.world.plan(
+            dry_state = (state.dry_detour_goal, state.dry_detour_until,
+                         state.dry_route_failures)
+            context = (observer.position, frame.topology_version,
+                       active_goal.position, planning_goal, state.escape_goal,
+                       dry_state, effective_wading, personality.style,
+                       frozenset(plan_arguments["abilities"]),
+                       plan_arguments["dig_profile"], plan_arguments["blocked_edges"])
+            if context != state.planning_context:
+                state.planning_context = context
+                state.planning_results.clear()
+
+            def request_plan(start, destination, **arguments):
+                # Preserve the completed first query until its fallback receives
+                # a grant. Otherwise every new decision repeats that first query
+                # and permanently starves its dry/wet alternative.
+                if getattr(self.world, "planning_budget", None) is None:
+                    state.corridor_yield_local = False
+                    return self.world.plan(start, destination, **arguments)
+                key = (start, destination, tuple(sorted(
+                    (name, frozenset(value) if isinstance(value, set) else value)
+                    for name, value in arguments.items())))
+                if key not in state.planning_results:
+                    result = self.world.plan(start, destination, **arguments)
+                    if not result.deferred:
+                        state.corridor_yield_local = False
+                    if not result.deferred and len(state.planning_results) < 4:
+                        state.planning_results[key] = result
+                    return result
+                return state.planning_results[key]
+
+            def wait_for_plan():
+                # Failure counts and detours describe tested geometry, not a
+                # second query still waiting for worker time.
+                (state.dry_detour_goal, state.dry_detour_until,
+                 state.dry_route_failures) = dry_state
+                return self._planning_wait_intent(frame, observer, state, active_goal, now)
+
+            if state.escape_goal is not None:
+                # Terrain changes replan the active escape with the same
+                # movement contract. Falling back to ordinary routing here
+                # silently removed DROP/dig/swim on the very next block edit.
+                plan_arguments["abilities"] |= {MovementAffordance.DROP}
+                plan = request_plan(
+                    observer.position, planning_goal,
+                    allow_water=effective_wading or state.escape_allow_water,
+                    _prefer_existing_path=False,
+                    **plan_arguments,
+                )
+            elif effective_wading:
+                plan = request_plan(
                     observer.position,
                     planning_goal,
                     allow_water=True,
@@ -1679,25 +2262,38 @@ class SimpleBotBrain:
                 state.dry_detour_goal = None
                 state.dry_detour_until = 0.0
                 state.dry_route_failures = 0
-                plan = self.world.plan(
+                plan = request_plan(
                     observer.position,
                     planning_goal,
                     allow_water=True,
                     **plan_arguments,
                 )
+                if plan.deferred:
+                    return wait_for_plan()
+                if not _plan_can_advance(plan, observer.position):
+                    # A swimmer's preference must not disable excavation.
+                    # Near the water plane, wet and dry searches can select
+                    # different floor layers; a failed wet graph does not
+                    # prove the dry pocket has no diggable exit.
+                    plan = request_plan(
+                        observer.position, planning_goal, allow_water=False,
+                        **plan_arguments,
+                    )
             else:
                 # Dry-route and builder identities search the shoreline
                 # before conceding to a swim. A bounded A* can reach the local
                 # minimum at the water's edge without proving there is no
                 # surface route around it, so an empty segment first creates
                 # a stable lateral dry target instead of entering immediately.
-                dry_plan = self.world.plan(
+                dry_plan = request_plan(
                     observer.position,
                     planning_goal,
                     allow_water=False,
                     **plan_arguments,
                 )
-                if dry_plan.steps:
+                if dry_plan.deferred:
+                    return wait_for_plan()
+                if _plan_can_advance(dry_plan, observer.position):
                     plan = dry_plan
                     if (
                         state.dry_detour_goal is None
@@ -1740,25 +2336,41 @@ class SimpleBotBrain:
                         state.dry_detour_until = (
                             float(now) + _DRY_DETOUR_SECONDS
                         )
-                        detour_plan = self.world.plan(
+                        detour_plan = request_plan(
                             observer.position,
                             state.dry_detour_goal,
                             allow_water=False,
                             **plan_arguments,
                         )
+                        if detour_plan.deferred:
+                            return wait_for_plan()
                     plan = (
                         detour_plan
-                        if detour_plan.steps
-                        else self.world.plan(
+                        if _plan_can_advance(detour_plan, observer.position)
+                        else request_plan(
                             observer.position,
                             planning_goal,
                             allow_water=True,
                             **plan_arguments,
                         )
                     )
-                    if not detour_plan.steps:
+                    if not _plan_can_advance(detour_plan, observer.position):
                         state.dry_detour_goal = None
                         state.dry_detour_until = 0.0
+            if plan.deferred:
+                return wait_for_plan()
+            state.planning_context = None
+            state.planning_results.clear()
+            self._reset_breach(state, now)
+            if state.escape_goal is not None and not _plan_can_advance(plan, observer.position):
+                # A terrain replan can reduce an escape to the occupied cell.
+                # Retaining that destination repeatedly "completes" a zero
+                # length segment without ever attempting a different exit.
+                state.escape_goal = None
+                self._clear_route(state, now)
+                if now >= state.escape_retry_at:
+                    self._escape_empty_route(frame, observer, state, now)
+                plan = replace(plan, steps=state.route)
             state.route = plan.steps
             # Plans commonly begin with the current/nearby surface. Skip
             # those already-reached placeholders before comparing a topology
@@ -1772,6 +2384,9 @@ class SimpleBotBrain:
                     candidate,
                     observer.position,
                     wading=effective_wading,
+                    previous_position=previous_position,
+                    final_step=state.route_index == len(state.route) - 1,
+                    require_current_cell=_requires_traversal_entry(state.route, state.route_index),
                 ):
                     break
                 state.route_index += 1
@@ -1782,6 +2397,16 @@ class SimpleBotBrain:
                 else None
             )
             if _same_traversal_step(previous_step, next_step):
+                if (previous_step is not None and next_step is not None
+                        and next_step.affordance is MovementAffordance.JUMP
+                        and previous_step.entry_edge is not None):
+                    # Unrelated terrain edits can replan while this jump is
+                    # airborne. Preserve its committed takeoff with its clock.
+                    state.route = (
+                        *state.route[:state.route_index],
+                        replace(next_step, entry_edge=previous_step.entry_edge),
+                        *state.route[state.route_index + 1:],
+                    )
                 # An unrelated bot can mutate terrain anywhere on the map.
                 # Replanning the exact same edge must not erase its progress
                 # timer, or continuous distant excavation makes a genuinely
@@ -1797,17 +2422,26 @@ class SimpleBotBrain:
                 state.waypoint_best_distance = math.inf
                 state.waypoint_progress_at = now
 
+        self._catch_up_walk_route(state, observer.position)
         while state.route_index < len(state.route):
             step = state.route[state.route_index]
             if not _route_step_reached(
                 step,
                 observer.position,
                 wading=effective_wading,
+                previous_position=previous_position,
+                final_step=state.route_index == len(state.route) - 1,
+                require_current_cell=_requires_traversal_entry(state.route, state.route_index),
             ):
                 break
             state.route_index += 1
             state.waypoint_best_distance = math.inf
             state.waypoint_progress_at = now
+
+        if state.route_index >= len(state.route):
+            if (now - state.navigation_progress_at >= _NAVIGATION_PROGRESS_SECONDS
+                    and now >= state.escape_retry_at):
+                self._escape_empty_route(frame, observer, state, now)
 
         if state.route_index >= len(state.route):
             # A bounded segment ended before the strategic destination.
@@ -1861,6 +2495,7 @@ class SimpleBotBrain:
             state.navigation_progress_at = float(now)
             state.navigation_window_position = observer.position
             state.navigation_window_at = float(now)
+            self._escape_empty_route(frame, observer, state, now)
             return self._intent(
                 frame,
                 movement=MovementIntent(),
@@ -1902,6 +2537,12 @@ class SimpleBotBrain:
             float(step.waypoint[1]) - float(observer.position[1]),
         )
         affordance = step.affordance
+        if affordance is MovementAffordance.JETPACK:
+            state.flight_step = step
+            state.flight_source = observer.position
+            state.flight_started_at = now
+            state.flight_departed = False
+            return self._flight_intent(frame, observer, state, now)
         motor_affordance = (
             MovementAffordance.SWIM
             if (
@@ -1915,6 +2556,12 @@ class SimpleBotBrain:
             )
             else affordance
         )
+        if (motor_affordance is MovementAffordance.WALK
+                and 1.5 < step.waypoint[2] - observer.position[2] <= 4.0):
+            # The live body may still be above the planner's source floor
+            # after a jump or a neighbouring lip. Validate the actual descent
+            # instead of rejecting every WALK until it somehow lands first.
+            motor_affordance = MovementAffordance.DROP
         return self._intent(
             frame,
             movement=MovementIntent(
@@ -1927,10 +2574,22 @@ class SimpleBotBrain:
                 crouch=affordance is MovementAffordance.CROUCH,
                 sprint=active_goal.sprint
                 and motor_affordance
-                in {MovementAffordance.WALK, MovementAffordance.SWIM},
+                in {MovementAffordance.WALK, MovementAffordance.SWIM}
+                and not (
+                    motor_affordance is MovementAffordance.WALK
+                    and step.waypoint[2] < observer.position[2] - 0.25
+                )
+                and (motor_affordance is MovementAffordance.SWIM
+                     or self._route_allows_sprint(state, observer)),
                 affordance=motor_affordance,
+                travel_source=(observer.position if motor_affordance in {
+                    MovementAffordance.WALK, MovementAffordance.CROUCH,
+                    MovementAffordance.JUMP, MovementAffordance.DROP} else None),
+                travel_waypoint=(step.waypoint if motor_affordance in {
+                    MovementAffordance.WALK, MovementAffordance.CROUCH,
+                    MovementAffordance.JUMP, MovementAffordance.DROP} else None),
             ),
-            look=LookIntent(step.waypoint, visible=False),
+            look=LookIntent(self._navigation_look_target(observer, direction), visible=False),
             tool_id=_weapon_tool(observer),
             priority=BotIntentPriority.TRAVERSAL,
             debug_goal=active_goal.position,
@@ -1945,6 +2604,345 @@ class SimpleBotBrain:
             ),
             debug_role=active_goal.role,
         )
+
+    @staticmethod
+    def _catch_up_walk_route(state: _BotState, position: Vector3) -> None:
+        """A body already on a later ordinary landing must not orbit an old one.
+
+        Native stepping and momentum can carry the body past a one-cell
+        terrace between worker snapshots. Match an actually occupied later
+        landing rather than relaxing the missed landing's height tolerance.
+        Never skip an unexecuted jump, drop, excavation or other special edge.
+        """
+        current = state.route_index
+        for index in range(current, min(len(state.route), current + 8)):
+            step = state.route[index]
+            if step.affordance not in {MovementAffordance.WALK, MovementAffordance.CROUCH}:
+                break
+            if index > current and _route_step_reached(
+                    step, position, wading=False, require_current_cell=True):
+                state.route_index = index
+
+    @staticmethod
+    def _route_allows_sprint(state: _BotState, observer: PlayerSnapshot) -> bool:
+        """Reserve native braking distance before turns, steps and landings."""
+        # The live motor uses this same velocity scale: 0.35 needs about four
+        # blocks to brake. A short approach needs walking even from rest, or
+        # sprint acceleration creates the AncientEgypt missed-waypoint orbit.
+        distance_needed = min(5.0, max(3.0, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
+        previous = observer.position
+        direction = None
+        distance = 0.0
+        for step in state.route[state.route_index:state.route_index + 8]:
+            if (step.affordance is not MovementAffordance.WALK
+                    or abs(step.waypoint[2] - previous[2]) > 0.25):
+                return False
+            dx, dy = step.waypoint[0] - previous[0], step.waypoint[1] - previous[1]
+            length = math.hypot(dx, dy)
+            if length > 1e-6:
+                heading = (dx / length, dy / length)
+                if direction is None:
+                    direction = heading
+                elif direction[0] * heading[0] + direction[1] * heading[1] < 0.94:
+                    return False
+                distance += length
+                if distance >= distance_needed:
+                    return True
+            previous = step.waypoint
+        return False
+
+    @staticmethod
+    def _navigation_look_target(observer: PlayerSnapshot, direction: Vector3) -> Vector3:
+        """Travel gaze stays ahead at eye height; footstep coordinates steer the body.
+
+        A near waypoint can pass behind or below the eye between worker frames.
+        It remains the movement target but must not make an idle gun snap down
+        at the bot's own feet. Combat, excavation and flight own separate aim.
+        """
+        return (observer.eye[0] + direction[0] * 6.0,
+                observer.eye[1] + direction[1] * 6.0, observer.eye[2])
+
+    @staticmethod
+    def _navigation_revisits(state: _BotState, position: Vector3,
+                             goal: _Goal, now: float) -> bool:
+        """Reject repeated local coverage, not valid detours away from a goal."""
+        if now - state.navigation_coverage_last_at > 1.0:
+            # Combat/idle interruptions do not age into a navigation failure.
+            state.navigation_coverage_at = now
+        state.navigation_coverage_last_at = now
+        cell = tuple(int(math.floor(value / 2.0)) for value in position)
+        new_cell = cell not in state.navigation_visited
+        state.navigation_visited.pop(cell, None)
+        state.navigation_visited[cell] = now
+        if len(state.navigation_visited) > _NAVIGATION_VISITED_CELLS:
+            del state.navigation_visited[next(iter(state.navigation_visited))]
+        distance = math.dist(position, goal.position)
+        target_changed = (state.navigation_coverage_goal != goal.key
+            or state.navigation_coverage_target is None
+            or math.dist(state.navigation_coverage_target, goal.position) >= 3.0)
+        if target_changed:
+            state.navigation_coverage_goal = goal.key
+            state.navigation_coverage_target = goal.position
+            state.navigation_coverage_best = distance
+        improved = distance + _NAVIGATION_WINDOW_DISTANCE < state.navigation_coverage_best
+        if improved:
+            state.navigation_coverage_best = distance
+        if new_cell or improved:
+            state.navigation_coverage_at = now
+            if state.escape_goal is None and improved:
+                state.escape_attempts = 0
+        return now - state.navigation_coverage_at >= _NAVIGATION_REVISIT_SECONDS
+
+    def _flight_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        now: float,
+    ) -> BotIntent | None:
+        """Own takeoff, a short crossing, then a thrust-free native landing."""
+        step, source = state.flight_step, state.flight_source
+        if step is None or source is None:
+            return None
+        elapsed = now - state.flight_started_at
+        distance = math.hypot(step.waypoint[0] - observer.position[0],
+                              step.waypoint[1] - observer.position[1])
+        state.flight_departed |= not observer.grounded
+        landed = (state.flight_departed and observer.grounded and elapsed > 0.35)
+        if landed or observer.wade or elapsed >= 3.5:
+            if distance > 1.0 or observer.wade:
+                edge = (tuple(int(math.floor(v)) for v in (*source[:2], source[2] + 2.25)),
+                        tuple(int(math.floor(v)) for v in (*step.waypoint[:2], step.waypoint[2] + 2.25)))
+                state.blocked_edges[edge] = now + _BLOCKED_EDGE_SECONDS
+                state.blocked_edge_since[edge] = now
+            state.flight_step = None
+            state.flight_source = None
+            state.next_flight_at = now + 4.0
+            self._clear_route(state, now)
+            return None
+        altitude = source[2] - observer.position[2]
+        direction = _normalized_xy(step.waypoint[0] - observer.position[0],
+                                   step.waypoint[1] - observer.position[1])
+        # Rise above the bank before entering the gap, then brake over its
+        # known landing. Never hold thrust until fuel exhaustion.
+        if (altitude < 0.8 and elapsed < 0.6) or distance < 0.4:
+            direction = (0.0, 0.0, 0.0)
+        ceiling = 5.0 if observer.jetpack_id == int(C.JETPACK_ENGINEER) else 2.5
+        thrust = (elapsed < 0.5 or (altitude < ceiling and distance > 0.6 and elapsed < 2.3))
+        return self._intent(frame,
+            movement=MovementIntent(direction=direction, affordance=MovementAffordance.JETPACK,
+                                    jetpack_thrust=thrust),
+            look=LookIntent(step.waypoint, visible=False), tool_id=_weapon_tool(observer),
+            priority=BotIntentPriority.TRAVERSAL, debug_goal=step.waypoint,
+            debug_role="jetpack_takeoff" if thrust else "jetpack_landing")
+
+    def _planning_wait_intent(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                              state: _BotState, goal: _Goal, now: float) -> BotIntent:
+        """Scheduling delay must not age into a physical/geometry failure."""
+        if state.planning_wait_at is None:
+            state.planning_wait_at = now
+        return self._intent(frame, movement=MovementIntent(), look=None,
+            tool_id=_weapon_tool(observer), debug_goal=goal.position,
+            debug_role=goal.role + ":planning_wait")
+
+    def _escape_empty_route(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        now: float,
+    ) -> None:
+        """Leave a local minimum instead of idling until failed edges expire."""
+
+        state.escape_retry_at = now + 1.0
+        goal = state.goal
+        if goal is None:
+            state.escape_search = None
+            return
+        escape_abilities = _movement_abilities(observer) | {MovementAffordance.DROP}
+        dig_profile = _dig_profile(observer)
+        context = (observer.position, goal.key, goal.position,
+                   frame.topology_version, frozenset(escape_abilities),
+                   dig_profile, observer.wade, frozenset(state.blocked_edges))
+        previous = state.escape_search[0] if state.escape_search is not None else None
+        resume = (previous is not None and previous[1] == goal.key
+                  and math.dist(previous[0], observer.position) < 1.0
+                  and math.dist(previous[2], goal.position) < 16.0
+                  and previous[4:7] == context[4:7])
+        if not resume:
+            bearing = math.atan2(goal.position[1] - observer.position[1],
+                                 goal.position[0] - observer.position[0])
+            sign = 1.0 if observer.player_id % 2 else -1.0
+            restrictions = [frozenset(state.blocked_edges)]
+            recent = frozenset(
+                edge for edge, expiry in state.blocked_edges.items()
+                if now - state.blocked_edge_since.get(edge, expiry - _BLOCKED_EDGE_SECONDS) < 4.0
+            )
+            if recent != restrictions[0]:
+                restrictions.append(recent)
+            offsets = (math.pi / 2, -math.pi / 2, math.pi,
+                       math.pi / 4, -math.pi / 4, 3 * math.pi / 4,
+                       -3 * math.pi / 4, 0.0)
+            attempt = state.escape_attempts
+            rotation = (attempt * 3) % len(offsets)
+            offsets = offsets[rotation:] + offsets[:rotation]
+            radius = 8.0 + min(attempt, 4) * 2.0
+            candidates = tuple(
+                (observer.position[0] + radius * math.cos(bearing + offset * sign),
+                 observer.position[1] + radius * math.sin(bearing + offset * sign),
+                 observer.position[2]) for offset in offsets)
+            water_options = (True,) if observer.wade else (False, True)
+            # At most 51 exact candidates, resumed rather than restarting the
+            # first dry direction every time the per-observer grant is spent.
+            queries = [(candidate, water, None, blocked)
+                       for water in water_options for blocked in restrictions
+                       for candidate in candidates]
+            queries.append((goal.position, True, None, recent))
+            if dig_profile is not None:
+                queries.extend((candidate, water, dig_profile, recent)
+                               for water in water_options
+                               for candidate in (goal.position, *candidates))
+            state.escape_search = (context, tuple(queries), 0)
+        context, queries, index = state.escape_search
+        chosen = None
+        chosen_restrictions = frozenset()
+        while index < len(queries):
+            candidate, allow_water, profile, blocked = queries[index]
+            # This continuation contains only candidate coordinates and
+            # failures, never cached successful geometry. Resume on live
+            # terrain, honoring newly rejected edges; expired ones can retry.
+            current_blocked = frozenset(state.blocked_edges)
+            recent_blocked = frozenset(
+                edge for edge, expiry in state.blocked_edges.items()
+                if now - state.blocked_edge_since.get(edge, expiry - _BLOCKED_EDGE_SECONDS) < 4.0
+            )
+            blocked = ((blocked & current_blocked) | (current_blocked - context[7])
+                       | recent_blocked)
+            arguments = dict(abilities=escape_abilities, dig_profile=profile,
+                             allow_water=allow_water, blocked_edges=blocked)
+            if profile is not None:
+                # Recovery must inspect the excavation instead of accepting
+                # an ordinary dead-end walking prefix beside the same wall.
+                arguments["_prefer_existing_path"] = False
+            plan = self.world.plan(observer.position, candidate, **arguments)
+            if plan.deferred:
+                state.escape_search = (context, queries, index)
+                state.escape_retry_at = now
+                return
+            index += 1
+            useful = (any(step.affordance is MovementAffordance.BREACH for step in plan.steps)
+                      and _plan_can_advance(plan, observer.position)) if profile is not None else (
+                          plan.steps and math.dist(observer.position, plan.steps[-1].waypoint) >= 6.0)
+            if useful:
+                chosen, chosen_restrictions = plan, blocked
+                break
+        state.escape_search = None
+        state.escape_attempts += 1
+        if goal.role == "tdm_squad_support":
+            state.support_escape_attempted = True
+        if chosen is None:
+            return
+        revalidated = _route_edges(observer.position, chosen.steps)
+        for edge in tuple(state.blocked_edges):
+            if edge not in chosen_restrictions and edge in revalidated:
+                del state.blocked_edges[edge]
+                state.blocked_edge_since.pop(edge, None)
+        state.escape_goal = chosen.steps[-1].waypoint
+        state.escape_allow_water = observer.wade or any(
+            step.affordance is MovementAffordance.SWIM for step in chosen.steps
+        )
+        state.escape_until = now + 8.0
+        state.route = chosen.steps
+        state.route_index = 0
+        state.route_topology_version = int(frame.topology_version)
+        state.waypoint_best_distance = math.inf
+        state.waypoint_progress_at = now
+        state.navigation_progress_position = observer.position
+        state.navigation_progress_at = now
+        state.navigation_window_position = observer.position
+        state.navigation_window_at = now
+
+    def _corridor_segment_goal(
+        self,
+        state: _BotState,
+        observer: PlayerSnapshot,
+        goal: _Goal,
+        now: float,
+    ) -> Vector3 | None:
+        """Remember a full detour while the local planner executes its corners."""
+
+        if observer.wade or state.water_committed:
+            return None
+        if (not state.corridor and state.corridor_search is None
+                and now >= state.corridor_retry_at
+                and now - state.goal_progress_at >= _GOAL_STALL_SECONDS):
+            reader = getattr(self.world, "begin_corridor", None)
+            if callable(reader):
+                state.corridor_search = reader(
+                    observer.position, goal.position,
+                    blocked_edges=frozenset(state.blocked_edges),
+                )
+                state.corridor_failed_goal = (goal.position
+                                             if state.corridor_search is None else None)
+                if state.corridor_search is None and goal.role == "tdm_squad_support":
+                    state.support_failed_goal = goal.position
+                    state.support_failure_at = now
+            state.corridor_retry_at = now + 15.0
+        search = state.corridor_search
+        if search is not None:
+            if (not search.done and state.corridor_yield_local
+                    and (state.route_index >= len(state.route)
+                         or state.route_topology_version != getattr(
+                             self.world, "topology_version", state.route_topology_version))):
+                # Coarse guidance shares this observer's one admitted job
+                # with local routing. After one coarse slice, an actor with
+                # no executable route owns the next grant until its detailed
+                # query completes. Otherwise a long search consumes every
+                # grant first and leaves it motionless for seconds.
+                return None
+            search.advance()
+            if getattr(search, "deferred", False):
+                return None
+            state.corridor_yield_local = True
+            if search.done:
+                if search.path:
+                    # The bot may have moved during incremental search. Join
+                    # a nearby corner only after proving a short dry connection;
+                    # proximity alone can pick the far side of a U-shaped wall.
+                    entry = None
+                    candidates = sorted(range(len(search.path)), key=lambda index:
+                                        math.dist(observer.position, search.path[index]))
+                    for offset, index in enumerate(candidates[:8]):
+                        if offset < state.corridor_join_index:
+                            continue
+                        point = search.path[index]
+                        distance = math.dist(observer.position, point)
+                        if distance > 12.0:
+                            break
+                        if distance <= 0.75:
+                            entry = index
+                            break
+                        join = self.world.plan(observer.position, point,
+                            abilities=_movement_abilities(observer) - {MovementAffordance.BREACH},
+                            dig_profile=None, allow_water=False,
+                            blocked_edges=frozenset(state.blocked_edges))
+                        if join.deferred:
+                            state.corridor_join_index = offset
+                            return None
+                        state.corridor_join_index = offset + 1
+                        if join.reached_segment_goal and (not join.steps or
+                                math.dist(join.steps[-1].waypoint, point) <= 1.25):
+                            entry = index
+                            break
+                    if entry is not None:
+                        state.corridor = search.path
+                        state.corridor_index = entry
+                        state.dry_detour_goal = None
+                        self._clear_route(state, now)
+                state.corridor_search = None
+                state.corridor_join_index = 0
+                state.corridor_yield_local = False
+        while state.corridor_index < len(state.corridor):
+            point = state.corridor[state.corridor_index]
+            if math.dist(observer.position, point) > 1.25:
+                return point
+            state.corridor_index += 1
+        state.corridor = ()
+        return None
 
     def _crowd_detour_intent(
         self,
@@ -2209,7 +3207,8 @@ class SimpleBotBrain:
         """Execute one planner-selected wall cell and await its terrain delta."""
 
         breach = step.breach
-        if breach is None or not self.world.solid(*breach.target_cell):
+        if (not observer.can_shoot or breach is None
+                or not self.world.solid(*breach.target_cell)):
             self._clear_route(state, now)
             return self._intent(
                 frame,
@@ -2307,9 +3306,15 @@ class SimpleBotBrain:
             bool(breach.secondary),
         )
         if state.breach_key != breach_key:
+            same_tool = (state.breach_key is not None
+                         and state.breach_key[1:] == breach_key[1:])
             state.breach_key = breach_key
             state.breach_started_at = float(now)
-            state.next_breach_at = float(now)
+            # Clearing one face does not reset the owned tool's cadence.
+            # Otherwise the next cell immediately produces a cooldown
+            # rejection, incorrectly excluding a partially excavated bank.
+            state.next_breach_at = (max(state.next_breach_at, float(now))
+                                    if same_tool else float(now))
 
         timeout = max(
             3.0,
@@ -2350,7 +3355,7 @@ class SimpleBotBrain:
             frame,
             movement=MovementIntent(
                 jump=False,
-                crouch=True,
+                crouch=target[2] >= observer.position[2],
                 affordance=MovementAffordance.BREACH,
             ),
             look=LookIntent(target, visible=False),
@@ -2438,7 +3443,7 @@ class SimpleBotBrain:
         block_tool = int(C.BLOCK_TOOL)
         if (
             block_tool not in observer.loadout
-            or int(observer.blocks) < 2
+            or int(observer.blocks) < 1
             or not observer.grounded
         ):
             return None
@@ -2452,6 +3457,7 @@ class SimpleBotBrain:
                 observer.position,
                 direction,
                 max_cells=min(6, int(observer.blocks)),
+                require_landing_within=int(observer.blocks) + 1,
             )
             if callable(line_reader)
             else None
@@ -2473,6 +3479,14 @@ class SimpleBotBrain:
         if line is None:
             return None
         start, end = line
+        if (observer.last_action_kind == BotActionKind.BUILD_LINE.value
+                and not observer.last_action_accepted
+                and observer.last_action_position is not None
+                and tuple(int(round(value)) for value in observer.last_action_position) == start
+                and now - float(observer.last_action_at) < 10.0):
+            # A reservation/protected cell rejection is not terrain progress.
+            # Yield to route/swim fallback instead of issuing it every 0.8 s.
+            return None
         cost = (
             max(
                 abs(int(end[index]) - int(start[index]))
@@ -2534,7 +3548,61 @@ class SimpleBotBrain:
         state = self._states[
             (int(observer.player_id), int(observer.generation))
         ]
+        if (state.water_search_origin is not None
+                and math.dist(observer.position[:2], state.water_search_origin[:2]) >= 6.0):
+            state.water_search_until = 0.0
+            state.water_search_origin = None
+        failed_search_heading = (
+            state.water_search_heading
+            if force_block_edge and now < state.water_search_until else None
+        )
+        if now < state.water_search_until and not force_block_edge:
+            search = self._water_search_intent(frame, observer, state)
+            if search is not None:
+                return search
+        if force_block_edge:
+            # Commit to leaving this pocket before considering its attractive
+            # but failed bank again. Per-edge exclusions alone can alternate
+            # neighbouring exits without ever escaping the same small basin.
+            # Finish a physical retreat before the nearest-bank flow can
+            # reclaim movement. A three-second timer often expired halfway
+            # out, causing the swimmer to turn back into the same pocket.
+            state.water_search_until = now + 8.0
+            state.water_search_origin = observer.position
+            state.water_search_heading = (
+                _normalized_xy(observer.position[0] - step.waypoint[0],
+                               observer.position[1] - step.waypoint[1])
+                if step is not None else None
+            )
+            if (step is not None and step.affordance in {
+                    MovementAffordance.WALK, MovementAffordance.SWIM}):
+                # In open water, reversing the current swim bearing creates
+                # a six-block out-and-back loop when shore flow resumes.
+                # Search across that failed bearing to reach a different
+                # approach. A concrete bank still calls for backing away.
+                dx, dy, _ = state.water_search_heading
+                side = 1.0 if (observer.player_id + observer.generation) % 2 else -1.0
+                state.water_search_heading = (-dy * side, dx * side, 0.0)
+            if failed_search_heading is not None:
+                # The whole-swim watchdog also owns an active retreat. A
+                # failed search must change direction, rather than consume
+                # another four-second window behind its eight-second lease.
+                state.water_search_heading = (
+                    -failed_search_heading[1], failed_search_heading[0], 0.0,
+                )
+            reader = getattr(self.world, "water_shore_edges", None)
+            if callable(reader):
+                # A recovery may already have swum several cells away from
+                # the bank. Remember the attempted exit, not merely the open
+                # water occupied when the progress timer expires.
+                failed_bank = (state.water_last_bank[1]
+                               if state.water_last_bank is not None
+                               and now - state.water_last_bank[0] < 30.0
+                               else observer.position)
+                state.water_failed_shores.append((now + 30.0, reader(failed_bank)))
+                state.water_failed_shores = state.water_failed_shores[-4:]
         if step is None:
+            state.water_landing_step = None
             state.water_step_key = None
             state.water_best_distance = math.inf
             state.water_progress_at = now
@@ -2550,9 +3618,19 @@ class SimpleBotBrain:
             bank = self.world.assisted_water_step(
                 observer.position,
                 preferred_goal=preferred_goal,
-                blocked_edges=frozenset(state.blocked_edges),
+                # Resolve the failing bank before applying the new region
+                # exclusion so its direction can seed the retreat.
+                blocked_edges=(frozenset(state.blocked_edges) if force_block_edge
+                               else self._water_exclusions(state, now)),
             )
+            if bank is not None:
+                state.water_last_bank = (now, bank.waypoint)
             if force_block_edge and bank is not None:
+                if failed_search_heading is None:
+                    state.water_search_heading = _normalized_xy(
+                        observer.position[0] - bank.waypoint[0],
+                        observer.position[1] - bank.waypoint[1],
+                    )
                 # The map-wide four-block swim timer owns this recovery even
                 # when the normal water flow has no direct step and falls back
                 # to an assisted build/breach bank. Ignoring the flag on this
@@ -2614,7 +3692,7 @@ class SimpleBotBrain:
                     observer.position,
                     profile,
                     preferred_goal=preferred_goal,
-                    blocked_edges=frozenset(state.blocked_edges),
+                    blocked_edges=self._water_exclusions(state, now),
                 )
                 if bank is not None and profile is not None
                 else None
@@ -2667,6 +3745,7 @@ class SimpleBotBrain:
                         debug_goal=bank.waypoint,
                         debug_role=f"{goal.role}:water_breach_rejected",
                     )
+                state.water_breach_target = plan.target_cell if plan is not None else None
                 return self._breach_intent(
                     frame,
                     observer,
@@ -2697,6 +3776,11 @@ class SimpleBotBrain:
                     debug_goal=bank.waypoint,
                     debug_role="water_bank:unusable_edge",
                 )
+            search = self._water_search_intent(frame, observer, state)
+            if search is not None:
+                state.water_search_until = now + 8.0
+                state.water_search_origin = observer.position
+                return search
             return self._intent(
                 frame,
                 movement=MovementIntent(
@@ -2768,6 +3852,9 @@ class SimpleBotBrain:
             float(step.waypoint[0]) - float(observer.position[0]),
             float(step.waypoint[1]) - float(observer.position[1]),
         )
+        state.water_landing_step = step if step.affordance is MovementAffordance.JUMP else None
+        if state.water_landing_step is not None:
+            state.water_last_bank = (now, step.waypoint)
         motor_affordance = (
             MovementAffordance.JUMP
             if step.affordance is MovementAffordance.JUMP
@@ -2787,6 +3874,43 @@ class SimpleBotBrain:
             debug_goal=step.waypoint,
             debug_path=(observer.position, step.waypoint),
             debug_role="water_exit",
+        )
+
+    @staticmethod
+    def _water_exclusions(state: _BotState, now: float) -> frozenset[EdgeKey]:
+        """Keep failed bank regions separate from the small local-edge cache."""
+        state.water_failed_shores[:] = [
+            item for item in state.water_failed_shores if item[0] > now
+        ]
+        return frozenset(state.blocked_edges).union(
+            *(edges for _expires, edges in state.water_failed_shores)
+        )
+
+    def _water_search_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+    ) -> BotIntent | None:
+        """Follow live open water while retaining a stable escape heading."""
+
+        reader = getattr(self.world, "water_roam_step", None)
+        step = (
+            reader(observer.position,
+                   heading=state.water_search_heading or observer.orientation,
+                   blocked_edges=frozenset(state.blocked_edges))
+            if callable(reader) else None
+        )
+        if step is None:
+            return None
+        state.water_search_heading = _normalized_xy(
+            step.waypoint[0] - observer.position[0],
+            step.waypoint[1] - observer.position[1],
+        )
+        return self._intent(
+            frame,
+            movement=MovementIntent(direction=state.water_search_heading,
+                                    sprint=True, affordance=MovementAffordance.SWIM),
+            look=LookIntent(step.waypoint, visible=False),
+            tool_id=_weapon_tool(observer), priority=BotIntentPriority.SURVIVAL,
+            debug_goal=step.waypoint, debug_role="water_search_shore",
         )
 
     def _block_water_step(
@@ -2812,17 +3936,21 @@ class SimpleBotBrain:
             vertical_span=8,
             allow_water=True,
         )
-        if current is not None and target is not None:
+        edge = step.entry_edge
+        if edge is None and current is not None and target is not None:
+            edge = (
+                (current.x, current.y, current.support_z),
+                (target.x, target.y, target.support_z),
+            )
+        if edge is not None:
             self._remember_blocked_edge(
                 state,
-                (
-                    (current.x, current.y, current.support_z),
-                    (target.x, target.y, target.support_z),
-                ),
+                edge,
                 now,
                 lifetime=_WATER_BLOCKED_EDGE_SECONDS,
             )
         state.water_step_key = None
+        state.water_landing_step = None
         state.water_best_distance = math.inf
         state.water_progress_at = now
 
@@ -3081,9 +4209,24 @@ class SimpleBotBrain:
         if same_key and not moved:
             state.goal = goal
             return
+        if (same_key and goal is not None and old is not None
+                and math.dist(old.position, goal.position) < 16.0
+                and (state.corridor or state.corridor_search is not None
+                     or state.route_index < len(state.route)
+                     or state.escape_search is not None)):
+            # Moving squad/escort targets must not reset a blocked edge's
+            # deadline each time they cross a quantized objective cell.
+            # Finish or reject the committed local edge before steering on.
+            state.goal = goal
+            return
         if old is None and goal is None:
             return
         state.goal = goal
+        state.navigation_previous_position = None
+        state.planning_context = None
+        state.planning_results.clear()
+        state.planning_wait_at = None
+        state.escape_search = None
         state.route = ()
         state.route_index = 0
         state.route_topology_version = -1
@@ -3108,6 +4251,13 @@ class SimpleBotBrain:
         state.dry_detour_until = 0.0
         state.dry_route_failures = 0
         SimpleBotBrain._reset_breach(state, now)
+        state.corridor_search = None
+        state.corridor = ()
+        state.corridor_index = 0
+        state.corridor_join_index = 0
+        state.corridor_yield_local = False
+        state.corridor_failed_goal = None
+        state.corridor_retry_at = float(now)
 
     def _invalidate_current_edge(
         self,
@@ -3122,6 +4272,19 @@ class SimpleBotBrain:
         if state.route_index >= len(state.route):
             return
         route_step = state.route[state.route_index]
+        if (route_step.affordance is MovementAffordance.JUMP
+                and route_step.entry_edge is not None):
+            # A failed jump can already be over the gap or inside the landing
+            # voxel. Reconstructing its source from that position records a
+            # different edge (or none), so A* keeps selecting the failed jump.
+            self._remember_blocked_edge(
+                state, route_step.entry_edge, now,
+                lifetime=(float(lifetime) if lifetime is not None else
+                          _WATER_BLOCKED_EDGE_SECONDS
+                          if route_step.entry_edge[0][2] >= int(C.Z_ABOVE_WATERPLANE) + 1
+                          else _JUMP_BLOCKED_EDGE_SECONDS),
+            )
+            return
         if route_step.breach is not None:
             breach = route_step.breach
             self._remember_blocked_edge(
@@ -3228,13 +4391,23 @@ class SimpleBotBrain:
     ) -> None:
         """Bound and time-limit one concrete failed navigation edge."""
 
-        if len(state.blocked_edges) >= _MAX_BLOCKED_EDGES:
+        if edge not in state.blocked_edges and len(state.blocked_edges) >= _MAX_BLOCKED_EDGES:
             oldest = min(
                 state.blocked_edges,
                 key=state.blocked_edges.__getitem__,
             )
             state.blocked_edges.pop(oldest, None)
+            state.blocked_edge_since.pop(oldest, None)
         state.blocked_edges[edge] = float(now) + max(0.1, float(lifetime))
+        state.blocked_edge_since[edge] = float(now)
+        if state.corridor_search is not None:
+            state.corridor_search.exclude_edge(*edge)
+        # A failed approach can start beside the coarse corridor, so testing
+        # membership in its centreline misses bad joins and pins that corner.
+        # Completed guidance must be rebuilt; only pending search work survives.
+        state.corridor = ()
+        state.corridor_index = 0
+        state.corridor_retry_at = float(now) + 1.0
 
     @staticmethod
     def _reset_breach(state: _BotState, now: float) -> None:
@@ -3260,16 +4433,21 @@ class SimpleBotBrain:
         ]
         for edge in expired:
             state.blocked_edges.pop(edge, None)
+            state.blocked_edge_since.pop(edge, None)
 
     def _prune_state(self, frame: PerceptionFrame) -> None:
-        active = {
-            (int(player.player_id), int(player.generation))
-            for player in frame.players
-            if player.is_bot
-        }
-        retired = [key for key in self._states if key not in active]
+        # Each frame contains a bounded subset, not the complete bot roster.
+        # Missing from someone else's frame must not erase a live task/route.
+        observed = {(p.player_id, p.generation): p for p in frame.players}
+        retired = [key for key, state in self._states.items()
+                   if (key in observed and (not observed[key].alive
+                       or state.life_id != observed[key].life_id))
+                   or frame.created_at - state.next_decision_at > 15]
         for key in retired:
             self._states.pop(key, None)
+            self.mode_policy.forget(*key)
+        while len(self._states) > 128:
+            self._states.pop(min(self._states, key=lambda key: self._states[key].next_decision_at))
 
     def _intent(
         self,
@@ -3294,6 +4472,7 @@ class SimpleBotBrain:
                 action=action,
             )
         emitted_at = max(time.monotonic(), float(frame.created_at))
+        navigation = self._states.get((int(frame.observer_id), int(frame.observer_generation)))
         return BotIntent(
             bot_id=int(frame.observer_id),
             bot_generation=int(frame.observer_generation),
@@ -3313,6 +4492,38 @@ class SimpleBotBrain:
             debug_goal=debug_goal,
             debug_path=debug_path,
             debug_role=str(debug_role),
+            life_id=next((p.life_id for p in frame.players if p.player_id == frame.observer_id
+                          and p.generation == frame.observer_generation), -1),
+            debug_navigation=(self._navigation_diagnostics(navigation, frame.created_at)
+                              if navigation is not None else ()),
+        )
+
+    @staticmethod
+    def _navigation_diagnostics(state: _BotState, now: float) -> tuple:
+        """Bounded scalar snapshot; never expose mutable search/path state."""
+        search = state.corridor_search
+        return (
+            ("corridor_expansions", int(search.expansions) if search is not None else -1),
+            ("corridor_done", bool(search.done) if search is not None else None),
+            ("corridor_remaining", max(0, len(state.corridor) - state.corridor_index)),
+            ("corridor_yield_local", state.corridor_yield_local),
+            ("corridor_endpoint_failure", state.corridor_failed_goal is not None),
+            ("escape_goal", state.escape_goal),
+            ("escape_query_index", state.escape_search[2] if state.escape_search else -1),
+            ("escape_attempts", state.escape_attempts),
+            ("goal_progress_age", round(max(0.0, now - state.goal_progress_at), 3)),
+            ("coverage_age", round(max(0.0, now - state.navigation_coverage_at), 3)),
+            ("route_index", state.route_index),
+            ("route_remaining", max(0, len(state.route) - state.route_index)),
+            ("planning_results", len(state.planning_results)),
+            ("planning_wait", state.planning_wait_at is not None),
+            ("blocked_edges", len(state.blocked_edges)),
+            ("support_no_progress_time", round(state.support_no_progress_time, 3)),
+            ("support_progress_anchor", state.support_progress_anchor),
+            ("support_failed_goal", state.support_failed_goal),
+            ("support_failure_age", round(max(0.0, now - state.support_failure_at), 3)
+             if state.support_failed_goal is not None else None),
+            ("support_escape_attempted", state.support_escape_attempted),
         )
 
     @staticmethod
@@ -3461,6 +4672,8 @@ def _weapon_tool(observer: PlayerSnapshot) -> int:
 
 
 def _melee_tool(observer: PlayerSnapshot) -> int | None:
+    if not observer.can_shoot:
+        return None
     return next(
         (
             int(tool)
@@ -3474,6 +4687,8 @@ def _melee_tool(observer: PlayerSnapshot) -> int | None:
 def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     """Return the fastest owned tool under the authoritative dig model."""
 
+    if not observer.can_shoot:
+        return None
     return best_navigation_dig_profile(
         int(tool) for tool in getattr(observer, "loadout", ())
     )
@@ -3487,10 +4702,18 @@ def _movement_abilities(
     # JUMP here reconnects that proven motor to the simple A* graph. Native
     # crouch does not reliably traverse authored two-cell-high openings, so
     # production bots clear the exact overhead voxel through BREACH instead.
-    # DROP and jetpack remain disabled until they have equally explicit
-    # multi-tick execution contracts. BREACH is exposed only with an owned,
+    # Ordinary routing stays conservative around descents. Escape recovery
+    # explicitly enables the native motor's validated two-to-four-block DROP.
+    # BREACH is exposed only with an owned,
     # positive-damage melee profile and is executed as a stationary action.
     abilities = {MovementAffordance.JUMP}
+    pack = int(getattr(observer, "jetpack_id", 0))
+    properties = C.JETPACK_PROPERTIES.get(pack)
+    if properties is not None and pack in {int(C.JETPACK2), int(C.JETPACK_ENGINEER)}:
+        reserve = (properties[C.JETPACK_FUEL_ACTIVATION_COST]
+                   + properties[C.JETPACK_FUEL_FLYING_CONSUMPTION] * 2.3 + 5.0)
+        if observer.grounded and not observer.wade and observer.jetpack_fuel >= reserve:
+            abilities.add(MovementAffordance.JETPACK)
     if _dig_profile(observer) is not None:
         abilities.add(MovementAffordance.BREACH)
     return frozenset(abilities)
@@ -3524,18 +4747,86 @@ def _same_traversal_step(
     return previous_target == current_target
 
 
+def _route_edges(start: Vector3, steps: tuple[RouteStep, ...]) -> set[EdgeKey]:
+    """Recover concrete edges hidden inside compacted straight waypoints.
+
+    A validated escape can reconsider an old failure. Its first cell may be
+    absent from the compacted waypoints, so checking only waypoint endpoints
+    leaves that failure active and makes the very next replan empty again.
+    """
+    result: set[EdgeKey] = set()
+    previous = start
+    for step in steps:
+        if step.breach is not None:
+            result.add((step.breach.source, step.breach.destination))
+        elif step.entry_edge is not None:
+            result.add(step.entry_edge)
+        else:
+            count = max(1, int(math.ceil(math.dist(previous, step.waypoint) * 4.0)))
+            node = (math.floor(previous[0]), math.floor(previous[1]), round(previous[2] + 2.25))
+            for index in range(1, count + 1):
+                point = tuple(a + (b - a) * index / count for a, b in zip(previous, step.waypoint))
+                next_node = (math.floor(point[0]), math.floor(point[1]), round(point[2] + 2.25))
+                if next_node != node:
+                    result.add((node, next_node))
+                    node = next_node
+        previous = step.waypoint
+    return result
+
+
+def _plan_can_advance(plan: RoutePlan, position: Vector3) -> bool:
+    """A path containing only the occupied cell is not an executable escape."""
+    return any(step.affordance is MovementAffordance.BREACH
+               or not _route_step_reached(step, position, wading=False)
+               for step in plan.steps)
+
+
+def _requires_traversal_entry(route: tuple[RouteStep, ...], index: int) -> bool:
+    """Occupy a special movement's approach column before executing its edge."""
+    return (index + 1 < len(route)
+            and route[index + 1].affordance is not MovementAffordance.WALK)
+
+
 def _route_step_reached(
     step: RouteStep,
     position: Vector3,
     *,
     wading: bool,
+    previous_position: Vector3 | None = None,
+    final_step: bool = True,
+    require_current_cell: bool = False,
 ) -> bool:
     """Return whether the native body actually occupies a route landing."""
 
+    vertical_tolerance = 0.75
+    if require_current_cell and (
+        int(math.floor(step.waypoint[0])) != int(math.floor(position[0]))
+        or int(math.floor(step.waypoint[1])) != int(math.floor(position[1]))
+    ):
+        # Passing a corner between decisions completes ordinary walking,
+        # but it cannot authorize a jump/drop from a different takeoff cell.
+        return False
     if step.affordance is MovementAffordance.BREACH:
         # A body pressed against a face is horizontally close to the breach
         # waypoint while the blocking column is still solid.
         return False
+    if (step.affordance is MovementAffordance.WALK
+            and previous_position is not None
+            and math.dist(previous_position, position) <= 4.0
+            and abs(step.waypoint[2] - position[2]) <= vertical_tolerance
+            and abs(step.waypoint[2] - previous_position[2]) <= vertical_tolerance):
+        dx = position[0] - previous_position[0]
+        dy = position[1] - previous_position[1]
+        length_squared = dx * dx + dy * dy
+        if length_squared > 1e-6:
+            projection = ((step.waypoint[0] - previous_position[0]) * dx
+                          + (step.waypoint[1] - previous_position[1]) * dy) / length_squared
+            if 0.0 < projection < 1.0 and math.hypot(
+                previous_position[0] + dx * projection - step.waypoint[0],
+                previous_position[1] + dy * projection - step.waypoint[1],
+            ) <= 0.45:
+                # A sprint can pass a one-cell corner between decisions.
+                return True
     if math.hypot(
         float(step.waypoint[0]) - float(position[0]),
         float(step.waypoint[1]) - float(position[1]),
@@ -3545,9 +4836,19 @@ def _route_step_reached(
         # Water bob can cross the shore waypoint's z without mounting the
         # bank. The authoritative wade flag is the actual exit contract.
         return False
+    if (step.affordance is MovementAffordance.SWIM and not wading
+            or final_step and step.affordance is MovementAffordance.WALK) and (
+        int(math.floor(step.waypoint[0])) != int(math.floor(position[0]))
+        or int(math.floor(step.waypoint[1])) != int(math.floor(position[1]))
+    ):
+        # A neighbour's centre can be inside the 0.9 radius before the body
+        # enters its voxel. A dry approach to water needs its intermediate
+        # cells too: skipping one can cut the following corner through the
+        # bank before the body has entered the water column.
+        return False
     # XY-only completion skipped GreatWall's two-block landing while the body
     # was still below it, then issued WALK for the upper corridor forever.
-    return abs(float(step.waypoint[2]) - float(position[2])) <= 0.75
+    return abs(float(step.waypoint[2]) - float(position[2])) <= vertical_tolerance
 
 
 def _deterministic_pair_axis(left_id: int, right_id: int) -> tuple[float, float]:
@@ -3587,6 +4888,73 @@ def _fallback_profile(player_id: int) -> BotProfile:
     )
 
 
+def behavior_metrics_snapshot(brain: SimpleBotBrain) -> dict[str, object]:
+    """Copy bounded coordinator diagnostics on the worker's owner thread."""
+    cooperative = getattr(brain, "cooperative", None)
+    if cooperative is None:
+        return {}
+    teams = cooperative.teams
+    kinds: dict[str, int] = {}
+    for project in teams.projects.values():
+        kinds[project.kind] = kinds.get(project.kind, 0) + 1
+    return {"counters": dict(teams.metrics),
+            "events": tuple(dict(event) for event in teams.events),
+            "active_projects": len(teams.projects),
+            "project_kinds": kinds,
+            "active_lives": len(cooperative.lives)}
+
+
+def refresh_planning_observers(world: SimpleVoxelWorld, frames: Iterable[PerceptionFrame]) -> None:
+    """Keep live FIFO waiters across slow coalesced batches, excluding dead lives."""
+    budget = world.planning_budget
+    if budget is None:
+        return
+    frames = tuple(frames)
+    if not frames:
+        return
+    observers = {
+        (int(frame.observer_id), int(frame.observer_generation))
+        for frame in frames
+        if any(player.player_id == frame.observer_id
+               and player.generation == frame.observer_generation
+               and player.alive and player.spawned for player in frame.players)
+    }
+    budget.refresh_waiters(observers, max(float(frame.created_at) for frame in frames))
+
+
+def decide_current_frame(
+    world: SimpleVoxelWorld,
+    brain: SimpleBotBrain,
+    frame: PerceptionFrame,
+) -> BotIntent | None:
+    """Use current terrain and isolate one bad observer from the fleet."""
+
+    if (frame.map_epoch != world.map_epoch
+            or frame.topology_version > world.topology_version):
+        return None
+    if frame.topology_version != world.topology_version:
+        frame = replace(frame, topology_version=world.topology_version)
+    world.begin_planning(
+        (int(frame.observer_id), int(frame.observer_generation)),
+        float(frame.created_at),
+    )
+    cancel_unused = False
+    try:
+        intent = brain.decide(frame)
+        cancel_unused = intent is not None
+        return intent
+    except Exception:
+        cancel_unused = True
+        logger.exception(
+            "Bot %d/%d decision failed; resetting its controller",
+            frame.observer_id, frame.observer_generation,
+        )
+        brain.reset_bot(frame.observer_id, frame.observer_generation)
+        return None
+    finally:
+        world.end_planning(cancel_unused=cancel_unused)
+
+
 def _process_worker_batch(
     world: SimpleVoxelWorld,
     brain: SimpleBotBrain,
@@ -3612,14 +4980,10 @@ def _process_worker_batch(
             if previous is None or int(message.frame_id) > int(previous.frame_id):
                 frames[key] = message
 
+    refresh_planning_observers(world, frames.values())
     intents: list[BotIntent] = []
     for frame in sorted(frames.values(), key=lambda item: int(item.frame_id)):
-        if (
-            int(frame.map_epoch) != int(world.map_epoch)
-            or int(frame.topology_version) != int(world.topology_version)
-        ):
-            continue
-        intent = brain.decide(frame)
+        intent = decide_current_frame(world, brain, frame)
         if intent is not None:
             intents.append(intent)
     return False, intents
@@ -3634,11 +4998,15 @@ def run_worker(
 ) -> None:
     """Child entry point with a bounded, coalescing message loop."""
 
-    del seed, path_requests_per_second
-    world = SimpleVoxelWorld()
+    from .planning_budget import PlanningBudget
+
+    del seed
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(
+        path_requests_per_second, decision_hz=decision_hz))
     brain = SimpleBotBrain(world, decision_hz=decision_hz)
     snapshot_assembler = MapSnapshotAssembler()
     batch_id = 0
+    next_metrics_at = time.monotonic() + 10.0
     while True:
         try:
             first = input_queue.get(timeout=0.25)
@@ -3667,6 +5035,10 @@ def run_worker(
         shutdown, intents = _process_worker_batch(world, brain, decoded)
         if shutdown:
             return
+        if time.monotonic() >= next_metrics_at:
+            logger.info("AI planning budget: %s", world.planning_budget.snapshot())
+            logger.info("AI behavior: %s", behavior_metrics_snapshot(brain))
+            next_metrics_at = time.monotonic() + 10.0
         batch_id += 1
         heartbeat = WorkerHeartbeat(
             batch_id=batch_id,

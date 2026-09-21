@@ -30,6 +30,12 @@ for package_name in (
 
 datas = []
 binaries = []
+# Stamp once during the actual freeze, never when a client joins. Reproducible
+# builders may supply SOURCE_DATE_EPOCH; the JSON remains in the onedir bundle.
+sys.path.insert(0, str(project_root))
+from server.build_info import write_build_info
+build_info_path = write_build_info(project_root / "build" / "metadata" / "build_info.json")
+datas.append((str(build_info_path), "."))
 for dependency_name in ("enet", "toml", "py_trees"):
     dependency_datas, dependency_binaries, dependency_imports = collect_all(
         dependency_name

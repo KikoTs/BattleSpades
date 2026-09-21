@@ -1,13 +1,13 @@
 """Verify one BattleSpades host in Valve's current game-server registry.
 
-The 2015 Ace of Spades browser asks the retired UDP master-list service and can
-therefore report zero rows even when a server registered successfully.  This
-tool checks the two server-owned contracts independently:
+Steam registration, direct query reachability, and the retail client's local
+category filters are separate checks. This tool checks the first two:
 
 1. ``ISteamApps/GetServersAtAddress`` contains the AoS app/game-dir record.
 2. The advertised public query port answers a valid A2S_INFO request.
 
-It uses only the standard library and is safe to run from another network.
+It uses only the standard library and should be run from another network to
+verify public reachability. A pass alone does not prove retail UI visibility.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def parse_a2s_info(packet: bytes) -> dict[str, Any]:
     vac = bool(packet[offset + 3])
     offset += 4
     version = read_string()
-    return {
+    result = {
         "protocol": protocol,
         "name": name,
         "map": map_name,
@@ -106,6 +106,31 @@ def parse_a2s_info(packet: bytes) -> dict[str, Any]:
         "vac": vac,
         "version": version,
     }
+    if offset < len(packet):
+        flags = packet[offset]
+        offset += 1
+
+        def read_number(fmt: str) -> int:
+            nonlocal offset
+            size = struct.calcsize(fmt)
+            if offset + size > len(packet):
+                raise ProbeError("truncated A2S_INFO extra field")
+            value = struct.unpack_from(fmt, packet, offset)[0]
+            offset += size
+            return value
+
+        if flags & 0x80:
+            result["game_port"] = read_number("<H")
+        if flags & 0x10:
+            result["steam_id"] = read_number("<Q")
+        if flags & 0x40:
+            result["spectator_port"] = read_number("<H")
+            result["spectator_name"] = read_string()
+        if flags & 0x20:
+            result["tags"] = read_string()
+        if flags & 0x01:
+            result["game_id"] = read_number("<Q")
+    return result
 
 
 def fetch_master_records(address: str, timeout: float) -> list[dict[str, Any]]:
@@ -122,13 +147,14 @@ def query_a2s(host: str, port: int, timeout: float) -> dict[str, Any]:
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(timeout)
-        sock.sendto(_A2S_INFO_REQUEST, (host, int(port)))
-        packet, _ = sock.recvfrom(4096)
+        sock.connect((host, int(port)))
+        sock.send(_A2S_INFO_REQUEST)
+        packet = sock.recv(4096)
         if packet[:5] == b"\xff\xff\xff\xffA":
             if len(packet) < 9:
                 raise ProbeError("truncated A2S challenge")
-            sock.sendto(_A2S_INFO_REQUEST + packet[5:9], (host, int(port)))
-            packet, _ = sock.recvfrom(4096)
+            sock.send(_A2S_INFO_REQUEST + packet[5:9])
+            packet = sock.recv(4096)
     return parse_a2s_info(packet)
 
 

@@ -13,10 +13,12 @@ cannot wedge every bot in the worker.
 
 from __future__ import annotations
 
+from array import array
 from collections import deque
 from dataclasses import dataclass
 import heapq
 import math
+import time
 from typing import Iterable
 
 import shared.constants as C
@@ -43,6 +45,8 @@ from .navigation_atlas import (
     NavigationAtlas,
     load_or_build_atlas,
 )
+from .surface_corridor import SurfaceCorridorSearch
+from .planning_budget import ObserverKey, PlanningBudget, PlanningJob
 
 
 MAP_SIZE = 512
@@ -57,6 +61,7 @@ _MAX_ROUTE_RADIUS = 64
 # replan from their endpoint; 256 expansions keep one batch within the 8 Hz
 # decision window while still making monotonic terrain progress.
 _MAX_ROUTE_EXPANSIONS = 256
+MAX_ROUTE_VALIDATION_STEPS = 64
 _MAX_WATER_EXPANSIONS = 8192
 _WATER_FLOW_LOOKAHEAD = 4
 _WALK_SECONDS_PER_CELL = 0.25
@@ -108,6 +113,9 @@ class RouteStep:
     waypoint: Vector3
     affordance: MovementAffordance
     breach: BreachPlan | None = None
+    # Retain the first water edge or the actual jump takeoff. An airborne
+    # body may no longer occupy that source when recovery rejects the edge.
+    entry_edge: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +125,46 @@ class RoutePlan:
     steps: tuple[RouteStep, ...]
     reached_segment_goal: bool
     expansions: int
+    # Scheduling pressure is not evidence that terrain is impassable.
+    deferred: bool = False
+
+
+class _BudgetedCorridorSearch:
+    """Keep an incremental frontier intact when this observer must wait."""
+
+    __slots__ = ("_world", "_search", "deferred")
+
+    def __init__(self, world: SimpleVoxelWorld, search: SurfaceCorridorSearch) -> None:
+        self._world = world
+        self._search = search
+        self.deferred = False
+
+    def __getattr__(self, name):
+        return getattr(self._search, name)
+
+    def advance(self) -> None:
+        if self._search.done:
+            return
+        world = self._world
+        budget = world.planning_budget
+        if budget is None:
+            self._search.advance()
+            return
+        world._planning_requested = True
+        job = (budget.try_acquire(world._planning_observer, world._planning_time)
+               if world._planning_observer is not None else None)
+        self.deferred = job is None
+        if job is None:
+            return
+        started = time.perf_counter()
+        before = self._search.expansions
+        try:
+            # This search already caps one retained slice at 512 expansions.
+            job.begin_search(512)
+            self._search.advance()
+        finally:
+            job.expansions = self._search.expansions - before
+            budget.finish(job, time.perf_counter() - started)
 
 
 class SimpleVoxelWorld:
@@ -128,14 +176,46 @@ class SimpleVoxelWorld:
         "_vxl",
         "_atlas",
         "_dirty_columns",
+        "_corridor_supports",
+        "prefab_geometry",
+        "planning_budget",
+        "_planning_observer",
+        "_planning_time",
+        "_planning_job",
+        "_planning_requested",
+        "_column_versions",
+        "_column_version_base",
+        "_column_version_latest",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, planning_budget: PlanningBudget | None = None) -> None:
         self.map_epoch = -1
         self.topology_version = -1
         self._vxl: CompactVoxelMap | None = None
         self._atlas: NavigationAtlas | None = None
         self._dirty_columns: set[tuple[int, int]] = set()
+        self._corridor_supports: bytearray | None = None
+        self.prefab_geometry = {}
+        self.planning_budget = planning_budget
+        self._planning_observer: ObserverKey | None = None
+        self._planning_time = 0.0
+        self._planning_job: PlanningJob | None = None
+        self._planning_requested = False
+        self._column_versions = array("q", [-1]) * (MAP_SIZE * MAP_SIZE)
+        self._column_version_base = -1
+        self._column_version_latest = -1
+
+    def begin_planning(self, observer: ObserverKey, now: float) -> None:
+        """Attribute expensive route work to one current observer decision."""
+        self._planning_observer = observer
+        self._planning_time = float(now)
+        self._planning_requested = False
+
+    def end_planning(self, *, cancel_unused: bool = False) -> None:
+        if (cancel_unused and not self._planning_requested
+                and self._planning_observer is not None and self.planning_budget is not None):
+            self.planning_budget.cancel(self._planning_observer)
+        self._planning_observer = None
 
     @property
     def ready(self) -> bool:
@@ -146,9 +226,19 @@ class SimpleVoxelWorld:
 
         self.map_epoch = int(snapshot.map_epoch)
         self.topology_version = int(snapshot.topology_version)
+        self._column_versions = array("q", [-1]) * (MAP_SIZE * MAP_SIZE)
+        self._column_version_base = self.topology_version
+        self._column_version_latest = self.topology_version
+        self.prefab_geometry = {
+            geometry.name: geometry for geometry in getattr(snapshot, "prefab_geometry", ())
+        }
         self._vxl = None
         self._atlas = None
         self._dirty_columns.clear()
+        self._corridor_supports = None
+        self.end_planning()
+        if self.planning_budget is not None:
+            self.planning_budget.reset()
         raw_vxl = map_snapshot_vxl_bytes(snapshot)
         if not raw_vxl:
             return
@@ -180,6 +270,19 @@ class SimpleVoxelWorld:
             return
         if int(delta.topology_version) < self.topology_version:
             return
+        if self._column_version_latest != self.topology_version:
+            self._column_version_base = -1
+        version = int(delta.topology_version)
+        if not 0 <= version < (1 << 63):
+            # Unsupported/untracked timelines always fall back to replanning.
+            self._column_version_base = -1
+        else:
+            for change in delta.changed_cells:
+                x, y = int(change.x), int(change.y)
+                if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
+                    self._column_versions[y * MAP_SIZE + x] = version
+                else:
+                    self._column_version_base = -1
         if self._vxl is not None:
             for change in delta.changed_cells:
                 self._vxl.set_solid(
@@ -190,6 +293,103 @@ class SimpleVoxelWorld:
                 )
                 self._dirty_columns.add((int(change.x), int(change.y)))
         self.topology_version = int(delta.topology_version)
+        self._column_version_latest = self.topology_version
+        if self._corridor_supports is not None and self._vxl is not None:
+            for x, y in {(int(c.x), int(c.y)) for c in delta.changed_cells}:
+                if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
+                    self._corridor_supports[y * MAP_SIZE + x] = min(
+                        255, self._vxl.surface_z(x, y)
+                    )
+
+    def route_needs_replan(self, version: int, position: Vector3,
+                           steps: tuple[RouteStep, ...]) -> bool:
+        """Check <=65 small column neighborhoods, keeping distant edits cheap.
+
+        Columns conservatively cover every floor and wall height. Simple walk
+        and crouch segments can survive unrelated edits; jump/dig/build/flight
+        geometry and unknown history retain ordinary global invalidation. The
+        authoritative motor still checks the actual body before movement.
+        """
+        if (self._column_version_base < 0
+                or not self._column_version_base <= version <= self.topology_version
+                or self._column_version_latest != self.topology_version
+                or not steps or len(steps) > MAX_ROUTE_VALIDATION_STEPS):
+            return True
+        if any(step.affordance not in {MovementAffordance.WALK, MovementAffordance.CROUCH}
+               or step.breach is not None for step in steps):
+            return True
+        previous = position
+        for point in (position, *(step.waypoint for step in steps)):
+            if (not all(math.isfinite(value) for value in point)
+                    or math.dist(previous, point) > 2.0):
+                return True
+            x, y = int(math.floor(point[0])), int(math.floor(point[1]))
+            if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+                return True
+            for column_y in range(max(0, y - 1), min(MAP_SIZE, y + 2)):
+                for column_x in range(max(0, x - 1), min(MAP_SIZE, x + 2)):
+                    if self._column_versions[column_y * MAP_SIZE + column_x] > version:
+                        return True
+            previous = point
+        return False
+
+    def begin_corridor(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        *,
+        blocked_edges: frozenset[tuple[tuple[int, int, int], tuple[int, int, int]]],
+    ) -> SurfaceCorridorSearch | _BudgetedCorridorSearch | None:
+        """Search dry supports at the actor's layer, including under roofs."""
+
+        if self._atlas is None:
+            return None
+        if self._corridor_supports is None:
+            self._corridor_supports = bytearray(self._atlas.primary_support)
+            if self._vxl is not None:
+                for x, y in self._dirty_columns:
+                    if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+                        continue
+                    self._corridor_supports[y * MAP_SIZE + x] = min(
+                        255, self._vxl.surface_z(x, y)
+                    )
+        supports = self._corridor_supports
+
+        def endpoint(position: Vector3, radius: int, vertical: float) -> int | None:
+            px, py = int(position[0]), int(position[1])
+            candidates: list[tuple[float, int]] = []
+            for y in range(max(0, py - radius), min(MAP_SIZE, py + radius + 1)):
+                for x in range(max(0, px - radius), min(MAP_SIZE, px + radius + 1)):
+                    index = y * MAP_SIZE + x
+                    surface = self.surface(x, y, position[2], vertical_span=int(math.ceil(vertical)))
+                    dz = (abs(surface.position[2] - position[2]) if surface else math.inf)
+                    if surface is not None and surface.support_z < WATER_SUPPORT_Z and dz <= vertical:
+                        candidates.append(((x + 0.5 - position[0]) ** 2
+                                           + (y + 0.5 - position[1]) ** 2 + dz * dz,
+                                           index + surface.support_z * MAP_SIZE * MAP_SIZE))
+            return min(candidates)[1] if candidates else None
+
+        source = endpoint(start, 1, 1.5)
+        target = endpoint(goal, 6, 12.0)
+        if source is None or target is None:
+            return None
+        blocked = frozenset(
+            (a[1] * MAP_SIZE + a[0] + a[2] * MAP_SIZE * MAP_SIZE,
+             b[1] * MAP_SIZE + b[0] + b[2] * MAP_SIZE * MAP_SIZE)
+            for a, b in blocked_edges
+            if all(0 <= point[0] < MAP_SIZE and 0 <= point[1] < MAP_SIZE for point in (a, b))
+        )
+        def layer_at(x: int, y: int, support: int) -> int | None:
+            sample = self.surface(x, y, support - PLAYER_SUPPORT_OFFSET, vertical_span=2)
+            return sample.support_z if sample is not None else None
+
+        area = MAP_SIZE * MAP_SIZE
+        search = SurfaceCorridorSearch(bytes(supports), MAP_SIZE, MAP_SIZE,
+                                       source % area, target % area, blocked,
+                                       surface_at=layer_at, start_height=source // area,
+                                       target_height=target // area)
+        return (_BudgetedCorridorSearch(self, search)
+                if self.planning_budget is not None else search)
 
     def solid(self, x: int, y: int, z: int) -> bool:
         """Return collision occupancy, failing closed outside the map."""
@@ -302,6 +502,46 @@ class SimpleVoxelWorld:
         blocked_edges: frozenset[
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = frozenset(),
+        _recover_start: bool = True,
+        _prefer_existing_path: bool = True,
+    ) -> RoutePlan:
+        """Admit one fair job; its traversal/breach searches share a cap."""
+        arguments = dict(abilities=abilities, dig_profile=dig_profile,
+                         allow_water=allow_water, blocked_edges=blocked_edges,
+                         _recover_start=_recover_start,
+                         _prefer_existing_path=_prefer_existing_path)
+        budget = self.planning_budget
+        self._planning_requested = True
+        # Standalone geometry fixtures can omit scheduling. Recursive ordinary
+        # traversal belongs to the already admitted breach query, not a retry.
+        if budget is None or self._planning_job is not None:
+            return self._plan(start, goal, **arguments)
+        if self._planning_observer is None:
+            return RoutePlan((), False, 0, deferred=True)
+        job = budget.try_acquire(self._planning_observer, self._planning_time)
+        if job is None:
+            return RoutePlan((), False, 0, deferred=True)
+        self._planning_job = job
+        started = time.perf_counter()
+        try:
+            return self._plan(start, goal, **arguments)
+        finally:
+            self._planning_job = None
+            budget.finish(job, time.perf_counter() - started)
+
+    def _plan(
+        self,
+        start: Vector3,
+        goal: Vector3,
+        *,
+        abilities: frozenset[MovementAffordance],
+        dig_profile: DigProfile | None = None,
+        allow_water: bool = False,
+        blocked_edges: frozenset[
+            tuple[tuple[int, int, int], tuple[int, int, int]]
+        ] = frozenset(),
+        _recover_start: bool = True,
+        _prefer_existing_path: bool = True,
     ) -> RoutePlan:
         """Return one bounded route segment toward ``goal``.
 
@@ -358,6 +598,7 @@ class SimpleVoxelWorld:
         if (
             dig_profile is not None
             and MovementAffordance.BREACH in abilities
+            and _prefer_existing_path
         ):
             # Dig edges are substantially more expensive than movement edges:
             # each solid frontier column can expose flat/up/down excavation
@@ -371,7 +612,10 @@ class SimpleVoxelWorld:
                 dig_profile=None,
                 allow_water=allow_water,
                 blocked_edges=blocked_edges,
+                _recover_start=False,
             )
+            if traversal.deferred:
+                return traversal
             if traversal.steps:
                 return traversal
 
@@ -417,6 +661,11 @@ class SimpleVoxelWorld:
             int(start_node.y),
             int(start_node.support_z),
         )
+        job = self._planning_job
+        search_limit = (_MAX_ROUTE_EXPANSIONS if job is None else
+                        job.begin_search(_MAX_ROUTE_EXPANSIONS))
+        if search_limit <= 0:
+            return RoutePlan((), False, 0, deferred=True)
         frontier: list[tuple[float, int, tuple[int, int, int]]] = [
             (0.0, 0, start_key)
         ]
@@ -436,9 +685,11 @@ class SimpleVoxelWorld:
         reached = False
         expansions = 0
 
-        while frontier and expansions < _MAX_ROUTE_EXPANSIONS:
+        while frontier and expansions < search_limit:
             _priority, _sequence, current = heapq.heappop(frontier)
             expansions += 1
+            if job is not None:
+                job.expansions += 1
             distance = target_distance(current)
             if distance < best_distance:
                 best = current
@@ -494,6 +745,25 @@ class SimpleVoxelWorld:
                 )
 
         if best == start_key:
+            if (
+                _recover_start
+                and (
+                    (int(math.floor(start[0])), int(math.floor(start[1])))
+                    != (start_node.x, start_node.y)
+                    or abs(start_node.position[2] - start[2]) > 0.75
+                )
+                and -0.75 <= start_node.position[2] - start[2] <= 2.0
+            ):
+                # A capsule overlapping a wall may borrow its neighbour as
+                # the search origin. It still has to move onto that support
+                # even when no edge beyond it improves the strategic goal.
+                # The same applies when a capsule rests on a neighbouring
+                # lip above this column's floor: centre before planning from
+                # the lower floor, rather than assuming it already landed.
+                return RoutePlan(
+                    (RouteStep(start_node.position, MovementAffordance.WALK),),
+                    False, expansions,
+                )
             return RoutePlan((), False, expansions)
 
         nodes: list[tuple[int, int, int]] = []
@@ -519,6 +789,8 @@ class SimpleVoxelWorld:
                 ),
                 came_by[node],
                 came_breach[node],
+                (nodes[index - 1], node)
+                if came_by[node] is MovementAffordance.JUMP else None,
             )
             for index, node in enumerate(nodes[1:], start=1)
         )
@@ -682,6 +954,7 @@ class SimpleVoxelWorld:
             if route is not None:
                 cursor = current
                 furthest_water: SurfaceNode | None = None
+                entry_edge = None
                 atlas_path_blocked = False
                 for _index in range(
                     min(_WATER_FLOW_LOOKAHEAD, max(1, int(route.distance)))
@@ -756,6 +1029,8 @@ class SimpleVoxelWorld:
                     if edge in blocked_edges:
                         atlas_path_blocked = True
                         break
+                    if entry_edge is None:
+                        entry_edge = edge
                     if sample.support_z < WATER_SUPPORT_Z:
                         break
                     furthest_water = sample
@@ -764,6 +1039,7 @@ class SimpleVoxelWorld:
                     return RouteStep(
                         furthest_water.position,
                         MovementAffordance.WALK,
+                        entry_edge=entry_edge,
                     )
 
         return self._bounded_water_search(
@@ -874,12 +1150,83 @@ class SimpleVoxelWorld:
             return None
         return target
 
+    def water_shore_edges(
+        self, position: Vector3, *, radius: int = 4,
+    ) -> frozenset[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        """Collect incoming bank edges around a failed swim pocket.
+
+        Exclude shoreline entries, never the open-water edges needed to leave
+        the pocket. Include the actual bank floor and its excavation height.
+        """
+        radius = max(1, min(4, int(radius)))
+        center_x, center_y = (int(math.floor(value)) for value in position[:2])
+        edges: set[tuple[tuple[int, int, int], tuple[int, int, int]]] = set()
+        for x in range(center_x - radius, center_x + radius + 1):
+            for y in range(center_y - radius, center_y + radius + 1):
+                current = self.surface(x, y, WATER_SUPPORT_Z - PLAYER_SUPPORT_OFFSET,
+                                       vertical_span=2, allow_water=True)
+                if current is None or current.support_z != WATER_SUPPORT_Z:
+                    continue
+                for dx, dy in _CARDINAL_EDGES:
+                    bank = self._live_dry_bank(current, x + dx, y + dy)
+                    if bank is not None:
+                        source = (x, y, current.support_z)
+                        edges.add((source, (bank.x, bank.y, bank.support_z)))
+                        edges.add((source, (bank.x, bank.y, WATER_SUPPORT_Z - 1)))
+                        edges.add((source, (bank.x, bank.y, WATER_SUPPORT_Z)))
+        return frozenset(edges)
+
+    def water_roam_step(
+        self,
+        position: Vector3,
+        *,
+        heading: Vector3,
+        blocked_edges: frozenset[tuple[tuple[int, int, int], tuple[int, int, int]]],
+    ) -> RouteStep | None:
+        """Keep searching open water when no known shore route survives edits."""
+
+        current = self.surface(int(math.floor(position[0])), int(math.floor(position[1])),
+                               position[2], vertical_span=3, allow_water=True)
+        if current is None:
+            return None
+        candidates: list[tuple[int, float, int, RouteStep]] = []
+        for rank, (dx, dy) in enumerate(_CARDINAL_EDGES):
+            cursor = current
+            entry = None
+            for length in range(1, 5):
+                sample = self.surface(cursor.x + dx, cursor.y + dy, cursor.position[2],
+                                      vertical_span=2, clearance=3, allow_water=True)
+                if sample is None or sample.support_z != WATER_SUPPORT_Z:
+                    break
+                edge = ((cursor.x, cursor.y, cursor.support_z),
+                        (sample.x, sample.y, sample.support_z))
+                if edge in blocked_edges:
+                    break
+                entry = entry or edge
+                cursor = sample
+                candidates.append((length, dx * heading[0] + dy * heading[1], -rank,
+                                   RouteStep(sample.position, MovementAffordance.SWIM,
+                                             entry_edge=entry)))
+        if candidates:
+            # Keep the heading whenever at least two cells remain clear.
+            # Ranking length first reverses a swimmer near each end of a
+            # corridor, even though there is room to continue to its turn.
+            return max(candidates, key=lambda item: (min(item[0], 2), item[1], item[0], item[2]))[3]
+        if blocked_edges:
+            # Failed shore cycles can exclude every adjacent water edge.
+            # Geometry still validates each swim cell; exhaustively excluding
+            # open water must not turn temporary failure memory into a cage.
+            return self.water_roam_step(position, heading=heading,
+                                        blocked_edges=frozenset())
+        return None
+
     def water_bridge_line(
         self,
         position: Vector3,
         direction: Vector3,
         *,
         max_cells: int = 6,
+        require_landing_within: int | None = None,
     ) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
         """Return a short face-supported floor line over immediate water.
 
@@ -903,6 +1250,22 @@ class SimpleVoxelWorld:
         if not self.solid(start_x, start_y, support_z):
             return None
 
+        if require_landing_within is not None:
+            # Do not spend the inventory on a pier that cannot reach land.
+            # Check the whole proposed crossing, then build it in short lines.
+            landing_found = False
+            for distance in range(1, min(128, max(1, int(require_landing_within))) + 1):
+                x, y = start_x + step_x * distance, start_y + step_y * distance
+                if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+                    break
+                if any(self.solid(x, y, support_z - offset) for offset in (1, 2, 3)):
+                    break
+                if self.solid(x, y, support_z):
+                    landing_found = True
+                    break
+            if not landing_found:
+                return None
+
         cells: list[tuple[int, int, int]] = []
         limit = max(1, min(8, int(max_cells)))
         for distance in range(1, limit + 1):
@@ -912,12 +1275,10 @@ class SimpleVoxelWorld:
                 break
             if self.solid(x, y, support_z):
                 break
-            if self.solid(x, y, support_z - 1) or self.solid(
-                x, y, support_z - 2
-            ):
+            if any(self.solid(x, y, support_z - offset) for offset in (1, 2, 3)):
                 break
             cells.append((x, y, support_z))
-        if len(cells) < 2:
+        if not cells:
             return None
         return cells[0], cells[-1]
 
@@ -1001,21 +1362,37 @@ class SimpleVoxelWorld:
         source_y = int(math.floor(position[1]))
         target_x = int(math.floor(bank.waypoint[0]))
         target_y = int(math.floor(bank.waypoint[1]))
-        support_z = WATER_SUPPORT_Z
+        support_z = WATER_SUPPORT_Z - 1
+        if (not self.solid(target_x, target_y, support_z)
+                or ((source_x, source_y, WATER_SUPPORT_Z),
+                    (target_x, target_y, support_z)) in blocked_edges):
+            # Shore selection names the bank's upper floor, while excavation
+            # enters on a dry ledge. Honor the exact failed excavation edge
+            # too; otherwise the two heights let a rejected swing retry forever.
+            return None
         blockers = tuple(
             (target_x, target_y, support_z - offset)
-            for offset in (2, 1)
+            for offset in (3, 2, 1)
             if self.solid(target_x, target_y, support_z - offset)
         )
-        target_cell, estimated_swings = self._clearance_target(
-            blockers,
-            support_z,
-            profile,
-        )
-        if target_cell is None or estimated_swings <= 0:
+        # Leave a dry floor above the waterbed and clear native standing
+        # headroom. Digging down to WATER_SUPPORT_Z extends a flooded tunnel.
+        # Clear lower safe faces first: a machete needs its lower pair before
+        # headroom, without a final hit removing the floor. Keep this order
+        # fixed while the swimmer bobs, so partial damage stays on one face.
+        floor = (target_x, target_y, support_z)
+        targets = []
+        for cell in blockers:
+            footprint = set(melee_dig_positions(cell, profile.pattern))
+            if floor not in footprint:
+                covered = sum(block in footprint for block in blockers)
+                targets.append((covered, cell[2], cell))
+        if not targets or profile.swings_per_block <= 0:
             return None
+        covered, _height, target_cell = max(targets)
+        estimated_swings = math.ceil(len(blockers) / covered) * profile.swings_per_block
         breach = BreachPlan(
-            source=(source_x, source_y, support_z),
+            source=(source_x, source_y, WATER_SUPPORT_Z),
             destination=(target_x, target_y, support_z),
             target_cell=target_cell,
             blocking_cells=blockers,
@@ -1093,7 +1470,7 @@ class SimpleVoxelWorld:
         ):
             return None
         expected = int(round(current.position[2] + PLAYER_SUPPORT_OFFSET))
-        low = 2
+        low = 3
         high = min(WATER_SUPPORT_Z, expected + 13)
         for support_z in sorted(
             range(low, high),
@@ -1103,7 +1480,7 @@ class SimpleVoxelWorld:
                 continue
             if all(
                 not self.solid(x, y, support_z - offset)
-                for offset in (1, 2)
+                for offset in (1, 2, 3)
             ):
                 return SurfaceNode(x, y, support_z)
         return None
@@ -1163,6 +1540,7 @@ class SimpleVoxelWorld:
         cursor = start
         visited = {(int(start.x), int(start.y))}
         furthest_water: SurfaceNode | None = None
+        entry_edge = None
         for _index in range(_WATER_FLOW_LOOKAHEAD):
             current_distance = math.hypot(
                 float(goal[0]) - (float(cursor.x) + 0.5),
@@ -1200,6 +1578,11 @@ class SimpleVoxelWorld:
             if not candidates:
                 break
             sample = min(candidates, key=lambda row: row[:3])[3]
+            if entry_edge is None:
+                entry_edge = (
+                    (start.x, start.y, start.support_z),
+                    (sample.x, sample.y, sample.support_z),
+                )
             if sample.support_z < WATER_SUPPORT_Z:
                 if cursor is start:
                     return RouteStep(
@@ -1215,6 +1598,7 @@ class SimpleVoxelWorld:
         return RouteStep(
             furthest_water.position,
             MovementAffordance.SWIM,
+            entry_edge=entry_edge,
         )
 
     def _bounded_water_search(
@@ -1380,6 +1764,35 @@ class SimpleVoxelWorld:
                         )
                     )
                 )
+                source_ceiling = tuple(
+                    (x, y, z)
+                    for z in range(int(support_z) - 3 + delta, int(support_z) - 2)
+                    if -2 <= delta < 0 and self.solid(x, y, z)
+                )
+                if source_ceiling:
+                    # Stepping up lifts the trailing half of the native body
+                    # before it leaves its source column. A carved passage
+                    # can have a clear destination but a ceiling above that
+                    # trailing half, making this otherwise valid edge fail
+                    # forever. Clear the source headroom through normal melee.
+                    if dig_profile is not None and MovementAffordance.BREACH in abilities:
+                        blockers = source_ceiling
+                        target_cell, swings = self._clearance_target(blockers, support_z, dig_profile)
+                        if (target_cell is not None and swings > 0
+                                and not {node, neighbor}.intersection(
+                                    melee_dig_positions(target_cell, dig_profile.pattern))):
+                            breach = BreachPlan(
+                                source=node, destination=neighbor, target_cell=target_cell,
+                                blocking_cells=blockers, tool_id=int(dig_profile.tool_id),
+                                secondary=bool(dig_profile.secondary),
+                                fire_interval=max(0.05, float(dig_profile.fire_interval)),
+                                estimated_swings=swings,
+                            )
+                            yield (neighbor, MovementAffordance.BREACH,
+                                   1.25 + _BREACH_SETUP_COST
+                                   + swings * breach.fire_interval / _WALK_SECONDS_PER_CELL,
+                                   breach)
+                    continue
                 if abs(delta) <= 1 and not low_overhang:
                     yield (
                         neighbor,
@@ -1471,12 +1884,13 @@ class SimpleVoxelWorld:
                     -2 <= delta < -1
                     and MovementAffordance.JUMP in abilities
                 ):
-                    yield (
-                        neighbor,
-                        MovementAffordance.JUMP,
-                        1.8 + abs(delta) * 0.35,
-                        None,
-                    )
+                    if not low_overhang:
+                        yield (
+                            neighbor,
+                            MovementAffordance.JUMP,
+                            1.8 + abs(delta) * 0.35,
+                            None,
+                        )
                     if (
                         dig_profile is not None
                         and MovementAffordance.BREACH in abilities
@@ -1521,17 +1935,6 @@ class SimpleVoxelWorld:
                         neighbor,
                         MovementAffordance.DROP,
                         1.2 + delta * 0.15,
-                        None,
-                    )
-                    continue
-                if (
-                    abs(delta) <= 8
-                    and MovementAffordance.JETPACK in abilities
-                ):
-                    yield (
-                        neighbor,
-                        MovementAffordance.JETPACK,
-                        3.0 + abs(delta) * 0.2,
                         None,
                     )
                     continue
@@ -1624,8 +2027,10 @@ class SimpleVoxelWorld:
                     )
                     break
                 if (
-                    abs(delta) <= 8
+                    delta == 0
                     and MovementAffordance.JETPACK in abilities
+                    and self._flight_gap_is_clear(x, y, dx, dy, distance,
+                                                  support_z, landing.support_z)
                 ):
                     yield (
                         target,
@@ -1634,6 +2039,20 @@ class SimpleVoxelWorld:
                         None,
                     )
                     break
+
+    def _flight_gap_is_clear(self, x: int, y: int, dx: int, dy: int,
+                             distance: int, source_support: int,
+                             landing_support: int) -> bool:
+        """Reserve the body-wide takeoff/crossing/landing volume of a short hop."""
+        low = min(source_support, landing_support) - 9
+        high = max(source_support, landing_support) - 1
+        if low < 1 or high >= int(C.Z_ABOVE_WATERPLANE):
+            return False
+        for offset in range(distance + 1):
+            cx, cy = x + dx * offset, y + dy * offset
+            if any(self.solid(cx, cy, z) for z in range(low, high + 1)):
+                return False
+        return True
 
     def _jump_gap_is_clear(
         self,

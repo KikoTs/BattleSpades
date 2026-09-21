@@ -91,6 +91,35 @@ def advance_player(player, ticks, step=1.0 / 60.0):
         asyncio.run(player.update(step))
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_water_fall_rule_reaches_native_class_profile(enabled):
+    # Original GameClass supplies zero water damage to native physics when
+    # InitialInfo disables it. Checking HP alone would miss a divergent
+    # native landing return value, which the retail Character also consumes.
+    manager = make_world_manager()
+    for x in range(98, 104):
+        for y in range(98, 104):
+            manager.map.set_point(x, y, 240, True, TEST_COLOR)
+    player = make_player(manager, flatten=False)
+    from server.game_rules import GameRules
+
+    rules = GameRules.server_defaults()
+    rules.apply({"RULE_ENABLE_FALL_ON_WATER_DAMAGE": enabled})
+    player.connection.server.config = ServerConfig(game_rules=rules)
+    native = player._world_object
+    player._apply_class_profile_to_world(native)
+    native.set_position(100.5, 100.5, 200.0)
+    native.set_velocity(0.0, 0.0, 0.0)
+    for _ in range(300):
+        result = native.update(1.0 / 60.0, [])
+        if not native.airborne:
+            assert native.wade
+            assert result > 0 if enabled else result == -1
+            break
+    else:
+        pytest.fail("fall did not reach the water shelf")
+
+
 def test_highest_live_build_layer_has_stable_ground_and_jump_contact():
     """Layer 0 triggers the stock mover's ceiling-contact oscillation.
 
@@ -388,16 +417,7 @@ def test_held_jump_uses_native_impulse():
 
 
 def test_authoritative_jump_rejects_a_stale_owner_anchor_teleport():
-    """A launch keeps native velocity without restoring a far-away WU row.
-
-    Retail ``Character.update_alive`` first runs native physics, then its
-    ``jump_this_frame`` branch calls ``world_object.set_position`` with all
-    three coordinates from ``network_position`` (``character.pyd``
-    ``0x100808E5`` -> ``0x100815AB``). A buffered re-jump can see a row from
-    the prior airborne cadence and move more than one voxel in one frame. The
-    maintained client and server retain the pre-physics position for that
-    stale-row case while keeping the native launch velocity.
-    """
+    """A stale output snapshot cannot replace a native launch position."""
     player = make_player()
     advance_player(player, 4)
     player.set_orientation_vector(1.0, 0.0, 0.0)
@@ -414,7 +434,9 @@ def test_authoritative_jump_rejects_a_stale_owner_anchor_teleport():
 
     asyncio.run(player.update(1.0 / 60.0))
 
-    assert player.position == pytest.approx(before, abs=1e-6)
+    assert player.x > before[0]
+    assert player.y == before[1]
+    assert player.z < before[2]
     assert player.vx > 0.0
     assert player.airborne is True
     assert player.vz == pytest.approx(-0.4085246, abs=1e-6)
@@ -427,8 +449,8 @@ def test_authoritative_jump_rejects_a_stale_owner_anchor_teleport():
     assert player.z < before[2]
 
 
-def test_authoritative_jump_keeps_small_retail_anchor_correction():
-    """Sub-quarter-block owner anchors retain the stock reconciliation path."""
+def test_authoritative_jump_ignores_even_small_owner_anchor_corrections():
+    """Sub-quarter-block output snapshots must not pull a launch backward."""
     player = make_player()
     advance_player(player, 4)
     before = player.position
@@ -440,16 +462,18 @@ def test_authoritative_jump_keeps_small_retail_anchor_correction():
 
     asyncio.run(player.update(1.0 / 60.0))
 
-    assert player.position == pytest.approx(advertised_anchor, abs=1e-6)
+    assert player.x > before[0]
+    assert player.y == before[1]
+    assert player.z < before[2]
     assert player.airborne is True
 
 
 def test_held_landing_relaunch_does_not_reuse_the_press_anchor():
-    """One continuous SPACE hold consumes its cached anchor only once."""
+    """A continuous SPACE hold relaunches from contact, never from an old row."""
     player = make_player()
     advance_player(player, 4)
     player.update_input(
-        True, False, False, False, True, False, False, True
+        False, False, False, False, True, False, False, False
     )
     asyncio.run(player.update(1.0 / 60.0))
     assert player.airborne is True
@@ -476,16 +500,8 @@ def test_held_landing_relaunch_does_not_reuse_the_press_anchor():
     assert player.position != pytest.approx(stale_anchor, abs=1e-6)
 
 
-def test_authoritative_jump_uses_owner_anchor_strictly_before_input_source():
-    """A row stamped with the launch loop was queued too late for that launch.
-
-    Live retail proof (2026-07-12): frame 3614 launched from the already cached
-    row 3612 at X=160.500000.  The server then queued row 3614 at X=160.516403;
-    its one-frame button latch applied that same frame's jump on the following
-    packet and incorrectly used the newer row.  The 0.016403 phase error later
-    became a 0.245728 correction at a voxel boundary.  Selection must therefore
-    be strict ``stamp < input_source_loop``, not ``<=`` and not latest queued.
-    """
+def test_authoritative_jump_is_independent_of_owner_snapshot_send_order():
+    """Both old and equal-label rows are outputs, not jump physics inputs."""
     player = make_player()
     advance_player(player, 4)
     player.set_orientation_vector(1.0, 0.0, 0.0)
@@ -506,7 +522,9 @@ def test_authoritative_jump_uses_owner_anchor_strictly_before_input_source():
 
     asyncio.run(player.update(1.0 / 60.0))
 
-    assert player.position == pytest.approx(old_anchor, abs=1e-6)
+    assert player.x > old_anchor[0]
+    assert player.z < old_anchor[2]
+    assert player.position != pytest.approx(equal_stamp_anchor, abs=1e-6)
     assert player.vx > 0.0
     assert player.airborne is True
 
@@ -810,6 +828,58 @@ def test_native_world_glide_jetpack_has_limited_vertical_thrust():
     assert normal_vz < engineer_vz
 
 
+@pytest.mark.parametrize("gravity", [1.0, 26.0 / 64.0])
+@pytest.mark.parametrize("crouch", [False, True])
+def test_ugc_hover_pins_or_descends_from_retail_vertical_branch(gravity, crouch):
+    """Original world.pyd 0x10012CF4..0x10012D25, pack enum 4 only."""
+    world_manager = make_world_manager()
+    world_manager.map_metadata.gravity = gravity
+    world_manager._refresh_world()
+    native = NativeWorldPlayer(world_manager.world)
+    native.set_position(100.5, 100.5, 100.0)
+    native.update(1.0 / 60.0, [])
+    native.set_velocity(0.0, 0.0, 0.25)
+    native.jetpack = int(C.JETPACK_UGCBUILDER)
+    # The recovered branch checks hover + concrete pack, not the delayed
+    # jetpack_active bit. Hover control already works during that handoff.
+    native.jetpack_active = False
+    native.hover = True
+    native.set_crouch(crouch, [], 0)
+    native.update(1.0 / 60.0, [])
+    expected = (
+        (0.25 + ((gravity + 1.0) * 0.025) * 0.5) / (1.0 + 1.0 / 60.0)
+        if crouch else 0.0
+    )
+    assert native.velocity.z == pytest.approx(expected, abs=1e-7)
+
+
+def test_ugc_hover_preserves_space_thrust_priority_over_crouch_descent():
+    world_manager = make_world_manager()
+    native = NativeWorldPlayer(world_manager.world)
+    native.set_position(100.5, 100.5, 100.0)
+    native.update(1.0 / 60.0, [])
+    native.set_velocity(0.0, 0.0, 0.0)
+    native.jetpack = int(C.JETPACK_UGCBUILDER)
+    native.jetpack_active = True
+    native.hover = True
+    native.set_crouch(True, [], 0)
+    native.jump = True
+    native.update(1.0 / 60.0, [])
+    assert native.velocity.z == pytest.approx(-0.025 / (1.0 + 1.0 / 60.0), abs=1e-7)
+
+
+@pytest.mark.parametrize("pack", [0, 66, 67, 68])
+def test_ordinary_players_and_flight_packs_ignore_ugc_hover_physics(pack):
+    player = make_player()
+    player.jetpack_id = pack
+    player.position = (100.5, 100.5, 20.0)
+    player.velocity = (0.0, 0.0, 0.0)
+    player.input.hover = True
+    asyncio.run(player.update(1.0 / 60.0))
+    assert not player._world_object.hover
+    assert player.velocity[2] == pytest.approx((1.0 / 60.0) / (1.0 + 1.0 / 60.0), abs=1e-7)
+
+
 def test_lunar_wire_gravity_drives_jetpack_and_glider_recurrences():
     """Authority uses the exact 26/64 scalar received by the retail client."""
     world_manager = make_world_manager()
@@ -1004,14 +1074,8 @@ def test_server_passes_held_jump_to_an_active_engineer_jetpack():
     assert player._world_object.jetpack_passive is False
 
 
-def test_grounded_launch_hold_does_not_freeze_engineer_sustained_thrust():
-    """The reconciliation-only launch hold applies to one grounded tick.
-
-    Retail keeps SPACE set while a jetpack is equipped, and every later
-    airborne frame consumes it as thrust.  Holding the pre-physics Z position
-    beyond the launch frame would make Engineer flight hover/stutter even
-    though its native velocity and fuel state continued to change.
-    """
+def test_grounded_launch_does_not_freeze_engineer_sustained_thrust():
+    """The launch and each later held frame keep their native displacement."""
     player = make_player()
     player.class_id = int(C.CLASS_ENGINEER)
     player.loadout = [int(C.SMG_TOOL), int(C.JETPACK_ENGINEER)]
@@ -1024,7 +1088,7 @@ def test_grounded_launch_hold_does_not_freeze_engineer_sustained_thrust():
     launch_z = player.z
     asyncio.run(player.update(1.0 / 60.0))
     assert player.airborne is True
-    assert player.z == pytest.approx(launch_z, abs=1e-6)
+    assert player.z < launch_z
 
     player.jetpack_active = True
     airborne_z = player.z
@@ -1202,6 +1266,9 @@ def test_soft_correction_moves_toward_client_without_snapping():
 
 def test_soft_correction_skips_vertical_adjustment_while_airborne():
     player = make_player()
+    # Let the exact spawn contact settle; boxclipmove, not the jump request,
+    # owns airborne on a ledge/glide frame (world.pyd0x1000247C).
+    advance_player(player, 4)
     player.update_input(False, False, False, False, True, False, False, False)
     asyncio.run(player.update(1.0 / 60.0))
     assert player.airborne

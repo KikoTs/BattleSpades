@@ -326,6 +326,10 @@ class MatchTransitionService:
                     )
                 if old_mode is not None:
                     await self._cancel_mode_end(old_mode)
+                bots = getattr(server, "bots", None)
+                prepare_bots = getattr(bots, "prepare_for_game_transition", None)
+                if callable(prepare_bots):
+                    await prepare_bots()
                 for connection in all_connections:
                     await self._detach_transition_player(connection, old_mode)
                 if old_mode is not None:
@@ -399,18 +403,16 @@ class MatchTransitionService:
                 server.mode = mode_class(server)
                 await server.mode.on_mode_start()
 
-                # Peerless bots are not part of ``server.connections`` and
-                # therefore survive the human detach loop above. Their player
-                # ids/profiles may persist, but their position, native
-                # Character, AI intents, map snapshot, and mutation listener
-                # all belong to the retired world. Re-anchor them before a
-                # replacement roster is streamed to any client.
+                # Rejoin peerless bots with fresh scores and personalities
+                # before the replacement roster is streamed to any client.
                 bots = getattr(server, "bots", None)
                 rebind_bots = getattr(
                     bots, "rebind_after_match_transition", None
                 )
                 if callable(rebind_bots):
-                    rebind_bots()
+                    result = rebind_bots()
+                    if result is not None:
+                        await result
 
                 # Each acknowledged peer now receives the normal initial-join
                 # loader ordering. MapDataValidation is the second-phase proof

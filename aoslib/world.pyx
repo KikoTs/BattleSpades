@@ -579,7 +579,7 @@ def _grounded(map_obj, position, crouch, wade):
     return feet >= MAP_Z
 
 
-cdef bint _clip(map_obj, double x, double y, double z):
+cdef bint _clip(map_obj, float x, float y, float z):
     """Faithful port of the compiled engine's clipbox @0x3c00 with
     allow_below_water = False (boxclipmove always passes 0) and no entity
     list / lock-box bounds (the infantry path).
@@ -615,14 +615,16 @@ cdef bint _clip(map_obj, double x, double y, double z):
     return False
 
 
-cdef bint _clip_corners(map_obj, double cx, double cy, double z):
+cdef bint _clip_corners(map_obj, float cx, float cy, float z):
     """The four AABB corners at radius 0.45 — the only horizontal probe set
     the live engine uses (a single z level, the head block is never probed by
     a lateral move)."""
-    return (_clip(map_obj, cx - 0.45, cy - 0.45, z)
-            or _clip(map_obj, cx - 0.45, cy + 0.45, z)
-            or _clip(map_obj, cx + 0.45, cy - 0.45, z)
-            or _clip(map_obj, cx + 0.45, cy + 0.45, z))
+    # world.pyd 0x100017D6..0x100018D1 stores each corner argument as
+    # float32 before clipbox converts it to a voxel index.
+    return (_clip(map_obj, cx - 0.449999988079071, cy - 0.449999988079071, z)
+            or _clip(map_obj, cx - 0.449999988079071, cy + 0.449999988079071, z)
+            or _clip(map_obj, cx + 0.449999988079071, cy - 0.449999988079071, z)
+            or _clip(map_obj, cx + 0.449999988079071, cy + 0.449999988079071, z))
 
 
 cdef bint _solid_int(map_obj, int x, int y, int z):
@@ -671,8 +673,9 @@ def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
     cdef bint climbed = False, advanced, hit, overlap
 
     v35 = dt * _PHYSICS_SCALE
-    v6 = vx * v35 + px                 # candidate new x
-    v32 = vy * v35 + py               # candidate new y
+    # x87 retains the product until the candidate's explicit float store.
+    v6 = <double>vx * v35 + px         # candidate new x
+    v32 = <double>vy * v35 + py        # candidate new y
     if cr and not hv:
         lp = 2; m = 0.89999998; rad = 0.44999999
     else:
@@ -723,7 +726,7 @@ def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
             overlap = False
             break
     if overlap:
-        v34 = ((vx * vx * 4.0) + 0.050000001) * v35
+        v34 = ((<double>vx * vx * 4.0) + <double><float>0.05) * v35
         v41 = _math.floor(v36 - m)
         if _clip_corners(map_obj, wx, wy, v41):
             wx = px
@@ -771,7 +774,7 @@ def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
             overlap = False
             break
     if overlap:
-        v34 = ((vy * vy * 4.0) + 0.050000001) * v35
+        v34 = ((<double>vy * vy * 4.0) + <double><float>0.05) * v35
         v46 = _math.floor(v37 - m)
         if _clip_corners(map_obj, wx, wy, v46):
             wy = py
@@ -808,7 +811,7 @@ def _move_box(position, velocity, dt, map_obj, crouch, hover, sprint,
 
     # normal vertical move
     v22 = m if vz >= 0.0 else -m
-    v37 = v37 + v35 * vz
+    v37 = v37 + <double>v35 * vz
     air = True
     v57 = _math.floor(v22 + v37)
     if not _clip_corners(map_obj, wx, wy, v57):
@@ -838,8 +841,8 @@ def _check_for_ground_holes(position, velocity, dt, map_obj, crouch, hover,
     a straight (or one resolved diagonal) neighbour is solid. The server used to
     stand perfectly still here, diverging from the client until reconciliation
     yanked the player into the cliff face."""
-    cdef double x = position.x, y = position.y, z = position.z
-    cdef double v2, v7, v8, v12, v13
+    cdef float x = position.x, y = position.y, z = position.z
+    cdef float v2, v7, v8, v12, v13, probe_z
     cdef int v4, v5, v6, v9, v14
     cdef bint v10, v11, v15, v16, v17, v19, v20
 
@@ -851,7 +854,8 @@ def _check_for_ground_holes(position, velocity, dt, map_obj, crouch, hover,
         return
     v4 = <int>_math.floor(x)
     v5 = <int>_math.floor(y)
-    v6 = <int>_math.floor(v2 + 1.0)
+    probe_z = v2 + 1.0
+    v6 = <int>_math.floor(probe_z)
     if not (v6 > 239 or v6 < 0 or v5 > 511 or v5 < 0 or v4 > 511
             or not _solid_int(map_obj, v4, v5, v6)):
         return
@@ -889,13 +893,13 @@ def _check_for_ground_holes(position, velocity, dt, map_obj, crouch, hover,
             v15 = True
 
     v19 = v15
-    if (not v19) or v8 <= 0.2:
+    if (not v19) or v8 <= 0.2000000029802322:
         v20 = v17
-        if (not v20) or v13 <= 0.2:
+        if (not v20) or v13 <= 0.2000000029802322:
             if v19:
-                velocity.x = (v7 * dt) * 5.0
+                velocity.x = <float>((v7 * dt) * 5.0)
             if v20:
-                velocity.y = (v12 * dt) * 5.0
+                velocity.y = <float>((v12 * dt) * 5.0)
 
 
 def _sign(value):
@@ -906,50 +910,87 @@ def _sign(value):
     return 0.0
 
 
-def _collide_with_players(player, positions, dt):
-    if not positions:
+cdef class Player
+
+
+def _collide_with_players(Player player, positions, dt, resolve=True):
+    """Original world.pyd sub_10012710, including its ordered peer impulses."""
+    cdef float scale = <float>dt * 32.0
+    cdef float own_height, own_half, own_offset
+    cdef float candidate_x, candidate_y, candidate_z, other_height, other_half
+    cdef float other_x, other_y, other_z, dx, dy, dz, dist_sq, length
+    cdef float push, overlap, strength, nx, ny, inverse, impulse, nz
+    if not positions or not player._alive or player._exploded:
         return 0
 
     position = player.position
     velocity = player.velocity
-    own_body_height = _player_body_height(player.crouch, player.wade)
-    own_center_z = position.z + ((own_body_height - 0.45) - (0.5 * own_body_height))
-    scale = max(dt * 32.0, 1e-6)
+    own_height = (4.0 if player._crouch and not player._hover else 6.0) * 0.449999988079071
+    own_half = own_height * 0.5
+    own_offset = own_height - 0.449999988079071 - own_half
+    # Candidate is captured once; previous peers' impulses do not move it.
+    candidate_x = <float>position.x + <double><float>velocity.x * scale
+    candidate_y = <float>position.y + <double><float>velocity.y * scale
+    candidate_z = <float>position.z + <double><float>velocity.z * scale + own_offset
     collisions = 0
 
     for item in positions:
         try:
             ox, oy, oz = item[:3]
-            other_body_height = float(item[3]) if len(item) >= 4 else _PLAYER_STANDING_BODY_HEIGHT
+            other_height = float(item[3]) if len(item) >= 4 else 2.699999928474426
         except Exception:
             continue
 
-        dx = (position.x + (velocity.x * scale)) - float(ox)
-        dy = (position.y + (velocity.y * scale)) - float(oy)
-        dist_sq = (dx * dx) + (dy * dy)
-        push = max(0.0, 0.9 - _math.sqrt(dist_sq))
+        other_x, other_y = ox, oy
+        other_half = other_height * 0.5
+        other_z = other_height - 0.449999988079071 - other_half
+        other_z = float(oz) + other_z
+        dx = <double>candidate_x - other_x
+        dy = <double>candidate_y - other_y
+        dist_sq = <double>dx * dx + <double>dy * dy
+        length = _math.sqrt(dist_sq)
+        push = max(0.0, 0.8999999761581421 - length)
         if push <= 0.0:
             continue
 
-        other_center_z = float(oz) + ((other_body_height - 0.45) - (0.5 * other_body_height))
-        vertical_overlap = max(
-            0.0,
-            ((0.5 * other_body_height) + (0.5 * own_body_height)) - abs(own_center_z - other_center_z),
-        )
-        if vertical_overlap <= 0.0:
+        dz = <double>candidate_z - other_z
+        overlap = max(0.0, <double>other_half + own_half - abs(dz))
+        if overlap <= 0.0:
             continue
-
-        if vertical_overlap <= push:
-            velocity.z += (_sign(own_center_z - other_center_z) * (vertical_overlap / scale))
-        else:
-            length = _math.sqrt(dist_sq)
-            if length <= 0.0:
+        if not resolve:
+            collisions += 1
+            continue
+        if scale <= 0.0:
+            continue
+        if overlap > push:
+            strength = <double>push / scale
+            # This OR is present in x86 at0x1001299C..0x100129B8.
+            if dx == 0.0 or dy == 0.0:
                 nx, ny = 1.0, 0.0
             else:
-                nx = dx / length
-                ny = dy / length
-            velocity.x += nx * (push / scale)
-            velocity.y += ny * (push / scale)
+                inverse = 1.0 / length
+                nx = <double>dx * inverse
+                ny = <double>dy * inverse
+            impulse = <double>nx * strength
+            velocity.x = <float>(<float>velocity.x + <double>impulse)
+            impulse = <double>ny * strength
+            velocity.y = <float>(<float>velocity.y + <double>impulse)
+        else:
+            strength = <double>overlap / scale
+            # sub_10012AA7 normalizes (0,0,dz) through the same float
+            # square/sqrt/reciprocal stores, rather than substituting sign.
+            # The resulting Z can be one ULP below +/-1.
+            if dz == 0.0:
+                nz = 1.0
+            else:
+                dist_sq = <double>dz * dz
+                length = _math.sqrt(dist_sq)
+                inverse = 1.0 / length
+                nz = <double>dz * inverse
+            impulse = <double>nz * strength
+            velocity.z = <float>(<float>velocity.z + <double>impulse)
+            if dz < 0.0:
+                player._fall_distance = 0.0
         collisions += 1
 
     return collisions
@@ -990,18 +1031,19 @@ cdef class Player(Object):
     cdef bint _sprint
     cdef bint _up
     cdef bint _wade
-    cdef double _fall_distance
-    cdef double _climb_timer
-    cdef double _accel_multiplier
-    cdef double _sprint_multiplier
-    cdef double _crouch_sneak_multiplier
-    cdef double _jump_multiplier
-    cdef double _water_friction
-    cdef double _fall_min_distance
-    cdef double _fall_max_distance
-    cdef double _fall_max_damage
-    cdef double _fall_on_water_multiplier
-    cdef double _climb_slowdown
+    # The original native player stores these scalars in 32-bit fields.
+    cdef float _fall_distance
+    cdef float _climb_timer
+    cdef float _accel_multiplier
+    cdef float _sprint_multiplier
+    cdef float _crouch_sneak_multiplier
+    cdef float _jump_multiplier
+    cdef float _water_friction
+    cdef float _fall_min_distance
+    cdef float _fall_max_distance
+    cdef float _fall_max_damage
+    cdef float _fall_on_water_multiplier
+    cdef float _climb_slowdown
     cdef bint _can_sprint_uphill
 
     def initialize(self):
@@ -1198,25 +1240,40 @@ cdef class Player(Object):
         return None
 
     def set_crouch(self, crouch, players, noof_players):
+        cdef float old_z, lower_probe, upper_probe
         target = bool(crouch)
         crouch_shift = _movement_override("crouch_shift")
-        if target == self._crouch:
+        # Public wrapper0x10014100 passes hover crouch through while running
+        # the uncrouch clearance path with a zero target.
+        effective_target = target
+        if self._hover:
+            self._crouch = target
+            effective_target = False
+        if effective_target == self._crouch:
             return None
-        if target:
+        if effective_target:
             if not self._airborne:
-                self._position.z += crouch_shift
+                self._position.z = <float>(<float>self._position.z + crouch_shift)
             self._crouch = True
             return None
-        if self._parent is None or self._parent.map is None or not _aabb_collides(
-            self._parent.map,
-            self._position.x,
-            self._position.y,
-            self._position.z - crouch_shift,
-            _PLAYER_RADIUS,
-            _player_contact_offset(False, self._wade),
-        ):
-            self._position.z -= crouch_shift
-            self._crouch = False
+        # sub_10013270 first expands downward without moving airborne eyes.
+        # Only if that is blocked (or grounded) does it try a0.9 upward shift.
+        map_obj = self._parent.map if self._parent is not None else None
+        peers = players[:noof_players] if players else ()
+        old_z = self._position.z
+        lower_probe = old_z + 2.25
+        upper_probe = old_z - 1.350000023841858
+        self._crouch = False
+        can_stand = (self._airborne
+                     and not _clip_corners(map_obj, self._position.x, self._position.y, lower_probe)
+                     and not _collide_with_players(self, peers, 0.0, False))
+        if not can_stand:
+            self._position.z = <float>(old_z - <double><float>crouch_shift)
+            can_stand = (not _clip_corners(map_obj, self._position.x, self._position.y, upper_probe)
+                         and not _collide_with_players(self, peers, 0.0, False))
+            if not can_stand:
+                self._position.z = <float>(<float>self._position.z + <double><float>crouch_shift)
+        self._crouch = bool(self._hover or not can_stand)
         return None
 
     def set_dead(self, dead):
@@ -1294,19 +1351,27 @@ cdef class Player(Object):
         return float(_CUBE_SQ_DISTANCE)
 
     def update(self, dt, positions):
-        dt = float(dt)
+        # Match the explicit float stores in world.pyd sub_10012B80. Vector3
+        # is double-backed here, so each native velocity write must round
+        # independently, not only at the later voxel-collision boundary.
+        cdef float step = dt
+        cdef float gravity = _GLOBAL_GRAVITY
+        cdef float accel, divisor, horizontal_divisor, landing_speed
+        cdef float fall_delta, fall, damage_ratio, severe_threshold
+        cdef float normal_sq, normal_length, normal_inverse, ox, oy, sx, sy
+        cdef float death_angle, death_trig
+        dt = float(step)
         map_obj = self._parent.map if self._parent is not None else None
         # wade is NOT recomputed here: the live engine holds the previous
         # value while airborne and only re-evaluates it on ground contact
         # (after the move, below). Oracle-calibrated.
         jump_requested = bool(self._jump)
         was_airborne = bool(self._airborne)
-        # Retail consumes the one-frame request regardless of whether it can
-        # launch.  An airborne request is a no-op; it must not reassign the
-        # impulse every frame while SPACE remains held.
-        self._jump = False
-        jumped_this_frame = False
-        ordinary_jump_this_frame = False
+        # 0x10012D27..0x10012D48 computes the launch flag from the incoming
+        # request and only clears a held request for airborne infantry.
+        jumped_this_frame = jump_requested and not was_airborne
+        if was_airborne and not self._jetpack and not self._parachute:
+            self._jump = False
         if jump_requested:
             if self._jetpack_active and 1 <= self._jetpack <= 4:
                 # world.pyd Player.update @ 0x10012C2F..0x10012CB1 selects
@@ -1317,27 +1382,36 @@ cdef class Player(Object):
                 # ordinary -0.36 jump impulse produces a retail rollback as
                 # soon as client and server disagree by one contact frame.
                 if self._jetpack == 1:
-                    jetpack_thrust = 0.045
+                    jetpack_thrust = <double><float>0.045
                 elif self._jetpack == 2:
-                    jetpack_thrust = 0.0125
+                    jetpack_thrust = <double><float>0.0125
                 elif self._jetpack == 3:
-                    jetpack_thrust = 0.020
+                    jetpack_thrust = <double><float>0.020
                 else:
-                    jetpack_thrust = 0.025
-                self._velocity.z -= ((_GLOBAL_GRAVITY + 1.0) * jetpack_thrust) * 0.5
+                    jetpack_thrust = <double><float>0.025
+                self._velocity.z = <float>(<float>self._velocity.z - ((gravity + 1.0) * jetpack_thrust) * 0.5)
                 self._fall_distance = 0.0
                 # Native +104 is still jump_requested && !was_airborne for an
                 # active pack.  Character uses this flag for its post-physics
                 # network-position restore, so preserve it independently of
                 # which vertical impulse branch ran.
                 jumped_this_frame = not was_airborne
-            elif not was_airborne:
-                self._velocity.z = _movement_override("jump_impulse") * self._jump_multiplier
+            elif not self._jetpack_active and not was_airborne:
+                self._velocity.z = <float>(<double><float>_movement_override("jump_impulse") * self._jump_multiplier)
                 # Native boxclipmove owns the airborne transition.  Keeping
                 # the frame-start value through acceleration/friction gives a
                 # grounded launch one final ground-horizontal step.
                 jumped_this_frame = True
-                ordinary_jump_this_frame = True
+        elif self._hover and self._jetpack == 4:
+            # Retail world.pyd 0x10012CF4..0x10012D25: with no SPACE
+            # request, UGC Builder hover pins vertical speed; crouch instead
+            # subtracts (gravity + 1) * -0.025 * 0.5 to descend. The branch
+            # does not require jetpack_active (its advertised handoff is
+            # independent), and ordinary gravity remains gated by hover below.
+            if self._crouch:
+                self._velocity.z = <float>(<float>self._velocity.z - ((gravity + 1.0) * -0.02500000037252903) * 0.5)
+            else:
+                self._velocity.z = 0.0
         self._jump_this_frame = jumped_this_frame
 
         # Oracle-calibrated: accel is the selected class multiplier (the
@@ -1353,46 +1427,55 @@ cdef class Player(Object):
             accel = self._sprint_multiplier * _movement_override("sprint_multiplier_scale")
         else:
             accel = self._accel_multiplier * _movement_override("accel_multiplier_scale")
+        accel = <double>accel * step
         if self._airborne:
             # Engineer/UGC packs trade horizontal control for climb.  Retail
             # applies 0.1 while they are actively firing; normal/Rocketeer
             # packs and ordinary airborne movement retain the 0.5 factor.
-            if self._jetpack_active and not self._wade and self._jetpack in (3, 4):
-                accel *= 0.1
-            else:
+            if self._jetpack_active and not self._hover and self._jetpack in (3, 4):
+                accel = <double>accel * 0.1000000014901161
+            elif not self._jetpack_active or self._hover or self._jetpack in (1, 2):
                 accel *= 0.5
-        accel *= dt
 
         if (self._up or self._down) and (self._left or self._right):
-            accel *= _math.sqrt(0.5)
+            accel = <double>accel * 0.7071067690849304
 
-        ox, oy = _normalize_xy(self._orientation)
+        # sub_10011D00 stores squared length, sqrt and inverse separately.
+        ox, oy = self._orientation.x, self._orientation.y
+        normal_sq = <double>ox * ox + <double>oy * oy
+        if normal_sq > 0.0:
+            normal_length = _math.sqrt(normal_sq)
+            normal_inverse = 1.0 / normal_length
+            ox = <double>ox * normal_inverse
+            oy = <double>oy * normal_inverse
         sx, sy = self._s.x, self._s.y
         if self._up:
-            self._velocity.x += ox * accel
-            self._velocity.y += oy * accel
-        elif self._down:
-            self._velocity.x -= ox * accel
-            self._velocity.y -= oy * accel
+            self._velocity.x = <float>(<float>self._velocity.x + <double>ox * accel)
+            self._velocity.y = <float>(<float>self._velocity.y + <double>oy * accel)
+        if self._down:
+            self._velocity.x = <float>(<float>self._velocity.x - <double>ox * accel)
+            self._velocity.y = <float>(<float>self._velocity.y - <double>oy * accel)
         if self._left:
-            self._velocity.x -= sx * accel
-            self._velocity.y -= sy * accel
-        elif self._right:
-            self._velocity.x += sx * accel
-            self._velocity.y += sy * accel
+            self._velocity.x = <float>(<float>self._velocity.x - <double>sx * accel)
+            self._velocity.y = <float>(<float>self._velocity.y - <double>sy * accel)
+        if self._right:
+            self._velocity.x = <float>(<float>self._velocity.x + <double>sx * accel)
+            self._velocity.y = <float>(<float>self._velocity.y + <double>sy * accel)
+
+        # 0x10012E93: a recent climb scales XY before gravity and drag.
+        if self._climb_timer > 0.0:
+            self._velocity.x = <float>(<float>self._velocity.x * <double>self._climb_slowdown)
+            self._velocity.y = <float>(<float>self._velocity.y * <double>self._climb_slowdown)
 
         divisor = dt + 1.0
-        gravity_step = dt * _GLOBAL_GRAVITY
+        gravity_step = dt * gravity
         if self._jetpack_passive:
             # Atomic retail oracle: Engineer active+passive yields
             # (-0.020 + dt*0.75)/(1+dt). Passive is a distinct 0.75-gravity
             # state; normal active thrust leaves it false.
             gravity_step *= 0.75
-        elif self._parachute_active and self._parachute:
-            gravity_step *= 0.05
-        # Oracle-calibrated: gravity applies normally while wading (the
-        # airborne bounce frames during a water-floor settle show the full
-        # gravity step with wade=1). Only the crouch buoyancy differs.
+        elif self._parachute_active:
+            gravity_step *= 0.05000000074505806
         # Retail world.pyd applies gravity after assigning the jump impulse in
         # the same frame.  This ordering is collision-sensitive near voxel
         # edges: omitting the gravity step changes the first-frame vz enough
@@ -1401,13 +1484,11 @@ cdef class Player(Object):
         # stock world.pyd 0x10012EAD. The adjacent 0.75 multiplier belongs to
         # passive jetpack state (+180), not hover.
         if not self._hover:
-            if jumped_this_frame:
-                self._velocity.z += gravity_step
-            elif self._wade and self._crouch:
-                self._velocity.z += ((_GLOBAL_GRAVITY + 1.0) * 0.025) * 0.5
-            else:
-                self._velocity.z += gravity_step
-        self._velocity.z /= divisor
+            # 0x10012EB9's passive switch has no default gravity addition.
+            # There is no crouch/wade buoyancy branch in the original.
+            if not self._jetpack_passive or 1 <= self._jetpack <= 4:
+                self._velocity.z = <float>(<float>self._velocity.z + gravity_step)
+        self._velocity.z = <float>(<float>self._velocity.z / <double>divisor)
 
         # A deployed parachute cancels accumulated falling distance every
         # native update (world.pyd 0x10012CD0). It does not apply the adjacent
@@ -1430,8 +1511,10 @@ cdef class Player(Object):
             horizontal_divisor = (dt * _movement_override("ground_friction")) + 1.0
         else:
             horizontal_divisor = (dt * _movement_override("air_friction")) + 1.0
-        self._velocity.x /= horizontal_divisor
-        self._velocity.y /= horizontal_divisor
+        self._velocity.x = <float>(<float>self._velocity.x / <double>horizontal_divisor)
+        self._velocity.y = <float>(<float>self._velocity.y / <double>horizontal_divisor)
+        # 0x10012FB4 saves landing speed BEFORE corpse/player impulses.
+        landing_speed = self._velocity.z
 
         # Retail world.pyd Player.update @ 0x10013011..0x1001308D keeps dead
         # jetpack bodies in the native mover.  After ordinary gravity/drag it
@@ -1442,12 +1525,14 @@ cdef class Player(Object):
         # the top of update made server-side death prediction static and left
         # the grave at the original ground-level death position.
         if not self._alive and 1 <= self._jetpack <= 4:
-            self._velocity.z -= dt * 3.0
-            self._velocity.x += _math.sin(self._velocity.z * 10.0) * dt
-            self._velocity.y += _math.cos(self._velocity.z * 10.0) * dt
+            self._velocity.z = <float>(<float>self._velocity.z - dt * 3.0)
+            death_angle = self._velocity.z * 10.0
+            death_trig = _math.sin(death_angle)
+            self._velocity.x = <float>(<float>self._velocity.x + death_trig * dt)
+            death_trig = _math.cos(death_angle)
+            self._velocity.y = <float>(<float>self._velocity.y + death_trig * dt)
 
         _collide_with_players(self, positions, dt)
-        landing_speed = self._velocity.z
         move_start_z = self._position.z
         # Single-pass boxclipmove port (aoslib.world.so @0x3e90). It owns the
         # airborne/wade flags exactly as the compiled engine does: airborne is
@@ -1465,6 +1550,12 @@ cdef class Player(Object):
             self._airborne,
             self._wade,
         )
+        if new_crouch and not self._crouch:
+            # Auto-crouch in sub_10001710@0x10002758 shifts the OLD eye
+            # position before sub_10007820 measures falling displacement.
+            # The candidate/final position is unaffected by that old-state
+            # write, but even a tiny glide must clear the accumulated fall.
+            move_start_z = <float>(<float>move_start_z + <double><float>0.9)
         self._crouch = new_crouch
 
         # Native sub_10007820 accumulates actual downward displacement after
@@ -1484,28 +1575,17 @@ cdef class Player(Object):
             self._position.z = min(max(self._position.z, z1), z2)
 
         if climbed:
-            self._climb_timer = 0.1
-        else:
-            self._climb_timer = max(0.0, self._climb_timer - dt)
-
-        if ordinary_jump_this_frame:
-            # The ported box mover does not expose native's ordinary launch
-            # transition, so preserve the calibrated force for the -0.36
-            # branch.  Do not apply it merely because jump_this_frame is set:
-            # retail also sets that flag for a grounded active jetpack, whose
-            # much smaller thrust remains contact-controlled by boxclipmove.
-            self._airborne = True
-        else:
-            self._airborne = bool(airborne)
+            self._climb_timer = 0.1000000014901161
+        # sub_10007820 runs after every move, including the new climb frame.
+        self._climb_timer = max(0.0, <float>(<double>self._climb_timer - step))
+        self._airborne = bool(airborne)
         if wade_out is not None:
             self._wade = bool(wade_out)
 
-        # Defensive world-bottom clamp (the z=239 floor fill normally makes
-        # this unreachable; mirrors move_player's p.z>240 -> 239 guard).
+        # sub_10007820 0x1000793A..0x10007964 clamps the position to238.
+        # Velocity/airborne remain the result of the preceding move.
         if self._position.z > MAP_Z:
-            self._position.z = float(MAP_Z)
-            self._velocity.z = 0.0
-            collided_down = True
+            self._position.z = 238.0
 
         # world.pyd enters one shared post-box landing branch whenever Z
         # velocity is zero. This includes X/Y glides that may retain the
@@ -1518,7 +1598,7 @@ cdef class Player(Object):
                 self._up, self._down, self._left, self._right,
             )
 
-            fall = self._fall_distance * _GLOBAL_GRAVITY
+            fall = <double>self._fall_distance * gravity
             if self._jetpack_passive and 1 <= self._jetpack <= 4:
                 fall *= 0.75
             span = self._fall_max_distance - self._fall_min_distance
@@ -1545,8 +1625,8 @@ cdef class Player(Object):
             # later. Ordinary shallow landings keep XY; the separate >0.8
             # branch applies the stock severe-fall multiplier of exactly 0.5.
             severe_threshold = (
-                _SEVERE_LANDING_VELOCITY / _GLOBAL_GRAVITY
-                if _GLOBAL_GRAVITY > 0.0
+                <double><float>_SEVERE_LANDING_VELOCITY / gravity
+                if gravity > 0.0
                 else float("inf")
             )
             if landing_speed > severe_threshold:

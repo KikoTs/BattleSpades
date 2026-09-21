@@ -51,6 +51,7 @@ class ArenaMode(BaseMode):
         # Pre-round countdown
         self.countdown_started = False
         self.countdown_end_time = 0.0
+        self.next_round_at: float | None = None
         
         # Players alive this round
         self.alive_players: List['Player'] = []
@@ -67,11 +68,14 @@ class ArenaMode(BaseMode):
         self.current_round += 1
         self.round_started = False
         self.round_ended = False
+        self.next_round_at = None
         
         await self.broadcast_message(f"Round {self.current_round} - Get ready!")
         
         # Respawn all players
         for player in self.server.players.values():
+            if player.team not in (TEAM1, TEAM2):
+                continue
             spawn = resolve_player_spawn(self.server, player)
             player.spawn(*spawn)
         
@@ -83,7 +87,13 @@ class ArenaMode(BaseMode):
     
     async def on_tick(self, tick: int):
         """Check round state."""
+        if self.ended:
+            return
         current_time = time.time()
+        if self.next_round_at is not None:
+            if current_time >= self.next_round_at:
+                await self._start_new_round()
+            return
         
         # Handle countdown
         if self.countdown_started and not self.round_started:
@@ -109,6 +119,12 @@ class ArenaMode(BaseMode):
         self.round_started = True
         self.countdown_started = False
         self.round_start_time = time.time()
+        # The mode starts before bot/human joins. Freeze the actual roster at
+        # FIGHT, otherwise the first death can eliminate an apparently empty
+        # side even while its newly joined teammates are alive.
+        self.alive_players = [player for player in self.server.players.values()
+                              if player.team in (TEAM1, TEAM2)
+                              and player.alive and player.spawned]
         
         await self.broadcast_message("FIGHT!")
         logger.info(f"Round {self.current_round} started")
@@ -185,11 +201,10 @@ class ArenaMode(BaseMode):
     
     async def _schedule_next_round(self):
         """Schedule the next round."""
-        import asyncio
-        await asyncio.sleep(self.round_end_delay)
-        
         if not self.ended:
-            await self._start_new_round()
+            # on_tick is awaited by the authoritative simulation. Sleeping
+            # here suspends physics/network progress for the whole interval.
+            self.next_round_at = time.time() + self.round_end_delay
     
     async def _end_match(self, winner: int):
         """End the entire match."""

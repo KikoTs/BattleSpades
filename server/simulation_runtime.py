@@ -22,6 +22,10 @@ class SimulationRuntime:
     """Run deterministic fixed-delta ticks for one server instance."""
 
     MAX_CATCH_UP_STEPS = 5
+    # Preserve ordinary hitches, including a full-map snapshot for a late
+    # joiner. Longer machine suspends must not replay minutes of gameplay;
+    # two seconds is also within the player's 128-row input-history horizon.
+    MAX_CATCH_UP_SECONDS = 2.0
 
     def __init__(self, server: "BattleSpadesServer") -> None:
         self.server = server
@@ -42,11 +46,21 @@ class SimulationRuntime:
             last_time = current
             accumulator = min(
                 accumulator,
-                server.tick_interval * self.MAX_CATCH_UP_STEPS,
+                self.MAX_CATCH_UP_SECONDS,
             )
 
-            while accumulator >= server.tick_interval:
+            # Bound work per batch, not retained elapsed time. Clamping debt
+            # to five ticks discarded the rest of a snapshot/compression
+            # hitch permanently: a steady 60 Hz input stream then remained
+            # queued behind those lost ticks even after the server recovered.
+            steps = 0
+            while (
+                server.running
+                and accumulator >= server.tick_interval
+                and steps < self.MAX_CATCH_UP_STEPS
+            ):
                 accumulator -= server.tick_interval
+                steps += 1
                 server.loop_count += 1
                 await self.step()
                 # Publish every crossed 30 Hz cadence boundary.  Sending only
@@ -190,6 +204,8 @@ class SimulationRuntime:
                 # and caused a measurable rollover hitch.
                 continue
             await player.simulate_tick(server.tick_interval)
+            from server.profile_stats import tick as profile_tick
+            profile_tick(player, server, server.tick_interval)
             bots = getattr(server, "bots", None)
             observe_physics = getattr(bots, "observe_player_physics", None)
             if callable(observe_physics):
@@ -199,17 +215,29 @@ class SimulationRuntime:
         server = self.server
         if server.mode is None:
             return
-        await server.mode.on_tick(server.loop_count)
+        # Damage has already been accepted and KillAction published earlier
+        # in this step. Settle those events before on_tick may end the match
+        # at the time limit; otherwise final-frame kills retain their kill
+        # counters but lose personal/team points through mode.ended guards.
         budget = min(
             len(server._mode_events),
             int(getattr(server.config, "mode_event_drain_budget", 512)),
         )
+        timeout_remaining = getattr(server.mode, "_timeout_events_remaining", None)
+        if timeout_remaining is not None and not server.mode.ended:
+            # The first expired-clock check captured the last eligible batch.
+            # Finish only that remainder, then let on_tick choose the winner;
+            # newer arrivals cannot add points or prolong a saturated queue.
+            budget = min(budget, timeout_remaining)
         for _ in range(budget):
             name, args = server._mode_events.popleft()
             handler = getattr(server.mode, name, None)
             if handler is not None:
                 await handler(*args)
             await server.plugin_manager.call_event(name, *args)
+        if timeout_remaining is not None and not server.mode.ended:
+            server.mode._timeout_events_remaining = max(0, timeout_remaining - budget)
+        await server.mode.on_tick(server.loop_count)
 
     def _update_second_schedulers(self) -> None:
         server = self.server
@@ -235,7 +263,7 @@ class SimulationRuntime:
             )
             send_round_timer(server, remaining)
         if server.vote_manager.active:
-            server.vote_manager.tick(time.time())
+            server.vote_manager.tick()
 
     def _record_health(self, tick_ms: float) -> None:
         server = self.server

@@ -58,6 +58,7 @@ def test_relative_config_paths_are_anchored_to_runtime_root(
     assert Path(config.prefabs_path) == paths.prefabs
     assert Path(config.plugins_path) == paths.plugins
     assert Path(config.bans_path) == paths.bans
+    assert Path(config.revival.results_path) == tmp_path.resolve() / "state/round-results.sqlite3"
 
 
 def test_absolute_configured_map_path_is_preserved(tmp_path: Path) -> None:

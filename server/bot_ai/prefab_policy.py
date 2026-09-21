@@ -7,6 +7,58 @@ gameplay hot path or the isolated worker.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from itertools import islice
+from typing import Iterable
+
+Cell = tuple[int, int, int]
+Bounds = tuple[Cell, Cell]
+MAX_PROJECT_PREFABS = 20
+MAX_PROJECT_PREFAB_CELLS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class PrefabGeometry:
+    """Pickle-safe authored geometry prepared once outside worker decisions."""
+
+    name: str
+    cells_by_yaw: tuple[tuple[Cell, ...], ...]
+    bounds_by_yaw: tuple[Bounds, ...]
+    block_count: int
+
+
+def load_bot_prefab_geometry(names: Iterable[str]) -> tuple[PrefabGeometry, ...]:
+    """Load at most 20 small real KV6s at map/setup time, never per decision.
+
+    Uses the same configured registry and invscale=1 expansion as authoritative
+    placement. Missing and oversized geometry fails closed. The returned data
+    contains no native handles and can travel in a MapSnapshot.
+    """
+    from server.prefabs import get_registry, rotate_point
+
+    registry = get_registry()
+    result: list[PrefabGeometry] = []
+    seen: set[str] = set()
+    for value in islice(names, MAX_PROJECT_PREFABS):
+        name = str(value).lower()
+        if name in seen:
+            continue
+        seen.add(name)
+        model = registry.get(name)
+        if model is None:
+            continue
+        points = model.get_points()
+        if not 0 < len(points) <= MAX_PROJECT_PREFAB_CELLS:
+            continue
+        rotations = tuple(tuple(rotate_point(x, y, z, yaw, 0, 0)
+                                for x, y, z, _r, _g, _b in points)
+                          for yaw in range(4))
+        bounds = tuple((tuple(min(cell[axis] for cell in cells) for axis in range(3)),
+                        tuple(max(cell[axis] for cell in cells) for axis in range(3)))
+                       for cells in rotations)
+        result.append(PrefabGeometry(name, rotations, bounds, len(points)))
+    return tuple(result)
+
 
 BOT_PREFAB_BLOCK_COUNTS: dict[str, int] = {
     "prefab_caltrop": 11,

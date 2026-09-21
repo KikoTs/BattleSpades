@@ -2,12 +2,14 @@
 World Manager - handles map state and operations.
 """
 
+import asyncio
 import logging
 import math
 import os
 import random
 import struct
 import zlib
+from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import shared.constants as C
@@ -91,6 +93,112 @@ def _shift_sync_records(data: bytes, z_shift: int) -> bytes:
     return bytes(out)
 
 
+@dataclass(frozen=True)
+class MapSyncSnapshot:
+    """Immutable map-transfer work; native VXL access happens before capture."""
+
+    raw: bytes | None
+    overlay_data: bytes
+    z_shift: int
+    map_name: str
+    revision: int
+    full: bool
+    columns: frozenset[tuple[int, int]]
+    cached_chunks: tuple[bytes, ...] | None = None
+
+    def build_chunks(self) -> list[bytes] | None:
+        """Wrap/compress bytes only, safe to call from the map-sync worker."""
+        if self.cached_chunks is not None:
+            return list(self.cached_chunks)
+        if not self.full:
+            if not self.overlay_data:
+                return []
+            compressed = zlib.compress(self.overlay_data, 6)
+            return [compressed[i:i + 1024] for i in range(0, len(compressed), 1024)]
+        raw = self.raw
+        if not raw:
+            return None
+        MAP_SIZE = 512
+        MAP_PACKET_SIZE = 1024  # matches aoslib/vxl.pyx DEF MAP_PACKET_SIZE
+        n = len(raw)
+        out = bytearray()
+        overlays = {}
+        z_shift = self.z_shift
+        if self.overlay_data:
+            overlay_data = self.overlay_data
+            overlay_pos = 0
+            while overlay_pos < len(overlay_data):
+                record_start = overlay_pos
+                if overlay_pos + 8 > len(overlay_data):
+                    logger.warning("Truncated dirty-column coordinate record")
+                    return None
+                ox, oy = struct.unpack_from("<II", overlay_data, overlay_pos)
+                overlay_pos += 8
+                while True:
+                    if overlay_pos + 4 > len(overlay_data):
+                        logger.warning("Truncated dirty-column span record")
+                        return None
+                    span_words = overlay_data[overlay_pos]
+                    top_start = overlay_data[overlay_pos + 1]
+                    top_end = overlay_data[overlay_pos + 2]
+                    top_len = (
+                        top_end - top_start + 1
+                        if top_end >= top_start else 0
+                    )
+                    if span_words == 0:
+                        record_size = 4 + top_len * 4
+                        if overlay_pos + record_size > len(overlay_data):
+                            logger.warning("Truncated dirty-column final span")
+                            return None
+                        overlay_pos += record_size
+                        break
+                    record_size = span_words * 4
+                    if overlay_pos + record_size > len(overlay_data):
+                        logger.warning("Truncated dirty-column span payload")
+                        return None
+                    overlay_pos += record_size
+                overlays[(ox, oy)] = overlay_data[record_start:overlay_pos]
+        pos = 0
+        for y in range(MAP_SIZE):
+            for x in range(MAP_SIZE):
+                start = pos
+                # Walk this column's span list to its terminating span.
+                while True:
+                    if pos + 4 > n:
+                        logger.warning("Map walker overran %s at col (%d,%d) — "
+                                       "falling back to chunker", self.map_name, x, y)
+                        return None
+                    span_words = raw[pos]
+                    top_start = raw[pos + 1]
+                    top_end = raw[pos + 2]
+                    top_len = (top_end - top_start + 1) if top_end >= top_start else 0
+                    if span_words == 0:
+                        pos += 4 + top_len * 4   # header + top-run colours; last span
+                        break
+                    pos += span_words * 4        # whole span is span_words 4-byte words
+                current = overlays.pop((x, y), None)
+                if current is not None:
+                    out += current
+                else:
+                    out += struct.pack("<II", x, y)
+                    out += _shift_vxl_spans(raw[start:pos], z_shift)
+        if pos != n:
+            logger.warning("Map walker consumed %d/%d bytes of %s — falling back "
+                           "to chunker", pos, n, self.map_name)
+            return None
+        if overlays:
+            logger.warning(
+                "Dirty-column overlay contained out-of-map coordinates: %s",
+                sorted(overlays)[:8],
+            )
+            return None
+        compressed = zlib.compress(bytes(out), 6)
+        return [
+            compressed[i:i + MAP_PACKET_SIZE]
+            for i in range(0, len(compressed), MAP_PACKET_SIZE)
+        ]
+
+
 class WorldManager:
     """
     Manages the game world (map) state.
@@ -121,6 +229,11 @@ class WorldManager:
         # records, zlib-compressed, sliced into 1 KB packets). Built lazily on
         # first join, invalidated when a new map loads.
         self._full_sync_chunks: list[bytes] | None = None
+        # One immutable transfer job at a time bounds compression CPU/memory.
+        # Keep only the last topology revision, in addition to the pristine map.
+        self.map_sync_lock = asyncio.Lock()
+        self._prepared_sync_key: tuple[object, ...] | None = None
+        self._prepared_sync_chunks: tuple[bytes, ...] | None = None
         # Columns modified since map load — what a matched-CRC client is
         # missing relative to its local file. Sent as the MapSync delta.
         self.dirty_columns: set[tuple[int, int]] = set()
@@ -169,6 +282,8 @@ class WorldManager:
                 raw = handle.read()
             self.map_raw_bytes = raw
             self._full_sync_chunks = None
+            self._prepared_sync_key = None
+            self._prepared_sync_chunks = None
             self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
             self._air_override_masks = {}
@@ -214,6 +329,8 @@ class WorldManager:
         raw = self.map.generate_vxl()
         self.map_raw_bytes = raw
         self._full_sync_chunks = None
+        self._prepared_sync_key = None
+        self._prepared_sync_chunks = None
         self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
         self._air_override_masks = {}
@@ -1077,123 +1194,60 @@ class WorldManager:
             return None
         return self.map.get_chunker()
 
-    def iter_full_sync_chunks(self, snapshot_columns=None):
-        """Full-map MapSync payload as MAP_PACKET_SIZE (1024-byte) chunks.
+    def capture_map_sync(
+        self, snapshot_columns, *, full: bool
+    ) -> MapSyncSnapshot:
+        """Freeze VXL-dependent bytes on the gameplay thread before yielding.
 
-        The client's stream-builder consumes ``(u32 x, u32 y, column-spans)``
-        records (the same layout ``VXL.get_chunk`` emits). We build those
-        records by wrapping the RAW .vxl file's own column spans — which use
-        the native *implicit-underground* encoding (a final span with
-        span_words==0 means "solid to the map floor", so only the visible
-        surface colours are on the wire).
-
-        This is the crux of the 2026-07-09 Steam-client join crash: our
-        in-memory grid fills the underground solid for collision, and
-        ``get_chunk`` re-serialises every one of those filled voxels
-        *explicitly* — 36 MB uncompressed, which the strict client rejects
-        mid-build. Re-wrapping the raw spans instead keeps the exact record
-        format the client wants at ~5 MB (the client refills the underground
-        itself, so the world is still solid and correctly coloured).
-
-        Cached after first build (the raw file never changes at runtime).
-        Returns a list of byte chunks, or None if no raw bytes are available
-        or the file can't be walked cleanly (caller falls back to
-        get_chunker()).
+        The caller must capture its mutation watermark in the same event-loop
+        turn, then can wrap/compress this snapshot without touching the VXL.
         """
-        snapshot_columns = set(snapshot_columns or ())
-        if not snapshot_columns and self._full_sync_chunks is not None:
-            return self._full_sync_chunks
-        raw = self.map_raw_bytes
-        if not raw:
-            return None
-        MAP_SIZE = 512
-        MAP_PACKET_SIZE = 1024  # matches aoslib/vxl.pyx DEF MAP_PACKET_SIZE
-        n = len(raw)
-        out = bytearray()
-        overlays = {}
-        z_shift = int(getattr(self.map, "source_z_shift", 0)) if self.map is not None else 0
-        if snapshot_columns and self.map is not None:
-            overlay_data = bytes(self.map.serialize_columns(sorted(snapshot_columns)))
-            overlay_pos = 0
-            while overlay_pos < len(overlay_data):
-                record_start = overlay_pos
-                if overlay_pos + 8 > len(overlay_data):
-                    logger.warning("Truncated dirty-column coordinate record")
-                    return None
-                ox, oy = struct.unpack_from("<II", overlay_data, overlay_pos)
-                overlay_pos += 8
-                while True:
-                    if overlay_pos + 4 > len(overlay_data):
-                        logger.warning("Truncated dirty-column span record")
-                        return None
-                    span_words = overlay_data[overlay_pos]
-                    top_start = overlay_data[overlay_pos + 1]
-                    top_end = overlay_data[overlay_pos + 2]
-                    top_len = (
-                        top_end - top_start + 1
-                        if top_end >= top_start else 0
-                    )
-                    if span_words == 0:
-                        record_size = 4 + top_len * 4
-                        if overlay_pos + record_size > len(overlay_data):
-                            logger.warning("Truncated dirty-column final span")
-                            return None
-                        overlay_pos += record_size
-                        break
-                    record_size = span_words * 4
-                    if overlay_pos + record_size > len(overlay_data):
-                        logger.warning("Truncated dirty-column span payload")
-                        return None
-                    overlay_pos += record_size
-                overlays[(ox, oy)] = overlay_data[record_start:overlay_pos]
-        pos = 0
-        for y in range(MAP_SIZE):
-            for x in range(MAP_SIZE):
-                start = pos
-                # Walk this column's span list to its terminating span.
-                while True:
-                    if pos + 4 > n:
-                        logger.warning("Map walker overran %s at col (%d,%d) — "
-                                       "falling back to chunker", self.map_name, x, y)
-                        return None
-                    span_words = raw[pos]
-                    top_start = raw[pos + 1]
-                    top_end = raw[pos + 2]
-                    top_len = (top_end - top_start + 1) if top_end >= top_start else 0
-                    if span_words == 0:
-                        pos += 4 + top_len * 4   # header + top-run colours; last span
-                        break
-                    pos += span_words * 4        # whole span is span_words 4-byte words
-                current = overlays.pop((x, y), None)
-                if current is not None:
-                    out += current
-                else:
-                    out += struct.pack("<II", x, y)
-                    out += _shift_vxl_spans(raw[start:pos], z_shift)
-        if pos != n:
-            logger.warning("Map walker consumed %d/%d bytes of %s — falling back "
-                           "to chunker", pos, n, self.map_name)
-            return None
-        if overlays:
-            logger.warning(
-                "Dirty-column overlay contained out-of-map coordinates: %s",
-                sorted(overlays)[:8],
+        columns = frozenset(snapshot_columns or ())
+        revision = self.topology_version
+        cache_key = (id(self.map_raw_bytes), revision, bool(full), columns)
+        cached = (
+            self._prepared_sync_chunks
+            if self._prepared_sync_key == cache_key else None
+        )
+        if full and not columns and self._full_sync_chunks is not None:
+            cached = tuple(self._full_sync_chunks)
+        overlay = (
+            bytes(self.map.serialize_columns(sorted(columns)))
+            if cached is None and columns and self.map is not None else b""
+        )
+        return MapSyncSnapshot(
+            raw=self.map_raw_bytes,
+            overlay_data=overlay,
+            z_shift=int(getattr(self.map, "source_z_shift", 0)),
+            map_name=self.map_name,
+            revision=revision,
+            full=bool(full),
+            columns=columns,
+            cached_chunks=cached,
+        )
+
+    def cache_map_sync(
+        self, snapshot: MapSyncSnapshot, chunks: list[bytes]
+    ) -> None:
+        """Keep only one completed revision; never publish into a new map."""
+        if snapshot.raw is not self.map_raw_bytes:
+            return
+        if snapshot.full and not snapshot.columns:
+            self._full_sync_chunks = list(chunks)
+        if snapshot.revision == self.topology_version:
+            self._prepared_sync_key = (
+                id(self.map_raw_bytes), snapshot.revision, snapshot.full,
+                snapshot.columns,
             )
-            return None
-        compressed = zlib.compress(bytes(out), 6)
-        if snapshot_columns:
-            return [
-                compressed[i:i + MAP_PACKET_SIZE]
-                for i in range(0, len(compressed), MAP_PACKET_SIZE)
-            ]
-        self._full_sync_chunks = [
-            compressed[i:i + MAP_PACKET_SIZE]
-            for i in range(0, len(compressed), MAP_PACKET_SIZE)
-        ]
-        logger.info("Built full-sync stream for %s: %d records, %d B raw, %d B "
-                    "compressed, %d chunks", self.map_name, MAP_SIZE * MAP_SIZE,
-                    len(out), len(compressed), len(self._full_sync_chunks))
-        return self._full_sync_chunks
+            self._prepared_sync_chunks = tuple(chunks)
+
+    def iter_full_sync_chunks(self, snapshot_columns=None):
+        """Synchronous compatibility API; the live connection uses a worker."""
+        snapshot = self.capture_map_sync(snapshot_columns, full=True)
+        chunks = snapshot.build_chunks()
+        if chunks is not None:
+            self.cache_map_sync(snapshot, chunks)
+        return chunks
 
     def serialize_dirty_columns_compressed(self, snapshot_columns=None) -> bytes:
         """Serialize the columns changed since map load, zlib-compressed in

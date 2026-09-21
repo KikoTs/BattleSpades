@@ -10,6 +10,7 @@ pickle pipes or a spawned interpreter.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import replace
 import logging
 import threading
@@ -23,7 +24,11 @@ from .messages import (
     WorldDelta,
 )
 from .simple_navigation import SimpleVoxelWorld
-from .simple_worker import SimpleBotBrain
+from .planning_budget import PlanningBudget
+from .simple_worker import (
+    SimpleBotBrain, behavior_metrics_snapshot, decide_current_frame,
+    refresh_planning_observers,
+)
 from .supervisor import WorkerStatus
 
 
@@ -43,8 +48,11 @@ class AIThreadSupervisor:
         decision_hz: float = 8.0,
         path_requests_per_second: float = 24.0,
     ) -> None:
-        del seed, path_requests_per_second
+        del seed
         self.decision_hz = max(1.0, float(decision_hz))
+        self.path_requests_per_second = max(1.0, float(path_requests_per_second))
+        self._planning_metrics: dict[str, int | float] = {}
+        self._behavior_metrics: dict[str, object] = {}
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -75,6 +83,8 @@ class AIThreadSupervisor:
         """Start one owner thread and publish its initial map."""
 
         if self._thread is not None and self._thread.is_alive():
+            if self._stop.is_set():
+                raise RuntimeError("previous AI thread is still shutting down")
             self.publish_map(snapshot)
             return
         with self._lock:
@@ -117,7 +127,25 @@ class AIThreadSupervisor:
             self._intents.clear()
             self._terrain_pending.clear()
             self._terrain_overlay.clear()
-        self._thread = None
+        if thread is None or not thread.is_alive():
+            self._thread = None
+
+    def recover_if_stopped(self) -> bool:
+        """Restart an unexpectedly exited owner with its canonical terrain."""
+
+        with self._lock:
+            if (self._stop.is_set() or self._latest_snapshot is None
+                    or self._thread is None or self._thread.is_alive()):
+                return False
+            snapshot = replace(
+                self._latest_snapshot,
+                topology_version=self._terrain_version,
+                changed_cells=tuple(self._terrain_overlay.values()),
+            )
+            self._restarts += 1
+        logger.warning("AI thread exited unexpectedly; restoring current map and bots")
+        self.start(snapshot)
+        return True
 
     def publish_map(self, snapshot: MapSnapshot) -> None:
         """Atomically replace the map generation and all old queued facts."""
@@ -251,8 +279,19 @@ class AIThreadSupervisor:
                 awaiting_snapshot_transfer_id=None,
             )
 
+    def planning_metrics(self) -> dict[str, int | float]:
+        """Last bounded worker-owned profiling snapshot, safe for main-thread reads."""
+        with self._lock:
+            return dict(self._planning_metrics)
+
+    def behavior_metrics(self) -> dict[str, object]:
+        """Return a detached copy without reading the mutable worker brain."""
+        with self._lock:
+            return deepcopy(self._behavior_metrics)
+
     def _worker_main(self) -> None:
-        world = SimpleVoxelWorld()
+        world = SimpleVoxelWorld(planning_budget=PlanningBudget(
+            self.path_requests_per_second, decision_hz=self.decision_hz))
         brain = SimpleBotBrain(world, decision_hz=self.decision_hz)
         applied_snapshot_serial = -1
         batch_id = 0
@@ -312,18 +351,13 @@ class AIThreadSupervisor:
 
                 intents: list[BotIntent] = []
                 processed_frame_id = -1
+                refresh_planning_observers(world, frames)
                 for frame in frames:
                     processed_frame_id = max(
                         processed_frame_id,
                         int(frame.frame_id),
                     )
-                    if (
-                        int(frame.map_epoch) != int(world.map_epoch)
-                        or int(frame.topology_version)
-                        != int(world.topology_version)
-                    ):
-                        continue
-                    intent = brain.decide(frame)
+                    intent = decide_current_frame(world, brain, frame)
                     if intent is not None:
                         intents.append(intent)
             except Exception:
@@ -331,7 +365,8 @@ class AIThreadSupervisor:
                 # decision error. Recreate all private state from the retained
                 # canonical snapshot on the next batch.
                 logger.exception("Bounded AI thread batch failed; rebuilding")
-                world = SimpleVoxelWorld()
+                world = SimpleVoxelWorld(planning_budget=PlanningBudget(
+                    self.path_requests_per_second, decision_hz=self.decision_hz))
                 brain = SimpleBotBrain(world, decision_hz=self.decision_hz)
                 applied_snapshot_serial = -1
                 with self._lock:
@@ -342,6 +377,8 @@ class AIThreadSupervisor:
             batch_id += 1
             processed_at = time.monotonic()
             with self._lock:
+                self._planning_metrics = world.planning_budget.snapshot()
+                self._behavior_metrics = behavior_metrics_snapshot(brain)
                 for intent in intents:
                     if len(self._intents) >= _INTENT_LIMIT:
                         self._intents.popleft()

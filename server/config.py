@@ -10,6 +10,7 @@ import toml
 import shared.constants as C
 from server.game_rules import GameRules
 from server.lobby import LOBBY_MATCH_LENGTH_OPTIONS
+from server.join_greeting import DEFAULT_JOIN_GREETING, DEFAULT_MOTD
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
@@ -69,6 +70,8 @@ class BotConfig:
     # Zero disables the periodic deep reset; per-round state still resets.
     clean_slate_games: int = 3
     configured: bool = False
+    behavior_version: str = "cooperative"
+    friendly_mischief: bool = True
 
 
 @dataclass
@@ -128,6 +131,7 @@ class RevivalMasterConfig:
     require_identity: bool = False
     heartbeat_interval_seconds: float = 30.0
     request_timeout_seconds: float = 5.0
+    results_path: str = "state/round-results.sqlite3"
 
 
 @dataclass
@@ -141,6 +145,9 @@ class ServerConfig:
     tick_rate: int = 60
     # Stable uint64 identity used by InitialInfo for non-Steam dedicated hosts.
     steam_id: int = 90087911866072064
+    # Private, once-per-connection chat after the GameScene is ready.
+    join_greeting: str = DEFAULT_JOIN_GREETING
+    motd: list[str] = field(default_factory=lambda: list(DEFAULT_MOTD))
 
     # Network settings
     timeout_ms: int = 10000
@@ -298,7 +305,7 @@ class ServerConfig:
 
     # Per-mode setting overlays from config.toml [modes.<code>] tables.
     # e.g. mode_settings["tdm"] = {"score_limit": 200, "time_limit": 900,
-    # "kill_points": 1, "headshot_bonus": 1}. Empty = use mode_data defaults.
+    # "kill_points": 1, "headshot_bonus": 0}. Empty = use mode_data defaults.
     mode_settings: dict = field(default_factory=dict)
 
     # Logging
@@ -460,6 +467,16 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             s.get("tick_rate", config.tick_rate)
         )))
         config.steam_id = max(0, int(s.get("steam_id", config.steam_id)))
+        greeting = s.get("join_greeting", config.join_greeting)
+        if not isinstance(greeting, str):
+            raise ValueError("server.join_greeting must be a string")
+        config.join_greeting = greeting
+        motd = s.get("motd", config.motd)
+        if isinstance(motd, str):
+            motd = motd.splitlines()
+        if not isinstance(motd, list) or not all(isinstance(line, str) for line in motd):
+            raise ValueError("server.motd must be a string or an array of strings")
+        config.motd = list(motd)
 
     if "lobby" in data:
         lobby = data["lobby"]
@@ -663,6 +680,13 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             ),
         )
         config.bots.seed = int(b.get("seed", config.bots.seed))
+        behavior = str(b.get("behavior_version", config.bots.behavior_version)).lower()
+        if behavior not in {"classic", "cooperative"}:
+            raise ValueError("bots.behavior_version must be classic or cooperative")
+        config.bots.behavior_version = behavior
+        config.bots.friendly_mischief = bool(
+            b.get("friendly_mischief", config.bots.friendly_mischief)
+        )
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
         )
@@ -821,6 +845,11 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             revival.get("region", config.revival.region),
             31,
         ) or "europe"
+        config.revival.results_path = str(
+            revival.get("results_path", config.revival.results_path)
+        ).strip()
+        if not config.revival.results_path:
+            raise ValueError("revival.results_path cannot be empty")
         config.revival.official = bool(
             revival.get("official", config.revival.official)
         )

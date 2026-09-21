@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from server.bot_ai.messages import ObjectiveSnapshot, PerceptionFrame, PlayerSnapshot
 from server.bot_ai.policies import (
@@ -93,10 +94,27 @@ def test_vip_guard_and_attacker_have_distinct_goals() -> None:
 
 
 def test_arena_wounded_bot_regroups_without_enemy_knowledge() -> None:
-    wounded = _player(1, 2, health=30)
+    wounded = replace(_player(1, 2, health=30), last_damage_at=time.monotonic())
     teammate = _player(4, 2, position=(12.0, 8.0, 10.0))
 
     assert objective_goal_for(_frame("arena", wounded, teammate), wounded) == teammate.position
+
+
+def test_tdm_wounded_squad_resumes_its_goal_after_a_short_regroup() -> None:
+    now = time.monotonic()
+    wounded = replace(_player(1, 2, health=30), last_damage_at=now - 1.0)
+    teammate = _player(4, 2, position=(12.0, 8.0, 10.0))
+    anchor = ObjectiveSnapshot("team_anchor", 3, (400.0, 250.0, 10.0))
+    frame = replace(_frame("tdm", wounded, teammate, objectives=(anchor,)), created_at=now)
+    assert objective_decision_for(frame, wounded).role == "tdm_regroup_wounded"
+    later = replace(frame, created_at=now + 10.0)
+    decision = objective_decision_for(later, wounded)
+    assert decision.role == "team_assault_enemy_side"
+    assert decision.position != teammate.position
+    arena = replace(frame, mode_id="arena")
+    assert objective_decision_for(arena, wounded).role == "arena_regroup"
+    arena_later = replace(arena, created_at=now + 10.0)
+    assert objective_decision_for(arena_later, wounded).role == "arena_elimination_push"
 
 
 def test_classic_ctf_does_not_track_a_hidden_enemy_carrier() -> None:

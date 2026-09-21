@@ -1,0 +1,8 @@
+# Replace the documentation-only address with this machine's public IPv4.
+# This table preserves client source addresses; UFW filters the translated port.
+table ip battlespades_retail {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr 203.0.113.10 udp dport 32887 counter redirect to :27015
+    }
+}

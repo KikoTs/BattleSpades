@@ -6,10 +6,13 @@ import asyncio
 import argparse
 from collections import Counter
 import math
+import json
+import hashlib
 import os
 import random
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,21 +41,43 @@ async def _run(
     trace_state: bool = False,
     seed: int | None = None,
     detect_team_congestion: bool = False,
+    worker_backend: str | None = None,
+    full_runtime: bool = False,
+    report_path: Path | None = None,
+    behavior_version: str | None = None,
+    config_path: Path | None = None,
+    trace_path: Path | None = None,
+    detect_travel_loops: bool = False,
+    detect_objective_abandonment: bool = False,
 ) -> None:
+    if detect_travel_loops and trace_path is None:
+        raise ValueError("--detect-travel-loops requires --trace-jsonl")
+    if detect_objective_abandonment and (trace_path is None or str(mode_name).lower() not in {"vip", "ctf", "cctf"}):
+        raise ValueError("--detect-objective-abandonment requires VIP/CTF and --trace-jsonl")
+    runner_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    def source_hashes():
+        return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted((ROOT / "server/bot_ai").glob("*.py"))}
+    initial_source_hashes = source_hashes()
     if seed is not None:
         # WorldManager deliberately uses the module RNG when shuffling authored
         # spawn candidates. Seed both that path and the bot profile factory so
         # a field report can be reduced to one replayable match.
         random.seed(int(seed))
-    config = load_config(ROOT / "config.toml")
+    config = load_config(config_path or ROOT / "config.toml")
     config.default_mode = str(mode_name).lower()
     if map_name is not None:
         config.default_map = str(map_name)
     config.bots.population_mode = "admin"
+    if behavior_version is not None:
+        config.bots.behavior_version = behavior_version
     config.bots.max_bots = max(1, int(bot_count))
+    config.max_players = max(config.max_players, config.bots.max_bots)
     if seed is not None:
         config.bots.seed = int(seed)
-    if restart_worker_at is not None:
+    if worker_backend is not None:
+        config.bots.worker = worker_backend
+    elif restart_worker_at is not None:
         # Killing a child is specifically a process-backend acceptance.
         config.bots.worker = "process"
     server = BattleSpadesServer(config)
@@ -66,6 +91,9 @@ async def _run(
     director = BotDirector(server)
     server.bots = director
     await director.start(initial_count=config.bots.max_bots)
+    if len(director.bots) != config.bots.max_bots:
+        await director.close()
+        raise RuntimeError("smoke could not create the requested bot population")
     starts = {bot.id: bot.position for bot in director.bots}
     unsafe_spawns = {
         bot.id: bot.position
@@ -113,6 +141,10 @@ async def _run(
         water_started[bot.id] = anchor
 
     previous_positions = {bot.id: bot.position for bot in director.bots}
+    missing_intent_since: dict[int, float] = {}
+    max_intent_gap = {bot.id: 0.0 for bot in director.bots}
+    was_alive = {bot.id: bot.alive for bot in director.bots}
+    respawns = {bot.id: 0 for bot in director.bots}
     progress_positions = dict(previous_positions)
     requested_stall_ticks = {bot.id: 0 for bot in director.bots}
     max_requested_stall_ticks = {bot.id: 0 for bot in director.bots}
@@ -137,7 +169,18 @@ async def _run(
     restart_observed = False
     loop = asyncio.get_running_loop()
     next_tick_at = loop.time()
+    tick_costs: list[float] = []
+    role_samples: Counter[str] = Counter()
+    action_results: Counter[str] = Counter()
+    last_feedback: dict[int, int] = {}
+    cpu_started = time.process_time()
+    wall_started = time.perf_counter()
+    trace_stream = None
     try:
+        if trace_path is not None:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_stream = trace_path.open("w", encoding="utf-8")
+        trace_steps = max(1, round(.1 / server.tick_interval))
         progress_steps = (
             max(1, int(float(progress_every) / server.tick_interval))
             if progress_every > 0.0
@@ -151,19 +194,44 @@ async def _run(
                 and elapsed >= float(restart_worker_at)
             ):
                 if original_pid is None:
-                    raise RuntimeError("worker has no process id")
-                # This PID came from our director; never enumerate or kill an
-                # unrelated Python process during the recovery acceptance.
-                os.kill(original_pid, signal.SIGTERM)
+                    director.supervisor.request_restart()
+                else:
+                    # This PID came from our director; only kill our child.
+                    os.kill(original_pid, signal.SIGTERM)
                 restart_requested = True
             server.loop_count += 1
-            await director.update(server.tick_interval)
-            director.drain_actions(limit=1)
-            await server.simulation_runtime._simulate_players()
+            tick_started = time.perf_counter()
+            if full_runtime:
+                await server.simulation_runtime.step()
+            else:
+                await director.update(server.tick_interval)
+                director.drain_actions(limit=1)
+                await server.simulation_runtime._simulate_players()
+            tick_costs.append((time.perf_counter() - tick_started) * 1000)
             now = asyncio.get_running_loop().time()
+            trace_objectives = ()
+            if trace_stream is not None and step % trace_steps == 0:
+                trace_objectives = tuple({"kind": objective.kind, "team": objective.team,
+                    "position": objective.position, "carrier_id": objective.carrier_id,
+                    "state": objective.state} for objective in director._snapshot_objectives()
+                    if objective.kind in {"vip", "team_anchor", "ctf_base", "ctf_intel"})[:16]
             for bot in director.bots:
                 runtime = director._runtime.get(bot.id)
                 intent = runtime.intent if runtime is not None else None
+                if intent is not None:
+                    role_samples[intent.debug_role.split(":")[0]] += 1
+                if runtime is not None and runtime.feedback_action_frame != last_feedback.get(bot.id):
+                    last_feedback[bot.id] = runtime.feedback_action_frame
+                    if runtime.feedback_action_kind:
+                        action_results[runtime.feedback_action_kind + (":accepted" if runtime.feedback_action_accepted else ":rejected")] += 1
+                if bot.alive and not was_alive[bot.id]:
+                    respawns[bot.id] += 1
+                was_alive[bot.id] = bot.alive
+                if bot.alive and bot.spawned and (intent is None or intent.expires_at <= now):
+                    since = missing_intent_since.setdefault(bot.id, now)
+                    max_intent_gap[bot.id] = max(max_intent_gap[bot.id], now - since)
+                else:
+                    missing_intent_since.pop(bot.id, None)
                 requested = (
                     intent is not None
                     and intent.expires_at > now
@@ -214,6 +282,72 @@ async def _run(
                         ),
                     }
                 previous_positions[bot.id] = bot.position
+                if trace_stream is not None and step % trace_steps == 0:
+                    look = intent.look if intent is not None else None
+                    terrain_target = (intent.action.position if intent else None)
+                    if terrain_target is None and runtime and runtime.pending_action:
+                        terrain_target = runtime.pending_action.position
+                    terrain_cell = (tuple(math.floor(value) for value in terrain_target)
+                                    if terrain_target is not None else None)
+                    record = {
+                        "t": round(elapsed, 4), "id": bot.id,
+                        "wall_t": round(time.perf_counter() - wall_started, 6),
+                        "life": bot.replication_generation,
+                        "team": bot.team, "class_id": bot.class_id,
+                        "score": bot.score,
+                        "carried_entity_id": int(bot.pickup_id if bot.pickup_id is not None else -1),
+                        "pickup_burdensome": bool(bot.pickup_burdensome),
+                        "shoot_with_intel": bool(getattr(server.mode, "shoot_with_intel", False)),
+                        "mode_state": {
+                            "mode": config.default_mode,
+                            "phase": getattr(getattr(server.mode, "phase", None), "name", None),
+                            "vips": {str(team): player.id if player is not None else None
+                                     for team, player in getattr(server.mode, "vips", {}).items()},
+                            "vip_alive": getattr(server.mode, "vip_alive", {}),
+                            "respawn_enabled": getattr(server.mode, "respawn_enabled", {}),
+                            "team_scores": {str(team): value.score for team, value in server.teams.items()},
+                            "objectives": trace_objectives,
+                        },
+                        "alive": bot.alive, "spawned": bot.spawned, "health": bot.health,
+                        "position": bot.position,
+                        "topology_version": server.world_manager.topology_version,
+                        "terrain_target": ({
+                            "cell": terrain_cell,
+                            "solid": server.world_manager.get_solid(*terrain_cell),
+                            "damage": server.world_manager.block_damage.get(terrain_cell, 0.0),
+                        } if terrain_cell is not None else None),
+                        "velocity": bot.velocity,
+                        "eye": (bot.eye_x, bot.eye_y, bot.eye_z),
+                        "orientation": (bot.o_x, bot.o_y, bot.o_z),
+                        "grounded": bot.grounded, "wade": bot.wade, "tool": bot.tool,
+                        "dry_safe": bool(bot.grounded and not bot.wade
+                                         and server.world_manager.spawn_position_is_safe(bot.position)),
+                        "intent_fresh": bool(intent and intent.expires_at > now),
+                        "intent_age_seconds": round(now - intent.created_at, 6) if intent else None,
+                        "role": intent.debug_role if intent else None,
+                        "goal": intent.debug_goal if intent else None,
+                        "path": intent.debug_path if intent else None,
+                        "navigation": dict(intent.debug_navigation) if intent else None,
+                        "movement": intent.movement.direction if intent else None,
+                        "sprint": intent.movement.sprint if intent else None,
+                        "travel_source": intent.movement.travel_source if intent else None,
+                        "travel_waypoint": intent.movement.travel_waypoint if intent else None,
+                        "affordance": intent.movement.affordance.value if intent else None,
+                        "look": look.target if look else None,
+                        "visible": look.visible if look else None,
+                        "target_id": getattr(look, "target_player_id", -1),
+                        "action": intent.action.kind.value if intent else None,
+                        "action_position": intent.action.position if intent else None,
+                        "feedback": (runtime.feedback_action_kind,
+                                     runtime.feedback_action_accepted,
+                                     runtime.feedback_action_frame) if runtime else None,
+                        "feedback_reason": runtime.feedback_reason if runtime else None,
+                        "pending": runtime.pending_action.kind.value if runtime and runtime.pending_action else None,
+                        "pending_position": runtime.pending_action.position if runtime and runtime.pending_action else None,
+                        "motor": (runtime.motor.yaw, runtime.motor.pitch,
+                                  runtime.motor.yaw_velocity, runtime.motor.pitch_velocity) if runtime else None,
+                    }
+                    trace_stream.write(json.dumps(record) + "\n")
                 history = position_history[bot.id]
                 history.append((elapsed, bot.position))
                 cutoff = elapsed - 8.0
@@ -222,9 +356,8 @@ async def _run(
                 if (
                     bot.id in water_started
                     and bot.id not in water_exit_seconds
-                    and not server.world_manager.is_water_column(
-                        int(bot.x), int(bot.y)
-                    )
+                    and bot.alive and bot.grounded and not bot.wade
+                    and server.world_manager.spawn_position_is_safe(bot.position)
                 ):
                     water_exit_seconds[bot.id] = elapsed
 
@@ -305,15 +438,15 @@ async def _run(
             # Match the production ordering boundary: bot action suggestions
             # arrive before physics; their shared terrain mutations commit
             # only after that tick's native Player simulation.
-            server.world_mutations.commit_ready()
-            server.prefab_actions.tick()
+            if not full_runtime:
+                server.world_mutations.commit_ready()
+                server.prefab_actions.tick()
             status = director.status()
             if (
                 restart_requested
                 and status.running
                 and status.restarts >= 1
-                and status.process_id is not None
-                and status.process_id != original_pid
+                and (original_pid is None or status.process_id != original_pid)
             ):
                 restart_observed = True
             if progress_steps and step > 0 and step % progress_steps == 0:
@@ -418,12 +551,90 @@ async def _run(
                         )
                     print("runtime_bot_state", rows, flush=True)
             next_tick_at += server.tick_interval
+            if trace_stream is not None and step % 60 == 0:
+                trace_stream.flush()
             await asyncio.sleep(max(0.0, next_tick_at - loop.time()))
         moved = {
             bot.id: math.dist(starts[bot.id], bot.position)
             for bot in director.bots
         }
         status = director.status()
+        try:
+            import psutil
+        except ImportError:
+            process_memory = None
+        else:
+            memory = psutil.Process().memory_info()
+            process_memory = {"rss_bytes": memory.rss,
+                              "peak_rss_bytes": getattr(memory, "peak_wset", memory.rss)}
+        travel_review = None
+        objective_review = None
+        objective_reviewer = None
+        if trace_stream is not None:
+            trace_stream.flush()
+            from scripts.bot_trace_review import review
+            trace_rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            travel_review = review(trace_rows)
+            if config.default_mode == "vip":
+                from scripts.bot_objective_review import review as review_objectives
+                objective_review = review_objectives(trace_rows)
+                objective_reviewer = "scripts/bot_objective_review.py"
+            elif config.default_mode in {"ctf", "cctf"}:
+                from scripts.bot_ctf_review import review as review_objectives
+                objective_review = review_objectives(trace_rows)
+                objective_reviewer = "scripts/bot_ctf_review.py"
+        report = {
+            "map": config.default_map, "mode": config.default_mode,
+            "seconds": seconds, "bots": len(director.bots),
+            "worker": config.bots.worker, "full_runtime": full_runtime,
+            "restarts": status.restarts, "restart_observed": restart_observed,
+            "max_intent_gap_seconds": max_intent_gap, "respawns": respawns,
+            "deaths": {bot.id: bot.deaths for bot in director.bots},
+            "water_started": water_started,
+            "water_exit_seconds": water_exit_seconds,
+            "max_requested_stall_seconds": {
+                key: ticks * server.tick_interval for key, ticks in max_requested_stall_ticks.items()
+            },
+            "world_mutations": server.metrics.committed_world_mutations,
+            "behavior_version": config.bots.behavior_version,
+            "config_path": str(config_path) if config_path else None,
+            "trace_path": str(trace_path) if trace_path else None,
+            "seed": seed,
+            "effective_bot_seed": config.bots.seed,
+            "source_sha256": initial_source_hashes,
+            "source_unchanged_during_run": initial_source_hashes == source_hashes(),
+            "smoke_runner_sha256": runner_sha256,
+            "smoke_runner_unchanged_during_run": runner_sha256 == hashlib.sha256(
+                Path(__file__).read_bytes()).hexdigest(),
+            "trace_reviewer_sha256": hashlib.sha256(
+                (ROOT / "scripts/bot_trace_review.py").read_bytes()).hexdigest() if trace_stream else None,
+            "travel_review": travel_review,
+            "objective_review": objective_review,
+            "objective_reviewer_sha256": hashlib.sha256(
+                (ROOT / objective_reviewer).read_bytes()).hexdigest() if objective_reviewer else None,
+            "runtime_metrics": server.metrics.snapshot(),
+            "planning_metrics": getattr(director.supervisor, "planning_metrics", lambda: {})(),
+            "behavior_metrics": getattr(director.supervisor, "behavior_metrics", lambda: {})(),
+            "role_samples": dict(role_samples), "action_results": dict(action_results),
+            "tick_ms": {"p95": sorted(tick_costs)[min(len(tick_costs) - 1, int(len(tick_costs) * .95))],
+                        "p99": sorted(tick_costs)[min(len(tick_costs) - 1, int(len(tick_costs) * .99))],
+                        "max": max(tick_costs, default=0)},
+            "host_process_cpu_seconds": time.process_time() - cpu_started,
+            "host_process_memory": process_memory,
+            "elapsed_wall_seconds": time.perf_counter() - wall_started,
+        }
+        if report_path is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if detect_travel_loops and travel_review["suspected_travel_loops"]:
+            raise RuntimeError(f"repeated native travel loops: {travel_review['suspected_travel_loops']}")
+        if detect_objective_abandonment:
+            if not objective_review["objective_state_recorded"]:
+                raise RuntimeError("objective acceptance lacks authoritative objective telemetry")
+            if objective_review["findings"]:
+                raise RuntimeError(f"native objective abandonment: {objective_review['findings']}")
+        if max(max_intent_gap.values(), default=0.0) >= 5.0:
+            raise RuntimeError(f"bots lost fresh intents for >=5s: {max_intent_gap}")
         if not status.running:
             raise RuntimeError(f"worker unavailable after smoke: {status}")
         if restart_worker_at is not None and not restart_observed:
@@ -487,7 +698,7 @@ async def _run(
             bot.id: bot.position
             for bot in director.bots
             if bot.id in water_started
-            and server.world_manager.is_water_column(int(bot.x), int(bot.y))
+            and bot.id not in water_exit_seconds
         }
         if water_remaining:
             raise RuntimeError(
@@ -525,6 +736,8 @@ async def _run(
             f"entities={[(entity.type, entity.player_id) for entity in server.entity_registry.all()]}",
         )
     finally:
+        if trace_stream is not None:
+            trace_stream.close()
         await director.close()
 
 
@@ -534,6 +747,19 @@ if __name__ == "__main__":
     parser.add_argument("--bots", type=int, default=2)
     parser.add_argument("--mode", default="tdm")
     parser.add_argument("--map", default=None)
+    parser.add_argument("--worker", choices=("thread", "process"), default=None)
+    parser.add_argument("--behavior", choices=("classic", "cooperative"), default=None)
+    parser.add_argument("--full-runtime", action="store_true",
+                        help="include mode events, projectiles, respawns and entities")
+    parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None,
+                        help="use a specific match configuration instead of repository defaults")
+    parser.add_argument("--trace-jsonl", type=Path, default=None,
+                        help="record native positions, aim, task and action ownership at 10 Hz")
+    parser.add_argument("--detect-travel-loops", action="store_true",
+                        help="fail suspected 20/30-second travel loops (requires --trace-jsonl)")
+    parser.add_argument("--detect-objective-abandonment", action="store_true",
+                        help="fail sustained VIP/CTF objective abandonment (requires --trace-jsonl)")
     parser.add_argument(
         "--water-spawn-bots",
         type=int,
@@ -581,5 +807,13 @@ if __name__ == "__main__":
             trace_state=args.trace_state,
             seed=args.seed,
             detect_team_congestion=args.detect_team_congestion,
+            worker_backend=args.worker,
+            full_runtime=args.full_runtime,
+            report_path=args.json,
+            behavior_version=args.behavior,
+            config_path=args.config,
+            trace_path=args.trace_jsonl,
+            detect_travel_loops=args.detect_travel_loops,
+            detect_objective_abandonment=args.detect_objective_abandonment,
         )
     )

@@ -13,6 +13,13 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import shared.constants as C
+from server.flight_profile import profile_for
+from server.deployable_inventory import (
+    commit_deployable_use,
+    deployable_ready,
+    reset_deployable_inventory,
+    restock_deployable_inventory,
+)
 from server.game_constants import (
     BLOCK_TOOL_IDS,
     DEFAULT_WEAPON_TOOL,
@@ -40,43 +47,25 @@ logger = logging.getLogger(__name__)
 # 4 flying_consumption, 5 burdened_slowdown, 6 refill_delay_due_damage,
 # 7 fall_damage_multiplier, 8 death_acceleration).
 _JETPACK_PROPERTIES: dict = dict(getattr(C, "JETPACK_PROPERTIES", {}) or {})
-# ClientData carries no jetpack-active acknowledgement. Two deferred physics
-# recurrences are the closest common scheduling phase recovered from retail
-# captures. ReplicationService owns the delivery handoff and, critically,
-# withholds the inactive owner row until release/landing: the high-thrust pack
-# cannot represent its remaining half-frame phase with another integer delay.
+# Compatibility heuristic, not an original-client rule: ClientData carries no
+# jetpack-active acknowledgement. The original Player.set_jetpack_active writes
+# native state immediately on receipt (player.pyd 0x1000BEE3/0x1000C011), but does
+# not reveal the original server's activation schedule. Preserve this existing
+# two-frame estimate until the server-side resource timeline is recovered.
 JETPACK_ACTIVATION_DEFER_FRAMES = 2
 
 JUMP_BUFFER_SECONDS = 0.25
 POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
 
-# The client stamps every ClientData with its loop_count. Measured live
-# (2026-06-12 evening): the packet stamped N arrives while the server runs
-# tick N — i.e. it RACES the tick boundary, and ~per-packet it is applied
-# at tick N or N+1 nondeterministically. That jitter is what made self-row
-# reconciliation yank the walking player by exactly one step (the client
-# pairs our row against its history at the stamp; a coin-flip input lag
-# cannot be compensated by any fixed stamp offset).
-#
-# INPUT_DELAY_TICKS=1 makes the pairing exact BY CONSTRUCTION: tick N
-# simulates with input N-1 (always arrived), and the WorldUpdate stamp
-# (loop_count - INPUT_DELAY_TICKS) labels the snapshot with the input tick
-# actually used — our post-tick-N state equals the client's post-frame-
-# (N-1) state bit-for-bit (same input sequence, same engine), so self-row
-# corrections are zero-diff. Costs 16.7ms of server-side input latency,
-# invisible under client prediction.
+# ClientData carries a client loop label, not a server tick or delivery ACK.
+# Keep the compatibility latch; it does not prove arrival by any deadline or
+# bit-exact agreement. Retail stores history before native movement and can
+# relabel its loop during ClockSync. Simulation consumes accepted input frames
+# rather than deriving elapsed time from gaps between those labels.
 INPUT_DELAY_TICKS = 1
 INPUT_HISTORY_LIMIT = 128
 PENDING_VELOCITY_IMPULSE_LIMIT = 64
 OWNER_ANCHOR_HISTORY_LIMIT = 128
-# Keep the server's jump launch anchor within the sub-voxel phase range proven
-# by foreground stock-client captures. Character.update_alive's cached-anchor
-# restore remains untouched in the client; this server guard only prevents an
-# already-stale owner row from becoming the next authoritative launch state.
-JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE = 0.25
-JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE_SQ = (
-    JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE ** 2
-)
 IDLE_INPUT_FLAGS = (False, False, False, False, False, False, False, False)
 # Slack on the server-side fire-rate gate: one 60Hz sim tick (~16.7ms).
 FIRE_RATE_GRACE = 1.0 / 60.0
@@ -340,6 +329,7 @@ class Player:
         self.disguise_stock: int = 0
         self._disguise_next_use: float = 0.0
         self._reset_equipment_state()
+        reset_deployable_inventory(self)
         self.last_shot_time: float = 0.0
         self.next_shot_time: float = 0.0
         self.reload_end_time: float = 0.0
@@ -356,8 +346,9 @@ class Player:
         self.god_mode: bool = False
         self.is_bot: bool = False
         # Jetpack (per-class equipment; JETPACK_PROPERTIES keys 66-69).
-        # Fuel model mirrors the client's local sim so hover reconciliation
-        # stays close (constants extracted from the client 2026-07-07).
+        # Resource constants come from the client. Its character/world modules
+        # consume replicated state; the server resource recurrence is a local
+        # compatibility policy, not a recovered client fuel simulation.
         self.jetpack_id: int = 0            # 0 / NO_JETPACK(65) = none
         self.jetpack_fuel: float = 100.0
         # ``jetpack_active`` is the state advertised to the retail owner in
@@ -367,21 +358,23 @@ class Player:
         self.jetpack_active: bool = False
         self._jetpack_physics_active: bool = False
         self._jetpack_activation_defer_remaining: int = 0
-        # Exhaustion finishes the current active recurrence and one already
-        # predicted recurrence before ordinary held-SPACE movement resumes.
+        # Compatibility tail retained from prior capture work; the original
+        # client does not prove an extra authoritative exhaustion recurrence.
         self._jetpack_exhaustion_tail_remaining: int = 0
         self._jetpack_requires_release: bool = False
         self._hover_since: float = 0.0
+        self._jetpack_idle_seconds: float = 0.0
         self._last_damage_at: float = 0.0
         self._last_combat_damage_at: float = 0.0
         self._last_damage_source_id: int = -1
         self._last_damage_source_position = None
         self.parachute_id: int = 0
         self.parachute_active: bool = False
-        # The retail client's default ``hover`` binding is Z (key code 122).
-        # Keep a separate edge latch because jump and hover are independent
-        # ClientData bits and UGC jetpacks also consume hover.
+        # Our maintained client patch routes the Z key to the hover bit for
+        # parachutes. Stock Character.set_hover accepts only pack 69, so this
+        # deployment latch is compatibility policy, not original input logic.
         self._parachute_deploy_last_held: bool = False
+        self._parachute_deploy_pending: bool = False
         self.disguised: bool = False        # specialist disguise toggle
         self.mounted_entity_id = None        # mounted MACHINE_GUN entity, if any
         self.on_fire: bool = False          # authoritative Molotov burn state
@@ -431,9 +424,8 @@ class Player:
         # used to backfill an older missing movement frame.
         self._applied_input_flags: Optional[tuple] = None
         self._applied_orientation: Optional[tuple] = None
-        # ClientData buttons are held for the next observed frame. Foreground
-        # jump A/B testing is slightly quieter with this latch; orientation is
-        # deliberately current because native-yaw capture resolves it earlier.
+        # ClientData locomotion and movement orientation are held for the next
+        # observed frame. Current aim remains immediate for combat/display.
         self._pending_packet_flags: tuple = IDLE_INPUT_FLAGS
         self._pending_packet_loop: Optional[int] = None
         self._applied_input_source_loop: Optional[int] = None
@@ -477,7 +469,6 @@ class Player:
         self.last_landed: bool = False
         self.last_step_delta: float = 0.0
         self.last_trigger_jump: bool = False
-        self._jump_anchor_consumed_for_hold: bool = False
         self.last_buffered_jump_active: bool = False
         self.last_collision_count: int = 0
         self.last_collision_preview: list[tuple[float, float, float, float]] = []
@@ -587,12 +578,17 @@ class Player:
         # use identical effective values or prediction drifts (rubber-band).
         from server.class_data import speed_scale
         rule_multiplier = 1.0
+        water_damage_multiplier = self.movement_profile.fall_on_water_damage_multiplier
         server = self.connection.server if self.connection else None
         config = getattr(server, "config", None)
         if config is not None:
             from server.game_rules import get_rules
 
             rules = get_rules(config)
+            # Retail GameClass.__init__ passes zero into the native mover
+            # when this InitialInfo rule is disabled, not only a later HP gate.
+            if not rules.enabled("RULE_ENABLE_FALL_ON_WATER_DAMAGE"):
+                water_damage_multiplier = 0.0
             rule_multiplier *= float(rules.get("RULE_CHARACTER_SPEED"))
             if str(getattr(config, "game_mode", "")).lower() in (
                 "zom", "zombie"
@@ -606,7 +602,7 @@ class Player:
         world_object.set_class_can_sprint_uphill(self.movement_profile.can_sprint_uphill)
         world_object.set_class_water_friction(self.movement_profile.water_friction)
         world_object.set_class_fall_on_water_damage_multiplier(
-            self.movement_profile.fall_on_water_damage_multiplier
+            water_damage_multiplier
         )
         world_object.set_class_falling_damage_min_distance(
             self.movement_profile.falling_damage_min_distance
@@ -658,10 +654,13 @@ class Player:
         world_object.sneak = self.input.sneak
         world_object.sprint = self.input.sprint
         # ``hover`` is the UGC Builder pack's toggled Z ability.  The same
-        # ClientData bit is also used as the Commando parachute deploy key,
+        # ClientData bit is also used by our patched Commando deploy key,
         # but feeding it into every native player skips gravity entirely.
         # Retail only applies the mover flag for pack 69; parachutes use their
-        # separate replicated state and 0.05-gravity branch below.
+        # separate replicated state. Do not blanket-reject crouch here:
+        # Character.is_crouching excludes active hover (0x10023760), and native
+        # hover+crouch is the UGC descent control. ClientData already carries
+        # the filtered world hover state rather than the raw key press.
         world_object.hover = bool(
             self.input.hover
             and self.jetpack_id == int(C.JETPACK_UGCBUILDER)
@@ -680,9 +679,14 @@ class Player:
             world_object.jetpack_active = bool(
                 self._jetpack_physics_active
             )
-            # Passive flight is a separate 0.75-gravity mode.  The stock
-            # Engineer keeps it false while ordinary SPACE thrust is active.
-            world_object.jetpack_passive = False
+            # Product flight policy: the Glide pack combines its stock thrust
+            # with the native 0.75-gravity state, approaching level flight at
+            # 60 Hz. Rocket/Engineer retain their ordinary upward thrust.
+            # Use the same physics phase as active, including release/tail.
+            world_object.jetpack_passive = bool(
+                self.jetpack_id == int(C.JETPACK2)
+                and self._jetpack_physics_active
+            )
             world_object.parachute = int(self.parachute_id or 0)
             world_object.parachute_active = bool(self.parachute_active)
         except Exception:
@@ -1064,6 +1068,7 @@ class Player:
         self.replication_generation += 1
         self.last_kill_action_data = None
         self._teabagged_deaths.clear()
+        self.damage_contributions = {}
         self.health = MAX_HEALTH
         self.spawned_at = time.monotonic()
         self.alive = True
@@ -1102,6 +1107,7 @@ class Player:
             getattr(C, "ROCKET_TURRET_INITIAL_STOCK", 2)
         )
         self._reset_equipment_state()
+        reset_deployable_inventory(self)
         # Jetpacks are concrete equipment-slot choices. Never infer one from
         # class_id here: Engineer can choose Disguise instead, and appending a
         # fallback pack would overlap two mutually exclusive native states.
@@ -1118,6 +1124,7 @@ class Player:
         self._jetpack_exhaustion_tail_remaining = 0
         self._jetpack_requires_release = False
         self._hover_since = 0.0
+        self._jetpack_idle_seconds = 0.0
         self.parachute_id = (
             int(C.A370)
             if int(C.A370) in [int(item) for item in (getattr(self, "loadout", None) or [])]
@@ -1125,6 +1132,7 @@ class Player:
         )
         self.parachute_active = False
         self._parachute_deploy_last_held = False
+        self._parachute_deploy_pending = False
         self.disguised = False
         self.on_fire = False
         self.pickup_id = None
@@ -1145,7 +1153,6 @@ class Player:
         self.last_landed = False
         self.last_step_delta = 0.0
         self.last_trigger_jump = False
-        self._jump_anchor_consumed_for_hold = False
         self.last_buffered_jump_active = False
         self.last_collision_count = 0
         self.last_collision_preview = []
@@ -1202,6 +1209,16 @@ class Player:
         )
 
     def _reset_ammo(self):
+        """Grant one fresh per-life/restock wallet for each retail weapon.
+
+        Keep the active pair as the compatibility facade used by combat and
+        bots. Stowed pairs are saved on selection; selecting is never a grant.
+        The bounded catalog also covers Tutorial unlocks and mounted weapons.
+        """
+        self._weapon_ammo = {
+            tool: (profile.clip_size, profile.reserve_ammo)
+            for tool, profile in WEAPON_PROFILES.items()
+        }
         profile = WEAPON_PROFILES.get(
             self.weapon,
             WEAPON_PROFILES[next(iter(WEAPON_PROFILES))],
@@ -1341,7 +1358,10 @@ class Player:
         if amount <= 0:
             return False
 
+        health_before = self.health
         self.health = max(0, self.health - amount)
+        from server.combat_scores import record_damage
+        record_damage(server, self, source, health_before - self.health)
         source_position = self.position if source is None else source.position
         self._last_combat_damage_at = time.monotonic()
         self._last_damage_source_id = int(
@@ -1476,11 +1496,18 @@ class Player:
         self.wade = False
         self.disguised = False
         self.death_time = time.time()
-        self.deaths += 1
+        transition_death = kill_type in {
+            C.FORCED_TEAM_CHANGE_KILL, C.TEAM_CHANGE_KILL, C.CLASS_CHANGE_KILL
+        }
+        if not transition_death:
+            self.deaths += 1
         self.kill_streak = 0
         self.reloading = False
         self.reload_end_time = 0.0
         self.jetpack_active = False
+        self.parachute_active = False
+        self._parachute_deploy_last_held = False
+        self._parachute_deploy_pending = False
         self._jetpack_physics_active = False
         self._jetpack_activation_defer_remaining = 0
         self._jetpack_exhaustion_tail_remaining = 0
@@ -1505,10 +1532,15 @@ class Player:
             self._sync_cached_vectors()
 
         kill_count = 0
-        if killer and killer != self:
+        if killer and killer != self and killer.team != self.team and not transition_death:
             killer.kills += 1
             killer.kill_streak = min(255, int(killer.kill_streak) + 1)
             kill_count = killer.kill_streak
+
+        from server.profile_stats import death
+        death(self, killer, int(kill_type))
+        from server.combat_scores import record_death
+        record_death(server, self, killer, int(kill_type))
 
         if server is not None:
             from shared.packet import KillAction
@@ -1563,6 +1595,7 @@ class Player:
                 killer is not None
                 and killer is not self
                 and killer.team != self.team
+                and not transition_death
             ):
                 server.queue_mode_event("on_player_kill", killer, self, kill_type)
 
@@ -1570,7 +1603,10 @@ class Player:
 
     def heal(self, amount: int):
         if self.alive:
+            health_before = self.health
             self.health = min(MAX_HEALTH, self.health + amount)
+            from server.combat_scores import record_healing
+            record_healing(self, self.health - health_before)
             if self.connection:
                 from shared.packet import SetHP
 
@@ -1602,6 +1638,11 @@ class Player:
         # the client. Mirror that complete reset, including late Battle Builder
         # projectile weapons and Disguise, rather than only the primary gun.
         self._reset_equipment_state()
+        # RoundLifecycle and bot creation send type zero immediately after
+        # spawn. New-life deployable stock was already granted by spawn();
+        # that notification must not add a second set of consumable items.
+        if int(restock_type) != 0:
+            restock_deployable_inventory(self)
         if self.connection:
             from shared.packet import Restock
             pkt = Restock()
@@ -1728,6 +1769,8 @@ class Player:
         """
         tool = int(tool)
         current_time = time.monotonic() if now is None else float(now)
+        if tool in (int(C.DYNAMITE_TOOL), int(C.LANDMINE_TOOL)):
+            return deployable_ready(self, tool, current_time)
         if current_time + FIRE_RATE_GRACE < self._oriented_next_use.get(tool, 0.0):
             return False
         if tool in (
@@ -1748,6 +1791,10 @@ class Player:
         current_time = time.monotonic() if now is None else float(now)
         if not self.can_use_oriented_item(tool, current_time):
             return False
+
+        if tool in (int(C.DYNAMITE_TOOL), int(C.LANDMINE_TOOL)):
+            commit_deployable_use(self, tool, current_time)
+            return True
 
         if tool in (
             int(getattr(C, "SNOWBLOWER_TOOL", 29)),
@@ -1774,12 +1821,18 @@ class Player:
                 or tool in GRENADE_TOOL_IDS
                 or tool in WEAPON_TOOL_IDS
             )
+        if tool != self.tool or raw != self.tool_is_raw:
+            # Retail Tool.on_unset cancels the outgoing reload, including a
+            # gun-to-gun switch. Repeated ClientData for one tool does not.
+            self.reloading = False
+            self.reload_end_time = 0.0
         self.tool = tool
         self.tool_is_raw = raw
         if raw and tool in WEAPON_PROFILES:
             if tool != self.weapon:
+                self._weapon_ammo[self.weapon] = (self.ammo_clip, self.ammo_reserve)
                 self.weapon = tool
-                self._reset_ammo()
+                self.ammo_clip, self.ammo_reserve = self._weapon_ammo[tool]
         if not self.is_weapon_tool():
             self.reloading = False
             self.reload_end_time = 0.0
@@ -1944,22 +1997,10 @@ class Player:
         self.last_update = time.time()
         self.movement_time += dt
         was_airborne = self.airborne
-        # Mirror the live client's input pipeline exactly (measured via the
-        # in-game tracer): while the jump key is HELD, the Character sets
-        # the world object's jump flag every frame the player is grounded —
-        # no edge detection, no queue, no buffer. The buffered-jump-on-
-        # landing behavior emerges naturally (key still held when landing).
-        if not bool(self.input.jump):
-            self._jump_anchor_consumed_for_hold = False
+        # The native mover decides whether held jump can launch. Authority
+        # advances from its simulated position; owner snapshots are outputs,
+        # never a position rewind input to the next jump.
         trigger_jump = bool(self.input.jump) and not bool(world_object.airborne)
-        # The cached owner row belongs to the current physical key press.
-        # Reusing it after the same hold auto-relaunches on landing produces
-        # the block-edge rollback observed in the retail Python 2 trace.
-        restore_launch_anchor = bool(
-            trigger_jump and not self._jump_anchor_consumed_for_hold
-        )
-        if trigger_jump:
-            self._jump_anchor_consumed_for_hold = True
         self.last_trigger_jump = bool(trigger_jump)
         positions = self._build_player_collision_positions()
         server = self.connection.server if self.connection else None
@@ -1992,49 +2033,15 @@ class Player:
             trigger_jump=trigger_jump, collisions=positions
         )
         result = world_object.update(dt, positions)
-        if restore_launch_anchor and not self.is_bot:
-            # Reconciliation is keyed to Character.movement_history[L], which
-            # retail snapshots *before* its native physics call.  ClientData L
-            # arrives afterward. Character.update_alive then unconditionally
-            # restores full XYZ from its cached network_position whenever
-            # jump_this_frame is true (character.pyd 0x100808E5->0x100815AB),
-            # while retaining native launch velocity and airborne state. Using
-            # only pre-physics Z leaves the server one sprint step ahead and
-            # eventually turns a 0.048-block X phase error into a terrain-step
-            # rollback. The event-order gate removes rows definitely sent too
-            # late, but cannot prove client delivery; foreground raw captures
-            # are required after changing this heuristic. Bots have no owner
-            # network anchor and keep full native post-move state.
-            anchor = self._owner_anchor_before_input(
-                self._applied_input_source_loop,
-                source_received_server_tick=(
-                    self._applied_input_source_server_tick
-                ),
-                source_received_owner_sequence=(
-                    self._applied_input_source_owner_sequence
-                ),
-            )
-            anchor_error_sq = sum(
-                (float(anchor[index]) - float(pre_position[index])) ** 2
-                for index in range(3)
-            )
-            # Preserve retail's cached-anchor behavior for ordinary sub-voxel
-            # phase correction, but never promote a stale row into the next
-            # authoritative launch state. Velocity/airborne state still come
-            # from the native physics step in either branch.
-            launch_position = (
-                pre_position
-                if anchor_error_sq
-                > JUMP_ANCHOR_TELEPORT_GUARD_DISTANCE_SQ
-                else anchor
-            )
-            world_object.set_position(
-                float(launch_position[0]),
-                float(launch_position[1]),
-                float(launch_position[2]),
-            )
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
+        # The landing row must close the canopy immediately. Waiting for the
+        # next pre-movement ability update publishes a grounded open chute and
+        # can carry its no-fall-damage state into the next jump.
+        if not self.airborne or self.wade:
+            self.parachute_active = False
+            self._parachute_deploy_pending = False
+            world_object.parachute_active = False
         if self.last_fall_result > 0:
             server = self.connection.server if self.connection else None
             config = getattr(server, "config", None)
@@ -2063,21 +2070,24 @@ class Player:
             )
 
     def _update_jetpack(self, dt: float) -> None:
-        """Advance the stock jetpack fuel model one simulation tick.
+        """Advance the negotiated fuel policy using original native thrust.
 
         Packs 66/67/68 use jump for thrust; only UGC Builder pack 69 uses the
         toggle-hover input. After the per-pack start delay, activation pays its
         one-time cost and then drains fuel until release or exhaustion. Idle
-        fuel regenerates after the post-damage refill delay.
+        fuel regenerates after the post-damage refill delay. Exact activation,
+        exhaustion, and damage-clock ordering are not recoverable from the
+        inspected client, which consumes server fuel/activity state.
         """
         physics_was_active = bool(self._jetpack_physics_active)
         props = _JETPACK_PROPERTIES.get(self.jetpack_id)
-        if props is None:
+        if props is None or not self.alive:
             self.jetpack_active = False
             self._jetpack_physics_active = False
             self._jetpack_activation_defer_remaining = 0
             self._jetpack_exhaustion_tail_remaining = 0
             self._jetpack_requires_release = False
+            self._hover_since = 0.0
             return
         start_delay = float(props.get(0, 0.25))
         max_fuel = float(props.get(1, 100))
@@ -2085,20 +2095,29 @@ class Player:
         refill_rate = float(props.get(3, 10))
         drain = float(props.get(4, 75))
         refill_delay = float(props.get(6, 2.0))
+        profile = profile_for(self)
+        combat_pack = 66 <= self.jetpack_id <= 68
+        if combat_pack:
+            drain = profile.drain[self.jetpack_id - 66]
+            refill_rate = profile.refill[self.jetpack_id - 66]
 
-        # Stock input split recovered from GameScene/Character: the normal,
-        # Rocketeer, and Engineer packs thrust from jump. Only the UGC Builder
-        # pack (69) accepts the toggle-hover/Z bit.
+        # Character.set_hover accepts only UGC pack 69; normal packs retain
+        # jump in the native mover. Resource activation from those controls
+        # is this server's policy; client code alone does not prove it.
         activation_held = (
             self.input.hover
             if self.jetpack_id == int(C.JETPACK_UGCBUILDER)
             else self.input.jump
         )
 
-        # The inactive/fuel-zero row and the client's ordinary-jump branch do
-        # not take effect on the same consumed input. Preserve exactly the one
-        # in-flight recurrence measured by the strict retail exhaustion gate.
-        # Physical key-up still cancels this immediately below.
+        if activation_held or self.jetpack_active or self._jetpack_physics_active:
+            self._jetpack_idle_seconds = 0.0
+        else:
+            self._jetpack_idle_seconds += dt
+
+        # Preserve the existing capture-derived exhaustion tail. This is a
+        # compatibility heuristic, not a phase proven by original code.
+        # Physical key-up cancels this policy immediately below.
         exhaustion_tail = int(self._jetpack_exhaustion_tail_remaining)
         if activation_held and self._jetpack_requires_release and exhaustion_tail > 0:
             self.jetpack_active = False
@@ -2108,12 +2127,10 @@ class Player:
             self.jetpack_fuel = 0.0
             return
 
-        # WorldUpdate is the owner's only source of action bit 0x04; ClientData
-        # does not echo a local jetpack-active state.  Preserve the previously
-        # advertised value as this tick's native state.  A transition is sent
-        # after this simulation step, and native thrust follows on the next
-        # consumed frame.  Applying both in the transition frame makes the
-        # server one thrust recurrence ahead of retail movement_history.
+        # WorldUpdate supplies the owner's jetpack-active state; ClientData
+        # does not acknowledge it. Retain the existing deferred server handoff
+        # policy without claiming the original client adds this delay: its
+        # Player setter writes native activity immediately on packet receipt.
         previously_advertised = bool(self.jetpack_active)
         activation_defer = int(self._jetpack_activation_defer_remaining)
         if previously_advertised and activation_defer > 0:
@@ -2149,10 +2166,9 @@ class Player:
         else:
             self._hover_since = 0.0
             self.jetpack_active = False
-            # Retail stops thrust from physical SPACE key-up immediately even
-            # while its last received WorldUpdate still carries action 0x04.
-            # Do not preserve one extra authoritative thrust/drain recurrence
-            # while the reliable inactive owner row travels to GameScene.
+            # Our compatibility policy stops activity on release. Native
+            # thrust also requires jump, but the inspected client does not
+            # reveal when the original server stops draining released fuel.
             self._jetpack_physics_active = False
             self._jetpack_activation_defer_remaining = 0
             self._jetpack_exhaustion_tail_remaining = 0
@@ -2165,19 +2181,16 @@ class Player:
                 or self._jetpack_physics_active
             )
         ):
-            # Fuel is a replicated Character resource. Once 0x04 is visible,
-            # the retail owner drains it during the three-frame physics handoff,
-            # even though authoritative native thrust is still deferred.
+            # The compatibility model drains advertised activity during its
+            # deferred native handoff. Character.update_jetpack only displays
+            # replicated fuel; it does not implement this resource recurrence.
             self.jetpack_fuel -= drain * dt
             if self.jetpack_fuel <= 0.0:
                 self.jetpack_fuel = 0.0
-                # Advertise exhaustion now. This tick already used active
-                # thrust; retain exactly one predicted recurrence before the
-                # held key resumes ordinary jump behavior.
+                # Advertise exhaustion and preserve the compatibility tail.
                 self.jetpack_active = False
-                # Holding SPACE through empty fuel must not auto-ignite as
-                # regeneration crosses the activation cost. Retail requires
-                # a release/new press before another start-delay cycle.
+                # The existing policy requires release before reactivation;
+                # this latch is not proven by original-client resource code.
                 self._jetpack_requires_release = True
                 self._jetpack_activation_defer_remaining = 0
                 self._jetpack_exhaustion_tail_remaining = (
@@ -2188,6 +2201,13 @@ class Player:
             not self.jetpack_active
             and not self._jetpack_physics_active
             and self.jetpack_fuel < max_fuel
+            and (
+                not combat_pack or not profile.grounded_refill_only
+                or (
+                    (not self.airborne or self.wade)
+                    and self._jetpack_idle_seconds + 1e-9 >= profile.refill_idle_seconds
+                )
+            )
         ):
             if (time.time() - self._last_damage_at) >= refill_delay:
                 self.jetpack_fuel = min(max_fuel, self.jetpack_fuel + refill_rate * dt)
@@ -2196,12 +2216,12 @@ class Player:
             self._note_jetpack_physics_started()
 
     def _update_parachute(self) -> None:
-        """Open the Commando parachute from the retail Z/hover input.
+        """Open the parachute using the maintained client's Z-key extension.
 
-        The maintained 1.x client binds ``hover`` to Z by default and sends it
-        as ClientData action bit 0x80.  Parachute deployment is an airborne
-        rising edge of that explicit action; SPACE remains ordinary jump.
-        Once open it stays open until landing/water.
+        The custom parachute_key_patch bypasses stock Character.set_hover,
+        which only accepts UGC pack 69, to send ClientData action bit 0x80.
+        Keep the existing airborne rising-edge policy pending recovery of the
+        original server's deployment rule; this is not stock-client behavior.
         """
         deploy_held = bool(self.input.hover)
         deploy_pressed = bool(
@@ -2211,9 +2231,15 @@ class Player:
         equipped = self.alive and self.parachute_id == int(C.A370)
         if not equipped or not self.airborne or self.wade:
             self.parachute_active = False
+            self._parachute_deploy_pending = False
             return
         if deploy_pressed:
+            self._parachute_deploy_pending = True
+        if self._parachute_deploy_pending and (
+            not profile_for(self).descending_parachute_only or self.vz >= 0.0
+        ):
             self.parachute_active = True
+            self._parachute_deploy_pending = False
 
     def update_input(
         self,
@@ -2563,11 +2589,12 @@ class Player:
                 frame.received_owner_sequence
             )
             applied_input_source_wire_unknown_byte = frame.wire_unknown_byte
-        # Buttons are latched by the retail input path, but native-yaw capture
-        # shows aim is already current in the movement history for this label.
-        # Delaying orientation creates a mixed turn state and persistent
-        # correction during ordinary mouse motion.
-        applied_orientation = orientation
+        # Native mouse-input captures pair movement with the preceding
+        # packet's orientation, just like locomotion buttons. Using current
+        # aim here runs turns one history frame ahead of the retail client.
+        applied_orientation = (
+            (self._applied_orientation or orientation) if latch_frames else orientation
+        )
         self.last_applied_input_loop = loop
         self.set_orientation_vector(*applied_orientation)
         self.update_input(*flags)
@@ -2597,7 +2624,12 @@ class Player:
         self._apply_explosion_impulses_through(frame.received_input_sequence)
         # One packet represents one movement-history record.  ClientData does
         # not carry dt, and its clock label is deliberately non-contiguous.
-        await self.update(dt)
+        try:
+            await self.update(dt)
+        finally:
+            # The latch belongs only to physics. Shooting and remote facing
+            # must continue to use the current packet's responsive aim.
+            self.set_orientation_vector(*orientation)
 
     def _tick_idle(self) -> None:
         """Per-tick housekeeping on a held frame (no physics step)."""
@@ -2743,8 +2775,8 @@ class Player:
         # MEASURED client-side meaning of this byte: 0x20=is_on_fire, 0x40=zoom,
         # 0x80=is_weapon_deployed (0x01/0x02 = fire/muzzle).
         #
-        # Exact stock mapping distinguishes 0x04 (jetpack active) from 0x10
-        # (can_display_weapon). 0x08 is still unassigned here.
+        # 0x04 is jetpack active, 0x08 is its separate passive/reduced-gravity
+        # state, and 0x10 is can_display_weapon.
         byte = 0
         if self.input.primary_fire:
             byte |= 0x01
@@ -2763,6 +2795,8 @@ class Player:
         # regression shows up, this bit is the first suspect — revert to 0.)
         if getattr(self, "jetpack_active", False):
             byte |= 0x04
+            if self.jetpack_id == int(C.JETPACK2):
+                byte |= 0x08
         # Stock WorldUpdate action bit 0x10 is can_display_weapon.  Remote
         # clients feed it directly to set_can_display_weapon; dropping it
         # makes every equipped weapon model invisible to other players.
@@ -2791,7 +2825,7 @@ class Player:
             byte |= 0x02
         # GameScene.process_packet_world_update line 3310 sends this bit to
         # Character.set_hover.  It is the UGC Builder's toggled Z state, not
-        # the raw ClientData hover/deploy key shared by the parachute.
+        # the ClientData hover/deploy extension used by our parachute patch.
         if (
             self.jetpack_id == int(C.JETPACK_UGCBUILDER)
             and self.input.hover

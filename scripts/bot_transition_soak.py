@@ -1,7 +1,7 @@
 """Long-running production lifecycle soak across every VXL and game mode.
 
-The harness keeps one real ``BattleSpadesServer`` and one retained bot roster
-alive while repeatedly exercising the production map rollover and same-map
+The harness keeps one real ``BattleSpadesServer`` alive and reconnects its bots
+while repeatedly exercising the production map rollover and same-map
 round restart paths. Each boundary is deliberately seeded with unsupported
 positions and stale controller data, then checked before AI ticks resume.
 
@@ -67,6 +67,7 @@ class TransitionSoakResult:
     clean_slate_resets: int = 0
     expected_clean_slate_resets: int = 0
     checked_spawns: int = 0
+    checked_reconnections: int = 0
     elapsed_seconds: float = 0.0
     failures: list[str] = field(default_factory=list)
 
@@ -75,10 +76,12 @@ class TransitionSoakResult:
         return not self.failures
 
 
-def _poison_completed_game_state(director: BotDirector) -> None:
+def _poison_completed_game_state(director: BotDirector) -> dict:
     """Seed the exact stale state that a lifecycle boundary must retire."""
 
-    for bot in director.bots:
+    previous = {bot.id: bot for bot in director.bots}
+    for bot in previous.values():
+        bot.score, bot.kills, bot.deaths = 700000, 450, 120
         bot.set_position(bot.x, bot.y, max(-96.0, float(bot.z) - 48.0))
         runtime = director._runtime[int(bot.id)]
         runtime.last_intent_frame = 2**30
@@ -92,6 +95,7 @@ def _poison_completed_game_state(director: BotDirector) -> None:
             object(),
             float("inf"),
         )
+    return previous
 
 
 def _validate_fresh_game(
@@ -100,6 +104,7 @@ def _validate_fresh_game(
     result: TransitionSoakResult,
     *,
     label: str,
+    previous: dict,
 ) -> None:
     """Check spawn, world ownership, and controller postconditions."""
 
@@ -113,6 +118,12 @@ def _validate_fresh_game(
 
     for bot in director.bots:
         result.checked_spawns += 1
+        old = previous.get(bot.id)
+        if (old is bot or (old is not None and bot.bot_generation <= old.bot_generation)
+                or (bot.score, bot.kills, bot.deaths) != (0, 0, 0)):
+            result.failures.append(f"{label}: bot {bot.id} retained identity or lifetime stats")
+        else:
+            result.checked_reconnections += 1
         runtime = director._runtime.get(int(bot.id))
         if runtime is None:
             result.failures.append(f"{label}: bot {bot.id} has no runtime")
@@ -230,7 +241,7 @@ async def run_transition_soak(
                     if first_session:
                         first_session = False
                     else:
-                        _poison_completed_game_state(director)
+                        previous = _poison_completed_game_state(director)
                         previous_map_epoch = director._map_epoch
                         candidate = await asyncio.to_thread(
                             server.match_transition._load_world_candidate,
@@ -257,12 +268,13 @@ async def run_transition_soak(
                             director,
                             result,
                             label=f"{label} rollover",
+                            previous=previous,
                         )
 
                     result.session_count += 1
                     await _tick_live_bots(server, director, settle_ticks)
                     for game_index in range(1, result.games_per_session):
-                        _poison_completed_game_state(director)
+                        previous = _poison_completed_game_state(director)
                         previous_mode_epoch = director._mode_epoch
                         restart = await server.match_transition.restart_round()
                         result.game_boundaries += 1
@@ -281,6 +293,7 @@ async def run_transition_soak(
                             director,
                             result,
                             label=restart_label,
+                            previous=previous,
                         )
                         await _tick_live_bots(server, director, settle_ticks)
     finally:

@@ -2,7 +2,7 @@
 
 # BattleSpades
 
-**A from-scratch, 1:1 server for _Ace of Spades 1.x_ (Battle Builders)**
+**An authoritative server for _Ace of Spades 1.x_ (Battle Builders)**
 
 Python 3 + Cython · ENet · server-authoritative · physics reverse-engineered from the original compiled client
 
@@ -13,8 +13,9 @@ Python 3 + Cython · ENet · server-authoritative · physics reverse-engineered 
 BattleSpades is a clean-room reimplementation of the dedicated server for the classic
 **Ace of Spades "Battle Builders" (0.x/1.x)** protocol. It talks to the **original,
 unmodified game client** — the physics, netcode, and packet formats were reverse-engineered
-from the compiled game and calibrated until the server simulates movement, shooting, and
-block edits identically to what the client predicts locally.
+from the compiled game and calibrated against observed retail movement,
+shooting and block-edit behavior. The maintained references distinguish
+implemented contracts from parity and release acceptance still required.
 
 The goal: a **complete, correct, hackable** server that anyone can run in one command, so the
 classic game stays alive and playable — and so it's a solid base for ports to other languages.
@@ -42,16 +43,21 @@ classic game stays alive and playable — and so it's a solid base for ports to 
 
 ## Status
 
-**Playable.** The netcode and core gameplay are reverse-engineered and verified against the
-real client: movement is frame-accurate, and jumping, shooting, block build/break, grenades,
-structure collapse, pickups, deaths/respawns, and bots all work and stay in sync with the
-client's world. See [What works](#what-works) and the [Roadmap](#roadmap) for the details and
-what's still on the list.
+**Playable.** The source implements movement, combat, terrain edits/collapse,
+pickups, deaths/respawns, objectives and bots against recovered retail contracts.
+Focused regressions and measured retail comparisons support those paths; they
+do not establish exact parity for every map, mode or network condition. See
+[What works](#what-works), the [Roadmap](#roadmap) and the release gates in the runbook.
 
-- **1,017** unit/regression tests pass (`py -3 -m pytest tests -q`)
-- The executable 50-player capacity gate sustains ~60 Hz with sub-5 ms tick
-  p99 on the current Windows/Python 3.12 baseline. See
-  [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+The cleaned local outputs are `dist/` and `release-dist/`; `release/` contains
+tracked packaging inputs. Retained binaries can predate source edits. Build and
+check the exact release you intend to use. The native client's current commands
+and feature guides are indexed in [its documentation](../BattleSpadesClient/docs/README.md).
+
+- Run the unit/regression suite with `py -3.12 -m pytest tests -q`.
+- Run the capacity and retail-client validation gates described in
+  [`docs/RUNBOOK.md`](docs/RUNBOOK.md) before a release. Historical test counts
+  and timing measurements are not guarantees for the current checkout.
 - Movement parity: mean client↔server position delta in the **millimetre** range over
   thousands of frames (`py scripts/replay_parity.py` — must stay `ALL PASS`)
 - Physics ground truth and every measured constant live in
@@ -100,7 +106,8 @@ python run_server.py                     # start the server on port 27015
 
 ## Portable alpha releases
 
-`0.0.3-alpha.9` is packaged as six standalone server archives. Each archive
+[`VERSION`](VERSION) defines the release version. The release workflow targets
+six standalone server archives. Each archive
 contains the launcher, Python/native runtime, editable `config.toml`, VXL maps,
 KV6 prefabs, plugin directory, and license notices.
 
@@ -195,9 +202,9 @@ explicit operator override. The release does not claim Apple notarization.
 | **Grenades** | Thrown entity + fuse + bounce physics + blast damage (falloff + line-of-sight) + 3×3×3 block destruction |
 | **Pickups** | Ammo / health crates, restock on spawn |
 | **Combat lifecycle** | Damage, kills, kill feed, death → grave entity → timed respawn |
-| **Game modes** | Team Deathmatch, CTF, Classic CTF, Arena, gangster VIP, and Zombie infection |
+| **Game modes** | Ten retail Match Lobby modes plus Arena; see [mode coverage](docs/GAMEPLAY.md) |
 | **Map Creator** | Isolated retail-compatible UGC host with nine terrain baseplates, all 373 native catalog entries, prefabs, carving, palettes, 19 Game Data objects, mode validation, preview PNGs, and atomic project checkpoints |
-| **Bots** | Isolated process worker with voxel navigation, fair perception/aim, class actions, and phase-aware CTF/Classic/VIP/Zombie/Arena roles |
+| **Bots** | Supervised thread or process worker with direct voxel navigation, fair perception/aim, class actions, and mode-specific roles |
 | **Map transfer** | Full VXL streaming with correct CRC validation |
 | **Admin / chat** | Player + admin command set, team management |
 
@@ -226,7 +233,7 @@ BattleSpades/
 │   ├── combat_runtime.py  # shooting, block damage, collapse
 │   ├── world_manager.py   # map ops, block mutation, flood-fill
 │   ├── connection.py   #   ENet peer + handshake
-│   └── bots.py         #   bot AI
+│   └── bot_ai/         #   bot ownership, worker, navigation, and actions
 ├── protocol/           # packet dispatch + runtime decoders
 ├── modes/              # tdm / ctf / classic_ctf / arena / vip / zombie
 ├── commands/           # player + admin commands
@@ -307,7 +314,7 @@ fill_target = 12
 max_bots = 12
 reserve_human_slots = 2
 difficulty = "mixed"    # casual | normal | hard | mixed
-worker = "process"
+worker = "thread"     # process is also supported
 perception_hz = 10
 decision_hz = 8
 path_requests_per_second = 24
@@ -326,7 +333,9 @@ password = "changeme"        # CHANGE THIS before hosting publicly
 > Never save `config.toml` with a UTF-8 **BOM** (e.g. PowerShell `Set-Content -Encoding utf8`)
 > — the BOM breaks `toml.load` and the server silently falls back to defaults.
 
-For local tweaks that shouldn't be committed, use `config.local.toml` (gitignored).
+For local tweaks that shouldn't be committed, copy the configuration to
+`config.local.toml` (gitignored) and pass it explicitly:
+`python run_server.py --config config.local.toml`.
 
 ## Running & hosting
 
@@ -394,7 +403,7 @@ browser, so verify registration with the source-tree checker described in the
 ## Testing & tooling
 
 ```bash
-py -3 -m pytest tests/ -q       # unit/regression tests (currently 866 passing)
+py -3.12 -m pytest tests/ -q    # unit/regression tests
 py scripts/replay_parity.py     # offline movement-parity check (must be ALL PASS)
 ```
 
@@ -408,6 +417,10 @@ IDs, and the recovered template variables are documented in
 
 ## Documentation
 
+These six references describe the maintained server. Check configuration and
+implementation details against `config.toml`, source, and tests; dated session
+reports and obsolete deployment claims are not current documentation.
+
 - [`docs/ADMIN_GUIDE.md`](docs/ADMIN_GUIDE.md): every config option, rule,
   command, and plugin hook.
 - [`docs/GAMEPLAY.md`](docs/GAMEPLAY.md): modes, official map sets, gameplay
@@ -417,18 +430,17 @@ IDs, and the recovered template variables are documented in
   reverse-engineering workflow.
 - [`docs/BOT_NAVIGATION.md`](docs/BOT_NAVIGATION.md): VXL semantic atlas,
   safe cache format, map-matrix simulation, and water/stuck recovery.
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release.
-- [`docs/HANDOFF.md`](docs/HANDOFF.md): current state, known gaps, and evidence.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release,
+  and container deployment.
 
 ## Roadmap
 
-See [`docs/HANDOFF.md`](docs/HANDOFF.md) for the live backlog. In short:
-
-- **Near term** — end-of-round scoreboard screen, per-player scoreboard column, HUD round
-  timer; polish grenade/collapse visuals; reconnect-lifecycle hardening.
-- **Content** — more maps, weapons, and classes; finish CTF/Arena scoring parity.
-- **Long term** — the project is intentionally a clean, documented base so it can be **ported
-  to other languages** (Go, Rust, …) if/when the community wants to carry it forward.
+Current limitations are documented with their features in
+[`docs/GAMEPLAY.md`](docs/GAMEPLAY.md),
+[`docs/BOT_NAVIGATION.md`](docs/BOT_NAVIGATION.md), and
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md). Further work needs reproducible failures
+and retail-client acceptance, especially for objective modes and destructible
+terrain navigation.
 
 ## Contributing
 

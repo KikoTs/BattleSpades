@@ -4,6 +4,9 @@ Asserts server/class_data.py movement/damage multipliers and loadouts match
 the ground-truth client values in docs/CONTENT_TABLES.md §2. Catches drift in
 the per-class stat tables that drive movement prediction and combat.
 """
+import json
+from pathlib import Path
+
 import shared.constants as C
 from server import class_data as CD
 
@@ -31,6 +34,18 @@ def test_movement_multipliers_match_client():
         m = CD.get_movement(cid)
         assert abs(m.sprint_multiplier - sprint) < 1e-4, f"class {cid} sprint"
         assert abs(m.jump_multiplier - jump) < 1e-4, f"class {cid} jump"
+
+
+def test_every_movement_field_matches_independent_original_tables():
+    fixture = json.loads(
+        (Path(__file__).parent / 'fixtures' / 'retail_class_movement.json').read_text()
+    )
+    for field, values in fixture['tables'].items():
+        assert set(map(int, values)) == set(CD.CLASS_IDS)
+        for class_id, expected in values.items():
+            assert getattr(CD.get_movement(int(class_id)), field) == expected, (
+                class_id, field
+            )
 
 
 def test_damage_multipliers_match_client():

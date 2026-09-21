@@ -19,6 +19,7 @@ Constants (from shared.constants, verified live):
 from __future__ import annotations
 
 import shared.constants as C
+from server.game_constants import TEAM1, TEAM2
 from shared.packet import (GameStats, DisplayCountdown, SetScore,
                            ShowGameStats, MapEnded)
 from server.connection import internal_team_to_wire
@@ -29,16 +30,21 @@ REASON_KILL = int(getattr(C.SCORE_REASON, "KILL_SCORE_REASON", 1))
 REASON_SUICIDE = int(getattr(C.SCORE_REASON, "SUICIDE_SCORE_REASON", 2))
 
 
+def player_score_packet(player, *, reason: int = 0) -> bytes:
+    """Encode an absolute snapshot without awarding profile credit."""
+    pkt = SetScore()
+    pkt.type, pkt.reason = SCORE_PLAYER, int(reason)
+    pkt.specifier, pkt.value = int(player.id), int(getattr(player, "score", 0))
+    return bytes(pkt.generate())
+
+
 def send_player_score(server, player, *, reason: int | None = None) -> None:
     """Push ONE player's personal score to every client (SetScore type=PLAYER).
     Without this the per-player scoreboard column stays 0 no matter how many
     kills they get."""
-    pkt = SetScore()
-    pkt.type = SCORE_PLAYER
-    pkt.reason = REASON_KILL if reason is None else int(reason)
-    pkt.specifier = int(player.id)
-    pkt.value = int(getattr(player, "score", 0))
-    server.broadcast(bytes(pkt.generate()))
+    from server.profile_stats import score_changed
+    score_changed(player, REASON_KILL if reason is None else int(reason))
+    server.broadcast(player_score_packet(player, reason=REASON_KILL if reason is None else int(reason)))
 
 
 def send_team_score(server, team, *, reason: int | None = None) -> None:
@@ -58,22 +64,104 @@ def send_round_timer(server, seconds_remaining: float) -> None:
     server.broadcast(bytes(pkt.generate()))
 
 
+def reveal_to(server, connection) -> None:
+    """Replay absolute scores after the loading peer has its full roster."""
+    known = getattr(connection, "known_player_lives", None)
+    for player in server.players.values():
+        if known is not None and int(player.id) not in known:
+            continue
+        connection.send(player_score_packet(player), reliable=True)
+    for team in getattr(server, "teams", {}).values():
+        pkt = SetScore()
+        pkt.type, pkt.reason = SCORE_TEAM, int(C.NO_SCORE_REASON)
+        pkt.specifier, pkt.value = internal_team_to_wire(team.id), int(team.score)
+        connection.send(bytes(pkt.generate()), reliable=True)
+    if bool(getattr(getattr(server, "mode", None), "ended", False)):
+        from shared.bytes import ByteReader
+        for data in getattr(server, "_game_stats_packets", ()):
+            packet = GameStats(ByteReader(data[1:]))
+            rows = [(player_id, award) for player_id, award in zip(packet.player_ids, packet.types)
+                    if known is None or player_id in known]
+            packet.noOfStats = len(rows)
+            packet.player_ids = [player_id for player_id, _award in rows]
+            packet.types = [award for _player_id, award in rows]
+            connection.send(bytes(packet.generate()), reliable=True)
+
+
+def reset_round_scores(server) -> None:
+    """Reset only match counters; lifetime profile evidence remains cumulative."""
+    from server.combat_scores import RoundCombatStats
+    for player in server.players.values():
+        player.score = player.kills = player.deaths = player.captures = 0
+        player.kill_streak = 0
+        player.round_combat_stats = RoundCombatStats()
+        player.damage_contributions = {}
+        state = getattr(player, "profile_stats", None)
+        if state is not None:
+            state.last_score = 0
+        server.broadcast(player_score_packet(player))
+    bridge = getattr(server, "revival_master", None)
+    reset_baselines = getattr(bridge, "reset_scoreboard_baselines", None)
+    if callable(reset_baselines):
+        reset_baselines()
+    server._game_stats_sent = False
+    server._game_stats_packets = ()
+
+
+_AWARD_ORDER = (
+    int(C.MOST_KILLS), int(C.MOST_ASSISTS), int(C.MOST_HEADSHOTS),
+    int(C.MOST_MELEE_KILLS), int(C.BIGGEST_KILL_STREAK), int(C.MOST_SUICIDES),
+)
+
+
+def _team_awards(server, team_id: int) -> list[tuple[int, int]]:
+    """Choose at most three supported awards, with stable player-id ties.
+
+    Retail exposes award ids and the three-row limit, not the server's award
+    sampling policy. Never fabricate unknown movement/objective statistics.
+    """
+    players = sorted(
+        (player for player in server.players.values()
+         if int(getattr(player, "team", -1)) == team_id),
+        key=lambda player: int(player.id),
+    )
+    result = []
+    for award in _AWARD_ORDER:
+        scored = [(int(getattr(getattr(player, "round_combat_stats", None),
+                               "awards", {}).get(award, 0)), int(player.id))
+                  for player in players]
+        if not scored:
+            continue
+        amount, player_id = max(scored, key=lambda row: (row[0], -row[1]))
+        if amount > 0:
+            result.append((player_id, award))
+        if len(result) >= int(C.NOOF_GAME_STATS_TO_SHOW):
+            break
+    return result
+
+
 def broadcast_game_stats(server, winner: int | None = None) -> None:
     """Broadcast the end-of-round GameStats(67) leaderboard data to all
     in-game clients. The client already knows each player's score (from the
     per-player SetScore stream). This packet alone is safe in GameScene; do not
     pair it with a terminal screen packet during a same-map restart."""
-    players = [p for p in server.players.values() if getattr(p, "spawned", False) or True]
-
-    pkt = GameStats()
-    pkt.noOfStats = len(players)
-    # team_id selects which team's column heads the widget; the client shows
-    # both teams regardless. Use the winner (or TEAM1) as the header team.
-    pkt.team_id = int(internal_team_to_wire(winner)) if winner is not None else 0
-    pkt.player_ids = [int(p.id) for p in players]
-    # stat_type 0 = "kills" column; the client labels the row from this.
-    pkt.types = [0 for _ in players]
-    server.broadcast(bytes(pkt.generate()))
+    # The retail receiver appends each packet into its team column. A repeated
+    # end callback must not duplicate award rows or reserve results twice.
+    if bool(getattr(server, "_game_stats_sent", False)):
+        return
+    server._game_stats_sent = True
+    packets = []
+    for team_id in (TEAM1, TEAM2):
+        awards = _team_awards(server, team_id)
+        pkt = GameStats()
+        pkt.team_id = int(team_id)
+        pkt.noOfStats = len(awards)
+        pkt.player_ids = [player_id for player_id, _award in awards]
+        pkt.types = [award for _player_id, award in awards]
+        data = bytes(pkt.generate())
+        packets.append(data)
+        server.broadcast(data)
+    server._game_stats_packets = tuple(packets)
 
     # Submit the same finished-round snapshot outside the simulation thread.
     # The bridge tracks per-player baselines, so same-map restarts add deltas

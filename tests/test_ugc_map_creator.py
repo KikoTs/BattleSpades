@@ -280,6 +280,20 @@ def test_dedicated_runtime_is_locked_and_uses_retail_prefab_catalog(
     assert configured.game_rules.enabled("RULE_ENABLE_PREFABS") is True
 
 
+def test_selected_prefab_palette_survives_save_and_initial_info(tmp_path: Path) -> None:
+    project = _complete_ctf_project()
+    project.prefab_set = 0  # Lunar constructs on the existing Grassland baseplate.
+    path = tmp_path / "Palette.ugc"
+    project.save(path)
+    restored = UGCProject.load(path)
+    assert restored.baseplate == project.baseplate
+    assert restored.prefab_terrain.key == "lunar"
+    mode = UGCMode(_EditorServer(restored, tmp_path))
+    packet = SimpleNamespace()
+    mode.configure_initial_info(packet)
+    assert packet.ugc_prefab_sets == [restored.prefab_terrain.prefab_tag]
+
+
 def test_builder_join_enforces_one_five_item_editor_backpack() -> None:
     project = UGCProject(
         title="Loadout",
@@ -481,6 +495,35 @@ def test_mode_assigns_one_host_and_replays_large_object_batches(
         batches.append(packet)
     assert [len(batch.items) for batch in batches] == [512, 1]
     assert sum(len(batch.items) for batch in batches) == 513
+
+
+def test_online_editor_authority_follows_authenticated_owner_not_arrival(tmp_path: Path) -> None:
+    project = UGCProject(title="Online", description="Online", author="Host",
+                         baseplate="grassland", target_mode="tdm")
+    server = _EditorServer(project, tmp_path)
+    server.config.ugc_owner_legacy_id = "1000"
+    mode = UGCMode(server)
+    guest, owner = _Connection(), _Connection()
+    server.connections[1] = guest
+    mode.configure_initial_info_for(guest, SimpleNamespace())
+    assert not mode.is_host(guest)
+    guest.player = SimpleNamespace(connection=guest, account_legacy_id="2000")
+    assert not mode.is_host(guest.player)
+    server.connections[2] = owner
+    mode.configure_initial_info_for(owner, SimpleNamespace())
+    assert not mode.is_host(owner)
+    owner.player = SimpleNamespace(connection=owner, account_legacy_id="1000")
+    assert mode.is_host(owner.player)
+    assert not mode.set_title(guest.player, "Hijacked")
+    assert mode.set_title(owner.player, "Shared Project")
+    del server.connections[2]
+    asyncio.run(mode.on_player_leave(owner.player))
+    assert not mode.is_host(guest)
+    rejoined = _Connection()
+    server.connections[3] = rejoined
+    mode.configure_initial_info_for(rejoined, SimpleNamespace())
+    rejoined.player = SimpleNamespace(connection=rejoined, account_legacy_id="1000")
+    assert mode.is_host(rejoined)
 
 
 def test_ugc_guest_receives_host_vxl_before_normal_map_sync(tmp_path: Path) -> None:

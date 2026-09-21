@@ -1,15 +1,17 @@
 # Operator and Extension Guide
 
-This is the complete operator-facing reference for `config.toml`, chat
+This is the operator-facing reference for `config.toml`, chat
 commands, and trusted Python plugins. The distributed `config.toml` is an
 executable example: every supported Match Lobby rule is present with comments.
 
 ## Configuration lifecycle
 
-The server reads TOML once at startup. Invalid TOML, an unknown `RULE_*` name,
-an unsafe map name, or an unsupported lobby slider value stops startup with a
-specific error. Runtime paths are resolved relative to the executable bundle,
-not the current shell directory.
+The server reads TOML once at startup. A missing file uses defaults; a TOML
+parse failure prints a warning and also falls back to defaults. Semantic
+validation rejects unknown rules, unsafe map names, and unsupported lobby
+slider values. Validate the selected configuration with `--check` before use.
+Runtime paths are resolved relative to the executable bundle, not the current
+shell directory. A local override file must be selected with `--config`.
 
 Precedence is narrowest first:
 
@@ -48,8 +50,10 @@ mirrored into the new rule service when their `RULE_*` equivalents are absent.
 - `query_port`: Steam A2S UDP port; zero means game port + 1. All three ports
   must be distinct.
 - `public`: public anonymous listing (`true`) versus LAN/no-master mode.
-- `secure`: requests VAC mode. The default public-insecure mode is truthful
-  because BattleSpades does not yet authenticate player Steam tickets.
+- `secure`: requests the registrar's VAC mode. Leave the default disabled;
+  accepting the legacy packet-105 ticket/XOR handshake is not VAC validation.
+  Revival's separately consumed join tickets provide account identity when
+  that integration is enabled.
 - `region`, `playlist_id`, `protocol_version`, `texture_skin`: inputs to the
   exact retail tags `v...;playlist=...;region=...;mode=%04d[;classic][;skin=...]`.
 - `game_version`: original value `1.0.0.0`.
@@ -61,10 +65,37 @@ mirrored into the new rule service when their `RULE_*` equivalents are absent.
 
 The stock server-row implementation ignores Steam's returned game port and
 always connects to UDP `32887`. Use `[server].port = 32887` when compatibility
-with an unmodified browser row matters. This does not repair list discovery:
-Valve retired the legacy master-list endpoint used by the 2015 client. The
-bridge still registers with Valve's current registry for updated clients,
-directories, and external Steam tooling.
+with an unmodified browser row matters. Registration and retail list discovery
+are separate paths: a healthy registrar/A2S probe does not establish that the
+2015 client's legacy list endpoint works. Verify the intended client and public
+endpoint using the checks in [RUNBOOK.md](RUNBOOK.md).
+
+### `[revival]` and durable match results
+
+`server/config.py` defines the settings: `enabled`, `base_url`, `public_host`,
+`server_id`, `region`, `official`, `require_identity`,
+`heartbeat_interval_seconds`, `request_timeout_seconds`, and `results_path`.
+The commented defaults in `config.toml` are the configuration reference.
+`AOS_MASTER_URL`, `AOS_MASTER_WRITE_TOKEN`, `AOS_SERVER_ID`, and public endpoint
+environment overrides are consumed by `server/revival_master.py`.
+
+The master bridge validates join tickets, advertises the server, and submits
+round-result snapshots. `server/profile_stats.py` records authoritative activity;
+`server/result_outbox.py` persists reports off the game loop in SQLite until an
+acknowledged upload. A retry retains the original event ID and payload. Shutdown
+captures unfinished participation before closing the bridge.
+
+`results_path` defaults to `state/round-results.sqlite3`, resolved through the
+runtime paths service. Preserve it across bundle replacement. For relay-hosted
+matches, `AOS_RELAY_LOBBY_ID` enables the optional credential-free JSON mirror
+at `AOS_MATCH_RESULTS_DIRECTORY`; keep that directory outside disposable server
+sessions. Do not treat either pending-result store as a build cache.
+
+XP rates, account eligibility, crate awards, and deployment/migration state are
+owned by the master/backend and native client, not this server reference.
+Local coverage is in `tests/test_revival_master.py`, `tests/test_profile_stats.py`,
+`tests/test_result_outbox.py`, and `tests/test_account_progression_evidence.py`.
+The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
 
 ### `[network]`
 
@@ -191,7 +222,8 @@ visible and hidden entries.
 
 - `[bots]`: `enabled`; `population_mode` (`backfill`, `fixed`, `admin`);
   `fill_target`; `max_bots`; `reserve_human_slots`; `difficulty` (`casual`,
-  `normal`, `hard`, `mixed`); process worker rates/budgets; `seed`;
+  `normal`, `hard`, `mixed`); `worker` (`thread` by default, or `process`);
+  worker rates/budgets; `seed`;
   `clean_slate_games` (defaults to `3`, `0` disables only the periodic worker
   recycle); and bounded `debug_visualization`. Per-round path, coordination,
   stuck, motor, and queued-intent state is always discarded.

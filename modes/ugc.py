@@ -314,7 +314,7 @@ class UGCMode(BaseMode):
         ]
         packet.map_is_ugc = int(C.MAP_IS_UGC_CLIENT)
         packet.ugc_mode = mode_id(self.project.target_mode)
-        packet.ugc_prefab_sets = [int(self.project.terrain.prefab_tag)]
+        packet.ugc_prefab_sets = [int(self.project.prefab_terrain.prefab_tag)]
         if self.project.ground_colors:
             packet.ground_colors = list(self.project.ground_colors)
         packet.enable_minimap = 1
@@ -340,7 +340,7 @@ class UGCMode(BaseMode):
         """
 
         active_connections = tuple(self.server.connections.values())
-        if not any(
+        if not getattr(self.server.config, "ugc_owner_legacy_id", "") and not any(
             active is self._host_connection for active in active_connections
         ):
             self._host_connection = connection
@@ -411,6 +411,10 @@ class UGCMode(BaseMode):
         """Return whether an object resolves to the current UGC host socket."""
 
         connection = getattr(player_or_connection, "connection", player_or_connection)
+        owner_id = getattr(self.server.config, "ugc_owner_legacy_id", "")
+        if owner_id:
+            player = getattr(connection, "player", None)
+            return player is not None and str(getattr(player, "account_legacy_id", "")) == owner_id
         return connection is self._host_connection
 
     def reveal_to(self, connection: "Connection") -> None:

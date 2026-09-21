@@ -20,6 +20,9 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from server.mode_data import get as get_mode_data
+from server.result_outbox import ResultOutbox
+from server.profile_stats import snapshot as profile_snapshot
+from server.cosmetics import CAPABILITY, CosmeticReplication
 
 
 logger = logging.getLogger(__name__)
@@ -32,9 +35,11 @@ MODE_TOTAL_STAT = {
     "tc": 194,
     "occupation": 195,
     "occ": 195,
+    "oc": 195,
     "diamond_mine": 196,
     "dia": 196,
     "ctf": 197,
+    "cctf": 197,
     "zombie": 198,
     "zom": 198,
     "demolition": 199,
@@ -65,6 +70,8 @@ class RevivalIdentity:
     identity_type: str
     ranked_eligible: bool
     steam_id: str | None = None
+    assigned_team: int | None = None
+    client_capabilities: tuple[str, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "RevivalIdentity":
@@ -88,6 +95,11 @@ class RevivalIdentity:
             account_type=account_type,
             identity_type=identity_type,
             ranked_eligible=bool(payload.get("ranked_eligible", False)),
+            client_capabilities=((CAPABILITY,) if isinstance(payload.get("client_capabilities"), list)
+                                 and CAPABILITY in payload["client_capabilities"] else ()),
+            assigned_team=(payload.get("assigned_team")
+                           if type(payload.get("assigned_team")) is int
+                           and payload["assigned_team"] in {2, 3} else None),
             steam_id=(
                 str(payload["steam_id"])
                 if payload.get("steam_id") is not None
@@ -107,9 +119,22 @@ class RevivalMasterService:
         self.server = server
         self.config = getattr(server.config, "revival", None)
         self._heartbeat_task: asyncio.Task | None = None
+        self.cosmetics = CosmeticReplication(self)
         self._closing = False
         self._player_baselines: dict[int, tuple[int, int, int, int]] = {}
+        self._profile_baselines: dict[int, dict[int, list[int]]] = {}
+        self._participation_baselines: dict[int, tuple[float, float, float]] = {}
+        self._round_started_at = datetime.now(timezone.utc)
+        self._round_match_id = uuid4().hex
+        self._round_completed = False
         self._departed: dict[str, dict[str, Any]] = {}
+        self._pending_results: dict[str, dict[str, Any]] = {}
+        self._result_task: asyncio.Task | None = None
+        self._result_lock = asyncio.Lock()
+        self._result_outbox = ResultOutbox(
+            getattr(self.config, "results_path", "state/round-results.sqlite3"),
+            os.environ.get("AOS_MATCH_RESULTS_DIRECTORY") if os.environ.get("AOS_RELAY_LOBBY_ID") else None,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -170,6 +195,13 @@ class RevivalMasterService:
         return self.public_port
 
     @property
+    def mode_code(self) -> str:
+        """Use the same canonical wire identity for discovery and XP evidence."""
+        return get_mode_data(
+            getattr(self.server.config, "game_mode", self.server.config.default_mode)
+        ).code
+
+    @property
     def server_id(self) -> str:
         derived = "%s:%d" % (
             self.public_host,
@@ -206,9 +238,22 @@ class RevivalMasterService:
             self._heartbeat_loop(),
             name="aos-revival-heartbeat",
         )
+        self._start_result_flush()
+
+        self.cosmetics.start()
 
     async def close(self) -> None:
+        if self._closing:
+            return
+        # Capture the final live counters before raising the shutdown gate.
+        # Quitting mid-round records activity, without a completion/win bonus.
+        if not self._round_completed:
+            try:
+                self._capture_round_results(None, finished=False)
+            except Exception:
+                logger.exception("Could not capture final Revival results during shutdown")
         self._closing = True
+        await self.cosmetics.close()
         task = self._heartbeat_task
         self._heartbeat_task = None
         if task is not None:
@@ -217,6 +262,18 @@ class RevivalMasterService:
                 await task
             except asyncio.CancelledError:
                 pass
+        if self._result_task is not None:
+            self._result_task.cancel()
+            try:
+                await self._result_task
+            except asyncio.CancelledError:
+                pass
+            self._result_task = None
+        async with self._result_lock:
+            try:
+                await self._persist_pending_results()
+            except Exception:
+                logger.exception("Could not persist pending Revival results during shutdown")
 
     async def _heartbeat_loop(self) -> None:
         interval = min(
@@ -226,6 +283,8 @@ class RevivalMasterService:
         while not self._closing:
             try:
                 await asyncio.sleep(interval)
+                # Result retries must continue even if heartbeats are rejected.
+                self._start_result_flush()
                 await self.publish_heartbeat()
             except asyncio.CancelledError:
                 raise
@@ -383,6 +442,7 @@ class RevivalMasterService:
 
     @staticmethod
     def bind_player(player, identity: RevivalIdentity | None) -> None:
+        player.client_capabilities = identity.client_capabilities if identity else ()
         if identity is None:
             player.account_public_id = None
             player.account_legacy_id = None
@@ -415,8 +475,12 @@ class RevivalMasterService:
         if not legacy_id or bool(getattr(player, "is_bot", False)):
             return
         kills, deaths, captures, score = self._player_delta(player)
-        if not any((kills, deaths, captures, score)):
+        profile = self._profile_delta(player)
+        participation = self._participation_delta(player)
+        if not any((kills, deaths, captures, score)) and not profile and not participation[0]:
             self._player_baselines.pop(id(player), None)
+            self._profile_baselines.pop(id(player), None)
+            self._participation_baselines.pop(id(player), None)
             return
         record = self._departed.setdefault(
             str(legacy_id),
@@ -433,11 +497,83 @@ class RevivalMasterService:
         record["deaths"] += deaths
         record["captures"] += captures
         record["score"] += score
+        self._merge_profile(record, profile)
+        self._merge_participation(record, player, participation)
+        record["profile_managed"] = record.get("profile_managed", False) or hasattr(player, "profile_stats")
         self._player_baselines.pop(id(player), None)
+        self._profile_baselines.pop(id(player), None)
+        self._participation_baselines.pop(id(player), None)
 
-    def _result_players(self, winner: int | None):
+    @staticmethod
+    def _participation_counters(player: Any) -> tuple[float, float, float]:
+        state = getattr(player, "profile_stats", None)
+        return tuple(max(0.0, float(getattr(state, key, 0.0))) for key in
+                     ("connected_seconds", "active_seconds", "afk_seconds"))
+
+    def _participation_delta(self, player: Any) -> tuple[float, float, float]:
+        current = self._participation_counters(player)
+        previous = self._participation_baselines.get(id(player), (0.0, 0.0, 0.0))
+        return tuple(max(0.0, current[index] - previous[index]) for index in range(3))
+
+    @staticmethod
+    def _merge_participation(record: dict[str, Any], player: Any, values: tuple[float, float, float]) -> None:
+        previous = record.get("participation_seconds", (0.0, 0.0, 0.0))
+        record["participation_seconds"] = tuple(previous[i] + values[i] for i in range(3))
+        state = getattr(player, "profile_stats", None)
+        for key in ("human_opponents", "bot_opponents"):
+            record[key] = max(record.get(key, 0), int(getattr(state, key, 0)))
+
+    def begin_round(self) -> None:
+        """Reset HTTP evidence boundaries without changing any game packet."""
+        self._round_started_at = datetime.now(timezone.utc)
+        self._round_match_id = uuid4().hex
+        self._round_completed = False
+        self._departed.clear()
+        self._participation_baselines = {
+            id(player): self._participation_counters(player)
+            for player in self.server.players.values()
+        }
+        for player in self.server.players.values():
+            state = getattr(player, "profile_stats", None)
+            if state is not None:
+                state.human_opponents = state.bot_opponents = 0
+                state.opponent_sample_seconds = 0.0
+                state.activity_seen = False
+
+    def reset_scoreboard_baselines(self) -> None:
+        """Pair a match-score reset with its result-delta baseline reset.
+
+        Profile and participation counters are cumulative and retain their
+        independent baselines. Finished-round snapshots are already immutable.
+        """
+        self._player_baselines = {
+            id(player): self._counters(player)
+            for player in self.server.players.values()
+        }
+
+    def _profile_delta(self, player) -> dict[int, list[int]]:
+        previous = self._profile_baselines.get(id(player), {})
+        delta = {}
+        for stat, pair in profile_snapshot(player).items():
+            baseline = previous.get(stat, [0, 0])
+            values = [max(0, pair[index] - baseline[index]) for index in range(2)]
+            if any(values):
+                delta[stat] = values
+        return delta
+
+    @staticmethod
+    def _merge_profile(record, profile) -> None:
+        values = record.setdefault("profile", {})
+        for stat, pair in profile.items():
+            total = values.setdefault(stat, [0, 0])
+            total[0] += pair[0]
+            total[1] += pair[1]
+
+    def _result_players(self, winner: int | None, *, finished: bool = True):
         combined: dict[str, dict[str, Any]] = {
-            legacy_id: dict(values) for legacy_id, values in self._departed.items()
+            legacy_id: {**values, "profile": {
+                stat: list(pair) for stat, pair in values.get("profile", {}).items()
+            }} for legacy_id, values in self._departed.items()
         }
         connected_snapshots: dict[int, tuple[int, int, int, int]] = {}
         for player in self.server.players.values():
@@ -461,8 +597,13 @@ class RevivalMasterService:
             record["deaths"] += delta[1]
             record["captures"] += delta[2]
             record["score"] += delta[3]
+            record["team"] = int(getattr(player, "team", -1))
+            record["connected"] = True
+            self._merge_participation(record, player, self._participation_delta(player))
+            self._merge_profile(record, self._profile_delta(player))
+            record["profile_managed"] = record.get("profile_managed", False) or hasattr(player, "profile_stats")
 
-        mode_name = str(self.server.config.default_mode).lower()
+        mode_name = self.mode_code
         mode_total = MODE_TOTAL_STAT.get(mode_name)
         players = []
         for legacy_id, record in combined.items():
@@ -470,20 +611,30 @@ class RevivalMasterService:
             deaths = int(record["deaths"])
             captures = int(record["captures"])
             score = int(record["score"])
-            if not any((kills, deaths, captures, score)):
+            if (not any((kills, deaths, captures, score)) and not record.get("profile")
+                    and not record.get("participation_seconds", (0,))[0]):
                 continue
             stats = {
                 "1": [kills, kills],
                 "220": [deaths, 0],
                 "201": [1, score],
             }
-            if captures:
+            if captures and mode_name in {"ctf", "cctf", "classic_ctf"}:
                 # CTF's recovered capture stat. Other modes still retain the
                 # honest generic score totals above.
                 stats["49"] = [captures, captures]
+            if record.get("profile_managed"):
+                # Team/class-change deaths and scoreboard refreshes are not
+                # new profile deaths, kills or captures.
+                stats["1"] = [0, 0]
+                stats["220"] = [0, 0]
+                stats.pop("49", None)
+            stats.update({str(stat): list(pair) for stat, pair in record.get("profile", {}).items()})
             if mode_total is not None:
                 stats[str(mode_total)] = [1, score]
-            if winner is None:
+            if not finished or not record.get("connected"):
+                pass
+            elif winner is None:
                 stats["161"] = [1, 0]
             elif int(record["team"]) == int(winner):
                 stats["159"] = [1, 0]
@@ -495,49 +646,141 @@ class RevivalMasterService:
                     "name": record["name"],
                     "total": [1, score],
                     "stats": stats,
+                    "participation": {
+                        "connected_seconds": int(record.get("participation_seconds", (0, 0, 0))[0]),
+                        "active_seconds": int(record.get("participation_seconds", (0, 0, 0))[1]),
+                        "afk_seconds": int(record.get("participation_seconds", (0, 0, 0))[2]),
+                        "human_opponents": min(100, record.get("human_opponents", 0)),
+                        "bot_opponents": min(100, record.get("bot_opponents", 0)),
+                        "result": ("unfinished" if not finished or not record.get("connected") else
+                                   "draw" if winner is None else
+                                   "win" if int(record["team"]) == int(winner) else "loss"),
+                    },
                 }
             )
         return players, connected_snapshots
 
-    async def submit_round_results(self, winner: int | None = None) -> None:
-        if not self.enabled or not self.write_token:
+    def _capture_round_results(self, winner: int | None, *, finished: bool = True) -> None:
+        if (bool(getattr(self.server.config, "ugc_runtime", False))
+                or self.mode_code in {"ugc", "tut"}
+                or str(getattr(self.server.config, "default_mode", "")).lower() == "tutorial"):
             return
-        players, snapshots = self._result_players(winner)
+        if not self.enabled or not self.write_token or self._closing:
+            return
+        if len(self._pending_results) >= 256:
+            raise RevivalMasterError("round result memory queue is full; check the durable outbox")
+        players, snapshots = self._result_players(winner, finished=finished)
+        if finished:
+            self._round_completed = True
         if not players:
             return
         event_id = "round_%s" % uuid4().hex
-        status, payload = await self._post(
-            "/api/master/stats",
-            {
-                "event_id": event_id,
-                "server_id": self.server_id,
-                "recorded_at": datetime.now(timezone.utc).isoformat(),
-                "players": players,
-            },
-        )
-        if status != 200 or not payload.get("accepted"):
-            raise RevivalMasterError(
-                payload.get("detail") or payload.get("error") or "result submission rejected"
-            )
+        ended_at = datetime.now(timezone.utc)
+        duration = max(0, int((ended_at - self._round_started_at).total_seconds()))
+        self._pending_results[event_id] = {
+            "event_id": event_id,
+            "server_id": self.server_id,
+            "recorded_at": ended_at.isoformat(),
+            "players": players,
+        }
+        relay_id = os.environ.get("AOS_RELAY_LOBBY_ID", "").strip()
+        if relay_id:
+            self._pending_results[event_id]["relay_lobby_id"] = relay_id
+        map_crc = getattr(getattr(self.server, "world_manager", None), "map_file_crc", None)
+        if 30 <= duration <= 14400 and isinstance(map_crc, int):
+            self._pending_results[event_id]["match"] = {
+                "match_id": self._round_match_id,
+                "playlist_id": str(getattr(getattr(self.server.config, "steam", None), "playlist_id", 0)),
+                "mode_id": self.mode_code,
+                "map_crc": f"{map_crc & 0xFFFFFFFF:08x}",
+                "duration_seconds": duration,
+                "started_at": self._round_started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+            }
+            for result in players:
+                evidence = result["participation"]
+                evidence["connected_seconds"] = min(duration, evidence["connected_seconds"])
+                evidence["active_seconds"] = min(evidence["connected_seconds"], evidence["active_seconds"])
+                evidence["afk_seconds"] = min(evidence["connected_seconds"] - evidence["active_seconds"], evidence["afk_seconds"])
+        else:
+            for result in players:
+                result.pop("participation", None)
+        # Reserve these counters before the first await or the round reset.
+        # The immutable event now owns them, independent of HTTP success.
         self._departed.clear()
         self._player_baselines.update(snapshots)
-        logger.info(
-            "Revival round results accepted: event=%s updated=%s ignored=%s",
-            event_id,
-            payload.get("updated", 0),
-            payload.get("ignored", 0),
-        )
+        self._profile_baselines.update({
+            id(player): profile_snapshot(player) for player in self.server.players.values()
+            if id(player) in snapshots
+        })
+        self._participation_baselines.update({
+            id(player): self._participation_counters(player) for player in self.server.players.values()
+            if id(player) in snapshots
+        })
 
-    def schedule_round_results(self, winner: int | None = None) -> None:
+    @staticmethod
+    async def _outbox_io(operation, *args):
+        # Cancelling to_thread does not stop SQLite. Wait for the transaction
+        # before releasing the async lock or beginning shutdown persistence.
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _persist_pending_results(self) -> None:
+        events = list(self._pending_results.values())
+        if not events:
+            return
+        await self._outbox_io(self._result_outbox.put_many, events)
+        for event in events:
+            self._pending_results.pop(event["event_id"], None)
+
+    async def flush_round_results(self) -> None:
         if not self.enabled or not self.write_token:
             return
+        async with self._result_lock:
+            while True:
+                await self._persist_pending_results()
+                if self._closing:
+                    return
+                events = await self._outbox_io(self._result_outbox.pending, self.server_id)
+                if not events:
+                    return
+                for event in events:
+                    status, payload = await self._post("/api/master/stats", event)
+                    if status != 200 or not payload.get("accepted"):
+                        raise RevivalMasterError(
+                            payload.get("detail") or payload.get("error") or "result submission rejected"
+                        )
+                    await self._outbox_io(self._result_outbox.acknowledge, event["event_id"])
+                    logger.info("Revival round results accepted: event=%s", event["event_id"])
 
-        async def submit() -> None:
+    async def submit_round_results(self, winner: int | None = None) -> None:
+        self._capture_round_results(winner)
+        await self.flush_round_results()
+
+    def _start_result_flush(self) -> None:
+        if self._closing or (self._result_task is not None and not self._result_task.done()):
+            return
+
+        async def flush() -> None:
             try:
-                await self.submit_round_results(winner)
+                await self.flush_round_results()
             except RevivalMasterError as error:
-                logger.warning("Revival result submission failed: %s", error)
+                logger.warning("Revival results retained for retry: %s", error)
             except Exception:
-                logger.exception("Unexpected Revival result submission failure")
+                logger.exception("Revival result outbox failure; pending results retained")
 
-        asyncio.create_task(submit(), name="aos-revival-round-results")
+        self._result_task = asyncio.create_task(flush(), name="aos-revival-round-results")
+
+    def schedule_round_results(self, winner: int | None = None) -> None:
+        if not self.enabled or not self.write_token or self._closing:
+            return
+        try:
+            self._capture_round_results(winner)
+        except Exception:
+            logger.exception("Could not capture Revival round results")
+            return
+        self._start_result_flush()

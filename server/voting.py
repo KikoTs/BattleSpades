@@ -95,6 +95,7 @@ class VoteManager:
         self.votes: dict[int, int] = {}
         self.next_map: str | None = None
         self.opened_at = 0.0
+        self._deadline = 0.0
         self._map_result_event = asyncio.Event()
         self._last_start: dict[int, float] = {}
         # Map discovery is startup work. Never glob the filesystem from the
@@ -130,12 +131,20 @@ class VoteManager:
             logger.warning("Ignoring unavailable lobby maps: %s", ", ".join(missing))
         return result
 
+    def _eligible_ids(self, *, exclude: int | None = None) -> set[int]:
+        """Count connected human voters, not peerless bots or loading peers."""
+        connections = {id(value) for value in self.server.connections.values()}
+        return {
+            int(player.id)
+            for player in self.server.players.values()
+            if int(player.id) != exclude
+            and not bool(getattr(player, "is_bot", False))
+            and id(getattr(player, "connection", None)) in connections
+            and bool(getattr(player.connection, "in_game", False))
+        }
+
     def _eligible_count(self) -> int:
-        return sum(
-            1
-            for connection in self.server.connections.values()
-            if connection.in_game
-        )
+        return len(self._eligible_ids())
 
     def _mode_available_maps(self) -> tuple[str, ...]:
         """Return the cached operator catalog narrowed by a stock playlist.
@@ -181,7 +190,11 @@ class VoteManager:
     def start_kick(self, starter, target, reason: int, now: float) -> bool:
         """Open a majority kick ballot if identity and cooldown are valid."""
 
-        if self.active or target is None or target.id == starter.id:
+        if (self.active or target is None or target.id == starter.id
+                or self.server.players.get(int(starter.id)) is not starter
+                or int(starter.id) not in self._eligible_ids()
+                or self.server.players.get(int(target.id)) is not target
+                or int(target.id) not in self._eligible_ids()):
             return False
         last = self._last_start.get(int(starter.id), -1e9)
         if float(now) - last < VOTE_COOLDOWN:
@@ -196,6 +209,7 @@ class VoteManager:
         self.yes = {int(starter.id)}
         self.no = set()
         self.opened_at = float(now)
+        self._deadline = time.monotonic() + VOTE_DURATION
         self._last_start[int(starter.id)] = float(now)
         self._broadcast(VOTE_START, target)
         logger.info(
@@ -222,6 +236,10 @@ class VoteManager:
             if not value or path.name != value:
                 continue
             value = path.stem if path.suffix.lower() == ".vxl" else value
+            try:
+                _retail_dynamic_text(value)
+            except ValueError:
+                continue
             key = value.casefold()
             # Internal callers use the startup catalog. Keep the direct API
             # useful for map-less unit/plugin servers, but when a real catalog
@@ -250,6 +268,7 @@ class VoteManager:
         self.no = set()
         self.next_map = None
         self.opened_at = float(now)
+        self._deadline = time.monotonic() + MAP_VOTE_DURATION
         self._map_result_event = asyncio.Event()
         self._broadcast(VOTE_START, None)
         logger.info("MAP VOTE opened: %s", ", ".join(self.candidates))
@@ -304,18 +323,19 @@ class VoteManager:
 
         if not self.active or self.kind != "map":
             return self.next_map
-        remaining = max(
-            0.0,
-            MAP_VOTE_DURATION - (time.time() - float(self.opened_at)),
-        )
+        event = self._map_result_event
+        remaining = max(0.0, self._deadline - time.monotonic())
         if remaining > 0.0:
             try:
                 await asyncio.wait_for(
-                    self._map_result_event.wait(),
+                    event.wait(),
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
                 pass
+        if self._map_result_event is not event:
+            # A cancelled ballot's waiter must never close a replacement vote.
+            return None
         if self.active and self.kind == "map":
             self._resolve_map()
         return self.next_map
@@ -323,6 +343,7 @@ class VoteManager:
     def reveal_to(self, connection) -> None:
         """Open the current ballot for a client that just entered GameScene."""
 
+        self._expire_due()
         if not self.active:
             return
         send = getattr(connection, "send", None)
@@ -376,12 +397,17 @@ class VoteManager:
         self._cast_index(voter, index)
 
     def _cast_index(self, voter, index: int) -> None:
+        self._expire_due()
         player_id = int(voter.id)
         if (
             not self.active
             or not 0 <= int(index) < len(self.candidates)
             or (self.kind == "kick" and player_id == self.target_id)
+            or self.server.players.get(player_id) is not voter
+            or player_id not in self._eligible_ids()
         ):
+            return
+        if self.votes.get(player_id) == int(index):
             return
         self.votes[player_id] = int(index)
         self.yes.discard(player_id)
@@ -396,18 +422,27 @@ class VoteManager:
         elif self.kind == "map" and len(self.votes) >= self._eligible_count():
             self._resolve_map()
 
-    def tick(self, now: float) -> None:
+    def tick(self, now: float | None = None) -> None:
         """Resolve an expired ballot without blocking the simulation tick."""
 
         if not self.active:
             return
         duration = MAP_VOTE_DURATION if self.kind == "map" else VOTE_DURATION
-        if float(now) - self.opened_at < duration:
+        forced_elapsed = now is not None and float(now) - self.opened_at >= duration
+        if not forced_elapsed and time.monotonic() < self._deadline:
             return
         if self.kind == "map":
             self._resolve_map()
         else:
             self._resolve_kick(passed=len(self.yes) >= self._needed())
+
+    def _expire_due(self) -> None:
+        """Enforce the deadline even before the next simulation tick."""
+        if self.active and time.monotonic() >= self._deadline:
+            if self.kind == "map":
+                self._resolve_map()
+            else:
+                self._resolve_kick(passed=len(self.yes) >= self._needed())
 
     def cancel(self) -> None:
         if not self.active:
@@ -436,6 +471,10 @@ class VoteManager:
                 VOTE_UPDATE,
                 self.server.players.get(self.target_id),
             )
+        if self.active and self.kind == "map":
+            remaining = self._eligible_ids(exclude=player_id)
+            if remaining and remaining.issubset(self.votes):
+                self._resolve_map()
 
     def consume_next_map(self) -> str | None:
         """Return and clear the map chosen for the next round boundary."""
@@ -448,6 +487,10 @@ class VoteManager:
         target = self.server.players.get(self.target_id)
         self._broadcast(VOTE_CLOSED, target)
         name = target.name if target is not None else "?"
+        yes_count, no_count = len(self.yes), len(self.no)
+        # Disconnect invokes forget_player synchronously. Retire this ballot
+        # before that callback to avoid recursively resolving the same kick.
+        self._clear_active()
         if passed and target is not None:
             logger.info("VOTE-KICK PASSED - kicking %s", name)
             try:
@@ -458,10 +501,9 @@ class VoteManager:
             logger.info(
                 "VOTE-KICK failed against %s (%d yes / %d no)",
                 name,
-                len(self.yes),
-                len(self.no),
+                yes_count,
+                no_count,
             )
-        self._clear_active()
 
     def _resolve_map(self) -> None:
         if not self.candidates:
@@ -540,7 +582,15 @@ class VoteManager:
         # The client literal-evaluates these fields into (id, arguments).
         # Omitting the empty arguments tuple is a native exception hazard.
         if self.kind == "map":
-            packet.title = _retail_localised_text("VOTE_MAP_TITLE")
+            # GenericVotingHUD uses CLOSED.title for the six-second result
+            # panel. Repeating the START title leaves "VOTE MAP" onscreen
+            # without ever saying which map won, even though the tally has
+            # closed and the next-map choice is already authoritative.
+            packet.title = _retail_localised_text(
+                "MAP_VOTED_MESSAGE", (self.next_map,)
+            ) if message_type == VOTE_CLOSED and self.next_map is not None else (
+                _retail_localised_text("VOTE_MAP_TITLE")
+            )
             packet.description = _retail_localised_text(
                 "VOTE_MAP_DESCRIPTION"
             )

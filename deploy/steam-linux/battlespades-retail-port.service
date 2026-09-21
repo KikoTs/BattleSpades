@@ -1,0 +1,14 @@
+[Unit]
+Description=BattleSpades retail UDP 32887 alias to existing TDM 27015
+Wants=network-online.target
+After=network-online.target ufw.service
+Before=battlespades-steam.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/battlespades-steam/retail-port.nft
+ExecStop=/usr/sbin/nft delete table ip battlespades_retail
+
+[Install]
+WantedBy=multi-user.target

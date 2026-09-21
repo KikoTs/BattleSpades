@@ -100,85 +100,28 @@ _DEF = lambda name, default: getattr(C, name, default)
 
 
 def _build_movement_table() -> dict[int, ClassMovement]:
-    """Pull per-class multipliers from shared.constants. The constants module
-    explicitly lists 9 named classes (soldier..ugcbuilder); for the rest we
-    use the 'unknown' entries (A137, A150, A189, etc.) at the documented
-    indices. Anything still missing falls back to soldier-like defaults.
+    """Use the exact class-indexed tables consumed by retail GameClass.
+
+    The client indexes every field independently. Cloning Soldier/Zombie
+    profiles silently discarded Fast Zombie, Specialist and Medic values and
+    incorrectly enabled uphill sprinting for Classic Soldier and Jump Zombie.
     """
-    # Helper that picks the constant from the table named ``base`` (e.g.
-    # SPRINT_MULTIPLIER) for a class. Falls back to a default.
-    def get(class_const: str, suffix: str, default: float) -> float:
-        # SOLDIER + _SPRINT_MULTIPLIER → SOLDIER_SPRINT_MULTIPLIER
-        return float(_DEF('{}_{}'.format(class_const, suffix), default))
-
-    table: dict[int, ClassMovement] = {}
-
-    # Named classes with explicit constants
-    named: tuple[tuple[int, str], ...] = (
-        (int(C.CLASS_SOLDIER),         'SOLDIER'),
-        (int(C.CLASS_SCOUT),           'SCOUT'),
-        (int(C.CLASS_ROCKETEER),       'ROCKETEER'),
-        (int(C.CLASS_MINER),           'MINER'),
-        (int(C.CLASS_ZOMBIE),          'ZOMBIE'),
-        (int(C.CLASS_CLASSIC_SOLDIER), 'CLASSIC_SOLDIER'),
-        (int(C.CLASS_GANGSTER_1),      'GANGSTER'),
-        (int(C.CLASS_ENGINEER),        'ENGINEER'),
-        (int(C.CLASS_UGCBUILDER),      'UGCBUILDER'),
-    )
-    for cid, prefix in named:
-        table[cid] = ClassMovement(
+    return {
+        cid: ClassMovement(
             class_id=cid,
-            accel_multiplier=get(prefix, 'ACCEL_MULTIPLIER', 0.7),
-            sprint_multiplier=get(prefix, 'SPRINT_MULTIPLIER', 1.4),
-            crouch_sneak_multiplier=get(prefix, 'CROUCH_SNEAK_MULTIPLIER', 0.5),
-            jump_multiplier=get(prefix, 'JUMP_MULTIPLIER', 1.2),
-            water_friction=get(prefix, 'WATER_FRICTION', 8.0),
-            can_sprint_uphill=bool(_DEF('{}_CAN_SPRINT_UPHILL'.format(prefix), True)),
-            fall_on_water_damage_multiplier=get(prefix, 'FALL_ON_WATER_DAMAGE_MULTIPLIER', 0.5),
-            falling_damage_min_distance=int(get(prefix, 'FALLING_DAMAGE_MIN_DISTANCE', 10)),
-            falling_damage_max_distance=int(get(prefix, 'FALLING_DAMAGE_MAX_DISTANCE', 40)),
-            falling_damage_max_damage=int(get(prefix, 'FALLING_DAMAGE_MAX_DAMAGE', 100)),
+            accel_multiplier=float(C.CLASS_ACCEL_MULTIPLIER[cid]),
+            sprint_multiplier=float(C.CLASS_SPRINT_MULTIPLIER[cid]),
+            crouch_sneak_multiplier=float(C.CLASS_CROUCH_SNEAK_MULTIPLIER[cid]),
+            jump_multiplier=float(C.CLASS_JUMP_MULTIPLIER[cid]),
+            water_friction=float(C.CLASS_WATER_FRICTION[cid]),
+            can_sprint_uphill=bool(C.CLASS_CAN_SPRINT_UPHILL[cid]),
+            fall_on_water_damage_multiplier=float(C.CLASS_FALL_ON_WATER_DAMAGE_MULTIPLIER[cid]),
+            falling_damage_min_distance=int(C.CLASS_FALLING_DAMAGE_MIN_DISTANCE[cid]),
+            falling_damage_max_distance=int(C.CLASS_FALLING_DAMAGE_MAX_DISTANCE[cid]),
+            falling_damage_max_damage=int(C.CLASS_FALLING_DAMAGE_MAX_DAMAGE[cid]),
         )
-
-    # Other gangster slots clone GANGSTER_1's table (verified game behavior).
-    for cid in (int(C.CLASS_GANGSTER_2), int(C.CLASS_GANGSTER_3),
-                int(C.CLASS_GANGSTER_4),
-                int(C.CLASS_GANGSTER_VIP_1), int(C.CLASS_GANGSTER_VIP_2)):
-        table[cid] = ClassMovement(class_id=cid,
-                                   **{k: v for k, v in table[int(C.CLASS_GANGSTER_1)].__dict__.items()
-                                      if k != 'class_id'})
-
-    # Classes without explicit named constants: FAST_ZOMBIE, JUMP_ZOMBIE,
-    # SPECIALIST, MEDIC. Use the "unknown" A### entries from constants.py at
-    # the documented offsets, falling back to ZOMBIE for fast/jump and
-    # SOLDIER for specialist/medic.
-    unknown_sprint = (
-        float(_DEF('A150', 3.0)),    # FAST_ZOMBIE sprint
-        float(_DEF('A151', 1.0)),    # JUMP_ZOMBIE sprint
-        float(_DEF('A152', 1.55)),   # SPECIALIST sprint
-        float(_DEF('A153', 1.35)),   # MEDIC sprint
-    )
-    unknown_jump = (
-        float(_DEF('A189', 2.5)),   # FAST_ZOMBIE jump
-        float(_DEF('A190', 3.0)),   # JUMP_ZOMBIE jump
-        float(_DEF('A191', 1.5)),   # SPECIALIST jump
-        float(_DEF('A192', 1.2)),   # MEDIC jump
-    )
-    unknown_classes = (
-        (int(C.CLASS_FAST_ZOMBIE),  table[int(C.CLASS_ZOMBIE)],   0),
-        (int(C.CLASS_JUMP_ZOMBIE),  table[int(C.CLASS_ZOMBIE)],   1),
-        (int(C.CLASS_SPECIALIST),   table[int(C.CLASS_SOLDIER)],  2),
-        (int(C.CLASS_MEDIC),        table[int(C.CLASS_SOLDIER)],  3),
-    )
-    for cid, base, idx in unknown_classes:
-        d = base.__dict__.copy()
-        d['class_id'] = cid
-        d['sprint_multiplier'] = unknown_sprint[idx]
-        d['jump_multiplier'] = unknown_jump[idx]
-        table[cid] = ClassMovement(**d)
-
-    return table
-
+        for cid in CLASS_IDS
+    }
 
 MOVEMENT: dict[int, ClassMovement] = _build_movement_table()
 

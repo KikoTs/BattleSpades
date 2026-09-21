@@ -135,5 +135,14 @@ def get(code: str) -> ModeData:
         'zombie': 'zom',
         'classic_ctf': 'cctf',
         'classic-ctf': 'cctf',
+        'multihill': 'mh',
+        'multi-hill': 'mh',
+        'territory_control': 'tc',
+        'territory-control': 'tc',
+        'diamond': 'dia',
+        'diamond_mine': 'dia',
+        'demolition': 'dem',
+        'occupation': 'oc',
+        'tutorial': 'tut',
     }.get(normalized, normalized)
     return MODES.get(normalized, MODES['nor'])

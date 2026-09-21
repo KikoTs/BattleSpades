@@ -228,6 +228,9 @@ class RoundLifecycle:
         server = self.server
         # Pending edits carry old-life inventory reservations and client-loop
         # labels.  Never let them cross the round's timeline reset.
+        begin_round = getattr(getattr(server, "revival_master", None), "begin_round", None)
+        if callable(begin_round):
+            begin_round()
         world_mutations = getattr(server, "world_mutations", None)
         if world_mutations is not None:
             world_mutations.cancel_all()

@@ -368,9 +368,18 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
 
     from server.main import BattleSpadesServer
     from server.telemetry import TelemetryService
+    from server.native_host import NativeHostStatus
 
     logger = logging.getLogger("BattleSpades")
     loop = asyncio.get_running_loop()
+    native_status = (
+        NativeHostStatus.from_environment(
+            getattr(config, "port", 0), getattr(config, "game_mode", "")
+        )
+        if control_stdin else None
+    )
+    if native_status is not None:
+        native_status.publish("starting")
 
     # Keep this directly beside construction: freezing later would retain
     # gameplay state forever, while freezing earlier would miss lazy imports.
@@ -383,6 +392,16 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
     server_task = asyncio.create_task(server.start(), name="BattleSpades-server")
     shutdown_task: asyncio.Task | None = None
     control_task: asyncio.Task | None = None
+    ready_task: asyncio.Task | None = None
+
+    async def report_ready() -> None:
+        while not server.running and not server_task.done():
+            await asyncio.sleep(0.025)
+        if server.running and shutdown_task is None and native_status is not None:
+            native_status.publish("ready")
+
+    if native_status is not None:
+        ready_task = asyncio.create_task(report_ready(), name="native-host-readiness")
 
     async def stop_after_start_boundary() -> None:
         # A parent can close its pipe immediately after spawning us. Avoid
@@ -397,6 +416,8 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
         if shutdown_task is not None:
             return
         logger.info("%s...", reason.capitalize())
+        if native_status is not None:
+            native_status.publish("stopping")
         shutdown_task = asyncio.create_task(
             stop_after_start_boundary(),
             name="BattleSpades-graceful-shutdown",
@@ -416,9 +437,19 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
     if control_stdin:
         control_task = _start_control_stdin_monitor(loop, request_shutdown)
 
+    failed = False
     try:
         await server_task
+    except Exception:
+        failed = True
+        if native_status is not None:
+            native_status.publish("failed")
+        raise
     finally:
+        if ready_task is not None:
+            ready_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ready_task
         # Await the same stop task that lowered ``server.running``. Calling
         # stop() a second time would return early and let asyncio.run cancel
         # the first task midway through UGC's final VXL/sidecar checkpoint.
@@ -431,6 +462,8 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
                 control_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await control_task
+        if native_status is not None and not failed:
+            native_status.publish("stopped")
 
 
 def _run_server(

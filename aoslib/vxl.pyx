@@ -1118,7 +1118,9 @@ cdef class VXL:
             xi = int(round(x1 + ((x2 - x1) * index) / float(steps)))
             yi = int(round(y1 + ((y2 - y1) * index) / float(steps)))
             zi = int(round(z1 + ((z2 - z1) * index) / float(steps)))
-            if not result or result[-1] != (xi, yi, zi):
+            # wraparound=False turns a negative typed-list index into an
+            # unchecked PyList_GET_ITEM(-1), not Python's last-item lookup.
+            if not result or result[len(result) - 1] != (xi, yi, zi):
                 result.append((xi, yi, zi))
         return result
 

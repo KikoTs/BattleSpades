@@ -106,6 +106,16 @@ PRIMARY_DIG_PROFILES = {
             "MACHETE_TOOL", 50, "MACHETE_DAMAGE", 35, 2.0, DIG_MACHETE,
             "MACHETE_SHOOT_INTERVAL", 0.7,
         ),
+        # Recovered weapon catalog values. A Medic who chose the riot stick
+        # still needs terrain access; the shield itself does no block damage.
+        _profile(
+            "RIOTSTICK_TOOL", 49, "RIOTSTICK_DAMAGE", 34, 1.75, DIG_SINGLE,
+            "RIOTSTICK_SHOOT_INTERVAL", 0.5,
+        ),
+        _profile(
+            "RIOTSHIELD_TOOL", 52, "RIOTSHIELD_DAMAGE", 36, 0.0, DIG_SINGLE,
+            "RIOTSHIELD_SHOOT_INTERVAL", 1.0,
+        ),
         _profile(
             "UGC_PICKAXE_TOOL", 44, "UGC_PICKAXE_DAMAGE", 28, 9.0,
             DIG_SINGLE, "UGC_PICKAXE_SHOOT_INTERVAL", 0.2,

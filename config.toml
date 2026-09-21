@@ -7,6 +7,11 @@ port = 27015
 max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
+# Private welcome after loading, once per connection. Omitted settings use the
+# Beta 1.1/AoS Revival defaults. Tokens: {player}, {release}, {build_date}.
+# Custom MOTD replaces the default lines; empty greeting and [] disable both.
+# join_greeting = "Welcome, {player}! {release} | Build (UTC): {build_date}"
+# motd = ["Build big. Play fair. Have fun!"]
 
 # Used only by run_map_creator.py / BattleSpadesMapCreator.exe.
 # `project` reopens an existing .ugc/.vxl/.txt triplet or names a new one.
@@ -65,6 +70,8 @@ official = false
 require_identity = false    # true rejects legacy/unranked clients
 heartbeat_interval_seconds = 30.0
 request_timeout_seconds = 5.0
+# Preserve this database across upgrades; pending results retry with their original IDs.
+results_path = "state/round-results.sqlite3"
 
 [network]
 timeout_ms = 10000
@@ -290,6 +297,9 @@ worker = "thread"
 perception_hz = 10
 decision_hz = 8
 path_requests_per_second = 24
+# Beta tactical squads; set "classic" to retain the previous behavior layer.
+behavior_version = "cooperative"
+friendly_mischief = true
 main_thread_budget_ms = 0.75
 seed = 0
 debug_visualization = false
@@ -304,7 +314,7 @@ clean_slate_games = 3
 [modes.tdm]
 time_limit = 900       # 15-minute round clock
 kill_points = 1        # team points per kill
-headshot_bonus = 1     # extra team point for a headshot kill
+headshot_bonus = 0     # retail: every enemy kill is one team point
 
 [modes.ctf]
 time_limit = 1800      # shipped CTF clock (30 minutes)

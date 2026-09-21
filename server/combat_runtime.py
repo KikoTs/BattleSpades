@@ -204,6 +204,9 @@ class CombatSystem:
         elif not player.consume_shot(now):
             return False
 
+        from server.profile_stats import shot
+        shot(player)
+
         if not player.is_spade_tool():
             feedback = self._build_shoot_feedback_packet(player, packet)
             # Packet 6 is the client -> server request. Retail clients
@@ -454,6 +457,9 @@ class CombatSystem:
     def _commit_block_build(self, player, action_loop, position, color) -> None:
         """Commit a reserved single-block build after its movement frame."""
 
+        if self._bot_build_overlaps_player(player, (position,)):
+            self._cancel_reserved_block_build(player, (position,))
+            return
         x, y, z = position
         wm = self.server.world_manager
         # Another ready mutation can win the cell before this one. Never charge
@@ -469,6 +475,8 @@ class CombatSystem:
         self._broadcast_block_mutation(
             player, position, BLOCK_ACTION_BUILD, loop_count=action_loop
         )
+        from server.profile_stats import add
+        add(player, C.MAP_SINGLEBLOCKS_ADDED_TOTAL)
         # BlockTool sends the line but does not play BUILD_SOUND on success.
         # Include the actor so a solo builder receives the authoritative cue.
         play_sound(
@@ -588,6 +596,9 @@ class CombatSystem:
     ) -> None:
         """Commit one validated BlockLine on the post-physics tick boundary."""
 
+        if self._bot_build_overlaps_player(player, build_cells):
+            self._cancel_reserved_block_build(player, build_cells)
+            return
         failed_cells = []
         for x, y, z in build_cells:
             if not self.server.world_manager.set_block(x, y, z, True, color):
@@ -620,11 +631,19 @@ class CombatSystem:
             cell for cell in build_cells if cell not in failed_cells
         ]
         if successful_cells:
+            from server.profile_stats import add
+            add(player, C.MAP_SINGLEBLOCKS_ADDED_TOTAL, len(successful_cells))
             play_sound(
                 self.server,
                 SND_BUILD,
                 position=successful_cells[0],
             )
+
+    def _bot_build_overlaps_player(self, player, cells) -> bool:
+        """Recheck bot construction after movement, before an atomic commit."""
+        construction = getattr(self.server, "construction", None)
+        return bool(getattr(player, "is_bot", False) and construction is not None
+                    and construction._overlaps_living_player(frozenset(cells)))
 
     def block_line_cells(self, a, b):
         """Return the stock face-connected cells for public action validation."""
@@ -1093,6 +1112,8 @@ class CombatSystem:
         health_before = target.health
         target.damage(damage, source=attacker, kill_type=attacker.get_weapon_profile().kill_type)
         if target.health < health_before:
+            from server.profile_stats import hit
+            hit(attacker, target)
             self._broadcast_player_hit_feedback(attacker, position)
         return True
 
@@ -1113,6 +1134,8 @@ class CombatSystem:
             health_before = target.health
             target.damage(damage, source=attacker, kill_type=kill_type)
             if target.health < health_before:
+                from server.profile_stats import hit
+                hit(attacker, target)
                 self._broadcast_player_hit_feedback(attacker, position)
             return True
 
@@ -1400,6 +1423,9 @@ class CombatSystem:
         The classic AoS behavior — without it a streetlamp whose base is dug
         out levitates forever."""
         wm = self.server.world_manager
+        from server.profile_stats import add
+        removed_positions = tuple(removed_positions)
+        add(player, C.MAP_BLOCKS_DESTROYED_TOTAL, len(removed_positions))
         chunks = wm.find_unsupported_chunks(list(removed_positions))
         collapsed = []
         for chunk in chunks:
@@ -1408,6 +1434,8 @@ class CombatSystem:
             # immediately; do not flood the original action with one Damage per
             # voxel because that duplicates collapse work and effects.
             collapsed.extend(wm.destroy_blocks(chunk))
+
+        add(player, C.MAP_BLOCKS_DESTROYED_TOTAL, len(collapsed))
 
         # A client whose topology differs by even one voxel can derive a
         # different falling component and retain visible blocks that no longer

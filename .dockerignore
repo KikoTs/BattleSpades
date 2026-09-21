@@ -1,5 +1,9 @@
 .git
 .github
+.agents
+.claude
+.codex
+.worktrees
 .idea
 .vscode
 .venv
@@ -17,6 +21,11 @@ env
 build
 dist
 release-dist
+release-*
+local-*
+validation-*
+NVIDIA Corporation
+*.lnk
 logs
 tmp
 captures

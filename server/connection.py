@@ -41,6 +41,8 @@ from server.game_constants import (
     is_playable_team,
 )
 from server.map_metadata import DEFAULT_SKYBOX_NAME, normalize_skybox_name
+from server.cosmetics import PACKET_ID as COSMETIC_PACKET_ID, MAGIC as COSMETIC_MAGIC, MAX_PACKET_BYTES, capable
+from server.flight_profile import RETAIL_FLIGHT, BALANCED_FLIGHT, ticket_has_flight_capability
 
 # Build packet name mapping
 PACKET_NAMES = {}
@@ -118,9 +120,11 @@ SPAWN_HP_DAMAGE_TYPE = 2
 _BLOCKED_OUTBOUND_PACKET_IDS = frozenset({3})
 
 
-def outbound_packet_is_safe(data: bytes) -> bool:
+def outbound_packet_is_safe(data: bytes, *, cosmetic_capable: bool = False) -> bool:
     """Return whether one complete payload may enter retail transport."""
 
+    if data and data[0] == COSMETIC_PACKET_ID:
+        return cosmetic_capable and data.startswith(COSMETIC_MAGIC) and len(data) <= MAX_PACKET_BYTES
     return bool(data) and int(data[0]) not in _BLOCKED_OUTBOUND_PACKET_IDS
 
 
@@ -164,8 +168,11 @@ class Connection:
         # Connection state
         self.authenticated = False
         self.map_sent = False
+        self._map_sync_generation = 0
         self.state_sent = False
         self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
+        self.flight_profile = RETAIL_FLIGHT
+        self.flight_profile_capable = False
         self.pending_selection = None
         # Compatibility mirrors for callers still constructing the old
         # handshake fields independently. Runtime join logic consumes the
@@ -181,6 +188,7 @@ class Connection:
         # ChatMessage/StateData/WorldUpdate) — a flood during the async world
         # build / GameScene transition crashes the compiled client natively.
         self.in_game = False
+        self._join_greeting_sent = False
         # Terrain sequence serialized into this connection's MapSync. Native
         # block packets after this watermark are replayed at first ClientData.
         self.map_mutation_watermark: Optional[int] = None
@@ -229,7 +237,7 @@ class Connection:
         if getattr(self.server, "_stopping", False):
             return
 
-        if not outbound_packet_is_safe(data):
+        if not outbound_packet_is_safe(data, cosmetic_capable=bool(getattr(self, "in_game", False)) and capable(self)):
             packet_id = data[0] if data else -1
             logger.error(
                 "Refused unsafe outbound packet id=%s len=%d",
@@ -277,6 +285,7 @@ class Connection:
     
     def disconnect(self, reason: int = 0):
         """Disconnect this peer."""
+        self._map_sync_generation += 1
         if getattr(self.server, "_stopping", False):
             return
         self.peer.disconnect(reason)
@@ -284,6 +293,7 @@ class Connection:
     def retire_for_server_shutdown(self) -> None:
         """Cancel connection-local waiters without touching the native peer."""
 
+        self._map_sync_generation += 1
         self.in_game = False
         for future in tuple(self._waiters.values()):
             if not future.done():
@@ -396,6 +406,7 @@ class Connection:
     
     def on_disconnect(self):
         """Called when connection is closed."""
+        self._map_sync_generation += 1
         logger.debug(f"Connection closed from {self.peer.address}")
     
     async def on_receive(self, data: bytes):
@@ -472,6 +483,8 @@ class Connection:
                 prune = getattr(self.server, "_prune_map_mutations", None)
                 if prune is not None:
                     prune()
+                from server.join_greeting import send_join_greeting
+                send_join_greeting(self)
             except Exception:
                 # Keep the connection gated so the next ClientData retries the
                 # complete reveal instead of admitting a partially synced
@@ -653,6 +666,8 @@ class Connection:
             logger.info(f"Received SteamSessionTicket from {self.peer.address}")
             try:
                 packet = SteamSessionTicket(reader)
+                self.flight_profile_capable = ticket_has_flight_capability(data)
+                self.flight_profile = BALANCED_FLIGHT if self.flight_profile_capable else RETAIL_FLIGHT
                 # Set steam key immediately - subsequent packets will be decrypted
                 self.steam_key = getattr(packet, 'ticket', None)
                 self.authenticated = True
@@ -717,6 +732,7 @@ class Connection:
         """
         if self.player is not None:
             raise RuntimeError("scene reload requires the old Player to be detached")
+        self._map_sync_generation += 1
 
         # A waiter belongs to the old scene/map epoch.  Letting its result
         # satisfy the next MapDataValidation would splice two VXL handshakes.
@@ -826,7 +842,10 @@ class Connection:
         )
         if callable(configure_for):
             configure_for(self, packet)
-        self.send(bytes(packet.generate()))
+        payload = bytes(packet.generate())
+        if self.flight_profile_capable:
+            payload += self.flight_profile.encode()
+        self.send(payload)
         logger.info(
             "Sent InitialInfo to %s map=%s mode_key=%d crc=%d",
             self.peer.address, packet.map_name, packet.mode_key, packet.checksum,
@@ -847,7 +866,18 @@ class Connection:
           client applies (x, y, column) records onto whatever base it has).
         """
         logger.debug(f"Sending map data to {self.peer.address}")
+        self._map_sync_generation += 1
+        generation = self._map_sync_generation
         wm = self.server.world_manager
+        source_map = wm.map
+
+        def still_current() -> bool:
+            return (
+                self._map_sync_generation == generation
+                and not getattr(self.server, "_stopping", False)
+                and self.server.world_manager is wm
+                and wm.map is source_map
+            )
         server_crc = int(getattr(wm, "map_file_crc", 0)) & 0xFFFFFFFF
         server_crc_wire = server_crc - (1 << 32) if server_crc >= (1 << 31) else server_crc
         client_crc = None
@@ -874,6 +904,8 @@ class Connection:
 
         # Allow client to process validation and state change
         await asyncio.sleep(0.1)
+        if not still_current():
+            return False
 
         crc_match = (
             client_crc is not None
@@ -882,12 +914,57 @@ class Connection:
         sync_mode = str(getattr(self.server.config, "map_sync_mode", "auto")).lower()
         use_delta = crc_match and sync_mode != "full"
 
-        # Capture one immutable column set. World mutation and packet handling
-        # share this event loop, and there is no await until the complete sync
-        # is sent, so the following watermark is exactly contiguous with it.
-        snapshot_columns = set(getattr(wm, "dirty_columns", ()) or ())
+        snapshot_prepared = False
+        if callable(getattr(wm, "capture_map_sync", None)):
+            # Only immutable bytes leave the gameplay thread. Pin the terrain
+            # watermark before yielding, so edits during compression are
+            # retained for the joining peer's canonical catch-up journal.
+            lock = wm.map_sync_lock
+            await lock.acquire()
+            release_lock = True
+            try:
+                if not still_current():
+                    return False
+                snapshot_columns = set(getattr(wm, "dirty_columns", ()) or ())
+                snapshot = wm.capture_map_sync(snapshot_columns, full=not use_delta)
+                mark_snapshot = getattr(self.server, "mark_map_snapshot_complete", None)
+                if mark_snapshot is not None:
+                    mark_snapshot(self)
+                if snapshot.cached_chunks is not None or (use_delta and not snapshot.overlay_data):
+                    chunk_list = snapshot.build_chunks()
+                else:
+                    worker = asyncio.create_task(asyncio.to_thread(snapshot.build_chunks))
+                    try:
+                        chunk_list = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        # Cancelling a coroutine cannot cancel an executing
+                        # thread. Retain the single-flight slot until it exits,
+                        # without delaying this peer's cancellation.
+                        release_lock = False
 
-        if use_delta:
+                        def release_worker(task):
+                            try:
+                                if not task.cancelled():
+                                    task.exception()
+                            finally:
+                                lock.release()
+
+                        worker.add_done_callback(release_worker)
+                        raise
+                if not still_current():
+                    return False
+                if chunk_list is not None:
+                    wm.cache_map_sync(snapshot, chunk_list)
+                    snapshot_prepared = True
+            finally:
+                if release_lock:
+                    lock.release()
+
+        # Compatibility fallback for maps without immutable raw bytes. The
+        # snapshot and watermark remain in one event-loop turn on this path.
+        if not snapshot_prepared:
+            snapshot_columns = set(getattr(wm, "dirty_columns", ()) or ())
+        if not snapshot_prepared and use_delta:
             payload = wm.serialize_dirty_columns_compressed(snapshot_columns)
             chunk_list = [
                 payload[i:i + 1024] for i in range(0, len(payload), 1024)
@@ -899,7 +976,7 @@ class Connection:
                 len(snapshot_columns),
                 len(payload),
             )
-        else:
+        elif not snapshot_prepared:
             # Full sync: stream the RAW .vxl bytes (native implicit-underground
             # encoding, ~0.5 MB) rather than re-serializing our filled in-memory
             # grid, which explicitly writes every underground voxel into a 36 MB
@@ -924,9 +1001,10 @@ class Connection:
                     server_crc,
                 )
 
-        mark_snapshot = getattr(self.server, "mark_map_snapshot_complete", None)
-        if mark_snapshot is not None:
-            mark_snapshot(self)
+        if not snapshot_prepared:
+            mark_snapshot = getattr(self.server, "mark_map_snapshot_complete", None)
+            if mark_snapshot is not None:
+                mark_snapshot(self)
 
         total_chunks = len(chunk_list)
         total_size = sum(len(chunk) for chunk in chunk_list)
@@ -1030,7 +1108,10 @@ class Connection:
         
         # NewPlayerConnection does not carry a concrete tool, so start with the default weapon tool.
         weapon = DEFAULT_WEAPON_TOOL
-        internal_team, wire_team = self._resolve_join_team(packet.team)
+        assigned_team = getattr(identity, "assigned_team", None)
+        internal_team, wire_team = self._resolve_join_team(
+            assigned_team if assigned_team in {2, 3} else packet.team
+        )
         is_spectator = internal_team == TEAM_SPECTATOR
         from server.player_names import allocate_unique_player_name
 

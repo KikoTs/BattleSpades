@@ -430,8 +430,11 @@ def test_bot_gateway_and_packet_handler_share_deployable_service():
     assert len(list(server.entity_registry.all())) == 1
 
 
-def test_bot_redeploys_radar_after_expiry_clears_nullable_owner_slot():
-    """An expired radar's ``None`` owner marker is a valid empty state."""
+def test_bot_redeploys_restocked_radar_after_expiry_clears_nullable_owner_slot(monkeypatch):
+    """Expiry releases the owner slot; a new radar still costs carried stock."""
+
+    now = [1000.0]
+    monkeypatch.setattr("server.deployable_actions.time.monotonic", lambda: now[0])
 
     server, player, _connection = _server_player(
         C.RADAR_STATION_TOOL,
@@ -456,6 +459,9 @@ def test_bot_redeploys_radar_after_expiry_clears_nullable_owner_slot():
         tool_id=C.RADAR_STATION_TOOL,
         position=(102.0, 100.0, 62.0),
     )
+    now[0] += float(C.RADAR_STATION_SHOOT_INTERVAL)
+    assert gateway.execute(player, second_action) is False
+    player.restock_ammo(int(C.AMMO_CRATE))
     assert gateway.execute(player, second_action) is True
     second = server.entity_registry.get(player._radar_entity_id)
     assert second is not None
