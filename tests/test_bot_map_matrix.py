@@ -10,11 +10,18 @@ import pytest
 
 from scripts.bot_map_matrix import shipped_maps, simulate_map
 
+# The simulated clock otherwise starts at the next eight-second boundary after
+# the machine's own uptime. Anything keyed to absolute time (guard beats, chat
+# cooldowns) then plays out differently on every runner, and a release build
+# failed on one platform for a trap the other five never saw. An explicit base
+# later than any CI runner's uptime is replayed exactly.
+_CLOCK_BASE = 1_000_000.0
+
 
 @pytest.mark.parametrize("mode", ("arena", "dia", "tc"))
 def test_mode_specific_london_recovery_survives_knockback_and_compacted_escapes(mode: str) -> None:
-    result = asyncio.run(simulate_map("London", mode_name=mode, seed=19,
-                                     seconds=120.0, bots=12, respawns=True))
+    result = asyncio.run(simulate_map("London", mode_name=mode, seed=19, seconds=120.0,
+                                     bots=12, respawns=True, clock_base=_CLOCK_BASE))
     assert result.passed, json.dumps(asdict(result), indent=2, sort_keys=True)
 
 
@@ -30,6 +37,7 @@ def test_shipped_map_avoids_bot_stalls_water_traps_and_team_piles(
             seed=0,
             seconds=35.0,
             bots=12,
+            clock_base=_CLOCK_BASE,
         )
     )
 
