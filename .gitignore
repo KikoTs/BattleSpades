@@ -27,6 +27,7 @@ server/bot_ai/recast.html
 # ── Packaging / distribution ────────────────────────────────────────
 build/
 dist/
+/out/
 release-dist/
 develop-eggs/
 downloads/
@@ -57,6 +58,7 @@ env/
 Thumbs.db
 
 # ── Runtime output ──────────────────────────────────────────────────
+state/
 logs/
 *.log
 server.log
@@ -65,6 +67,17 @@ config.local.toml
 # ── Dev / research scratch (not part of the server) ─────────────────
 tmp/
 .deleted/
+# Keep experimental builds and validation runs out of the source tree.
+/local-*/
+/validation-*/
+/release-*/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+/NVIDIA Corporation/
+/*.lnk
 # physics captures / self-row samples
 *.ndjson
 selfrow_samples.ndjson
@@ -87,14 +100,12 @@ aoslib-reversed/
 aceofspades/
 
 # ── Maps ────────────────────────────────────────────────────────────
-# maps/*.vxl ARE tracked — the 4 stock Battle Builders maps ship with the
+# maps/*.vxl ARE tracked — the stock Battle Builders maps ship with the
 # server so a fresh clone runs out of the box. But ignore generated map
 # artifacts (minimap thumbnails / compiled metadata) so a player's local
 # game files aren't committed by accident.
 /maps/*.txtc
 /maps/*.png
 
-
-# ── Builds ─────────────────────────────────────────────────
-
-release-*
+# Machine-specific Steam paths and generated local admin password.
+/config.steam-local.toml

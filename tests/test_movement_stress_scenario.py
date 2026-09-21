@@ -397,7 +397,8 @@ def test_yaw_ramp_uses_one_client_clock_schedule_and_one_cleanup_rpc():
     assert "clock.schedule(_stress_yaw_tick)" in start
     assert "_stress_yaw_elapsed += max(0.0, float(dt))" in start
     assert "nonlocal" not in start  # generated code runs under Python 2.7
-    assert "_player.character.yaw = _yaw" in start
+    assert "dispatch_event('on_mouse_motion'" in start
+    assert "_player.character.yaw =" not in start
     assert "if _player is None" in start
     assert "unschedule(_stress_yaw_tick)" in start
     assert "_stress_yaw_delta = 90.000000000" in start
@@ -407,6 +408,37 @@ def test_yaw_ramp_uses_one_client_clock_schedule_and_one_cleanup_rpc():
 
     assert len(console.calls) == 2
     assert "clock.unschedule(_stress_yaw_tick)" in console.calls[1]
+
+
+def test_yaw_ramp_runs_before_physics_and_restores_callback_order(monkeypatch):
+    from types import SimpleNamespace
+
+    observed = []
+    character = SimpleNamespace(yaw=0.0, update_orientation=lambda: None)
+    physics = SimpleNamespace(func=lambda dt: observed.append(character.yaw))
+    network = SimpleNamespace(func=lambda dt: None)
+    items = [physics, network]
+    clock = SimpleNamespace(
+        schedule=lambda fn: items.append(SimpleNamespace(func=fn)),
+        unschedule=lambda fn: items.__setitem__(slice(None), [i for i in items if i.func is not fn]),
+        get_default=lambda: SimpleNamespace(_schedule_items=items),
+    )
+    monkeypatch.setitem(sys.modules, "pyglet", SimpleNamespace(clock=clock))
+    def mouse_motion(event, x, y, dx, dy):
+        assert event == "on_mouse_motion"
+        character.yaw += dx * 0.1
+
+    scope = {"manager": SimpleNamespace(
+        scene=SimpleNamespace(player=SimpleNamespace(character=character)),
+        config=SimpleNamespace(mouse_sensitivity=0.1),
+        window=SimpleNamespace(dispatch_event=mouse_motion),
+    )}
+    exec(movement_stress.START_YAW_RAMP.format(duration=2.0, start=0.0, delta=90.0), scope)
+    for item in list(items):
+        item.func(1.0)
+    assert observed == [45.0], "physics must consume this frame's aim before its packet is sent"
+    exec(movement_stress.STOP_YAW_RAMP, scope)
+    assert items == [physics, network]
 
 
 def test_client_sample_sweeps_adjacent_reconciliation_history_labels():

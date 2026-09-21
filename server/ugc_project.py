@@ -243,8 +243,11 @@ class UGCProject:
     aos_ugc_handle: int = int(C.UGC_INVALID_STEAM_PUBLISHED_FILE_HANDLE)
     modified_since_publish: bool = True
     tags: list[str] = field(default_factory=lambda: ["map", "tdm"])
+    prefab_set: int | None = None
 
     def __post_init__(self) -> None:
+        if self.prefab_set is not None and (type(self.prefab_set) is not int or not 0 <= self.prefab_set < 6):
+            raise ValueError("prefab_set must be a retail palette index from 0 to 5")
         self.target_mode = normalize_target_mode(self.target_mode)
         self.baseplate = terrain_spec(self.baseplate).stem
         self.title = _clean_text(self.title, "Untitled Map", 80)
@@ -259,6 +262,11 @@ class UGCProject:
     @property
     def terrain(self) -> TerrainSpec:
         return terrain_spec(self.baseplate)
+
+    @property
+    def prefab_terrain(self) -> TerrainSpec:
+        palettes = ("lunar", "desert", "grassland", "mountain", "temple", "urban")
+        return self.terrain if self.prefab_set is None else terrain_spec(palettes[self.prefab_set])
 
     def place(self, x: int, y: int, z: int, item: int, *, mode: str | None = None) -> bool:
         """Insert one object, returning false for an exact duplicate or full project."""
@@ -349,6 +357,7 @@ class UGCProject:
             "baseplate": self.baseplate,
             "modified_since_publish": bool(self.modified_since_publish),
             "tags": list(self.tags),
+            "prefab_set": self.prefab_set,
         }
 
     def save(self, path: str | Path) -> Path:
@@ -393,6 +402,7 @@ class UGCProject:
             ),
             modified_since_publish=bool(data.get("modified_since_publish", True)),
             tags=tags,
+            prefab_set=data.get("prefab_set"),
         )
 
 

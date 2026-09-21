@@ -190,6 +190,7 @@ class ConstructionSafetyService:
                 player_x = float(player.x)
                 player_y = float(player.y)
                 body_z = int(math.floor(float(player.z)))
+                foot_z = int(math.floor(float(player.z) + 2.0))
             except (AttributeError, TypeError, ValueError):
                 # Incomplete player state must not authorize construction.
                 return True
@@ -205,7 +206,7 @@ class ConstructionSafetyService:
                 (x, y, z) in proposed
                 for x in x_cells
                 for y in y_cells
-                for z in (body_z, body_z + 1)
+                for z in range(body_z, foot_z + 1)
             ):
                 return True
         return False

@@ -25,6 +25,7 @@ ROCKET_TURRET_AIMING_SPEED = float(getattr(C, "ROCKET_TURRET_AIMING_SPEED", 180.
 ROCKET_TURRET_TOLERANCE = float(getattr(C, "ROCKET_TURRET_TOLERANCE", 0.1))
 ROCKET_TURRET_SHOOT_INTERVAL = float(getattr(C, "ROCKET_TURRET_SHOOT_INTERVAL", 1.5))
 ROCKET_TURRET_ROCKET_SPEED = float(getattr(C, "ROCKET_SPEED", 75.0))
+ROCKET_TURRET_MIN_PITCH = -float(C.ROCKET_TURRET_LOWER_PITCH_LIMIT)
 
 ROCKET_TURRET_ROCKET_SPEC = ProjectileSpec(
     "rocket_turret_rocket",
@@ -186,7 +187,7 @@ class RocketTurretController:
             dz = target_point[2] - origin[2]
             horizontal = math.hypot(dx, dy)
             desired_yaw = math.degrees(math.atan2(dx, dy))
-            desired_pitch = max(-30.0, min(90.0, -math.degrees(math.atan2(dz, horizontal))))
+            desired_pitch = -math.degrees(math.atan2(dz, horizontal))
             amount = ROCKET_TURRET_AIMING_SPEED * max(0.0, float(dt))
             turret.yaw = _approach_angle(turret.yaw, desired_yaw, amount)
             turret.pitch = _approach(turret.pitch, desired_pitch, amount)
@@ -247,7 +248,16 @@ class RocketTurretController:
         distance_sq = sum(
             (target[index] - origin[index]) ** 2 for index in range(3)
         )
-        if distance_sq > radius * radius:
+        if not math.isfinite(distance_sq) or not 1e-12 < distance_sq <= radius * radius:
+            return False
+        # Reject targets below the barrel's authored elevation limit. Clamping
+        # their angle and then launching directly at their unclamped position
+        # made the gun claim it was on target while firing through its base.
+        pitch = -math.degrees(math.atan2(
+            target[2] - origin[2],
+            math.hypot(target[0] - origin[0], target[1] - origin[1]),
+        ))
+        if pitch < ROCKET_TURRET_MIN_PITCH:
             return False
         blocked = getattr(self.server, "_blocked_los", None)
         return blocked is None or not blocked(
@@ -270,8 +280,12 @@ class RocketTurretController:
         # their first authoritative contact step.
         pos = tuple(origin[index] + direction[index] for index in range(3))
         vel = tuple(component * ROCKET_TURRET_ROCKET_SPEED for component in direction)
+        # `now` belongs to the monotonic turret cooldown. ProjectileEngine's
+        # runtime/update clock is time.time(), as for ordinary RPG shots.
+        # Mixing those clocks trips its maximum-flight failsafe on tick one
+        # and detonates the rocket beside the turret that launched it.
         projectile = self.server.projectile_engine.spawn_spec(
-            ROCKET_TURRET_ROCKET_SPEC, pos, vel, turret.owner_id, now=now)
+            ROCKET_TURRET_ROCKET_SPEC, pos, vel, turret.owner_id)
         if projectile is None:
             return
         owner = self.server.players.get(turret.owner_id)

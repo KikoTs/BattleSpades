@@ -1,5 +1,13 @@
-BattleSpades Portable Alpha
-===========================
+BattleSpades Portable Beta 1.1
+=============================
+
+Part of the open AoS Revival project: https://aosplay.net
+Server source: https://github.com/KikoTs/BattleSpades
+Client source: https://github.com/KikoTs/BattleSpadesClient
+
+Beta 1.1 adds cooperative class tactics and a private welcome with the actual
+UTC build day. See BETA_1_1_NOTES.md in this beta archive for behavior,
+configuration and local verification details.
 
 1. Extract the complete zip into a writable directory.
 2. Run `BattleSpades.exe --check` on Windows or `./BattleSpades --check` on

@@ -1,6 +1,18 @@
 import shared.constants as C
+import pytest
 
 from server.mode_data import get
+
+
+@pytest.mark.parametrize("alias, canonical", [
+    ("zombie", "zom"), ("classic_ctf", "cctf"), ("classic-ctf", "cctf"),
+    ("multihill", "mh"), ("multi-hill", "mh"),
+    ("territory_control", "tc"), ("territory-control", "tc"),
+    ("diamond", "dia"), ("diamond_mine", "dia"),
+    ("demolition", "dem"), ("occupation", "oc"), ("tutorial", "tut"),
+])
+def test_hosted_mode_aliases_share_wire_discovery_and_progression_metadata(alias, canonical):
+    assert get(alias) is get(canonical)
 
 
 def test_tdm_only_exposes_normal_battle_builder_classes():

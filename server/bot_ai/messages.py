@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from typing import TypeAlias
 
+from .prefab_policy import PrefabGeometry
+
 
 Vector3: TypeAlias = tuple[float, float, float]
 VoxelCoordinate: TypeAlias = tuple[int, int, int]
@@ -110,6 +112,7 @@ class MapSnapshot:
     compressed_vxl: bytes = b""
     raw_vxl_size: int = 0
     map_directory: str = ""
+    prefab_geometry: tuple[PrefabGeometry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,9 +229,16 @@ class PlayerSnapshot:
     last_damage_at: float = 0.0
     last_damage_source_id: int = -1
     last_damage_source_position: Vector3 | None = None
-    # Monotonic authoritative death count. Bot connection generation survives
-    # respawns, so workers use this separate value to reset per-life memory.
+    # Authoritative spawn generation, including non-death respawns. Connection
+    # generation survives respawns, so live tasks require this separate fence.
     life_id: int = 0
+    deployable_stock: tuple[tuple[int, int], ...] = ()
+    last_action_request_id: int = 0
+    last_action_reason: str = ""
+    last_task_accepted: bool = True
+    last_task_at: float = 0.0
+    # Mode-authoritative weapon/spade permission while carrying an objective.
+    can_shoot: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +257,9 @@ class EntitySnapshot:
     blast_radius: float = 0.0
     detonate_at: float = 0.0
     hazardous: bool = False
+    uses_remaining: int = -1
+    hit_position: Vector3 | None = None
+    hit_radius: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +307,10 @@ class PerceptionFrame:
     # COUNTDOWN).  Workers receive no mode object and may only branch on this
     # immutable phase label.
     mode_phase: str = ""
+    # Classic remains available for rollback and older replay fixtures.
+    behavior_version: str = "classic"
+    friendly_mischief: bool = True
+    local_safety_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +323,14 @@ class MovementIntent:
     sneak: bool = False
     sprint: bool = False
     affordance: MovementAffordance = MovementAffordance.WALK
+    # Internal worker/motor control: release thrust while retaining airborne
+    # steering for a planned landing. This is not a network protocol field.
+    jetpack_thrust: bool = True
+    # Explicit ordinary-route authority for the live motor. A direction alone
+    # can point away from a nearby step by the time a worker reply arrives.
+    # Combat, terrain actions and flight leave these unset.
+    travel_source: Vector3 | None = None
+    travel_waypoint: Vector3 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +370,8 @@ class BotAction:
     # continuous fire at the weapon cadence (legacy behavior).
     burst: int = 0
     burst_pause: float = 0.0
+    # Internal task transaction, never a client protocol field.
+    request_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +396,9 @@ class BotIntent:
     debug_goal: Vector3 | None = None
     debug_path: tuple[Vector3, ...] = ()
     debug_role: str = ""
+    life_id: int = -1
+    # Fixed-size internal worker diagnostics, never client protocol data.
+    debug_navigation: tuple[tuple[str, float | int | bool | str | Vector3 | None], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

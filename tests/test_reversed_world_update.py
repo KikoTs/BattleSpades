@@ -511,6 +511,12 @@ def test_repeated_live_client_data_held_jump_launches_on_next_tick():
     )
     player, _ = make_player(server)
     start_z = player.z
+    # At the exact spawn height, the original mover's corner probes touch the
+    # floor and take its climb/glide path, which can consume a jump while still
+    # grounded. Settle that initial contact before testing packet-driven launch.
+    advance_player(player, 4.0 / 60.0)
+    assert player.airborne is False
+    assert player.vz == 0.0
 
     raw_packet = bytes([ClientData.id]) + struct.pack(
         "<IBBHHHBBBf",
@@ -535,10 +541,9 @@ def test_repeated_live_client_data_held_jump_launches_on_next_tick():
     advance_player(player, 1.0 / 60.0)
 
     assert player.airborne is True
-    # Retail restores the complete cached network position on its launch
-    # frame.  Airborne/jump_this_frame, rather than a position delta, proves
-    # that the held request was consumed by this direct-update fixture.
-    assert math.isclose(player.z, start_z, abs_tol=1e-6)
+    assert player.vz < 0.0
+    # Repeated packets cannot cancel the native launch or rewind it to spawn.
+    assert player.z < start_z
     assert player._world_object.jump_this_frame is True
 
 

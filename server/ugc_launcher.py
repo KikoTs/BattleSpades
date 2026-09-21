@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import os
 from pathlib import Path
 import sys
 from typing import Sequence
@@ -95,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="validation/game mode authored by editor objects (default: tdm)",
     )
     parser.add_argument("--title", default=None, help="new-project display title")
+    parser.add_argument("--prefab-set", type=int, choices=range(6), default=None)
     parser.add_argument("--description", default=None, help="new-project description")
     parser.add_argument("--author", default=None, help="new-project author")
     parser.add_argument(
@@ -192,6 +194,10 @@ def apply_map_creator_config(arguments, paths: RuntimePaths):
                 + ", ".join(item.key for item in TERRAINS)
             )
     arguments.terrain = terrain
+    prefab_set = configured("prefab_set", None)
+    if prefab_set is not None and (type(prefab_set) is not int or not 0 <= prefab_set < 6):
+        raise ValueError("map_creator.prefab_set must be between 0 and 5")
+    arguments.prefab_set = prefab_set
     target_mode = configured("target_mode", None)
     if target_mode is not None:
         target_mode = str(target_mode).strip().casefold()
@@ -314,6 +320,8 @@ def prepare_ugc_project(
             project.author = str(arguments.author)[:80]
         if arguments.target_mode:
             project.set_target_mode(arguments.target_mode)
+        if getattr(arguments, "prefab_set", None) is not None:
+            project.prefab_set = arguments.prefab_set
         project.save(sidecar_path)
         return project, vxl_path, metadata_path, sidecar_path
 
@@ -329,6 +337,7 @@ def prepare_ugc_project(
         ground_colors=ground_colors,
         skybox_name=skybox,
         tags=["map", arguments.target_mode or "tdm"],
+        prefab_set=getattr(arguments, "prefab_set", None),
     )
     # create_project_files owns the actual byte-for-byte baseplate copies.
     create_project_files(
@@ -356,7 +365,7 @@ def configure_ugc_runtime(
 
     if port is not None and not 1 <= int(port) <= 65535:
         raise ValueError("Map Creator port must be between 1 and 65535")
-    compatible_prefabs = assets.compatible_prefabs(project.terrain)
+    compatible_prefabs = assets.compatible_prefabs(project.prefab_terrain)
     if not compatible_prefabs:
         raise FileNotFoundError(
             f"no retail UGC prefabs match {project.baseplate} in {assets.prefabs}"
@@ -377,8 +386,8 @@ def configure_ugc_runtime(
     config.default_map = vxl_path.stem
     config.maps_path = str(vxl_path.parent)
     config.port = int(config.port if port is None else port)
-    config.max_players = 12
-    config.max_connections = 12
+    config.max_players = max(2, min(24, int(config.max_players)))
+    config.max_connections = config.max_players
     config.score_limit = 0
     config.match_length_minutes = None
     config.mode_settings = {"ugc": {"score_limit": 0, "time_limit": 0.0}}
@@ -408,8 +417,10 @@ def configure_ugc_runtime(
     config.steam.enabled = False
     config.steam.public = False
     config.steam.require_registration = False
-    config.revival.enabled = False
-    config.revival.require_identity = False
+    owner_id = os.environ.get("AOS_UGC_OWNER_ID", "")
+    config.ugc_owner_legacy_id = owner_id if owner_id.isascii() and owner_id.isdigit() else ""
+    config.revival.enabled = bool(config.revival.enabled and config.ugc_owner_legacy_id)
+    config.revival.require_identity = config.revival.enabled
 
     config.game_rules.apply({
         "RULE_ENABLE_BLOCKS": True,

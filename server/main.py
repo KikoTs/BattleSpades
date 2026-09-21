@@ -980,6 +980,10 @@ class BattleSpadesServer:
         for connection in self.connections.values():
             if getattr(connection, "in_game", False):
                 remember_player_life(connection, player)
+        # A peer that joined while this player was dead may be seeing their
+        # first CreatePlayer now. Restore the existing score after that row.
+        from server.scoreboard import player_score_packet
+        self.broadcast(player_score_packet(player))
         from shared.packet import SetColor
         color = SetColor()
         color.player_id = player.id
@@ -1042,6 +1046,9 @@ class BattleSpadesServer:
         # first ClientData. This is still synchronous on the server event loop,
         # so no live mutation can interleave between replay and in_game=True.
         self.replay_map_mutations(connection)
+
+        from server.scoreboard import reveal_to as reveal_scores
+        reveal_scores(self, connection)
 
         # World ambience + the in-game music bed for this now-settled client
         # (a mid-round joiner must get both directly — the round-start

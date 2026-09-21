@@ -304,6 +304,23 @@ def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
     closed = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
     assert closed.message_type == voting.VOTE_CLOSED
     assert closed.can_vote == 0
+    assert ast.literal_eval(closed.title) == (
+        "MAP_VOTED_MESSAGE", ("CastleWars",)
+    )
+
+
+def test_closed_map_vote_keeps_winning_map_as_literal_format_argument():
+    srv = _vote_server(1)
+    vm = voting.VoteManager(srv)
+    vm._available_maps = ("Map {1}'s Hill", "London")
+    assert vm.start_map_vote(("Map {1}'s Hill", "London"), now=100.0)
+    start = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    vm.cast_wire_candidate(srv.players[0], start.candidates[0]["name"])
+    closed = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    identifier, arguments = ast.literal_eval(closed.title)
+    assert identifier == "MAP_VOTED_MESSAGE"
+    assert "Next map will be {0}".format(*arguments) == "Next map will be Map {1}'s Hill"
+    assert vm.consume_next_map() == "Map {1}'s Hill"
 
 
 def test_every_outbound_vote_packet_uses_crash_safe_retail_text():
@@ -442,7 +459,7 @@ def test_wait_for_map_result_forces_expired_ballot_resolution():
     srv = _vote_server(1)
     vm = voting.VoteManager(srv)
     assert vm.start_map_vote(("CastleWars",), now=time.time())
-    vm.opened_at = time.time() - voting.MAP_VOTE_DURATION - 1.0
+    vm._deadline = time.monotonic() - 1.0
 
     selected = asyncio.run(vm.wait_for_map_result())
 
@@ -507,3 +524,66 @@ def test_kick_vote_wire_candidates_use_stock_localized_yes_no_labels():
     vm.cast_wire_candidate(srv.players[1], packet.candidates[0]["name"])
     assert vm.active is False
     assert srv.players[3].disconnected == 2
+
+
+def test_duplicate_and_ineligible_votes_do_not_change_tally_or_broadcast():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("London", "CastleWars"), now=100.0)
+    vm.cast_candidate(srv.players[0], 1)
+    count = len(srv.sent)
+    vm.cast_candidate(srv.players[0], 1)
+    vm.cast_candidate(FakePlayer(0), 0)
+    srv.players[1].connection.in_game = False
+    vm.cast_candidate(srv.players[1], 0)
+    vm.cast_candidate(FakePlayer(99), 0)
+    assert vm.votes == {0: 1}
+    assert len(srv.sent) == count
+
+
+def test_vote_after_deadline_cannot_change_result_before_tick():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("London", "CastleWars"), now=100.0)
+    vm.cast_candidate(srv.players[0], 1)
+    vm._deadline = time.monotonic() - 1
+    vm.cast_candidate(srv.players[1], 0)
+    assert not vm.active and vm.next_map == "CastleWars"
+
+
+def test_departing_nonvoter_resolves_all_remaining_votes():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    assert vm.start_map_vote(("London", "CastleWars"), now=100.0)
+    vm.cast_candidate(srv.players[0], 1)
+    vm.cast_candidate(srv.players[1], 1)
+    vm.forget_player(2)  # Called before roster removes the compact id.
+    assert not vm.active and vm.next_map == "CastleWars"
+
+
+def test_cancelled_waiter_does_not_resolve_replacement_ballot():
+    async def scenario():
+        srv = _vote_server(3)
+        vm = voting.VoteManager(srv)
+        vm.start_map_vote(("London",), now=time.time())
+        waiter = asyncio.create_task(vm.wait_for_map_result())
+        await asyncio.sleep(0)
+        vm.cancel()
+        vm.start_map_vote(("CastleWars",), now=time.time())
+        assert await waiter is None
+        assert vm.active and vm.candidates == ("CastleWars",)
+        vm.cancel()
+    asyncio.run(scenario())
+
+
+def test_kick_resolution_is_retired_before_disconnect_callback():
+    srv = _vote_server(3)
+    vm = voting.VoteManager(srv)
+    target = srv.players[2]
+    target.disconnect = lambda reason: vm.forget_player(target.id)
+    vm.start_kick(srv.players[0], target, voting.KICK_ABUSE, now=100.0)
+    vm.cast(srv.players[1], True)
+    assert not vm.active
+    closed = [data for data in srv.sent if data[0] == 47
+              and GenericVoteMessage(ByteReader(data[1:])).message_type == voting.VOTE_CLOSED]
+    assert len(closed) == 1

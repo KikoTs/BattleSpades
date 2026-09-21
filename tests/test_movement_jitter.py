@@ -427,7 +427,7 @@ def test_real_jump_physics_is_invariant_to_starvation_and_label_skips() -> None:
     assert delayed._pending_packet_flags == baseline._pending_packet_flags
 
 
-def test_orientation_transition_uses_current_observed_frame() -> None:
+def test_orientation_transition_latches_physics_but_preserves_current_aim() -> None:
     player, _ = make_player()
     simulated = []
 
@@ -441,10 +441,11 @@ def test_orientation_transition_uses_current_observed_frame() -> None:
     asyncio.run(player.simulate_tick(TICK_DT))
     player.record_input_frame(101, FORWARD, turned)
     asyncio.run(player.simulate_tick(TICK_DT))
+    assert player.orientation == turned, "combat/display aim must not inherit the physics latch"
     player.record_input_frame(102, FORWARD, turned)
     asyncio.run(player.simulate_tick(TICK_DT))
 
-    assert simulated == [first, turned, turned]
+    assert simulated == [first, first, turned]
 
 
 def test_buffered_action_state_cannot_leak_from_a_future_drained_frame() -> None:
@@ -860,17 +861,11 @@ def test_replication_forgets_cadence_and_transition_state_before_id_reuse():
     replication = ReplicationService(server)
     replication._last_self_row_loop[3] = 900
     replication._last_advertised_jetpack_active[3] = True
-    replication._jetpack_owner_handoff_deadline[3] = 912
-    replication._jetpack_owner_handoff_target[3] = True
-    replication._jetpack_owner_release_settle_deadline[3] = 906
 
     replication.forget_player(3)
 
     assert 3 not in replication._last_self_row_loop
     assert 3 not in replication._last_advertised_jetpack_active
-    assert 3 not in replication._jetpack_owner_handoff_deadline
-    assert 3 not in replication._jetpack_owner_handoff_target
-    assert 3 not in replication._jetpack_owner_release_settle_deadline
 
 
 def test_spawn_resets_owner_replication_state_for_the_new_life():
@@ -1008,8 +1003,8 @@ def test_jetpack_activation_sends_an_immediate_owner_row_off_cadence() -> None:
     assert sent == [(b"2:None", False), (b"3:0", True)]
 
 
-def test_jetpack_handoff_bounds_active_flight_with_causal_checkpoints() -> None:
-    """Long flight cannot hide clock drift until one release-time hard snap."""
+def test_active_flight_preserves_the_configured_owner_snapshot_cadence() -> None:
+    """Flight must not replace normal ACKs with a separate quiet window."""
     sent: list[tuple[bytes, bool]] = []
     player = SimpleNamespace(
         id=0,
@@ -1042,7 +1037,6 @@ def test_jetpack_handoff_bounds_active_flight_with_causal_checkpoints() -> None:
             worldupdate_airborne_self_row_interval=2,
             worldupdate_loop_offset=0,
             worldupdate_include_self=True,
-            jetpack_owner_handoff_input_frames=2,
             debug_selfrow=False,
         ),
         connections={object(): connection},
@@ -1059,24 +1053,20 @@ def test_jetpack_handoff_bounds_active_flight_with_causal_checkpoints() -> None:
     server.loop_count = 3
     replication.broadcast_world_updates()
 
-    # One later accepted input is still inside the two-frame handoff. The
-    # owner is excluded, while this full server snapshot remains available to
-    # every observer group.
+    # The reliable transition at3 resets the ordinary two-tick row cadence.
     player._input_receive_sequence = 11
     player.last_applied_input_loop = 102
     server.loop_count = 4
     replication.broadcast_world_updates()
 
-    # Accepted input 12 reaches the checkpoint boundary. Exactly one owner row
-    # is admitted before the next quiet window; observer snapshots remain on
-    # their ordinary cadence.
+    # The next ordinary cadence row carries the current authority ACK.
     player._input_receive_sequence = 12
     player.last_applied_input_loop = 104
     server.loop_count = 6
     replication.broadcast_world_updates()
 
-    # A new snapshot at the same accepted input cannot duplicate the
-    # checkpoint because the next deadline was installed atomically.
+    # A temporarily idle input stream still gets normal authoritative rows;
+    # no flight suppression window can retain a stale resource state.
     server.loop_count = 8
     replication.broadcast_world_updates()
 
@@ -1085,73 +1075,8 @@ def test_jetpack_handoff_bounds_active_flight_with_causal_checkpoints() -> None:
         (b"exclude=None:local=0:loop=3", True),
         (b"exclude=0:local=None:loop=4", False),
         (b"exclude=None:local=None:loop=6", False),
-        (b"exclude=0:local=None:loop=8", False),
+        (b"exclude=None:local=None:loop=8", False),
     ]
-
-
-def test_active_jetpack_checkpoint_window_clears_after_pack_becomes_inactive() -> None:
-    server = SimpleNamespace(
-        config=SimpleNamespace(jetpack_owner_handoff_input_frames=2)
-    )
-    replication = ReplicationService(server)
-    player = SimpleNamespace(
-        id=7,
-        jetpack_active=True,
-        _input_receive_sequence=10,
-    )
-
-    replication._begin_jetpack_owner_handoff(player)
-    player._input_receive_sequence = 100
-    assert replication._jetpack_owner_handoff_active(player) is False
-    # The same accepted input is inside the newly installed quiet window.
-    assert replication._jetpack_owner_handoff_active(player) is True
-
-    player.jetpack_active = False
-    player._input_receive_sequence = 102
-    assert replication._jetpack_owner_handoff_active(player) is False
-
-
-def test_exhaustion_handoff_waits_for_release_and_settled_ground() -> None:
-    """Held SPACE may not resume owner correction near fuel-zero landing."""
-    server = SimpleNamespace(
-        config=SimpleNamespace(
-            jetpack_owner_handoff_input_frames=2,
-            jetpack_owner_release_handoff_input_frames=20,
-        )
-    )
-    replication = ReplicationService(server)
-    player = SimpleNamespace(
-        id=4,
-        jetpack_id=68,
-        jetpack_active=False,
-        airborne=True,
-        input=SimpleNamespace(jump=True, hover=False),
-        _input_receive_sequence=30,
-    )
-
-    replication._begin_jetpack_owner_handoff(player)
-    player._input_receive_sequence = 35
-    assert replication._jetpack_owner_handoff_active(player) is True
-
-    player.airborne = False
-    assert replication._jetpack_owner_handoff_active(player) is True
-
-    player.input.jump = False
-    assert replication._jetpack_owner_handoff_active(player) is True
-    player._input_receive_sequence = 36
-    assert replication._jetpack_owner_handoff_active(player) is True
-    player._input_receive_sequence = 37
-    assert replication._jetpack_owner_handoff_active(player) is False
-
-    player.airborne = True
-    player._input_receive_sequence = 40
-    replication._begin_jetpack_owner_handoff(player)
-    player.input.jump = False
-    assert replication._jetpack_owner_handoff_active(player) is True
-    player._input_receive_sequence = 42
-    assert replication._jetpack_owner_handoff_active(player) is True
-    player.airborne = False
-    assert replication._jetpack_owner_handoff_active(player) is False
 
 
 def test_jetpack_release_also_sends_one_immediate_owner_row() -> None:
@@ -1206,44 +1131,16 @@ def test_jetpack_release_also_sends_one_immediate_owner_row() -> None:
     assert sent == [(b"2:None", True), (b"3:0", True)]
 
 
-def test_retail_jetpack_release_waits_for_key_up_and_ground_settle() -> None:
-    """The inactive owner row may not reconcile a mid-air fuel transition."""
+@pytest.mark.parametrize("airborne", [False, True])
+@pytest.mark.parametrize("held", [False, True])
+def test_jetpack_exhaustion_is_urgent_without_waiting_for_ground_or_release(airborne, held):
     player = SimpleNamespace(
-        id=4,
-        airborne=True,
-        jetpack_id=66,
-        jetpack_active=False,
+        id=4, airborne=airborne, jetpack_id=66, jetpack_active=False,
         last_applied_input_loop=200,
-        input=SimpleNamespace(jump=True, hover=False),
-        _input_receive_sequence=30,
+        input=SimpleNamespace(jump=held, hover=False),
     )
     connection = SimpleNamespace(in_game=True, player=player)
-    server = SimpleNamespace(
-        config=SimpleNamespace(
-            worldupdate_include_self=True,
-            jetpack_owner_handoff_input_frames=2,
-        )
-    )
+    server = SimpleNamespace(config=SimpleNamespace(worldupdate_include_self=True))
     replication = ReplicationService(server)
     replication._last_advertised_jetpack_active[player.id] = True
-    replication._jetpack_owner_handoff_deadline[player.id] = 32
-    replication._jetpack_owner_handoff_target[player.id] = True
-
-    assert replication._jetpack_transition_connections((connection,)) == []
-    assert replication._jetpack_owner_handoff_active(player) is True
-
-    # Landing alone is insufficient while the physical activation key remains
-    # held; this is the fuel-zero auto-jump edge from the retail report.
-    player.airborne = False
-    player._input_receive_sequence = 40
-    assert replication._jetpack_transition_connections((connection,)) == []
-
-    # Key-up starts a short accepted-input settle window.
-    player.input.jump = False
-    assert replication._jetpack_transition_connections((connection,)) == []
-    player._input_receive_sequence = 41
-    assert replication._jetpack_transition_connections((connection,)) == []
-    player._input_receive_sequence = 42
-    assert replication._jetpack_transition_connections((connection,)) == [
-        connection
-    ]
+    assert replication._jetpack_transition_connections((connection,)) == [connection]

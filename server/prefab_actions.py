@@ -30,6 +30,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class _BotPrefabOwner:
+    """The concrete bot life and committed selection that paid for a job."""
+
+    generation: int
+    deaths: int
+    life: int
+    team: int
+    class_id: int
+    tool: int
+    loadout: tuple[int, ...]
+    prefabs: tuple[str, ...]
+
+    @classmethod
+    def capture(cls, player: object) -> "_BotPrefabOwner":
+        return cls(
+            int(getattr(player, "bot_generation", 0)),
+            int(getattr(player, "deaths", 0)),
+            int(getattr(player, "replication_generation", 0)),
+            int(getattr(player, "team", -1)),
+            int(getattr(player, "class_id", -1)),
+            int(getattr(player, "tool", -1)),
+            tuple(int(tool) for tool in (getattr(player, "loadout", ()) or ())),
+            tuple(str(name) for name in (getattr(player, "prefabs", ()) or ())),
+        )
+
+    def owns_inventory(self, player: object) -> bool:
+        """Refund only the original living wallet, never a respawn's stock."""
+
+        return (
+            bool(getattr(player, "alive", False))
+            and bool(getattr(player, "spawned", False))
+            and self.generation == int(getattr(player, "bot_generation", 0))
+            and self.deaths == int(getattr(player, "deaths", 0))
+            and self.life == int(getattr(player, "replication_generation", 0))
+        )
+
+
 @dataclass(slots=True)
 class _PendingPrefab:
     """One validated prefab drained in bounded per-tick cell batches."""
@@ -45,6 +83,7 @@ class _PendingPrefab:
     editor_native: bool = False
     erase: bool = False
     placed: int = 0
+    bot_owner: _BotPrefabOwner | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +399,26 @@ class PrefabActionService:
                 self._pending.popleft()
                 self._cancel(pending)
                 continue
+            if pending.bot_owner is not None and (
+                not pending.bot_owner.owns_inventory(player)
+                or not bool(getattr(player, "is_bot", False))
+                or pending.bot_owner != _BotPrefabOwner.capture(player)
+                or not self._authorized(player, pending.name)
+            ):
+                self._pending.popleft()
+                self._cancel(pending)
+                continue
+            construction = getattr(self.server, "construction", None)
+            if (getattr(player, "is_bot", False) and not pending.erase
+                    and construction is not None
+                    and construction._overlaps_living_player(
+                        frozenset(cell[0] for cell in pending.cells))):
+                # Competitive bot prefabs emit explicit cell packets. Stop
+                # and refund the remaining cells if a body enters between
+                # reservation and one of the bounded post-physics batches.
+                self._pending.popleft()
+                self._cancel(pending)
+                continue
             coordinate, color, charged = pending.cells.popleft()
             if pending.erase:
                 if self._erase_cell(coordinate):
@@ -379,9 +438,9 @@ class PrefabActionService:
             ):
                 pending.placed += 1
                 if charged and was_solid:
-                    player.blocks += 1
+                    self._refund(pending, 1)
             elif charged:
-                player.blocks += 1
+                self._refund(pending, 1)
             committed += 1
             if not pending.cells:
                 self._pending.popleft()
@@ -717,6 +776,11 @@ class PrefabActionService:
                 total_cells=len(queued_cells),
                 reservation=reservation,
                 editor_native=editor_native,
+                bot_owner=(
+                    _BotPrefabOwner.capture(player)
+                    if bool(getattr(player, "is_bot", False)) and not editor_native
+                    else None
+                ),
             )
         )
         return True
@@ -759,15 +823,33 @@ class PrefabActionService:
     def _cancel(self, pending: _PendingPrefab) -> None:
         refund = sum(1 for _coordinate, _color, charged in pending.cells if charged)
         if refund:
-            pending.player.blocks += refund
+            self._refund(pending, refund)
         construction = getattr(self.server, "construction", None)
         if construction is not None:
             construction.release(pending.reservation)
+
+    def _refund(self, pending: _PendingPrefab, count: int) -> None:
+        """Return only uncommitted paid cells to their original bot life."""
+
+        player = pending.player
+        if pending.bot_owner is not None:
+            if (self.server.players.get(int(player.id)) is not player
+                    or not pending.bot_owner.owns_inventory(player)):
+                return
+            wallet_max = getattr(player, "_block_wallet_max", None)
+            if callable(wallet_max):
+                # A real block pickup during a queued job may already have
+                # filled the wallet. Refunds cannot exceed that same cap.
+                count = min(count, max(0, int(wallet_max()) - int(player.blocks)))
+        player.blocks += count
 
     def _finish(self, pending: _PendingPrefab) -> None:
         complete = PrefabComplete()
         pending.player.send(bytes(complete.generate()), reliable=True)
         if pending.placed and not pending.erase:
+            from server.profile_stats import add
+            from shared.constants import MAP_PREFAB_ADDED_TOTAL
+            add(pending.player, MAP_PREFAB_ADDED_TOTAL)
             play_sound(
                 self.server,
                 SND_PREFAB_BUILD,

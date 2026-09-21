@@ -6,6 +6,11 @@ claim that every boundary has already been extracted into a separate module.
 The stock Ace of Spades 1.x client and its observed behavior remain the protocol
 oracle.
 
+For startup/configuration and packaging use [RUNBOOK.md](RUNBOOK.md) and
+[ADMIN_GUIDE.md](ADMIN_GUIDE.md). The maintained native client has a separate
+[architecture guide](../../BattleSpadesClient/docs/ARCHITECTURE.md); its rendering
+or service adapters do not move simulation authority out of this server.
+
 ## Runtime data flow
 
 ```text
@@ -169,73 +174,40 @@ terrain replication paths.
 - Mid-join clients never receive repair packets. Their crash-sensitive world
   transition is handled exclusively by MapSync and the mutation journal.
 
-### BotDirector and AIWorkerSupervisor
+### Bot ownership and worker backends
 
 `BotDirector` owns server-created `Player` objects, population policy,
 profiles, lifecycle hooks, staggered perception, expiring intent validation,
-and the cheap 60 Hz look/locomotion motors. Peerless bot connections are
-explicitly active server-owned players, so they pass through ordinary native
-physics, death, respawn, mode, and replication boundaries.
+and the 60 Hz look/locomotion motors. Bots pass through ordinary native
+physics, death, respawn, mode, and replication services.
 
-`AIWorkerSupervisor` owns a Windows `spawn` child through a bridge thread.
-Process creation, pickling, queue/pipe operations, Recast tile builds, LOS,
-target search, behavior-tree traversal, and path queries never run on the
-gameplay thread. The server-to-bridge frame queue is capped at 64, the result
-queue at 128, and the director drains at most 12 intents per simulation tick.
-Results carry bot generation, frame, map/mode epoch, topology version, and a
-250 ms expiry; any mismatch is discarded.
+`bots.worker = "thread"` selects `AIThreadSupervisor`; `"process"` selects
+`AIWorkerSupervisor`, a spawned child behind a bridge thread. Both use
+`SimpleBotBrain` and `SimpleVoxelWorld`. The direct VXL planner, semantic atlas,
+and bounded incremental surface search are documented in
+[BOT_NAVIGATION.md](BOT_NAVIGATION.md). The older `worker.py` and Recast modules
+remain reference/rollback code and are not the production worker entry point.
 
-Full map snapshots are serialized and level-1 compressed on the bridge, then
-sent as versioned, Blake2-validated records no larger than 48 KiB. Frames and
-terrain cannot overtake an incomplete transfer. Terrain deltas contain at most
-1,024 cells and equal-version batches are idempotent in the worker. A transfer
-lease begins with the first queued header and is renewed only by child
-heartbeats, so a dead reader is restarted even when a large custom map fills
-the 64-record queue before any perception frame can be sent.
+Results carry bot generation, frame, map/mode epoch, topology version, and an
+expiry. The director rejects stale ownership, future topology, and expired
+intents. Fresh results from an older topology may still be accepted after
+unrelated edits; live motor and action checks validate the current terrain.
+Motor phases advance only when motors run, so perception refreshes cannot
+starve a fixed group of bot IDs.
 
-The bridge retains a coalesced canonical terrain overlay in addition to the
-immutable base VXL. Worker restart and the 65,536-cell overflow rebase compose
-`base + overlay` on the bridge thread. This prevents a restarted navigator
-from reverting to the original map and avoids calling `generate_vxl` from the
-60 Hz thread. Terrain edits dirty the affected 32x32 Recast tile and its
-neighbors; immediate movement still checks the live authoritative map.
+The process bridge keeps bounded queues, coalesces perception by bot life, and
+transfers compressed, validated map snapshots in chunks. Terrain updates are
+bounded and the bridge retains the current overlay for restart. Pipe I/O,
+serialization, and child lifecycle work run outside the gameplay thread.
+Snapshot/frame acknowledgements and processed-frame heartbeats distinguish a
+healthy idle worker from a stalled child. The thread backend also retains its
+terrain and can recover an unexpected exit without overlapping worker owners.
 
-Frames are coalesced by `(player_id, generation)` before crossing the process
-boundary. A slow worker therefore receives the newest perception for every
-concrete bot life instead of making decisions from an obsolete FIFO backlog;
-the 64-entry bound applies to unique bot lives and overflow remains observable.
-
-Each frame contains at most 32 prioritized players and 192 live entities. The
-observer, server-owned bots, objective carriers, explosives, projectiles, and
-nearby resources win deterministic priority. Dead respawning pickups are not
-serialized; overflow is counted in runtime metrics. This prevents dense custom
-maps and the protocol's optional 255-player configuration from producing one
-unbounded Windows pipe write.
-
-The worker uses `py_trees` at 8 Hz, perception at 10 Hz per staggered bot, and
-a token bucket capped at 24 path requests/second for the default 12-bot roster.
-Native Recast/Detour v1.6.0 is vendored under its Zlib license. A bounded
-layered A* remains the source-only fallback. The native bridge owns a persistent
-DetourCrowd instance (64-agent cap) and returns obstacle-avoiding desired
-steering only; native `Player` physics still executes every movement input.
-Live steering never calls Detour's synchronous `find_path` fallback. Expensive
-native corridor warming is limited to one 32x32 tile per worker batch; bounded
-voxel A* remains available while later batches warm the rest. Full-map water
-escape is also resumable in 128-node slices rather than scanning a 512x512 sea
-inside one decision. The worker emits a processed-frame heartbeat even when a
-valid frame intentionally produces no intent. The supervisor clears a live
-frame lease only for that frame or a newer one, so countdown/cadence states do
-not cause false restarts and an old map-only acknowledgement cannot hide a real
-wedge. The first snapshot/frame has an eight-second cold lease; after one
-processed frame, five seconds without a result terminates and restarts only the
-AI child. `/bots status` exposes stalls, current intent silence, awaited frame,
-snapshot transfer, and heartbeat progress so an alive-but-wedged worker is
-distinguishable from ordinary local route recovery.
-Class-filtered jump, crouch, safe-drop, and fuel-gated jetpack transitions are
-represented by an explicit affordance layer above the ground mesh. Immediate
-waypoints are rechecked against the live VXL whenever the body voxel or
-topology version changes, so an old worker path cannot authorize traversal
-through a newly placed block.
+Full game/map transitions retire and recreate bots with fresh profiles, zero
+match scores, and increasing generations. Population refill and action
+commitments pause while retirement is in progress. Arena subrounds preserve
+the match roster; full restarts use the fresh-roster boundary. Human player
+objects are preserved. Periodic planner recycling follows `clean_slate_games`.
 
 Fairness is explicit: fresh firing requires worker LOS plus a final normal
 `CombatSystem` trace; a hidden enemy becomes a frozen last-seen record; sound
@@ -350,10 +322,8 @@ handler validates the sender and packet, invokes one domain operation, and
 requests replication. Packet decoding itself does not mutate gameplay state.
 
 `Player` remains the compatibility facade used by modes and existing handlers.
-Its internal responsibilities should be extracted behind that facade in this
-order: equipment selection, input buffering, movement simulation, and
-replication snapshot construction. This order isolates the class/loadout bug
-without forcing a risky movement rewrite at the same time.
+Keep equipment, movement, and replication changes consistent with the services
+above and their regression tests.
 
 ## Compatibility rules
 
@@ -367,9 +337,9 @@ without forcing a risky movement rewrite at the same time.
   underground voxels has crashed stock clients.
 - Reconciliation stamps are per recipient. A global stamp can make one client
   correct against another client's input history.
-- Prefer short invariant comments in code. Investigation history, rejected
-  approaches, and reproduction evidence belong in
-  [HANDOFF.md](HANDOFF.md).
+- Prefer short invariant comments in code. Put reproducible checks in tests
+  and [RUNBOOK.md](RUNBOOK.md); keep investigation logs in ignored `tmp/`.
+  Update the relevant reference when behavior changes.
 
 ## Release gates
 

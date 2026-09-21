@@ -7,7 +7,10 @@ Fuel constants ground truth (client JETPACK_PROPERTIES, extracted 2026-07-07):
   JETPACK_UGCBUILDER(69): delay .1, max 100, activation 0, regen 100/s, drain 0/s
 """
 import sys
+import math
 from types import SimpleNamespace
+
+import pytest
 
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
@@ -56,6 +59,50 @@ def test_no_jetpack_never_activates():
     p.jetpack_id = 0
     hold_jetpack(p, 1.0)
     assert p.jetpack_active is False
+
+
+def test_removed_pack_clears_ignition_hold_and_does_not_spend_fuel():
+    p = make_player()
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    hold_jetpack(p, 0.2)
+    p.jetpack_id = 0
+    p._update_jetpack(DT)
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    fuel = p.jetpack_fuel
+    p._update_jetpack(DT)
+    assert not p.jetpack_active
+    assert p.jetpack_fuel == fuel
+
+
+def test_dead_player_cannot_reignite_or_regenerate_from_held_input():
+    p = make_player()
+    p.jetpack_id = int(C.JETPACK_ENGINEER)
+    hold_jetpack(p, 0.5)
+    p.die()
+    fuel = p.jetpack_fuel
+    hold_jetpack(p, 1.0)
+    assert not p.jetpack_active
+    assert not p._jetpack_physics_active
+    assert p.jetpack_fuel == fuel
+
+
+def test_held_exhaustion_cannot_chain_free_activations():
+    for pack in (66, 67, 68):
+        p = make_player()
+        p.jetpack_id = pack
+        hold_jetpack(p, 6.0)
+        assert p._jetpack_requires_release
+        hold_jetpack(p, 40.0)
+        assert p.jetpack_fuel == 100.0
+        assert not p.jetpack_active
+        assert not p._jetpack_physics_active
+        p.input.jump = False
+        p._update_jetpack(DT)
+        hold_jetpack(p, 0.2)
+        assert not p.jetpack_active
+        hold_jetpack(p, 0.1)
+        assert p.jetpack_active
+        assert p.jetpack_fuel <= 90.0
 
 
 def test_activation_after_start_delay_and_cost():
@@ -336,6 +383,29 @@ def test_damage_pauses_regen():
     for _ in range(30):  # 0.5s — inside the 2s pause window
         p._update_jetpack(DT)
     assert p.jetpack_fuel == 50.0
+
+
+@pytest.mark.parametrize("pack,rate,delay", [(66, 10.0, 2.0), (67, 9.0, 2.0), (68, 3.0, 0.5)])
+def test_damage_lockout_then_full_refill_uses_original_resource_units(monkeypatch, pack, rate, delay):
+    """Original JETPACK_PROPERTIES is fuel/second, never fuel/input packet."""
+    player = make_player()
+    player.jetpack_id = pack
+    player.jetpack_fuel = 0.0
+    player._last_damage_at = 100.0
+    clock = [100.0]
+    monkeypatch.setattr("server.player.time.time", lambda: clock[0])
+
+    for frame in range(math.ceil(delay / DT)):
+        clock[0] = 100.0 + frame * DT
+        player._update_jetpack(DT)
+        assert player.jetpack_fuel == 0.0
+    clock[0] = 100.0 + delay + 0.001
+    player._update_jetpack(DT)
+    assert player.jetpack_fuel == pytest.approx(rate * DT)
+    for _ in range(math.ceil(100.0 / rate / DT)):
+        player._update_jetpack(DT)
+    assert player.jetpack_fuel == 100.0
+    assert not player.jetpack_active
 
 
 def test_spawn_assigns_class_jetpack():

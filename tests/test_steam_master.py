@@ -32,7 +32,7 @@ def test_retail_tags_and_spaced_map_name_are_exact() -> None:
     config.steam.region = "eu"
 
     assert build_game_tags(config) == (
-        "v168;playlist=8;region=eu;mode=0008;classic"
+        "v168;playlist=8;region=eu;mode=0001;classic"
     )
     assert build_steam_map_name("tdm", "City of Chicago") == (
         "TDM_CityOfChicago"
@@ -132,7 +132,22 @@ def test_snapshot_coalesces_live_population_and_native_tags() -> None:
     assert snapshot.map_name == "VIP_CityOfChicago"
     assert snapshot.player_count == 2
     assert snapshot.bot_count == 1
-    assert snapshot.tags.endswith("mode=0007;skin=mafia")
+    assert snapshot.tags.endswith("mode=0001;skin=mafia")
+
+
+@pytest.mark.parametrize("mode", ["tdm", "ctf", "cctf", "vip", "tc", "zom", "dem"])
+def test_public_advertisements_pass_retail_category_filter(mode: str) -> None:
+    # Retail shared.steam.pyd 0x10002320 tests the request mask's individual
+    # bits against mode=%04d strings. ServerMenu passes SERVERMODE_PUBLIC=1;
+    # gameplay IDs (e.g. TDM=6, CTF=8) are not public-server categories.
+    tags = build_game_tags(ServerConfig(default_mode=mode))
+    requested_categories = 1
+    matches = any(
+        requested_categories & (1 << bit)
+        and f"mode={1 << bit:04d}" in tags
+        for bit in range(5)
+    )
+    assert matches
 
 
 def test_disabled_service_is_a_noop() -> None:

@@ -23,10 +23,10 @@ Sources of truth:
   back-reference as `distance - 1`; the decoder must restore the missing one or
   repeated strings are silently spliced together. Input references and expanded
   output are bounded before the packet decoder runs.
-- **Every packet class is kept even if currently unused.** The unused ones are
-  the *surface* for planned features (sounds, minimap, voting, deployables,
-  territory control, UGC, entity management, legacy map-sync, network buffering).
-  See the roadmap grouping at the end.
+- **Every packet class is kept even if currently unused.** A definition alone
+  does not establish a receive/send path. Several historically planned domains
+  now have live handlers; use the per-packet table and implementation references
+  below rather than inferring feature status from the existence of a class.
 
 Statuses:
 - **Handled** — has a `@register_handler` (server parses it on receive).
@@ -182,6 +182,64 @@ that exact loop, not with the current render transform. InitialInfo movement
 entries are direct scales after all rule multipliers are composed and rounded
 once to 1/64; authority calls the same `speed_scale(class, rule_multiplier)`
 function so custom speed rules cannot create server/client drift.
+
+### Proven movement code and compatibility limits
+
+The original `world.pyd` core at `0x10012B80` stores movement scalars and
+velocity writes as float32. The server follows its ordering for pack thrust,
+ordinary jump, hover, crouch/sprint acceleration, opposite movement keys,
+gravity, and drag. Active Engineer/UGC airborne acceleration uses 0.1 only
+outside hover; crouching in water does not add a separate buoyancy branch.
+Climbing and voxel contact determine the final airborne state. The peer
+collision pass uses one predicted position for the entire peer list.
+
+`tests/test_retail_binary_movement.py` compares exact values from 1,600 direct
+x86 executions across 60/20 Hz steps, all pack types, water/contact states,
+and control combinations. Regenerate its fixture with
+`scripts/reverse_movement_core.py --binary <original-world.pyd> --output
+tests/fixtures/retail_movement_core.json` (optional tooling dependencies:
+`pefile`, `unicorn`). The script checks the original PE's SHA-256. It executes
+the arithmetic through `0x1001304A`, before collision, with the CRT square-root
+call replaced by x87 `fsqrt` and the control word explicitly set to `0x037f`.
+The basis and starting velocity are fixed; deployed CRT/FPU settings and
+arbitrary-direction normalization need separate verification. These vectors
+do not establish collision, network scheduling, or fuel-policy parity.
+
+`tests/test_retail_binary_movebox.py` separately checks 2,352 original x86
+voxel-mover cases: sparse floors, walls, steps, corners and tunnels with varied
+movement/contact flags. Regenerate with `scripts/reverse_movebox.py` using the
+same `--binary`, `--output`, and optional `--dependency-dir` arguments. This
+harness executes the original clipping branches, with sparse voxel lookup and
+CRT floor supplied externally. It does not cover player collisions or the
+complete Character/network wrapper.
+
+`tests/test_retail_binary_peers.py` adds 2,000 original-instruction peer
+collision vectors, including multiple peers and count-only clearance probes.
+The vertical push uses the same float normalization and intermediate stores as
+the original; replacing that calculation with just the sign changes rounding.
+Regenerate with `scripts/reverse_peer_collisions.py` using the same arguments.
+The full evidence scope and remaining gaps are in
+[Retail movement parity](RETAIL_MOVEMENT_PARITY.md).
+
+The client schedules network polling before each scene step. Foreground uses
+1/60 second; its explicit limited-update mode uses 1/20 second. ClockSync can
+relabel the client loop, so label gaps cannot be converted into physics steps.
+Character history is recorded before native movement. Owner WorldUpdate rows
+refresh position, velocity, fuel, and ability state even when pong repeats;
+the active-state setter ignores an unchanged value, without restarting its
+activity timer. Owner orientation, movement input, tool, and health fields
+are skipped by this WorldUpdate handler.
+
+The original Character also restores its last *received* network position on
+every native `jump_this_frame`. The server's chosen queued-row anchor,
+once-per-hold guard, and 0.25-block guard are compatibility policies, not a
+recovered authoritative-server algorithm. `character_jump_smoothing.py` in the
+maintained Python client adds that distance guard; captures made with it
+enabled cannot verify unpatched retail behavior. The two-frame flight defer,
+exhaustion tail, owner-row suppression, and original fuel timer ordering remain
+unproven by the inspected client binaries. Resource constants are recovered;
+the receiving client is not the source of the original server's resource
+state machine.
 
 ### Snowball Damage/Destroy ordering
 
@@ -729,7 +787,14 @@ retail Internet list requests app `224540` and filters
 `gamedir=aceofspades`. Its Official tab additionally requires `white=1`; its
 User tab applies `nand(white=1)`. BattleSpades deliberately does not forge the
 official-only key, so community hosts belong in the generic/User lists. The
-client then locally matches `mode=%04d` and optional `region=...`. It uses a
+client then locally matches `mode=%04d` and optional `region=...`. **This tag
+is a server category, not a gameplay mode ID.** The original native filter at
+`shared.steam.pyd` RVA `0x2320` tests individual `SERVERMODE_*` bits;
+`ServerMenu` requests `SERVERMODE_PUBLIC=1`. Public dedicated servers must
+therefore advertise `mode=0001` for TDM, CTF, Classic CTF, VIP, etc. TDM's
+session mode remains 6. Actual gameplay is identified by the map prefix and
+session packets. Advertising `mode=0006` makes the public filter discard the
+row even after successful registration and A2S queries. It uses a
 separate game and query port. Its displayed map is `<MODE>_<MapName>` with
 spaces removed and the following character capitalized, for example
 `TDM_CityOfChicago`.
@@ -744,13 +809,16 @@ not an AoS server identity. BattleSpades creates a private `224540` file for
 the helper. The helper's Steam-owned query socket is separate from the ENet
 port's direct A2S intercept.
 
-As of the 2026 recovery, registration and retrieval are different systems.
-Valve's public `ISteamApps/GetServersAtAddress` registry returns BattleSpades
-with app `224540` and game dir `aceofspades`, while the old
-`hl2master.steampowered.com` UDP endpoint no longer resolves. Consequently the
-unmodified 2015 All/Community UI completes with `eServerFailedToRespond` even
-for a correctly registered and publicly queryable server. This is a client
-discovery outage, not permission to alter the recovered app/game-dir identity.
+Registration and retrieval are separate checks. On 2026-09-20, the Windows
+bridge logged on anonymously and Valve's public `ISteamApps/GetServersAtAddress`
+registry returned BattleSpades with app `224540` and game dir `aceofspades`.
+The old `hl2master.steampowered.com` hostname did not resolve, but that alone
+does not establish failure of the Steam client API's list retrieval. The
+retail wrapper calls `ISteamMatchmakingServers::RequestInternetServerList`;
+its underlying transport depends on the loaded Steam runtime. Earlier notes
+incorrectly treated the DNS observation as conclusive and overlooked the
+server-category mismatch above. See [Steam discovery](STEAM_DISCOVERY.md)
+for the corrected evidence and Windows setup.
 
 ### UI / messaging
 ChatMessage (49) and LocalisedMessage (50) are active for retail top-screen
@@ -808,17 +876,20 @@ client field.
 
 Use evidence in this order:
 
-1. A clean retail client observed live.
-2. IDA/decompiler control flow and the shipped Python 2 `.pyc` constant pool.
-3. Packet read/write layouts in `shared/packet.pyx`.
-4. Maintained characterization tests and raw captures.
-5. Reversed Python/Cython ports only as hypotheses.
+1. Shipped binaries, verified IDA control flow, and original constant pools.
+2. Direct execution of those binary paths with controlled inputs.
+3. A clean retail client observed live, with active patches recorded.
+4. Packet read/write layouts in `shared/packet.pyx`.
+5. Maintained characterization tests and raw captures.
+6. Reversed Python/Cython ports only as hypotheses.
 
 For lobby data, import the constant module with the client's bundled 32-bit
 Python 2 executable and print the obfuscated table directly. For native code,
 record image base, function address, caller/callee, field offsets, packet
-direction, and exact reproduction. A claim without a static path and a retail
-observation remains provisional.
+direction, binary hash, and exact reproduction. Keep decompiler interpretation,
+direct binary verification, integration observations, and server compatibility
+policy distinct. Agreement between our own client and server does not prove
+retail parity.
 
 Movement evidence must preserve the 60 Hz clock, input label, receipt tick,
 owner send sequence, WorldUpdate stamp, and pre/post native state. Owner rows
@@ -830,3 +901,114 @@ Crash-sensitive invariants include `InitialInfo` list shapes, compact player
 IDs, entity create/destroy symmetry, map display names used for screenshots,
 scene-terminal packets, localized-string tuple fields, and entity IDs used by
 projectile effects. Change one only with a focused test and two clean clients.
+
+## Unused Packet Audit
+
+This is the evidence-backed review of packet definitions which are not part of
+BattleSpades' normal runtime path. It complements the master table in
+`PROTOCOL.md`; it is not permission to register every packet as client input.
+
+### Audit method
+
+Each packet was classified on four independent axes before considering an
+implementation:
+
+1. **Direction** — client-to-server, server-to-client, handshake-only, or
+   bidirectional.
+2. **Phase** — handshake, map transfer, GameScene, round transition, or editor.
+3. **Authority** — request, authoritative state, presentation-only, or local
+   client state.
+4. **Framing and bounds** — exact field order, signedness, fixed-point format,
+   count limits, and legal lifecycle teardown.
+
+Evidence came from `shared/packet.pyx`, the clean retail Python 2
+`shared/packet.pyd`, native `gameScene.pyd` receiver decompilation, recovered
+server mode code, and the current handler/sender call sites. Golden vectors in
+`tests/test_recovered_objective_packets.py` are produced from the clean retail
+module rather than this repository's own reader.
+
+### Findings implemented or corrected
+
+| ID | Packet | Finding |
+|----|--------|---------|
+| 25 | StopSound | Native `process_packet_stop_sound` (`gameScene.pyd:0x1019CCD0`) resolves `loop_id` through the media manager and catches the missing-id path. BattleSpades now exposes validated global and per-player teardown helpers. |
+| 44 | MinimapZoneClear | Already active in objective-mode lifecycle cleanup. Its six shorts are the exact packet-43 zone identity; the old catalog entry was stale. |
+| 106 | TerritoryBaseState | Already active in Territory Control for join replay and owner/attacker/capture updates. Retail bytes match. |
+| 108 | LockToZone | Already active during Demolition's build phase. Retail bytes match. |
+| 109 | HelpMessage | Already active in Tutorial. The delay is the protocol's unusual big-endian float, followed by bounded null-terminated localization ids. Retail bytes match. |
+| 117 | TeamProgress | Already active for Demolition base health. Both its flag byte and fixed16-percent variant match retail. |
+
+All six are **server-to-client only**. Adding receive handlers for them would
+turn presentation or rule state into an untrusted-client authority path.
+
+### Reversed but blocked
+
+#### ProgressBar (65)
+
+The 1.x wire packet encodes `progress` and `rate` as signed fixed16 values. The
+native receiver (`gameScene.pyd:0x1019E3A0`) still contains a legacy
+`is_stopped()` branch which hides the HUD when progress is NaN. That sentinel
+belonged to the older float32 packet:
+the clean 1.x writer's `stopped` setter does nothing, and attempting to encode
+NaN cannot produce a valid fixed16 packet.
+
+Sending an active bar is easy, but there is no evidence-backed way to dismiss
+it. BattleSpades therefore does not emit packet 65. Territory Control and
+Occupation must keep their current marker/score feedback until a live-compatible
+hide transition is recovered.
+
+### Deliberately unused or unsafe
+
+| IDs | Reason |
+|-----|--------|
+| 3, 96 | Entity delta/disable paths have no recovered lifecycle that is safer than the active Create/Change/Destroy entity path. Packet 3 is also rejected at the final outbound boundary: a truncated five-byte instance makes the retail reader consume a missing short count and crash with `NoDataLeft`. |
+| 14 | `ExistingPlayer.pickup` has no safe empty sentinel in this client. Roster replay intentionally uses CreatePlayer (28). |
+| 34, 38, 39 | Block ownership/manager packets do not repair VXL topology; packet 39 is a native no-op. Authoritative block changes continue through the verified Damage/build paths. |
+| 73 | Selects one of nine compiled messages; it is not free text. Packets 49/50 own broadcasts. |
+| 101 | Steam-lobby host progress only. It is unnecessary and crash-prone during dedicated direct-connect map loading. |
+
+### Valid candidates when a real feature needs them
+
+| IDs | Conditions before implementation |
+|-----|----------------------------------|
+| 18 | POIFocus is presentation-only and server-to-client. Use only when a mode has an exact focus event and clear/expiry semantics. |
+| 41, 42 | Billboard add/clear are a paired lifecycle keyed by entity id. Do not duplicate packet-43 CTF zones or native intel entities. |
+| 72 | ForceShowScores needs an exact round-state transition and a verified release/toggle path; ShowGameStats (53) already owns the current end screen. |
+| 75, 79–82 | Runtime rule mutations only. Join/spawn truth must still be reflected in StateData, and no client packet may set these values. |
+| 61–63 | Resource-pack transfer requires a separate phase machine, byte/count caps, checksum validation, acknowledgement correlation, timeout, and cancellation. |
+| 66 | Rank progression needs persistent authoritative progression; a display packet alone is not a progression system. |
+| 103 | Voice requires bounded codec/frame validation, rate limiting, routing policy, mute/abuse controls, and no gameplay-thread decoding. |
+| 107 | DebugDraw must remain authenticated development tooling and server-to-client only. |
+| 111–113 | Password challenge/response requires pre-GameScene phase gating, attempt throttling, constant-time comparison, and secret-safe logging. |
+
+The priority rule is simple: implement a packet only when its full state
+transition is recovered. A known byte layout without direction, authority, and
+cleanup behavior is not an implementation contract.
+
+## Optional BattleSpades cosmetic replication
+
+`server/cosmetics.py` synchronizes equipped catalog IDs obtained from the Revival
+master. It is an optional presentation service, independent of the authoritative
+weapon, class, combat and movement systems.
+
+Only `battlespades-cosmetics-v1` in the identity returned by consuming a bound
+game ticket enables transmission. A client name, ENet version or Steam identity
+alone never enables it. `Connection.send` enforces the recipient gate as the final
+outbound check, including during loading.
+
+The reliable envelope is byte 240, ASCII `BSC1`, then JSON containing `player_id`
+and an `items` slot-to-catalog-ID map. Maximum size is 8192 bytes. World weapon,
+class body/hat and tombstone slots are accepted; paths, scripts, model data and
+gameplay attributes are absent. Empty items clear a player's previous outfit.
+Retail Protocol 168 packets and client-to-server input remain unchanged.
+
+The background service batches up to 32 verified account IDs per HTTPS request,
+with a five-second request timeout and five-second refresh interval. Requests run
+off the simulation thread. It resolves `Player.id` from live connections after
+HTTP completes, sends changed snapshots to capable peers, and clears departed
+players without transferring old cosmetics to reused IDs. Failed lookups keep
+the last verified data; publication failures are logged and retried.
+
+Tests: `tests/test_cosmetics.py`, `tests/test_revival_master.py`, and
+`tests/test_connection_skybox.py`. Master/client deployment policy is owned by
+those projects; this repository defines only the server wire/service contract.

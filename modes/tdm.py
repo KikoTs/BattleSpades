@@ -7,7 +7,9 @@ import logging
 from typing import Optional, TYPE_CHECKING
 
 from server import mode_data
-from server.game_constants import KILL_HEADSHOT, TEAM1, TEAM2
+import shared.constants as C
+import shared.constants_gamemode as CG
+from server.game_constants import KILL_HEADSHOT, KILL_MELEE, TEAM1, TEAM2
 
 from .base_mode import BaseMode
 
@@ -22,7 +24,7 @@ class TDMMode(BaseMode):
     Team Deathmatch mode.
 
     Rules:
-    - Each cross-team kill scores a point for the killer's team (+1 headshot).
+    - Each cross-team kill scores one point for the killer's team.
     - First team to the score limit wins; otherwise the leader at the time
       limit wins.
 
@@ -34,8 +36,8 @@ class TDMMode(BaseMode):
     description = "Eliminate the enemy team to score points!"
 
     # Points per event.
-    kill_points = 1
-    headshot_bonus = 1
+    kill_points = int(CG.TDM_TEAM_SCORE_FOR_KILL)
+    headshot_bonus = 0  # Optional custom-server override, not a retail default.
 
     def __init__(self, server):
         super().__init__(server)
@@ -73,7 +75,8 @@ class TDMMode(BaseMode):
     async def on_player_kill(self, killer: 'Player', victim: 'Player', kill_type: int):
         """Award team + personal points for a cross-team kill and check win."""
         # No scoring once the round has ended (during the stats screen / restart).
-        if self.ended:
+        if (self.ended or killer is victim or killer.team == victim.team
+                or killer.team not in (TEAM1, TEAM2) or victim.team not in (TEAM1, TEAM2)):
             return
         from server.scoreboard import send_player_score, send_team_score
 
@@ -89,8 +92,14 @@ class TDMMode(BaseMode):
         # Personal scoreboard: the client's per-player column. Award the
         # generic per-kill score (100, +50 headshot) so the leaderboard fills.
         # (killer.kills is already incremented in Player.die.)
-        killer.score += 150 if kill_type == KILL_HEADSHOT else 100
-        send_player_score(self.server, killer)
+        if kill_type == KILL_HEADSHOT:
+            amount, reason = CG.GENERIC_SCORE_HEADSHOT, C.KILL_SCORE_HEADSHOT_REASON
+        elif kill_type == KILL_MELEE:
+            amount, reason = CG.GENERIC_SCORE_MELEE, C.KILL_SCORE_MELEE_REASON
+        else:
+            amount, reason = CG.GENERIC_SCORE_KILL, C.KILL_SCORE_REASON
+        killer.score += int(amount)
+        send_player_score(self.server, killer, reason=int(reason))
 
         # Audio stingers: a "good" cue to the killer, a "bad" cue to the victim.
         from server.audio import play_sound_to, SND_EVENT_POSITIVE, SND_EVENT_NEGATIVE
@@ -105,6 +114,20 @@ class TDMMode(BaseMode):
 
         if team.score >= self.score_limit:
             await self._end_by_score(killer.team)
+
+    async def on_player_death(self, player, killer, kill_type: int) -> None:
+        """Apply retail personal penalties without changing the team kill count."""
+        if self.ended or kill_type in {
+            C.FORCED_TEAM_CHANGE_KILL, C.TEAM_CHANGE_KILL, C.CLASS_CHANGE_KILL
+        }:
+            return
+        from server.scoreboard import send_player_score
+        if killer is player or killer is None:
+            player.score += int(CG.GENERIC_SCORE_SUICIDE)
+            send_player_score(self.server, player, reason=int(C.SUICIDE_SCORE_REASON))
+        elif killer.team == player.team:
+            killer.score += int(CG.GENERIC_SCORE_TEAMKILL)
+            send_player_score(self.server, killer, reason=int(C.KILL_SCORE_TEAMKILL_REASON))
 
     async def on_tick(self, tick: int):
         """Periodic lead announcements."""

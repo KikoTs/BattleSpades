@@ -17,13 +17,16 @@ See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for toolchain requirements.
 
 ## Before you open a PR
 
-1. **Tests pass:** `py -m pytest tests/ -q` (currently 87 passing).
+1. **Tests pass:** `py -m pytest tests/ -q`.
 2. **Movement parity holds:** `py scripts/replay_parity.py` prints `ALL PASS`.
 3. **Rebuild Cython** if you edited any `.pyx`/`.pxd`:
    `python setup.py build_ext --inplace` (stop the server first — it locks the
    compiled files).
 4. Keep changes focused and describe *what you observed* — this project is
    measurement-driven.
+5. Update the existing maintained guide and check its local links/commands.
+   Distinguish source behavior from fresh runtime evidence; do not present a
+   previous run's count or a retained executable as validation of new edits.
 
 ## Working on netcode or physics? Read first
 
@@ -45,6 +48,12 @@ measurement in your PR.
   (especially a measured constant or a protocol quirk), not narrate the code.
 - Don't commit build artifacts (`.pyd`/`.so`/generated `.c`), logs, or local
   config — `.gitignore` already covers them.
+- Keep build work in `build/`, frozen executables in `dist/`, portable bundles
+  in `release-dist/`, and diagnostic runs in `tmp/` or `logs/`. Replace obsolete
+  outputs instead of accumulating dated directories at the repository root.
+- Update the relevant reference linked from `README.md` when behavior changes.
+  Keep investigation logs and dated validation reports out of `docs/`; code,
+  tests, and reproducible commands are the sources of current behavior.
 
 ## Reporting bugs
 

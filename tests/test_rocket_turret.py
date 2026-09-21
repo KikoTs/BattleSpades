@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+import math
+
+import pytest
 
 import shared.constants as C
 from shared.bytes import ByteReader
@@ -12,6 +15,7 @@ from server.rocket_turret import (
     RocketTurretController,
 )
 from server.handlers.deployables import _deploy_pos
+from server.projectiles import ProjectileEngine
 
 
 class Player:
@@ -151,6 +155,70 @@ def test_turret_ignores_teammates_and_out_of_detection_range():
     assert turret.target_id is None
     assert turret.ammo == ROCKET_TURRET_AMMO
     assert server.projectile_engine.spawned == []
+
+
+@pytest.mark.parametrize("direction", [(1, 0), (-1, 0), (0, 1), (0, -1)])
+def test_live_turret_rocket_survives_launch_and_reaches_enemy(monkeypatch, direction):
+    """Exercise the real runtime's monotonic cooldown / wall-clock flight split."""
+    wall_now = 1_900_000_000.0
+    monkeypatch.setattr("server.projectiles.time.time", lambda: wall_now)
+    server = Server()
+    server.projectile_engine = ProjectileEngine()
+    owner = Player(1, 2, (80.0, 80.0, 17.3))
+    controller = RocketTurretController(server)
+    turret = controller.place(owner, (100.0, 100.0, 20.0), yaw=0.0, now=200.0)
+    origin = controller._aim_origin(turret)
+    enemy = Player(2, 3, (
+        origin[0] + direction[0] * 12.0,
+        origin[1] + direction[1] * 12.0,
+        17.3,
+    ))
+    server.players = {owner.id: owner, enemy.id: enemy}
+    controller.update(1.0, now=202.0)
+    assert len(server.projectile_engine.projectiles) == 1
+    rocket = server.projectile_engine.projectiles[0]
+    assert rocket.spawned_at == wall_now
+    assert turret.next_shot_at == 203.5
+    yaw, pitch = math.radians(turret.yaw), math.radians(turret.pitch)
+    barrel = (math.sin(yaw) * math.cos(pitch),
+              math.cos(yaw) * math.cos(pitch), -math.sin(pitch))
+    speed = math.sqrt(rocket.vx ** 2 + rocket.vy ** 2 + rocket.vz ** 2)
+    assert (rocket.vx / speed, rocket.vy / speed, rocket.vz / speed) == pytest.approx(barrel)
+    floor = SimpleNamespace(get_solid=lambda x, y, z: z >= 20)
+    wall_now += 1.0 / 60.0
+    assert server.projectile_engine.update(
+        1.0 / 60.0, floor, players=(owner, enemy)
+    ) == []
+    assert rocket.z < 20.0
+    for _ in range(30):
+        wall_now += 1.0 / 60.0
+        impacts = server.projectile_engine.update(
+            1.0 / 60.0, floor, players=(owner, enemy)
+        )
+        if impacts:
+            assert len(impacts) == 1
+            impact = impacts[0]
+            assert math.hypot(impact.x - enemy.x, impact.y - enemy.y) <= 1.0
+            assert math.hypot(impact.x - origin[0], impact.y - origin[1]) > 10.0
+            break
+    else:
+        pytest.fail("Turret rocket failed to reach its unobstructed enemy")
+
+
+def test_turret_skips_target_below_barrel_limit_and_acquires_reachable_enemy():
+    server = Server()
+    owner = Player(1, 2, (10.0, 10.0, 10.0))
+    controller = RocketTurretController(server)
+    turret = controller.place(owner, (10.0, 10.0, 10.0), yaw=0.0)
+    origin = controller._aim_origin(turret)
+    below = Player(2, 3, (origin[0], origin[1] + 1.0, origin[2] + 5.0))
+    reachable = Player(3, 3, (origin[0], origin[1] + 15.0, origin[2]))
+    server.players = {1: owner, 2: below, 3: reachable}
+    controller.update(1.0, now=2.0)
+    assert turret.target_id == reachable.id
+    assert turret.pitch == pytest.approx(0.0)
+    assert len(server.projectile_engine.spawned) == 1
+    assert server.projectile_engine.spawned[0][2][2] == pytest.approx(0.0)
 
 
 def test_change_entity_target_and_ammo_use_stock_action_layout():

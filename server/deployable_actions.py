@@ -18,6 +18,7 @@ import shared.constants as C
 
 from server.class_selection import deployable_authorized
 from server.connection import internal_team_to_wire
+from server.deployable_inventory import commit_deployable_use, deployable_ready
 from server.entities.behaviors import (
     MedpackBehavior,
     ProximityMineBehavior,
@@ -106,6 +107,9 @@ class DeployableActionService:
 
         if not deployable_authorized(player, C.MEDPACK_TOOL):
             return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.MEDPACK_TOOL), now):
+            return False
         pos = self.validate_position(
             player,
             position,
@@ -131,6 +135,7 @@ class DeployableActionService:
             ),
             support_cell=support_cell,
         )
+        commit_deployable_use(player, int(C.MEDPACK_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info("MEDPACK id=%d placed by %s at %s", entity.entity_id, player.name, pos)
         return True
@@ -148,6 +153,9 @@ class DeployableActionService:
             not deployable_authorized(player, C.DYNAMITE_TOOL)
             or not 0 <= int(face) <= 5
         ):
+            return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.DYNAMITE_TOOL), now):
             return False
         pos = self.validate_position(
             player,
@@ -179,6 +187,7 @@ class DeployableActionService:
             behavior=behavior,
             support_cell=support_cell,
         )
+        commit_deployable_use(player, int(C.DYNAMITE_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info("DYNAMITE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
         return True
@@ -187,6 +196,9 @@ class DeployableActionService:
         """Place one arming proximity mine for the active Scout."""
 
         if not deployable_authorized(player, C.LANDMINE_TOOL):
+            return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.LANDMINE_TOOL), now):
             return False
         pos = self.validate_position(
             player,
@@ -227,6 +239,7 @@ class DeployableActionService:
             behavior=behavior,
             support_cell=support_cell,
         )
+        commit_deployable_use(player, int(C.LANDMINE_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info("LANDMINE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
         return True
@@ -237,6 +250,9 @@ class DeployableActionService:
         """Attach one stock-limited remote charge to a valid face."""
 
         if not deployable_authorized(player, C.C4_TOOL) or not 0 <= int(face) <= 5:
+            return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.C4_TOOL), now):
             return False
         pos = self.validate_position(
             player,
@@ -276,6 +292,7 @@ class DeployableActionService:
         )
         live_ids.append(entity.entity_id)
         player._c4_entity_ids = live_ids
+        commit_deployable_use(player, int(C.C4_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info(
             "C4 id=%d placed by %s at %s face=%d",
@@ -311,6 +328,9 @@ class DeployableActionService:
         """Place the one-live-station Scout radar and enable visibility."""
 
         if not deployable_authorized(player, C.RADAR_STATION_TOOL):
+            return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.RADAR_STATION_TOOL), now):
             return False
         # Radar expiry and round cleanup deliberately use ``None`` to mean
         # "no live station".  Do not coerce that nullable owner slot into an
@@ -358,6 +378,7 @@ class DeployableActionService:
             support_cell=support_cell,
         )
         player._radar_entity_id = entity.entity_id
+        commit_deployable_use(player, int(C.RADAR_STATION_TOOL), now)
         self.server._radar_station_added(player.team)
         self.server.broadcast_create_entity(entity)
         logger.info("RADAR id=%d placed by %s at %s", entity.entity_id, player.name, pos)
@@ -369,6 +390,9 @@ class DeployableActionService:
         """Place the one-per-owner durable mounted machine gun."""
 
         if not deployable_authorized(player, C.MG_TOOL) or not math.isfinite(float(yaw)):
+            return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.MG_TOOL), now):
             return False
         pos = self.validate_position(
             player,
@@ -397,6 +421,7 @@ class DeployableActionService:
             behavior=MachineGunBehavior(player.id, player.team),
             support_cell=support_cell,
         )
+        commit_deployable_use(player, int(C.MG_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info(
             "MACHINE GUN id=%d placed by %s at %s yaw=%.2f",
@@ -414,6 +439,9 @@ class DeployableActionService:
 
         if not deployable_authorized(player, C.ROCKET_TURRET_TOOL):
             return False
+        now = time.monotonic()
+        if not deployable_ready(player, int(C.ROCKET_TURRET_TOOL), now):
+            return False
         if not math.isfinite(float(yaw)):
             return False
         pos = self.validate_position(
@@ -426,13 +454,16 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
             return False
-        turret = self.server.rocket_turret_controller.place(
-            player,
-            pos,
-            float(yaw),
-            now=time.monotonic(),
-            support_cell=support_cell,
-        )
+        stock_before = player.rocket_turret_stock
+        try:
+            turret = self.server.rocket_turret_controller.place(
+                player, pos, float(yaw), now=now, support_cell=support_cell,
+            )
+        finally:
+            # The dedicated controller debits before broadcasting. A transport
+            # failure after creation still costs stock and starts the cadence.
+            if player.rocket_turret_stock < stock_before:
+                commit_deployable_use(player, int(C.ROCKET_TURRET_TOOL), now)
         if turret is None:
             return False
         logger.info(

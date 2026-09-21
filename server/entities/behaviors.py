@@ -266,9 +266,10 @@ class MedpackBehavior(DamageableEntityBehavior):
     """A medic's placed medpack: heals teammates who step on it, for a limited
     number of uses, then despawns.
 
-    The real heal amount/model lives in compiled client code (not in the
-    constant catalog) — this uses full-heal-per-touch with 3 uses, flagged for
-    live calibration. One instance per placed medpack (it carries use state).
+    DeployableActionService supplies the recovered MEDPACK_HEAL_AMOUNT (25)
+    and MEDPACK_USES (3) constants. The generic constructor's full-heal default
+    is retained for explicitly constructed custom entities; normal player and
+    bot packs always use the service-supplied values. Each pack owns its uses.
     """
 
     touch_radius = 3.0

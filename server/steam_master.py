@@ -22,6 +22,7 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING, Optional
 
+from shared.constants import SERVERMODE_PUBLIC
 from server.mode_data import get as get_mode_data
 
 if TYPE_CHECKING:
@@ -69,9 +70,10 @@ class SteamAdvertisement:
 def build_game_tags(config: "ServerConfig", mode_code: Optional[str] = None) -> str:
     """Build the exact semicolon-delimited tags consumed by retail AoS.
 
-    The stock browser filters on ``mode=%04d`` and may additionally filter on
-    ``region=<name>``.  Keep ordering identical to the recovered server wrapper
-    so old clients and external query tools see one stable representation.
+    ``mode`` is a SERVERMODE_* category, not a gameplay mode ID. The retail
+    Internet menu requests SERVERMODE_PUBLIC (1); advertising TDM's gameplay
+    ID (6), for example, makes its native filter discard the row. Gameplay is
+    conveyed separately by the map prefix and session packets.
     """
 
     steam = config.steam
@@ -82,7 +84,7 @@ def build_game_tags(config: "ServerConfig", mode_code: Optional[str] = None) -> 
     ]
     if steam.region:
         tags.append(f"region={steam.region}")
-    tags.append(f"mode={int(mode.mode_id):04d}")
+    tags.append(f"mode={int(SERVERMODE_PUBLIC):04d}")
     if mode.classic:
         tags.append("classic")
     skin = steam.texture_skin or ("mafia" if mode.mafia else "")

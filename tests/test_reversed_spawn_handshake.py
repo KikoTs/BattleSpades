@@ -165,6 +165,31 @@ def test_initial_spectator_join_preserves_team_zero_without_spawning_body():
     assert all(packet[0] not in (SetHP.id, 69) for packet in sent_packets)
 
 
+def test_authenticated_host_assignment_reaches_original_create_player_packet():
+    from server.revival_master import RevivalIdentity, RevivalMasterService
+
+    server = DummyServer()
+    identity = RevivalIdentity("ply_test", "1000", "Assigned", "registered", "password", True,
+                               assigned_team=TEAM2)
+
+    async def consume(_ticket):
+        return identity
+
+    server.revival_master = SimpleNamespace(consume_join_ticket=consume,
+                                            bind_player=RevivalMasterService.bind_player)
+    connection = make_connection(server)
+    sent = []
+    connection.send = lambda data, **kwargs: sent.append(data)
+    join = NewPlayerConnection()
+    join.team, join.class_id, join.forced_team, join.local_language = TEAM1, 0, 0, 0
+    join.name = "~12345678901234"
+    asyncio.run(connection._on_new_player(join))
+    assert connection.player.team == TEAM2
+    assert connection.player.account_legacy_id == "1000"
+    packet = next(packet for packet in sent if packet[0] == CreatePlayer.id)
+    assert CreatePlayer(ByteReader(packet[1:])).team == TEAM2
+
+
 def test_player_default_block_color_matches_retail_neutral_gray():
     player = Player(0, "Builder", TEAM1, C.RIFLE_TOOL, None)
     assert player.block_color == 0x707070

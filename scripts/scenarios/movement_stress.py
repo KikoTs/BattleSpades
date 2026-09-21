@@ -122,11 +122,23 @@ def _stress_yaw_tick(dt):
     _stress_yaw_elapsed += max(0.0, float(dt))
     _progress = min(1.0, _stress_yaw_elapsed / max(0.001, _stress_yaw_duration))
     _yaw = _stress_yaw_start + _stress_yaw_delta * _progress
-    _player.character.yaw = _yaw
-    _player.character.update_orientation()
+    _sensitivity = float(getattr(manager.config, 'mouse_sensitivity', 0.1))
+    if _sensitivity > 0.0:
+        _delta = (_yaw - float(_player.character.yaw) + 180.0) % 360.0 - 180.0
+        manager.window.dispatch_event('on_mouse_motion', 0, 0,
+                                      int(round(_delta / _sensitivity)), 0)
     if _progress >= 1.0:
         _stress_pyglet.clock.unschedule(_stress_yaw_tick)
 _stress_pyglet.clock.schedule(_stress_yaw_tick)
+# Supply ordinary mouse input before the game callbacks, without directly
+# changing the Character/world orientation between physics and packet send.
+# The bundled pyglet Clock executes _schedule_items in list order; preserve
+# the relative order of every existing game callback.
+_stress_clock_items = _stress_pyglet.clock.get_default()._schedule_items
+for _stress_index, _stress_item in enumerate(_stress_clock_items):
+    if _stress_item.func is _stress_yaw_tick:
+        _stress_clock_items.insert(0, _stress_clock_items.pop(_stress_index))
+        break
 _ = 'yaw-ramp-started'"""
 
 STOP_YAW_RAMP = """import pyglet as _stress_pyglet
@@ -1746,6 +1758,7 @@ def run_scenario(
         "scenario": "movement_stress",
         "created_at": started_at.isoformat(),
         "configuration": {
+            "yaw_input_phase": "mouse_motion_before_game_callbacks",
             "interval_seconds": interval,
             "repeats": repeats,
             "segments": [asdict(segment) for segment in segments],

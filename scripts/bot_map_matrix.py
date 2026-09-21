@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 import json
 import math
@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
 import shared.constants as C
 
 from modes.tdm import TDMMode
+from modes import get_mode_class
 from server.bot_ai.director import BotDirector
 from server.bot_ai.messages import (
     BotActionKind,
@@ -92,6 +93,7 @@ class WorstBotState:
     feedback_accepted: bool = True
     feedback_position: tuple[float, float, float] | None = None
     local_solids: tuple[tuple[int, int, int], ...] = ()
+    navigation_state: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -117,6 +119,18 @@ class MapResult:
     map_name: str
     seed: int
     requested_seconds: float
+    mode_name: str = "tdm"
+    clock_base: float = 0.0
+    clock_phase: float = 0.0
+    requested_clock_base: float | None = None
+    classes_seen: tuple[int, ...] = ()
+    actions_requested: dict[str, int] = field(default_factory=dict)
+    actions_accepted: dict[str, int] = field(default_factory=dict)
+    roles: dict[str, int] = field(default_factory=dict)
+    movement_abilities: dict[str, int] = field(default_factory=dict)
+    kills: int = 0
+    terrain_recoveries: int = 0
+    team_scores: dict[int, int] = field(default_factory=dict)
     simulated_seconds: float = 0.0
     wall_seconds: float = 0.0
     bot_count: int = 0
@@ -139,6 +153,10 @@ class MapResult:
         default_factory=dict
     )
     bridge_line_requests_by_bot: dict[int, int] = field(default_factory=dict)
+    closest_enemy_side_by_bot: dict[int, float] = field(default_factory=dict)
+    enemy_contacts_by_bot: dict[int, int] = field(default_factory=dict)
+    goal_arrivals_by_bot: dict[int, int] = field(default_factory=dict)
+    respawns_by_bot: dict[int, int] = field(default_factory=dict)
     teams: tuple[TeamResult, ...] = ()
     decision_calls: int = 0
     decision_wall_seconds: float = 0.0
@@ -169,6 +187,16 @@ def _round_position(position: Iterable[float]) -> tuple[float, float, float]:
     return values
 
 
+def water_stall_contact(player: object) -> bool:
+    """Measure shoreline stalls without counting a high knockback flight.
+
+    Native wade can remain latched while an explosion launches a swimmer
+    thirty blocks above the river. Keep ordinary bobbing and bank jumps in
+    the test, but restart its water clock after a genuinely airborne flight.
+    """
+    return bool(player.wade and float(player.z) >= float(C.Z_ABOVE_WATERPLANE) - 6.0)
+
+
 def _bot_state(
     *,
     player: object,
@@ -177,6 +205,8 @@ def _bot_state(
     tick: int,
     seconds: float,
     body_clear: bool,
+    brain: SimpleBotBrain | None = None,
+    now: float = 0.0,
 ) -> WorstBotState:
     """Capture enough local geometry to reproduce a navigation wedge."""
 
@@ -191,8 +221,33 @@ def _bot_state(
         else (0.0, 0.0, 0.0)
     )
     goal = getattr(intent, "debug_goal", None) if intent is not None else None
+    state = brain._states.get((player.id, runtime.generation)) if brain is not None else None
     return WorstBotState(
         bot_id=int(player.id),
+        navigation_state=({
+            "class_id": player.class_id,
+            "goal_key": state.goal.key if state.goal is not None else None,
+            "escape_goal": state.escape_goal,
+            "escape_remaining": state.escape_until - now,
+            "escape_retry": state.escape_retry_at - now,
+            "progress_age": now - state.navigation_progress_at,
+            "window_age": now - state.navigation_window_at,
+            "goal_age": now - state.goal_progress_at,
+            "water_escape_age": now - state.water_escape_at,
+            "water_escape_origin": state.water_escape_position,
+            "water_search_remaining": state.water_search_until - now,
+            "water_search_origin": state.water_search_origin,
+            "water_search_heading": state.water_search_heading,
+            "water_progress_age": now - state.water_progress_at,
+            "water_step_key": state.water_step_key,
+            "water_committed": state.water_committed,
+            "water_recovery": state.water_recovery,
+            "corridor_index": state.corridor_index,
+            "corridor": state.corridor,
+            "route_index": state.route_index,
+            "route": [(step.waypoint, step.affordance.value) for step in state.route],
+            "blocked": [(a, b, expiry-now) for (a,b),expiry in state.blocked_edges.items()],
+        } if state is not None else {}),
         team=int(player.team),
         tick=int(tick),
         seconds=round(float(seconds), 3),
@@ -256,6 +311,29 @@ def _largest_dense_cohort(players: Iterable[object]) -> tuple[object, ...]:
     return largest
 
 
+def simulation_clock_base(after_setup: float, *, phase: float = 0.0,
+                          replay_base: float | None = None) -> float:
+    """Keep mining's clock phase repeatable without reversing live cooldowns.
+
+    Existing actors were initialized against real monotonic time. A historical
+    replay base is therefore shifted by whole eight-second cycles when needed;
+    its mining phase is preserved, while every initialization timestamp remains
+    in the past. Future explicit bases can be replayed exactly.
+    """
+    if not math.isfinite(after_setup):
+        raise ValueError("setup clock must be finite")
+    if replay_base is not None:
+        if not math.isfinite(replay_base):
+            raise ValueError("replay clock base must be finite")
+        phase = replay_base % 8.0
+    if not math.isfinite(phase) or not 0.0 <= phase < 8.0:
+        raise ValueError("clock phase must be finite and in [0, 8)")
+    minimum = after_setup + 1.0
+    if replay_base is not None and replay_base >= minimum:
+        return replay_base
+    return math.ceil((minimum - phase) / 8.0) * 8.0 + phase
+
+
 async def simulate_map(
     map_name: str,
     *,
@@ -264,6 +342,12 @@ async def simulate_map(
     bots: int = 12,
     warmup_seconds: float = 12.0,
     trace_bot: int | None = None,
+    respawns: bool = False,
+    fail_fast: bool = False,
+    mode_name: str = "tdm",
+    class_ids: tuple[int, ...] = (),
+    clock_phase: float = 0.0,
+    clock_base: float | None = None,
 ) -> MapResult:
     """Run one deterministic map through production AI and native physics."""
 
@@ -271,6 +355,8 @@ async def simulate_map(
         map_name=str(map_name),
         seed=int(seed),
         requested_seconds=float(seconds),
+        mode_name=str(mode_name),
+        requested_clock_base=clock_base,
     )
     started = time.perf_counter()
     random_state = random.getstate()
@@ -278,19 +364,29 @@ async def simulate_map(
     subscription: int | None = None
     server: BattleSpadesServer | None = None
     monotonic_patcher = None
+    wall_clock_patcher = None
     try:
         config = ServerConfig(
             default_map=map_name,
-            default_mode="tdm",
+            default_mode=mode_name,
             maps_path=str(ROOT / "maps"),
         )
         config.bots.seed = int(seed)
         config.bots.max_bots = int(bots)
+        config.max_players = max(int(config.max_players), int(bots))
         server = BattleSpadesServer(config)
         if not server.world_manager.load_map(map_name):
             raise RuntimeError(f"could not load map {map_name!r}")
-        server.mode = TDMMode(server)
+        mode_type = get_mode_class(mode_name)
+        if mode_type is None:
+            raise ValueError(f"unknown mode {mode_name}")
+        server.mode = mode_type(server)
         await server.mode.on_mode_start()
+        if respawns:
+            # Keep a single continuous round alive for accelerated endurance.
+            # Cross-round lifecycle coverage lives in bot_transition_soak.
+            server.mode.score_limit = 1_000_000
+            server.mode.time_limit = float(seconds) + 60.0
         director = BotDirector(server, supervisor=SimpleNamespace())
         # Mirror the production composition boundary so the 60 Hz player
         # simulation can publish transient native water contact to the bot
@@ -301,12 +397,19 @@ async def simulate_map(
             bot = await director.add_bot(
                 team=TEAM1 if bot_index % 2 == 0 else TEAM2,
                 name=f"Matrix{map_name[:12]}{bot_index}",
-                class_id=int(C.CLASS_SOLDIER),
+                class_id=(class_ids[bot_index % len(class_ids)] if class_ids
+                          else int(C.CLASS_SOLDIER) if mode_name == "tdm" else None),
             )
             if bot is None:
                 raise RuntimeError(f"bot {bot_index} could not spawn")
 
         players = tuple(director.bots)
+        classes_seen: set[int] = set()
+        requested_actions: Counter[str] = Counter()
+        accepted_actions: Counter[str] = Counter()
+        roles: Counter[str] = Counter()
+        abilities: Counter[str] = Counter()
+        feedback_frames: dict[int, int] = {}
         result.bot_count = len(players)
         starts = {int(player.id): tuple(player.position) for player in players}
         result.unsafe_spawn_ids = tuple(
@@ -352,7 +455,12 @@ async def simulate_map(
         tactical_swim_jumps = {int(player.id): 0 for player in players}
         tactical_swim_jump_roles: dict[int, set[str]] = defaultdict(set)
         bridge_line_requests = {int(player.id): 0 for player in players}
+        closest_enemy_side = {int(player.id): math.inf for player in players}
+        enemy_contacts: dict[int, set[int]] = defaultdict(set)
+        goal_arrivals: dict[int, set[tuple[object, ...]]] = defaultdict(set)
         was_wading = {int(player.id): False for player in players}
+        previously_alive = {int(player.id): True for player in players}
+        respawn_counts = {int(player.id): 0 for player in players}
         water_origins = {
             int(player.id): tuple(player.position) for player in players
         }
@@ -373,8 +481,12 @@ async def simulate_map(
         team_congestion_states: dict[int, dict[int, WorstBotState]] = {
             TEAM1: {}, TEAM2: {}
         }
-        base = time.monotonic() + 1.0
+        base = simulation_clock_base(time.monotonic(), phase=clock_phase,
+                                     replay_base=clock_base)
+        result.clock_base = base
+        result.clock_phase = base % 8.0
         simulated_clock = [base]
+        wall_base = time.time()
         # All production cooldowns must observe the same accelerated clock as
         # the bot frames. Previously only ``created_at`` advanced at 60 Hz,
         # while combat/spade authority read real monotonic time; fast maps then
@@ -385,6 +497,10 @@ async def simulate_map(
             side_effect=lambda: simulated_clock[0],
         )
         monotonic_patcher.start()
+        if respawns:
+            wall_clock_patcher = patch.object(
+                time, "time", side_effect=lambda: wall_base + simulated_clock[0] - base)
+            wall_clock_patcher.start()
         frame_id = 0
         total_ticks = max(1, int(round(float(seconds) * SIMULATION_HZ)))
         warmup_ticks = max(0, int(round(float(warmup_seconds) * SIMULATION_HZ)))
@@ -409,7 +525,7 @@ async def simulate_map(
                             observer_id=int(player.id),
                             observer_generation=runtime.generation,
                             created_at=now,
-                            mode_id="tdm",
+                            mode_id=mode_name,
                             players=snapshots,
                             profile=runtime.profile,
                             entities=entities,
@@ -417,6 +533,32 @@ async def simulate_map(
                             mode_phase=director._mode_phase(),
                         )
                     intent = brain.decide(frame)
+                    snapshot = next(p for p in snapshots if p.player_id == player.id)
+                    classes_seen.add(snapshot.class_id)
+                    if snapshot.last_action_frame > feedback_frames.get(player.id, -1):
+                        feedback_frames[player.id] = snapshot.last_action_frame
+                        if snapshot.last_action_accepted:
+                            accepted_actions[snapshot.last_action_kind] += 1
+                    if intent is not None:
+                        requested_actions[intent.action.kind.value] += 1
+                        roles[intent.debug_role] += 1
+                        abilities[intent.movement.affordance.value] += 1
+                    state = brain._states.get((int(player.id), runtime.generation))
+                    enemy_anchor = next((
+                        item for item in objectives
+                        if item.kind == "team_anchor" and item.team != player.team
+                    ), None)
+                    if enemy_anchor is not None:
+                        closest_enemy_side[int(player.id)] = min(
+                            closest_enemy_side[int(player.id)],
+                            math.dist(player.position, enemy_anchor.position),
+                        )
+                    if state is not None and state.contact_until > now:
+                        enemy_contacts[int(player.id)].add(state.contact_id)
+                    if (intent is not None and state is not None
+                            and state.goal is not None
+                            and intent.debug_role.endswith(":arrived")):
+                        goal_arrivals[int(player.id)].add(state.goal.key)
                     traversal_styles[int(player.id)] = (
                         brain._traversal_personality(
                             frame,
@@ -457,9 +599,31 @@ async def simulate_map(
                         now,
                         MOTOR_PHASES / SIMULATION_HZ,
                     )
+            if respawns:
+                director.drain_actions(limit=1)
+                server._update_grenades(1.0 / SIMULATION_HZ)
             await server.simulation_runtime._simulate_players()
             server.world_mutations.commit_ready()
             server.prefab_actions.tick()
+            if respawns:
+                await server.simulation_runtime._tick_mode()
+                server.corpse_lifecycle.tick(1.0 / SIMULATION_HZ)
+                await server._process_respawns()
+                server.entity_registry.tick(server._build_entity_ctx())
+                server.rocket_turret_controller.update(1.0 / SIMULATION_HZ, now)
+                server.fire_controller.update()
+                # Run queued damage/death callbacks and native resource
+                # cleanup. A long accelerated run without yielding stockpiles
+                # work that a real server drains between gameplay ticks.
+                await asyncio.sleep(0)
+                if tick > 0 and tick % (60 * SIMULATION_HZ) == 0:
+                    print(
+                        f"endurance map={map_name} seconds={tick / SIMULATION_HZ:.0f} "
+                        f"deaths={sum(player.deaths for player in players)} "
+                        f"respawns={sum(respawn_counts.values())} "
+                        f"topology={server.world_manager.topology_version}",
+                        flush=True,
+                    )
             if trace_bot is not None and tick % 15 == 0:
                 traced = next(
                     (
@@ -505,6 +669,12 @@ async def simulate_map(
                         "route_index": (
                             int(state.route_index) if state is not None else -1
                         ),
+                        "escape_goal": state.escape_goal if state is not None else None,
+                        "escape_remaining": state.escape_until - now if state is not None else 0,
+                        "progress_age": now - state.navigation_progress_at if state is not None else 0,
+                        "corridor_index": state.corridor_index if state is not None else -1,
+                        "corridor_goal": (state.corridor[state.corridor_index]
+                            if state is not None and state.corridor_index < len(state.corridor) else None),
                         "route_step": (
                             {
                                 "waypoint": _round_position(route_step.waypoint),
@@ -565,6 +735,15 @@ async def simulate_map(
                 runtime = director._runtime[bot_id]
                 intent = runtime.intent
                 alive = bool(player.alive and player.spawned)
+                if alive and not previously_alive[bot_id]:
+                    respawn_counts[bot_id] += 1
+                    previous[bot_id] = tuple(player.position)
+                    position_history[bot_id].clear()
+                    water_ticks[bot_id] = 0
+                    stall_ticks[bot_id] = 0
+                    navigation_trap_ticks[bot_id] = 0
+                    was_wading[bot_id] = False
+                previously_alive[bot_id] = alive
                 requested = bool(
                     alive
                     and intent is not None
@@ -601,6 +780,7 @@ async def simulate_map(
                     total_water_ticks[bot_id] += 1
                     if not was_wading[bot_id]:
                         water_entries[bot_id] += 1
+                if alive and water_stall_contact(player):
                     if water_ticks[bot_id] == 0:
                         water_origins[bot_id] = tuple(player.position)
                     water_ticks[bot_id] += 1
@@ -646,6 +826,7 @@ async def simulate_map(
                 if water_ticks[bot_id] / SIMULATION_HZ > result.max_water_seconds:
                     result.max_water_seconds = water_ticks[bot_id] / SIMULATION_HZ
                     result.worst_water = _bot_state(
+                        brain=brain, now=now,
                         player=player,
                         runtime=runtime,
                         worker_world=worker_world,
@@ -698,6 +879,8 @@ async def simulate_map(
                         requested
                         or bool(player.wade)
                         or role == "water_no_route"
+                        or role.endswith((":segment_complete", ":edge_blocked",
+                                          ":physical_edge_blocked"))
                     )
                     and action_kind
                     not in {BotActionKind.FIRE, BotActionKind.ORIENTED}
@@ -718,6 +901,7 @@ async def simulate_map(
                 if trap_seconds > result.max_navigation_trap_seconds:
                     result.max_navigation_trap_seconds = trap_seconds
                     result.worst_navigation_trap = _bot_state(
+                        brain=brain, now=now,
                         player=player,
                         runtime=runtime,
                         worker_world=worker_world,
@@ -840,7 +1024,15 @@ async def simulate_map(
                             for player in dense
                         }
 
-        result.simulated_seconds = total_ticks / SIMULATION_HZ
+            if fail_fast and (
+                result.max_stall_seconds >= 10.0
+                or result.max_water_seconds >= 10.0
+                or result.max_navigation_trap_seconds >= INDIVIDUAL_TRAP_FAILURE_SECONDS
+                or any(value >= 8 * SIMULATION_HZ for value in team_max_congestion.values())
+            ):
+                break
+
+        result.simulated_seconds = (tick + 1) / SIMULATION_HZ
         result.topology_version = int(server.world_manager.topology_version)
         result.terrain_changes = tuple(all_terrain_changes)
         result.trace = tuple(trace_rows)
@@ -883,6 +1075,24 @@ async def simulate_map(
             for bot_id, roles in tactical_swim_jump_roles.items()
         }
         result.bridge_line_requests_by_bot = dict(bridge_line_requests)
+        result.closest_enemy_side_by_bot = {
+            bot_id: round(distance, 3) for bot_id, distance in closest_enemy_side.items()
+        }
+        result.enemy_contacts_by_bot = {
+            int(player.id): len(enemy_contacts[int(player.id)]) for player in players
+        }
+        result.goal_arrivals_by_bot = {
+            int(player.id): len(goal_arrivals[int(player.id)]) for player in players
+        }
+        result.respawns_by_bot = dict(respawn_counts)
+        result.classes_seen = tuple(sorted(classes_seen))
+        result.actions_requested = dict(requested_actions)
+        result.actions_accepted = dict(accepted_actions)
+        result.roles = dict(roles)
+        result.movement_abilities = dict(abilities)
+        result.kills = sum(player.kills for player in players)
+        result.terrain_recoveries = director.terrain_recoveries
+        result.team_scores = {key: team.score for key, team in server.teams.items()}
 
         failures: list[str] = []
         if result.unsafe_spawn_ids:
@@ -938,6 +1148,7 @@ async def simulate_map(
             required_moving_bots = max(1, (len(team.bot_ids) + 1) // 2)
             if (
                 result.simulated_seconds >= 30.0
+                and mode_name == "tdm" and team.bot_ids
                 and moving_bots < required_moving_bots
             ):
                 failures.append(
@@ -948,6 +1159,8 @@ async def simulate_map(
     except (AssertionError, OSError, RuntimeError, TypeError, ValueError) as exc:
         result.error = f"{type(exc).__name__}: {exc}"
     finally:
+        if wall_clock_patcher is not None:
+            wall_clock_patcher.stop()
         if monotonic_patcher is not None:
             monotonic_patcher.stop()
         if server is not None and subscription is not None:
@@ -966,6 +1179,13 @@ async def run_matrix(
     seconds: float,
     bots: int,
     trace_bot: int | None = None,
+    respawns: bool = False,
+    report_path: Path | None = None,
+    fail_fast: bool = False,
+    mode_name: str = "tdm",
+    class_ids: tuple[int, ...] = (),
+    clock_phase: float = 0.0,
+    clock_base: float | None = None,
 ) -> tuple[MapResult, ...]:
     """Run map/seed cases sequentially to avoid cross-server global state."""
 
@@ -978,8 +1198,23 @@ async def run_matrix(
                 seconds=seconds,
                 bots=bots,
                 trace_bot=trace_bot,
+                respawns=respawns,
+                fail_fast=fail_fast,
+                mode_name=mode_name,
+                class_ids=class_ids,
+                clock_phase=clock_phase,
+                clock_base=clock_base,
             )
             results.append(result)
+            if report_path is not None:
+                # Preserve completed cases during an endurance run, including
+                # the failing bot's exact geometry, instead of waiting hours
+                # for the final map before a regression can be investigated.
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(json.dumps({
+                    "schema": 1, "complete": False,
+                    "results": [asdict(item) for item in results],
+                }, indent=2, sort_keys=True), encoding="utf-8")
             status = "PASS" if result.passed else "FAIL"
             team_summary = ", ".join(
                 f"t{team.team}:crowd={team.max_congestion_seconds:.1f}s"
@@ -1015,7 +1250,19 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=40.0)
     parser.add_argument("--bots", type=int, default=12)
     parser.add_argument("--trace-bot", type=int)
+    parser.add_argument("--mode", default="tdm")
+    clock_options = parser.add_mutually_exclusive_group()
+    clock_options.add_argument("--clock-phase", type=float, default=0.0,
+                               help="repeatable mining clock phase in [0,8); default0")
+    clock_options.add_argument("--clock-base", type=float,
+                               help="replay a recorded clock phase; old bases shift forward by8s cycles")
+    parser.add_argument("--class-id", action="append", type=int, dest="class_ids",
+                        help="cycle requested class IDs; normal mode restrictions still apply")
+    parser.add_argument("--respawns", action="store_true",
+                        help="process mode events and respawns for continuous-round endurance")
     parser.add_argument("--json", type=Path, help="write the full diagnostic report")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="save each case at its first stall failure for exact terrain replay")
     args = parser.parse_args()
 
     available = shipped_maps()
@@ -1027,6 +1274,11 @@ def main() -> int:
         parser.error("--seconds must be positive")
     if not 2 <= args.bots <= 32:
         parser.error("--bots must be between 2 and 32")
+    try:
+        simulation_clock_base(time.monotonic(), phase=args.clock_phase,
+                              replay_base=args.clock_base)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     results = asyncio.run(
         run_matrix(
@@ -1035,10 +1287,18 @@ def main() -> int:
             seconds=float(args.seconds),
             bots=int(args.bots),
             trace_bot=args.trace_bot,
+            respawns=args.respawns,
+            report_path=args.json,
+            fail_fast=args.fail_fast,
+            mode_name=args.mode,
+            class_ids=tuple(args.class_ids or ()),
+            clock_phase=args.clock_phase,
+            clock_base=args.clock_base,
         )
     )
     document = {
         "schema": 1,
+        "complete": True,
         "maps": len(maps),
         "cases": len(results),
         "passed": sum(result.passed for result in results),

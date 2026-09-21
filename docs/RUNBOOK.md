@@ -1,16 +1,93 @@
 # RUNBOOK — Operating the Server, Game Client, and Control Tools
 
 How to start everything, control the live game programmatically, and run
-the measurement workflows. This is the operational handoff doc; the physics
+the measurement workflows. This is the maintained operational guide; the physics
 ground truth and reverse-engineering workflow live in [PROTOCOL.md](PROTOCOL.md).
 
-> **2026-07-11 operational note:** sections marked as historical later in this
-> file describe the old always-on tracing rig. Production launches must keep
-> parity capture and packet/movement tracing disabled. Current architecture and
-> investigation context lives in [ARCHITECTURE.md](ARCHITECTURE.md) and
-> [HANDOFF.md](HANDOFF.md).
+> Production launches should keep parity capture and packet/movement tracing
+> disabled. Runtime ownership is documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Retail/decompiled client paths below describe this developer's local setup;
+normal hosting does not require that research installation. For the maintained
+native client see its [runbook](../../BattleSpadesClient/docs/RUNBOOK.md).
+Captured measurements belong to their original experiment. Regenerate evidence
+for the source, configuration and executable you intend to release.
 
 ## Components & ports
+
+### Native client lifecycle bridge
+
+Client-owned servers launched with `--control-stdin` can receive
+`AOS_NATIVE_HOST_STATUS` (an absolute `host-status.json` path in a unique
+`session-*` directory) and `AOS_NATIVE_HOST_SESSION` (that directory name).
+`server/native_host.py` atomically publishes schema version 1 with session,
+port, mode and state: starting, ready, stopping, stopped or failed. Ready is
+published after the server's map/mode/services/bots initialize. The file never
+contains identity credentials. Status I/O failure does not terminate gameplay.
+The parent still sends `shutdown` or closes stdin to stop its child; this adds
+no public listener. Standalone servers need neither variable.
+
+The native client validates the session, port and mode, consumes readiness on
+its hosting worker and retains LAN probing for older bundles. Update the
+client's bundled server alongside the client to use the bridge. Run the client
+`aos_local_server_host_smoke <server-directory> --native-bridge` to require a
+real readiness report and Protocol 168 map bootstrap. Server regressions:
+`py -3.12 -m pytest tests/test_native_host.py tests/test_launcher.py -q`.
+
+### Hosted playtests, discovery and account XP
+
+The native client's network-hosted combat lobbies use an authenticated relay
+allocation and appear in the AoSPlay community server list. Discovery and join
+permission are separate: invite-only and friends lobbies can be listed while
+their server-side ticket checks restrict admission. Offline **Local Match**
+does not allocate a relay, publish a server or award account XP.
+
+The client supplies the relay's server ID, public endpoint, scoped write
+credential and allocation ID to its owned server process. The server must see
+the complete `AOS_MASTER_*` / `AOS_PUBLIC_*` identity override set before the
+client enables the Revival bridge. Never embed the site's global master write
+token in a client bundle. Account-bound join tickets identify participating
+players; the gameplay server records authoritative participation and submits
+results at round completion or controlled shutdown. The result outbox and
+optional hosted-result mirror allow retries without awarding the same event
+twice. Preserve both across upgrades.
+
+Community relay games do not need an official/ranked flag to earn XP. The
+backend must enable `AOS_PROGRESSION_AWARDS=1`; its existing relay multiplier
+defaults to 25% (`AOS_RELAY_XP_MULTIPLIER_BPS=2500`). A player needs at least
+30 active seconds and at least one human or bot opponent, a consumed join
+ticket and valid match evidence within the allocation's authorized lifetime.
+The authenticated owner can retry durable reports after the allocation closes.
+Merely hosting,
+remaining AFK, or changing a local XP display does not award account XP.
+Map Creator, tutorial and debug sessions are excluded.
+
+Discovery and results use the same canonical mode code. In particular,
+`zombie` becomes `zom`; `classic_ctf` / `classic-ctf` become `cctf`;
+`multihill` / `multi-hill` become `mh`; `territory_control` /
+`territory-control` become `tc`; `diamond` / `diamond_mine` become `dia`;
+`demolition` becomes `dem`; and `occupation` becomes `oc`. Tutorial is
+canonical `tut` and remains ineligible. A mismatch between the advertised mode
+and submitted result causes the backend to reject progression evidence.
+
+The companion AoSPlay backend's hosted admission changes require deployment
+separately from this bundle. Its ticket consumer allows current members and
+the owner into combat lobbies, accepted owner friends into friends lobbies,
+and others into open lobbies. Blocks override those grants; stale/closed
+lobbies and expired allocations are denied. UGC always requires current lobby
+membership. A standalone community relay without an associated social lobby
+remains public. These rules are checked during ticket consumption, including
+the interval before the host publishes the social lobby's relay link. Preparing
+or staging the game executables does not deploy those backend changes.
+
+For a local contract check, run the Python progression/outbox tests and the
+backend's isolated hosted admission, social audit, relay lifecycle and
+progression fixtures. They require no production accounts. Then run the
+packaged `--check` and native bridge smoke above. A public relay/XP acceptance
+test additionally needs the deployed backend and two authorized test accounts;
+local fixtures alone do not prove the live service's configuration.
+
+### Services
 
 | Thing | Where | Port |
 |---|---|---|
@@ -43,8 +120,8 @@ py -3.12 run_map_creator.py --project MyMap --terrain grassland `
 # Game client (from AceOfSpades_no_steam_new; MUST use the bundled py2!)
 .\python\python.exe launcher.py +s
 
-# Kill the server (it LOCKS the .pyd files — required before rebuilds)
-Get-CimInstance Win32_Process | ? {$_.CommandLine -match 'run_server'} | % {Stop-Process -Id $_.ProcessId -Force}
+# Stop the specific server before rebuilding locked .pyd files:
+# use Ctrl+C in its owning console, or its launcher's shutdown command.
 
 # Rebuild Cython after editing aoslib/world.pyx etc. (server must be stopped)
 py setup.py build_ext --inplace
@@ -180,16 +257,17 @@ Gotchas:
 - After a server restart the game drops to MenuScene; `auto_join.py` re-joins,
   but after several reconnect cycles the CLIENT's network state wedges —
   restart the game process when joins start timing out at "map transfer".
-- Kill SERVERS with a CommandLine match on 'run_server' WITHOUT a Name
-  filter: `py run_server.py` is a py.exe→python.exe chain and killing only
-  python.exe leaves the parent; filtered kills during 2026-06-12 left THREE
-  servers fighting over port 27015 (clients connect to a zombie → endless
-  flakiness). Same for game instances: only ONE at a time (the tracer
-  console port 32896 binds first-come; extra instances silently swallow
-  console queries).
+- Stop the specific instance through Ctrl+C, its service manager or the owned
+  launcher's stdin shutdown contract. If forced termination is needed, identify
+  that PID/process tree first: `py run_server.py` can have both launcher and
+  Python processes. Do not kill unrelated Python tasks by name. Use one retail
+  tracer per TCP 32896 listener; duplicate clients can steal console queries.
 - Never call `player.set_jetpack(0)` in-game (corrupts HUD, hangs renderer).
-- Never write config.toml with PowerShell `Set-Content -Encoding utf8`
-  (BOM breaks toml.load → server silently runs DEFAULTS on port 32887!).
+- Write TOML as UTF-8 without a BOM. Windows PowerShell 5.1's
+  `Set-Content -Encoding utf8` adds a BOM; PowerShell 7's `utf8NoBOM` or
+  `[IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))`
+  is explicit. Parse failures log a warning and use configuration defaults;
+  check startup output and validate the intended config.
 - py2 code sent to the console: no f-strings; coding-cookie lines stripped
   by game_console --file automatically.
 
@@ -677,28 +755,27 @@ Also validate the boundary cases on an isolated server:
 
 ## Bot runtime validation
 
-Build the pinned native navigator, then run the process and gameplay smokes:
+Build the native extensions, then run the process and gameplay smokes:
 
 ```powershell
 py setup.py build_ext --inplace
 py scripts\bot_worker_smoke.py --restart
 py scripts\bot_combat_smoke.py
-py scripts\bot_zombie_smoke.py --seconds 15
-py scripts\bot_runtime_smoke.py --seconds 12 --bots 12 --restart-worker-at 2
-py scripts\bot_city_soak.py --mode tdm --bots 12 --sim-seconds 60 --report-every 10
-py scripts\bot_city_soak.py --mode zom --bots 12 --sim-seconds 60 --report-every 10
-py scripts\bot_city_soak.py --map CastleWars --mode zom --bots 2 --sim-seconds 60 --report-every 30 --strand-water-bots 2
-py scripts\bot_transition_soak.py --games-per-session 4 --bots 6 --json validation-reports\bot-transition.json
+py scripts\bot_runtime_smoke.py --seconds 12 --bots 12 --worker process --restart-worker-at 2
+py scripts\bot_runtime_smoke.py --map London --mode zom --seconds 120 --bots 12 --worker thread --full-runtime --restart-worker-at 60
+py scripts\bot_map_matrix.py --map London --map GreatWall --map MayanJungle --seconds 1800 --bots 12 --seed 7 --respawns --json tmp\bot-validation\endurance.json
+py scripts\bot_transition_soak.py --games-per-session 4 --bots 6 --json tmp\bot-validation\bot-transition.json
 py scripts\server_capacity.py --players 12 --seconds 30 --port 27016
 
 # Exercise every implemented mode through the same real worker/native physics.
-foreach ($mode in "tdm", "ctf", "cctf", "zombie", "vip", "arena") {
+foreach ($mode in "tdm", "ctf", "cctf", "zom", "vip", "arena", "mh", "tc", "dia", "dem", "oc") {
   py scripts\bot_runtime_smoke.py --seconds 4 --bots 12 --mode $mode
 }
 ```
 
-The runtime smoke must report a live child PID and movement for at least one
-bot. A class-capable roster should eventually report a replicated deployable
+The process runtime smoke must report a live child PID and movement for at
+least one bot. Also exercise the default thread backend with `--worker thread`.
+A class-capable roster should eventually report a replicated deployable
 entity; absence in one short seeded run is not itself a failure because
 equipment use is intentionally probabilistic. The capacity gate must sustain
 58+ Hz, keep overall tick p99 at or below 12 ms and `subsystem_bots_p99_ms` at
@@ -715,13 +792,12 @@ local queue writes; a transfer that fills the queue with no reader is therefore
 also restarted. Zero-intent countdown and cadence frames still return a control
 heartbeat and are healthy. `stalls`, `awaiting_frame`, `awaiting_snapshot`, and
 the heartbeat fields distinguish each state. If profiling is available,
-capture the child before restarting it; a stack inside `recast*.pyd` from
-`WorkerVoxelWorld._native_path_direction` indicates native tile work, while a
-stack in `VoxelActionPlanner.water_exit` indicates water-search work. Both are
-bounded in current builds. Do not stop the authoritative server to recover a
-worker fault.
+capture the child before restarting it. Both production backends run the
+direct voxel planner described in [BOT_NAVIGATION.md](BOT_NAVIGATION.md).
+Do not stop the authoritative server to recover a worker fault.
 
-`bot_transition_soak.py` keeps one production server and bot roster alive while
+`bot_transition_soak.py` keeps one production server alive while recreating
+its bot roster at full game boundaries and
 crossing every shipped VXL/mode pair. Before every full rollover and same-map
 restart it deliberately injects unsupported coordinates plus stale path,
 feedback, motor, and pending-action state. The gate requires a supported spawn,
@@ -729,20 +805,11 @@ new native world owner, new controller record, empty old-timeline queues, and
 one isolated-planner recycle per `bots.clean_slate_games`. It never exercises
 or enables bot-only idle/hibernation behavior.
 
-`bot_city_soak.py` loads the real CityOfChicago VXL and advances worker policy
-time without sleeping. It prints each bot's position, role, action, affordance,
-movement direction, health/ammo/tool, stuck attempts, and stationary duration.
-Its exit gate requires zero point-blank construction priority inversions,
-repeated action loops, jump loops, travel-role navigation stalls, invalid look
-targets, and water stalls. This is an accelerated decision/navigation
-diagnostic, not native physics or replication proof; keep the real worker,
-capacity, and two-retail-client gates above.
-
-The CastleWars fault-injection command places bots in the two water columns
-farthest from dry terrain. Both must report `water_recovery`, eventually reach
-dry land, and finish with `water_remaining=0`. Dry bots must still refuse to
-enter water. The test exercises the full-map cached voxel escape flow; it is
-specifically intended to catch regressions to the old 24/64-column search cap.
+`bot_city_soak.py` and the inline adapter in `bot_zombie_smoke.py` still import
+the legacy `worker.py` implementation. Keep them as reference diagnostics;
+they do not replace current-planner coverage from `bot_map_matrix.py`,
+`bot_runtime_smoke.py`, and the tests linked in
+[BOT_NAVIGATION.md](BOT_NAVIGATION.md).
 
 `bot_combat_smoke.py` is the stricter player-parity gate. It uses a real worker,
 server-owned peerless Players, an authored VXL, and a settled packet observer.
@@ -776,8 +843,8 @@ palette-on ClientData records and are separate from the roster acceptance gate.
 For retail acceptance, observe 12 bots from two clean clients in TDM, CTF,
 Zombie, VIP, and Arena. Confirm ordinary CreatePlayer/tool/WorldUpdate state,
 natural turning, no fire through walls, visible deployable creation, objective
-pickup/drop, and no new crash dump. Kill the `BattleSpadesAI` child only (never
-an unrelated Python process), confirm players and 58+ Hz simulation survive,
+pickup/drop, and no new crash dump. For the process backend, stop only its
+`BattleSpadesAI` child and confirm players and 58+ Hz simulation survive,
 then wait for the 1/2/5/30-second supervised restart and verify movement
 recovers without stale traversal through edited terrain.
 
@@ -791,8 +858,9 @@ redirected stdin contract used by the client host:
 # After A2S and bot movement are visible, write exactly "shutdown\n" to stdin.
 ```
 
-Repeat the hidden controlled launch ten times. Every run must show one worker
-PID, a full-map heartbeat in under eight seconds, zero restart/stall markers,
+Repeat the hidden controlled launch ten times. Every run must show a healthy
+selected worker (a child PID for `worker = "process"`, thread ownership for the
+default thread backend), a full-map heartbeat in under eight seconds, zero restart/stall markers,
 and exit cleanly on stdin shutdown. Then change to a different real VXL while
 bots are active: the map epoch must advance without replacing the worker. The
 final retail gate requires A2S bot accounting, visible bot movement/tools, a
@@ -854,68 +922,211 @@ The checker uses Valve's public `ISteamApps/GetServersAtAddress` endpoint and
 then performs the optional A2S challenge round-trip. A pass proves that the
 server-owned registration path is healthy.
 
-The original server-list UI has two independent 2026 limitations:
+The original server-list UI has independent compatibility concerns:
 
-- Valve removed the `hl2master.steampowered.com` legacy list service used by
-  the 2015 client. All/Community can therefore show zero and finish with
-  `eServerFailedToRespond` even when the checker passes.
+- Its native browser filters public rows using the server-category tag
+  `mode=0001`. This is not the gameplay mode ID: TDM's session ID is 6, but
+  `mode=0006` is rejected by the public-server filter. The 2026-09-20 fix in
+  `build_game_tags` corrects this for all advertised gameplay modes.
+- The wrapper uses `RequestInternetServerList`. A failed lookup of the old
+  `hl2master.steampowered.com` hostname does not by itself prove that this API
+  is broken. Verify current API retrieval and query reachability separately.
 - The retail `ServerInfo` class ignores the returned game port and always
   joins UDP `32887`. Set `[server].port = 32887` and forward it when an
   unmodified browser row/direct default is a deployment requirement.
 
 Do not change app `224540`, game dir `aceofspades`, or forge `white=1` to work
-around the retired client endpoint. A modern directory/client fallback is a
+around a failing client list endpoint. A modern directory/client fallback is a
 separate client-distribution concern.
 
 `require_registration=false` is the production-safe default: the supervisor
 backs off while the game remains online. Set it true only when an orchestration
 system should treat missing Steam discovery as a failed deployment.
 
-## Historical status (2026-06-12, evening — post map-sync fix)
+See [Steam discovery](STEAM_DISCOVERY.md) for the recovered category-filter
+evidence, tested Windows configuration, and the distinction between logon,
+registry membership, public UDP reachability, and retail visibility.
 
-DONE: physics parity (replay suite ALL PASS, see PROTOCOL.md),
-wade threshold (feet >= 239), unreliable WorldUpdates, non-blocking logs,
-input buffering, jump mirror, spawn drop-in, InitialInfo speed-scale
-alignment (class_data.speed_scale).
+## Local build and validation layout
 
-**FIXED today — the jump-rollback / "stuck" desync.** Root cause was the
-map transfer, not physics: InitialInfo.checksum carried a chunker CRC
-instead of the raw FILE crc32, so the client's local-map validation failed,
-it discarded its map and played in an EMPTY world (wading at the waterline
-at ~60% speed → 85-block divergence; every jump snapped it back to its only
-network anchor, the CreatePlayer spawn). Now: checksum = file crc32,
-MapDataValidation reply = our file CRC, map_sync_mode=full (the client's
-world content comes ONLY from the sync stream — its local file is just for
-validation). Verified live: CRC match at join, world columns match on real
-terrain, mean client/server delta 0.13mm over 858 samples.
+Use the standard output directories so local experiments do not accumulate at
+the repository root:
 
-Tests: 75/75 pass (the old test_reversed_map_sync failure was a buggy raw
-walker in the TEST — multi-span columns desynced its (x,y) attribution; the
-loader itself is byte-faithful, 0/262144 mismatches on ArcticBase).
-Harness scenarios all PASS (full_handshake, spawn_walk, walk_speed,
-multi_bot, reconnect, block_build).
+| Path | Purpose |
+| --- | --- |
+| `build/` | Native/compiler and PyInstaller work, including the Steam helper |
+| `dist/BattleSpades/` | Current PyInstaller frozen executables and runtime |
+| `release-dist/BattleSpades-<version>-<platform>-<arch>/` | Complete portable server, with adjacent ZIP |
+| `tmp/` | Disposable validation reports and experiment output |
+| `logs/` | Runtime logs and captures |
 
-OPEN (task list):
-1. **Movement release gate.** Production self rows are on. The release gate must
-   include visible-position rollback detection, not only native SNAP/ADJUST
-   counters. Keep `clock_sync_loop_bias=0`; stale no-self-row experiments are
-   known to pass counters while visibly rolling back on jump.
-2. **auto_join map-build gate**: spawning before the client's async world
-   build completes drops the player into water and entombs them when the
-   terrain materialises. auto_join now polls world content stability
-   before create_player. The REAL client UI gate should be confirmed.
-3. **Native server crash after several connect/disconnect cycles** — dies
-   silently (no Python traceback => native, likely enet peer lifecycle).
-   faulthandler writes logs/faulthandler.log.
-4. **Game client dies ~2-4 min after spawn during autonomous runs** (exit
-   code 5, no traceback; instances left disconnected in the menu live
-   indefinitely). Suspects: someone closing the popped-up window, or a
-   periodic packet/timer. Track when it next happens with the window
-   left alone.
-5. **Climb micro-interplay**: slope transitions still produce small
-   transient divergence (~0.4 max). Walking feel is fine; polish.
-6. parity_summary.py: flag comparison uses mismatched schemas;
-   latest_capture sorts by name not mtime.
-7. Delta map sync ("auto" mode) parked: needs the client to actually use
-   its local file as world base, which it does NOT (content comes only
-   from the stream). Dirty-column tracking already implemented server-side.
+The cleaned local tree also retains an active native-client working copy in
+`validation-reports/ui-graphics-20260914/`. It contains source edits and is not
+disposable diagnostic output. New routine reports should use `tmp/`.
+
+`release/` contains tracked packaging inputs, not disposable build output.
+Keep maps, prefabs, `tests/fixtures/`, authored UGC projects, and native modules
+needed to run the source checkout. Preserve `state/round-results.sqlite3` and
+any configured hosted-result mirror across upgrades; they can contain unsent
+match results. Old release directories may hold their own state databases.
+
+The standard packaging commands are:
+
+```powershell
+py -3.12 -m PyInstaller --noconfirm --clean BattleSpades.spec
+py -3.12 scripts/package_release.py
+```
+
+The packager defaults to `dist/BattleSpades` and `release-dist`. It refuses an
+existing destination to prevent mixing releases: preserve runtime state before
+replacing a previous bundle. Run the resulting `BattleSpades.exe --check` before
+use. Packaging prerequisites are in `requirements-release.txt`,
+`BattleSpades.spec`, and `.github/workflows/release.yml`.
+
+Validation results belong to the exact source/build that produced them. Keep
+reproduction commands and regression fixtures in source; regenerate reports
+when making a new release instead of treating an old pass count as current.
+
+## Container deployment
+
+The game socket requires inbound UDP. Deploy it on a UDP-capable node or an
+explicitly configured relay; an HTTP domain or TCP proxy alone cannot carry
+ENet traffic. The contracts below come from `Dockerfile`,
+`scripts/container_entrypoint.py`, `deploy/`, and
+`.github/workflows/container.yml`; they do not assert a live deployment state.
+
+### Container contract
+
+The initializer claims only the `/data` volume when a provider mounts it as
+root, then permanently drops to UID/GID `10001` before Python or game data is
+loaded. The fleet example also drops Linux capabilities, keeps the source
+filesystem read-only, and writes runtime config, logs, and bans only beneath
+`/data`.
+
+Supported per-instance environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `BATTLESPADES_SERVER_NAME` | Public server name, up to 64 characters |
+| `BATTLESPADES_PORT` | UDP game and A2S port |
+| `BATTLESPADES_MAX_PLAYERS` | Slot limit, 1 through 255 |
+| `BATTLESPADES_MODE` | Startup mode code |
+| `BATTLESPADES_MAP` | Startup map name, never a filesystem path |
+| `BATTLESPADES_BOT_COUNT` | Fixed startup bot population |
+| `BATTLESPADES_REGION` | Revival browser region |
+| `BATTLESPADES_REQUIRE_IDENTITY` | Require Revival/Steam identity tickets |
+| `BATTLESPADES_ADMIN_PASSWORD` | Required strong server-console password |
+| `AOS_MASTER_URL` | Revival API origin |
+| `AOS_PUBLIC_HOST` | Public IPv4 used in listing identity |
+| `AOS_PUBLIC_PORT` | Public UDP game port; defaults to `BATTLESPADES_PORT` |
+| `AOS_PUBLIC_QUERY_PORT` | Public A2S UDP port; defaults to the public game port when mapped |
+| `AOS_SERVER_ID` | Must equal `AOS_PUBLIC_HOST:AOS_PUBLIC_PORT` |
+| `AOS_MASTER_WRITE_TOKEN` | One server-scoped `aos_srv_*` token |
+
+Despite its legacy environment name, `AOS_MASTER_WRITE_TOKEN` should contain a
+different server-scoped token in every public container. Never copy the global
+master write credential onto a game node.
+
+The Windows x86 Steam browser helper is disabled in the Linux image. This does
+not reject original Steam customers: retail identity still travels through the
+normal Protocol 168/Revival validation path.
+
+For a Playit endpoint such as `147.185.221.26:56675` forwarding to the
+container's `27015/udp`, keep `BATTLESPADES_PORT=27015` and set both public port
+variables to `56675`. A2S continues to answer on the private listen socket, but
+heartbeats and join tickets use the reachable public identifier.
+
+### Build locally
+
+```bash
+docker build \
+  --build-arg VCS_REF="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_VERSION="$(cat VERSION)" \
+  -t battlespades:local .
+
+docker run --rm \
+  -p 27015:27015/udp \
+  -e BATTLESPADES_ADMIN_PASSWORD='replace-with-a-long-secret' \
+  -e BATTLESPADES_SERVER_NAME='Local container test' \
+  -e BATTLESPADES_REVIVAL_ENABLED=false \
+  -v battlespades-local:/data \
+  battlespades:local
+```
+
+Validate the live socket from another shell:
+
+```bash
+python deploy/a2s_probe.py --host 127.0.0.1 --port 27015
+```
+
+### First game-node installation
+
+Use a Linux VM or bare-metal node with a stable public IPv4 and inbound UDP.
+Install Docker Engine, the Compose plugin, Git, and Python 3. Clone the
+repository into `/opt/BattleSpades`, then create the private environment:
+
+```bash
+sudo git clone https://github.com/KikoTs/BattleSpades.git /opt/BattleSpades
+cd /opt/BattleSpades
+sudo cp deploy/.env.example deploy/.env
+sudo chmod 600 deploy/.env
+sudoedit deploy/.env
+```
+
+Open UDP `27015`, `27025`, and `27035` in both the provider firewall and the
+host firewall. Keep the ten-port gaps available if separate Steam query ports
+are introduced later.
+
+For the first boot, leave the three `AOS_SERVER_*_TOKEN` values empty:
+
+```bash
+docker compose --env-file deploy/.env \
+  -f deploy/docker-compose.example.yml up -d
+```
+
+Run each registration command **on the game node** after its A2S probe passes:
+
+```bash
+python deploy/register_server.py \
+  --port 27015 \
+  --name 'AoS Revival EU / CTF' \
+  --map MayanJungle \
+  --mode CTF
+```
+
+The API prints an `AOS_MASTER_WRITE_TOKEN=aos_srv_*` value once. Put that value
+in the matching `AOS_SERVER_1_TOKEN`, `AOS_SERVER_2_TOKEN`, or
+`AOS_SERVER_3_TOKEN` field in `deploy/.env`, then recreate only that service.
+
+### Push-to-deploy flow
+
+`.github/workflows/container.yml` performs the full source suite first. A
+successful `main` push publishes:
+
+- `ghcr.io/kikots/battlespades:main`;
+- `ghcr.io/kikots/battlespades:sha-<commit>`;
+- BuildKit provenance and SBOM attestations.
+
+Production deployment uses the immutable SHA tag, never mutable `main`. Set
+these GitHub repository configuration values:
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Variable | `AUTO_DEPLOY_GAME_NODE` | `true` when automatic rollout is desired |
+| Secret | `GAME_NODE_HOST` | Node hostname or IPv4 |
+| Secret | `GAME_NODE_USER` | Restricted SSH deployment user |
+| Secret | `GAME_NODE_SSH_KEY` | Dedicated private deployment key |
+| Secret | `GAME_NODE_KNOWN_HOSTS` | Pre-verified `ssh-keyscan` line |
+
+Protect the `game-production` GitHub Environment if a human approval should
+remain between image publication and match restarts.
+
+The node keeps a separate clean deployment clone. `deploy/rollout.sh` pulls the
+tested image, recreates one server at a time, and requires a valid Protocol 168
+A2S response before moving to the next instance. A failed health gate stops
+the rollout and emits the affected container's latest logs.
+
+Every container restart disconnects players in that instance. During early
+alpha, deploy while servers are empty or retain environment approval. The
+later orchestrator can mark a listing as draining, block new joins, wait for
+the current round to finish, and then invoke this same immutable rollout.

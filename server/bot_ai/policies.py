@@ -8,7 +8,7 @@ or infer a hidden enemy from the complete roster snapshot.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import math
 from typing import Protocol
@@ -66,6 +66,8 @@ class ModeBotDecision:
     # Defensive roles also measure an enemy against their protected objective,
     # rather than only against the bot's current position.
     engagement_radius: float = 160.0
+    # Public approach to watch once arrived; independent of the ground waypoint.
+    watch_position: Vector3 | None = None
 
 
 _MODE_STRATEGIES: dict[str, ModeBotStrategy] = {
@@ -247,7 +249,11 @@ class TeamDeathmatchBotPolicy:
         teamwork = float(profile.teamwork) if profile is not None else 0.5
         aggression = float(profile.aggression) if profile is not None else 0.6
 
-        if observer.health <= 45 and teammates:
+        recently_wounded = (
+            float(observer.last_damage_at) > 0.0
+            and 0.0 <= frame.created_at - observer.last_damage_at <= 8.0
+        )
+        if observer.health <= 45 and teammates and recently_wounded:
             teammate = min(
                 teammates,
                 key=lambda player: _distance_squared(
@@ -569,12 +575,14 @@ class ZombieBotPolicy:
 
 
 class VIPBotPolicy:
-    """Protect VIPs in formation and flank the opposing marked VIP."""
+    """Keep an escort while attackers eliminate the VIP, then survivors."""
 
     def decide(
         self,
         frame: PerceptionFrame,
         observer: PlayerSnapshot,
+        *,
+        retained_role: str = "",
     ) -> ModeBotDecision | None:
         phase = str(frame.mode_phase).lower()
         own_vip = _objective(frame, "vip", observer.team)
@@ -609,34 +617,62 @@ class VIPBotPolicy:
             )
 
         if own_vip is not None and observer.player_id == own_vip.carrier_id:
+            recently_hurt = (observer.last_damage_at > 0
+                            and 0 <= frame.created_at - observer.last_damage_at <= 6)
             retreat = own_anchor.position if own_anchor is not None else own_vip.position
+            if recently_hurt and observer.last_damage_source_position is not None:
+                # A received hit reveals this position. Do not derive a threat
+                # from invisible enemy roster entries.
+                retreat = _away_from(observer.position,
+                                     observer.last_damage_source_position, 14.0)
+            elif not recently_hurt:
+                friends = [p for p in frame.players
+                           if p.team == observer.team and p.player_id != observer.player_id
+                           and p.alive and p.spawned
+                           and _distance_squared(p.position, observer.position) <= 40.0 ** 2
+                           and (enemy_vip is None or
+                                _distance_squared(p.position, enemy_vip.position) >=
+                                _distance_squared(observer.position, enemy_vip.position))]
+                if friends:
+                    retreat = min(friends, key=lambda p: (
+                        _distance_squared(observer.position, p.position), p.player_id)).position
             return ModeBotDecision(
                 retreat,
-                "vip_retreat",
-                sprint=observer.health < 70,
+                "vip_retreat" if recently_hurt else "vip_rally",
+                sprint=recently_hurt,
                 arrival_radius=6.0,
                 posture=ModeBotPosture.EVASIVE,
                 objective_priority=1.0,
                 engagement_radius=8.0,
             )
 
-        if own_vip is not None and (observer.player_id % 3 != 0 or enemy_vip is None):
-            guard = _formation_point(own_vip.position, observer.player_id, 5.0)
+        # Assign from the actual friendly bot roster, not id%3: a small team
+        # can otherwise have no attacker at all. Humans receive no assumed
+        # orders. Reserve at least one attacker even with a lone non-VIP bot.
+        teammates = sorted({p.player_id for p in frame.players
+                            if p.team == observer.team and p.is_bot and p.alive and p.spawned
+                            and (own_vip is None or p.player_id != own_vip.carrier_id)})
+        guard_count = min(max(0, len(teammates) - 1), max(1, len(teammates) // 3))
+        guarding = observer.player_id in teammates[:guard_count]
+        if retained_role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}:
+            guarding = retained_role == "vip_guard_formation"
+        if own_vip is not None and guarding:
             return ModeBotDecision(
-                guard,
+                # A live character is a grounded route anchor; inventing a
+                # ring point at its height can put an escort outside a ledge.
+                own_vip.position,
                 "vip_guard_formation",
                 sprint=True,
-                arrival_radius=2.5,
+                arrival_radius=6.0,
                 posture=ModeBotPosture.ESCORT,
                 objective_priority=0.94,
                 engagement_radius=36.0,
             )
 
         if enemy_vip is not None:
-            flank = _formation_point(enemy_vip.position, observer.player_id + 17, 6.0)
             role = "vip_sudden_death_assault" if own_vip is None else "vip_flank_attack"
             return ModeBotDecision(
-                flank,
+                enemy_vip.position,
                 role,
                 sprint=own_vip is not None,
                 arrival_radius=2.5,
@@ -665,7 +701,11 @@ class ArenaBotPolicy:
         frame: PerceptionFrame,
         observer: PlayerSnapshot,
     ) -> ModeBotDecision | None:
-        if observer.health >= 55:
+        recently_wounded = (
+            float(observer.last_damage_at) > 0.0
+            and 0.0 <= frame.created_at - observer.last_damage_at <= 8.0
+        )
+        if observer.health >= 55 or not recently_wounded:
             assault = _FALLBACK.decide(frame, observer)
             if assault is None:
                 return None
@@ -1060,9 +1100,120 @@ def objective_decision_for(
 ) -> ModeBotDecision | None:
     """Return the complete role decision for worker navigation/debugging."""
 
-    return _POLICIES.get(
+    decision = _POLICIES.get(
         _canonical_mode(frame.mode_id), _FALLBACK
     ).decide(frame, observer)
+    return _watch_approach(frame, observer, decision)
+
+
+def mode_objective_committed(decision: ModeBotDecision | None) -> bool:
+    """Mode jobs keep locomotion ownership despite optional team activity.
+
+    A numeric priority ranks urgency within a mode; it is not permission to
+    abandon that mode's capture, escort, defence, or elimination job.
+    """
+    return decision is not None and (
+        decision.directive == "mine" or decision.objective_priority >= .9
+        or decision.role.startswith(("ctf_", "classic_ctf_", "vip_", "multihill_",
+                                     "territory_", "demolition_", "diamond_",
+                                     "occupation_", "zombie_", "arena_")))
+
+
+def _watch_approach(frame: PerceptionFrame, observer: PlayerSnapshot,
+                    decision: ModeBotDecision | None) -> ModeBotDecision | None:
+    if decision is None or decision.watch_position is not None:
+        return decision
+    if decision.posture not in {ModeBotPosture.DEFEND, ModeBotPosture.ESCORT,
+                                ModeBotPosture.SURVIVE, ModeBotPosture.EVASIVE,
+                                ModeBotPosture.BUILD}:
+        return decision
+    approach = next((item for item in frame.objectives
+                     if item.kind == "team_anchor" and item.team != observer.team), None)
+    if approach is None:
+        approach = next((item for item in frame.objectives
+                         if item.kind == "vip" and item.team != observer.team), None)
+    return replace(decision, watch_position=approach.position) if approach is not None else decision
+
+
+@dataclass(slots=True)
+class _ModeCommitment:
+    signature: tuple[object, ...]
+    decision: ModeBotDecision
+    role_since: float
+    anchor_since: float
+    last_seen: float
+
+
+class ModePolicyMemory:
+    """Bounded worker-owned role/anchor hysteresis, reset at authoritative edges."""
+
+    def __init__(self) -> None:
+        self.epoch = (-1, -1)
+        self._states: dict[tuple[int, int], _ModeCommitment] = {}
+
+    def reset(self) -> None:
+        self._states.clear()
+        self.epoch = (-1, -1)
+
+    def forget(self, player_id: int, generation: int) -> None:
+        self._states.pop((int(player_id), int(generation)), None)
+
+    def decide(self, frame: PerceptionFrame,
+               observer: PlayerSnapshot) -> ModeBotDecision | None:
+        epoch = (frame.map_epoch, frame.mode_epoch)
+        if self.epoch != epoch:
+            self.reset()
+            self.epoch = epoch
+        key = (observer.player_id, observer.generation)
+        decision = objective_decision_for(frame, observer)
+        if decision is None or not mode_objective_committed(decision):
+            self._states.pop(key, None)
+            return decision
+        now = float(frame.created_at)
+        signature = (
+            _canonical_mode(frame.mode_id), frame.mode_phase,
+            observer.life_id, observer.team, observer.class_id, observer.carried_entity_id,
+            observer.last_damage_source_id if decision.role == "vip_retreat" else -1,
+            tuple((item.kind, item.team, item.carrier_id, item.state,
+                   item.position if item.carrier_id < 0 and item.kind != "vip" else None)
+                  for item in frame.objectives),
+        )
+        previous = self._states.get(key)
+        if previous is not None and (previous.signature != signature
+                                     or now < previous.last_seen):
+            previous = None
+        if previous is not None:
+            if (_canonical_mode(frame.mode_id) == "vip"
+                    and previous.decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
+                    and decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
+                    and now - previous.role_since < 8):
+                decision = _watch_approach(frame, observer, VIPBotPolicy().decide(
+                    frame, observer, retained_role=previous.decision.role))
+                assert decision is not None
+            if decision.role == previous.decision.role:
+                separation = math.dist(decision.position, previous.decision.position)
+                moving_role = ("escort" in decision.role or decision.role in {
+                    "vip_guard_formation", "vip_flank_attack", "vip_sudden_death_assault",
+                    "vip_rally", "vip_retreat", "ctf_intercept_carrier"})
+                # Small motion must not rebuild an escort route every frame.
+                # Meaningful carrier movement still moves its escort promptly.
+                hold = separation <= 3 and abs(decision.position[2] - previous.decision.position[2]) <= 1
+                if not moving_role and now - previous.anchor_since < 8:
+                    hold |= (math.dist(observer.position, decision.position) + 6 >=
+                             math.dist(observer.position, previous.decision.position))
+                if decision.role == "vip_retreat" and now - previous.anchor_since < 4:
+                    hold = True
+                if hold:
+                    decision = replace(decision, position=previous.decision.position)
+        role_since = (previous.role_since if previous is not None and
+                      previous.decision.role == decision.role else now)
+        anchor_since = (previous.anchor_since if previous is not None and
+                        previous.decision.position == decision.position else now)
+        if key not in self._states and len(self._states) >= 64:
+            oldest = min(self._states, key=lambda item: self._states[item].last_seen)
+            self._states.pop(oldest)
+        self._states[key] = _ModeCommitment(signature, decision, role_since, anchor_since, now)
+        return decision
 
 
 def mode_decision_allows_combat(
@@ -1180,7 +1331,9 @@ __all__ = [
     "ModeBotDecision",
     "ModeBotPosture",
     "ModeBotStrategy",
+    "ModePolicyMemory",
     "mode_decision_allows_combat",
+    "mode_objective_committed",
     "mode_strategy_for",
     "objective_decision_for",
     "objective_goal_for",

@@ -29,6 +29,7 @@ from server.bot_ai.simple_worker import (
     _TraversalStyle,
     _dig_profile,
     _movement_abilities,
+    _requires_traversal_entry,
     _route_step_reached,
     _same_traversal_step,
 )
@@ -61,6 +62,55 @@ def _world(solids: set[tuple[int, int, int]]) -> SimpleVoxelWorld:
     return world
 
 
+def test_failed_shore_region_keeps_water_open_and_finds_another_bank():
+    solids = {(x, y, 239) for x in range(3, 24) for y in range(8, 17)}
+    solids.update((x, 9, z) for x in range(3, 24) for z in range(234, 239))
+    world = _world(solids)
+    start = (10.5, 10.5, 236.75)
+    assert world.water_step(start) is None  # Touching the tall bank.
+    rejected = world.water_shore_edges(start)
+    assert ((10, 10, 239), (10, 9, 234)) in rejected
+    assert ((10, 10, 239), (10, 9, 239)) in rejected  # Excavation height.
+    assert ((10, 10, 239), (11, 10, 239)) not in rejected
+    alternate = world.water_step(start, blocked_edges=rejected)
+    assert alternate is not None
+    assert alternate.waypoint[1] >= 10.5
+    assert alternate.waypoint != start
+
+
+def test_water_roaming_keeps_heading_when_opposite_direction_is_longer():
+    world = _world({(x, 10, 239) for x in range(3, 13)} |
+                   {(13, 10, z) for z in range(230, 239)})
+    step = world.water_roam_step((10.5, 10.5, 236.75), heading=(1., 0., 0.),
+                                 blocked_edges=frozenset())
+    assert step is not None and step.waypoint == (12.5, 10.5, 236.75)
+
+
+def test_failed_shore_memory_expires_without_evicting_local_edge_failures():
+    local = ((1, 1, 20), (2, 1, 20))
+    shore = ((10, 10, 239), (10, 9, 234))
+    state = _BotState(1, 1, 1, blocked_edges={local: 100.},
+                      water_failed_shores=[(20., frozenset({shore}))])
+    assert SimpleBotBrain._water_exclusions(state, 19.) == frozenset({local, shore})
+    assert SimpleBotBrain._water_exclusions(state, 20.) == frozenset({local})
+    assert not state.water_failed_shores
+    assert state.blocked_edges == {local: 100.}
+
+
+def test_recovery_can_look_past_a_partial_walk_to_plan_the_needed_excavation() -> None:
+    solids = {(x, y, 20) for x in range(5, 19) for y in range(5, 16)}
+    solids.update((11, y, z) for y in range(5, 16) for z in range(14, 20))
+    world = _world(solids)
+    arguments = dict(abilities=frozenset({MovementAffordance.JUMP, MovementAffordance.BREACH}),
+                     dig_profile=navigation_dig_profile(int(C.SPADE_TOOL)))
+    start, goal = (9.5, 10.5, 17.75), (15.5, 10.5, 17.75)
+    approach = world.plan(start, goal, **arguments)
+    assert approach.steps and all(step.breach is None for step in approach.steps)
+    escape = world.plan(start, goal, _prefer_existing_path=False, **arguments)
+    assert escape.reached_segment_goal
+    assert any(step.breach is not None for step in escape.steps)
+
+
 def test_production_abilities_route_over_a_two_block_obstacle() -> None:
     # AoS z grows downward. Ground support is z=20; the two added voxels at
     # z=18/19 make the obstacle top a two-block climb at support z=18.
@@ -82,6 +132,26 @@ def test_production_abilities_route_over_a_two_block_obstacle() -> None:
         and step.waypoint == (12.5, 10.5, 15.75)
         for step in plan.steps
     )
+
+
+def test_source_ceiling_excavation_preserves_jump_landing_with_area_tool() -> None:
+    world = _world({(10, 10, 20), (10, 10, 17), (11, 10, 18)})
+    abilities = frozenset({MovementAffordance.JUMP, MovementAffordance.BREACH})
+    ordinary_edges = tuple(world._neighbors(
+        (10, 10, 20), abilities=abilities,
+        dig_profile=navigation_dig_profile(int(C.SPADE_TOOL)), allow_water=False,
+    ))
+    assert any(target == (11, 10, 18) and breach is not None
+               for target, _affordance, _cost, breach in ordinary_edges)
+    profile = navigation_dig_profile(int(C.SUPERSPADE_TOOL))
+    assert profile is not None
+    edges = tuple(world._neighbors(
+        (10, 10, 20), abilities=abilities,
+        dig_profile=profile, allow_water=False,
+    ))
+    for _target, _affordance, _cost, breach in edges:
+        if breach is not None:
+            assert (11, 10, 18) not in melee_dig_positions(breach.target_cell, profile.pattern)
 
 
 def test_blocked_two_block_jump_can_lower_ledge_with_spade() -> None:
@@ -298,7 +368,190 @@ def test_jump_waypoint_requires_vertical_landing_and_dry_shore() -> None:
     )
 
 
-def test_topology_replan_skips_reached_prefix_before_progress_comparison() -> None:
+def test_walk_waypoint_must_enter_the_destination_voxel() -> None:
+    step = RouteStep((11.5, 10.5, 17.75), MovementAffordance.WALK)
+    assert not _route_step_reached(step, (10.95, 10.5, 17.75), wading=False)
+    assert _route_step_reached(step, (11.05, 10.5, 17.75), wading=False)
+    assert _route_step_reached(
+        step, (12.1, 10.5, 17.75), wading=False,
+        previous_position=(10.9, 10.5, 17.75),
+    )
+    assert not _route_step_reached(
+        step, (10.95, 10.5, 17.75), wading=False,
+        previous_position=(10.5, 10.5, 17.75),
+    )
+
+
+@pytest.mark.parametrize("wading", (False, True))
+def test_intermediate_swim_step_enters_its_column_before_turning_around_a_bank(wading) -> None:
+    step = RouteStep((225.5, 222.32, 236.75), MovementAffordance.SWIM)
+    assert _route_step_reached(
+        step, (226.35, 222.55, 236.643), wading=wading, final_step=False,
+    ) is wading
+    assert _route_step_reached(
+        step, (225.8, 222.4, 236.643), wading=wading, final_step=False,
+    )
+
+
+@pytest.mark.parametrize("next_affordance", (MovementAffordance.DROP, MovementAffordance.JUMP))
+def test_special_traversal_cannot_skip_its_approach_column(next_affordance) -> None:
+    approach = RouteStep((144.5, 209.68, 205.75), MovementAffordance.WALK)
+    route = (approach, RouteStep((144.5, 208.5, 207.75), next_affordance))
+    # The old radius-only test advanced here and drove diagonally through
+    # the corner at (143, 208), before entering the planned (144, 209) edge.
+    assert not _route_step_reached(
+        approach, (143.869, 209.457, 205.744), wading=False,
+        require_current_cell=_requires_traversal_entry(route, 0),
+    )
+    assert _route_step_reached(
+        approach, (144.4, 209.5, 205.744), wading=False,
+        require_current_cell=_requires_traversal_entry(route, 0),
+    )
+    flat = (approach, RouteStep((145.5, 209.68, 205.75), MovementAffordance.WALK))
+    assert not _requires_traversal_entry(flat, 0)
+    # Crossing the approach between samples is insufficient if momentum has
+    # already carried the body into the next column before the jump/drop.
+    assert not _route_step_reached(
+        approach, (145.2, 209.68, 205.75), wading=False,
+        previous_position=(144.0, 209.68, 205.75),
+        require_current_cell=_requires_traversal_entry(route, 0),
+    )
+
+
+def test_water_without_a_known_shore_still_has_a_live_search_step() -> None:
+    world = _world({(x, y, 239) for x in range(8, 18) for y in range(8, 18)})
+    step = world.water_roam_step((10.5, 10.5, 236.75), heading=(1.0, 0.0, 0.0),
+                                 blocked_edges=frozenset())
+    assert step is not None and step.waypoint == (14.5, 10.5, 236.75)
+    alternate = world.water_roam_step(
+        (10.5, 10.5, 236.75), heading=(1.0, 0.0, 0.0),
+        blocked_edges=frozenset({((10, 10, 239), (11, 10, 239))}),
+    )
+    assert alternate is not None and alternate.waypoint != step.waypoint
+    exhausted = frozenset(((10, 10, 239), (10 + dx, 10 + dy, 239))
+                          for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+    assert world.water_roam_step((10.5, 10.5, 237.73), heading=(1.0, 0.0, 0.0),
+                                blocked_edges=exhausted) is not None
+
+
+def test_overlapping_wall_moves_to_borrowed_start_even_at_a_local_minimum() -> None:
+    solids = {(10, 10, 20)} | {(11, 10, z) for z in range(10, 21)}
+    world = _world(solids)
+    plan = world.plan((11.03, 10.5, 17.75), (30.5, 10.5, 17.75),
+                      abilities=frozenset({MovementAffordance.WALK}))
+    assert plan.steps
+    assert plan.steps[0].waypoint == (10.5, 10.5, 17.75)
+    assert not plan.reached_segment_goal
+
+
+def test_capsule_on_a_neighbouring_lip_centres_before_using_the_lower_floor() -> None:
+    world = _world({(10, 10, 20)})
+    start = (10.05, 10.5, 16.75)
+    plan = world.plan(start, (30.5, 10.5, 17.75),
+                      abilities=frozenset({MovementAffordance.WALK}))
+    assert plan.steps[0].waypoint == (10.5, 10.5, 17.75)
+    assert not _route_step_reached(plan.steps[0], start, wading=False)
+
+
+@pytest.mark.parametrize("escape_completed", (False, True))
+def test_failed_shore_cycle_commits_to_open_water_before_retrying_bank(escape_completed: bool) -> None:
+    from .test_bot_architecture import _player_snapshot
+
+    observer = replace(
+        _player_snapshot(1, TEAM1, (10.5, 10.5, 236.75), is_bot=True),
+        wade=True, grounded=False,
+    )
+    world = _world({(x, y, 239) for x in range(4, 18) for y in range(4, 18)})
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    brain._states[(observer.player_id, observer.generation)] = state
+    bank = RouteStep((11.5, 10.5, 235.75), MovementAffordance.JUMP)
+    frame = PerceptionFrame(
+        frame_id=1, map_epoch=1, mode_epoch=1, topology_version=0,
+        observer_id=observer.player_id, observer_generation=observer.generation,
+        created_at=100.0, mode_id="tdm", players=(observer,),
+    )
+    brain._water_intent(frame, observer, bank, 100.0, force_block_edge=True)
+    intent = brain._water_intent(replace(frame, frame_id=2), observer, bank, 100.2)
+    assert intent.debug_role == "water_search_shore"
+    assert intent.movement.direction[0] < 0.0
+    assert not intent.movement.jump
+    # A timer alone must not hand movement back before leaving the pocket.
+    continuing = brain._water_intent(replace(frame, frame_id=3), observer, bank, 104.0)
+    assert continuing.debug_role == "water_search_shore"
+    if escape_completed:
+        observer = replace(observer, position=(4.4, 10.5, 236.75))
+    # Physical completion releases early; an unproductive retreat still has
+    # a hard deadline so it cannot become a permanent patrol mode.
+    resumed = brain._water_intent(replace(frame, frame_id=4), observer, bank,
+                                  104.2 if escape_completed else 108.0)
+    assert resumed.debug_role == "water_exit"
+
+
+def test_swim_watchdog_interrupts_and_turns_an_unproductive_active_search() -> None:
+    from .test_bot_architecture import _player_snapshot
+
+    observer = replace(_player_snapshot(1, TEAM1, (10.5, 10.5, 236.75), is_bot=True),
+                       wade=True, grounded=False)
+    world = _world({(x, y, 239) for x in range(4, 18) for y in range(4, 18)})
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    brain._states[(observer.player_id, observer.generation)] = state
+    state.water_search_until = 108.
+    state.water_search_origin = observer.position
+    state.water_search_heading = (-1., 0., 0.)
+    bank = RouteStep((11.5, 10.5, 235.75), MovementAffordance.JUMP)
+    frame = PerceptionFrame(frame_id=1, map_epoch=1, mode_epoch=1, topology_version=0,
+                            observer_id=observer.player_id, observer_generation=observer.generation,
+                            created_at=104.6, mode_id="tdm", players=(observer,))
+    intent = brain._water_intent(frame, observer, bank, 104.6, force_block_edge=True)
+    assert intent.debug_role == "water_exit:cycle_blocked"
+    assert state.water_search_heading == (0., -1., 0.)
+    resumed = brain._water_intent(replace(frame, frame_id=2), observer, bank, 104.8)
+    assert resumed.debug_role == "water_search_shore"
+    assert resumed.movement.direction[1] < -0.9
+
+
+def test_failed_open_water_cycle_searches_across_the_bearing_instead_of_reversing() -> None:
+    from .test_bot_architecture import _player_snapshot
+
+    observer = replace(_player_snapshot(1, TEAM1, (10.5, 10.5, 236.75), is_bot=True),
+                       wade=True, grounded=False)
+    world = _world({(x, y, 239) for x in range(4, 18) for y in range(4, 18)})
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    brain._states[(observer.player_id, observer.generation)] = state
+    step = RouteStep((14.5, 10.5, 236.75), MovementAffordance.SWIM)
+    frame = PerceptionFrame(frame_id=1, map_epoch=1, mode_epoch=1, topology_version=0,
+                            observer_id=observer.player_id, observer_generation=observer.generation,
+                            created_at=100., mode_id="tdm", players=(observer,))
+    brain._water_intent(frame, observer, step, 100., force_block_edge=True)
+    intent = brain._water_intent(replace(frame, frame_id=2), observer, step, 100.2)
+    assert intent.debug_role == "water_search_shore"
+    assert abs(intent.movement.direction[0]) < 0.01
+    assert abs(intent.movement.direction[1]) > 0.99
+
+
+@pytest.mark.parametrize("open_water_column", (True, False))
+def test_live_swim_probe_ignores_waterbed_contact_but_rejects_a_solid_bank(
+    open_water_column: bool,
+) -> None:
+    player = SimpleNamespace(z=238.645, wade=True)
+    world = SimpleNamespace(
+        is_water_column=lambda x, y: open_water_column,
+        clipbox=lambda x, y, z: z >= 239.0,
+    )
+    assert BotDirector._probe_surface_is_live(
+        world, player, 301.2, 227.2, MovementAffordance.SWIM,
+    )
+    world.clipbox = lambda x, y, z: z >= 237.0
+    assert not BotDirector._probe_surface_is_live(
+        world, player, 301.2, 227.2, MovementAffordance.SWIM,
+    )
+
+
+@pytest.mark.parametrize("jump", (False, True))
+def test_topology_replan_skips_reached_prefix_before_progress_comparison(jump: bool) -> None:
     observer = PlayerSnapshot(
         player_id=1,
         generation=1,
@@ -321,7 +574,8 @@ def test_topology_replan_skips_reached_prefix_before_progress_comparison() -> No
     )
     actionable = RouteStep(
         (11.5, 10.5, 17.75),
-        MovementAffordance.WALK,
+        MovementAffordance.JUMP if jump else MovementAffordance.WALK,
+        entry_edge=((9, 10, 20), (11, 10, 20)) if jump else None,
     )
     world = SimpleNamespace(
         plan=lambda *_args, **_kwargs: RoutePlan(
@@ -330,7 +584,7 @@ def test_topology_replan_skips_reached_prefix_before_progress_comparison() -> No
                     observer.position,
                     MovementAffordance.WALK,
                 ),
-                actionable,
+                replace(actionable, entry_edge=((10, 10, 20), (11, 10, 20))) if jump else actionable,
             ),
             True,
             2,
@@ -376,6 +630,7 @@ def test_topology_replan_skips_reached_prefix_before_progress_comparison() -> No
     assert intent.debug_role == "topology_prefix"
     assert state.route_index == 1
     assert state.waypoint_progress_at == 90.0
+    assert state.route[state.route_index].entry_edge == actionable.entry_edge
 
 
 def test_goal_switch_retains_bounded_directed_blocked_edges() -> None:
@@ -534,6 +789,20 @@ def test_goal_directed_water_recovery_keeps_crossing_opposite_bank() -> None:
     assert step is not None
     assert step.affordance is MovementAffordance.SWIM
     assert step.waypoint == (14.5, 10.5, 236.75)
+    assert step.entry_edge == ((10, 10, 239), (11, 10, 239))
+
+    brain = SimpleBotBrain(world)
+    state = _BotState(map_epoch=0, mode_epoch=0, life_id=0)
+    brain._block_water_step(state, (10.5, 10.5, 236.75), step, 10.0)
+    assert ((10, 10, 239), (11, 10, 239)) in state.blocked_edges
+    assert ((10, 10, 239), (14, 10, 239)) not in state.blocked_edges
+    alternative = world.water_step(
+        (10.5, 10.5, 236.75),
+        preferred_goal=(20.5, 10.5, 235.75),
+        blocked_edges=frozenset(state.blocked_edges),
+    )
+    assert alternative is not None
+    assert alternative.waypoint == (9.5, 10.5, 235.75)
 
 
 def test_blocked_goal_facing_bank_falls_back_to_another_live_shore() -> None:
@@ -615,6 +884,18 @@ def test_water_surface_wins_over_an_overhead_platform_support() -> None:
 
     assert surface is not None
     assert surface.support_z == 239
+
+
+@pytest.mark.parametrize("position", ((11.5, 10.5, 15.75), (12.1, 10.5, 16.5)))
+def test_failed_airborne_jump_keeps_its_original_takeoff_edge(position) -> None:
+    world = _world({(10, 10, 20), (12, 10, 20)})
+    plan = world.plan((10.5, 10.5, 17.75), (12.5, 10.5, 17.75),
+                      abilities=frozenset({MovementAffordance.JUMP}))
+    edge = ((10, 10, 20), (12, 10, 20))
+    assert plan.steps[0].entry_edge == edge
+    state = _BotState(map_epoch=1, mode_epoch=1, life_id=0, route=plan.steps)
+    SimpleBotBrain(world)._invalidate_current_edge(state, position, now=10.0)
+    assert state.blocked_edges == {edge: 22.0}
 
 
 def test_failed_two_cell_gap_jump_records_the_concrete_landing_edge() -> None:
@@ -729,14 +1010,28 @@ def test_zombie_hand_can_carve_a_waterline_exit_through_a_high_bank() -> None:
     assert step.affordance is MovementAffordance.BREACH
     assert step.breach is not None
     assert step.breach.blocking_cells == (
+        (11, 10, 235),
+        (11, 10, 236),
         (11, 10, 237),
-        (11, 10, 238),
     )
-    assert step.breach.target_cell == (11, 10, 237)
-    assert (11, 10, 239) not in melee_dig_positions(
+    assert step.breach.target_cell == (11, 10, 236)
+    assert step.breach.source == (10, 10, 239)
+    assert step.breach.destination == (11, 10, 238)
+    assert (11, 10, 238) not in melee_dig_positions(
         step.breach.target_cell,
         profile.pattern,
     )
+
+
+def test_rejected_waterline_breach_cannot_reenter_through_the_banks_upper_floor() -> None:
+    world = _world({(10, 10, 239)} | {(11, 10, z) for z in range(230, 240)})
+    profile = _dig_profile(SimpleNamespace(loadout=(int(C.ZOMBIEHAND_TOOL),)))
+    position = (10.5, 10.5, 236.75)
+    step = world.water_bank_breach(position, profile)
+    assert step is not None and step.breach is not None
+    rejected = frozenset({(step.breach.source, step.breach.destination)})
+    # The same bank has an upper-floor edge at z=230 and a dry dig ledge at z=238.
+    assert world.water_bank_breach(position, profile, blocked_edges=rejected) is None
 
 
 def test_spade_never_targets_air_above_a_one_block_water_lip() -> None:
@@ -1003,7 +1298,7 @@ def test_production_zombie_brain_digs_an_unclimbable_water_bank() -> None:
     assert intent.movement.jump is False
     assert intent.action.kind is BotActionKind.MELEE
     assert intent.action.tool_id == int(C.ZOMBIEHAND_TOOL)
-    assert intent.action.position == (11.5, 10.5, 237.5)
+    assert intent.action.position == (11.5, 10.5, 236.5)
 
 
 def test_swimmer_can_build_a_supported_step_on_the_waterbed() -> None:
@@ -1030,6 +1325,24 @@ def test_bridge_builder_extends_a_dry_shore_over_water() -> None:
     )
 
     assert line == ((11, 10, 238), (16, 10, 238))
+
+
+def test_bridge_requires_a_reachable_landing_within_remaining_inventory() -> None:
+    world = _world({(10, 10, 20), (18, 10, 20)})
+    assert world.water_bridge_line((10.5, 10.5, 17.75), (1.0, 0.0, 0.0),
+                                  require_landing_within=7) is None
+    assert world.water_bridge_line((10.5, 10.5, 17.75), (1.0, 0.0, 0.0),
+                                  require_landing_within=8) == ((11, 10, 20), (16, 10, 20))
+    world._vxl.solids.add((14, 10, 17))
+    assert world.water_bridge_line((10.5, 10.5, 17.75), (1.0, 0.0, 0.0),
+                                  require_landing_within=8) is None
+
+
+def test_builder_can_close_the_final_single_cell_in_a_bridge() -> None:
+    world = _world({(10, 10, 20), (12, 10, 20)})
+    assert world.water_bridge_line((10.5, 10.5, 17.75), (1.0, 0.0, 0.0),
+                                  max_cells=1, require_landing_within=2) == (
+                                      (11, 10, 20), (11, 10, 20))
 
 
 def test_bridge_widener_follows_the_native_body_overhang() -> None:

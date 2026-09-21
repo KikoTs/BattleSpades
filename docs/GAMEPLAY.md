@@ -5,6 +5,11 @@ server owns health, ammo, inventory, movement, voxel mutations, entities,
 objectives, deaths, scores, and round transitions. Retail clients must see the
 same class, held tool, feature switches, and terrain that the server validates.
 
+Use `modes/`, `server/game_rules.py`, `server/game_constants.py` and their
+focused tests to resolve implementation questions. This guide describes source
+behavior; an older frozen release may predate local changes. Validation and
+packaging are covered in [RUNBOOK.md](RUNBOOK.md).
+
 ## Match Lobby modes
 
 The ten public rows were recovered from the shipped Match Lobby. `mode_id`,
@@ -19,15 +24,14 @@ sent for every registered mode.
 | `zom` | Zombie/Infection | 10 min | playable |
 | `vip` | VIP | 15 min | playable |
 | `mh` | Multi-Hill | 25 min | rotating shared hills, control score, airstrikes |
-| `tc` | Territory Control | 25 min | scene-safe skeleton |
-| `dia` | Diamond Mine | 15 min | scene-safe skeleton |
+| `tc` | Territory Control | 25 min | territory ownership, capture and control scoring |
+| `dia` | Diamond Mine | 15 min | diamond discovery, carrying and cash-in objectives |
 | `dem` | Demolition | 15 min | build phase, destructible/repairable team bases |
-| `oc` | Occupation | 15 min | scene-safe skeleton |
+| `oc` | Occupation | 15 min | bomb possession, scoring and detonation lifecycle |
 
 `arena` is a BattleSpades extension and is not one of the retail hosting rows.
-Skeleton means the client enters its correct scene, shared lifecycle/resources
-and all recovered settings are valid, but its objective entities and scoring
-state machine are intentionally not claimed as complete.
+The objective modes have implemented state machines and focused tests. Complete
+retail/native match acceptance is still required before claiming exact parity.
 
 ## Official playlist map lists
 
@@ -85,6 +89,16 @@ receive reason 18 without being sent new-scene packets.
 
 ## Classes, equipment, and construction
 
+Movement profiles use every class's own recovered table entry, including
+acceleration, crouch/sneak speed, water friction, uphill sprint permission,
+and fall thresholds. Fast/Jump Zombie, Specialist, and Medic no longer inherit
+partial Soldier/Zombie profiles. Classic Soldier and Jump Zombie cannot sprint
+uphill, matching the client tables. These values are checked against a fixture
+extracted from the original Python constants and verified against its Python 2
+bytecode.
+Disabling water fall damage also passes a zero water-damage multiplier to the
+native mover, matching the client's class constructor and its landing result.
+
 Class/loadout selection is transactional. `ChangeClass(78)` and
 `SetClassLoadout(13)` can arrive in either order, but one normalized selection
 is committed only at a life boundary. Disabled/cross-class tools cannot survive
@@ -106,13 +120,15 @@ assets are referenced by stock names; custom maps receive full map sync.
 Bots are ordinary server-owned `Player` objects. They use the same spawn,
 class, inventory, movement, combat, terrain, entity, damage, score, death, and
 replication paths as humans. The 60 Hz motor stays on the authoritative thread;
-perception, behavior selection, and voxel navigation run in a supervised child
-process with versioned, expiring messages and bounded queues.
+perception, behavior selection, and voxel navigation run in a supervised thread
+by default, or a child process with `bots.worker = "process"`. Both backends use
+the same direct voxel planner with versioned, expiring messages.
 
-The navigation stack combines tiled Recast/Detour ground routes with dynamic
-voxel affordances: walk, crouch, jump, drop, jetpack/glide, breach, build step,
-bridge, and prefab. Live terrain changes increment topology versions; stale
-results cannot authorize traversal through a new block. Water/edge penalties,
+The navigation stack combines bounded local voxel search, incremental surface
+guidance, and a semantic navigation atlas. Walk, jump, drop, short fuel-gated
+flight, digging, and construction are checked against live terrain and normal
+inventory rules. Fresh intents may survive unrelated terrain edits, but cannot
+authorize traversal through a new block. Water/edge penalties,
 pickup deadlines, progress watchdogs, danger interrupts, ammo/health recovery,
 mode objectives, and close-threat priority prevent long-lived idle goals.
 
@@ -121,5 +137,7 @@ memory, approximate sound stimuli, reaction time, bounded turn acceleration,
 and correlated aim error. A bot cannot fire at an occluded exact position or
 bypass a disabled tool, empty magazine, class rule, or objective lock.
 
-Operational limits and validation commands are in `RUNBOOK.md`; configuration
-and `/bots` controls are in `ADMIN_GUIDE.md`.
+The detailed navigation contract and its limits are in
+[BOT_NAVIGATION.md](BOT_NAVIGATION.md). Operational validation commands are in
+[RUNBOOK.md](RUNBOOK.md); configuration and `/bots` controls are in
+[ADMIN_GUIDE.md](ADMIN_GUIDE.md).

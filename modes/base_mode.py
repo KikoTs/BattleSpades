@@ -38,6 +38,9 @@ class BaseMode(ABC):
         # Round timing
         self.start_time: float = 0.0
         self.elapsed_time: float = 0.0
+        # Fixed remainder of accepted events at the first timeout check.
+        # Later arrivals must not extend the deadline or change its winner.
+        self._timeout_events_remaining: int | None = None
         # Timeout music fires exactly once, TIMEOUT_MUSIC_SECONDS before the end.
         self._timeout_music_played = False
         # Gameplay music bed is re-sent on a cadence so a finite track never
@@ -64,6 +67,10 @@ class BaseMode(ABC):
         self._end_sequence_running = False
         self.start_time = time.time()
         self.elapsed_time = 0.0
+        self._timeout_events_remaining = None
+
+        from server.scoreboard import reset_round_scores
+        reset_round_scores(self.server)
 
         # Kick off the in-game music bed so the round is never silent.
         from server.audio import play_gameplay_music
@@ -147,9 +154,18 @@ class BaseMode(ABC):
                 if callable(ensure_vote):
                     ensure_vote(now)
 
-        # Check time limit
+        # A bounded drain may split an accepted death/kill pair across ticks.
+        # Capture its fixed remainder once: waiting for the entire live queue
+        # to become empty would let a steady stream of late events extend the
+        # round indefinitely. SimulationRuntime drains this snapshot within
+        # the normal budget before delivering any newer mode events.
         if self.time_limit > 0 and self.elapsed_time >= self.time_limit:
-            await self._end_by_time()
+            if self._timeout_events_remaining is None:
+                self._timeout_events_remaining = len(getattr(self.server, "_mode_events", ()))
+            if self._timeout_events_remaining == 0:
+                await self._end_by_time()
+        else:
+            self._timeout_events_remaining = None
     
     async def on_round_start(self):
         """Called when a new round starts."""
@@ -467,6 +483,10 @@ class BaseMode(ABC):
         reset teams (aosmodes/__init__.py reset())."""
         # GameScene remains alive. Remove its old transient entities before the
         # mode re-creates crates/objectives and reuses registry ids.
+        bots = getattr(self.server, "bots", None)
+        prepare_bots = getattr(bots, "prepare_for_game_transition", None)
+        if callable(prepare_bots):
+            await prepare_bots()
         reset_runtime = getattr(self.server, "reset_round_runtime", None)
         if reset_runtime is not None:
             reset_runtime()
@@ -499,4 +519,6 @@ class BaseMode(ABC):
         bots = getattr(self.server, "bots", None)
         reset_bots = getattr(bots, "reset_after_round_restart", None)
         if callable(reset_bots):
-            reset_bots()
+            result = reset_bots()
+            if result is not None:
+                await result

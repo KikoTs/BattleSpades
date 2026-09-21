@@ -29,7 +29,7 @@ _WORLD_UPDATE_PLAYER_ROW_SIZE = 56
 _WORLD_UPDATE_PLAYER_TOOL_OFFSET = 48
 _WORLD_UPDATE_TRAILER_MIN_SIZE = 4  # entity count + turret count
 # Fire, aim/display, and deployed-state bits must not be paired with a rejected
-# tool. Jetpack (0x04) and on-fire (0x20) are independent display state.
+# tool. Flight active/passive (0x04/0x08) and fire (0x20) are independent state.
 _WORLD_UPDATE_WEAPON_ACTION_MASK = 0x01 | 0x02 | 0x10 | 0x40 | 0x80
 
 
@@ -46,9 +46,6 @@ class ReplicationService:
         self._last_broadcast_bucket: Optional[int] = None
         self._last_self_row_loop: dict[int, int] = {}
         self._last_advertised_jetpack_active: dict[int, bool] = {}
-        self._jetpack_owner_handoff_deadline: dict[int, int] = {}
-        self._jetpack_owner_handoff_target: dict[int, bool] = {}
-        self._jetpack_owner_release_settle_deadline: dict[int, int] = {}
 
     def forget_player(self, player_id: int) -> None:
         """Discard recipient state at disconnect or a new-life boundary.
@@ -62,9 +59,6 @@ class ReplicationService:
         player_id = int(player_id)
         self._last_self_row_loop.pop(player_id, None)
         self._last_advertised_jetpack_active.pop(player_id, None)
-        self._jetpack_owner_handoff_deadline.pop(player_id, None)
-        self._jetpack_owner_handoff_target.pop(player_id, None)
-        self._jetpack_owner_release_settle_deadline.pop(player_id, None)
 
     def broadcast_world_updates(self) -> None:
         """Send one grouped snapshot at the configured retail cadence."""
@@ -141,8 +135,7 @@ class ReplicationService:
                 and (
                     player.id in urgent_player_ids
                     or (
-                        not self._jetpack_owner_handoff_active(player)
-                        and self._should_send_self_row(
+                        self._should_send_self_row(
                             player.id,
                             max(
                                 self_row_interval,
@@ -310,62 +303,8 @@ class ReplicationService:
                 player.id, False
             )
             if active != advertised:
-                if (
-                    advertised
-                    and not active
-                    and self._defer_jetpack_release_transition(player)
-                ):
-                    # Key-up and fuel exhaustion already stop local thrust.
-                    # Sending the inactive row in mid-air only adds a position
-                    # correction; wait until the owner is settled while every
-                    # observer continues receiving authoritative false state.
-                    continue
                 urgent.append(connection)
         return urgent
-
-    def _defer_jetpack_release_transition(self, player) -> bool:
-        """Hold the owner's inactive action row until grounded and released.
-
-        Retail stops local thrust from physical SPACE key-up or zero fuel even
-        while its last WorldUpdate action bit remains active. Position and
-        velocity in that same row are inseparable from the bit. During fast
-        Jump Pack flight an integer server/client phase differs by either
-        0.63 or 4.9 blocks at exhaustion, so transmitting the row there causes
-        the reported ADJUST/SNAP. Observers are unaffected because their rows
-        are never suppressed.
-        """
-        input_state = getattr(player, "input", None)
-        if input_state is None:
-            # Lightweight tests and non-retail facades have no physical-input
-            # witness; preserve their immediate transition behavior.
-            return False
-
-        player_id = int(player.id)
-        jetpack_id = int(getattr(player, "jetpack_id", 0))
-        activation_held = bool(
-            getattr(input_state, "hover", False)
-            if jetpack_id == 69
-            else getattr(input_state, "jump", False)
-        )
-        if activation_held or bool(getattr(player, "airborne", False)):
-            self._jetpack_owner_release_settle_deadline.pop(player_id, None)
-            return True
-
-        received = int(getattr(player, "_input_receive_sequence", 0))
-        settle_deadline = self._jetpack_owner_release_settle_deadline.get(
-            player_id
-        )
-        if settle_deadline is None:
-            settle_frames = max(1, min(120, int(getattr(
-                getattr(self.server, "config", None),
-                "jetpack_owner_handoff_input_frames",
-                30,
-            ))))
-            settle_deadline = received + settle_frames
-            self._jetpack_owner_release_settle_deadline[player_id] = (
-                settle_deadline
-            )
-        return received < settle_deadline
 
     def _send_urgent_owner_rows(self, connections: list) -> None:
         """Send transition-only owner snapshots between 30 Hz cadence rows."""
@@ -389,8 +328,8 @@ class ReplicationService:
             # Unlike ordinary 30 Hz snapshots, this rare state transition is
             # reliable so packet loss cannot leave effects/flight stuck until
             # a later cadence row. Physics phase remains an estimate; ENet
-            # delivery is not a GameScene application ACK, so the bounded
-            # owner-row handoff below protects the asynchronous interval.
+            # delivery is not a GameScene application ACK. Ordinary snapshots
+            # continue at the configured cadence for deterministic prediction.
             connection.send(data, reliable=True)
             self._flush_transition_delivery(connection)
             self._record_owner_row(player, int(stamp), transition=True)
@@ -430,10 +369,9 @@ class ReplicationService:
         )
         snapshot = getattr(player, "world_update_snapshot", None)
         if callable(snapshot):
-            # Retail Character caches the local row as network_position and
-            # restores that exact XYZ on jump_this_frame after native physics.
-            # Update only after Connection.send queued this owner packet; a
-            # merely built or excluded snapshot was never visible to retail.
+            # Retain the actual queued owner rows for protocol diagnostics.
+            # Authoritative movement never rewinds to this output history.
+            # A built or excluded snapshot was not queued to the owner.
             row = snapshot()
             position = tuple(row[0])
             velocity = (
@@ -454,7 +392,6 @@ class ReplicationService:
                 # doubles which do not implement the Player facade method.
                 player.last_advertised_owner_position = position
         if transition:
-            self._begin_jetpack_owner_handoff(player)
             note_transition = getattr(
                 player, "note_jetpack_transition_sent", None
             )
@@ -463,136 +400,6 @@ class ReplicationService:
                     bool(getattr(player, "jetpack_active", False)),
                     int(stamp),
                 )
-
-    def _begin_jetpack_owner_handoff(self, player) -> None:
-        """Start a bounded no-correction window after a jetpack state row.
-
-        The reliable WorldUpdate is queued before this method runs, but neither
-        ENet delivery nor subsequent ClientData proves that retail GameScene
-        has applied it.  During the short window, this owner's ordinary row is
-        excluded so an old prediction phase cannot pull the camera backward.
-        The same authoritative player row continues to reach every observer.
-        """
-        config = getattr(self.server, "config", None)
-        target_active = bool(getattr(player, "jetpack_active", False))
-        if target_active:
-            frames = max(0, min(120, int(getattr(
-                config,
-                "jetpack_owner_handoff_input_frames",
-                30,
-            ))))
-        else:
-            frames = max(0, min(1200, int(getattr(
-                config,
-                "jetpack_owner_release_handoff_input_frames",
-                600,
-            ))))
-        player_id = int(player.id)
-        if frames == 0:
-            self._jetpack_owner_handoff_deadline.pop(player_id, None)
-            self._jetpack_owner_handoff_target.pop(player_id, None)
-            self._jetpack_owner_release_settle_deadline.pop(player_id, None)
-            return
-        received = int(getattr(player, "_input_receive_sequence", 0))
-        self._jetpack_owner_handoff_deadline[player_id] = received + frames
-        self._jetpack_owner_handoff_target[player_id] = target_active
-        self._jetpack_owner_release_settle_deadline.pop(player_id, None)
-
-    def _jetpack_owner_handoff_active(self, player) -> bool:
-        """Return whether ordinary local position rows remain suppressed.
-
-        Progress is measured in accepted ClientData frames instead of wall
-        time, so a stalled client cannot make the server guess that GameScene
-        advanced.  The transition gets a quiet handoff window, then an active
-        flight receives one bounded checkpoint per window.  Suppressing every
-        owner row for an entire Glide Jetpack burn lets independent native
-        frame clocks accumulate several blocks of error and turns the eventual
-        release row into a retail hard SNAP.  Periodic causal checkpoints keep
-        that error in the soft-adjust range while observers continue receiving
-        the authoritative row at normal cadence.  Release uses the bounded
-        settle/deadline path below, and lifecycle cleanup removes reused ids.
-        """
-        player_id = int(player.id)
-        deadline = self._jetpack_owner_handoff_deadline.get(player_id)
-        if deadline is None:
-            return False
-        target_active = self._jetpack_owner_handoff_target.get(player_id)
-        received = int(getattr(player, "_input_receive_sequence", 0))
-        if target_active is True and bool(
-            getattr(player, "jetpack_active", False)
-        ):
-            if received < deadline:
-                return True
-            # Permit exactly one ordinary owner row at this accepted-input
-            # boundary, then start the next quiet window.  Do not clear the
-            # active target: a repeated call at the same input must suppress
-            # rather than duplicate the checkpoint.
-            checkpoint_frames = max(1, min(120, int(getattr(
-                getattr(self.server, "config", None),
-                "jetpack_owner_handoff_input_frames",
-                30,
-            ))))
-            self._jetpack_owner_handoff_deadline[player_id] = (
-                received + checkpoint_frames
-            )
-            return False
-        if (
-            target_active is True
-            and not bool(getattr(player, "jetpack_active", False))
-            and self._defer_jetpack_release_transition(player)
-        ):
-            return True
-        if received >= deadline:
-            self._clear_jetpack_owner_handoff(player_id)
-            return False
-        if target_active is False:
-            input_state = getattr(player, "input", None)
-            if input_state is not None:
-                jetpack_id = int(getattr(player, "jetpack_id", 0))
-                activation_held = bool(
-                    getattr(input_state, "hover", False)
-                    if jetpack_id == 69
-                    else getattr(input_state, "jump", False)
-                )
-                if activation_held:
-                    # Fuel exhaustion while SPACE remains held can make the
-                    # two native worlds touch ground and relaunch on different
-                    # frames. A server-side ground contact is therefore not a
-                    # safe owner-row release witness.
-                    self._jetpack_owner_release_settle_deadline.pop(
-                        player_id, None
-                    )
-                    return True
-                settle_deadline = (
-                    self._jetpack_owner_release_settle_deadline.get(player_id)
-                )
-                if settle_deadline is None:
-                    settle_frames = max(1, min(120, int(getattr(
-                        getattr(self.server, "config", None),
-                        "jetpack_owner_handoff_input_frames",
-                        30,
-                    ))))
-                    settle_deadline = received + settle_frames
-                    self._jetpack_owner_release_settle_deadline[player_id] = (
-                        settle_deadline
-                    )
-                if (
-                    received < settle_deadline
-                    or bool(getattr(player, "airborne", False))
-                ):
-                    return True
-                self._clear_jetpack_owner_handoff(player_id)
-                return False
-        if received < deadline:
-            return True
-        self._clear_jetpack_owner_handoff(player_id)
-        return False
-
-    def _clear_jetpack_owner_handoff(self, player_id: int) -> None:
-        """Remove all bounded handoff state for one connected owner."""
-        self._jetpack_owner_handoff_deadline.pop(player_id, None)
-        self._jetpack_owner_handoff_target.pop(player_id, None)
-        self._jetpack_owner_release_settle_deadline.pop(player_id, None)
 
     def _should_send_self_row(self, player_id: int, interval: int) -> bool:
         """Return whether the local correction anchor needs a refresh now."""

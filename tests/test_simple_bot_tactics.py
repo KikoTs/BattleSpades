@@ -8,6 +8,7 @@ import random
 from types import SimpleNamespace
 
 import shared.constants as C
+import pytest
 
 from server.bot_ai.director import _choose_bot_loadout
 from server.bot_ai.gateway import BotActionGateway
@@ -23,6 +24,7 @@ from server.bot_ai.messages import (
     PlayerSnapshot,
 )
 from server.bot_ai.simple_navigation import BreachPlan, RoutePlan, RouteStep
+from server.bot_ai.policies import ModeBotDecision
 from server.bot_ai.simple_worker import SimpleBotBrain, _BotState, _Goal
 from server.class_selection import normalize_class_selection
 from server.game_constants import TEAM1, TEAM2
@@ -176,6 +178,49 @@ def _frame(
     )
 
 
+def test_assault_search_starts_after_arrival_and_keeps_a_stable_destination() -> None:
+    observer = _player(1, TEAM1, (10.0, 10.0, 20.0), is_bot=True)
+    brain = SimpleBotBrain(_TacticalWorld())
+    state = _BotState(1, 1, observer.life_id)
+    decision = ModeBotDecision(observer.position, "team_assault_enemy_side")
+    initial = brain._assault_search_goal(observer, state, decision, 100.0)
+    assert initial.position == observer.position
+    held = brain._assault_search_goal(observer, state, decision, 102.0)
+    assert held.position == initial.position
+    search = brain._assault_search_goal(observer, state, decision, 103.0)
+    assert search.role == "team_assault_search"
+    assert math.dist(search.position, initial.position) > 10.0
+    moving = brain._assault_search_goal(observer, state, decision, 120.0)
+    assert moving == search
+
+
+def test_goal_under_another_floor_is_not_reported_as_arrived() -> None:
+    observer = _player(1, TEAM1, (10.0, 10.0, 20.0), is_bot=True)
+    world = _TacticalWorld(route_step=RouteStep((15.0, 10.0, 20.0), MovementAffordance.WALK))
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    goal = _Goal(("upper_floor",), (10.0, 10.0, 10.0), "objective", 3.0, True)
+    intent = brain._navigation_intent(_frame(observer), observer, state, goal, 100.0)
+    assert not intent.debug_role.endswith(":arrived")
+    assert intent.movement.direction[0] > 0
+
+
+def test_detour_is_not_blacklisted_for_moving_away_from_final_goal() -> None:
+    observer = _player(1, TEAM1, (10.0, 10.0, 20.0), is_bot=True)
+    world = _TacticalWorld()
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    goal = _Goal(("detour",), (100.0, 10.0, 20.0), "objective", 3.0, True)
+    brain._set_goal(state, goal, observer.position, 90.0)
+    state.route = (RouteStep((2.0, 10.0, 20.0), MovementAffordance.WALK),)
+    state.route_topology_version = 1
+    state.waypoint_progress_at = 100.0
+    intent = brain._navigation_intent(_frame(observer), observer, state, goal, 100.0)
+    assert intent.movement.direction[0] < 0
+    assert not state.blocked_edges
+    assert not world.plan_calls
+
+
 def test_stale_weapon_never_requests_fire_with_an_unowned_tool() -> None:
     smg = int(C.SMG_TOOL)
     turret = int(C.ROCKET_TURRET_TOOL)
@@ -282,6 +327,49 @@ def test_open_water_swim_moves_straight_without_holding_jump() -> None:
     assert intent.movement.jump is False
 
 
+def test_missing_shore_route_searches_open_water_instead_of_freezing() -> None:
+    world = _TacticalWorld(water_step=None)
+    world.water_roam_step = lambda *args, **kwargs: RouteStep(
+        (14.5, 10.5, 236.75), MovementAffordance.SWIM)
+    observer = _player(1, TEAM1, (10.5, 10.5, 236.75),
+                       is_bot=True, grounded=False, wade=True)
+    intent = SimpleBotBrain(world).decide(_frame(observer))
+    assert intent is not None and intent.debug_role == "water_search_shore"
+    assert intent.movement.direction[0] > 0.9
+    assert not intent.movement.jump
+
+
+def test_brief_dry_foothold_does_not_erase_a_failed_bank() -> None:
+    observer = _player(1, TEAM1, (10.5, 10.5, 20.), is_bot=True)
+    brain = SimpleBotBrain(_TacticalWorld())
+    brain.reset_for_map(1)
+    shore = ((10, 10, 239), (10, 9, 234))
+    state = _BotState(1, 1, observer.life_id, water_committed=True,
+                      water_failed_shores=[(120., frozenset({shore}))],
+                      water_last_bank=(100., (10.5, 9.5, 231.75)))
+    brain._states[(observer.player_id, observer.generation)] = state
+    brain.decide(_frame(observer, created_at=101.))
+    assert not state.water_committed
+    assert shore in brain._water_exclusions(state, 102.)
+    assert shore not in brain._water_exclusions(state, 120.)
+
+
+def test_optional_squad_formation_in_water_yields_to_a_concrete_shore() -> None:
+    observer = _player(9, TEAM1, (10.5, 10.5, 236.75), is_bot=True,
+                       wade=True, grounded=False)
+    shore = RouteStep((14.5, 10.5, 236.75), MovementAffordance.SWIM)
+    brain = SimpleBotBrain(_TacticalWorld(water_step=shore))
+    brain.reset_for_map(1)
+    state = _BotState(1, 1, observer.life_id,
+                      goal=_Goal(("objective", "tdm_squad_support"),
+                                 (10.5, 30.5, 236.75), "tdm_squad_support", 3., True))
+    brain._states[(observer.player_id, observer.generation)] = state
+    intent = brain.decide(_frame(observer))
+    assert state.water_recovery
+    assert intent.debug_role == "water_exit" and intent.debug_goal == shore.waypoint
+    assert intent.priority is BotIntentPriority.SURVIVAL
+
+
 def test_bridge_personality_builds_a_block_line_instead_of_swimming() -> None:
     water_step = RouteStep(
         (11.5, 10.5, 236.75),
@@ -335,6 +423,19 @@ def test_bridge_personality_builds_a_block_line_instead_of_swimming() -> None:
     assert intent.action.position == (11.0, 10.0, 20.0)
     assert intent.action.end_position == (16.0, 10.0, 20.0)
     assert intent.movement.jump is False
+
+
+def test_rejected_bridge_line_yields_to_navigation_until_retry_window() -> None:
+    observer = replace(_player(5, TEAM1, (10.5, 10.5, 17.75), is_bot=True,
+                               loadout=(int(C.BLOCK_TOOL), int(C.SPADE_TOOL))),
+                       last_action_kind="build_line", last_action_accepted=False,
+                       last_action_position=(11.0, 10.0, 20.0), last_action_at=99.0)
+    brain = SimpleBotBrain(_TacticalWorld(bridge_line=((11, 10, 20), (16, 10, 20))))
+    state = _BotState(1, 1, observer.life_id)
+    goal = _Goal(("bridge",), (30.5, 10.5, 17.75), "crossing", 1.0, True)
+    assert brain._water_bridge_intent(_frame(observer), observer, state, goal, 100.0) is None
+    retry = brain._water_bridge_intent(_frame(observer), observer, state, goal, 110.0)
+    assert retry is not None and retry.action.kind is BotActionKind.BUILD_LINE
 
 
 def test_combat_pursuit_preserves_swim_without_promoting_it_to_jump() -> None:
@@ -491,6 +592,38 @@ def test_diamond_mode_directive_performs_real_surface_mining() -> None:
     assert intent.action.position is not None
 
 
+@pytest.mark.parametrize("previous_role", ("diamond_guard_dropoff", "combat_pursuit"))
+def test_unreachable_diamond_guard_mines_then_retries_without_abandoning_carried_loot(previous_role: str) -> None:
+    observer = _player(8, TEAM1, (10., 10., 20.), is_bot=True)
+    dropoff = ObjectiveSnapshot("dia_dropoff", int(C.TEAM_NEUTRAL), (80., 90., 20.), state=1)
+    frame = replace(_frame(observer, objectives=(dropoff,)), mode_id="dia")
+    world = _TacticalWorld()
+    world.solid = lambda *_args: True
+    brain = SimpleBotBrain(world)
+    brain.reset_for_map(1)
+    state = _BotState(1, 1, observer.life_id,
+                      goal=_Goal(("objective", previous_role),
+                                 dropoff.position, previous_role, 3., False),
+                      goal_progress_at=99., guard_target=dropoff.position,
+                      guard_best_distance=0., guard_progress_at=80.)
+    brain._states[(observer.player_id, observer.generation)] = state
+    mining = brain.decide(frame)
+    assert mining.debug_role == "diamond_mine_blocks"
+    assert mining.action.kind is BotActionKind.MELEE
+    deadline = state.guard_retry_at
+    assert deadline > 100. and state.goal is None
+    brain.decide(replace(frame, frame_id=2, created_at=110.))
+    assert state.guard_retry_at == deadline
+    # Carrying a diamond takes priority even during reassignment.
+    carrier = replace(observer, carried_entity_id=int(C.DIAMOND_PICKUP))
+    brain.decide(replace(frame, frame_id=3, created_at=120., players=(carrier,)))
+    state = brain._states[(observer.player_id, observer.generation)]
+    assert state.goal is not None and state.goal.role == "diamond_cash_in"
+    brain.decide(replace(frame, frame_id=4, created_at=deadline + 1.))
+    state = brain._states[(observer.player_id, observer.generation)]
+    assert state.goal is not None and state.goal.role == "diamond_guard_dropoff"
+
+
 def test_dry_route_is_preferred_before_an_available_swim() -> None:
     dry_step = RouteStep(
         (10.5, 11.5, 17.75),
@@ -567,6 +700,30 @@ def test_airborne_false_wade_frame_does_not_release_water_commitment() -> None:
     assert first is not None and first.debug_role == "water_exit"
     assert second is not None and second.debug_role == "water_exit"
     assert state.water_committed is True
+
+
+def test_shore_jump_finishes_landing_when_water_flow_disappears_then_expires() -> None:
+    bank = RouteStep((9.5, 10.5, 235.75), MovementAffordance.JUMP)
+    world = _TacticalWorld(water_step=bank)
+    brain = SimpleBotBrain(world)
+    swimmer = _player(1, TEAM1, (10.5, 10.5, 236.75), is_bot=True,
+                      grounded=False, wade=True)
+    frame = _frame(swimmer, created_at=100.0)
+    assert brain.decide(frame).debug_role == "water_exit"
+    world._water_step = None
+    airborne = replace(swimmer, position=(9.6, 10.5, 234.2), wade=False)
+    above_bank = replace(frame, frame_id=2, created_at=100.2, players=(airborne,))
+    landing = brain.decide(above_bank)
+    assert landing.debug_role == "water_exit"
+    assert landing.debug_goal == bank.waypoint
+    assert landing.movement.direction[0] < 0.0
+    assert len(world.water_step_calls) == 1
+    state = brain._states[(swimmer.player_id, swimmer.generation)]
+    assert state.water_last_bank == (100.2, bank.waypoint)
+    # A motionless airborne snapshot cannot extend landing ownership forever.
+    expired = brain.decide(replace(above_bank, frame_id=3, created_at=101.5))
+    assert expired.debug_role == "water_no_route"
+    assert state.water_landing_step is None
 
 
 def test_false_wade_frame_on_water_starts_water_commitment() -> None:
@@ -1078,7 +1235,8 @@ def test_fallback_water_exit_blacklists_its_own_stalled_edge() -> None:
     assert state.blocked_edges
 
 
-def test_alternating_water_steps_cannot_reset_whole_swim_progress() -> None:
+@pytest.mark.parametrize("airborne", (False, True))
+def test_alternating_water_steps_cannot_reset_whole_swim_progress(airborne: bool) -> None:
     left_step = RouteStep(
         (9.5, 10.5, 235.75),
         MovementAffordance.JUMP,
@@ -1100,12 +1258,17 @@ def test_alternating_water_steps_cannot_reset_whole_swim_progress() -> None:
     frame = _frame(observer, created_at=100.0)
 
     intent = brain.decide(frame)
+    if airborne:
+        observer = replace(observer, position=(10.5, 10.5, 233.5), wade=False)
+        assert not brain._water_contact(observer)
+        assert not brain._landed_on_dry_surface(observer)
     for index in range(1, 6):
         world._water_step = upper_step if index % 2 else left_step
         intent = brain.decide(replace(
             frame,
             frame_id=index + 1,
             created_at=100.0 + float(index),
+            players=(observer,),
         ))
 
     assert intent is not None
