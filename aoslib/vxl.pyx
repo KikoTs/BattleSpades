@@ -14,6 +14,8 @@ import random as _random
 import struct as _struct
 import zlib as _zlib
 from libc.math cimport sqrt
+from libc.stdlib cimport malloc, free
+from libc.string cimport memset
 
 
 DEF MAP_SIZE = 512
@@ -29,6 +31,145 @@ DEF MAP_PACKET_SIZE = 1024
 
 cdef list _ground_colors = []
 cdef int _max_modifiable_z = 238
+
+cdef unsigned int _FREE_SLOT = 0xFFFFFFFF
+cdef unsigned int _DEAD_SLOT = 0xFFFFFFFE
+
+
+cdef class _ColorTable:
+    """Voxel index -> packed colour in two flat uint32 arrays.
+
+    A Python dict spends about 100 bytes on each coloured voxel: 235 MB for one
+    retail map, more than a 512 MB host has left, and the two Frankfurt servers
+    answered nothing while they swapped. This open-addressing table spends 8
+    bytes a slot, about 35 MB for the same map. Voxel indexes are below 2**26,
+    so the two largest uint32 values are free to mark empty and deleted slots.
+    Only the dict operations the map uses are provided.
+    """
+
+    cdef unsigned int* _keys
+    cdef unsigned int* _values
+    cdef Py_ssize_t _capacity
+    cdef Py_ssize_t _live
+    cdef Py_ssize_t _occupied
+
+    def __cinit__(self):
+        self._keys = NULL
+        self._values = NULL
+        self._capacity = 0
+        self._live = 0
+        self._occupied = 0
+        self._resize(1 << 12)
+
+    def __dealloc__(self):
+        free(self._keys)
+        free(self._values)
+
+    cdef int _resize(self, Py_ssize_t capacity) except -1:
+        cdef unsigned int* old_keys = self._keys
+        cdef unsigned int* old_values = self._values
+        cdef Py_ssize_t old_capacity = self._capacity
+        cdef Py_ssize_t index
+        cdef unsigned int* keys = <unsigned int*>malloc(capacity * sizeof(unsigned int))
+        cdef unsigned int* values = <unsigned int*>malloc(capacity * sizeof(unsigned int))
+        if keys == NULL or values == NULL:
+            free(keys)
+            free(values)
+            raise MemoryError()
+        memset(keys, 0xFF, capacity * sizeof(unsigned int))
+        self._keys = keys
+        self._values = values
+        self._capacity = capacity
+        self._live = 0
+        self._occupied = 0
+        for index in range(old_capacity):
+            if old_keys[index] < _DEAD_SLOT:
+                self._insert(old_keys[index], old_values[index])
+        free(old_keys)
+        free(old_values)
+        return 0
+
+    cdef inline Py_ssize_t _home(self, unsigned int key) noexcept:
+        cdef unsigned int mixed = key
+        mixed ^= mixed >> 16
+        mixed *= <unsigned int>0x7FEB352D
+        mixed ^= mixed >> 15
+        mixed *= <unsigned int>0x846CA68B
+        mixed ^= mixed >> 16
+        return <Py_ssize_t>mixed & (self._capacity - 1)
+
+    cdef Py_ssize_t _find(self, unsigned int key) noexcept:
+        cdef Py_ssize_t index = self._home(key)
+        while self._keys[index] != _FREE_SLOT:
+            if self._keys[index] == key:
+                return index
+            index = (index + 1) & (self._capacity - 1)
+        return -1
+
+    cdef void _insert(self, unsigned int key, unsigned int value) noexcept:
+        """Store into a table known to have room."""
+        cdef Py_ssize_t index = self._home(key)
+        cdef Py_ssize_t reusable = -1
+        while self._keys[index] != _FREE_SLOT:
+            if self._keys[index] == key:
+                self._values[index] = value
+                return
+            if self._keys[index] == _DEAD_SLOT and reusable < 0:
+                reusable = index
+            index = (index + 1) & (self._capacity - 1)
+        if reusable >= 0:
+            index = reusable
+        else:
+            self._occupied += 1
+        self._keys[index] = key
+        self._values[index] = value
+        self._live += 1
+
+    cdef int _store(self, unsigned int key, unsigned int value) except -1:
+        if key >= _DEAD_SLOT:
+            raise KeyError(key)
+        if (self._occupied + 1) * 5 > self._capacity * 3:
+            # Grow only when live entries need it; otherwise just drop tombstones.
+            self._resize(self._capacity * 2 if self._live * 5 > self._capacity * 2
+                         else self._capacity)
+        self._insert(key, value)
+        return 0
+
+    cdef bint _discard(self, unsigned int key) noexcept:
+        cdef Py_ssize_t index = self._find(key)
+        if index < 0:
+            return False
+        self._keys[index] = _DEAD_SLOT
+        self._live -= 1
+        return True
+
+    cdef inline unsigned int _value(self, unsigned int key) noexcept:
+        """Stored colour, or 0 for a voxel without one."""
+        cdef Py_ssize_t index = self._find(key)
+        return 0 if index < 0 else self._values[index]
+
+    def __setitem__(self, key, value):
+        self._store(<unsigned int>key, <unsigned int>value)
+
+    def __delitem__(self, key):
+        if not self._discard(<unsigned int>key):
+            raise KeyError(key)
+
+    def __contains__(self, key):
+        return self._find(<unsigned int>key) >= 0
+
+    def __len__(self):
+        return self._live
+
+    def __sizeof__(self):
+        return self._capacity * 2 * sizeof(unsigned int)
+
+    def get(self, key, default=0):
+        cdef Py_ssize_t index = self._find(<unsigned int>key)
+        if index < 0:
+            return default
+        return self._values[index]
+
 cdef bytes _EMPTY_COLUMN = b"\x00\xF0\xEF\x00"
 cdef bytes _BLANK_VXL = _EMPTY_COLUMN * MAP_AREA
 
@@ -330,7 +471,7 @@ cdef class VXL:
     cdef bytes _raw_data
     cdef bytes _overview_opaque
     cdef bytes _overview_transparent
-    cdef dict _colors
+    cdef _ColorTable _colors
     cdef bytearray _solid_bits
     cdef list _top_z
     cdef list _bottom_z
@@ -349,7 +490,7 @@ cdef class VXL:
         self._raw_data = _BLANK_VXL
         self._overview_opaque = b""
         self._overview_transparent = b""
-        self._colors = {}
+        self._colors = _ColorTable()
         self._solid_bits = bytearray(VOXEL_BITS)
         self._top_z = [MAP_HEIGHT] * MAP_AREA
         self._bottom_z = [-1] * MAP_AREA
@@ -388,7 +529,7 @@ cdef class VXL:
         self._fill_floor()
 
     cdef void _reset_blank(self):
-        self._colors = {}
+        self._colors = _ColorTable()
         self._solid_bits = bytearray(VOXEL_BITS)
         self._top_z = [MAP_HEIGHT] * MAP_AREA
         self._bottom_z = [-1] * MAP_AREA
@@ -468,7 +609,7 @@ cdef class VXL:
         self._set_solid(x, y, z, True)
         self._update_column_bounds(x, y, z)
         if color:
-            self._colors[_voxel_index(x, y, z)] = color
+            self._colors._store(<unsigned int>_voxel_index(x, y, z), color)
 
     cdef void _fill_floor(self):
         """Force-fill the bottom row (z=239) solid for every column, mirroring
@@ -522,7 +663,7 @@ cdef class VXL:
         if edge * edge != columns or edge > MAP_SIZE or max_z >= 241:
             return False
 
-        self._colors = {}
+        self._colors = _ColorTable()
         self._solid_bits = bytearray(VOXEL_BITS)
         self._top_z = [MAP_HEIGHT] * MAP_AREA
         self._bottom_z = [-1] * MAP_AREA
@@ -657,7 +798,7 @@ cdef class VXL:
 
             x = col & 511
             y = col >> 9
-            color = self._colors.get(_voxel_index(x, y, top_z), 0)
+            color = self._colors._value(<unsigned int>_voxel_index(x, y, top_z))
             color_tuple = _color_tuple(color)
             opaque[out_pos] = color_tuple[0]
             opaque[out_pos + 1] = color_tuple[1]
@@ -712,7 +853,7 @@ cdef class VXL:
         return tuple(runs)
 
     cdef unsigned int _surface_color_source(self, int map_x, int map_y, int source_z):
-        return self._colors.get(_voxel_index(map_x, map_y, source_z + self._z_shift), 0)
+        return self._colors._value(<unsigned int>_voxel_index(map_x, map_y, source_z + self._z_shift))
 
     cdef tuple _column_runs_world(self, int map_x, int map_y):
         cdef list runs = []
@@ -735,7 +876,7 @@ cdef class VXL:
         return tuple(runs)
 
     cdef unsigned int _surface_color_world(self, int map_x, int map_y, int z):
-        return self._colors.get(_voxel_index(map_x, map_y, z), 0)
+        return self._colors._value(<unsigned int>_voxel_index(map_x, map_y, z))
 
     cdef bytes _serialize_column(self, int map_x, int map_y):
         cdef bytearray out = bytearray()
