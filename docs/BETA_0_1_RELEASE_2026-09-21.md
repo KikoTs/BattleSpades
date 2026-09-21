@@ -75,9 +75,22 @@ needed on a live server. A protocol probe through the upgraded EU CTF server
 completed handshake, map sync (CRC match), spectator join and live world
 updates, and received the four greeting/MOTD chat lines. The Steam helper on
 main EU missed one upstream probe during the TDM restart and resumed
-advertising by itself. The Frankfurt servers, unresponsive before, answer
-again at about 100 MiB each (385 MiB before); those hosts now sit near 300 of
-498 MiB used.
+advertising by itself. The Frankfurt servers, unresponsive before, answered
+again at about 100 MiB each (385 MiB before).
+
+Two hours later both Frankfurt hosts had starved again. It was not a leak: old
+worlds are freed on rotation and memory returns to the same figure for the same
+map. Memory depends on the map. Process memory after loading, without bots:
+76-137 MiB for most maps, about 192 MiB for Frontier, Alcatraz and Classic, and
+**319 MiB for MayanJungle**, because every filled underground voxel carries its
+own colour entry and that map is tall and solid. Bots add 30-60 MiB. The
+rotation had reached a heavy map on a service capped at `MemoryMax=320M`.
+Those two hosts now rotate only maps that fit (Frontier and MayanJungle removed
+from Diamond Mine; Alcatraz from Territory Control, which leaves it
+CityOfChicago alone); the 8 GB and 16 GB hosts keep every map. Storing one
+fill colour per column instead of one per voxel would remove the limit and is
+the obvious next step; it changes re-serialized map bytes, so it needs the same
+byte-for-byte comparison the colour table had.
 
 Two things the first attempts taught: run `--check` from the service's working
 directory (the AI child process enters its parent's directory, and the `opc`
