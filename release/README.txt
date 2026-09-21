@@ -1,13 +1,13 @@
-BattleSpades Portable Beta 1.1
+BattleSpades Portable Beta 0.1
 =============================
 
 Part of the open AoS Revival project: https://aosplay.net
 Server source: https://github.com/KikoTs/BattleSpades
 Client source: https://github.com/KikoTs/BattleSpadesClient
 
-Beta 1.1 adds cooperative class tactics and a private welcome with the actual
-UTC build day. See BETA_1_1_NOTES.md in this beta archive for behavior,
-configuration and local verification details.
+Beta 0.1 adds cooperative class tactics, bots that fight and move like
+players, and a private welcome with the actual UTC build day. Behavior,
+configuration and verification details are in the server repository's docs.
 
 1. Extract the complete zip into a writable directory.
 2. Run `BattleSpades.exe --check` on Windows or `./BattleSpades --check` on
@@ -85,7 +85,7 @@ Seamless live `/map`, `/mode`, and voted-map transitions require the bundled
 `client_patches/INSTALL.txt`, then restart that client once. The patch retains
 the existing authenticated connection while the normal map loader runs.
 
-macOS alpha builds are not signed or notarized and may trigger Gatekeeper. The
+macOS beta builds are not signed or notarized and may trigger Gatekeeper. The
 release page documents this limitation; no archive should be described as an
 Apple-notarized application.
 

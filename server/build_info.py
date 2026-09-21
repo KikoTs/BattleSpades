@@ -16,7 +16,7 @@ from functools import lru_cache
 from pathlib import Path
 
 
-DISPLAY_RELEASE = "BattleSpades Beta 1.1"
+DISPLAY_RELEASE = "BattleSpades Beta 0.1"
 BUILD_INFO_FILENAME = "build_info.json"
 SERVER_REPOSITORY = "https://github.com/KikoTs/BattleSpades"
 CLIENT_REPOSITORY = "https://github.com/KikoTs/BattleSpadesClient"

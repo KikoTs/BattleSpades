@@ -37,7 +37,7 @@ def test_default_greeting_contains_requested_release_and_verified_project_links(
     config = ServerConfig()
     lines = join_message_lines(config, "Builder", BuildInfo(DISPLAY_RELEASE, "2026-09-21"))
     assert len(lines) == 4
-    assert lines[0] == "Welcome, Builder! BattleSpades Beta 1.1 | Build (UTC): 2026-09-21"
+    assert lines[0] == "Welcome, Builder! BattleSpades Beta 0.1 | Build (UTC): 2026-09-21"
     assert "open AoS Revival project" in lines[1]
     assert "Server + client" in lines[1]
     assert PROJECT_WEBSITE in lines[1]
@@ -126,7 +126,7 @@ def test_join_dispatch_waits_for_world_reveal_and_never_repeats(monkeypatch):
     assert len(chats) == 4
     assert all(packet.player_id == 255 and packet.chat_type == CHAT_SYSTEM
                and flags["reliable"] for packet, flags in chats)
-    assert chats[0][0].value.startswith("Welcome, Builder! BattleSpades Beta 1.1")
+    assert chats[0][0].value.startswith("Welcome, Builder! BattleSpades Beta 0.1")
     assert not any(data[0] == ChatMessage.id for data in server.broadcast_packets)
     assert len(handled) == 3
 
@@ -167,4 +167,4 @@ def test_freezer_includes_stable_stamp_without_changing_internal_version():
     spec = (root / "BattleSpades.spec").read_text(encoding="utf-8")
     assert "from server.build_info import write_build_info" in spec
     assert 'datas.append((str(build_info_path), "."))' in spec
-    assert (root / "VERSION").read_text().strip() == "0.0.3-alpha.9"
+    assert (root / "VERSION").read_text().strip() == "0.1.0-beta.1"
