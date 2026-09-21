@@ -46,7 +46,8 @@ jobs:
             python_architecture: arm64
             runner: macos-15
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # The Intel macOS runner needs about 85 minutes for the full suite alone.
+    timeout-minutes: 150
 
     steps:
       - name: Check out release source
