@@ -142,6 +142,12 @@ class CooperativeBehavior:
         if life.task and (critical and not objective_support or danger and life.task.kind != "heal"
                           or combat_interrupt or self._live_hazard(frame, player)):
             self._finish(life, now, False, "combat_contact" if combat_interrupt else "urgent_interrupt")
+        if (life.task and life.task.kind in {"outpost", "cover", "strongpoint", "sabotage"}
+                and self._ammunition(player) <= 0):
+            # A firing position is worthless to an empty gun; a dry Marksman
+            # held its perch with a pickaxe while being shot. Free the bot to
+            # resupply or close in instead.
+            self._finish(life, now, False, "ammo_exhausted")
         if critical:
             # Retiring the ownership is essential: otherwise a completed
             # objective resumes an obsolete human-follow lease immediately.
@@ -154,7 +160,7 @@ class CooperativeBehavior:
             if (strategic is not None and self._can_stop_for_supplies(strategic)
                     and combat_visible is None and now >= life.next_evaluate
                     and not self._live_hazard(frame, player)
-                    and (player.health < 55 or player.ammo_clip + player.ammo_reserve == 0)):
+                    and (player.health < 55 or self._ammunition(player) == 0)):
                 life.next_evaluate = now + .75
                 # Only urgent personal supplies, close to the objective route,
                 # can borrow up to four seconds. No patient/partner chasing.
@@ -237,7 +243,10 @@ class CooperativeBehavior:
                     candidates.append(_Task(task_id, kind, site.approach, lane, now,
                         now + (patience if kind == "outpost" else 25), score, site=site,
                         progress_at=now))
-        if visible is None and contact is not None and math.dist(player.position, contact.position) > 4:
+        if (visible is None and contact is not None and contact.expires_at - now >= 2.0
+                and math.dist(player.position, contact.position) > 4):
+            # Evidence about to expire would start an errand only to cancel it
+            # on the next decision, resetting the bot's real route twice.
             score = .4 + creativity * .1 - life.memory.penalty("investigate", contact.position, now)
             if score > .2:
                 candidates.append(_Task(task_id, "investigate", contact.position, contact.position,
@@ -278,6 +287,11 @@ class CooperativeBehavior:
                 self.teams.event("tasks_started", task_id, "mischief", now)
                 return self._advance(frame, player, visible, life, allies)
         return None
+
+    @staticmethod
+    def _ammunition(player: PlayerSnapshot) -> int:
+        stowed = sum(clip + reserve for _tool, clip, reserve in player.weapon_ammo)
+        return stowed if player.weapon_ammo else player.ammo_clip + player.ammo_reserve
 
     @staticmethod
     def _can_stop_for_supplies(strategic: ModeBotDecision) -> bool:
@@ -361,7 +375,7 @@ class CooperativeBehavior:
             and dict(player.deployable_stock).get(int(C.MEDPACK_TOOL), 0) <= 0)
         if player.blocks < 12:
             desired.add(int(C.BLOCK_CRATE))
-        if player.ammo_clip + player.ammo_reserve < 6 or depleted_medical:
+        if self._ammunition(player) < 6 or depleted_medical:
             desired.add(int(C.AMMO_CRATE))
         sources = sorted((entity for entity in frame.entities[:96]
             if entity.alive and entity.entity_type in desired

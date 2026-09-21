@@ -24,6 +24,7 @@ from server.game_constants import (
 )
 
 from .combat_profiles import recoil_kick_for
+from .banter import BotBanter
 from .gateway import BotActionGateway
 from .messages import (
     BotAction,
@@ -205,7 +206,20 @@ def _choose_bot_loadout(
             if int(tool) not in disabled_tools
         )
         if options:
-            selected.append(int(rng.choice(options)))
+            choice = int(rng.choice(options))
+            # Every variant stays possible, but a 20-block double barrel is a
+            # niche pick on open maps: most of its owners watched enemies they
+            # could never reach. Players gravitate to guns with some range.
+            # The second opinion uses its own stream so every other seeded
+            # roster decision stays exactly where replay fixtures expect it.
+            reach = float(getattr(WEAPON_PROFILES.get(choice), "max_range", 0.0) or 0.0)
+            longer = [tool for tool in options if tool != choice and float(
+                getattr(WEAPON_PROFILES.get(tool), "max_range", 0.0) or 0.0) >= 30.0]
+            if 0.0 < reach < 30.0 and longer:
+                second = random.Random(hash(rng.getstate()) ^ (choice * 7919 + len(selected)))
+                if second.random() < 0.6:
+                    choice = int(second.choice(longer))
+            selected.append(choice)
     return tuple(selected)
 
 
@@ -286,6 +300,11 @@ class _RuntimeBot:
     action_primary_kind: BotActionKind = BotActionKind.NONE
     movement_input: tuple[bool, bool, bool, bool, bool, bool, bool, bool] | None = None
     waypoint_probe_key: tuple | None = None
+    # Blocks an ordinary walk may descend in one go: 1, or the worker's safe
+    # ledge height while it runs a validated line that goes over one.
+    walk_drop_allowance: int = 1
+    # Heading the eight key directions still owe the requested one.
+    key_residual: tuple[float, float] = (0.0, 0.0)
     waypoint_probe_result: bool = False
     steering_cache_key: tuple | None = None
     steering_cache_direction: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -352,6 +371,7 @@ class BotDirector:
             )
         self.gateway = BotActionGateway(server)
         self.profile_factory = ProfileFactory(seed=seed)
+        self.banter = BotBanter(seed=seed)
         self._rng = random.Random(seed)
         self.bots: list[Player] = []
         self._runtime: dict[int, _RuntimeBot] = {}
@@ -456,6 +476,8 @@ class BotDirector:
         self._refresh_epochs()
         await self._reconnect_roster()
         self._record_game_boundary()
+        # Humans are still loading; greet once the round is actually moving.
+        self.on_match_phase("start", delay=10.0)
 
         logger.info(
             "Reconnected %d fresh bot(s) for map=%s epoch=%d",
@@ -694,6 +716,7 @@ class BotDirector:
         runtime.next_perception_at = time.monotonic() + phase / max(1, int(getattr(self._config, "max_bots", 12)))
         self.bots.append(player)
         self._runtime[player_id] = runtime
+        self.banter.register(player_id, profile.name)
 
         if self.server.mode is not None:
             await self.server.mode.on_player_join(player)
@@ -735,6 +758,7 @@ class BotDirector:
             await self.server.mode.on_player_leave(bot)
         if runtime is not None:
             self.profile_factory.release_name(runtime.profile.name)
+        self.banter.forget(int(bot.id))
         logger.info("Bot retired: %s id=%s", bot.name, bot.id)
         return True
 
@@ -754,6 +778,7 @@ class BotDirector:
                 recover()
             await self._maintain_population(now)
             population_maintained = True
+            self._release_banter(now)
         section_started = time.perf_counter()
         self._drain_intents(now)
         self.server.metrics.record_subsystem(
@@ -808,6 +833,48 @@ class BotDirector:
             "bots_motors",
             (time.perf_counter() - section_started) * 1000.0,
         )
+
+    def on_player_killed(self, victim: "Player", killer: "Player | None", kill_type: int) -> None:
+        """Let talkative bots react to a kill the whole server just saw."""
+
+        if not bool(getattr(self._config, "chatter", True)) or killer is None:
+            return
+        if int(getattr(victim, "team", -1)) == int(getattr(killer, "team", -2)) and victim is not killer:
+            return  # team changes and friendly accidents are not banter
+        explosive_kills = {int(getattr(C, name)) for name in (
+            "GRENADE_KILL", "ROCKET_KILL", "ROCKET2_KILL", "LANDMINE_KILL", "DYNAMITE_KILL",
+            "CLASSIC_GRENADE_KILL", "ANTIPERSONNEL_GRENADE_KILL", "SHRAPNEL_KILL")
+            if hasattr(C, name)}
+        melee_kills = {int(C.MELEE_KILL)} if hasattr(C, "MELEE_KILL") else set()
+        self.banter.on_kill(
+            time.monotonic(), killer_id=int(killer.id), victim_id=int(victim.id),
+            killer_name=str(getattr(killer, "name", "")), victim_name=str(getattr(victim, "name", "")),
+            streak=int(getattr(killer, "kill_streak", 0)),
+            distance=math.dist(tuple(killer.position), tuple(victim.position)),
+            melee=int(kill_type) in melee_kills, explosive=int(kill_type) in explosive_kills)
+
+    def on_match_phase(self, kind: str, *, delay: float = 0.0) -> None:
+        """``start``/``end`` courtesy lines; queued lines die with a retired roster."""
+
+        if bool(getattr(self._config, "chatter", True)) and self._started:
+            self.banter.on_phase(time.monotonic() + max(0.0, float(delay)), str(kind))
+
+    def _release_banter(self, now: float) -> None:
+        if not bool(getattr(self._config, "chatter", True)):
+            return
+        busy = frozenset(player_id for player_id, runtime in self._runtime.items()
+                         if runtime.player.alive and now - runtime.lock_confirmed_at < 3.0)
+        for player_id, text in self.banter.due(now, busy=busy):
+            runtime = self._runtime.get(player_id)
+            if runtime is None:
+                continue
+            from shared.packet import ChatMessage
+
+            packet = ChatMessage()
+            packet.player_id = int(player_id)
+            packet.chat_type = int(C.CHAT_ALL)
+            packet.value = text
+            self.server.broadcast(bytes(packet.generate()))
 
     def status(self) -> WorkerStatus:
         """Expose the worker portion of operational status."""
@@ -1222,12 +1289,28 @@ class BotDirector:
                     last_task_accepted=(runtime.feedback_task_accepted if runtime else True),
                     last_task_at=(runtime.feedback_task_at if runtime else 0.0),
                     can_shoot=self._can_shoot(player),
+                    weapon_ammo=self._weapon_ammo_snapshot(player),
                 )
 
     def _can_shoot(self, player: "Player") -> bool:
         """Mirror CombatRuntime's authoritative burdensome-carrier rule."""
         return (not bool(getattr(player, "pickup_burdensome", False))
                 or bool(getattr(getattr(self.server, "mode", None), "shoot_with_intel", False)))
+
+    @staticmethod
+    def _weapon_ammo_snapshot(player: "Player") -> tuple[tuple[int, int, int], ...]:
+        """Report every owned firearm's wallet; the held one uses live counters."""
+        stowed = getattr(player, "_weapon_ammo", None) or {}
+        held = int(getattr(player, "weapon", -1))
+        result = []
+        for tool in tuple(getattr(player, "loadout", ()) or ())[:16]:
+            tool = int(tool)
+            if tool not in WEAPON_PROFILES:
+                continue
+            clip, reserve = ((getattr(player, "ammo_clip", 0), getattr(player, "ammo_reserve", 0))
+                             if tool == held else stowed.get(tool, (0, 0)))
+            result.append((tool, int(clip), int(reserve)))
+        return tuple(result)
 
     @staticmethod
     def _deployable_snapshot(player: "Player") -> tuple[tuple[int, int], ...]:
@@ -1820,6 +1903,14 @@ class BotDirector:
                 dx, dy = (travel_direction[:2] if length > 1e-6 else
                           (math.cos(runtime.motor.yaw), math.sin(runtime.motor.yaw)))
                 length = length if length > 1e-6 else 1.0
+                rest = intent.movement.gaze_waypoint
+                if rest is not None:
+                    # Eyes rest on where the route is heading; the view-relative
+                    # keys below still steer the body at the step underfoot.
+                    gaze_x, gaze_y = rest[0] - player.eye_x, rest[1] - player.eye_y
+                    gaze_length = math.hypot(gaze_x, gaze_y)
+                    if gaze_length > 2.0:
+                        dx, dy, length = gaze_x, gaze_y, gaze_length
                 aim_point = (player.eye_x + dx / length * 6.0,
                              player.eye_y + dy / length * 6.0, player.eye_z)
                 settle = 0.0
@@ -1855,6 +1946,7 @@ class BotDirector:
             hover=runtime.action_hover,
         )
         self._try_pending_action(runtime, now)
+        runtime.walk_drop_allowance = max(1, min(4, int(intent.movement.walk_drop)))
         direction = self._live_movement_direction(
             runtime,
             travel_direction,
@@ -2010,11 +2102,12 @@ class BotDirector:
                  or wading_ascent
                  or current_loop <= runtime.jump_until_loop)
         )
+        key_forward, key_side = self._movement_keys(runtime, forward_amount, side_amount)
         self._set_movement_state(runtime, (False,) * 8 if completed_water_movement else (
-            forward_amount > 0.25,
-            forward_amount < -0.25,
-            side_amount < -0.25,
-            side_amount > 0.25,
+            key_forward > 0,
+            key_forward < 0,
+            key_side < 0,
+            key_side > 0,
             jump_held,
             bool(intent.movement.crouch)
             or affordance is MovementAffordance.CROUCH,
@@ -2031,6 +2124,36 @@ class BotDirector:
             zoom=bool(intent.zoom),
             hover=jetpack_requested and jetpack_uses_hover,
         )
+
+    @staticmethod
+    def _movement_keys(runtime: _RuntimeBot, forward: float, side: float) -> tuple[int, int]:
+        """Pick W/S and A/D so the body goes where asked wherever the eyes look.
+
+        Keys offer eight headings. Thresholding each axis on its own turned a
+        heading 20 degrees off the view into a 45 degree strafe, so a bot whose
+        eyes were not exactly on its steering point veered off its validated
+        line. The nearest of the eight is pressed and the angle it misses by is
+        carried into the next press, as a player feathers a strafe key: the
+        heading is exact on average and straight ahead is still plain W.
+        """
+
+        length = math.hypot(forward, side)
+        if length <= 0.1:
+            runtime.key_residual = (0.0, 0.0)
+            return 0, 0
+        owed_forward, owed_side = getattr(runtime, "key_residual", (0.0, 0.0))
+        want_forward = forward / length + owed_forward
+        want_side = side / length + owed_side
+        octant = round(math.atan2(want_side, want_forward) / (math.pi / 4.0))
+        pressed_forward = math.cos(octant * math.pi / 4.0)
+        pressed_side = math.sin(octant * math.pi / 4.0)
+        owed_forward, owed_side = want_forward - pressed_forward, want_side - pressed_side
+        owed = math.hypot(owed_forward, owed_side)
+        if owed > 1.0:  # a sharp change of heading owes nothing to the old one
+            owed_forward, owed_side = owed_forward / owed, owed_side / owed
+        runtime.key_residual = (owed_forward, owed_side)
+        return ((pressed_forward > 0.3) - (pressed_forward < -0.3),
+                (pressed_side > 0.3) - (pressed_side < -0.3))
 
     def _recover_buried_bot(self, runtime: _RuntimeBot, now: float) -> None:
         """Retire an impossible body below the immutable waterbed after recovery time.
@@ -2764,6 +2887,7 @@ class BotDirector:
             if ordinary_walk and not wading
             else 0.65
         )
+        walk_drop = int(getattr(runtime, "walk_drop_allowance", 1)) if ordinary_walk else 1
         probe_key = (
             int(round(float(player.x) * 8.0)),
             int(round(float(player.y) * 8.0)),
@@ -2775,6 +2899,7 @@ class BotDirector:
             bool(getattr(player, "grounded", False)),
             int(round(probe_distance * 100.0)),
             affordance.value,
+            walk_drop,
         )
         if runtime.waypoint_probe_key == probe_key:
             return runtime.waypoint_probe_result
@@ -2797,6 +2922,7 @@ class BotDirector:
                 probe_x,
                 probe_y,
                 affordance,
+                walk_drop=walk_drop,
             )
             for probe_x, probe_y in immediate
         )
@@ -2842,6 +2968,21 @@ class BotDirector:
                 ):
                     result = False
                     break
+        if not result and (affordance is MovementAffordance.DROP or walk_drop > 1):
+            # The centre of the body decides where a drop lands. On a terraced
+            # slope one shoulder always hangs over the next, deeper step; asking
+            # each shoulder for its own safe landing refused every such drop and
+            # left the bot standing at the lip until a timeout. Shoulders only
+            # have to be clear of walls.
+            result = (
+                BotDirector._probe_surface_is_live(world, player, *immediate[0], affordance,
+                                                   walk_drop=walk_drop)
+                and all(
+                    not world.clipbox(probe_x, probe_y, float(player.z))
+                    and not world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
+                    for probe_x, probe_y in immediate[1:]
+                )
+            )
         if not result and affordance is MovementAffordance.JUMP:
             body_clear = all(
                 not world.clipbox(probe_x, probe_y, float(player.z))
@@ -2879,6 +3020,8 @@ class BotDirector:
         """Short leased steps need prompt, noise-free heading acquisition."""
 
         movement = intent.movement
+        if movement.gaze_waypoint is not None:
+            return "travel"
         # Native movement keys are relative to the current yaw. A short
         # obstacle step can finish before the relaxed travel turn settles,
         # changing its effective key direction mid-step on a narrow ledge.
@@ -2977,6 +3120,7 @@ class BotDirector:
             affordance.value,
             int(getattr(world, "topology_version", -1)),
             bool(getattr(player, "wade", False)),
+            int(getattr(runtime, "walk_drop_allowance", 1)),
         )
         cached_position = getattr(runtime, "steering_cache_position", None)
         current_position = (
@@ -3132,6 +3276,8 @@ class BotDirector:
         probe_x: float,
         probe_y: float,
         affordance: MovementAffordance,
+        *,
+        walk_drop: int = 1,
     ) -> bool:
         """Validate one body-width movement probe against current VXL state."""
 
@@ -3196,7 +3342,7 @@ class BotDirector:
             MovementAffordance.JUMP: (2, 3),
             MovementAffordance.DROP: (1, 4),
             MovementAffordance.JETPACK: (8, 8),
-        }.get(affordance, (1, 1))
+        }.get(affordance, (1, walk_drop))
         solid = getattr(world, "get_solid", None)
         if callable(solid):
             candidates = range(
@@ -3271,7 +3417,7 @@ class BotDirector:
                        if planar > 1e-6 else motor.yaw)
         desired_pitch = max(-1.35, min(1.35,
             math.atan2(dz, max(planar, 1e-6)) + pitch_error))
-        if purpose in {"travel", "focus"}:
+        if purpose in {"travel", "focus", "traverse"}:
             self._update_purposeful_gaze(runtime, desired_yaw, desired_pitch, dt, purpose)
         else:
             # A visible target, selected world cell or short traversal step
@@ -3304,9 +3450,18 @@ class BotDirector:
 
     def _update_purposeful_gaze(self, runtime: _RuntimeBot, yaw: float, pitch: float,
                                dt: float, purpose: str) -> None:
-        """Commit meaningful gaze changes, with personality-stable brief dwell."""
+        """Look where the route goes: steady on a straight, quick at a corner.
+
+        Movement keys are relative to the view, so a slow pan is not merely
+        cosmetic: while the head crawled through a 100 degree corner for over a
+        second, the body strafed and hopped on the spot. Players snap to a new
+        heading in a fraction of a second and then hold it. Small changes of
+        the target still wait out a short dwell, so a steady walk keeps a steady
+        head; a short exact step (``traverse``) is followed at once.
+        """
         motor, profile = runtime.motor, runtime.profile
-        dwell = .16 + .10 * profile.caution + .06 * (1.0 - profile.skill)
+        dwell = (0.0 if purpose == "traverse"
+                 else .16 + .10 * profile.caution + .06 * (1.0 - profile.skill))
         if motor.gaze_purpose != purpose or motor.gaze_yaw is None:
             motor.gaze_yaw, motor.gaze_pitch = motor.yaw, motor.pitch
             motor.gaze_age = dwell
@@ -3320,28 +3475,27 @@ class BotDirector:
                     and (yaw_change > yaw_deadzone or pitch_change > math.radians(.6)))):
             motor.gaze_yaw, motor.gaze_pitch = yaw, pitch
             motor.gaze_age = 0.0
-        speed = min(profile.turn_speed, 3.4, max(1.8, profile.turn_speed * .70))
-        acceleration = min(profile.turn_acceleration, 10.,
-                           max(5., profile.turn_acceleration * .65))
+        # Temperament still shows: a casual hand is a little slower to the
+        # new heading than an expert, but nobody pans like a security camera.
+        stiffness = 9.0 + 1.6 * float(profile.turn_speed)
+        speed = 6.0 + float(profile.turn_speed)
         motor.yaw, motor.yaw_velocity, motor.yaw_acceleration = self._smooth_gaze_axis(
             motor.yaw, motor.yaw_velocity, motor.yaw_acceleration,
-            motor.gaze_yaw, speed, acceleration, dt, wrap=True)
+            motor.gaze_yaw, speed, stiffness, dt, wrap=True)
         motor.pitch, motor.pitch_velocity, motor.pitch_acceleration = self._smooth_gaze_axis(
             motor.pitch, motor.pitch_velocity, motor.pitch_acceleration,
-            motor.gaze_pitch, speed * .75, acceleration * .75, dt, wrap=False)
+            motor.gaze_pitch, speed * .75, stiffness, dt, wrap=False)
 
     def _smooth_gaze_axis(self, current: float, velocity: float, acceleration: float,
-                          target: float, max_speed: float, max_acceleration: float,
+                          target: float, max_speed: float, stiffness: float,
                           dt: float, *, wrap: bool) -> tuple[float, float, float]:
-        """Critically damped purposeful turns with bounded acceleration changes."""
+        """Critically damped turn: fastest approach that never overshoots."""
         elapsed = max(0., min(.25, dt))
-        steps = max(1, int(math.ceil(elapsed * 60.)))
+        steps = max(1, int(math.ceil(elapsed * 120.)))
         step = elapsed / steps
         for _ in range(steps):
             error = self._wrap(target - current) if wrap else target - current
-            desired = max(-max_acceleration, min(max_acceleration, 25. * error - 10. * velocity))
-            jerk_step = max_acceleration * 8. * step
-            acceleration += max(-jerk_step, min(jerk_step, desired - acceleration))
+            acceleration = stiffness * stiffness * error - 2.0 * stiffness * velocity
             velocity = max(-max_speed, min(max_speed, velocity + acceleration * step))
             current += velocity * step
             if wrap:

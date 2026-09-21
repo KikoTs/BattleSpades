@@ -1599,6 +1599,11 @@ class Player:
             ):
                 server.queue_mode_event("on_player_kill", killer, self, kill_type)
 
+        if server is not None and not transition_death:
+            react = getattr(getattr(server, "bots", None), "on_player_killed", None)
+            if callable(react):
+                react(self, killer if killer is not None else self, kill_type)
+
         logger.debug("Player %s died (killer: %s)", self.name, killer.name if killer else "none")
 
     def heal(self, amount: int):

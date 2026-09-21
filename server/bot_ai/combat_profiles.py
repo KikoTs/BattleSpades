@@ -7,7 +7,7 @@ catalog weapon automatically inherits its category's fighting doctrine.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from server.game_constants import (
     CAT_MG,
@@ -60,7 +60,15 @@ def envelope_for(tool_id: int) -> EngagementEnvelope:
     profile = WEAPON_PROFILES.get(int(tool_id))
     if profile is None:
         return _DEFAULT
-    return _BY_CATEGORY.get(profile.category, _DEFAULT)
+    envelope = _BY_CATEGORY.get(profile.category, _DEFAULT)
+    reach = float(getattr(profile, "max_range", 0.0) or 0.0)
+    if 0.0 < reach < envelope.hard_max:
+        # A category doctrine must not outrange the actual gun: the double
+        # barrel stops at 20 blocks, so holding at 25 only wastes shells.
+        ideal_max = min(envelope.ideal_max, reach * 0.75)
+        envelope = replace(envelope, hard_max=reach * 0.95, ideal_max=ideal_max,
+                           ideal_min=min(envelope.ideal_min, ideal_max * 0.5))
+    return envelope
 
 
 def recoil_kick_for(tool_id: int) -> float:

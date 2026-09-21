@@ -51,13 +51,37 @@ def test_own_floor_adjacent_wall_or_other_height_in_same_column_invalidates(cell
     assert world.route_needs_replan(0, POSITION, ROUTE)
 
 
-@pytest.mark.parametrize("kind", [MovementAffordance.JUMP, MovementAffordance.BREACH,
-                                  MovementAffordance.BUILD_STEP, MovementAffordance.JETPACK,
-                                  MovementAffordance.SWIM, MovementAffordance.DROP])
-def test_complex_routes_keep_conservative_global_invalidation(kind):
+_SPECIAL = [MovementAffordance.JUMP, MovementAffordance.BREACH, MovementAffordance.BUILD_STEP,
+            MovementAffordance.JETPACK, MovementAffordance.SWIM, MovementAffordance.DROP]
+
+
+@pytest.mark.parametrize("kind", _SPECIAL)
+def test_a_distant_edit_does_not_discard_a_route_because_it_contains_a_special_step(kind):
+    # Every broken block used to invalidate every route with a jump in it, so
+    # a firefight kept whole squads queueing for the planner and standing still.
     world = _world()
     world.apply(WorldDelta(1, 1, (VoxelChange(200, 300, 100, False),)))
-    assert world.route_needs_replan(0, POSITION, (replace(ROUTE[0], affordance=kind),))
+    route = (ROUTE[0], replace(ROUTE[1], affordance=kind), *ROUTE[2:])
+    assert not world.route_needs_replan(0, POSITION, route)
+
+
+@pytest.mark.parametrize("kind", _SPECIAL)
+def test_an_edit_beside_a_special_step_still_invalidates_it(kind):
+    world = _world()
+    world.apply(WorldDelta(1, 1, (VoxelChange(13, 11, 96, True),)))
+    route = (ROUTE[0], replace(ROUTE[1], affordance=kind), *ROUTE[2:])
+    assert world.route_needs_replan(0, POSITION, route)
+
+
+def test_a_dig_edge_is_invalidated_when_its_own_cells_change():
+    from server.bot_ai.simple_navigation import BreachPlan
+    world = _world()
+    dig = BreachPlan((11, 10, 100), (12, 10, 100), (40, 40, 98), ((40, 40, 97),), 2, False, .5, 3)
+    route = (replace(ROUTE[0], affordance=MovementAffordance.BREACH, breach=dig),)
+    world.apply(WorldDelta(1, 1, (VoxelChange(200, 300, 100, False),)))
+    assert not world.route_needs_replan(0, POSITION, route)
+    world.apply(WorldDelta(1, 2, (VoxelChange(40, 40, 98, False),)))
+    assert world.route_needs_replan(0, POSITION, route)
 
 
 def test_history_is_fixed_size_and_unknown_versions_or_map_reset_fail_closed():
@@ -80,15 +104,25 @@ def test_history_is_fixed_size_and_unknown_versions_or_map_reset_fail_closed():
     assert not world.route_needs_replan(6000, POSITION, ROUTE)
 
 
-def test_long_sparse_and_invalid_routes_keep_a_hard_probe_bound():
+def test_long_and_sparse_routes_are_checked_locally_within_a_hard_bound():
     world = _world()
-    assert world.route_needs_replan(0, POSITION, ROUTE * (MAX_ROUTE_VALIDATION_STEPS // 5 + 1))
-    assert world.route_needs_replan(0, POSITION, (ROUTE[-1],))
+    long_route = tuple(RouteStep((x + .5, 10.5, 97.75), MovementAffordance.WALK)
+                       for x in range(11, 11 + MAX_ROUTE_VALIDATION_STEPS * 3))
+    sparse = (ROUTE[-1],)  # one compacted five-block stride
+    assert not world.route_needs_replan(0, POSITION, long_route)
+    assert not world.route_needs_replan(0, POSITION, sparse)
     assert world.route_needs_replan(0, POSITION, (replace(ROUTE[0], waypoint=(float("nan"), 10, 97)),))
+    # An edit under the middle of the compacted stride is found...
+    world.apply(WorldDelta(1, 1, (VoxelChange(13, 10, 100, False),)))
+    assert world.route_needs_replan(0, POSITION, sparse)
+    # ...while one beyond the validated stretch waits until the body is nearer.
+    far = _world()
+    far.apply(WorldDelta(1, 1, (VoxelChange(11 + MAX_ROUTE_VALIDATION_STEPS + 40, 10, 100, False),)))
+    assert not far.route_needs_replan(0, POSITION, long_route)
 
 
 @pytest.mark.parametrize("local_edit", [False, True])
-def test_real_brain_keeps_moving_without_a_grant_only_for_unaffected_route(local_edit):
+def test_real_brain_keeps_moving_without_a_grant_and_retries_an_affected_route(local_edit):
     world = _world()
     observer = _player(1, 1, POSITION, is_bot=True)
     brain = SimpleBotBrain(world)
@@ -104,10 +138,8 @@ def test_real_brain_keeps_moving_without_a_grant_only_for_unaffected_route(local
     world.end_planning()
     assert state.route is ROUTE
     assert world.planning_budget.snapshot()["granted"] == 1
-    if local_edit:
-        assert intent.debug_role.endswith(":planning_wait")
-        assert state.route_topology_version == 0
-    else:
-        assert intent.movement.direction[0] > 0
-        assert not intent.debug_role.endswith(":planning_wait")
-        assert state.route_topology_version == 1
+    # Either way the bot keeps walking: a busy planner is not a reason to halt.
+    assert intent.movement.direction[0] > 0
+    assert not intent.debug_role.endswith(":planning_wait")
+    # Only the unaffected route is marked current; the edited one asks again.
+    assert state.route_topology_version == (0 if local_edit else 1)

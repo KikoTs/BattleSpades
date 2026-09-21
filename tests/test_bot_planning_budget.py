@@ -252,3 +252,21 @@ def test_process_entry_enforces_same_rate_and_observer_context(monkeypatch):
 
     simple_worker.run_worker(Input(), queue.Queue(), path_requests_per_second=1)
     assert _RoutingBrain.results == [(1, False, 1.0), (2, True, 1.0)]
+
+
+def test_the_request_rate_follows_the_roster_and_never_drops_below_the_configured_floor():
+    budget = PlanningBudget(24, decision_hz=8)
+    budget.scale_for(2)
+    assert budget.requests_per_second == 24  # a small roster keeps the configured rate
+    budget.scale_for(10)
+    assert budget.requests_per_second == 60 and budget.burst == math.ceil(60 / 8)
+    budget.scale_for(0)
+    assert budget.requests_per_second == 24
+
+
+def test_would_grant_predicts_admission_without_spending_it():
+    budget = PlanningBudget(8, decision_hz=8)
+    assert budget.would_grant((1, 1), 0.0) and budget.would_grant((1, 1), 0.0)
+    assert budget.try_acquire((1, 1), 0.0) is not None
+    assert not budget.would_grant((2, 1), 0.0)  # this instant's allowance is spent
+    assert budget.snapshot()["granted"] == 1

@@ -74,11 +74,24 @@ def test_minor_route_target_jitter_has_dwell_instead_of_alternating_head_turns()
 @pytest.mark.parametrize("difficulty", ("casual", "normal", "hard"))
 def test_real_route_corners_turn_smoothly_without_abandoning_the_direction(difficulty):
     metrics, rows, *_ = measure_gaze("corners", difficulty=difficulty)
-    assert metrics["jerk_max_rad_s3"] < 110.
-    assert metrics["turn_90_settle_seconds"] <= 2.
+    # Movement keys follow the view, so a corner taken as a two-second pan left
+    # the body strafing on the spot. Players snap to the new heading.
+    assert metrics["turn_90_settle_seconds"] <= .5
     assert metrics["final_error_degrees"] < 2.
     assert metrics["reversals"] <= 2  # Only the intentional 90 -> 45 degree corner.
     assert max(row[1] for row in rows[:40]) <= math.pi / 2 + math.radians(.5)
+
+
+def test_a_short_exact_step_is_followed_at_once_and_as_quickly_as_a_corner():
+    metrics, rows, *_ = measure_gaze("corners", purpose="traverse")
+    assert metrics["turn_90_settle_seconds"] <= .5
+    assert max(row[1] for row in rows[:40]) <= math.pi / 2 + math.radians(.5)
+
+
+@pytest.mark.parametrize("dt", (1 / 60, .1, .25))
+def test_corner_turns_never_overshoot_at_any_motor_cadence(dt):
+    _, rows, *_ = measure_gaze("corners", dt=dt)
+    assert max(row[1] for row in rows if row[0] < 4.) <= math.pi / 2 + math.radians(.5)
 
 
 @pytest.mark.parametrize("purpose", ("combat", "precise", "traverse"))

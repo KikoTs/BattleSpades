@@ -411,10 +411,9 @@ class CTFBotPolicy:
                     engagement_radius=32.0,
                 )
 
-        if observer.player_id % 3 == 0 and own_base is not None:
-            defence = _formation_point(own_base.position, observer.player_id, 6.0)
+        if own_base is not None and self._is_defender(frame, observer, own_base.position):
             return ModeBotDecision(
-                defence,
+                self._guard_point(frame, observer, own_base.position, enemy_intel),
                 f"{prefix}ctf_defend",
                 sprint=False,
                 arrival_radius=3.0,
@@ -428,6 +427,18 @@ class CTFBotPolicy:
             and enemy_intel.carrier_id < 0
             and (not classic or int(enemy_intel.state) == 0)
         ):
+            if own_base is not None and self._should_rally(
+                    frame, observer, own_base.position, enemy_intel.position):
+                return ModeBotDecision(
+                    observer.position,
+                    f"{prefix}ctf_rally",
+                    sprint=False,
+                    arrival_radius=4.0,
+                    posture=ModeBotPosture.DEFEND,
+                    objective_priority=0.8,
+                    engagement_radius=60.0,
+                    watch_position=enemy_intel.position,
+                )
             return ModeBotDecision(
                 enemy_intel.position,
                 f"{prefix}ctf_attack_intel",
@@ -438,6 +449,73 @@ class CTFBotPolicy:
                 engagement_radius=90.0,
             )
         return None
+
+
+    @staticmethod
+    def _should_rally(frame: PerceptionFrame, observer: PlayerSnapshot,
+                      base: Vector3, goal: Vector3) -> bool:
+        """Wait at midfield for a teammate who is about to arrive.
+
+        Lone attackers reached the enemy base one at a time and died there;
+        five minutes produced no pickup. The wait is self-limiting: it exists
+        only while an ally is coming up from behind within 70 blocks, never
+        under fire, and ends the moment anyone is alongside.
+        """
+        ax, ay = goal[0] - base[0], goal[1] - base[1]
+        span = ax * ax + ay * ay
+        if span < 160.0 ** 2:
+            return False
+
+        def along(position: Vector3) -> float:
+            return ((position[0] - base[0]) * ax + (position[1] - base[1]) * ay) / span
+
+        mine = along(observer.position)
+        recently_hit = (observer.last_damage_at > 0.0
+                        and 0.0 <= frame.created_at - observer.last_damage_at <= 4.0)
+        if not 0.38 <= mine <= 0.58 or recently_hit:
+            return False
+        allies = [player for player in frame.players
+                  if player.team == observer.team and player.alive and player.spawned
+                  and player.player_id != observer.player_id]
+        if any(math.dist(player.position, observer.position) <= 18.0
+               or along(player.position) > mine + 0.04 for player in allies):
+            return False  # someone is alongside, or the push already left
+        return any(0.12 <= along(player.position) < mine
+                   and math.dist(player.position, observer.position) <= 70.0
+                   for player in allies)
+
+    @staticmethod
+    def _is_defender(frame: PerceptionFrame, observer: PlayerSnapshot,
+                     base: Vector3) -> bool:
+        """Keep the teammates nearest home on guard; everyone else attacks.
+
+        Fixed ``id % 3`` sentries froze four of ten bots for a whole match.
+        Proximity rotates the duty by itself: a fresh respawn beside the base
+        relieves the previous guard, who then joins the push.
+        """
+        team = [player for player in frame.players
+                if player.team == observer.team and player.alive and player.spawned]
+        wanted = 0 if len(team) < 3 else 1 if len(team) < 7 else 2
+        if wanted == 0:
+            return False
+        own = math.dist(observer.position, base)
+        closer = sorted(math.dist(player.position, base) for player in team
+                        if player.player_id != observer.player_id)
+        if len(closer) < wanted:
+            return True
+        # A relief must be clearly nearer before the duty changes hands, so
+        # two bots at similar range do not swap roles every decision.
+        return own <= closer[wanted - 1] + 6.0 and own <= 90.0
+
+    @staticmethod
+    def _guard_point(frame: PerceptionFrame, observer: PlayerSnapshot, base: Vector3,
+                     enemy_intel) -> Vector3:
+        """Walk a slow beat around the base, with a forward picket every third leg."""
+        beat = int((float(frame.created_at) + observer.player_id * 4.1) // 16.0)
+        if beat % 3 == 2 and enemy_intel is not None and enemy_intel.carrier_id < 0:
+            return _toward(base, enemy_intel.position, 26.0 + 4.0 * (observer.player_id % 3))
+        return _formation_point(base, observer.player_id + beat * 5,
+                                7.0 + 4.0 * ((beat + observer.player_id) % 3))
 
 
 class ZombieBotPolicy:
@@ -820,7 +898,7 @@ class DemolitionBotPolicy:
             )
         if observer.player_id % 4 == 0 and own_base is not None:
             return ModeBotDecision(
-                _formation_point(own_base.position, observer.player_id, 6.0),
+                _guard_beat(frame, observer, own_base.position, 6.0),
                 "demolition_defend_base",
                 sprint=False,
                 arrival_radius=3.0,
@@ -863,7 +941,7 @@ class TerritoryControlBotPolicy:
                 key=lambda item: _distance_squared(observer.position, item.position),
             )
             return ModeBotDecision(
-                _formation_point(base.position, observer.player_id, 4.0),
+                _guard_beat(frame, observer, base.position, 4.0),
                 "territory_defend",
                 sprint=False,
                 arrival_radius=2.5,
@@ -960,7 +1038,7 @@ class DiamondMineBotPolicy:
                 key=lambda item: _distance_squared(observer.position, item.position),
             )
             return ModeBotDecision(
-                _formation_point(target.position, observer.player_id, 5.0),
+                _guard_beat(frame, observer, target.position, 5.0),
                 "diamond_guard_dropoff",
                 sprint=False,
                 arrival_radius=3.0,
@@ -1285,6 +1363,18 @@ def _friendly_player(
         ),
         None,
     )
+
+
+def _guard_beat(frame: PerceptionFrame, observer: PlayerSnapshot, center: Vector3,
+                radius: float) -> Vector3:
+    """Move a sentry between a few posts instead of freezing it on one cell.
+
+    The post changes every 18 seconds on an identity-staggered clock and stays
+    inside the fortification radius of the guarded objective.
+    """
+    beat = int((float(frame.created_at) + observer.player_id * 5.3) // 18.0)
+    return _formation_point(center, observer.player_id + beat * 5,
+                            radius + 2.5 * ((beat + observer.player_id) % 3))
 
 
 def _formation_point(position: Vector3, key: int, radius: float) -> Vector3:
