@@ -1,6 +1,6 @@
-# Beta 1.1 welcome and build date
+# Beta 0.1 welcome and build date
 
-The default private join greeting identifies **BattleSpades Beta 1.1** and the
+The default private join greeting identifies **BattleSpades Beta 0.1** and the
 build's UTC day. Its three MOTD lines identify the server and BattleSpades
 client as an open AoS Revival project, link `https://aosplay.net`, and link:
 

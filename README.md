@@ -27,7 +27,7 @@ classic game stays alive and playable — and so it's a solid base for ports to 
 
 - [Status](#status)
 - [Quick start](#quick-start)
-- [Portable alpha releases](#portable-alpha-releases)
+- [Portable beta releases](#portable-beta-releases)
 - [What works](#what-works)
 - [Architecture](#architecture)
 - [Building from source](#building-from-source)
@@ -66,7 +66,7 @@ and feature guides are indexed in [its documentation](../BattleSpadesClient/docs
 ## Quick start
 
 For a dedicated server without a Python or compiler installation, use a
-[portable alpha release](#portable-alpha-releases). The source workflow below
+[portable beta release](#portable-beta-releases). The source workflow below
 is intended for development and custom server builds.
 
 You need **Python 3.10–3.12** (3.12 is the primary dev target) and a **C/C++ compiler**
@@ -104,7 +104,7 @@ python run_server.py                     # start the server on port 27015
 ```
 </details>
 
-## Portable alpha releases
+## Portable beta releases
 
 [`VERSION`](VERSION) defines the release version. The release workflow targets
 six standalone server archives. Each archive
@@ -187,7 +187,7 @@ No system Python or compiler is needed. Change the default admin password
 `changeme` before exposing UDP port 27015. Verify the downloaded zip against
 the release's `SHA256SUMS.txt`.
 
-The first macOS alpha is unsigned and unnotarized, so Gatekeeper may require an
+The macOS beta is unsigned and unnotarized, so Gatekeeper may require an
 explicit operator override. The release does not claim Apple notarization.
 
 ## What works

@@ -1,9 +1,10 @@
-name: Build portable alpha release
+name: Build portable beta release
 
 on:
   workflow_dispatch:
   push:
     tags:
+      - "v*-beta.*"
       - "v*-alpha.*"
 
 concurrency:
@@ -183,7 +184,7 @@ jobs:
       - name: Require complete matrix and write checksums
         run: python scripts/verify_release_assets.py --asset-dir release-assets --project-root .
 
-      - name: Publish unsigned alpha prerelease
+      - name: Publish unsigned beta prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -192,4 +193,4 @@ jobs:
           --verify-tag
           --prerelease
           --title "BattleSpades ${GITHUB_REF_NAME#v}"
-          --notes "Unsigned alpha server builds for Windows, Linux, and macOS on x86_64 and arm64. macOS archives are not notarized. Verify downloads with SHA256SUMS.txt."
+          --notes "Unsigned beta server builds for Windows, Linux, and macOS on x86_64 and arm64. macOS archives are not notarized. Verify downloads with SHA256SUMS.txt."
