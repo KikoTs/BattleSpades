@@ -239,6 +239,9 @@ class PlayerSnapshot:
     last_task_at: float = 0.0
     # Mode-authoritative weapon/spade permission while carrying an objective.
     can_shoot: bool = True
+    # (tool, clip, reserve) for each owned firearm, so a bot can draw its
+    # sidearm when the primary runs dry. Policies read only the observer's.
+    weapon_ammo: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,6 +334,12 @@ class MovementIntent:
     # Combat, terrain actions and flight leave these unset.
     travel_source: Vector3 | None = None
     travel_waypoint: Vector3 | None = None
+    # Where the eyes rest during ordinary travel: a point farther along the
+    # route than the step underfoot. Unset means "face the step itself".
+    gaze_waypoint: Vector3 | None = None
+    # Ordinary walking may run off ledges this many blocks high. Falls only
+    # start to hurt at ten blocks, so a short drop is just more walking.
+    walk_drop: int = 1
 
 
 @dataclass(frozen=True, slots=True)

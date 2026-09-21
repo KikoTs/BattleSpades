@@ -384,6 +384,9 @@ class BaseMode(ABC):
         try:
             # 1) Victory sting immediately on the win.
             play_ending_music(self.server)
+            sign_off = getattr(getattr(self.server, "bots", None), "on_match_phase", None)
+            if callable(sign_off):
+                sign_off("end")
 
             # 2) Send final leaderboard data without a terminal UI trigger.
             # ShowGameStats opens a native statistics overlay which is safe

@@ -72,6 +72,8 @@ class BotConfig:
     configured: bool = False
     behavior_version: str = "cooperative"
     friendly_mischief: bool = True
+    # Sparse, rate-limited bot chat reacting to kills and round boundaries.
+    chatter: bool = True
 
 
 @dataclass
@@ -687,6 +689,7 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.bots.friendly_mischief = bool(
             b.get("friendly_mischief", config.bots.friendly_mischief)
         )
+        config.bots.chatter = bool(b.get("chatter", config.bots.chatter))
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
         )

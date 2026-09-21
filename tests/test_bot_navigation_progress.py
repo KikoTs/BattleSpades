@@ -86,7 +86,7 @@ def test_internal_navigation_diagnostics_are_fixed_and_detached():
     state.goal_progress_at = 90.
     state.planning_results[("cached",)] = object()
     snapshot = SimpleBotBrain._navigation_diagnostics(state, 100.)
-    assert len(snapshot) == 20
+    assert len(snapshot) == 21
     assert dict(snapshot)["corridor_expansions"] == 1536
     assert dict(snapshot)["goal_progress_age"] == 10.
     assert dict(snapshot)["escape_goal"] == (10., 20., 30.)

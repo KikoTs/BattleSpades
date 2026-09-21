@@ -8,7 +8,7 @@ max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 # Private welcome after loading, once per connection. Omitted settings use the
-# Beta 1.1/AoS Revival defaults. Tokens: {player}, {release}, {build_date}.
+# Beta 0.1/AoS Revival defaults. Tokens: {player}, {release}, {build_date}.
 # Custom MOTD replaces the default lines; empty greeting and [] disable both.
 # join_greeting = "Welcome, {player}! {release} | Build (UTC): {build_date}"
 # motd = ["Build big. Play fair. Have fun!"]
@@ -300,6 +300,8 @@ path_requests_per_second = 24
 # Beta tactical squads; set "classic" to retain the previous behavior layer.
 behavior_version = "cooperative"
 friendly_mischief = true
+# Occasional short bot chat lines after kills/deaths (hard rate limited).
+chatter = true
 main_thread_budget_ms = 0.75
 seed = 0
 debug_visualization = false

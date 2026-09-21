@@ -211,6 +211,21 @@ class SimpleVoxelWorld:
         self._planning_time = float(now)
         self._planning_requested = False
 
+    def planning_available(self) -> bool:
+        """Can this decision obtain a route right now?
+
+        When it cannot, the observer still takes its place in the fair queue,
+        so a caller may keep using what it has and ask again next decision.
+        """
+        budget = self.planning_budget
+        if budget is None or self._planning_observer is None:
+            return True
+        if budget.would_grant(self._planning_observer, self._planning_time):
+            return True
+        budget.try_acquire(self._planning_observer, self._planning_time)
+        self._planning_requested = True
+        return False
+
     def end_planning(self, *, cancel_unused: bool = False) -> None:
         if (cancel_unused and not self._planning_requested
                 and self._planning_observer is not None and self.planning_budget is not None):
@@ -302,34 +317,68 @@ class SimpleVoxelWorld:
                     )
 
     def route_needs_replan(self, version: int, position: Vector3,
-                           steps: tuple[RouteStep, ...]) -> bool:
-        """Check <=65 small column neighborhoods, keeping distant edits cheap.
+                           steps: tuple[RouteStep, ...], *, stuck: bool = False) -> bool:
+        """Did committed terrain change along the stretch of route just ahead?
 
-        Columns conservatively cover every floor and wall height. Simple walk
-        and crouch segments can survive unrelated edits; jump/dig/build/flight
-        geometry and unknown history retain ordinary global invalidation. The
-        authoritative motor still checks the actual body before movement.
+        ``stuck`` callers, who have made no headway for a while, reconsider an
+        exact edge (jump, drop, dig, build, flight, swim) on any edit at all:
+        committing to a route is for a body that is getting somewhere.
+
+        A global version bump is not a reason to replan: in a firefight blocks
+        break somewhere every second, and treating each as an invalidation made
+        every bot discard its route, queue for the planner and stand waiting,
+        over and over. Every edit is stamped on its column, so the body and the
+        next steps' 3x3 column neighbourhoods are compared instead, for every
+        kind of step, including the cells a dig edge expects to find solid.
+        Farther steps are checked when the body gets there; unknown edit
+        history still invalidates everything.
         """
         if (self._column_version_base < 0
                 or not self._column_version_base <= version <= self.topology_version
                 or self._column_version_latest != self.topology_version
-                or not steps or len(steps) > MAX_ROUTE_VALIDATION_STEPS):
+                or not steps):
             return True
-        if any(step.affordance not in {MovementAffordance.WALK, MovementAffordance.CROUCH}
-               or step.breach is not None for step in steps):
+        if stuck and any(step.affordance not in {MovementAffordance.WALK, MovementAffordance.CROUCH}
+                         or step.breach is not None
+                         for step in steps[:MAX_ROUTE_VALIDATION_STEPS]):
+            return True
+        versions = self._column_versions
+        checked: set[int] = set()
+
+        def changed_near(x: float, y: float, reach: int = 1) -> bool:
+            cx, cy = int(math.floor(x)), int(math.floor(y))
+            if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
+                return True
+            key = cy * MAP_SIZE + cx
+            if key in checked:
+                return False
+            checked.add(key)
+            return any(versions[column_y * MAP_SIZE + column_x] > version
+                       for column_y in range(max(0, cy - reach), min(MAP_SIZE, cy + reach + 1))
+                       for column_x in range(max(0, cx - reach), min(MAP_SIZE, cx + reach + 1)))
+
+        # Anything changing within tool reach of the body matters, whether or
+        # not it touches the current route: the bot's own dig or build, or a
+        # teammate's beside it, usually exists to open a better way.
+        if changed_near(position[0], position[1], reach=4):
             return True
         previous = position
-        for point in (position, *(step.waypoint for step in steps)):
-            if (not all(math.isfinite(value) for value in point)
-                    or math.dist(previous, point) > 2.0):
+        for step in steps[:MAX_ROUTE_VALIDATION_STEPS]:
+            point = step.waypoint
+            if not all(math.isfinite(value) for value in (*previous, *point)):
                 return True
-            x, y = int(math.floor(point[0])), int(math.floor(point[1]))
-            if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+            # Compacted straight runs and flight gaps span several columns.
+            span = math.hypot(point[0] - previous[0], point[1] - previous[1])
+            pieces = max(1, int(math.ceil(span)))
+            for piece in range(pieces + 1):
+                fraction = piece / pieces
+                if changed_near(previous[0] + (point[0] - previous[0]) * fraction,
+                                previous[1] + (point[1] - previous[1]) * fraction):
+                    return True
+            if step.breach is not None and any(
+                    changed_near(cell[0] + 0.5, cell[1] + 0.5)
+                    for cell in (step.breach.target_cell, *step.breach.blocking_cells)):
                 return True
-            for column_y in range(max(0, y - 1), min(MAP_SIZE, y + 2)):
-                for column_x in range(max(0, x - 1), min(MAP_SIZE, x + 2)):
-                    if self._column_versions[column_y * MAP_SIZE + column_x] > version:
-                        return True
             previous = point
         return False
 
@@ -790,7 +839,7 @@ class SimpleVoxelWorld:
                 came_by[node],
                 came_breach[node],
                 (nodes[index - 1], node)
-                if came_by[node] is MovementAffordance.JUMP else None,
+                if came_by[node] in {MovementAffordance.JUMP, MovementAffordance.DROP} else None,
             )
             for index, node in enumerate(nodes[1:], start=1)
         )
@@ -1930,6 +1979,12 @@ class SimpleVoxelWorld:
                 if (
                     1 < delta <= 4
                     and MovementAffordance.DROP in abilities
+                    # The body walks into the lower column at the height it
+                    # stands at and only then falls. A tunnel mouth whose roof
+                    # is below that height is not a drop: MayanJungle bots
+                    # stood at such a lip until the motor's refusal timed out.
+                    and not any(self.solid(nx, ny, z) for z in range(
+                        int(support_z) - 3, int(sample.support_z)))
                 ):
                     yield (
                         neighbor,
@@ -2064,21 +2119,27 @@ class SimpleVoxelWorld:
         source_support: int,
         landing_support: int,
     ) -> bool:
-        """Reject a nominal gap jump whose intermediate body crosses terrain."""
+        """Reject a nominal gap jump whose airborne body would meet terrain.
 
-        for offset in range(1, max(1, int(distance))):
-            fraction = float(offset) / float(distance)
-            body_support = int(round(
-                float(source_support)
-                + (float(landing_support) - float(source_support))
-                * fraction
-            ))
+        A standing body is three cells tall and a jump lifts it about one
+        more. Checking only two cells let the planner "jump" through a
+        head-height opening under a slab: on AncientEgypt bots hopped into the
+        slab twice, gave up, blocked the edge and tried the identical jump two
+        rows along, for as long as they were near it. Such openings are dug or
+        walked around like any other low ceiling.
+        """
+
+        highest = min(int(source_support), int(landing_support))
+        for offset in range(0, max(1, int(distance)) + 1):
             cell_x = int(x) + int(dx) * offset
             cell_y = int(y) + int(dy) * offset
-            if any(
-                self.solid(cell_x, cell_y, body_support - body_offset)
-                for body_offset in (2, 1)
-            ):
+            floor = (int(source_support) if offset == 0 else int(landing_support)
+                     if offset == int(distance) else highest)
+            # Take-off and landing need standing room plus the arc; the gap
+            # itself must be open from the higher lip's feet to that apex.
+            lowest_body_cell = floor - 1 if offset in (0, int(distance)) else highest - 1
+            if any(self.solid(cell_x, cell_y, z)
+                   for z in range(highest - 4, lowest_body_cell + 1)):
                 return False
         return True
 

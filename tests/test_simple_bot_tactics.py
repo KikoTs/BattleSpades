@@ -218,7 +218,9 @@ def test_detour_is_not_blacklisted_for_moving_away_from_final_goal() -> None:
     intent = brain._navigation_intent(_frame(observer), observer, state, goal, 100.0)
     assert intent.movement.direction[0] < 0
     assert not state.blocked_edges
-    assert not world.plan_calls
+    # The detour itself is never replanned or swapped for a swim. Asking for
+    # the dry continuation beyond a nearly finished segment is expected.
+    assert world.plan_calls in ([], [False])
 
 
 def test_stale_weapon_never_requests_fire_with_an_unowned_tool() -> None:

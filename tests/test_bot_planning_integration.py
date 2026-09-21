@@ -107,10 +107,11 @@ def test_real_brain_dispatch_keeps_live_state_when_another_observer_used_grant(m
     assert world._planning_observer is None
 
 
-def test_topology_denial_preserves_route_breach_and_failed_edge_history(monkeypatch):
+@pytest.mark.parametrize("kind", (MovementAffordance.WALK, MovementAffordance.BREACH))
+def test_topology_denial_preserves_route_breach_and_failed_edge_history(monkeypatch, kind):
     world, brain, observer, state, goal = _setup(monkeypatch)
     brain._set_goal(state, goal, observer.position, 99)
-    state.route = (RouteStep((12.5, 10.5, 97.75), MovementAffordance.WALK),)
+    state.route = (RouteStep((12.5, 10.5, 97.75), kind),)
     state.route_topology_version = 0
     state.breach_key = ("unchanged_breach",)
     state.breach_started_at = 99
@@ -120,12 +121,21 @@ def test_topology_denial_preserves_route_breach_and_failed_edge_history(monkeypa
     state.navigation_progress_position = state.navigation_window_position = observer.position
     route = state.route
     world.planning_budget.try_acquire((2, 1), 100)
-    assert _navigate(world, brain, observer, state, goal).debug_role.endswith(":planning_wait")
+    denied = _navigate(world, brain, observer, state, goal)
     assert state.route is route and state.route_topology_version == 0
-    assert state.breach_key == ("unchanged_breach",)
-    assert state.breach_started_at == 99 and state.next_breach_at == 101
-    assert state.waypoint_progress_at == 99
     assert not state.blocked_edges
+    if kind is MovementAffordance.WALK:
+        # A busy planner is no reason to halt on plain ground: the still-usable
+        # walk continues and the revalidation is asked for again next decision.
+        assert not denied.debug_role.endswith(":planning_wait")
+        assert denied.movement.direction[0] > 0
+    else:
+        # An exact edge is never executed against changed terrain; it waits
+        # with its dig clocks and progress history untouched.
+        assert denied.debug_role.endswith(":planning_wait")
+        assert state.breach_key == ("unchanged_breach",)
+        assert state.breach_started_at == 99 and state.next_breach_at == 101
+        assert state.waypoint_progress_at == 99
     recovered = _navigate(world, brain, observer, state, goal, 101)
     assert recovered.movement.direction[0] > 0
     assert state.route_topology_version == 1
@@ -270,7 +280,8 @@ def test_completed_corridor_survives_deferred_join_then_executes(monkeypatch):
     world.begin_planning((1, 1), 101)
     target = brain._corridor_segment_goal(state, observer, goal, 101)
     world.end_planning()
-    assert target == search.path[0]
+    # One detailed plan is sent a straight section along the corridor, not to its next corner.
+    assert target in search.path[1:] and math.dist(target, search.path[0]) <= 8.0
     assert state.corridor_search is None and state.corridor == search.path
     result = _navigate(world, brain, observer, state, goal, 102)
     assert result.movement.direction[0] > 0
@@ -295,12 +306,18 @@ def test_long_coarse_search_reserves_next_grant_for_missing_local_route(monkeypa
                                    10 * 512 + 10, 400 * 512 + 400)
     state.corridor_search = _BudgetedCorridorSearch(world, search)
     first = _navigate(world, brain, observer, state, goal, 100)
-    assert first.debug_role.endswith(":planning_wait")
+    # Without a route there is nothing to walk: wait. A retained route is kept
+    # in use while its revalidation queues behind the coarse search.
+    assert first.debug_role.endswith(":planning_wait") is not stale_route
     assert search.expansions == 512 and not search.done
     # Another observer owns this turn. Retain the local reservation; denied
     # admission must not let coarse search steal the following grant again.
     world.planning_budget.try_acquire((2, 1), 101)
-    assert _navigate(world, brain, observer, state, goal, 101).debug_role.endswith(":planning_wait")
+    second = _navigate(world, brain, observer, state, goal, 101)
+    assert second.debug_role.endswith(":planning_wait") is not stale_route
+    if stale_route:
+        assert first.movement.direction[0] > 0 and second.movement.direction[0] > 0
+        assert state.route_topology_version == 0
     recovered = _navigate(world, brain, observer, state, goal, 102)
     assert math.hypot(*recovered.movement.direction[:2]) > .9
     assert state.route_topology_version == world.topology_version

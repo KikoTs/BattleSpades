@@ -16,6 +16,7 @@ from typing import Iterable
 ObserverKey = tuple[int, int]
 MAX_PENDING_OBSERVERS = 128
 MAX_BURST_JOBS = 8
+REQUESTS_PER_BOT = 6.0
 MAX_SEARCHES_PER_JOB = 2
 MAX_EXPANSIONS_PER_JOB = 512
 MAX_PROFILE_SAMPLES = 256
@@ -53,6 +54,8 @@ class PlanningBudget:
             raise ValueError("planning rate must be finite and positive")
         if not math.isfinite(frequency) or frequency <= 0.0:
             raise ValueError("decision frequency must be finite and positive")
+        self.configured_rate = rate
+        self.decision_hz = frequency
         self.requests_per_second = rate
         self.burst = max(1, min(MAX_BURST_JOBS, math.ceil(rate / frequency)))
         self.stale_seconds = max(1.0, 2.0 / frequency)
@@ -75,6 +78,21 @@ class PlanningBudget:
         self._last_granted.clear()
         self._last_time = None
         self._credits = float(self.burst)
+
+    def scale_for(self, bots: int) -> None:
+        """Never ration a roster below a few route requests per bot per second.
+
+        One fixed team-wide rate was tuned for a handful of bots. Ten bots on a
+        terraced map ask about 28 times a second between them; at 24 more than
+        half were deferred, and a bot working through an escape's candidate
+        exits stood still for nine seconds waiting its turn. A request costs a
+        few milliseconds on the AI worker, so the configured rate is kept as a
+        floor and the ceiling follows the number of live bots.
+        """
+        rate = max(self.configured_rate, REQUESTS_PER_BOT * max(0, int(bots)))
+        if rate != self.requests_per_second:
+            self.requests_per_second = rate
+            self.burst = max(1, min(MAX_BURST_JOBS, math.ceil(rate / self.decision_hz)))
 
     def refresh_waiters(self, observers: Iterable[ObserverKey], now: float) -> None:
         """Refresh a batch's live waiters before slow work expires their turn."""
@@ -127,6 +145,17 @@ class PlanningBudget:
             del self._last_granted[next(iter(self._last_granted))]
         self.granted += 1
         return PlanningJob()
+
+    def would_grant(self, observer: ObserverKey, now: float) -> bool:
+        """Whether ``try_acquire`` would admit this observer now; changes nothing."""
+        now = float(now)
+        observer = int(observer[0]), int(observer[1])
+        elapsed = max(0.0, now - self._last_time) if self._last_time is not None else 0.0
+        credits = min(float(self.burst), self._credits + elapsed * self.requests_per_second)
+        cutoff = now - self.stale_seconds
+        head = next((key for key, requested in self._pending.items() if requested >= cutoff), None)
+        return (credits + 1e-9 >= 1.0 and self._last_granted.get(observer) != now
+                and head in (None, observer))
 
     def finish(self, job: PlanningJob, seconds: float) -> None:
         self.searches += job.searches
