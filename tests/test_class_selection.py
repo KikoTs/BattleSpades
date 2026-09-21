@@ -17,11 +17,27 @@ from server.player import Player
 from shared.packet import ChangeClass, SetClassLoadout
 
 
+def _track_lives(player: Player) -> Player:
+    """Count ended lives: a class change ends one without a scoreboard death."""
+
+    player.lives_ended = 0
+    original_die = player.die
+
+    def counted_die(*args, **kwargs):
+        was_alive = player.alive
+        result = original_die(*args, **kwargs)
+        player.lives_ended += int(was_alive and not player.alive)
+        return result
+
+    player.die = counted_die
+    return player
+
+
 def _live_medic() -> Player:
     player = Player(3, "SelectionTest", TEAM1, C.LIGHT_MACHINE_GUN_TOOL, None)
     player.apply_class_selection(normalize_class_selection(C.CLASS_MEDIC))
     player.spawn(100.5, 100.5, 60.0)
-    return player
+    return _track_lives(player)
 
 
 def _handler() -> PacketHandler:
@@ -171,7 +187,7 @@ def test_set_loadout_then_change_class_stages_one_selection_and_kills_once():
     ))
     asyncio.run(handler.handle(player, _change_class_packet(C.CLASS_MINER)))
 
-    assert player.deaths == 1
+    assert player.lives_ended == 1 and player.deaths == 0
     assert player.class_id == C.CLASS_MEDIC
     assert player.pending_selection.class_id == C.CLASS_MINER
     assert C.DYNAMITE_TOOL in player.pending_selection.loadout
@@ -195,7 +211,7 @@ def test_change_class_then_set_loadout_replaces_defaults_without_second_death():
         ),
     ))
 
-    assert player.deaths == 1
+    assert player.lives_ended == 1 and player.deaths == 0
     assert C.SHOTGUN2_TOOL in player.pending_selection.loadout
     assert C.C4_TOOL in player.pending_selection.loadout
 
@@ -209,7 +225,7 @@ def test_untrusted_instant_selection_still_waits_for_competitive_respawn():
         _loadout_packet(C.CLASS_MINER, [C.SHOTGUN_TOOL, C.DYNAMITE_TOOL], 1),
     ))
 
-    assert player.deaths == 1
+    assert player.lives_ended == 1 and player.deaths == 0
     assert player.class_id == C.CLASS_MEDIC
     assert C.MEDPACK_TOOL in player.loadout
     assert player.pending_selection.class_id == C.CLASS_MINER
@@ -228,7 +244,7 @@ def test_same_class_live_loadout_change_stages_and_forces_respawn():
         ),
     ))
 
-    assert player.deaths == 1
+    assert player.lives_ended == 1 and player.deaths == 0
     assert player.class_id == C.CLASS_MEDIC
     assert C.SHOTGUN2_TOOL not in player.loadout
     assert C.SHOTGUN2_TOOL in player.pending_selection.loadout
@@ -236,7 +252,7 @@ def test_same_class_live_loadout_change_stages_and_forces_respawn():
 
 
 def test_map_creator_same_class_backpack_change_remains_live():
-    player = Player(3, "UGCBuilder", TEAM1, C.BLOCK_TOOL, None)
+    player = _track_lives(Player(3, "UGCBuilder", TEAM1, C.BLOCK_TOOL, None))
     player.apply_class_selection(normalize_class_selection(
         C.CLASS_UGCBUILDER,
     ))
@@ -254,14 +270,14 @@ def test_map_creator_same_class_backpack_change_remains_live():
     packet.ugc_tools = list(player.ugc_tools)
     asyncio.run(handler.handle(player, bytes(packet.generate())))
 
-    assert player.deaths == 0
+    assert player.lives_ended == 0 and player.deaths == 0
     assert player.prefabs == ["Tent"]
     assert player.pending_selection is None
     assert len(handler.server.broadcasts) == 1
 
 
 def test_scout_mine_to_locator_swap_receives_a_new_life_boundary():
-    player = Player(3, "ScoutSwap", TEAM1, C.SNIPER_TOOL, None)
+    player = _track_lives(Player(3, "ScoutSwap", TEAM1, C.SNIPER_TOOL, None))
     player.apply_class_selection(normalize_class_selection(
         C.CLASS_SCOUT,
         [C.SNIPER_TOOL, C.LANDMINE_TOOL, C.PICKAXE_TOOL],
@@ -277,7 +293,7 @@ def test_scout_mine_to_locator_swap_receives_a_new_life_boundary():
         ),
     ))
 
-    assert player.deaths == 1
+    assert player.lives_ended == 1 and player.deaths == 0
     assert C.LANDMINE_TOOL in player.loadout
     assert C.RADAR_STATION_TOOL not in player.loadout
     assert C.RADAR_STATION_TOOL in player.pending_selection.loadout

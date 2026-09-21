@@ -117,7 +117,7 @@ def test_production_abilities_route_over_a_two_block_obstacle() -> None:
     solids = {(x, 10, 20) for x in range(10, 15)}
     solids.update({(12, 10, 18), (12, 10, 19)})
     world = _world(solids)
-    abilities = _movement_abilities(SimpleNamespace())
+    abilities = _movement_abilities(SimpleNamespace(can_shoot=True))
 
     plan = world.plan(
         (10.5, 10.5, 17.75),
@@ -306,7 +306,7 @@ def test_production_bot_breaches_level_two_cell_high_passage() -> None:
         (11, 10, 17),
     }
     world = _world(solids)
-    observer = SimpleNamespace(loadout=(int(C.SPADE_TOOL),))
+    observer = SimpleNamespace(can_shoot=True, loadout=(int(C.SPADE_TOOL),))
 
     plan = world.plan(
         (10.5, 10.5, 17.75),
@@ -1001,7 +1001,7 @@ def test_zombie_hand_can_carve_a_waterline_exit_through_a_high_bank() -> None:
     )
     world._dirty_columns.update({(10, 10), (11, 10)})
     profile = _dig_profile(
-        SimpleNamespace(loadout=(int(C.ZOMBIEHAND_TOOL),))
+        SimpleNamespace(can_shoot=True, loadout=(int(C.ZOMBIEHAND_TOOL),))
     )
 
     step = world.water_bank_breach((10.5, 10.5, 236.75), profile)
@@ -1025,7 +1025,7 @@ def test_zombie_hand_can_carve_a_waterline_exit_through_a_high_bank() -> None:
 
 def test_rejected_waterline_breach_cannot_reenter_through_the_banks_upper_floor() -> None:
     world = _world({(10, 10, 239)} | {(11, 10, z) for z in range(230, 240)})
-    profile = _dig_profile(SimpleNamespace(loadout=(int(C.ZOMBIEHAND_TOOL),)))
+    profile = _dig_profile(SimpleNamespace(can_shoot=True, loadout=(int(C.ZOMBIEHAND_TOOL),)))
     position = (10.5, 10.5, 236.75)
     step = world.water_bank_breach(position, profile)
     assert step is not None and step.breach is not None
@@ -1039,7 +1039,7 @@ def test_spade_never_targets_air_above_a_one_block_water_lip() -> None:
 
     world = _world({(11, 10, 238), (11, 10, 239)})
     profile = _dig_profile(
-        SimpleNamespace(loadout=(int(C.SPADE_TOOL),))
+        SimpleNamespace(can_shoot=True, loadout=(int(C.SPADE_TOOL),))
     )
 
     target, swings = world._clearance_target(
@@ -1399,7 +1399,7 @@ def test_two_block_route_drives_real_native_player_over_wall() -> None:
         plan = world.plan(
             bot.position,
             (106.5, 100.5, 59.75),
-            abilities=_movement_abilities(SimpleNamespace()),
+            abilities=_movement_abilities(SimpleNamespace(can_shoot=True)),
         )
         assert plan.reached_segment_goal is True
 
@@ -1477,6 +1477,7 @@ def _sealed_wall_solids(*, thickness: int = 1) -> set[tuple[int, int, int]]:
 def test_sealed_wall_route_plans_exact_spade_clearance_cell() -> None:
     world = _world(_sealed_wall_solids())
     observer = SimpleNamespace(
+        can_shoot=True,
         loadout=(int(C.SMG_TOOL), int(C.SPADE_TOOL))
     )
 
@@ -1526,7 +1527,7 @@ def test_breach_cost_and_aim_follow_each_owned_tools_real_footprint() -> None:
     )
     for tool_id, expected_swings, expected_secondary in expectations:
         world = _world(_sealed_wall_solids())
-        observer = SimpleNamespace(loadout=(tool_id,))
+        observer = SimpleNamespace(can_shoot=True, loadout=(tool_id,))
         plan = world.plan(
             (12.5, 10.5, 17.75),
             (17.5, 10.5, 17.75),
@@ -1550,7 +1551,7 @@ def test_costed_route_uses_short_detour_instead_of_unnecessary_dig() -> None:
     }
     solids.update((13, 10, z) for z in (17, 18, 19))
     world = _world(solids)
-    observer = SimpleNamespace(loadout=(int(C.KNIFE_TOOL),))
+    observer = SimpleNamespace(can_shoot=True, loadout=(int(C.KNIFE_TOOL),))
 
     plan = world.plan(
         (10.5, 10.5, 17.75),
@@ -1592,7 +1593,7 @@ def test_route_skips_malformed_edge_cost_without_losing_valid_neighbors(
 def test_planned_tunnel_replans_until_a_two_column_wall_is_clear() -> None:
     solids = _sealed_wall_solids(thickness=2)
     world = _world(solids)
-    observer = SimpleNamespace(loadout=(int(C.SPADE_TOOL),))
+    observer = SimpleNamespace(can_shoot=True, loadout=(int(C.SPADE_TOOL),))
     profile = _dig_profile(observer)
     assert profile is not None
     position = (10.5, 10.5, 17.75)
@@ -1646,7 +1647,7 @@ def test_route_carves_upward_instead_of_arriving_under_high_ground() -> None:
         for z in range(17, 21)
     )
     world = _world(solids)
-    observer = SimpleNamespace(loadout=(int(C.SPADE_TOOL),))
+    observer = SimpleNamespace(can_shoot=True, loadout=(int(C.SPADE_TOOL),))
 
     approach = world.plan(
         (10.5, 10.5, 17.75),

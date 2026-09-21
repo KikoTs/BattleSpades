@@ -19,7 +19,12 @@ if sys.platform == "win32":
     extra_compile_args = ["/O2", "/GL-"]
     extra_link_args = ["/MANIFEST:NO"]
 else:
-    extra_compile_args = ["-O3", "-ffast-math"]
+    # The movement model is a bit-exact port of the retail x86 engine and the
+    # client predicts against it. -ffast-math reassociates float arithmetic and
+    # fused multiply-add (the default on arm64) changes rounding: both moved
+    # results by one unit in the last place against the retail fixtures. Keep
+    # strict IEEE evaluation on every platform.
+    extra_compile_args = ["-O3", "-fno-fast-math", "-ffp-contract=off"]
     extra_link_args = ["-O3"]
 
 

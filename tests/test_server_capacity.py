@@ -362,10 +362,12 @@ def test_mode_event_drain_budget_defers_fifo_tail_to_next_tick():
 
     asyncio.run(SimulationRuntime(server)._tick_mode())
 
+    # Events settle before on_tick so a final-frame kill still scores when
+    # that tick ends the match at its time limit.
     assert calls == [
-        ("tick", 77),
         ("event", 1),
         ("plugin", "event", 1),
+        ("tick", 77),
     ]
     assert list(server._mode_events) == [("event", (2,))]
 
