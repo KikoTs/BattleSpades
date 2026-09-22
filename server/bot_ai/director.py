@@ -731,6 +731,28 @@ class BotDirector:
         )
         return player
 
+    async def make_room_for_human(self) -> bool:
+        """Retire one bot so a joining human can take its slot.
+
+        Bots that are safe to retire go first. A human is never refused while
+        a bot holds the last slot, so an objective carrier is retired as a
+        last resort; remove_bot runs the mode's normal leave handling.
+        """
+
+        candidates = sorted(
+            self.bots,
+            key=lambda player: (
+                not self._safe_to_retire(player),
+                bool(getattr(player, "alive", False)),
+                int(player.id),
+            ),
+        )
+        for candidate in candidates:
+            if await self.remove_bot(candidate, force=True):
+                logger.info("Bot %s made room for a joining player", candidate.name)
+                return True
+        return False
+
     async def remove_bot(
         self, bot: "Player", *, force: bool = False, notify_mode: bool = True
     ) -> bool:
@@ -985,11 +1007,15 @@ class BotDirector:
             return
         else:
             desired = max(0, int(getattr(config, "fill_target", 12)) - humans)
-            reserved = max(0, int(getattr(config, "reserve_human_slots", 2)))
-            desired = min(
-                desired,
-                max(0, int(self.server.config.max_players) - humans - reserved),
-            )
+        # Bots never take a human's place. Every mode, including the fixed
+        # count Create Match uses, keeps at least one slot free for the next
+        # player; clients still loading already hold a reserved id.
+        joining = len(getattr(self.server, "reserved_player_ids", ()) or ())
+        reserved = max(1, int(getattr(config, "reserve_human_slots", 2)))
+        desired = min(
+            desired,
+            max(0, int(self.server.config.max_players) - humans - joining - reserved),
+        )
         desired = min(desired, maximum)
         while len(self.bots) < desired:
             if await self.add_bot() is None:
