@@ -776,6 +776,29 @@ class Connection:
         self.reset_for_scene_reload()
         return await self.send_connection_data(require_map_validation=True)
 
+    async def _claim_player_slot(self) -> bool:
+        """Reserve a player id, retiring a bot if bots fill the server.
+
+        A server full of humans refuses with ERROR_FULL here, before team and
+        class selection, instead of after the client pressed Select.
+        """
+        if self.reserved_player_id is not None:
+            return True
+        reserved = self.server.get_next_player_id()
+        if reserved < 0:
+            make_room = getattr(getattr(self.server, "bots", None), "make_room_for_human", None)
+            if callable(make_room) and await make_room():
+                reserved = self.server.get_next_player_id()
+        if reserved < 0:
+            from shared.constants import DISCONNECT
+
+            logger.warning("Server full, rejecting %s", self.peer.address)
+            self.disconnect(reason=int(DISCONNECT.ERROR_FULL))
+            return False
+        self.reserved_player_id = reserved
+        self.server.reserved_player_ids.add(reserved)
+        return True
+
     async def send_connection_data(
         self,
         *,
@@ -783,6 +806,8 @@ class Connection:
     ) -> bool:
         """Send the loader handshake and report whether map sync completed."""
         logger.info(f"Sending connection data to {self.peer.address}")
+        if not await self._claim_player_slot():
+            return False
         
         # Send initial info
         await self.send_info()
@@ -810,11 +835,8 @@ class Connection:
 
         # Reserve this client's player id NOW: StateData must carry the same
         # id the Player will get at NewPlayerConnection (see __init__ note).
-        if self.reserved_player_id is None:
-            reserved = self.server.get_next_player_id()
-            if reserved >= 0:
-                self.reserved_player_id = reserved
-                self.server.reserved_player_ids.add(reserved)
+        if not await self._claim_player_slot():
+            return False
 
         # Notes: State and players should sent "right away" (before NewPlayerConnection)
         await self.send_state_data(
@@ -1101,9 +1123,13 @@ class Connection:
             self.server.reserved_player_ids.discard(player_id)
         else:
             player_id = self.server.get_next_player_id()
+            if player_id < 0:
+                make_room = getattr(getattr(self.server, "bots", None), "make_room_for_human", None)
+                if callable(make_room) and await make_room():
+                    player_id = self.server.get_next_player_id()
         if player_id < 0:
             logger.warning("Server full, rejecting connection")
-            self.disconnect(reason=3)  # Server full
+            self.disconnect(reason=int(DISCONNECT.ERROR_FULL))
             return
         
         # NewPlayerConnection does not carry a concrete tool, so start with the default weapon tool.
