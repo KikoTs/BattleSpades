@@ -15,7 +15,7 @@ from typing import Protocol
 
 import shared.constants as C
 
-from .messages import PerceptionFrame, PlayerSnapshot, Vector3
+from .messages import ObjectiveSnapshot, PerceptionFrame, PlayerSnapshot, Vector3
 
 
 _ZOMBIE_CLASSES = frozenset({
@@ -518,8 +518,37 @@ class CTFBotPolicy:
                                 7.0 + 4.0 * ((beat + observer.player_id) % 3))
 
 
+_SURVIVOR_THREAT_RADIUS = 28.0
+_SURVIVOR_KITE_RADIUS = 9.0
+_ROAM_ARRIVAL_RADIUS = 5.0
+_ROAM_NO_PROGRESS_SECONDS = 15.0
+_ROAM_MIN_LEG = 15.0
+
+
+@dataclass(slots=True)
+class _RoamLeg:
+    """One survivor's current roam destination and its progress evidence."""
+
+    waypoint: Vector3
+    chosen_at: float
+    deadline: float
+    best_distance: float
+    progress_at: float
+    arrived_at: float | None = None
+
+
 class ZombieBotPolicy:
-    """Separate preparation, survivor, infected, and last-man behavior."""
+    """Separate preparation, survivor, infected, and last-man behavior.
+
+    Survivor roaming keeps a small per-life leg record so a bot walks a leg to
+    completion (or gives up on an unreachable one) instead of re-rolling its
+    destination on a clock, and so survivors spread out rather than clump.
+    """
+
+    def __init__(self) -> None:
+        self._epoch: tuple[int, int] | None = None
+        self._legs: dict[tuple[int, int, int], _RoamLeg] = {}
+        self._recent: dict[tuple[int, int, int], list[Vector3]] = {}
 
     def decide(
         self,
@@ -536,13 +565,15 @@ class ZombieBotPolicy:
         if phase in ("", "waiting", "countdown"):
             if own_anchor is None:
                 return None
-            preparation = _formation_point(
-                own_anchor.position,
-                observer.player_id,
-                10.0 + float(observer.player_id % 4) * 3.0,
-            )
+            if observer.player_id % 3 != 0:
+                # Most survivors scout and loot the map before the outbreak
+                # instead of all queueing on one fortification site.
+                return self._survivor_roam(frame, observer, own_anchor)
             return ModeBotDecision(
-                preparation,
+                _guard_beat(
+                    frame, observer, own_anchor.position,
+                    10.0 + float(observer.player_id % 4) * 3.0,
+                ),
                 "zombie_prepare_fortify",
                 sprint=False,
                 arrival_radius=5.0,
@@ -621,35 +652,177 @@ class ZombieBotPolicy:
                 engagement_radius=7.0,
             )
 
-        if own_anchor is not None:
-            fallback = _formation_point(
-                own_anchor.position,
-                observer.player_id,
-                12.0,
-            )
-            role = (
-                "zombie_survivor_regroup"
-                if survivor is None or survivor.team == observer.team
-                else "zombie_infected_breach"
-            )
+        if own_anchor is None:
+            return None
+        if int(observer.class_id) in _ZOMBIE_CLASSES:
             return ModeBotDecision(
-                fallback,
-                role,
-                sprint=role.endswith("breach"),
+                _formation_point(own_anchor.position, observer.player_id, 12.0),
+                "zombie_infected_breach",
+                sprint=True,
                 arrival_radius=5.0,
-                # Regrouping survivors keep fortifying; infected never do.
-                directive="fortify" if role == "zombie_survivor_regroup" else "",
-                posture=(
-                    ModeBotPosture.BUILD
-                    if role == "zombie_survivor_regroup"
-                    else ModeBotPosture.ASSAULT
-                ),
+                posture=ModeBotPosture.ASSAULT,
                 objective_priority=0.86,
-                engagement_radius=(
-                    28.0 if role == "zombie_survivor_regroup" else 160.0
-                ),
+                engagement_radius=160.0,
             )
-        return None
+
+        threat = self._nearest_threat(frame, observer)
+        if threat is not None:
+            distance = math.dist(observer.position, threat.position)
+            if distance <= _SURVIVOR_KITE_RADIUS:
+                # Back away from a zombie in claw range while still allowed to
+                # shoot it; melee zombies must not simply walk into the bot.
+                return ModeBotDecision(
+                    _away_from(observer.position, threat.position, 12.0),
+                    "zombie_survivor_kite",
+                    sprint=True,
+                    arrival_radius=2.0,
+                    posture=ModeBotPosture.SURVIVE,
+                    objective_priority=0.8,
+                    engagement_radius=_SURVIVOR_THREAT_RADIUS,
+                )
+            # A zombie is close enough to hear: stop roaming and face it.
+            return ModeBotDecision(
+                _toward(observer.position, threat.position, 3.0),
+                "zombie_survivor_hold_line",
+                sprint=False,
+                arrival_radius=2.0,
+                posture=ModeBotPosture.SURVIVE,
+                objective_priority=0.72,
+                engagement_radius=_SURVIVOR_THREAT_RADIUS + 20.0,
+                watch_position=threat.position,
+            )
+        return self._survivor_roam(frame, observer, own_anchor)
+
+    @staticmethod
+    def _nearest_threat(
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+    ) -> PlayerSnapshot | None:
+        """Nearest living zombie within earshot, or None."""
+        zombies = [
+            player for player in frame.players
+            if player.team != observer.team
+            and player.alive
+            and player.spawned
+            and int(player.class_id) in _ZOMBIE_CLASSES
+            and math.dist(observer.position, player.position)
+            <= _SURVIVOR_THREAT_RADIUS
+        ]
+        return min(
+            zombies,
+            key=lambda player: math.dist(observer.position, player.position),
+            default=None,
+        )
+
+    def _survivor_roam(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        own_anchor: ObjectiveSnapshot,
+    ) -> ModeBotDecision:
+        """Walk between map points like a player instead of idling at spawn.
+
+        Each survivor keeps its destination until it arrives (then lingers a
+        few seconds), stops making progress, or the leg's deadline passes. A
+        new destination is chosen away from where other survivors are and are
+        heading, so the team spreads over the map. Points are public map
+        knowledge: pickups, team anchors, and rings around the survivor base.
+        """
+        now = float(frame.created_at)
+        epoch = (int(frame.map_epoch), int(frame.mode_epoch))
+        if epoch != self._epoch:
+            self._epoch = epoch
+            self._legs.clear()
+            self._recent.clear()
+        key = (int(observer.player_id), int(observer.generation), int(observer.life_id))
+        waypoints = _survivor_waypoints(frame, own_anchor)
+
+        leg = self._legs.get(key)
+        if leg is not None and (now < leg.chosen_at or leg.waypoint not in waypoints):
+            leg = None
+        if leg is not None:
+            distance = math.dist(observer.position[:2], leg.waypoint[:2])
+            if distance + 2.0 < leg.best_distance:
+                leg.best_distance = distance
+                leg.progress_at = now
+            if distance <= _ROAM_ARRIVAL_RADIUS and leg.arrived_at is None:
+                leg.arrived_at = now
+            dwell = 3.0 + float(observer.player_id % 4) * 1.5
+            if (now >= leg.deadline
+                    or (leg.arrived_at is None
+                        and now - leg.progress_at > _ROAM_NO_PROGRESS_SECONDS)
+                    or (leg.arrived_at is not None and now - leg.arrived_at > dwell)):
+                leg = None
+        if leg is None:
+            leg = self._choose_leg(frame, observer, key, waypoints, now)
+            self._legs[key] = leg
+            self._forget_stale_legs(frame)
+
+        target = _formation_point(leg.waypoint, observer.player_id, 1.5)
+        return ModeBotDecision(
+            target,
+            "zombie_survivor_roam",
+            sprint=math.dist(observer.position, target) > 30.0,
+            arrival_radius=_ROAM_ARRIVAL_RADIUS - 1.0,
+            posture=ModeBotPosture.BALANCED,
+            objective_priority=0.6,
+            engagement_radius=80.0,
+        )
+
+    def _choose_leg(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        key: tuple[int, int, int],
+        waypoints: list[Vector3],
+        now: float,
+    ) -> _RoamLeg:
+        allies = [
+            player for player in frame.players
+            if player.team == observer.team and player.alive and player.spawned
+            and player.player_id != observer.player_id
+        ]
+        ally_ids = {int(player.player_id) for player in allies}
+        crowd = [player.position for player in allies] + [
+            leg.waypoint for other, leg in self._legs.items()
+            if other[0] in ally_ids
+        ]
+        recent = self._recent.setdefault(key, [])
+
+        def score(waypoint: Vector3) -> float:
+            own = math.dist(observer.position[:2], waypoint[:2])
+            spread = min(
+                (math.dist(waypoint[:2], point[:2]) for point in crowd),
+                default=120.0,
+            )
+            value = min(spread, 90.0) + min(own, 100.0) * 0.3
+            if own < _ROAM_MIN_LEG:
+                value -= 60.0
+            if waypoint in recent:
+                value -= 45.0
+            # Stable per-bot tie breaking so equal bots do not pick alike.
+            value += ((hash((observer.player_id, waypoint)) & 0xFFFF) % 97) * 0.1
+            return value
+
+        waypoint = max(waypoints, key=score)
+        recent.append(waypoint)
+        del recent[:-4]
+        distance = math.dist(observer.position[:2], waypoint[:2])
+        return _RoamLeg(
+            waypoint=waypoint,
+            chosen_at=now,
+            deadline=now + 12.0 + distance / 3.0,
+            best_distance=distance,
+            progress_at=now,
+        )
+
+    def _forget_stale_legs(self, frame: PerceptionFrame) -> None:
+        if len(self._legs) <= 64:
+            return
+        live = {(p.player_id, p.generation, p.life_id) for p in frame.players}
+        for key in [key for key in self._legs if key not in live]:
+            self._legs.pop(key, None)
+            self._recent.pop(key, None)
 
 
 class VIPBotPolicy:
@@ -1375,6 +1548,29 @@ def _guard_beat(frame: PerceptionFrame, observer: PlayerSnapshot, center: Vector
     beat = int((float(frame.created_at) + observer.player_id * 5.3) // 18.0)
     return _formation_point(center, observer.player_id + beat * 5,
                             radius + 2.5 * ((beat + observer.player_id) % 3))
+
+
+def _survivor_waypoints(frame: PerceptionFrame,
+                        own_anchor: ObjectiveSnapshot) -> list[Vector3]:
+    """Deterministic roam targets built only from public map knowledge."""
+    center = own_anchor.position
+    points: set[Vector3] = {
+        tuple(round(float(value), 1) for value in entity.position)
+        for entity in frame.entities
+        if entity.alive and not entity.hazardous and entity.owner_id < 0
+        and entity.kind != "projectile"
+        and math.dist(entity.position, center) <= 160.0
+    }
+    for item in frame.objectives:
+        if item.kind == "team_anchor":
+            points.add(item.position)
+            if item.team != own_anchor.team:
+                points.add(_toward(center, item.position,
+                                   math.dist(center, item.position) * 0.5))
+    for ring, radius in enumerate((22.0, 38.0, 56.0)):
+        for spoke in range(6):
+            points.add(_formation_point(center, spoke * 7 + ring * 3, radius))
+    return sorted(points)
 
 
 def _formation_point(position: Vector3, key: int, radius: float) -> Vector3:
