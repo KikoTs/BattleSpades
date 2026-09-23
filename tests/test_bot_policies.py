@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import replace
 
@@ -9,6 +10,7 @@ from server.bot_ai.messages import ObjectiveSnapshot, PerceptionFrame, PlayerSna
 from server.bot_ai.policies import (
     ModeBotPosture,
     mode_decision_allows_combat,
+    mode_objective_committed,
     mode_strategy_for,
     objective_decision_for,
     objective_goal_for,
@@ -151,7 +153,7 @@ def test_classic_ctf_does_not_track_a_hidden_enemy_carrier() -> None:
 
 
 def test_zombie_policy_changes_from_preparation_to_last_man_hunt() -> None:
-    survivor = _player(1, 2)
+    survivor = _player(3, 2)
     infected = _player(4, 3)
     survivor_anchor = ObjectiveSnapshot("team_anchor", 2, (64.0, 64.0, 50.0))
     zombie_anchor = ObjectiveSnapshot("team_anchor", 3, (448.0, 448.0, 50.0))
@@ -182,6 +184,119 @@ def test_zombie_policy_changes_from_preparation_to_last_man_hunt() -> None:
     assert preparation.role == "zombie_prepare_fortify"
     assert hunt.role == "zombie_hunt_last_survivor"
     assert hunt.position == survivor.position
+
+
+def _zombie_anchors():
+    return (
+        ObjectiveSnapshot("team_anchor", 2, (64.0, 64.0, 50.0)),
+        ObjectiveSnapshot("team_anchor", 3, (448.0, 448.0, 50.0)),
+    )
+
+
+def _roam(observer, *others, at: float, epoch: int = 1):
+    frame = replace(
+        _frame("zom", observer, *others, objectives=_zombie_anchors()),
+        created_at=at,
+        mode_epoch=epoch,
+    )
+    return objective_decision_for(frame, observer)
+
+
+def test_zombie_survivor_keeps_leg_while_progressing_then_moves_on() -> None:
+    start = (64.0, 64.0, 50.0)
+    survivor = _player(1, 2, position=start)
+    first = _roam(survivor, at=1000.0, epoch=101)
+    assert first.role == "zombie_survivor_roam"
+    assert mode_objective_committed(first)
+    assert math.dist(first.position, start) >= 13.0
+
+    # Walking toward the target keeps the same destination past any clock.
+    for step in range(1, 8):
+        fraction = step / 8.0
+        position = tuple(start[i] + (first.position[i] - start[i]) * fraction
+                         for i in range(3))
+        walking = replace(survivor, position=position)
+        decision = _roam(walking, at=1000.0 + step * 5.0, epoch=101)
+        assert decision.position == first.position
+
+    # Arrive, linger briefly, then pick a different destination.
+    arrived = replace(survivor, position=first.position)
+    assert _roam(arrived, at=1040.0, epoch=101).position == first.position
+    later = _roam(arrived, at=1050.0, epoch=101)
+    assert later.position != first.position
+
+
+def test_zombie_survivor_abandons_unreachable_leg() -> None:
+    survivor = _player(1, 2, position=(64.0, 64.0, 50.0))
+    first = _roam(survivor, at=2000.0, epoch=102)
+    stuck = _roam(survivor, at=2000.0 + 16.0, epoch=102)
+    assert stuck.position != first.position
+
+
+def test_zombie_survivors_spread_to_different_destinations() -> None:
+    spawn = (64.0, 64.0, 50.0)
+    survivors = [_player(player_id, 2, position=spawn) for player_id in (0, 1, 2, 4, 5)]
+    targets = []
+    for survivor in survivors:
+        others = [player for player in survivors if player is not survivor]
+        targets.append(_roam(survivor, *others, at=3000.0, epoch=103).position)
+
+    for index, target in enumerate(targets):
+        for other in targets[index + 1:]:
+            assert math.dist(target, other) > 15.0
+
+
+def test_zombie_preparation_sends_most_survivors_scouting() -> None:
+    scouts = [_player(player_id, 2) for player_id in (1, 2, 4, 5)]
+    for scout in scouts:
+        decision = objective_decision_for(
+            _frame("zom", scout, objectives=_zombie_anchors(), phase="countdown"),
+            scout,
+        )
+        assert decision is not None
+        assert decision.role == "zombie_survivor_roam"
+
+
+def test_zombie_survivor_kites_close_zombie_and_may_shoot_it() -> None:
+    survivor = _player(1, 2, position=(100.0, 100.0, 50.0))
+    zombie = _player(4, 3, position=(105.0, 100.0, 50.0), class_id=4)
+    decision = objective_decision_for(
+        _frame("zom", survivor, zombie, objectives=_zombie_anchors()),
+        survivor,
+    )
+
+    assert decision is not None
+    assert decision.role == "zombie_survivor_kite"
+    assert decision.position[0] < survivor.position[0]
+    assert mode_decision_allows_combat(
+        decision, survivor, zombie, now=time.monotonic()
+    )
+
+
+def test_zombie_survivor_holds_line_against_approaching_zombie() -> None:
+    survivor = _player(1, 2, position=(100.0, 100.0, 50.0))
+    zombie = _player(4, 3, position=(120.0, 100.0, 50.0), class_id=4)
+    decision = objective_decision_for(
+        _frame("zom", survivor, zombie, objectives=_zombie_anchors()),
+        survivor,
+    )
+
+    assert decision is not None
+    assert decision.role == "zombie_survivor_hold_line"
+    assert mode_decision_allows_combat(
+        decision, survivor, zombie, now=time.monotonic()
+    )
+
+
+def test_idle_infected_do_not_flee_from_survivors() -> None:
+    infected = _player(4, 3, position=(100.0, 100.0, 50.0), class_id=4)
+    decision = objective_decision_for(
+        _frame("zom", infected, objectives=_zombie_anchors()),
+        infected,
+    )
+
+    assert decision is not None
+    assert decision.role == "zombie_infected_breach"
 
 
 def test_tdm_squads_advance_toward_enemy_side_instead_of_random_patrol() -> None:

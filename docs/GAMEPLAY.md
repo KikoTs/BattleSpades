@@ -78,6 +78,16 @@ Zombie owns survivor/infected phase transitions, Patient Zero selection,
 permanent conversion, role-safe classes, respawns, last-survivor visibility,
 zombie damage/speed rules, and mode-aware bot policy.
 
+Zombie survivor bots roam instead of holding their spawn. Before the outbreak
+every third survivor fortifies near the survivor base while the rest scout.
+Each survivor walks its own leg between public map points (pickups, team
+anchors, rings around the survivor base), preferring points away from other
+survivors and their destinations. It keeps a leg until it arrives and lingers
+briefly, makes no progress for 15 seconds, or passes the leg deadline. A
+zombie within 28 blocks makes it hold and fire; within 9 blocks it backs away
+while still firing. Roam, hold, and kite roles are committed, so optional
+team errands cannot pull survivors back into one cluster.
+
 VIP owns one boss per team, VIP health, markers, team respawn lockout, sudden
 death, elimination, sub-round score, role reset, and gangster class menus.
 

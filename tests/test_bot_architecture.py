@@ -1445,7 +1445,8 @@ def test_zombie_policy_flags_fortify_for_survivors_only() -> None:
     from server.bot_ai.messages import ObjectiveSnapshot
     from server.bot_ai.policies import objective_decision_for
 
-    observer = _player_snapshot(1, 2, (100.0, 100.0, 7.75), is_bot=True)
+    # Every third survivor keeps preparation fortify duty; the rest scout.
+    observer = _player_snapshot(3, 2, (100.0, 100.0, 7.75), is_bot=True)
     anchor = ObjectiveSnapshot("team_anchor", 2, (100.0, 100.0, 7.75))
     waiting = replace(
         _frame(1, observer, _player_snapshot(2, 3, (200.0, 200.0, 7.75))),
