@@ -41,3 +41,17 @@ def test_normal_matches_do_not_advertise_map_creator_prefab_sets():
     packet = build_initial_info(BattleSpadesServer(ServerConfig()))
 
     assert packet.ugc_prefab_sets == []
+
+
+def test_steam_public_ip_above_2_31_serializes_instead_of_aborting_the_join():
+    """213.152.101.147 is 0xD5986593; the signed wire field used to overflow."""
+    from types import SimpleNamespace
+
+    server = BattleSpadesServer(ServerConfig())
+    server.steam_master = SimpleNamespace(public_ip=0xD5986593, query_active=False)
+
+    packet = build_initial_info(server)
+    data = bytes(packet.generate())
+
+    assert packet.server_ip & 0xFFFFFFFF == 0xD5986593
+    assert data[9:13] == (0xD5986593).to_bytes(4, "little")
