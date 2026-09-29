@@ -24,7 +24,7 @@ def queued(monkeypatch, *, human=False, actual_player=False):
         server = _server(_World(solids={(10, 10, 11)}))
         server.config = SimpleNamespace()
         player = SimpleNamespace(
-            id=6, name="QueuedBot", team=2, alive=True, spawned=True,
+            id=6, name="QueuedBot", eye=(10.5, 12.5, 8.0), team=2, alive=True, spawned=True,
             x=100., y=100., z=20., loadout=[int(C.PREFAB_TOOL)],
             tool=int(C.PREFAB_TOOL), tool_is_raw=True,
             class_id=int(C.CLASS_SOLDIER), deaths=0,
@@ -49,23 +49,31 @@ def queued(monkeypatch, *, human=False, actual_player=False):
     return server, player, service
 
 
-@pytest.mark.parametrize("committed", (0, 1))
-def test_death_cancels_remaining_cells_and_does_not_refund_dead_wallet(monkeypatch, committed):
+def test_death_cancels_queued_prefab_and_does_not_refund_dead_wallet(monkeypatch):
     server, player, service = queued(monkeypatch)
-    for _ in range(committed):
-        assert service.tick() == 1
     player.alive = player.spawned = False
     player.deaths += 1
     assert service.tick() == 0
     assert service.pending_count == 0 and server.construction.active_count == 0
-    assert set(CELLS) & server.world_manager.solids == set(CELLS[:committed])
+    assert not set(CELLS) & server.world_manager.solids
+    assert player.blocks == 7
+
+
+def test_competitive_bot_prefab_commits_whole_in_one_tick(monkeypatch):
+    server, player, service = queued(monkeypatch)
+    assert service.tick() == len(CELLS)
+    assert set(CELLS).issubset(server.world_manager.solids)
+    assert service.pending_count == 0 and server.construction.active_count == 0
+    # A later death has nothing left to cancel or refund.
+    player.alive = player.spawned = False
+    player.deaths += 1
+    assert service.tick() == 0
     assert player.blocks == 7
 
 
 @pytest.mark.parametrize("kill_type", (int(C.WEAPON_KILL), int(C.CLASS_CHANGE_KILL)))
 def test_actual_player_death_and_immediate_respawn_cannot_commit_or_refund_old_job(monkeypatch, kill_type):
     server, player, service = queued(monkeypatch, actual_player=True)
-    assert service.tick() == 1
     old_deaths, old_life = player.deaths, player.replication_generation
     player.die(kill_type=kill_type)
     player.spawn(100.5, 100.5, 59.75)
@@ -75,7 +83,7 @@ def test_actual_player_death_and_immediate_respawn_cannot_commit_or_refund_old_j
     assert player.deaths == old_deaths + (kill_type != int(C.CLASS_CHANGE_KILL))
     assert service.tick() == 0
     assert player.blocks == fresh_blocks
-    assert set(CELLS) & server.world_manager.solids == {CELLS[0]}
+    assert not set(CELLS) & server.world_manager.solids
     assert service.pending_count == 0 and server.construction.active_count == 0
 
 
@@ -84,15 +92,14 @@ def test_actual_player_death_and_immediate_respawn_cannot_commit_or_refund_old_j
     ("prefabs", ["prefab_other"]), ("loadout", [int(C.BLOCK_TOOL)]),
     ("class_id", int(C.CLASS_MINER)), ("team", 3), ("is_bot", False),
 ))
-def test_same_life_selection_change_cancels_and_refunds_only_unbuilt_cells(monkeypatch, field, value):
+def test_same_life_selection_change_cancels_and_refunds_the_queued_prefab(monkeypatch, field, value):
     server, player, service = queued(monkeypatch)
-    assert service.tick() == 1
     setattr(player, field, value)
     assert service.tick() == 0
-    assert player.blocks == 9
-    assert set(CELLS) & server.world_manager.solids == {CELLS[0]}
+    assert player.blocks == 10
+    assert not set(CELLS) & server.world_manager.solids
     assert service.cancel_owner(player.id) == 0
-    assert player.blocks == 9 and server.construction.active_count == 0
+    assert player.blocks == 10 and server.construction.active_count == 0
 
 
 @pytest.mark.parametrize("replacement", (False, True))
@@ -135,6 +142,6 @@ def test_round_cancel_all_refunds_only_the_original_life(monkeypatch, new_life):
 def test_human_prefab_job_keeps_existing_tool_switch_semantics(monkeypatch):
     server, player, service = queued(monkeypatch, human=True)
     player.tool = int(C.BLOCK_TOOL)
-    assert sum(service.tick() for _ in CELLS) == len(CELLS)
+    assert service.tick() == len(CELLS)
     assert set(CELLS).issubset(server.world_manager.solids)
     assert player.blocks == 7 and service.pending_count == 0

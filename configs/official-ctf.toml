@@ -42,3 +42,6 @@ query_port = 27018
 level = "INFO"
 file = "official-ctf.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

@@ -146,6 +146,14 @@ def test_real_respawn_lifecycle_does_not_double_initial_consumable_stock(is_bot,
     assert player._deployable_next_use == {}
 
 
+def test_dynamite_wallet_matches_stock_alias_one_one_one():
+    """Stock DynamiteWeapon.ammo = (A1627, A1628, None, None, A1629), A1627=1."""
+    from server.deployable_inventory import STOCK_RULES
+
+    rule = STOCK_RULES[int(C.DYNAMITE_TOOL)]
+    assert (rule.initial, rule.maximum, rule.restock) == (1, 1, 1)
+
+
 def test_medpack_packets_and_bot_gateway_share_one_bounded_wallet(clock):
     server, player, _ = _server_player(C.MEDPACK_TOOL, [C.MEDPACK_TOOL])
     packet = bytes([90]) + struct.pack("<IBHHHB", 10, player.id, 101, 100, 62, 4)
@@ -183,8 +191,13 @@ def test_oriented_projectiles_and_placed_explosives_share_stock_and_cadence(tool
     assert player.deployable_stock[tool] == before - 1
     assert not _place(server, player)
     clock[0] += 1.0
+    if player.deployable_stock[tool] == 0:
+        # Stock dynamite carries one stick (max 1): refill before placing.
+        assert not _place(server, player)
+        player.restock_ammo(int(C.AMMO_CRATE))
+    before = player.deployable_stock[tool]
     assert _place(server, player)
-    assert player.deployable_stock[tool] == before - 2
+    assert player.deployable_stock[tool] == before - 1
 
 
 def test_c4_live_cap_and_remote_detonation_never_refund_stock(clock):

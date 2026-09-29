@@ -126,8 +126,14 @@ def test_fuel_exhaustion_deactivates():
     assert p.jetpack_fuel <= 25.0  # mostly regen after the burn
 
 
-def test_engineer_exhaustion_keeps_one_predicted_thrust_recurrence():
-    """Exhaustion finishes this tick plus one measured predicted recurrence."""
+def test_engineer_exhaustion_keeps_the_calibrated_thrust_tail():
+    """Exhaustion is announced now; thrust runs on for the calibrated tail.
+
+    Live 60 Hz captures (2026-09-24, docs/RETAIL_JUMP_RESTORE.md) show the
+    retail owner stops thrust two to three frames after the inactive row is
+    sent, so the default tail is three frames: any residual is a forward
+    nudge, never a rollback.
+    """
     p = make_player(class_id=int(C.CLASS_ENGINEER))
     p.jetpack_id = int(C.JETPACK_ENGINEER)
     p.jetpack_fuel = 0.1
@@ -140,11 +146,12 @@ def test_engineer_exhaustion_keeps_one_predicted_thrust_recurrence():
     assert p.jetpack_fuel == 0.0
     assert p.jetpack_active is False
     assert p._jetpack_physics_active is True
-    assert p._jetpack_exhaustion_tail_remaining == 1
+    assert p._jetpack_exhaustion_tail_remaining == 3
 
-    p._update_jetpack(DT)
-    assert p._jetpack_physics_active is True
-    assert p._jetpack_exhaustion_tail_remaining == 0
+    for remaining in (2, 1, 0):
+        p._update_jetpack(DT)
+        assert p._jetpack_physics_active is True
+        assert p._jetpack_exhaustion_tail_remaining == remaining
 
     p._update_jetpack(DT)
     assert p._jetpack_physics_active is False
@@ -433,7 +440,8 @@ def test_spawn_honors_client_chosen_jetpack():
 def test_melee_profiles_per_tool():
     p = make_player()
     for tool, player_dmg, block_dmg in [
-        (int(C.PICKAXE_TOOL), 50, 7),
+        # Stock PICKAXE_HITPLAYER_DAMAGE_AMOUNT (A1105) is 40 (docs/WEAPONS_RETAIL.md).
+        (int(C.PICKAXE_TOOL), 40, 7),
         (int(C.SPADE_TOOL), 35, 5),
         (int(C.SUPERSPADE_TOOL), 50, 7.5),
         (int(C.CROWBAR_TOOL), 80, 5),
@@ -444,3 +452,59 @@ def test_melee_profiles_per_tool():
         prof = p.get_weapon_profile()
         assert prof.base_damage == player_dmg, f"tool {tool} player dmg"
         assert prof.block_damage == block_dmg, f"tool {tool} block dmg"
+
+
+def test_boundary_frames_follow_the_server_config():
+    """The unacknowledged activation/exhaustion boundaries are calibrated knobs."""
+    p = make_player(int(C.CLASS_ROCKETEER))
+    p.jetpack_id = int(C.JETPACK_NORMAL)
+    p.jetpack_fuel = 100.0
+    p.connection = SimpleNamespace(server=SimpleNamespace(config=SimpleNamespace(
+        jetpack_activation_defer_frames=4,
+        jetpack_exhaustion_tail_frames=3,
+    )))
+    p.input.jump = True
+    ticks = 0
+    while not p.jetpack_active and ticks < 60:
+        p._update_jetpack(DT)
+        ticks += 1
+    assert p.jetpack_active
+    assert p._jetpack_activation_defer_remaining == 4
+    # Burn the pack out while holding: the physics tail follows the knob.
+    while p.jetpack_fuel > 0.0 and ticks < 600:
+        p._update_jetpack(DT)
+        ticks += 1
+    assert not p.jetpack_active
+    assert p._jetpack_exhaustion_tail_remaining == 3
+    for _ in range(3):
+        p._update_jetpack(DT)
+        assert p._jetpack_physics_active
+    p._update_jetpack(DT)
+    assert not p._jetpack_physics_active
+
+
+def test_native_owner_boundary_frames_ignore_the_retail_override():
+    """Client parity P0-07: BSCF owners predict defer 2 / tail 3 locally, so a
+    host override of the retail handoff must not split the two sides."""
+    p = make_player(int(C.CLASS_ROCKETEER))
+    p.jetpack_id = int(C.JETPACK_NORMAL)
+    p.jetpack_fuel = 100.0
+    p.connection = SimpleNamespace(
+        flight_profile_capable=True,
+        server=SimpleNamespace(config=SimpleNamespace(
+            jetpack_activation_defer_frames=4,
+            jetpack_exhaustion_tail_frames=1,
+        )),
+    )
+    p.input.jump = True
+    ticks = 0
+    while not p.jetpack_active and ticks < 60:
+        p._update_jetpack(DT)
+        ticks += 1
+    assert p.jetpack_active
+    assert p._jetpack_activation_defer_remaining == 2
+    while p.jetpack_fuel > 0.0 and ticks < 600:
+        p._update_jetpack(DT)
+        ticks += 1
+    assert not p.jetpack_active
+    assert p._jetpack_exhaustion_tail_remaining == 3

@@ -104,17 +104,35 @@ def test_prefab_selection_preserves_three_slots_and_wire_order():
     selection = normalize_class_selection(
         C.CLASS_ENGINEER,
         prefabs=[
-            "prefab_superbridge",
+            "prefab_superdome",
             "prefab_platform",
             "prefab_supertower",
         ],
     )
 
     assert selection.prefabs == (
-        "prefab_superbridge",
+        "prefab_superdome",
         "prefab_platform",
         "prefab_supertower",
     )
+
+
+def test_engineer_constructs_match_the_stock_alias_seven():
+    """Stock A475 has 7 Engineer constructs; superbridge/superpole are mod."""
+    assert C.PREFAB_LISTS[int(C.CLASS_PREFABS_ENGINEER)] == [
+        "prefab_caltrop",
+        "prefab_supertower",
+        "prefab_ultrabarrier",
+        "prefab_platform",
+        "prefab_superminibunker",
+        "prefab_superdome",
+        "prefab_fort_wall",
+    ]
+    selection = normalize_class_selection(
+        C.CLASS_ENGINEER,
+        prefabs=["prefab_superbridge", "prefab_superpole", "prefab_caltrop"],
+    )
+    assert selection.prefabs == ("prefab_caltrop",)
 
 
 def test_stray_flare_block_is_not_part_of_spawn_loadout():

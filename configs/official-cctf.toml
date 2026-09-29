@@ -1,5 +1,5 @@
 [server]
-name = "AoS Revival Official Classic CTF"
+name = "AoS Revival Classic CTF"  # <= 31 chars (retail MAX_SERVER_NAME_SIZE)
 port = 27019
 max_players = 24
 tick_rate = 60
@@ -42,3 +42,6 @@ query_port = 27020
 level = "INFO"
 file = "official-cctf.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

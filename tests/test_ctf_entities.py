@@ -5,6 +5,7 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
+import shared.constants_gamemode as CG  # noqa: E402
 from modes.ctf import CTFMode  # noqa: E402
 from server.entities.registry import EntityRegistry  # noqa: E402
 from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL  # noqa: E402
@@ -109,6 +110,7 @@ def test_ctf_flag_hides_on_pickup_and_reappears_when_carrier_dies():
         vx=0.0, vy=0.0, vz=0.0, pickup_id=None,
         pickup_burdensome=False, pickup_state=None, _world_object=None,
     )
+    server.players[player.id] = player
 
     asyncio.run(mode._pickup_intel(player, TEAM2))
     assert mode._intel_entities[TEAM2] is None
@@ -118,6 +120,10 @@ def test_ctf_flag_hides_on_pickup_and_reappears_when_carrier_dies():
     assert pickup.pickup_id == int(C.INTEL_PICKUP)
     # Retail uses this wire bit to render the carrier's burdened/special state.
     assert pickup.burdensome == 1
+    # Retail exposes the carrier only after INTEL_MINIMAP_EXPOSURE_TIME.
+    assert not _packets(server, ChangePlayer)
+    mode._tick_carriers(1000.0)
+    mode._tick_carriers(1000.0 + float(C.INTEL_MINIMAP_EXPOSURE_TIME))
     visibility = _packets(server, ChangePlayer)
     assert visibility[-1].player_id == player.id
     assert visibility[-1].type == C.SET_HIGH_MINIMAP_VISIBILITY
@@ -145,7 +151,10 @@ def test_ctf_late_join_gets_base_zones_and_current_carrier_visibility():
         vx=0.0, vy=0.0, vz=0.0, pickup_id=None,
         pickup_burdensome=False, pickup_state=None, _world_object=None,
     )
+    server.players[carrier.id] = carrier
     asyncio.run(mode._pickup_intel(carrier, TEAM2))
+    mode._tick_carriers(1000.0)
+    mode._tick_carriers(1000.0 + float(C.INTEL_MINIMAP_EXPOSURE_TIME))
     connection = _Connection(carrier)
 
     mode.reveal_to(connection)
@@ -192,7 +201,10 @@ def test_ctf_capture_uses_visible_five_block_base_zone():
     player = SimpleNamespace(x=bx + 4.75, y=by, z=bz)
 
     assert mode._is_at_base(player, TEAM1)
+    # Stock BASE_ZONE_DISTANCE_TOLERANCE: half a block of slack.
     player.x = bx + 5.25
+    assert mode._is_at_base(player, TEAM1)
+    player.x = bx + 5.75
     assert not mode._is_at_base(player, TEAM1)
 
 
@@ -268,61 +280,45 @@ def test_ctf_capture_awards_retail_personal_and_team_scores():
         pickup_id=None, pickup_burdensome=False, pickup_state=None,
         _world_object=None, captures=0, score=0,
     )
+    server.players[player.id] = player
 
     asyncio.run(mode._pickup_intel(player, TEAM2))
+    # Grabbing the intel from its home is "First to Claim Flag" (100).
+    claim = _packets(server, SetScore)[-1]
+    assert claim.reason == int(C.SCORE_REASON.CTF_CLAIM_SCORE_REASON)
+    assert player.score == int(CG.CTF_SCORE_CLAIM)
     asyncio.run(mode._capture_intel(player, TEAM2))
 
     assert player.captures == 1
-    assert player.score == 10
+    assert player.score == int(CG.CTF_SCORE_CLAIM) + 10
     assert server.teams[TEAM1].score == 1
     personal = _packets(server, SetScore)[-1]
     assert personal.type == int(C.SCORE.PLAYER)
     assert personal.specifier == player.id
     assert personal.reason == int(C.SCORE_REASON.CTF_CAPTURE_SCORE_REASON)
-    assert personal.value == 10
+    assert personal.value == int(CG.CTF_SCORE_CLAIM) + 10
 
 
-def test_ctf_player_touch_return_awards_retail_claim_point():
+def test_ctf_player_touch_return_awards_an_unlabelled_point():
     server = _Server()
     mode = CTFMode(server)
     asyncio.run(mode.on_mode_start())
     player = SimpleNamespace(id=8, score=4)
+    server.players[player.id] = player
 
     asyncio.run(mode._return_intel(TEAM1, returned_by=player))
 
     assert player.score == 5
     personal = _packets(server, SetScore)[-1]
-    assert personal.reason == int(C.SCORE_REASON.CTF_CLAIM_SCORE_REASON)
+    # Retail has no return reason; "First to Claim Flag" is the home grab.
+    assert personal.reason == int(C.SCORE_REASON.NO_SCORE_REASON)
     assert personal.value == 5
 
 
-def test_ctf_and_classic_award_one_personal_point_for_enemy_kill():
-    server = _Server()
-    mode = CTFMode(server)
-    killer = SimpleNamespace(id=3, team=TEAM1, score=6)
-    victim = SimpleNamespace(id=4, team=TEAM2)
+def test_ctf_and_classic_use_base_generic_kill_score():
+    """CTF has no per-kill override: BaseMode's retail generic score applies."""
+    from modes.base_mode import BaseMode
+    from modes.classic_ctf import ClassicCTFMode
 
-    asyncio.run(mode.on_player_kill(killer, victim, kill_type=0))
-
-    assert killer.score == 7
-    personal = _packets(server, SetScore)[-1]
-    assert personal.type == int(C.SCORE.PLAYER)
-    assert personal.specifier == killer.id
-    assert personal.reason == int(C.SCORE_REASON.KILL_SCORE_REASON)
-    assert personal.value == 7
-
-
-def test_ctf_does_not_score_teamkill_suicide_or_post_round_kill():
-    server = _Server()
-    mode = CTFMode(server)
-    killer = SimpleNamespace(id=3, team=TEAM1, score=6)
-    teammate = SimpleNamespace(id=4, team=TEAM1)
-
-    asyncio.run(mode.on_player_kill(killer, teammate, kill_type=0))
-    asyncio.run(mode.on_player_kill(killer, killer, kill_type=0))
-    mode.ended = True
-    enemy = SimpleNamespace(id=5, team=TEAM2)
-    asyncio.run(mode.on_player_kill(killer, enemy, kill_type=0))
-
-    assert killer.score == 6
-    assert not _packets(server, SetScore)
+    assert CTFMode.on_player_kill is BaseMode.on_player_kill
+    assert ClassicCTFMode.on_player_kill is BaseMode.on_player_kill

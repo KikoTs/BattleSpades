@@ -16,6 +16,36 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 from urllib.parse import urlsplit
 
+# Retail server-only MAX_SERVER_NAME_SIZE (A2269).
+MAX_SERVER_NAME_SIZE = int(getattr(C, "MAX_SERVER_NAME_SIZE", 31))
+
+
+# The sample [admin] password shipped in config.toml. A server still using it
+# (or an empty/short secret) has in-game /admin login disabled: anyone who has
+# read the docs would otherwise own the server.
+DEFAULT_ADMIN_PASSWORD = "changeme"
+MIN_ADMIN_PASSWORD_LENGTH = 12
+
+# Size classes accepted by [lobby] map_size_overrides; the areas they stand
+# for live in server.voting.MAP_SIZE_CLASS_AREAS.
+MAP_SIZE_CLASSES = ("small", "medium", "large")
+
+
+def admin_password_problem(password: object) -> Optional[str]:
+    """Why ``password`` cannot enable /admin login, or None when it can."""
+
+    text = "" if password is None else str(password)
+    if not text.strip():
+        return "the [admin] password is empty"
+    if text == DEFAULT_ADMIN_PASSWORD:
+        return 'the [admin] password is still the shipped default "changeme"'
+    if len(text) < MIN_ADMIN_PASSWORD_LENGTH:
+        return (
+            f"the [admin] password is shorter than {MIN_ADMIN_PASSWORD_LENGTH} "
+            "characters"
+        )
+    return None
+
 
 def _steam_token(name: str, value: object, limit: int) -> str:
     """Validate one legacy ASCII tag/version token from untrusted TOML."""
@@ -74,6 +104,159 @@ class BotConfig:
     friendly_mischief: bool = True
     # Sparse, rate-limited bot chat reacting to kills and round boundaries.
     chatter: bool = True
+    # Per-team bot skill balancing (server/bot_ai/skill_balance.py): when the
+    # humans on one team clearly out-kill the other side, that team's bots are
+    # eased and the other team's sharpened, by at most ``skill_balance_max_shift``
+    # of each profile field, moving ``skill_balance_rate`` per second and only
+    # outside a ``skill_balance_deadband`` edge once a team has
+    # ``skill_balance_min_events`` kills/deaths on record.
+    skill_balance: bool = True
+    skill_balance_max_shift: float = 0.35
+    skill_balance_rate: float = 0.03
+    skill_balance_deadband: float = 0.15
+    skill_balance_min_events: int = 6
+
+
+@dataclass
+class AntiCheatConfig:
+    """Server-side validation switches.
+
+    Checks that could reject legitimate retail play under packet loss start
+    log-only (``enforce_* = False``): violations are counted and logged by
+    ``server.anticheat`` but the action is still accepted. Flip a switch to
+    true once a play session shows no false positives.
+    """
+
+    # Shot/throw/build origin vs the server eye at the shot's input frame.
+    enforce_shot_origin: bool = False
+    shot_origin_tolerance: float = 1.5
+    # A shot direction vs that frame's aim (degrees).
+    enforce_aim_direction: bool = False
+    aim_direction_tolerance_deg: float = 10.0
+    # Input starvation: airborne bodies fall after this many starved ticks,
+    # and a fully silent in-game client times out.
+    enforce_input_starvation: bool = False
+    starvation_airborne_ticks: int = 24
+    starvation_timeout_seconds: float = 8.0
+    # Input backlog (fake lag): catch up once the queue stays above this.
+    enforce_input_backlog: bool = False
+    backlog_max_frames: int = 6
+    # Stock server-only MIN_BLOCK_INTERVAL (0.1 s) between one player's
+    # accepted block builds/lines; log-only until a play session is clean.
+    enforce_block_interval: bool = False
+    # Protocol violations the stock client never produces (NaN, forged tool,
+    # impossible packets) kick immediately when true.
+    kick_on_protocol_violation: bool = True
+    # Admin login attempts before a kick.
+    admin_login_attempts: int = 3
+    # Rate-limited per-player summary log interval (seconds). Also the
+    # suspicion report's evaluation interval (server/anticheat_report.py).
+    summary_interval_seconds: float = 60.0
+
+    # Statistical suspicion report (server/anticheat_report.py). Log/report
+    # only: it never kicks. Keys and defaults mirror anticheat_report.DEFAULTS.
+    report_enabled: bool = True
+    report_path: str = "logs/anticheat.jsonl"
+    report_max_bytes: int = 5_000_000
+    report_backups: int = 3
+    flag_min_score: float = 1.0
+    # Headshot share of hitscan kills.
+    headshot_kill_ratio: float = 0.60
+    headshot_kill_min_kills: int = 30
+    # Headshot share of single-ray hitscan hits.
+    headshot_hit_ratio: float = 0.55
+    headshot_hit_min_hits: int = 60
+    # Per-weapon accuracy vs the human population.
+    accuracy_min_shots: int = 100
+    accuracy_min_population: int = 20
+    accuracy_percentile: float = 99.0
+    accuracy_min_margin: float = 0.15
+    # Aim snaps.
+    snap_min_deg: float = 20.0
+    snap_frames: int = 2
+    snap_head_radius: float = 0.35
+    snap_margin_deg: float = 0.75
+    snap_min_events: int = 4
+    snap_min_engaged: int = 20
+    snap_ratio: float = 0.10
+    # Acquisition ("reaction") time.
+    reaction_acquire_deg: float = 10.0
+    reaction_history_frames: int = 60
+    reaction_min_samples: int = 15
+    reaction_median_ms: float = 90.0
+    reaction_reengage_seconds: float = 3.0
+    engage_cone_deg: float = 4.0
+    # Pellet seed skew.
+    pellet_seed_min_shots: int = 64
+    pellet_seed_top_share: float = 0.2
+    # Sustained log-only violations.
+    sustained_min_minutes: float = 5.0
+    sustained_min_count: int = 20
+    sustained_per_minute: float = 3.0
+
+
+# ``[weapons]`` keys still parsed for old configs but ignored (see
+# ServerConfig.rifle_damage); setting any of them logs a deprecation warning.
+_DEPRECATED_WEAPON_KEYS = frozenset({
+    "rifle_damage",
+    "smg_damage",
+    "shotgun_damage",
+    "spade_damage",
+    "grenade_damage",
+})
+# ``[world] map_size_*`` are informational; the retail VXL is always this size.
+_INFORMATIONAL_MAP_SIZE = {"map_size_x": 512, "map_size_y": 512, "map_size_z": 240}
+
+
+# ``[anticheat]`` values that are shares (0..1) or a percentile (0..100);
+# every other numeric key is only clamped to be non-negative.
+_ANTICHEAT_UNIT_KEYS = frozenset({
+    "headshot_kill_ratio",
+    "headshot_hit_ratio",
+    "accuracy_min_margin",
+    "snap_ratio",
+    "pellet_seed_top_share",
+})
+_ANTICHEAT_BOUNDS = {
+    "accuracy_percentile": (0.0, 100.0),
+    "snap_frames": (1, 30),
+    "reaction_history_frames": (1, 600),
+    "report_backups": (0, 20),
+    "report_max_bytes": (4096, 1024 * 1024 * 1024),
+}
+
+
+@dataclass
+class ConductConfig:
+    """Team-grief and AFK kicks (``server.conduct``).
+
+    Grief points: ``grief_team_damage_points`` per 100 teammate HP removed
+    plus ``grief_team_kill_points`` per team kill, including a teammate's
+    death from a deployable you set off (shooting their landmine). One point
+    decays every ``grief_decay_seconds``; one burst is capped at
+    ``grief_incident_max_points`` so an accident alone never kicks.
+    """
+
+    grief_kick_enabled: bool = True
+    grief_kick_points: float = 10.0
+    grief_warn_points: float = 5.0
+    grief_decay_seconds: float = 60.0
+    grief_team_kill_points: float = 3.0
+    grief_team_damage_points: float = 1.0
+    grief_incident_seconds: float = 3.0
+    grief_incident_max_points: float = 6.0
+    grief_exempt_admins: bool = True
+    # Seconds of no real input (keys/aim) before an AFK kick; 0 disables.
+    afk_kick_seconds: float = 600.0
+    afk_warn_seconds: float = 540.0
+    # Spectators idle longer; 0 exempts them.
+    afk_spectator_kick_seconds: float = 1800.0
+    afk_exempt_admins: bool = True
+    # System-chat line to everyone when someone is kicked for grief/AFK.
+    announce_kicks: bool = True
+    # Extra names (beyond the built-in Server/Admin/Console/...) no player
+    # may use; compared after homoglyph folding.
+    reserved_names: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -140,10 +323,13 @@ class RevivalMasterConfig:
 class ServerConfig:
     """Server configuration container."""
 
-    # Server settings
+    # Server settings. Every default here matches the shipped config.toml so
+    # an omitted key behaves like the documented sample (tests/
+    # test_config_defaults.py). The retail Steam-browser port 32887 is an
+    # explicit opt-in (docs/ADMIN_GUIDE.md), not the fallback.
     name: str = "BattleSpades Server"
-    port: int = 32887
-    max_players: int = 50
+    port: int = 27015
+    max_players: int = 24
     tick_rate: int = 60
     # Stable uint64 identity used by InitialInfo for non-Steam dedicated hosts.
     steam_id: int = 90087911866072064
@@ -152,9 +338,18 @@ class ServerConfig:
     motd: list[str] = field(default_factory=lambda: list(DEFAULT_MOTD))
 
     # Network settings
+    # ``timeout_ms`` and ``bandwidth_limit`` are accepted for old configs but
+    # IGNORED: retail creates its ENet host with 0/0 bandwidth and never
+    # overrides peer.timeout (library defaults: limit 32, 5-30 s), and so do
+    # the native client and this server.  A non-default value logs a warning.
     timeout_ms: int = 10000
     max_connections: int = 64
     bandwidth_limit: int = 0
+    # Refuse an ENet connect whose data is not PROTOCOL_VERSION (168): retail
+    # connects with shared.steam.game_version() (168) and the native client
+    # with 168.  Older -> ERROR_CLIENT_OUT_OF_DATE (10), newer ->
+    # ERROR_SERVER_OUT_OF_DATE (3).
+    require_protocol_version: bool = True
     network_event_budget: int = 512
     max_pending_packets: int = 4096
     packet_drain_budget: int = 4096
@@ -170,6 +365,23 @@ class ServerConfig:
     # remains gameplay-gated. At 256, a typical Drill tunnel converges in a
     # handful of 60 Hz input frames without one join monopolizing the tick.
     map_air_catchup_batch_limit: int = 256
+    # Re-send every destroyed cell since map load as a per-cell Damage packet
+    # after the joiner reaches GameScene. The MapSync stream already carries
+    # the current spans of every edited column, so this is a belt-and-braces
+    # repair that costs one reliable packet per cell and is visible to the
+    # player as terrain changing after spawn. Off by default; see
+    # docs/MAP_SYNC_JOIN.md for the live verification.
+    map_air_catchup_enabled: bool = False
+    # ENet lowers a peer's unreliable-send throttle whenever a round trip
+    # measures worse than the recent mean plus twice its variance and then
+    # drops that share of unreliable packets for up to packetThrottleInterval
+    # (5 s). Our per-peer unreliable traffic (30 Hz WorldUpdate) is a few KB/s,
+    # so that throttle can only hurt: 0 keeps every unreliable packet flowing
+    # (ENet default deceleration is 2). Guard only: in the measured lossy-link
+    # runs the throttle stayed at 32/32 (`tick stats: thr=`), and the observed
+    # one-second WorldUpdate gap was ENet head-of-line blocking behind a lost
+    # reliable packet instead (docs/RETAIL_INPUT_LOSS.md).
+    unreliable_throttle_deceleration: int = 0
     # Upper bound for per-frame behavior on_tick calls. Touch/proximity uses a
     # spatial index and still checks all relevant entities; this prevents a
     # pathological pile of ticking effects from monopolizing one frame.
@@ -185,12 +397,28 @@ class ServerConfig:
     world_mutation_batch_limit: int = 256
     world_mutation_cell_budget: int = 4096
     world_mutation_timeout_ticks: int = 180
-    # Prefab expansion is an authoritative world mutation, but a large KV6
-    # model is deliberately committed over multiple simulation frames. These
-    # limits bound both retained placements and per-tick cell/packet work.
+    # Prefab expansion is an authoritative world mutation. Competitive
+    # prefabs commit whole in one tick (so the client renders them at once),
+    # capped across all players by ``prefab_competitive_cell_budget``; large
+    # UGC editor models drain over multiple frames in
+    # ``prefab_cell_batch_limit`` cell batches.
     prefab_queue_limit: int = 32
     prefab_cell_batch_limit: int = 16
+    prefab_competitive_cell_budget: int = 2048
     prefab_validation_batch_limit: int = 1024
+    # BlockManager health-state rows per reliable packet when a joiner is sent
+    # the damaged-block/prefab health snapshot (server/prefab_actions.py).
+    prefab_health_state_batch: int = 128
+    # Server-side hitbox rewind for hitscan/melee hits
+    # (server/lag_compensation.py): targets are checked where the shooter saw
+    # them, one round trip (+ ``lag_compensation_view_delay_ms``) ago, never
+    # more than RTT + ``lag_compensation_extra_ms`` nor
+    # ``lag_compensation_max_ms``. The retail client extrapolates remotes, so
+    # view delay 0 is the measured contract.
+    lag_compensation_enabled: bool = True
+    lag_compensation_max_ms: float = 250.0
+    lag_compensation_extra_ms: float = 50.0
+    lag_compensation_view_delay_ms: float = 0.0
     # Reliable mutation packets are primary. This delayed, bounded canonical
     # replay repairs rare native BlockManager rejection/prediction divergence.
     terrain_repair_enabled: bool = True
@@ -211,18 +439,18 @@ class ServerConfig:
     transition_grace_seconds: float = 1.25
 
     # Game settings
-    default_mode: str = "ctf"
-    default_map: str = "classicgen"
+    default_mode: str = "tdm"
+    default_map: str = "MayanJungle"
     respawn_time: float = 5.0
     friendly_fire: bool = False
     fall_damage: bool = True
     build_damage: bool = True
     score_limit: int = 10
     # RadarStationEntity only starts its native countdown when CreateEntity
-    # carries a non-zero fuse.  The shipped server behavior observed by the
-    # playtest team is roughly 35 seconds; keep the server expiry and wire
-    # countdown on the same configurable clock.
-    radar_station_lifetime_seconds: float = 35.0
+    # carries a non-zero fuse (the client has no lifetime of its own).  The
+    # retail value is 45 s (``C.RADAR_STATION_LIFETIME``, retail A1901; see
+    # docs/RETAIL_VALUES.md); the server expiry and wire countdown share it.
+    radar_station_lifetime_seconds: float = 45.0
     # This value is sent in InitialInfo and must also govern the authoritative
     # collision list.  A mismatch makes the native client predict through an
     # ally while the server injects a collision impulse, producing rollback.
@@ -245,9 +473,52 @@ class ServerConfig:
     # Empty means discover every .vxl in maps_path. A non-empty list is the
     # ordered catalog used by map voting and future lobby hosting.
     map_rotation: List[str] = field(default_factory=list)
+    # Retail baseSquadLobbyMenu shuffles the mode_map list once when the
+    # lobby is created (random.shuffle(map_list)); the rotation/vote order
+    # below is shuffled once at startup the same way.
+    map_rotation_shuffle: bool = True
+    # Retail playlists.mapinfo max_players (DragonIsland 16, London and
+    # LunarBase 20, BlockNess and SpookyMansion 24): a map whose cap is
+    # below the human player count is offered only after every map that
+    # fits (inferred use; the retail server-side consumer is lost).
+    map_vote_retail_max_players: bool = True
     # Seconds the retail statistics overlay remains visible after a map vote
     # resolves and before MapEnded starts the next validated loader handshake.
     end_screen_seconds: float = 12.0
+    # Retail end-of-round presentation: ShowTextMessage(73) headline plus
+    # ForceShowScores(72) holding the scoreboard open for end_screen_seconds,
+    # released again on the in-place restart.
+    end_round_scoreboard: bool = True
+    # ShowTextMessage(73) scoreboard headline at the win (separate knob so
+    # the two retail packets can be bisected live).
+    end_round_headline: bool = True
+    # Map-vote candidate ranking (server/voting.py). With size fit on, maps
+    # whose playable area suits the lobby (players x area_per_player, never
+    # below min_area) are offered first; bots count as ``map_vote_bot_weight``
+    # players. The last ``map_vote_recent_exclude`` maps go to the back.
+    # ``map_size_overrides`` maps a map name to an area (int) or to one of
+    # "small"/"medium"/"large" when its .botnav cache is missing or misleading.
+    map_vote_size_fit: bool = True
+    map_vote_area_per_player: float = 8000.0
+    map_vote_min_area: float = 24000.0
+    map_vote_recent_exclude: int = 2
+    map_vote_bot_weight: float = 1.0
+    map_size_overrides: dict = field(default_factory=dict)
+    # Kick-vote cooldowns per starter (retail MIN_TIME_BETWEEN_KICK_VOTES =
+    # 300 s and MIN_TIME_BETWEEN_CANCELLED_KICK_VOTES = 45 s, shared
+    # constants C:5269-5273). A denial sends KICK_DENIED_REASON_VOTE_TOO_SOON.
+    votekick_cooldown_seconds: float = 300.0
+    votekick_cancelled_cooldown_seconds: float = 45.0
+    # Retail KICK_NOT_ENOUGH_PLAYERS: "There must be at least 3 players on a
+    # team to initiate a kick" (counted on the starter's team, bots included).
+    votekick_min_team_players: int = 3
+    # [audio] mode_start_music: start a looping in-round music bed (a
+    # last_man_standing_00N track) at every round start and for joiners.
+    # A deliberate deviation kept on the owner's request: retail rounds were
+    # silent plus map ambience until the final 61 s (game_ending_00N), and
+    # last_man_standing played only for the Zombie last survivor. false =
+    # retail silence.
+    mode_start_music: bool = True
     game_rules: GameRules = field(default_factory=GameRules.server_defaults)
 
     # Team settings
@@ -257,12 +528,47 @@ class ServerConfig:
     team2_color: Tuple[int, int, int] = (137, 179, 44)
     auto_balance: bool = True
     balance_threshold: int = 2
+    # Mid-match auto-balance (server/team_balance.py), checked every
+    # ``balance_check_interval`` seconds while auto_balance is on. A lead of
+    # balance_threshold must last ``balance_grace_seconds`` (a reconnect or bot
+    # backfill may fix it); then a dead bot switches sides, after
+    # ``balance_bot_wait_seconds`` a bot is retired/replaced, and finally a
+    # dead human is moved. Nobody is moved twice within
+    # ``balance_player_cooldown`` seconds.
+    balance_mid_match: bool = True
+    balance_grace_seconds: float = 5.0
+    balance_player_cooldown: float = 600.0
+    balance_bot_wait_seconds: float = 10.0
+    balance_check_interval: float = 1.0
+
+    # [objectives]: escape watch (server/escape_watch.py) and objective
+    # guards (modes/objective_guard.py). The watch flags players standing
+    # above the map ceiling (sky), inside solid terrain (embedded), or an
+    # objective holder sealed in a tiny pocket (entomb) for the given seconds.
+    escape_watch_enabled: bool = True
+    escape_watch_interval: float = 1.0
+    escape_watch_sky_seconds: float = 5.0
+    escape_watch_embedded_seconds: float = 3.0
+    escape_watch_entomb_seconds: float = 5.0
+    # An objective (intel/diamond/bomb) buried in an unreachable pocket for
+    # this long is returned/respawned so it can never be made unobtainable.
+    objective_entomb_seconds: float = 5.0
+    objective_pickup_requires_los: bool = True
+    objective_pickup_ends_spawn_protection: bool = True
+    # Players idle (no real input) this long do not count toward holding a
+    # TC/MH zone; 0 disables.
+    objective_afk_seconds: float = 60.0
+    # CTF: a carrier in an open-sky pit dug up to this many blocks below the
+    # base still scores, so defenders cannot excavate captures away.
+    ctf_base_pit_depth: float = 24.0
 
     # Dev bots: server-side AI players spawned at startup (0 = none).
     bot_count: int = 0
     # New isolated runtime. ``configured`` distinguishes an explicit [bots]
     # table from legacy game.bot_count fixed-population behavior.
     bots: BotConfig = field(default_factory=BotConfig)
+    anticheat: AntiCheatConfig = field(default_factory=AntiCheatConfig)
+    conduct: ConductConfig = field(default_factory=ConductConfig)
     steam: SteamMasterConfig = field(default_factory=SteamMasterConfig)
     revival: RevivalMasterConfig = field(default_factory=RevivalMasterConfig)
 
@@ -273,17 +579,26 @@ class ServerConfig:
     # count bytes, then int+float property arrays).
     entities_wire_ready: bool = True
 
-    # Weapon damage
+    # DEPRECATED ``[weapons]`` keys: accepted for old configs but IGNORED.
+    # Damage comes from the retail per-weapon/per-body-part tables
+    # (server/weapons_retail.py, shared/constants.py); a flat per-weapon
+    # number cannot express them and wiring one would break retail parity.
+    # Setting any of these keys logs a warning.
     rifle_damage: int = 49
     smg_damage: int = 29
     shotgun_damage: int = 27
     spade_damage: int = 50
     grenade_damage: int = 100
 
-    # World settings
+    # World settings. ``map_size_*`` are INFORMATIONAL: every retail VXL is
+    # 512x512x240 and the loader never reads these; a non-stock value logs a
+    # warning.
     map_size_x: int = 512
     map_size_y: int = 512
     map_size_z: int = int(C.MAP_Z) if hasattr(C, "MAP_Z") else 240
+    # Informational only: the water plane is fixed by the retail VXL format
+    # (z 238/239) and retail has no water damage besides the class
+    # fall-on-water multiplier.  Neither key changes the simulation.
     water_level: int = int(C.Z_ABOVE_WATERPLANE)
     water_damage: bool = True
     fog_color_rgb: Tuple[int, int, int] = (12, 13, 11)
@@ -373,6 +688,15 @@ class ServerConfig:
     # to ballistic movement asynchronously. Keep the owner row quiet through
     # release, settle, and landing, with this accepted-input safety bound.
     jetpack_owner_release_handoff_input_frames: int = 600
+    # The retail owner applies pack thrust when its WorldUpdate row with the
+    # active bit arrives, and stops it when the inactive row arrives; neither
+    # moment is acknowledged. The authoritative simulation therefore starts
+    # thrust this many accepted-input frames after announcing activation and
+    # keeps it this many frames after announcing exhaustion. Calibrated with
+    # scripts/scenarios/movement_stress.py (rocketeer_jump_pack_hold), see
+    # docs/RETAIL_JUMP_RESTORE.md.
+    jetpack_activation_defer_frames: int = 2
+    jetpack_exhaustion_tail_frames: int = 3
     # When true, append every self-row's (stamp, position) to
     # logs/selfrow_samples.ndjson for offline reconciliation calibration
     # (join with the client capture via tmp/reconcile_sim.py). Debug only.
@@ -382,6 +706,16 @@ class ServerConfig:
     # buttons may describe the preceding native step. Kept as an explicit A/B
     # switch until the transition chronology is fully certified (0 or 1).
     movement_input_latch_frames: int = 1
+    # Retail ClientData is ENet SEND_UNSEQUENCED (measured with
+    # scripts/enet_sniff.py), so a lost packet is never retransmitted, and the
+    # client labels every update with a contiguous loop_count that only jumps
+    # when it is more than MAX_CLOCK_SYNC_DIFFERENCE (10) loops off. A gap of
+    # up to this many missing labels is therefore lost input, not a clock
+    # jump: the server synthesizes one held-input frame per tick for each so
+    # its step count keeps matching the client's frame count. Without this a
+    # single lost packet leaves authority one frame behind for good and the
+    # client corrects on every self row (docs/RETAIL_INPUT_LOSS.md). 0 disables.
+    input_gap_fill_limit: int = 8
     # Added to the loop_count we report in ClockSync replies. The client
     # paces its clock from this, so +1 makes it run one tick AHEAD of us:
     # ClientData stamped N then arrives while we are still at N-1 and is
@@ -400,7 +734,13 @@ class ServerConfig:
 
     @property
     def server_name(self) -> str:
-        return self.name
+        """The advertised name, capped at retail MAX_SERVER_NAME_SIZE (31).
+
+        The constant is server-only (no stock client binary reads it), so
+        the retail server enforced it; InitialInfo, A2S and the master
+        adverts all use this capped value.
+        """
+        return str(self.name)[:MAX_SERVER_NAME_SIZE]
 
     @property
     def fog_color(self) -> Tuple[int, int, int]:
@@ -428,6 +768,25 @@ class ServerConfig:
         if overlay_key in overlay:
             return overlay[overlay_key]
         return self.game_rules.get(rule_key)
+
+
+def resolve_mode_code(value) -> str:
+    """Validate ``game.default_mode`` and return its canonical registry code.
+
+    An unknown mode used to leave the server running with ``mode = None``
+    (no rules, no scoring, no round end). Fail fast with the accepted names.
+    Aliases collapse to the retail short code ("zombie" -> "zom") so map
+    metadata and ``[modes.*]`` overlays see one spelling.
+    """
+    from modes import canonical_mode_code, registered_mode_codes
+
+    code = canonical_mode_code(str(value))
+    if code is None:
+        raise ValueError(
+            f"game.default_mode {value!r} is not a registered game mode; "
+            f"expected one of: {', '.join(registered_mode_codes())}"
+        )
+    return code
 
 
 def load_config(path: Optional[Path] = None) -> ServerConfig:
@@ -461,6 +820,15 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
     if "server" in data:
         s = data["server"]
         config.name = s.get("name", config.name)
+        if len(str(config.name)) > MAX_SERVER_NAME_SIZE:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[server] name %r is longer than the retail limit of %d "
+                "characters; clients will see %r",
+                config.name, MAX_SERVER_NAME_SIZE,
+                str(config.name)[:MAX_SERVER_NAME_SIZE],
+            )
         config.port = s.get("port", config.port)
         config.max_players = min(255, max(1, int(
             s.get("max_players", config.max_players)
@@ -504,6 +872,12 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 seen_maps.add(folded)
                 normalized_rotation.append(name)
         config.map_rotation = normalized_rotation
+        config.map_rotation_shuffle = bool(
+            lobby.get("map_rotation_shuffle", config.map_rotation_shuffle)
+        )
+        config.map_vote_retail_max_players = bool(lobby.get(
+            "map_vote_retail_max_players", config.map_vote_retail_max_players
+        ))
         config.end_screen_seconds = min(
             120.0,
             max(
@@ -516,6 +890,60 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 ),
             ),
         )
+        config.end_round_scoreboard = bool(
+            lobby.get("end_round_scoreboard", config.end_round_scoreboard)
+        )
+        config.end_round_headline = bool(
+            lobby.get("end_round_headline", config.end_round_headline)
+        )
+        config.map_vote_size_fit = bool(
+            lobby.get("map_vote_size_fit", config.map_vote_size_fit)
+        )
+        config.map_vote_area_per_player = min(262144.0, max(1.0, float(
+            lobby.get("map_vote_area_per_player", config.map_vote_area_per_player)
+        )))
+        config.map_vote_min_area = min(262144.0, max(0.0, float(
+            lobby.get("map_vote_min_area", config.map_vote_min_area)
+        )))
+        config.map_vote_recent_exclude = min(32, max(0, int(
+            lobby.get("map_vote_recent_exclude", config.map_vote_recent_exclude)
+        )))
+        config.map_vote_bot_weight = min(1.0, max(0.0, float(
+            lobby.get("map_vote_bot_weight", config.map_vote_bot_weight)
+        )))
+        config.votekick_cooldown_seconds = min(3600.0, max(0.0, float(
+            lobby.get("votekick_cooldown_seconds", config.votekick_cooldown_seconds)
+        )))
+        config.votekick_cancelled_cooldown_seconds = min(3600.0, max(0.0, float(
+            lobby.get(
+                "votekick_cancelled_cooldown_seconds",
+                config.votekick_cancelled_cooldown_seconds,
+            )
+        )))
+        config.votekick_min_team_players = min(32, max(0, int(
+            lobby.get("votekick_min_team_players", config.votekick_min_team_players)
+        )))
+        overrides = lobby.get("map_size_overrides", config.map_size_overrides)
+        if not isinstance(overrides, dict):
+            raise ValueError("lobby.map_size_overrides must be a TOML table")
+        normalized_overrides: dict = {}
+        for map_name, size in overrides.items():
+            if isinstance(size, str):
+                size_class = size.strip().lower()
+                if size_class not in MAP_SIZE_CLASSES:
+                    raise ValueError(
+                        f"lobby.map_size_overrides.{map_name} must be an area "
+                        "or one of small, medium, large"
+                    )
+                normalized_overrides[str(map_name)] = size_class
+            elif isinstance(size, bool) or not isinstance(size, (int, float)):
+                raise ValueError(
+                    f"lobby.map_size_overrides.{map_name} must be an area "
+                    "or one of small, medium, large"
+                )
+            else:
+                normalized_overrides[str(map_name)] = min(262144, max(1, int(size)))
+        config.map_size_overrides = normalized_overrides
 
     game_rule_data = data.get("game_rules", {})
     if game_rule_data:
@@ -528,6 +956,16 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.timeout_ms = n.get("timeout_ms", config.timeout_ms)
         config.max_connections = n.get("max_connections", config.max_connections)
         config.bandwidth_limit = n.get("bandwidth_limit", config.bandwidth_limit)
+        config.require_protocol_version = bool(n.get(
+            "require_protocol_version", config.require_protocol_version))
+        for dead_key, retail_value in (("timeout_ms", 10000), ("bandwidth_limit", 0)):
+            if dead_key in n and n.get(dead_key) != retail_value:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "[network] %s is ignored: the ENet host keeps the retail "
+                    "library defaults", dead_key,
+                )
         config.network_event_budget = max(32, int(n.get(
             "event_budget", config.network_event_budget)))
         config.max_pending_packets = max(256, int(n.get(
@@ -541,6 +979,11 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.map_air_catchup_batch_limit = max(1, int(n.get(
             "map_air_catchup_batch_limit",
             config.map_air_catchup_batch_limit)))
+        config.map_air_catchup_enabled = bool(n.get(
+            "map_air_catchup_enabled", config.map_air_catchup_enabled))
+        config.unreliable_throttle_deceleration = max(0, min(32, int(n.get(
+            "unreliable_throttle_deceleration",
+            config.unreliable_throttle_deceleration))))
         config.entity_tick_batch_limit = max(64, int(n.get(
             "entity_tick_batch_limit", config.entity_tick_batch_limit)))
         config.mode_event_queue_limit = max(64, int(n.get(
@@ -559,9 +1002,24 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "prefab_queue_limit", config.prefab_queue_limit))))
         config.prefab_cell_batch_limit = min(128, max(1, int(n.get(
             "prefab_cell_batch_limit", config.prefab_cell_batch_limit))))
+        config.prefab_competitive_cell_budget = min(8192, max(64, int(n.get(
+            "prefab_competitive_cell_budget",
+            config.prefab_competitive_cell_budget))))
         config.prefab_validation_batch_limit = min(4096, max(64, int(n.get(
             "prefab_validation_batch_limit",
             config.prefab_validation_batch_limit))))
+        config.prefab_health_state_batch = min(4096, max(1, int(n.get(
+            "prefab_health_state_batch",
+            config.prefab_health_state_batch))))
+        config.lag_compensation_enabled = bool(n.get(
+            "lag_compensation_enabled", config.lag_compensation_enabled))
+        config.lag_compensation_max_ms = min(1000.0, max(0.0, float(n.get(
+            "lag_compensation_max_ms", config.lag_compensation_max_ms))))
+        config.lag_compensation_extra_ms = min(250.0, max(0.0, float(n.get(
+            "lag_compensation_extra_ms", config.lag_compensation_extra_ms))))
+        config.lag_compensation_view_delay_ms = min(250.0, max(0.0, float(n.get(
+            "lag_compensation_view_delay_ms",
+            config.lag_compensation_view_delay_ms))))
         config.terrain_repair_enabled = bool(n.get(
             "terrain_repair_enabled", config.terrain_repair_enabled))
         config.terrain_repair_queue_limit = max(64, int(n.get(
@@ -583,13 +1041,17 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
 
     if "game" in data:
         g = data["game"]
-        config.default_mode = g.get("default_mode", config.default_mode)
+        config.default_mode = resolve_mode_code(
+            g.get("default_mode", config.default_mode)
+        )
         config.default_map = g.get("default_map", config.default_map)
         config.respawn_time = g.get("respawn_time", config.respawn_time)
         config.friendly_fire = g.get("friendly_fire", config.friendly_fire)
         config.fall_damage = g.get("fall_damage", config.fall_damage)
         config.build_damage = g.get("build_damage", config.build_damage)
         config.score_limit = max(0, int(g.get("score_limit", config.score_limit)))
+        # 250 is an operator ceiling only (it is the retail radar RANGE, not a
+        # lifetime); the retail lifetime is the 45 s default above.
         config.radar_station_lifetime_seconds = min(
             250.0,
             max(
@@ -620,14 +1082,91 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.respawn_time = float(config.game_rules.get("RULE_RESPAWN_TIMES"))
     else:
         config.game_rules.values["RULE_RESPAWN_TIMES"] = config.respawn_time
-    if "RULE_ENABLE_FALL_ON_WATER_DAMAGE" in config.game_rules.explicit:
-        config.fall_damage = config.game_rules.enabled(
-            "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
-        )
-    else:
+    # RULE_ENABLE_FALL_ON_WATER_DAMAGE ("Enable Damage for Falling in Water")
+    # only zeroes the WATER landing multiplier; it never switches off land
+    # fall damage, so an explicit rule must not rewrite ``fall_damage``
+    # (rules audit 2026-09-27 #5). ``fall_damage`` stays the operator switch.
+    if "RULE_ENABLE_FALL_ON_WATER_DAMAGE" not in config.game_rules.explicit:
         config.game_rules.values[
             "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
         ] = bool(config.fall_damage)
+
+    if "anticheat" in data and isinstance(data["anticheat"], dict):
+        ac = data["anticheat"]
+        for name, default in vars(AntiCheatConfig()).items():
+            if name not in ac:
+                continue
+            value = ac[name]
+            if isinstance(default, bool):
+                setattr(config.anticheat, name, bool(value))
+                continue
+            if isinstance(default, str):
+                text = str(value).strip()
+                if not text:
+                    raise ValueError(f"anticheat.{name} cannot be empty")
+                setattr(config.anticheat, name, text)
+                continue
+            if isinstance(default, int):
+                number = max(0, int(value))
+            else:
+                number = max(0.0, float(value))
+            if name in _ANTICHEAT_UNIT_KEYS:
+                number = min(1.0, number)
+            bounds = _ANTICHEAT_BOUNDS.get(name)
+            if bounds is not None:
+                number = min(bounds[1], max(bounds[0], number))
+            setattr(config.anticheat, name, number)
+
+    if "audio" in data:
+        au = data["audio"]
+        if not isinstance(au, dict):
+            raise ValueError("audio must be a TOML table")
+        config.mode_start_music = bool(
+            au.get("mode_start_music", config.mode_start_music)
+        )
+
+    if "objectives" in data:
+        ob = data["objectives"]
+        if not isinstance(ob, dict):
+            raise ValueError("objectives must be a TOML table")
+        for name in (
+            "escape_watch_enabled",
+            "objective_pickup_requires_los",
+            "objective_pickup_ends_spawn_protection",
+        ):
+            setattr(config, name, bool(ob.get(name, getattr(config, name))))
+        config.escape_watch_interval = min(60.0, max(0.1, float(ob.get(
+            "escape_watch_interval", config.escape_watch_interval))))
+        for name in (
+            "escape_watch_sky_seconds",
+            "escape_watch_embedded_seconds",
+            "escape_watch_entomb_seconds",
+            "objective_entomb_seconds",
+        ):
+            setattr(config, name, min(600.0, max(0.0, float(
+                ob.get(name, getattr(config, name))))))
+        config.objective_afk_seconds = min(3600.0, max(0.0, float(ob.get(
+            "objective_afk_seconds", config.objective_afk_seconds))))
+        config.ctf_base_pit_depth = min(240.0, max(0.0, float(ob.get(
+            "ctf_base_pit_depth", config.ctf_base_pit_depth))))
+
+    if "conduct" in data and isinstance(data["conduct"], dict):
+        cd = data["conduct"]
+        for name, default in vars(ConductConfig()).items():
+            if name not in cd:
+                continue
+            value = cd[name]
+            if isinstance(default, bool):
+                setattr(config.conduct, name, bool(value))
+            elif isinstance(default, list):
+                if isinstance(value, (list, tuple)):
+                    setattr(
+                        config.conduct,
+                        name,
+                        [str(item) for item in value if str(item).strip()],
+                    )
+            else:
+                setattr(config.conduct, name, max(0.0, float(value)))
 
     if "bots" in data and isinstance(data["bots"], dict):
         b = data["bots"]
@@ -697,6 +1236,22 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             0,
             int(b.get("clean_slate_games", config.bots.clean_slate_games)),
         )
+        config.bots.skill_balance = bool(
+            b.get("skill_balance", config.bots.skill_balance)
+        )
+        # Bounds match the clamps skill_balance.py applies at use.
+        config.bots.skill_balance_max_shift = min(0.9, max(0.0, float(
+            b.get("skill_balance_max_shift", config.bots.skill_balance_max_shift)
+        )))
+        config.bots.skill_balance_rate = min(1.0, max(0.0, float(
+            b.get("skill_balance_rate", config.bots.skill_balance_rate)
+        )))
+        config.bots.skill_balance_deadband = min(0.95, max(0.0, float(
+            b.get("skill_balance_deadband", config.bots.skill_balance_deadband)
+        )))
+        config.bots.skill_balance_min_events = min(1000, max(1, int(
+            b.get("skill_balance_min_events", config.bots.skill_balance_min_events)
+        )))
 
     if "steam" in data:
         steam = data["steam"]
@@ -900,6 +1455,21 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             config.team2_color = color
         config.auto_balance = t.get("auto_balance", config.auto_balance)
         config.balance_threshold = t.get("balance_threshold", config.balance_threshold)
+        config.balance_mid_match = bool(
+            t.get("balance_mid_match", config.balance_mid_match)
+        )
+        config.balance_grace_seconds = min(600.0, max(0.0, float(
+            t.get("balance_grace_seconds", config.balance_grace_seconds)
+        )))
+        config.balance_player_cooldown = min(86400.0, max(0.0, float(
+            t.get("balance_player_cooldown", config.balance_player_cooldown)
+        )))
+        config.balance_bot_wait_seconds = min(600.0, max(0.0, float(
+            t.get("balance_bot_wait_seconds", config.balance_bot_wait_seconds)
+        )))
+        config.balance_check_interval = min(60.0, max(0.1, float(
+            t.get("balance_check_interval", config.balance_check_interval)
+        )))
 
     if "weapons" in data:
         w = data["weapons"]
@@ -908,14 +1478,44 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.shotgun_damage = w.get("shotgun_damage", config.shotgun_damage)
         config.spade_damage = w.get("spade_damage", config.spade_damage)
         config.grenade_damage = w.get("grenade_damage", config.grenade_damage)
+        present = sorted(key for key in _DEPRECATED_WEAPON_KEYS if key in w)
+        if present:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[weapons] %s ignored: damage comes from the retail per-weapon "
+                "tables (server/weapons_retail.py, shared/constants.py); "
+                "remove the [weapons] table",
+                "/".join(present),
+            )
 
     if "world" in data:
         w = data["world"]
         config.map_size_x = w.get("map_size_x", config.map_size_x)
         config.map_size_y = w.get("map_size_y", config.map_size_y)
         config.map_size_z = w.get("map_size_z", config.map_size_z)
+        changed = [
+            f"{key}={w[key]!r}"
+            for key, stock in _INFORMATIONAL_MAP_SIZE.items()
+            if key in w and w[key] != stock
+        ]
+        if changed:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[world] %s ignored: map dimensions are fixed by the retail "
+                "VXL format (512x512x240); map_size_* is informational",
+                ", ".join(changed),
+            )
         config.water_level = w.get("water_level", config.water_level)
         config.water_damage = w.get("water_damage", config.water_damage)
+        if "water_level" in w or "water_damage" in w:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[world] water_level/water_damage are ignored (the retail "
+                "water plane is fixed at z 238/239 and has no water damage)"
+            )
         config.default_skybox = w.get("default_skybox", config.default_skybox)
         config.maps_path = w.get("maps_path", config.maps_path)
         config.prefabs_path = w.get("prefabs_path", config.prefabs_path)
@@ -942,15 +1542,43 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
     # Per-mode overlays: [modes.tdm], [modes.ctf], ... Each table's keys
     # override that mode's defaults (score_limit, time_limit, kill_points...).
     if "modes" in data and isinstance(data["modes"], dict):
-        for code, settings in data["modes"].items():
+        from modes import canonical_mode_code
+
+        # Modes read their overlay by retail short code ("zom", "oc"), so an
+        # alias table such as [modes.zombie] used to be silently ignored.
+        # Canonical-key tables win over alias tables for the same mode.
+        items = sorted(
+            data["modes"].items(),
+            key=lambda item: canonical_mode_code(str(item[0])) == str(item[0]).lower(),
+        )
+        for code, settings in items:
             if isinstance(settings, dict):
-                config.mode_settings[str(code)] = dict(settings)
+                key = canonical_mode_code(str(code)) or str(code)
+                merged = dict(config.mode_settings.get(key, {}))
+                merged.update(settings)
+                config.mode_settings[key] = merged
 
     if "admin" in data:
         a = data["admin"]
-        config.admin_password = a.get("password", config.admin_password)
+        if not isinstance(a, dict):
+            raise ValueError("admin must be a TOML table")
+        password = a.get("password", config.admin_password)
+        if isinstance(password, (dict, list)):
+            raise ValueError("admin.password must be a string")
+        config.admin_password = "" if password is None else str(password)
         config.log_commands = a.get("log_commands", config.log_commands)
         config.bans_path = str(a.get("bans_path", config.bans_path))
+    problem = admin_password_problem(config.admin_password)
+    if problem is not None:
+        import logging
+
+        logging.getLogger("BattleSpades.config").warning(
+            "In-game /admin login is DISABLED: %s. Set [admin] password in "
+            "%s to a unique secret of at least %d characters to enable it.",
+            problem,
+            path if path is not None else "config.toml",
+            MIN_ADMIN_PASSWORD_LENGTH,
+        )
 
     if "logging" in data:
         lg = data["logging"]
@@ -1013,11 +1641,22 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 config.jetpack_owner_release_handoff_input_frames,
             )
         )))
+        config.jetpack_activation_defer_frames = max(0, min(30, int(
+            dbg.get("jetpack_activation_defer_frames",
+                    config.jetpack_activation_defer_frames)
+        )))
+        config.jetpack_exhaustion_tail_frames = max(0, min(30, int(
+            dbg.get("jetpack_exhaustion_tail_frames",
+                    config.jetpack_exhaustion_tail_frames)
+        )))
         config.debug_selfrow = bool(dbg.get("debug_selfrow", config.debug_selfrow))
         config.movement_debug_capture = bool(dbg.get(
             "movement_debug_capture", config.movement_debug_capture))
         config.movement_input_latch_frames = max(0, min(1, int(dbg.get(
             "movement_input_latch_frames", config.movement_input_latch_frames
+        ))))
+        config.input_gap_fill_limit = max(0, min(9, int(dbg.get(
+            "input_gap_fill_limit", config.input_gap_fill_limit
         ))))
         config.clock_sync_loop_bias = int(dbg.get(
             "clock_sync_loop_bias", config.clock_sync_loop_bias))

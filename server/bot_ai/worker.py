@@ -3456,9 +3456,13 @@ class BotBrain:
                 break
         if cell is None:
             return None
+        # The server gates melee on the stock catalog cadence of THIS tool.
+        from server.game_constants import WEAPON_CATALOG
+
+        stock = WEAPON_CATALOG.get(int(melee))
         state.next_breach_at = now + max(
             0.35,
-            float(getattr(C, "PICKAXE_SHOOT_INTERVAL", 0.4)),
+            float(getattr(stock, "fire_interval", 0.0) or 0.0),
         )
         target = tuple(float(value) + 0.5 for value in cell)
         return self._intent(

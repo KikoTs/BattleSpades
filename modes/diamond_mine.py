@@ -13,6 +13,7 @@ import shared.constants_gamemode as CG
 from server import mode_data
 from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL
 
+from . import objective_guard
 from .base_mode import BaseMode
 from .objective_zones import (
     ObjectiveZone,
@@ -108,17 +109,37 @@ class DiamondMineMode(BaseMode):
         self._next_discovery_at = 0.0
         self._next_carry_score_at = 0.0
         self._rng = random.Random()
+        from server.combat_scores import EscortTracker
+
+        self._escorts = EscortTracker(
+            float(CG.DIA_ESCORT_RADIUS), float(CG.DIA_ESCORT_HYSTERESIS)
+        )
+        # serial -> (uncovering player or None, teams that have carried it):
+        # feeds DIA_STEAL_TOTAL / DIA_FINDANDCASHIN_TOTAL (COM_DIA_STEAL).
+        self._diamond_history: dict[int, tuple[object, set[int]]] = {}
 
     async def on_mode_start(self) -> None:
-        await super().on_mode_start()
+        # Clear before the base class rebuilds map resources: on a round
+        # restart the registry was already wiped and its ids restart at 0, so
+        # a later clear would DestroyEntity freshly rebuilt crates.
         self._clear_runtime_entities()
+        await super().on_mode_start()
         for team in self.server.teams.values():
             team.reset()
+        # An in-place restart keeps the GameScene: clear the previous
+        # round's drop-off minimap zones before the rebuilt list replaces
+        # them, or their icons stay on every client forever.
+        for dropoff in tuple(self.active_dropoffs):
+            dropoff.active = False
+            self._clear_dropoff(dropoff)
         self.dropoffs = self._build_dropoffs()
         self.active_dropoffs = []
         self.carriers.clear()
+        self._escorts.reset()
+        self._diamond_history.clear()
         self._rotation_cursor = 0
         self._activate_next_dropoffs()
+        self.broadcast_start_cue()
         now = time.time()
         self._next_discovery_at = now
         self._next_carry_score_at = now + float(CG.DIA_SCORE_CARRY_INTERVAL)
@@ -140,9 +161,23 @@ class DiamondMineMode(BaseMode):
         if self.ended:
             return
         now = time.time()
+        registry = getattr(self.server, "entity_registry", None)
         for diamond in tuple(self.ground_diamonds.values()):
+            if now < diamond.expires_at:
+                # Keep the wire fuse at the remaining lifetime so a late
+                # joiner's CreateEntity replay counts down from the live value.
+                entity = registry.get(diamond.entity_id) if registry else None
+                if entity is not None:
+                    entity.fuse = max(0.0, float(diamond.expires_at - now))
             if now >= diamond.expires_at:
                 self._remove_ground_diamond(diamond.entity_id)
+                # A diamond left on the ground too long vanishes with its
+                # own cue where it lay (DIAMOND_DISAPPEAR, server-only id).
+                from server.audio import SND_DIAMOND_DISAPPEAR, play_sound
+
+                play_sound(
+                    self.server, SND_DIAMOND_DISAPPEAR, position=diamond.position
+                )
 
         for player in tuple(getattr(self.server, "players", {}).values()):
             if not self._active_player(player):
@@ -205,9 +240,83 @@ class DiamondMineMode(BaseMode):
             float(position[1]) + 0.5,
             float(position[2]) + 0.5,
         ), now=now, uncovered_by=player)
+        # Only a mined discovery starts the spawn cooldown; a carrier's drop
+        # re-places an existing diamond and must not delay the next find.
+        self._next_discovery_at = float(now) + float(CG.DIA_TIME_BETWEEN_DIAMOND_SPAWN)
 
     async def on_player_death(self, player, killer, kill_type: int) -> None:
+        await super().on_player_death(player, killer, kill_type)
+        self._award_kill_events(player, killer, kill_type)
         await self._drop_carried_diamond(player)
+
+    # Retail objective kill events (see server.combat_scores).
+    _KILL_EVENT_AMOUNTS = {
+        "intercept": int(CG.DIA_SCORE_INTERCEPT),
+        "carrier_defend": int(CG.DIA_SCORE_CARRIER_DEFEND),
+        "defend": int(CG.DIA_SCORE_DEFEND),
+        "assault": int(CG.DIA_SCORE_ASSAULT),
+        "assault_enemy": int(CG.DIA_SCORE_ASSAULT),
+        "distract": int(CG.DIA_SCORE_DISTRACT),
+    }
+    _KILL_EVENT_REASONS = {
+        "intercept": int(C.SCORE_REASON.DIA_INTERCEPT_SCORE_REASON),
+        "carrier_defend": int(C.SCORE_REASON.DIA_CARRIER_DEFEND_SCORE_REASON),
+        "defend": int(C.SCORE_REASON.DIA_DEFEND_SCORE_REASON),
+        "assault": int(C.SCORE_REASON.DIA_ASSAULT_SCORE_REASON),
+        "assault_enemy": int(C.SCORE_REASON.DIA_ASSAULT_SCORE_REASON),
+        "distract": int(C.SCORE_REASON.DIA_DISTRACT_SCORE_REASON),
+    }
+
+    def _team_carriers(self, team: int) -> list:
+        players = getattr(self.server, "players", {})
+        result = []
+        for player_id in self.carriers:
+            carrier = players.get(player_id)
+            if carrier is not None and getattr(carrier, "team", None) == team:
+                result.append(carrier)
+        return result
+
+    def _award_kill_events(self, victim, killer, kill_type: int) -> None:
+        """Objective kill events, evaluated BEFORE the victim drops a diamond.
+
+        Intercept Carrier: kill an enemy diamond carrier. Carrier Defend:
+        kill an enemy within DIA_CARRIER_THREAT_RADIUS (10) of your carrier.
+        Diamond Defend: kill an enemy within DIA_THREAT_RADIUS (20) of a
+        ground diamond. Diamond Assault: a kill at an active drop-off your
+        team may use (you or the victim within DIA_THREAT_RADIUS of it).
+        Diamond Distraction: the victim died to an enemy within
+        DIA_ESCORT_RADIUS (15) of its own carrier.
+        """
+        from server import combat_scores as cs
+
+        if self.ended or not cs.eligible_kill(killer, victim, kill_type):
+            return
+        killer_team, victim_team = int(killer.team), int(victim.team)
+        event = cs.classify_objective_kill(
+            killer, victim,
+            victim_carrying=int(getattr(victim, "id", -1)) in self.carriers,
+            killer_team_carriers=self._team_carriers(killer_team),
+            defend_points=[d.position for d in self.ground_diamonds.values()],
+            attack_points=[
+                dropoff.zone.center for dropoff in self.active_dropoffs
+                if dropoff.remaining > 0
+                and dropoff.team in (TEAM_NEUTRAL, killer_team)
+            ],
+            carrier_threat_radius=float(CG.DIA_CARRIER_THREAT_RADIUS),
+            threat_radius=float(CG.DIA_THREAT_RADIUS),
+        )
+        cs.award_kill_event(
+            self.server, killer, event,
+            self._KILL_EVENT_AMOUNTS, self._KILL_EVENT_REASONS, mode=self,
+        )
+        if cs.is_distraction(
+            victim, killer, kill_type, self._team_carriers(victim_team),
+            float(CG.DIA_ESCORT_RADIUS),
+        ):
+            cs.award_kill_event(
+                self.server, victim, "distract",
+                self._KILL_EVENT_AMOUNTS, self._KILL_EVENT_REASONS, mode=self,
+            )
 
     async def on_player_leave(self, player) -> None:
         await self._drop_carried_diamond(player)
@@ -222,6 +331,7 @@ class DiamondMineMode(BaseMode):
         return True
 
     def reveal_to(self, connection) -> None:
+        super().reveal_to(connection)
         for dropoff in self.active_dropoffs:
             self._send_dropoff(dropoff, connection=connection)
         from server.entities.registry import send_create_entity_to
@@ -230,11 +340,10 @@ class DiamondMineMode(BaseMode):
             entity = self.server.entity_registry.get(diamond.entity_id)
             if entity is not None:
                 send_create_entity_to(connection, entity)
-        self.send_localised_message_to(
-            connection,
-            "DIAMOND_START",
-            override_previous=True,
-        )
+        self.send_start_cue_to(connection)
+
+    def start_cue_for(self, player):
+        return "DIAMOND_START"
 
     def _build_dropoffs(self) -> list[DiamondDropoff]:
         wm = getattr(self.server, "world_manager", None)
@@ -337,6 +446,9 @@ class DiamondMineMode(BaseMode):
             state=TEAM_NEUTRAL,
             kind="diamond",
             radius=0.5,
+            # Retail sends the diamond lifetime (RULE_DIAMOND_LIFETIME) as
+            # the packet-21 fuse; the client's 3D label counts it down.
+            fuse=float(self.diamond_lifetime),
         )
         self.server.broadcast_create_entity(entity)
         diamond = GroundDiamond(
@@ -349,13 +461,19 @@ class DiamondMineMode(BaseMode):
         )
         self._serial += 1
         self.ground_diamonds[diamond.entity_id] = diamond
-        self._next_discovery_at = float(now) + float(CG.DIA_TIME_BETWEEN_DIAMOND_SPAWN)
         if uncovered_by is not None:
+            self._diamond_history[diamond.serial] = (uncovered_by, set())
             self._award_player(
                 uncovered_by,
                 int(CG.DIA_INDIVIDUAL_SCORE_FOR_MINED_DIAMOND),
                 int(C.SCORE_REASON.DIA_UNCOVER_SCORE_REASON),
             )
+            self.announce_localised(
+                "DIAMOND_UNCOVERED", (str(getattr(uncovered_by, "name", "")),)
+            )
+            from server.audio import SND_DIAMOND_APPEAR, play_sound
+
+            play_sound(self.server, SND_DIAMOND_APPEAR)
         return diamond
 
     def _pickup_diamond(self, player, diamond: GroundDiamond) -> None:
@@ -370,7 +488,18 @@ class DiamondMineMode(BaseMode):
         ):
             return
         self.carriers[int(player.id)] = diamond.serial
+        history = self._diamond_history.setdefault(diamond.serial, (None, set()))
+        history[1].add(int(player.team))
+        objective_guard.end_spawn_protection_for_objective(self.server, player)
         self._remove_ground_diamond(diamond.entity_id)
+        name = str(getattr(player, "name", ""))
+        self.announce_localised_to_team(
+            int(player.team), "DIAMOND_PICKEDUP_YOURTEAM", (name,)
+        )
+        self.announce_localised_to_team(
+            TEAM2 if int(player.team) == TEAM1 else TEAM1,
+            "DIAMOND_PICKEDUP_OPPOSITION", (name,)
+        )
 
     async def _cash_in(self, player, dropoff: DiamondDropoff) -> None:
         from server.pickups import broadcast_drop
@@ -382,7 +511,9 @@ class DiamondMineMode(BaseMode):
             (0.0, 0.0, 0.0),
         ) is None:
             return
-        self.carriers.pop(int(player.id), None)
+        serial = self.carriers.pop(int(player.id), None)
+        self._escorts.forget_carrier(player)
+        self._record_cash_in_totals(player, serial)
         self._award_player(
             player,
             int(CG.DIA_INDIVIDUAL_SCORE_FOR_CASHED_IN_DIAMOND),
@@ -397,12 +528,64 @@ class DiamondMineMode(BaseMode):
         except TypeError:
             self.server.broadcast_set_score(team)
         dropoff.remaining -= 1
-        await self.broadcast_message(f"{player.name} cashed in a diamond!")
+        name = str(getattr(player, "name", ""))
+        # The carrier reads "You cashed in a diamond for your team!"; the
+        # rest of the team sees the named variant.
+        self.announce_localised_to_player(player, "DIAMOND_CASHED_IN_YOURSELF")
+        self.announce_localised_to_team(
+            int(player.team), "DIAMOND_CASHED_IN_YOURTEAM", (name,), exclude=player
+        )
+        self.announce_localised_to_team(
+            TEAM2 if int(player.team) == TEAM1 else TEAM1,
+            "DIAMOND_CASHED_IN_OPPOSITION", (name,)
+        )
+        from server.audio import SND_DIAMOND_DROPINBASE, play_team_relative
+
+        play_team_relative(
+            self.server, int(player.team), good=SND_DIAMOND_DROPINBASE
+        )
         if team.score >= self.score_limit:
             await self._end_by_score(int(player.team))
             return
+        self._open_map_vote_if_due(int(team.score))
         if dropoff.remaining <= 0:
             self._rotate_dropoff(dropoff)
+
+    def map_vote_trigger_score(self) -> int:
+        """Team diamonds that open the next-map ballot.
+
+        Retail DIA_DIAMONDS_TO_TRIGGER_MAP_VOTE is defined as
+        DIA_DIAMONDS_TO_GET_FOR_MAP_ROTATION - 3 (12 of 15); keep that lead
+        when an operator changes the target.
+        """
+        lead = int(CG.DIA_DIAMONDS_TO_GET_FOR_MAP_ROTATION) - int(
+            CG.DIA_DIAMONDS_TO_TRIGGER_MAP_VOTE
+        )
+        return max(1, int(self.score_limit) - lead)
+
+    def _open_map_vote_if_due(self, score: int) -> None:
+        if score < self.map_vote_trigger_score() or score >= self.score_limit:
+            return
+        vote_manager = getattr(self.server, "vote_manager", None)
+        ensure_vote = getattr(vote_manager, "ensure_map_vote", None)
+        if not callable(ensure_vote):
+            return
+        try:
+            ensure_vote(time.time())
+        except Exception:  # noqa: BLE001 - the ballot must not stop scoring
+            logger.debug("diamond map vote failed to open", exc_info=True)
+
+    def _record_cash_in_totals(self, player, serial) -> None:
+        """DIA_STEAL_TOTAL: cash in a diamond the enemy team carried.
+        DIA_FINDANDCASHIN_TOTAL: cash in a diamond you uncovered yourself.
+        Both roll into the COM_DIA_STEAL commendation."""
+        from server.combat_scores import record_profile_total
+
+        uncovered_by, teams = self._diamond_history.pop(serial, (None, set()))
+        if any(team != int(player.team) for team in teams):
+            record_profile_total(player, C.DIA_STEAL_TOTAL)
+        if uncovered_by is player:
+            record_profile_total(player, C.DIA_FINDANDCASHIN_TOTAL)
 
     async def _drop_carried_diamond(self, player, position=None, velocity=None) -> None:
         serial = self.carriers.get(int(getattr(player, "id", -1)))
@@ -420,7 +603,16 @@ class DiamondMineMode(BaseMode):
         if dropped is None:
             return
         self.carriers.pop(int(player.id), None)
+        self._escorts.forget_carrier(player)
+        if self.ended:
+            # Clear the carried tool only: no new pickup entity is created
+            # into the end screen (the restart would have to destroy it).
+            return
         settled = self._surface_anchor(dropped[2][0], dropped[2][1])
+        # The client sounds the pickup itself but not the drop.
+        from server.audio import SND_DIAMOND_DROP, play_sound
+
+        play_sound(self.server, SND_DIAMOND_DROP, position=settled)
         diamond = self._spawn_diamond(
             settled,
             now=time.time(),
@@ -445,6 +637,11 @@ class DiamondMineMode(BaseMode):
         replacement.remaining = replacement.capacity
         self.active_dropoffs.append(replacement)
         self._send_dropoff(replacement)
+        # Retail DIAMOND_BASE "Bring diamonds here!" (server-sent; no client
+        # binary references it). Sent when a new drop-off opens mid-round --
+        # inferred timing; the round-start drop-off is covered by
+        # DIAMOND_START.
+        self.announce_localised("DIAMOND_BASE")
 
     def _surface_anchor(self, x: float, y: float) -> tuple[float, float, float]:
         wm = getattr(self.server, "world_manager", None)
@@ -475,8 +672,14 @@ class DiamondMineMode(BaseMode):
                     (player.x, player.y, player.z),
                     (0.0, 0.0, 0.0),
                 )
+        registry = self.server.entity_registry
         for entity_id in tuple(self.ground_diamonds):
-            self._remove_ground_diamond(entity_id)
+            # After reset_round_runtime the registry was wiped (clients got
+            # their DestroyEntity then) and ids restart at 0: only destroy an
+            # id that still names this mode's own diamond entity.
+            entity = registry.get(entity_id)
+            if entity is not None and getattr(entity, "kind", None) == "diamond":
+                self._remove_ground_diamond(entity_id)
         self.ground_diamonds.clear()
         self.carriers.clear()
 
@@ -488,8 +691,17 @@ class DiamondMineMode(BaseMode):
             if sum((float(value) - float(origin)) ** 2 for value, origin in zip(
                 diamond.position, (player.x, player.y, player.z)
             )) <= radius_sq
+            # No grabbing through a wall/floor: mined diamonds sit at the
+            # mined cell's centre, dropped ones on a surface; aim just below
+            # either so the target stays inside the diamond's own air cell.
+            and objective_guard.pickup_line_of_sight(
+                self.server, player, diamond.position, player_space=False, lift=0.25
+            )
         ]
         return min(candidates, key=lambda item: item.entity_id) if candidates else None
+
+    def escape_watch_objective_player(self, player) -> bool:
+        return int(getattr(player, "id", -1)) in self.carriers
 
     def _cashable_dropoff(self, player) -> DiamondDropoff | None:
         return next((
@@ -511,25 +723,17 @@ class DiamondMineMode(BaseMode):
                 periods * int(CG.DIA_SCORE_CARRY_SCORE),
                 int(C.SCORE_REASON.DIA_CARRY_SCORE_REASON),
             )
-            radius_sq = float(CG.DIA_ESCORT_RADIUS) ** 2
-            for escort in players.values():
-                if (
-                    escort is carrier
-                    or not self._active_player(escort)
-                    or int(escort.team) != int(carrier.team)
-                ):
-                    continue
-                distance_sq = (
-                    (escort.x - carrier.x) ** 2
-                    + (escort.y - carrier.y) ** 2
-                    + (escort.z - carrier.z) ** 2
+            # DIA_ESCORT_RADIUS (15) to join, + DIA_ESCORT_HYSTERESIS (10)
+            # before an existing escort drops out.
+            escorts = self._escorts.escorts(carrier, [
+                escort for escort in players.values() if self._active_player(escort)
+            ])
+            for escort in escorts:
+                self._award_player(
+                    escort,
+                    periods * int(CG.DIA_SCORE_ESCORT_SCORE),
+                    int(C.SCORE_REASON.DIA_ESCORT_SCORE_REASON),
                 )
-                if distance_sq <= radius_sq:
-                    self._award_player(
-                        escort,
-                        periods * int(CG.DIA_SCORE_ESCORT_SCORE),
-                        int(C.SCORE_REASON.DIA_ESCORT_SCORE_REASON),
-                    )
 
     def _active_diamond_count(self) -> int:
         return len(self.ground_diamonds) + len(self.carriers)
@@ -544,7 +748,7 @@ class DiamondMineMode(BaseMode):
         )
 
     def _award_player(self, player, points: int, reason: int) -> None:
-        if points <= 0:
+        if points <= 0 or not self._owns_slot(player) or self.retiring:
             return
         from server.scoreboard import send_player_score
 

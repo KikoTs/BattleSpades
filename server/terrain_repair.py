@@ -18,7 +18,9 @@ import logging
 from typing import Iterable, TYPE_CHECKING
 
 import shared.constants as C
-from shared.packet import BlockBuildColored, Damage
+from shared.packet import BlockBuildColored, Damage, PaintBlockPacket
+
+from server.colors import pack_rgb, unpack_rgb
 
 if TYPE_CHECKING:
     from .main import BattleSpadesServer
@@ -280,7 +282,9 @@ class TerrainRepairService:
         for connection in recipients:
             actor_id = int(connection.player.id)
             packets = [
-                self.canonical_packet(cell, actor_id) for cell in cells
+                data
+                for cell in cells
+                for data in self.canonical_packets(cell, actor_id)
             ]
             for data in packets:
                 try:
@@ -294,6 +298,76 @@ class TerrainRepairService:
         self.server.metrics.terrain_repair_cells += len(cells)
         self.server.metrics.terrain_repair_sends += sends
         return len(cells)
+
+    def canonical_packets(self, cell: Cell, actor_id: int) -> list[bytes]:
+        """Encode one cell so ANY prior client state converges to the VXL.
+
+        ``canonical_packet`` alone is enough when the recipient holds air
+        (packet 33 builds) or a stale solid (Damage removes). It cannot fix a
+        solid cell holding the wrong colour: live-measured, the stock client
+        ignores BlockBuildColored(33) on an already-solid voxel. Solid cells
+        therefore also carry PaintBlock(7), which recolours an existing voxel
+        exactly and is a no-op on air, so the pair is idempotent whatever the
+        receiver had (joiner snapshot, predicted paint, rebuilt cell).
+        """
+
+        first = self.canonical_packet(cell, actor_id)
+        x, y, z = cell
+        world = self.server.world_manager
+        if not world.get_solid(x, y, z):
+            return [first]
+        packets = [first]
+        # Implicit interior voxels have no authoritative colour: each client
+        # shades them itself, so recolouring an existing one would overwrite
+        # the client's own rendering with the server's column fill.
+        explicit = getattr(
+            getattr(world, "map", None), "has_explicit_color", None
+        )
+        if not callable(explicit) or explicit(x, y, z):
+            paint = PaintBlockPacket()
+            paint.loop_count = int(self.server.loop_count)
+            paint.x, paint.y, paint.z = x, y, z
+            paint.color = unpack_rgb(world.get_color(x, y, z))
+            packets.append(bytes(paint.generate()))
+        packets.extend(self.canonical_health_packets(cell))
+        return packets
+
+    def canonical_health_packets(self, cell: Cell) -> list[bytes]:
+        """BlockManagerState(38) row pinning one solid cell's block health.
+
+        A voxel re-created through BlockBuildColored(33) enters the stock
+        client's ``user_blocks`` at 3.0 (live 2026-09-26), not the server's
+        9.0 (player-built) or 5.0 (map voxel).  The user row restores the
+        server's initial health and, when the cell is partially damaged, the
+        damaged row restores its remaining health and darkening.  Both rows
+        are idempotent for a client that already agrees, and the packets
+        follow the 33 on the same reliable stream.
+        """
+
+        world = self.server.world_manager
+        rows_of = getattr(world, "block_manager_rows", None)
+        if not callable(rows_of):
+            return []
+        user_rows, damaged_rows = rows_of((cell,))
+        from server.prefab_actions import (
+            block_shade_packets,
+            block_state_packets,
+        )
+
+        # User row first: the client darkens a damaged row against the
+        # initial health it holds at that moment.
+        packets = block_state_packets(user_rows, damaged_rows)
+        # The row darkens its original colour once by the total damage; live
+        # clients compounded it per hit (or painted over it).  Restate the
+        # live shade after the row so a repaired client matches everyone.
+        shade_of = getattr(world, "block_shade_rows", None)
+        if damaged_rows and callable(shade_of):
+            packets.extend(
+                block_shade_packets(
+                    shade_of((cell,)), int(getattr(self.server, "loop_count", 0))
+                )
+            )
+        return packets
 
     def canonical_packet(self, cell: Cell, actor_id: int) -> bytes:
         """Encode the VXL's current state for one exact cell at send time.
@@ -311,7 +385,7 @@ class TerrainRepairService:
             packet.loop_count = int(self.server.loop_count)
             packet.player_id = actor_id
             packet.x, packet.y, packet.z = x, y, z
-            packet.color = int(world.get_color(x, y, z)) & 0xFFFFFF
+            packet.color = pack_rgb(world.get_color(x, y, z))
             return bytes(packet.generate())
 
         packet = Damage()

@@ -19,7 +19,8 @@ from .messages import BotAction, BotActionKind, PerceptionFrame, PlayerSnapshot,
 from .policies import ModeBotDecision, mode_objective_committed
 from .project_sites import (
     ProjectSite, find_bridge_project, find_decorative_site,
-    find_mine_approach, find_prefab_cover, find_sniper_outpost,
+    find_mine_approach, find_prefab_cover, find_rampart_segment,
+    find_sniper_outpost,
 )
 from .simple_navigation import SimpleVoxelWorld
 from .team_tasks import Identity, TacticalOrder, TaskStage, TeamProject, TeamTasks
@@ -129,7 +130,13 @@ class CooperativeBehavior:
         allies = tuple(p for p in frame.players if p.alive and p.spawned and p.team == player.team)
         # Role urgency is not permission for optional construction/formation
         # to replace the mode's actual winning job.
-        critical = player.carried_entity_id >= 0 or mode_objective_committed(strategic)
+        fortifying = strategic is not None and strategic.directive == "fortify"
+        # A mode that orders fortification (Zombie survivors at their refuge)
+        # wants construction here; only carrying an objective or a committed
+        # non-building job may suppress optional work.
+        critical = player.carried_entity_id >= 0 or (
+            mode_objective_committed(strategic) and not fortifying
+        )
         combat_visible = visible if self._combat_relevant(frame, player, visible) else None
         danger = visible is not None and math.dist(player.position, visible.position) < 10
         defending = bool(life.task and life.task.kind in {"outpost", "cover", "strongpoint"}
@@ -200,6 +207,8 @@ class CooperativeBehavior:
         contact = life.memory.contact(player.position, now)
         lane = visible.eye if visible else contact.position if contact else (
             strategic.position if strategic else None)
+        if fortifying and visible is None and contact is None:
+            lane = self._fortify_lane(frame, player, strategic)
         profile = frame.profile
         creativity = profile.creativity if profile else .5
         teamwork = profile.teamwork if profile else .5
@@ -221,7 +230,18 @@ class CooperativeBehavior:
             has_miner = int(C.SUPERSPADE_TOOL) in player.loadout
             site = None
             kind = ""
-            if has_sniper and math.dist(player.position, lane) > 18:
+            refuge = self._refuge(frame, player) if fortifying else None
+            if (refuge is not None and int(C.BLOCK_TOOL) in player.loadout
+                    and math.dist(player.position, refuge) <= 14):
+                # The squad walls its refuge before anything optional: the
+                # nearest grounded run on the lowest unfinished layer that
+                # no teammate has reserved.
+                site = find_rampart_segment(self.world, player, refuge,
+                    friendly_positions=friends, reserved_cells=reserved)
+                kind = "rampart"
+            if site is not None:
+                pass
+            elif has_sniper and math.dist(player.position, lane) > 18:
                 site = find_sniper_outpost(self.world, player, lane, friendly_positions=friends)
                 kind = "outpost"
             elif has_miner and combat_visible is None:
@@ -231,12 +251,15 @@ class CooperativeBehavior:
                     from .project_sites import find_breach_project
                     site = find_breach_project(self.world, player, lane)
                     kind = "breach"
-            elif player.blocks >= 6 and (combat_visible is None or player.reloading) and creativity > .35:
+            elif player.blocks >= 6 and (combat_visible is None or player.reloading) and (creativity > .35 or fortifying):
                 site = find_prefab_cover(self.world, player, lane,
                     friendly_positions=friends, reserved_cells=reserved)
                 kind = "strongpoint" if int(C.ROCKET_TURRET_TOOL) in player.loadout else "cover"
-            if site is not None and not self._near_objective(frame, site.position, 10):
+            if site is not None and (kind == "rampart"
+                                     or not self._near_objective(frame, site.position, 10)):
                 score = .66 + creativity * .18 + teamwork * .08
+                if kind == "rampart":
+                    score = .8 + teamwork * .1
                 score -= life.memory.penalty(kind, site.position, now)
                 if score > .35:
                     patience = 24 + 48 * (profile.caution if profile else .5)
@@ -298,6 +321,7 @@ class CooperativeBehavior:
         return not strategic.role.endswith("_passive") and strategic.role not in {
             "demolition_escape_airstrike", "occupation_dispose_bomb",
             "zombie_last_survivor_escape", "vip_retreat",
+            "multihill_evade_airstrike",
         }
 
     @staticmethod
@@ -460,6 +484,10 @@ class CooperativeBehavior:
                 task.built_cells += task.action_site.cells
             task.progress_at = now
             self.teams.event("actions_confirmed", task.task_id, task.kind, now)
+            if task.kind == "rampart":
+                self._finish(life, now, True, "rampart_built")
+                life.next_project = now + 2.5
+                return None
             if task.kind == "heal":
                 task.phase = "use_pack"
             elif task.kind == "outpost":
@@ -597,6 +625,22 @@ class CooperativeBehavior:
                 self._finish(life, now, False, "crossing_stalled")
                 return None
             return self._move(task, destination, "cross_bridge", .35)
+        if task.kind == "rampart":
+            if any(self.world.solid(*cell) for cell in site.cells):
+                # A teammate or human filled part of this run; replan.
+                self._finish(life, now, False, "run_changed")
+                life.next_project = now + 1.0
+                return None
+            if distance > 1.25:
+                if now - task.progress_at > 8:
+                    self._finish(life, now, False, "approach_stalled")
+                    return None
+                return self._move(task, destination, "rampart_approach", 1.0)
+            if not self.teams.allow_mutation(player.team, now, len(site.cells)):
+                self._finish(life, now, False, "construction_budget")
+                return None
+            return self._action(frame, player, task, BotAction(BotActionKind.BUILD_LINE,
+                int(C.BLOCK_TOOL), position=site.cells[0], end_position=site.cells[-1]), site)
         if task.kind == "bridge":
             if not self.teams.allow_mutation(player.team, now, len(site.cells)):
                 self._finish(life, now, False, "construction_budget")
@@ -851,7 +895,32 @@ class CooperativeBehavior:
 
     @staticmethod
     def _near_objective(frame: PerceptionFrame, position: Vector3, radius: float) -> bool:
-        return any(math.dist(position, objective.position) < radius for objective in frame.objectives)
+        return any(math.dist(position, objective.position) < radius
+                   for objective in frame.objectives
+                   if objective.kind != "zombie_refuge")
+
+    @staticmethod
+    def _refuge(frame: PerceptionFrame, player: PlayerSnapshot) -> Vector3 | None:
+        """The team's elected Zombie refuge, the only place ramparts go up."""
+        return next((o.position for o in frame.objectives
+                     if o.kind == "zombie_refuge" and o.team == player.team), None)
+
+    @staticmethod
+    def _fortify_lane(frame: PerceptionFrame, player: PlayerSnapshot,
+                      strategic: ModeBotDecision) -> Vector3:
+        """Face the horde's side of the refuge when nothing is in sight."""
+        threat = strategic.watch_position
+        if threat is None:
+            threat = next((o.position for o in frame.objectives
+                           if o.kind == "team_anchor" and o.team != player.team), None)
+        if threat is None:
+            return strategic.position
+        dx, dy = threat[0] - player.position[0], threat[1] - player.position[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return strategic.position
+        return (player.position[0] + dx / length * 12.0,
+                player.position[1] + dy / length * 12.0, player.position[2])
 
     @staticmethod
     def _live_hazard(frame: PerceptionFrame, player: PlayerSnapshot) -> bool:

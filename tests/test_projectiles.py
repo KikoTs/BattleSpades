@@ -85,7 +85,8 @@ def test_rocket_spec_matches_client_constants():
     assert s.damage == 140
     assert s.block_damage == 5
     s2 = PROJECTILE_SPECS[int(C.RPG2_TOOL)]
-    assert s2.gravity_mult == 0.025 and s2.damage == 50 and s2.block_damage == 2
+    # Stock handle_rocket2_damage passes 40 (our constant still says 50).
+    assert s2.gravity_mult == 0.025 and s2.damage == 40 and s2.block_damage == 2
     d = PROJECTILE_SPECS[int(C.DRILLGUN_TOOL)]
     assert d.lifespan == 3.0 and d.destroyed_damage == 95
     sb = PROJECTILE_SPECS[int(C.SNOWBLOWER_TOOL)]
@@ -122,8 +123,9 @@ def test_projectile_knockback_matches_recovered_client_wrappers():
             grenade.knockback_max) == (4.0, 0.5, 1.0)
     assert (rocket.blast_radius, rocket.knockback_min,
             rocket.knockback_max) == (6.0, 0.0, 0.25)
-    assert (rocket2.self_knockback_min,
-            rocket2.self_knockback_max) == (1.0, 1.5)
+    # Stock has no RPG2 self override (the 1.0/1.5 pair is the mod tail).
+    assert (rocket2.knockback_min, rocket2.knockback_max) == (0.0, 0.25)
+    assert (rocket2.self_knockback_min, rocket2.self_knockback_max) == (None, None)
     assert (sticky.knockback_min, sticky.knockback_max) == (0.75, 0.1)
     assert (drill.destroyed_blast_radius, drill.destroyed_knockback_min,
             drill.destroyed_knockback_max) == (3.5, 0.1, 0.2)
@@ -285,6 +287,8 @@ def test_oriented_projectile_requires_exact_held_normalized_tool():
         tool=int(C.RPG_TOOL),
         loadout=[int(C.RPG_TOOL)],
         disguised=True,
+        # Launch origin must be near the eye; the bare packets default to 0.
+        eye=(0.0, 0.0, 0.0),
     )
     forged = SimpleNamespace(tool=int(C.SNOWBLOWER_TOOL))
 
@@ -854,3 +858,14 @@ def test_sticky_attaches_to_and_follows_player_until_stock_fuse():
     assert events[0].spec.name == "sticky_grenade"
     assert abs(events[0].x - target.x) < 1e-6
     assert abs((t - stuck_at) - C.STICKY_GRENADE_STICK_FUSE) < 0.1
+
+
+def test_explosion_path_modules_are_loaded_with_the_server():
+    """A first-time import inside a blast drops the GIL on file I/O and
+    stalled the first explosion/kill of a match by 100+ ms under bot load."""
+    import sys
+
+    import server.main  # noqa: F401
+
+    assert "server.explosions" in sys.modules
+    assert "server.kill_feed" in sys.modules

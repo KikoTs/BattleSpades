@@ -9,6 +9,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass
 import errno
+import inspect
 import logging
 import socket
 import sys
@@ -60,11 +61,38 @@ from .terrain_repair import TerrainRepairService
 from .world_mutations import WorldMutationService
 from .bot_ai.stimuli import BotStimulusBus
 from .bot_ai.messages import StimulusKind
+# Leaf modules that combat paths import lazily on their first explosion /
+# kill. A first-time import does file I/O, which drops the GIL; with the bot
+# AI thread busy, each drop costs a whole switch interval (~15.6 ms on
+# Windows) and the first blast of a match stalled its tick by 100+ ms.
+from . import explosions as _preload_explosions  # noqa: F401
+from . import kill_feed as _preload_kill_feed  # noqa: F401
 
 if TYPE_CHECKING:
     import enet
 
 logger = logging.getLogger(__name__)
+
+# Initial health the stock client gives a BlockBuildColored(33) voxel.
+BLOCK_COLORED_HEALTH = 3.0
+# Retail PROTOCOL_VERSION / shared.steam.game_version().
+CLIENT_PROTOCOL_VERSION = 168
+ERROR_SERVER_OUT_OF_DATE = 3
+ERROR_CLIENT_OUT_OF_DATE = 10
+
+
+def protocol_version_refusal(data) -> int | None:
+    """Retail DISCONNECT reason for a mismatched ENet connect data, else None."""
+
+    try:
+        version = int(data)
+    except (TypeError, ValueError):
+        return ERROR_CLIENT_OUT_OF_DATE
+    if version == CLIENT_PROTOCOL_VERSION:
+        return None
+    if version < CLIENT_PROTOCOL_VERSION:
+        return ERROR_CLIENT_OUT_OF_DATE
+    return ERROR_SERVER_OUT_OF_DATE
 
 # Native Damage processing changes velocity before Character physics. Across
 # six clean retail contacts, the matching authoritative pre-physics state was
@@ -72,6 +100,17 @@ logger = logging.getLogger(__name__)
 # server.loop_count nor the sparse client loop label was a stable clock. This
 # is not a transport ACK. The effect itself is recomputed at that state.
 _SNOWBALL_PREDICTION_OBSERVED_FRAMES = 3
+# Every blast whose Damage(37) type is a key of the stock
+# ``ExplosionDamageManager.damage_functions`` table is predicted the same way:
+# ``GameScene.process_packet_damage`` -> ``handle_damage`` dispatches on the
+# packet TYPE alone (causer id is not consulted) to ``handle_<x>_damage``,
+# which pushes the local character. Recovered by running the stock 32-bit
+# ``shared.explosionDamageManager.pyd`` (rules audit 2026-09-27 #9).
+STOCK_EXPLOSION_DAMAGE_TYPES = frozenset((
+    7, 8, 9, 10, 11, 12, 13, 15, 16, 18, 19, 20, 21, 22, 23, 24,
+    30, 33, 37, 38, 39, 40, 41,
+))
+_BLAST_PREDICTION_OBSERVED_FRAMES = _SNOWBALL_PREDICTION_OBSERVED_FRAMES
 
 
 class ServerBindError(RuntimeError):
@@ -221,8 +260,9 @@ class BattleSpadesServer:
         # crates live here and reach clients via StateData (join) + CreateEntity.
         from server.entities.registry import EntityRegistry
         self.entity_registry = EntityRegistry()
-        # Active radar stations per owning team. TeamMapVisibility is sent
-        # only to teammates and reference-counted for overlapping stations.
+        # Live radar stations per owning team (bookkeeping only). The stock
+        # client does radar detection itself from the RadarStationEntity, so
+        # radar sends no TeamMapVisibility(83).
         self._radar_station_counts = {TEAM1: 0, TEAM2: 0}
         # Plugin system: loaded at startup, fired at the mode-event + tick
         # dispatch points below. Drop a *.py with a BasePlugin subclass in
@@ -250,14 +290,24 @@ class BattleSpadesServer:
         self.rocket_turret_controller = RocketTurretController(self)
         from server.fire import FireController
         self.fire_controller = FireController(self)
+        from server.chemical_goo import ChemicalGooController
+        self.goo_controller = ChemicalGooController(self)
         from server.voting import VoteManager
         self.vote_manager = VoteManager(self)
+        # Mid-match auto-balance and bot difficulty balance (1 Hz, see
+        # _run_periodic_services).
+        from server.team_balance import TeamBalancer
+        self.team_balance = TeamBalancer(self)
+        from server.bot_ai.skill_balance import BotSkillBalancer
+        self.bot_skill_balance = BotSkillBalancer(self)
         # In-game packets received since the last simulation tick; drained
         # synchronously at the start of each tick so an input that ARRIVED
         # before tick N is guaranteed to be APPLIED at tick N (dispatching
         # via create_task could slip past the tick — input timing became a
         # per-packet race no WorldUpdate stamp offset could compensate).
         self._pending_ingame_packets = deque()
+        # connection -> rows it currently holds in _pending_ingame_packets.
+        self._pending_ingame_counts: dict = {}
         self._dropped_ingame_packets = 0
         self.bot_stimuli = BotStimulusBus()
         self.telemetry = telemetry or TelemetryService()
@@ -358,8 +408,158 @@ class BattleSpadesServer:
             return
         self._mode_events.append((name, args))
 
+    # Events whose handler would give the departing player new mode state.
+    _LEAVER_REACQUIRE_EVENTS = frozenset({
+        "on_player_spawn",
+        "on_player_team_change",
+    })
+    # Already-happened scoring events involving the departing player.
+    _LEAVER_SETTLE_EVENTS = frozenset({
+        "on_player_death",
+        "on_player_kill",
+    })
+
+    def _run_player_leave_hooks(self, player) -> None:
+        """Run mode + plugin ``on_player_leave`` for a disconnect, now.
+
+        Called from the synchronous ENet disconnect path while ``player`` is
+        still in ``players`` and its team, before PlayerLeft. The network
+        loop only runs between simulation steps, so this is still outside
+        any tick.
+
+        Queued events are reconciled first:
+
+        - events that would re-acquire mode state for the departing player
+          (``_LEAVER_REACQUIRE_EVENTS``: spawn, team change) are discarded;
+          after the leave hook released that state they would re-arm a
+          departed id;
+        - the departing player's pending ``on_player_death`` /
+          ``on_player_kill`` (as victim or killer) are settled NOW, in queue
+          order, before the leave hook. They record things that already
+          happened: a kill in the same tick as the disconnect still earns
+          the TDM team point, and a VIP killed just before quitting still
+          pays the killer's bonus instead of the leave hook recording a
+          killer-less VIP death first;
+        - every other event (other players' kills, block events) stays
+          queued untouched.
+        """
+        if self._mode_events:
+            settle_now = []
+            kept = []
+            for name, args in self._mode_events:
+                involves = bool(args) and any(arg is player for arg in args[:2])
+                if involves and name in self._LEAVER_REACQUIRE_EVENTS and args[0] is player:
+                    continue
+                if involves and name in self._LEAVER_SETTLE_EVENTS:
+                    settle_now.append((name, args))
+                    continue
+                kept.append((name, args))
+            # In place: the drain loop holds a reference to this deque.
+            self._mode_events.clear()
+            self._mode_events.extend(kept)
+            mode = self.mode
+            plugins = getattr(self, "plugin_manager", None)
+            call_event = getattr(plugins, "call_event", None)
+            for name, args in settle_now:
+                handler = getattr(mode, name, None) if mode is not None else None
+                if callable(handler):
+                    self._drive_hook_now(f"mode {name} (leaver)", handler, *args)
+                if callable(call_event):
+                    self._drive_hook_now(
+                        f"plugin {name} (leaver)", call_event, name, *args
+                    )
+        mode = self.mode
+        if mode is not None:
+            hook = getattr(mode, "on_player_leave", None)
+            if callable(hook):
+                self._drive_hook_now("mode on_player_leave", hook, player)
+        plugins = getattr(self, "plugin_manager", None)
+        call_event = getattr(plugins, "call_event", None)
+        if callable(call_event):
+            self._drive_hook_now(
+                "plugin on_player_leave", call_event, "on_player_leave", player
+            )
+
+    def _drive_hook_now(self, label: str, hook, *args) -> None:
+        """Run a (possibly async) hook to completion synchronously.
+
+        Mode leave hooks only emit packets and mutate state, so they finish
+        without suspending. If one does suspend, its remainder continues on
+        the event loop as a retained task instead of blocking the network
+        loop; everything before its first await has already run in order.
+        """
+        try:
+            result = hook(*args)
+        except Exception:
+            logger.exception("%s failed", label)
+            return
+        if not inspect.isawaitable(result):
+            return
+        iterator = result.__await__()
+        try:
+            pending = iterator.send(None)
+        except StopIteration:
+            return
+        except Exception:
+            logger.exception("%s failed", label)
+            return
+
+        async def _finish(pending=pending):
+            while True:
+                if pending is None:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.wait([pending])
+                try:
+                    pending = iterator.send(None)
+                except StopIteration:
+                    return
+                except Exception:
+                    logger.exception("%s failed", label)
+                    return
+
+        task = asyncio.ensure_future(_finish())
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
+
+    async def _run_periodic_services(self) -> None:
+        """Once-per-second gameplay services that need the fixed tick.
+
+        Runs inside the simulation step right before respawns, so a dead
+        player the team balancer moves respawns on the new side in this same
+        tick. Each service is isolated: one failure never skips the others
+        or the respawn pass.
+        """
+        tick_rate = max(1, int(getattr(self, "tick_rate", 60) or 60))
+        if int(getattr(self, "loop_count", 0)) % tick_rate != 0:
+            return
+        now = time.monotonic()
+        balancer = getattr(self, "team_balance", None)
+        if balancer is not None:
+            try:
+                await balancer.tick(now)
+            except Exception:
+                logger.exception("team balance tick failed")
+        skill_balance = getattr(self, "bot_skill_balance", None)
+        if skill_balance is not None:
+            try:
+                skill_balance.update(now)
+            except Exception:
+                logger.exception("bot skill balance update failed")
+        try:
+            from server import anticheat_report
+        except ImportError:
+            anticheat_report = None
+        report_tick = getattr(anticheat_report, "tick", None)
+        if callable(report_tick):
+            try:
+                report_tick(self, now)
+            except Exception:
+                logger.exception("anticheat report tick failed")
+
     async def _process_respawns(self) -> None:
         """Compatibility delegate to the round lifecycle service."""
+        await self._run_periodic_services()
         lifecycle = getattr(self, "round_lifecycle", None)
         if lifecycle is None:
             lifecycle = RoundLifecycle(self)
@@ -494,10 +694,11 @@ class BattleSpadesServer:
                 self._explode_projectile(event)
 
     def _apply_drill_contact(self, event) -> None:
-        """Apply one measured 81-cell Drill bore and replicate it safely.
+        """Apply one Drill bore with the client's exact footprint.
 
         A live type-10 packet is compact and drives the retail Drill sound,
-        particles, and exact radius-2 BlockManager footprint.  It requires a
+        particles, and the radius-3 BlockManager footprint (seeded; see
+        block_damage_model) the server has just applied per cell.  It requires a
         still-live projectile entity, however, so reconnect catch-up records
         type-6 exact cells instead.  If the entity vanished unexpectedly, the
         live path also falls back to those exact cells rather than triggering
@@ -511,12 +712,20 @@ class BattleSpadesServer:
         if owner is None:
             return
 
-        positions = drill_contact_cells(event.block)
-        destroyed = self.world_manager.destroy_blocks(positions)
-        if not destroyed:
+        combat = get_combat_system(self)
+        # Retail handle_drill_damage = radius-3 footprint with falloff and a
+        # seeded random extra (block_damage_model): 20 damage bores the
+        # 81-cell core through map voxels, while 9-health built blocks near
+        # the rim may survive exactly as they do on every client.
+        seed, amount, destroyed, damaged = combat.apply_native_terrain_damage(
+            owner,
+            tuple(float(value) for value in event.block),
+            int(C.DRILL_DAMAGE),
+            float(getattr(C, "DRILL_DRILLING_BLOCK_DAMAGE", 20.0)),
+        )
+        if not destroyed and not damaged:
             return
 
-        combat = get_combat_system(self)
         raw_entity_id = getattr(event.projectile, "entity_id", None)
         live_entity = (
             self.entity_registry.get(int(raw_entity_id))
@@ -524,23 +733,22 @@ class BattleSpadesServer:
             else None
         )
         if live_entity is None:
-            combat._broadcast_block_destroy(
-                owner,
-                destroyed,
-                damage_type=int(C.WEAPON_DAMAGE),
-                causer_id=int(owner.id),
-            )
+            for data in combat._exact_outcome_packets(owner, destroyed, damaged):
+                self.broadcast(data, reliable=True, record_mutation=False)
+            if destroyed:
+                combat.record_exact_block_destroy_catchup(
+                    owner, destroyed, causer_id=int(owner.id)
+                )
+                combat._collapse_unsupported(owner, destroyed)
             return
 
         packet = Damage()
         packet.player_id = int(owner.id)
         packet.type = int(C.DRILL_DAMAGE)
-        packet.damage = float(
-            getattr(C, "DRILL_DRILLING_BLOCK_DAMAGE", 20.0)
-        )
+        packet.damage = amount
         packet.face = 0
         packet.chunk_check = 1
-        packet.seed = 0
+        packet.seed = int(seed)
         # Entity id 0 is valid; never use truthiness as the sentinel here.
         packet.causer_id = int(raw_entity_id)
         packet.position = tuple(float(value) for value in event.block)
@@ -552,12 +760,13 @@ class BattleSpadesServer:
 
         # A joiner's MapSync snapshot may predate this bore but its replay may
         # occur after the projectile is gone. Journal stable exact cells only.
-        combat.record_exact_block_destroy_catchup(
-            owner,
-            destroyed,
-            causer_id=int(owner.id),
-        )
-        combat._collapse_unsupported(owner, destroyed)
+        if destroyed:
+            combat.record_exact_block_destroy_catchup(
+                owner,
+                destroyed,
+                causer_id=int(owner.id),
+            )
+            combat._collapse_unsupported(owner, destroyed)
 
     def _deploy_launched_mine(self, event) -> None:
         """Turn a Mine Launcher projectile's terrain contact into an armed,
@@ -684,12 +893,22 @@ class BattleSpadesServer:
             if self.entity_registry.remove(eid) is not None:
                 self.broadcast_destroy_entity(eid)
 
+        if ex.spec.name == "chemical_bomb":
+            # Retail has no Chemical Bomb blast: the stock shared
+            # ExplosionDamageManager has a handler for every other late
+            # explosive (GL grenade, sticky, radar, mine, C4) but none for
+            # it, and its Damage type 43 is single-block (no crater). The
+            # bomb's whole effect is the goo it leaves behind.
+            self.goo_controller.splash(gx, gy, gz, thrower)
+            return
+
         # Projectiles that don't self-destroy blocks (RPG2, block_damage 2)
         # ACCUMULATE damage; grenade-family + strong warheads destroy outright.
         force_destroy = ex.spec.behavior != "contact"
         self._apply_blast(gx, gy, gz, ex.damage, ex.block_damage,
                           ex.spec.kill_type, thrower, crater_radius=1,
                           force_destroy=force_destroy,
+                          terrain_damage_type=int(ex.spec.damage_type),
                           blast_radius=float(ex.blast_radius),
                           knockback_min=float(ex.knockback_min),
                           knockback_max=float(ex.knockback_max),
@@ -702,6 +921,79 @@ class BattleSpadesServer:
                           ))
         if ex.spec.name == "molotov":
             self.fire_controller.ignite_impact(gx, gy, gz, thrower)
+
+    def _apply_blast_terrain(self, gx, gy, gz, block_damage, thrower, *,
+                             crater_radius: int = 1,
+                             damage_type: int | None = None,
+                             causer_entity_id: int | None = None) -> bool:
+        """Apply one explosion's terrain damage with per-cell health.
+
+        Returns True when ONE native expanding ``Damage(37)`` of
+        ``damage_type`` was broadcast. For a stock explosion type that packet
+        is also each stock client's knockback prediction, so it is sent even
+        when the footprint holds no solid cell (every client derives the same
+        empty footprint and changes no terrain).
+        """
+
+        import shared.constants as C
+        from server import block_damage_model
+
+        combat = get_combat_system(self)
+        # WEAPON_DAMAGE (6) is the exact single-cell type; a projectile spec
+        # that carries it (chemical bomb, type not in the catalog) has no
+        # measured blast footprint and keeps the cube below.
+        if (
+            damage_type is not None
+            and int(damage_type) != int(C.WEAPON_DAMAGE)
+            and block_damage_model.is_native(damage_type)
+        ):
+            seed, amount, destroyed, damaged = (
+                combat.apply_native_terrain_damage(
+                    thrower, (gx, gy, gz), int(damage_type), block_damage
+                )
+            )
+            if not destroyed and not damaged and (
+                int(damage_type) not in STOCK_EXPLOSION_DAMAGE_TYPES
+            ):
+                return False
+            if causer_entity_id is not None:
+                combat.broadcast_native_radius_destroy(
+                    thrower,
+                    (float(gx), float(gy), float(gz)),
+                    destroyed,
+                    damage=amount,
+                    damage_type=int(damage_type),
+                    causer_entity_id=int(causer_entity_id),
+                    seed=seed,
+                    damaged=damaged,
+                )
+            else:
+                combat.broadcast_native_terrain_damage(
+                    thrower,
+                    (float(gx), float(gy), float(gz)),
+                    destroyed,
+                    damage=amount,
+                    damage_type=int(damage_type),
+                    seed=seed,
+                )
+            return True
+
+        # No retail footprint known for this source: damage the crater cube
+        # cell by cell with exact type-6 packets, still through per-cell
+        # health so built blocks survive exactly as long as on clients.
+        import math
+
+        bx, by, bz = (int(math.floor(float(v) + 0.5)) for v in (gx, gy, gz))
+        r = max(1, int(crater_radius))
+        for block in [
+            (ax, ay, az)
+            for ax in range(bx - r, bx + r + 1)
+            for ay in range(by - r, by + r + 1)
+            for az in range(bz - r, bz + r + 1)
+        ]:
+            if self.world_manager.get_solid(*block):
+                combat._apply_block_damage(thrower, block, block_damage)
+        return False
 
     def _place_block_cannon_impact(self, ex, thrower) -> bool:
         """Commit one Block Cannon voxel at a terrain impact.
@@ -727,7 +1019,9 @@ class BattleSpadesServer:
         world = self.world_manager
         if not world.can_build(*position) or not combat._block_supported(*position):
             return False
-        if not world.set_block(*position, True, color):
+        # Every stock client stores a BlockBuildColored(33) voxel at 3.0
+        # health (live 2026-09-26); record the same so all break it together.
+        if not world.set_block(*position, True, color, health=BLOCK_COLORED_HEALTH):
             return False
 
         from shared.packet import BlockBuildColored
@@ -757,10 +1051,22 @@ class BattleSpadesServer:
                      prediction_frame_delay: int | None = None,
                      native_damage_type: int | None = None,
                      causer_entity_id: int | None = None,
-                     ignore_player_los: bool = False) -> None:
-        """Shared explosion: crater a cube of `crater_radius` and damage nearby
-        players with the live-verified falloff. Used by projectiles AND
-        deployables (dynamite/landmine/C4)."""
+                     ignore_player_los: bool = False,
+                     terrain_damage_type: int | None = None) -> None:
+        """Shared explosion: damage terrain and nearby players.
+
+        Terrain follows the retail client's own BlockManager footprint for
+        the explosive's damage type (:mod:`server.block_damage_model`, live
+        fitted 2026-09-26): every cell's damage is applied to the canonical
+        map with its own health (9 for built blocks, 5 for map voxels) and
+        ONE native Damage packet with the same seed makes every client apply
+        the identical per-cell damage.  ``native_damage_type`` (deployables,
+        which also carry ``causer_entity_id``) or ``terrain_damage_type``
+        (projectiles) selects the footprint; an explosion without a known
+        footprint damages the ``crater_radius`` cube cell by cell through the
+        same per-cell health.  ``force_destroy`` is retained for callers but
+        no longer bypasses block health.  Players take the live-verified
+        falloff."""
         stimuli = getattr(self, "bot_stimuli", None)
         if stimuli is not None:
             stimuli.publish(
@@ -771,66 +1077,90 @@ class BattleSpadesServer:
                 radius=max(48.0, float(blast_radius) * 5.0),
                 lifetime=2.0,
             )
-        bx, by, bz = int(gx), int(gy), int(gz)
-        r = max(1, int(crater_radius))
-        if native_damage_type is not None and causer_entity_id is not None:
-            from server.projectiles import radius_damage_cells
-
-            positions = list(radius_damage_cells((bx, by, bz), r))
-        else:
-            positions = [
-                (ax, ay, az)
-                for ax in range(bx - r, bx + r + 1)
-                for ay in range(by - r, by + r + 1)
-                for az in range(bz - r, bz + r + 1)
-            ]
+        terrain_packet_sent = False
         if getattr(self.config, "build_damage", True) and block_damage > 0.0:
-            if block_damage >= DEFAULT_BLOCK_HEALTH or force_destroy:
-                destroyed = self.world_manager.destroy_blocks(positions)
-                if destroyed:
-                    combat = get_combat_system(self)
-                    if (
-                        native_damage_type is not None
-                        and causer_entity_id is not None
-                    ):
-                        combat.broadcast_native_radius_destroy(
-                            thrower if thrower is not None else None,
-                            (float(gx), float(gy), float(gz)),
-                            destroyed,
-                            damage=float(block_damage),
-                            damage_type=int(native_damage_type),
-                            causer_entity_id=int(causer_entity_id),
-                        )
-                    else:
-                        combat._broadcast_block_destroy(
-                            thrower if thrower is not None else None,
-                            destroyed,
-                        )
-            else:
-                combat = get_combat_system(self)
-                for block in positions:
-                    if self.world_manager.get_solid(*block):
-                        combat._apply_block_damage(thrower, block, block_damage)
+            terrain_packet_sent = self._apply_blast_terrain(
+                gx, gy, gz, block_damage, thrower,
+                crater_radius=crater_radius,
+                damage_type=(
+                    native_damage_type
+                    if native_damage_type is not None
+                    else terrain_damage_type
+                ),
+                causer_entity_id=(
+                    causer_entity_id if native_damage_type is not None else None
+                ),
+            )
+        packet_type = (
+            native_damage_type if native_damage_type is not None
+            else terrain_damage_type
+        )
+        if (
+            prediction_frame_delay is None
+            and terrain_packet_sent
+            and packet_type is not None
+            and int(packet_type) in STOCK_EXPLOSION_DAMAGE_TYPES
+        ):
+            # Stock clients push their own character while processing that
+            # Damage(37); apply the authoritative push on the matching
+            # accepted input frame instead of at server-side contact, so the
+            # owner is not corrected by an impulse it has not predicted yet.
+            prediction_frame_delay = _BLAST_PREDICTION_OBSERVED_FRAMES
 
-        # Player blast damage: within 16 blocks, LOS-gated. Same falloff CURVE
-        # as the live-verified grenade (min(100, 4096/sq)), scaled to each
-        # warhead's max damage.
-        scale = damage / 100.0
+        # Player blast damage: the stock shared ExplosionDamageManager
+        # (server/weapons_retail.py, docs/WEAPONS_RETAIL.md). A blast whose
+        # kill type + warhead damage matches a stock handler uses that
+        # handler's radius/knockback/classic flag, so every caller gets the
+        # retail curve even if it passed a different radius.
+        from server import weapons_retail as retail
+        from server.explosions import explosion_impulse
+
+        stock = retail.retail_explosion_for(kill_type, damage)
+        classic = False
+        if stock is not None:
+            blast_radius = float(stock.radius)
+            knockback_min = float(stock.knockback_min)
+            knockback_max = float(stock.knockback_max)
+            classic = bool(stock.classic)
+        origin = (float(gx), float(gy), float(gz))
+        # Sight-ray occlusion: the world raycast reproduces the stock
+        # 10%..110% hitscan_accurate ray exactly; a server without a world
+        # (unit fixtures) falls back to its segment LOS test.
+        segment_blocked = None
+        if not ignore_player_los:
+            world_raycast = getattr(
+                getattr(self, "world_manager", None), "raycast", None
+            )
+            if callable(world_raycast):
+                segment_blocked = retail.raycast_segment_blocker(world_raycast)
+            else:
+                def segment_blocked(start, end):
+                    return bool(self._blocked_los(
+                        start[0], start[1], start[2], end[0], end[1], end[2]
+                    ))
         for target in list(self.players.values()):
             if not target.alive or not target.spawned:
                 continue
-            dx = target.x - gx
-            dy = target.y - gy
-            dz = target.z - gz
-            sq = dx * dx + dy * dy + dz * dz
-            if sq >= float(blast_radius) ** 2:
+            crouched = bool(getattr(
+                target, "hitbox_crouched",
+                getattr(getattr(target, "input", None), "crouch", False),
+            ))
+            raw_position = target.position
+            position = (float(raw_position[0]), float(raw_position[1]),
+                        float(raw_position[2]))
+            falloff = retail.explosion_falloff(
+                origin, position, blast_radius,
+                retail.BODY_OFFSET_CROUCHING if crouched
+                else retail.BODY_OFFSET_STANDING,
+            )
+            if falloff <= 0.0:
                 continue
-            if (
-                not ignore_player_los
-                and self._blocked_los(gx, gy, gz, target.x, target.y, target.z)
-            ):
+            # Three stock sight rays (head/torso/legs, weights .5/.3/.2).
+            los_fraction = retail.explosion_los_fraction(
+                segment_blocked, origin, position, crouched
+            )
+            if los_fraction <= 0.0:
                 continue
-            from server.explosions import explosion_impulse
             target_knockback_min = float(knockback_min)
             target_knockback_max = float(knockback_max)
             if target is thrower:
@@ -838,12 +1168,20 @@ class BattleSpadesServer:
                     target_knockback_min = float(self_knockback_min)
                 if self_knockback_max is not None:
                     target_knockback_max = float(self_knockback_max)
-            crouched = bool(getattr(getattr(target, "input", None), "crouch", False))
+            # The stock impulse magnitude is scaled by the LOS fraction.
+            target_knockback_min, target_knockback_max = retail.scale_knockback(
+                target_knockback_min, target_knockback_max, los_fraction
+            )
             impulse_preview = explosion_impulse(
-                (gx, gy, gz), target.position, blast_radius,
+                origin, target.position, blast_radius,
                 target_knockback_min, target_knockback_max,
                 crouched=crouched,
             )
+            if target is thrower and impulse_preview is not None:
+                note_push = getattr(target, "note_own_blast_push", None)
+                if callable(note_push):
+                    # ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER for the landing.
+                    note_push(int(kill_type))
             queue_explosion = getattr(target, "queue_explosion_impulse", None)
             target_input_sequence = None
             deferred_prediction = (
@@ -896,7 +1234,15 @@ class BattleSpadesServer:
                 and not getattr(self.config, "friendly_fire", False)
             ):
                 continue
-            dmg = int(round(damage if sq <= 1.0 else min(damage, (4096.0 / sq) * scale)))
+            amount = retail.explosion_player_damage(
+                origin, position, blast_radius, damage,
+                crouched=crouched,
+                los_fraction=los_fraction,
+                is_self=thrower is not None and target is thrower,
+                target_team=getattr(target, "team", None),
+                classic=classic,
+            ) * retail.victim_damage_multiplier(target)
+            dmg = int(round(amount))
             if dmg > 0:
                 target.damage(dmg, source=thrower, kill_type=int(kill_type))
 
@@ -912,22 +1258,23 @@ class BattleSpadesServer:
                 or not getattr(behavior, "takes_damage", False)
             ):
                 continue
-            ex, ey, ez = behavior.get_hit_center(entity)
-            dx, dy, dz = ex - gx, ey - gy, ez - gz
-            sq = dx * dx + dy * dy + dz * dz
-            if sq >= float(blast_radius) ** 2:
-                continue
-            if self._blocked_los(gx, gy, gz, ex, ey, ez):
-                continue
-            entity_damage = (
-                float(damage)
-                if sq <= 1.0
-                else min(float(damage), (4096.0 / sq) * scale)
+            raw_center = behavior.get_hit_center(entity)
+            center = (float(raw_center[0]), float(raw_center[1]),
+                      float(raw_center[2]))
+            # Stock non-player damageable: D * (R^2 - d^2) / R^2 at its own
+            # position, one sight ray (10%..110%), all-or-nothing.
+            entity_damage = retail.explosion_entity_damage(
+                origin, center, blast_radius, damage
             )
-            if entity_damage > 0.0:
-                self.entity_registry.damage_entity(
-                    entity.entity_id, entity_damage, thrower, entity_ctx
-                )
+            if entity_damage <= 0.0:
+                continue
+            if segment_blocked is not None and retail.los_ray_blocked(
+                segment_blocked, origin, center
+            ):
+                continue
+            self.entity_registry.damage_entity(
+                entity.entity_id, entity_damage, thrower, entity_ctx
+            )
 
     def _blocked_los(self, x0, y0, z0, x1, y1, z1) -> bool:
         dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
@@ -990,6 +1337,59 @@ class BattleSpadesServer:
         color.value = int(player.block_color) & 0xFFFFFF
         self.broadcast(bytes(color.generate()))
 
+    def _repair_dead_join_respawn(self, connection) -> None:
+        """Deliver a dead joiner's own first life if it began while gated.
+
+        A joiner the mode kept dead (Connection._send_join_death) respawns
+        through the gameplay-gated broadcast. If that respawn happened
+        before its first ClientData, the client never saw its own new
+        CreatePlayer, and catch_up_roster deliberately skips the local id.
+        """
+        token = getattr(connection, "join_death_token", None)
+        player = getattr(connection, "player", None)
+        if token is None or player is None:
+            return
+        connection.join_death_token = None
+        from server.roster import build_create_player, player_life_token
+
+        if not (player.alive and player.spawned):
+            return
+        if player_life_token(player) == token:
+            return
+        connection.send(bytes(build_create_player(player).generate()), reliable=True)
+        send_hp = getattr(connection, "_send_spawn_hp", None)
+        if callable(send_hp):
+            send_hp()
+
+    def _send_join_audio(self, connection) -> None:
+        """Start map ambience and the right music track on one joiner.
+
+        A mid-round joiner must get both directly (the round-start broadcast
+        fired before it arrived). The mode picks the track (the game_ending
+        track in the final minute or on the end screen); otherwise a random
+        gameplay bed. ``play_music_to`` sends StopMusic+PlayMusic, which also
+        clears the client's leftover menu music.
+        """
+        if getattr(connection, "join_audio_sent", False):
+            return
+        try:
+            from server.audio import send_map_ambient, play_music_to, \
+                gameplay_bed_track
+            player = getattr(connection, "player", None)
+            if player is not None:
+                send_map_ambient(self, player)
+            track = None
+            pick = getattr(getattr(self, "mode", None), "join_music_track", None)
+            if callable(pick):
+                track = pick()
+            # [audio] mode_start_music = false: no bed, retail silence.
+            track = track or gameplay_bed_track(self)
+            if track is not None:
+                play_music_to(connection, track)
+            connection.join_audio_sent = True
+        except Exception:
+            logger.debug("reveal ambient/music send failed", exc_info=True)
+
     def reveal_world_to(self, connection) -> bool:
         """Send a now-in-game client the map entities (crates). Called from the
         connection's FIRST ClientData, never during the join handshake — a
@@ -1004,6 +1404,15 @@ class BattleSpadesServer:
         The caller sets connection.in_game only after this complete reveal, so
         ongoing gameplay broadcasts cannot interleave with catch-up.
         """
+        # World ambience + music for this now-settled client, BEFORE any
+        # catch-up below. The terrain/roster replay is a burst of hit/build
+        # effects that exhausts the stock client's 128 OpenAL sources; a
+        # stream started after it fails (live 2026-09-26: ~1550 replayed
+        # Damage -> 191 "Error starting source", amb_city and the music bed
+        # never loaded). Sent once per scene epoch: a large air-override
+        # history returns False here and resumes on the next ClientData.
+        self._send_join_audio(connection)
+
         # MapSync is still the efficient bulk path, but the retail VXL worker
         # has a native collision/mesh cache that can retain stale solids after
         # a heavily drilled column merge. Clear every pre-snapshot destroyed
@@ -1015,12 +1424,18 @@ class BattleSpadesServer:
 
         from server.roster import catch_up_roster
         catch_up_roster(self, connection)
+        self._repair_dead_join_respawn(connection)
 
         # BlockLine/BlockBuild packets carry no RGB. Refresh every sender's
         # current palette before replaying terrain so late joiners render the
         # authoritative VXL colours.
         from shared.packet import SetColor
+        joining_player = getattr(connection, "player", None)
         for roster_player in self.players.values():
+            if roster_player is joining_player:
+                # The joiner's own palette may be a choice still in flight to
+                # the server; echoing the stale value would overwrite it.
+                continue
             color = SetColor()
             color.player_id = roster_player.id
             color.value = int(roster_player.block_color) & 0xFFFFFF
@@ -1046,24 +1461,14 @@ class BattleSpadesServer:
         # first ClientData. This is still synchronous on the server event loop,
         # so no live mutation can interleave between replay and in_game=True.
         self.replay_map_mutations(connection)
+        # Per-cell block health (prefab cells start at 9) via
+        # BlockManagerState(38): MapSync/33 alone would leave the joiner at 5/3.
+        prefab_reveal = getattr(getattr(self, "prefab_actions", None), "reveal_to", None)
+        if callable(prefab_reveal):
+            prefab_reveal(connection)
 
         from server.scoreboard import reveal_to as reveal_scores
         reveal_scores(self, connection)
-
-        # World ambience + the in-game music bed for this now-settled client
-        # (a mid-round joiner must get both directly — the round-start
-        # broadcast already fired before they arrived). play_music_to sends
-        # StopMusic+PlayMusic (needed to clear the client's leftover menu music).
-        try:
-            import random
-            from server.audio import send_map_ambient, play_music_to, \
-                GAMEPLAY_TRACKS
-            player = getattr(connection, "player", None)
-            if player is not None:
-                send_map_ambient(self, player)
-            play_music_to(connection, random.choice(GAMEPLAY_TRACKS))
-        except Exception:
-            logger.debug("reveal ambient/music send failed", exc_info=True)
 
         # CreatePlayer intentionally has no safe no-pickup sentinel. Genuine
         # carriers must be announced even when generic entity replication is
@@ -1098,10 +1503,17 @@ class BattleSpadesServer:
                 reveal_mode_state(connection)
             except Exception:
                 logger.debug("mode reveal send failed", exc_info=True)
+        # Late joiners: live minimap billboards and runtime team rules (81/82).
+        try:
+            from server.hud_packets import reveal_hud_state
 
-        player = getattr(connection, "player", None)
-        if player is not None and self._radar_station_counts.get(player.team, 0) > 0:
-            self._send_radar_visibility(player, True)
+            reveal_hud_state(self, connection)
+        except Exception:
+            logger.debug("hud reveal failed", exc_info=True)
+
+        # Radar needs no extra join replay: live stations are ordinary
+        # deployable entities in the CreateEntity replay above, and the
+        # client's Minimap runs RadarStationEntity.can_detect_player itself.
 
         # Gameplay broadcasts are gated until this first ClientData, so a
         # player who loaded during the final map ballot missed its original
@@ -1114,32 +1526,22 @@ class BattleSpadesServer:
 
         return True
 
-    def _send_radar_visibility(self, player, visible: bool) -> None:
-        """Expose the enemy team on one teammate's minimap."""
-        from shared.packet import TeamMapVisibility
-        enemy_team = TEAM2 if player.team == TEAM1 else TEAM1
-        packet = TeamMapVisibility()
-        packet.team_id = int(enemy_team)
-        packet.visible = int(bool(visible))
-        player.send(bytes(packet.generate()), reliable=True)
-
+    # Radar stations send no TeamMapVisibility(83). The stock client's
+    # Minimap asks each of the viewer team's RadarStationEntity objects
+    # ``can_detect_player`` (250 blocks, C.RADAR_STATION_RANGE) for every
+    # enemy, so the packet-21 entity (team + position + fuse) is all it
+    # needs. Packet 83 sets ``teams[team_id].can_see_other_team``, a
+    # whole-team reveal with no range, which retail radar did not do
+    # (verified live 2026-09-26, docs/RETAIL_VALUES.md "Radar station").
     def _radar_station_added(self, team: int) -> None:
         team = int(team)
         count = int(self._radar_station_counts.get(team, 0)) + 1
         self._radar_station_counts[team] = count
-        if count == 1:
-            for player in self.players.values():
-                if player.team == team:
-                    self._send_radar_visibility(player, True)
 
     def _radar_station_removed(self, team: int) -> None:
         team = int(team)
         count = max(0, int(self._radar_station_counts.get(team, 0)) - 1)
         self._radar_station_counts[team] = count
-        if count == 0:
-            for player in self.players.values():
-                if player.team == team:
-                    self._send_radar_visibility(player, False)
 
     def broadcast_create_entity(self, map_entity) -> None:
         """Announce a placed entity (crate/intel/...) to all clients."""
@@ -1176,6 +1578,62 @@ class BattleSpadesServer:
             if entity_id not in known:
                 continue
             connection.send(data, reliable=reliable)
+
+    def broadcast_known_player_packet(
+        self,
+        data: bytes,
+        player_id: int,
+        *,
+        reliable: bool = True,
+        exclude=None,
+    ) -> int:
+        """Send a packet naming ``player_id`` only to peers that know that id.
+
+        The retail GameScene indexes its player table directly for SetScore,
+        ChatMessage, ExplodeCorpse, SetColor and PlayerLeft; an id it never
+        received a CreatePlayer for (a dead joiner, a player created while the
+        peer was loading, a departed id) raises inside the packet handler.
+        ``known_player_lives`` is exactly the set of ids this connection was
+        told about. Connections without the ledger (legacy embedders/test
+        doubles) keep the historical broadcast contract. Returns the number
+        of connections the packet was queued to.
+        """
+
+        player_id = int(player_id)
+        sent = 0
+        for connection in tuple(self.connections.values()):
+            if not bool(getattr(connection, "in_game", False)):
+                continue
+            if exclude is not None and getattr(connection, "player", None) is exclude:
+                continue
+            known = getattr(connection, "known_player_lives", None)
+            if known is not None and player_id not in known:
+                continue
+            connection.send(data, reliable=reliable)
+            sent += 1
+        return sent
+
+    def _forget_departed_player_id(self, player_id: int) -> None:
+        """Drop a departed id from every in-game peer's roster ledgers.
+
+        Runs right after PlayerLeft went to the in-game peers that knew the
+        id. Loading peers keep their entry: ``roster.catch_up_roster`` sends
+        their PlayerLeft for the stale id on first ClientData. Forgetting the
+        id also makes later packets naming the departed id (a leaver's queued
+        SetScore, ExplodeCorpse, chat) reach nobody.
+        """
+        player_id = int(player_id)
+        for connection in tuple(self.connections.values()):
+            if not bool(getattr(connection, "in_game", False)):
+                continue
+            for ledger_name in (
+                "known_player_lives",
+                "known_player_deaths",
+                "known_corpse_cleanups",
+            ):
+                ledger = getattr(connection, ledger_name, None)
+                if isinstance(ledger, dict):
+                    ledger.pop(player_id, None)
 
     def broadcast_change_entity_position(self, map_entity) -> None:
         """Move an existing static entity without duplicate create/destroy.
@@ -1309,6 +1767,17 @@ class BattleSpadesServer:
         if self._stopping or self._stopped:
             raise RuntimeError("a stopped BattleSpadesServer cannot be restarted")
 
+        # Fail fast before binding sockets: an unknown mode used to start a
+        # server with mode=None (no rules, scoring or round end). Launchers
+        # register tut/ugc before start(), so those resolve here too.
+        from modes import get_mode_class, registered_mode_codes
+        if get_mode_class(self.config.game_mode) is None:
+            raise ValueError(
+                f"game.default_mode {self.config.game_mode!r} is not a "
+                f"registered game mode; expected one of: "
+                f"{', '.join(registered_mode_codes())}"
+            )
+
         # Windows default timer granularity is ~15.6ms, which makes
         # asyncio.sleep bursty and the 60Hz tick/broadcast jittery (the
         # client sees irregular WorldUpdate spacing as movement jank).
@@ -1341,12 +1810,10 @@ class BattleSpadesServer:
         # Load map
         self.world_manager.load_map(self.config.map_name)
         
-        # Initialize game mode
-        from modes import get_mode_class
+        # Initialize game mode (validated at the top of start()).
         mode_class = get_mode_class(self.config.game_mode)
-        if mode_class:
-            self.mode = mode_class(self)
-            await self.mode.on_mode_start()
+        self.mode = mode_class(self)
+        await self.mode.on_mode_start()
 
         # Product/map/mode identity must be established before anonymous Steam
         # logon. Missing optional runtime files do not prevent local hosting.
@@ -1565,11 +2032,7 @@ class BattleSpadesServer:
                     if connection is not None and connection.player is not None:
                         # In-game traffic: queue for the tick-start drain
                         # (deterministic ordering relative to simulation).
-                        if len(self._pending_ingame_packets) < self.config.max_pending_packets:
-                            self._pending_ingame_packets.append((connection, data))
-                        else:
-                            self._dropped_ingame_packets += 1
-                            self.metrics.dropped_ingame_packets += 1
+                        self._queue_ingame_packet(connection, data)
                     else:
                         # Pre-join flows (handshake, map transfer) can be
                         # slow — keep them off the simulation path.
@@ -1583,6 +2046,51 @@ class BattleSpadesServer:
             except Exception as e:
                 logger.error(f"Error in net_update: {e}", exc_info=True)
     
+    def _per_connection_packet_cap(self) -> int:
+        """Most in-game packets one connection may hold in the shared queue.
+
+        The global queue is drained once per tick. Without a per-peer share a
+        single flooding client filled all ``max_pending_packets`` slots and
+        every other player's ClientData was dropped at the global cap.
+        """
+        total = max(1, int(getattr(self.config, "max_pending_packets", 4096)))
+        configured = getattr(self.config, "max_pending_packets_per_connection", None)
+        if configured is not None:
+            return max(1, min(total, int(configured)))
+        # 256 rows is >4 s of 60 Hz input for one peer: far above any honest
+        # backlog, while 16 flooding peers still cannot starve the rest.
+        return max(1, min(total, 256))
+
+    def _pending_packet_counts(self) -> dict:
+        """Per-connection share of ``_pending_ingame_packets`` (self-healing).
+
+        Other owners clear the shared deque wholesale (timeline resets,
+        shutdown); an empty deque therefore always resets the shares.
+        """
+        counts = getattr(self, "_pending_ingame_counts", None)
+        if counts is None:
+            counts = {}
+            self._pending_ingame_counts = counts
+        if not self._pending_ingame_packets and counts:
+            counts.clear()
+        return counts
+
+    def _queue_ingame_packet(self, connection, data: bytes) -> bool:
+        """Queue one in-game packet, dropping a flooding peer's own excess."""
+        counts = self._pending_packet_counts()
+        key = id(connection)  # test doubles/embedders may be unhashable
+        queued = counts.get(key, 0)
+        if (
+            queued >= self._per_connection_packet_cap()
+            or len(self._pending_ingame_packets) >= self.config.max_pending_packets
+        ):
+            self._dropped_ingame_packets += 1
+            self.metrics.dropped_ingame_packets += 1
+            return False
+        self._pending_ingame_packets.append((connection, data))
+        counts[key] = queued + 1
+        return True
+
     async def _network_loop(self):
         """Handle ENet events."""
         while self.running:
@@ -1661,13 +2169,43 @@ class BattleSpadesServer:
         """Handle new connection (sync version for net_update)."""
         logger.info(f"New connection from {peer.address} (proto_ver={data})")
 
+        # Retail GameClient connects with shared.steam.game_version() (168)
+        # as the ENet connect data; the native client sends 168 too.  Refuse
+        # anything else with the retail version reasons before allocating.
+        if bool(getattr(self.config, "require_protocol_version", True)):
+            reason = protocol_version_refusal(data)
+            if reason is not None:
+                logger.info(
+                    "Rejected client %s with protocol %s (reason %d)",
+                    peer.address, data, reason,
+                )
+                try:
+                    peer.disconnect(reason)
+                except Exception:
+                    pass
+                return
+
         # Reject banned IPs before we allocate any state for them.
         from server.bans import address_host
         ban = self.ban_manager.is_banned(address_host(peer))
         if ban is not None:
             logger.info("Rejected banned client %s (%s)", peer.address, ban.get("reason"))
             try:
-                peer.disconnect(1)  # DISCONNECT_BANNED
+                # ERROR_TEMP_BANNED (19) for a ban with an expiry, else
+                # ERROR_BANNED (1).
+                peer.disconnect(19 if ban.get("until") else 1)
+            except Exception:
+                pass
+            return
+        # A vote-kick lasts "until the end of the current match" (client text).
+        vote_manager = getattr(self, "vote_manager", None)
+        kick_reason = getattr(vote_manager, "match_kick_reason", lambda _host: None)(
+            address_host(peer)
+        )
+        if kick_reason is not None:
+            logger.info("Rejected vote-kicked client %s until the match ends", peer.address)
+            try:
+                peer.disconnect(int(kick_reason))
             except Exception:
                 pass
             return
@@ -1677,10 +2215,28 @@ class BattleSpadesServer:
         if connection is None:
             connection = Connection(peer, self)
             self.connections[peer] = connection
+            self._configure_peer_throttle(peer)
         
         # Call connection's on_connect
         connection.on_connect(data)
     
+    def _configure_peer_throttle(self, peer) -> None:
+        """Keep unreliable WorldUpdates flowing on jittery links.
+
+        ENet's per-peer packet throttle drops a share of unreliable sends after
+        round trips that look worse than the recent variance allows, for up to
+        five seconds at a time. ``unreliable_throttle_deceleration = 0`` (the
+        default) stops it ever lowering that share; see ServerConfig.
+        """
+        deceleration = int(getattr(
+            self.config, "unreliable_throttle_deceleration", 0
+        ))
+        try:
+            peer.packetThrottleDeceleration = deceleration
+        except (AttributeError, TypeError, ValueError):
+            # Older/other ENet bindings: keep the library default.
+            logger.debug("peer throttle not configurable for %s", peer.address)
+
     def _on_disconnect_sync(self, peer):
         """Handle disconnection (sync version for net_update)."""
         connection = self.connections.pop(peer, None)
@@ -1697,6 +2253,9 @@ class BattleSpadesServer:
                 for queued_connection, data in self._pending_ingame_packets
                 if queued_connection is not connection
             )
+        counts = getattr(self, "_pending_ingame_counts", None)
+        if counts is not None:
+            counts.pop(id(connection), None)
         # A connection may disconnect after taking a MapSync watermark but
         # before first ClientData. Once it is gone, it must no longer pin the
         # terrain catch-up journal at an old sequence indefinitely.
@@ -1715,11 +2274,14 @@ class BattleSpadesServer:
             if revival_master is not None:
                 revival_master.accumulate_departing_player(player)
 
-            # Mode state (VIP ownership, CTF intel, etc.) must observe the
-            # departing identity. The event is drained next tick after the
-            # player has been removed from team/player collections.
-            if self.mode is not None:
-                self.queue_mode_event("on_player_leave", player)
+            # Mode state (VIP ownership, CTF intel, bomb, diamond) must be
+            # released while the departing id is still a valid roster entry:
+            # the drop packets it emits name this player, so they must reach
+            # clients BEFORE PlayerLeft. Queuing the hook to the next tick
+            # (the old behaviour) sent them after PlayerLeft, naming an id the
+            # clients had already destroyed. Same order as the transition
+            # path's _detach_transition_player.
+            self._run_player_leave_hooks(player)
 
             # Numeric player ids are reused from the lowest free slot. Retire
             # every owner-sensitive producer/cache before exposing this id to
@@ -1734,13 +2296,55 @@ class BattleSpadesServer:
             # Remove from players
             self.players.pop(player.id, None)
             
-            # Broadcast disconnect
+            # Broadcast disconnect, but only to GameScenes that were told
+            # about this id. A dead joiner (or a player whose only life began
+            # while a peer was still loading) was never created on those
+            # peers; PlayerLeft for an unknown id fails in the retail roster
+            # handler. Forget the id on each recipient so a later reuse of
+            # the number starts from a clean ledger.
+            self._announce_player_left(connection, player)
             left_packet = PlayerLeft()
             left_packet.player_id = player.id
-            self.broadcast(bytes(left_packet.generate()))
+            self.broadcast(
+                bytes(left_packet.generate()), known_player_id=int(player.id)
+            )
+            self._forget_departed_player_id(int(player.id))
         
         connection.on_disconnect()
     
+    def _announce_player_left(self, connection, player) -> None:
+        """Retail PLAYER_LEFT "{0} has disconnected" (packet 50).
+
+        EN:596 sits right after PLAYER_JOINED and no stock client binary
+        references it, so the retail server sent it; the stock PlayerLeft(64)
+        handler prints nothing.  Same lane as PLAYER_JOINED, sent before
+        PlayerLeft.  Skipped for bots, spectators, players that never
+        reached the game, map-rollover (ERROR_MATCH_ENDED) reloads and
+        server shutdown.
+        """
+
+        if getattr(self, "_stopping", False) or bool(getattr(player, "is_bot", False)):
+            return
+        if int(getattr(connection, "disconnect_reason", -1)) == 18:
+            return
+        try:
+            team = int(getattr(player, "team", -1))
+        except (TypeError, ValueError):
+            return
+        if team not in (TEAM1, TEAM2):
+            return
+        if not getattr(connection, "in_game", True):
+            return
+        from server.announcements import broadcast_localised_overlay
+
+        try:
+            broadcast_localised_overlay(
+                self, "PLAYER_LEFT", (str(player.name),),
+                localise_parameters=False,
+            )
+        except ValueError:
+            logger.debug("PLAYER_LEFT skipped for %r", player.name)
+
     async def _on_receive_data(self, peer, data: bytes):
         """Handle a received raw datagram (pre-join / unbound peers)."""
         connection = self.connections.get(peer)
@@ -1763,6 +2367,14 @@ class BattleSpadesServer:
             self.config.packet_drain_budget,
         )
         pending = [self._pending_ingame_packets.popleft() for _ in range(count)]
+        counts = self._pending_packet_counts()
+        for connection, _data in pending:
+            key = id(connection)
+            queued = counts.get(key, 0)
+            if queued > 1:
+                counts[key] = queued - 1
+            else:
+                counts.pop(key, None)
         for connection, data in pending:
             # The disconnect path normally purges these rows.  Recheck at the
             # consumption boundary after every await as well: an earlier
@@ -1791,7 +2403,8 @@ class BattleSpadesServer:
     
     def broadcast(self, data: bytes, exclude: Optional[Player] = None,
                   reliable: bool = True, gameplay: bool = True,
-                  record_mutation: bool = True):
+                  record_mutation: bool = True,
+                  known_player_id: Optional[int] = None):
         """Send packet to all connected players.
 
         gameplay=True (default): only clients that are fully in-game receive
@@ -1803,8 +2416,16 @@ class BattleSpadesServer:
         regardless of state. ``record_mutation=False`` is reserved for
         ephemeral packets that share a terrain packet id but must never be
         replayed to a MapSync joiner (for example Snowball Damage(37)).
+        ``known_player_id`` restricts delivery to connections whose
+        ``known_player_lives`` contains that id (packets the retail roster
+        resolves by player id: SetScore, ExplodeCorpse, ChatMessage, ...).
         """
         if getattr(self, "_stopping", False):
+            return
+        if known_player_id is not None:
+            self.broadcast_known_player_packet(
+                data, known_player_id, reliable=reliable, exclude=exclude
+            )
             return
 
         packet_id = data[0] if len(data) > 0 else -1
@@ -1886,7 +2507,20 @@ class BattleSpadesServer:
             snapshot_air = getattr(
                 self.world_manager, "snapshot_air_overrides", None
             )
-            columns = tuple(snapshot_air()) if callable(snapshot_air) else ()
+            columns = (
+                tuple(snapshot_air())
+                if callable(snapshot_air)
+                and bool(getattr(self.config, "map_air_catchup_enabled", False))
+                else ()
+            )
+            if columns:
+                cells = sum(bin(mask).count("1") for _x, _y, mask in columns)
+                logger.info(
+                    "Join air catch-up armed for %s: %d cells in %d columns",
+                    getattr(getattr(connection, "peer", None), "address", "?"),
+                    cells,
+                    len(columns),
+                )
             connection.map_air_replay = _MapAirReplayLease(columns=columns)
         self._prune_map_mutations()
         return watermark
@@ -1936,10 +2570,12 @@ class BattleSpadesServer:
             lowest_bit = lease.remaining_mask & -lease.remaining_mask
             z = lowest_bit.bit_length() - 1
             cell = (lease.current_x, lease.current_y, z)
-            data = self.terrain_repair.canonical_packet(cell, actor_id)
-            # Advance only after ENet accepts the reliable packet. A failed
-            # reveal retries the unsent bit on the next ClientData.
-            connection.send(data, reliable=True)
+            # 33 builds air; a PaintBlock pins a stale-colour solid (the
+            # client ignores 33 on solid cells). Resending both is harmless.
+            for data in self.terrain_repair.canonical_packets(cell, actor_id):
+                # Advance only after ENet accepts the reliable packet. A failed
+                # reveal retries the unsent bit on the next ClientData.
+                connection.send(data, reliable=True)
             lease.remaining_mask ^= lowest_bit
             sent += 1
 
@@ -2173,8 +2809,8 @@ class BattleSpadesServer:
             actor_id = int(player.id) if player is not None else 0
             while lease.next_index < len(cells):
                 cell = cells[lease.next_index]
-                data = self.terrain_repair.canonical_packet(cell, actor_id)
-                connection.send(data, reliable=True)
+                for data in self.terrain_repair.canonical_packets(cell, actor_id):
+                    connection.send(data, reliable=True)
                 # Only advance after ENet accepted this reliable packet. A
                 # failed reveal retries from the first unsent exact cell.
                 lease.next_index += 1

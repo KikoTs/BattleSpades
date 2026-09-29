@@ -72,6 +72,7 @@ class TutorialSession:
     minimum_local_x: float = 1_000.0
     destroyed_targets: set[int] = field(default_factory=set)
     built_cells: set[tuple[int, int, int]] = field(default_factory=set)
+    reached_tower_top: bool = False
     completion_deadline: float | None = None
     last_countdown_value: int | None = None
     disconnect_sent: bool = False
@@ -88,6 +89,11 @@ class TutorialMode(BaseMode):
         missing any of the authored target groups also fails startup instead
         of silently running an impossible lesson.
     """
+
+    # No combat score economy: no generic kill/suicide SetScore.
+    generic_scoring_enabled = False
+    # No combat stakes: never reveal learners as map escapers.
+    escape_watch_enabled = False
 
     name = "Tutorial"
     description = "Learn the basics of playing Ace of Spades"
@@ -123,6 +129,24 @@ class TutorialMode(BaseMode):
         (53, 78, 229),
     )
     TARGET_SCAN_RADIUS = 4
+    # Every bullseye is a 21-voxel disc in the lane's x plane: 13 red cells
+    # (ring + centre) and 8 inner white cells, all within distance^2 5 of
+    # the centre.  One hit on a live red cell drops the whole disc (the
+    # native offline rule), so the server removes the disc authoritatively.
+    TARGET_DISC_RADIUS_SQ = 5
+
+    # CLIMB1: "Dig and build your way to the top of the tower!"  Every lane
+    # repeats one domed tower (Training.vxl, measured 2026-09-29): dome top
+    # z=193, dome surface z<=197 within r~8.5 of local (118.5, 51.5), a
+    # ledge ring at z=207 around it.  A player standing on the dome has
+    # position z ~194.75; on the ledge ~204.75.
+    TOWER_CENTER_LOCAL = (118.5, 51.5)
+    TOWER_RADIUS = 9.5
+    TOWER_TOP_MAX_Z = 200.0
+
+    # Lane reuse restores every cell a previous occupant changed.  The set
+    # is bounded; an overflowing lane restores the tracked cells and logs.
+    LANE_TOUCH_LIMIT = 200_000
 
     HELP_BY_STAGE = {
         TutorialStage.INTRO: ("TUTORIAL_INTRO",),
@@ -194,6 +218,13 @@ class TutorialMode(BaseMode):
         self._pending_restore_packets: dict[
             int, list[tuple[tuple[int, int, int], int]]
         ] = {}
+        self._pending_restore_removals: dict[
+            int, list[tuple[int, int, int]]
+        ] = {}
+        # Full 21-cell disc per lane/target (coordinate -> colour).
+        self._target_discs: list[list[dict[tuple[int, int, int], int]]] = []
+        self._lane_touched: dict[int, set[tuple[int, int, int]]] = {}
+        self._pristine = None
 
     async def on_mode_start(self) -> None:
         """Initialize target geometry without normal pickups or match music."""
@@ -204,6 +235,7 @@ class TutorialMode(BaseMode):
         self.start_time = time.time()
         self.elapsed_time = 0.0
         self._capture_authored_targets()
+        self._load_pristine_map()
         subscribe = getattr(self.server.world_manager, "subscribe_mutations", None)
         if callable(subscribe):
             self._mutation_listener_token = subscribe(self._on_world_mutation)
@@ -228,6 +260,8 @@ class TutorialMode(BaseMode):
         self._lane_occupants.clear()
         self._mutation_queue.clear()
         self._pending_restore_packets.clear()
+        self._pending_restore_removals.clear()
+        self._lane_touched.clear()
         self.started = False
         self.ended = True
 
@@ -273,7 +307,14 @@ class TutorialMode(BaseMode):
         return False
 
     def prepare_player_spawn(self, player: "Player") -> None:
-        """Restore the stage-appropriate native tool across accidental deaths."""
+        """Restore the stage-appropriate native tool across accidental deaths.
+
+        Below SHOOTING the loadout is empty, so the owner's CreatePlayer
+        carries no tool and the owner holds nothing.  The internal weapon
+        stays the pistol because the server weapon profile needs a real id
+        and the only "no tool" wire value (0xFF) is the owner-row sentinel;
+        observers never receive a switch until the SHOOTING grant.
+        """
 
         session = self._sessions.get(id(player))
         tool = (
@@ -284,6 +325,8 @@ class TutorialMode(BaseMode):
         player.weapon = tool
         player.tool = tool
         player.tool_is_raw = True
+
+    smart_spawns = False
 
     def get_spawn_point(self, player: "Player") -> tuple[float, float, float]:
         """Allocate one authored interior lane and reset its five targets."""
@@ -356,7 +399,16 @@ class TutorialMode(BaseMode):
         packet.score_limit = 0
 
     def configure_initial_info(self, packet) -> None:
-        """Publish the stock tutorial scene switches and its tiny tool set."""
+        """Publish the stock tutorial scene switches and its tiny tool set.
+
+        Retail ``playlists/tutorial.txt`` overrides exactly one rule,
+        ``RULE_ENABLE_COLOUR_PICKER: OFF``; minimap, death cam, spectators
+        and fall-on-water damage keep their defaults (constants_matchmaking
+        396-411).  The palette stays ON so the climb's block tool can choose
+        a colour (our builder otherwise ties the palette to the picker).  The
+        player score box stays hidden: the tutorial has no score economy and
+        retail shows no evidence of one (a deliberate choice).
+        """
 
         allowed_tools = set(self.TUTORIAL_LOADOUT)
         packet.disabled_tools = [
@@ -369,15 +421,10 @@ class TutorialMode(BaseMode):
             for class_id in range(int(C.CLASS_NOOF))
             if class_id != int(C.CLASS_SOLDIER)
         ]
-        packet.enable_minimap = 0
         packet.enable_colour_picker = 0
-        packet.enable_colour_palette = 0
-        packet.enable_deathcam = 0
-        packet.enable_spectator = 0
+        packet.enable_colour_palette = 1
         packet.enable_player_score = 0
-        packet.enable_fall_on_water_damage = 0
         packet.friendly_fire = 0
-        packet.enable_corpse_explosion = 0
 
     async def on_player_join(self, player: "Player") -> None:
         """Publish any target reset after CreatePlayer made its actor id safe."""
@@ -385,6 +432,9 @@ class TutorialMode(BaseMode):
         session = self._sessions.get(id(player))
         if session is None:
             return
+        removals = self._pending_restore_removals.pop(session.lane_index, ())
+        if removals:
+            self._broadcast_cell_removals(player, removals)
         pending = self._pending_restore_packets.pop(session.lane_index, ())
         for (x, y, z), color in pending:
             packet = BlockBuildColored()
@@ -495,13 +545,105 @@ class TutorialMode(BaseMode):
                 if len(session.destroyed_targets) >= len(self.TARGET_CENTERS):
                     self._enter_stage(session, TutorialStage.CLIMB, now)
             elif session.stage is TutorialStage.CLIMB:
-                # The recovered final prompt explicitly teaches click-drag
-                # BlockLine. Two committed cells distinguish a line from an
-                # accidental single click while still allowing two taps.
-                if len(session.built_cells) >= 2:
+                # CLIMB1 promises "the top of the tower"; the lesson ends
+                # when the player stands on (or above) the lane's dome.
+                if self._on_tower_top(session, player):
+                    session.reached_tower_top = True
                     self._enter_stage(session, TutorialStage.COMPLETE, now)
             elif session.stage is TutorialStage.COMPLETE:
                 self._tick_completion(session, now)
+
+            if session.stage is TutorialStage.SHOOTING:
+                self._poll_target_hits(session, now)
+
+    def _on_tower_top(self, session: TutorialSession, player: object) -> bool:
+        """Whether the player stands on the lane's tower dome."""
+
+        origin_x, origin_y = self.LANE_ORIGINS[session.lane_index]
+        dx = float(getattr(player, "x", 0.0)) - origin_x - self.TOWER_CENTER_LOCAL[0]
+        dy = float(getattr(player, "y", 0.0)) - origin_y - self.TOWER_CENTER_LOCAL[1]
+        return (
+            dx * dx + dy * dy <= self.TOWER_RADIUS * self.TOWER_RADIUS
+            and float(getattr(player, "z", 1_000.0)) <= self.TOWER_TOP_MAX_Z
+        )
+
+    def _poll_target_hits(self, session: TutorialSession, now: float) -> None:
+        """Drop a whole disc on the first damage to one of its red cells.
+
+        Block damage is observable without touching combat code: a partly
+        damaged cell has an entry in ``world_manager.block_damage``.  At most
+        5 x 13 dictionary probes per shooting player per tick.
+        """
+
+        damage = getattr(self.server.world_manager, "block_damage", None)
+        if not damage or not self._target_voxels:
+            return
+        for target_index, red_cells in enumerate(
+            self._target_voxels[session.lane_index]
+        ):
+            if target_index in session.destroyed_targets:
+                continue
+            if any(cell in damage for cell in red_cells):
+                self._drop_target(session, target_index, now)
+
+    def _drop_target(
+        self, session: TutorialSession, target_index: int, now: float
+    ) -> None:
+        """Remove every disc cell authoritatively and count the target once."""
+
+        if target_index in session.destroyed_targets:
+            return
+        session.destroyed_targets.add(target_index)
+        world = self.server.world_manager
+        cells = [
+            cell
+            for cell in self._disc_cells(session.lane_index, target_index)
+            if world.get_solid(*cell)
+        ]
+        destroyed = list(world.destroy_blocks(cells)) if cells else []
+        if destroyed:
+            self._broadcast_cell_removals(session.player, destroyed)
+        if session.revealed:
+            remaining = max(
+                0, len(self.TARGET_CENTERS) - len(session.destroyed_targets)
+            )
+            self._send_target_remaining(session.player, remaining)
+            if remaining == 0 and session.stage is TutorialStage.SHOOTING:
+                self._enter_stage(session, TutorialStage.CLIMB, now)
+
+    def _disc_cells(self, lane_index: int, target_index: int):
+        if self._target_discs:
+            return tuple(self._target_discs[lane_index][target_index])
+        return tuple(self._target_voxels[lane_index][target_index])
+
+    def _broadcast_cell_removals(self, player, cells) -> None:
+        """Checked kill-damage Damage(37) per removed cell (native collapse)."""
+
+        try:
+            from server.combat_runtime import get_combat_system
+
+            combat = get_combat_system(self.server)
+            for cell in cells:
+                packet = combat._build_block_damage_packet(
+                    player, cell, combat._BLOCK_KILL_DAMAGE
+                )
+                self.server.broadcast(bytes(packet.generate()))
+        except (AttributeError, TypeError, ValueError):
+            return
+
+    def _load_pristine_map(self) -> None:
+        """Keep an untouched copy of Training.vxl for exact lane restores."""
+
+        raw = getattr(self.server.world_manager, "map_raw_bytes", None)
+        if not isinstance(raw, (bytes, bytearray)) or not raw:
+            self._pristine = None
+            return
+        try:
+            from aoslib.vxl import VXL
+
+            self._pristine = VXL(None, bytes(raw), len(raw))
+        except (TypeError, ValueError, RuntimeError):
+            self._pristine = None
 
     def session_for(self, player: object) -> TutorialSession | None:
         """Return read-only-by-convention progress for tests/administration."""
@@ -513,9 +655,11 @@ class TutorialMode(BaseMode):
 
         world = self.server.world_manager
         self._target_voxels = []
+        self._target_discs = []
         self._target_lookup = {}
         for lane_index, (origin_x, origin_y) in enumerate(self.LANE_ORIGINS):
             lane_targets: list[dict[tuple[int, int, int], int]] = []
+            lane_discs: list[dict[tuple[int, int, int], int]] = []
             for target_index, (local_x, local_y, center_z) in enumerate(
                 self.TARGET_CENTERS
             ):
@@ -547,30 +691,68 @@ class TutorialMode(BaseMode):
                         f"lane={lane_index} center={(x, center_y, center_z)}"
                     )
                 lane_targets.append(voxels)
+                disc: dict[tuple[int, int, int], int] = {}
+                for y in range(center_y - 3, center_y + 4):
+                    for z in range(center_z - 3, center_z + 4):
+                        dy = y - center_y
+                        dz = z - center_z
+                        if dy * dy + dz * dz > self.TARGET_DISC_RADIUS_SQ:
+                            continue
+                        if world.get_solid(x, y, z):
+                            disc[(x, y, z)] = int(world.get_color(x, y, z)) & 0xFFFFFF
+                lane_discs.append(disc)
             self._target_voxels.append(lane_targets)
+            self._target_discs.append(lane_discs)
 
     def _restore_lane_targets(self, lane_index: int) -> None:
-        """Restore destroyed/repainted bullseyes before assigning a reused lane."""
+        """Restore a reused lane: every touched cell plus the five discs.
 
-        if not self._target_voxels:
-            return
+        Cells a previous occupant dug, built, painted or knocked down go back
+        to their pristine Training.vxl state (T10).  Solid restores replay as
+        BlockBuildColored and removals as checked kill-damage once the new
+        occupant's id is safe (``on_player_join``); a joiner still crossing
+        MapSync catches the canonical edits from its map watermark.
+        """
+
         world = self.server.world_manager
         restored: list[tuple[tuple[int, int, int], int]] = []
-        for target in self._target_voxels[lane_index]:
-            for coordinate, color in target.items():
-                current = (
-                    int(world.get_color(*coordinate)) & 0xFFFFFF
-                    if world.get_solid(*coordinate)
-                    else None
+        removed: list[tuple[int, int, int]] = []
+        desired: dict[tuple[int, int, int], int | None] = {}
+        pristine = self._pristine
+        for coordinate in self._lane_touched.pop(lane_index, set()):
+            if pristine is not None:
+                solid = bool(pristine.get_solid(*coordinate))
+                desired[coordinate] = (
+                    int(pristine.get_color(*coordinate)) & 0xFFFFFF
+                    if solid else None
                 )
-                if current != color:
-                    if world.set_block(*coordinate, True, color):
-                        restored.append((coordinate, color))
-                clear_damage = getattr(world, "clear_block_damage", None)
-                if callable(clear_damage):
-                    clear_damage(*coordinate)
+        if self._target_discs:
+            for disc in self._target_discs[lane_index]:
+                desired.update(disc)
+        elif self._target_voxels:
+            for target in self._target_voxels[lane_index]:
+                desired.update(target)
+        for coordinate, color in desired.items():
+            solid_now = bool(world.get_solid(*coordinate))
+            if color is None:
+                if solid_now and world.destroy_blocks([coordinate]):
+                    removed.append(coordinate)
+                continue
+            current = (
+                int(world.get_color(*coordinate)) & 0xFFFFFF if solid_now else None
+            )
+            if current != color:
+                if world.set_block(*coordinate, True, color):
+                    restored.append((coordinate, color))
+            clear_damage = getattr(world, "clear_block_damage", None)
+            if callable(clear_damage):
+                clear_damage(*coordinate)
+        # Our own restore edits are not occupant changes.
+        self._lane_touched.pop(lane_index, None)
         if restored:
             self._pending_restore_packets[lane_index] = restored
+        if removed:
+            self._pending_restore_removals[lane_index] = removed
 
     def _on_world_mutation(
         self,
@@ -583,6 +765,11 @@ class TutorialMode(BaseMode):
     ) -> None:
         """Enqueue one canonical edit without doing lesson work in the publisher."""
 
+        lane_index = self._lane_for_coordinate(int(x), int(y))
+        if lane_index is not None:
+            touched = self._lane_touched.setdefault(lane_index, set())
+            if len(touched) < self.LANE_TOUCH_LIMIT:
+                touched.add((int(x), int(y), int(z)))
         if len(self._mutation_queue) >= self.MUTATION_QUEUE_LIMIT:
             return
         self._mutation_queue.append((int(x), int(y), int(z), bool(solid)))
@@ -602,19 +789,7 @@ class TutorialMode(BaseMode):
                 session = self._sessions.get(token) if token is not None else None
                 if session is None or target_index in session.destroyed_targets:
                     continue
-                session.destroyed_targets.add(target_index)
-                if session.revealed:
-                    remaining = max(
-                        0,
-                        len(self.TARGET_CENTERS)
-                        - len(session.destroyed_targets),
-                    )
-                    self._send_target_remaining(session.player, remaining)
-                    if (
-                        remaining == 0
-                        and session.stage is TutorialStage.SHOOTING
-                    ):
-                        self._enter_stage(session, TutorialStage.CLIMB, now)
+                self._drop_target(session, target_index, now)
                 continue
 
             lane_index = self._lane_for_coordinate(x, y)

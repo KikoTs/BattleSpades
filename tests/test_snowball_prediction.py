@@ -239,9 +239,11 @@ def test_snowball_prediction_is_not_replayed_as_a_map_mutation():
 
 def test_snowball_prediction_reaches_friendly_and_enemy_without_changing_policy():
     impact = (100.0, 100.0, 30.0)
-    thrower = BlastPlayer(1, 0, (200.0, 200.0, 30.0))
-    teammate = BlastPlayer(2, 0, (102.0, 100.0, 30.0))
-    enemy = BlastPlayer(3, 1, (102.0, 100.0, 30.0))
+    # Real team ids: team 1 is TEAM_NEUTRAL, which the stock explosion
+    # manager halves (TEAM_EXPLOSION_DAMAGE_REDUCTION).
+    thrower = BlastPlayer(1, int(C.TEAM1), (200.0, 200.0, 30.0))
+    teammate = BlastPlayer(2, int(C.TEAM1), (102.0, 100.0, 30.0))
+    enemy = BlastPlayer(3, int(C.TEAM2), (102.0, 100.0, 30.0))
     teammate_connection = RecordingConnection(teammate)
     enemy_connection = RecordingConnection(enemy)
     server = BattleSpadesServer(
@@ -264,8 +266,9 @@ def test_snowball_prediction_reaches_friendly_and_enemy_without_changing_policy(
     assert teammate.health == 100
     assert teammate.damage_calls == []
     assert teammate.velocity == pytest.approx((0.3, 0.0, 0.0))
-    assert enemy.health == 90
-    assert enemy.damage_calls == [(10, thrower, explosion.spec.kill_type)]
+    # Stock falloff 10 * (5^2 - (2^2 + 0.75^2)) / 5^2 = 8.175 -> 8.
+    assert enemy.health == 92
+    assert enemy.damage_calls == [(8, thrower, explosion.spec.kill_type)]
     assert enemy.velocity == pytest.approx((0.3, 0.0, 0.0))
 
     for connection in (teammate_connection, enemy_connection):

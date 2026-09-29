@@ -7,6 +7,7 @@ with a stale Medic movement profile or equipment list.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -15,16 +16,54 @@ from .game_constants import TEAM1, TEAM2
 if TYPE_CHECKING:
     from .main import BattleSpadesServer
 
+logger = logging.getLogger(__name__)
+
 
 def resolve_player_spawn(server, player) -> tuple[float, float, float]:
-    """Resolve and validate the final coordinates for one new player life."""
+    """Resolve and validate the final coordinates for one new player life.
+
+    This must always produce a position: a raising mode resolver or a map
+    whose spawn area was dug down to the water would otherwise leave the
+    player dead forever (process_respawns retries every tick).  Invalid
+    proposals go through ``spawn_selection.rescue_spawn`` (bounded: team-side
+    dry ground, any dry ground, then the water at the base), never through
+    the exhaustive region spiral that stalled the gameplay thread.
+    """
+    from server.spawn_selection import emergency_spawn, rescue_spawn
+
+    world = getattr(server, "world_manager", None)
     spawn_resolver = getattr(server.mode, "get_spawn_point", None)
-    candidate = (
-        spawn_resolver(player)
-        if callable(spawn_resolver)
-        else server.world_manager.get_spawn_point(player.team)
-    )
-    sanitizer = getattr(server.world_manager, "sanitize_spawn_point", None)
+    try:
+        candidate = (
+            spawn_resolver(player)
+            if callable(spawn_resolver)
+            else world.get_spawn_point(player.team)
+        )
+        candidate = tuple(float(candidate[index]) for index in range(3))
+    except Exception:
+        logger.exception("spawn resolver failed for %r; using rescue spawn",
+                         getattr(player, "name", player))
+        candidate = None
+
+    checker = getattr(world, "spawn_position_is_safe", None)
+    if callable(checker):
+        try:
+            safe = candidate is not None and bool(checker(candidate))
+        except Exception:
+            safe = False
+        if not safe:
+            try:
+                candidate = rescue_spawn(server, player, candidate)
+            except Exception:
+                logger.exception("rescue spawn failed; using emergency spawn")
+                candidate = emergency_spawn(server, int(getattr(player, "team", -1)))
+        return tuple(float(value) for value in candidate)
+
+    # Lightweight worlds (tests/plugins) without a body validator keep the
+    # original sanitizer contract.
+    if candidate is None:
+        candidate = world.get_spawn_point(player.team)
+    sanitizer = getattr(world, "sanitize_spawn_point", None)
     if callable(sanitizer):
         candidate = sanitizer(candidate, player.team)
     return tuple(float(value) for value in candidate)
@@ -64,7 +103,17 @@ class RoundLifecycle:
             # GraveBehavior owns its seven-second fuse independently of the
             # usually shorter player respawn timer.
             player._grave_entity_id = None
-            self.respawn_player(player)
+            try:
+                self.respawn_player(player)
+            except Exception:
+                # One broken life must not stall the whole respawn pass or
+                # retry (and log) every tick: back off one respawn period.
+                logger.exception(
+                    "respawn failed for %r; retrying after the respawn delay",
+                    getattr(player, "name", player),
+                )
+                if not player.alive:
+                    player.death_time = now
 
     def respawn_player(self, player) -> None:
         """Apply pending equipment atomically, then create the new life."""
@@ -141,6 +190,10 @@ class RoundLifecycle:
         forget_fire = getattr(fire_controller, "forget_player", None)
         if callable(forget_fire):
             forget_fire(player_id)
+        goo_controller = getattr(server, "goo_controller", None)
+        forget_goo = getattr(goo_controller, "forget_player", None)
+        if callable(forget_goo):
+            forget_goo(player_id)
 
         combat = getattr(server, "combat", None)
         forget_combat = getattr(combat, "forget_player", None)
@@ -161,6 +214,12 @@ class RoundLifecycle:
         forget_replication = getattr(replication, "forget_player", None)
         if callable(forget_replication):
             forget_replication(player_id)
+
+        # Domination/revenge and multikill state is keyed by the same
+        # reusable wire id; a newcomer must not inherit it.
+        from server import kill_feed
+
+        kill_feed.forget_player(server, player)
 
         self.remove_owned_deployables(player)
 
@@ -234,17 +293,18 @@ class RoundLifecycle:
         world_mutations = getattr(server, "world_mutations", None)
         if world_mutations is not None:
             world_mutations.cancel_all()
+        # The client minimap survives a same-map restart: drop old billboards.
+        from server import hud_packets
+
+        hud_packets.clear_all_billboards(server)
         prefab_actions = getattr(server, "prefab_actions", None)
         if prefab_actions is not None:
             prefab_actions.cancel_all()
         construction = getattr(server, "construction", None)
         if construction is not None:
             construction.clear()
-        for team, count in list(server._radar_station_counts.items()):
-            if count > 0:
-                for player in server.players.values():
-                    if player.team == team:
-                        server._send_radar_visibility(player, False)
+        # Radar has no client-side team flag to reset (no TeamMapVisibility):
+        # the stations themselves are destroyed with the other entities below.
         server._radar_station_counts = {TEAM1: 0, TEAM2: 0}
 
         # The retail GameScene survives a same-map restart. Destroy visible
@@ -262,14 +322,19 @@ class RoundLifecycle:
         server.rocket_turrets.clear()
         server.projectile_engine.projectiles.clear()
         server.fire_controller.clear()
+        goo_controller = getattr(server, "goo_controller", None)
+        if goo_controller is not None:
+            goo_controller.clear()
         corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
         clear_corpses = getattr(corpse_lifecycle, "clear", None)
         if callable(clear_corpses):
             clear_corpses(notify=True)
 
+        # A new round starts every multikill chain and domination afresh.
+        from server import kill_feed
+
+        kill_feed.reset_all(server)
         for player in server.players.values():
-            # KillAction.kill_count is a current-life streak used by the
-            # retail multikill HUD, not the cumulative scoreboard total.
             player.kill_streak = 0
             player.mounted_entity_id = None
             player._c4_entity_ids = []

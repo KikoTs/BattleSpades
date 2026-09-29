@@ -103,3 +103,41 @@ def test_disconnected_client_never_opens_transition_loader(monkeypatch) -> None:
     )
 
     patch._enter_loading_menu(manager)
+
+
+def test_audio_guard_clears_pending_al_error_before_every_stream_call(monkeypatch) -> None:
+    """ALURE refuses stream calls while an OpenAL error is pending; a refused
+    alureDestroyStream orphans a playing stream and the next alurePlaySource
+    blocks forever (live rollover freeze 2026-09-26)."""
+    patch, _loading_menu = _load_patch(monkeypatch)
+    calls = []
+    pending = {"error": 0xA001}
+
+    def al_get_error():
+        calls.append("alGetError")
+        error, pending["error"] = pending["error"], 0
+        return error
+
+    def stream_call(name):
+        def call(*args):
+            calls.append((name, pending["error"]))
+            return 1
+        return call
+
+    audio = SimpleNamespace(alGetError=al_get_error)
+    for name in patch._GUARDED_STREAM_CALLS:
+        setattr(audio, name, stream_call(name))
+    audio.alurePlaySource = stream_call("alurePlaySource")
+
+    assert patch.install_audio_guard(audio) is True
+    for name in patch._GUARDED_STREAM_CALLS:
+        pending["error"] = 0xA001
+        assert getattr(audio, name)("stream", 0, None) == 1
+        # The stream call observed a clean error state.
+        assert calls[-1] == (name, 0) and calls[-2] == "alGetError"
+    # Buffered playback already clears the error itself and is untouched.
+    assert not getattr(audio.alurePlaySource, "_bs_stream_guard", False)
+    # Idempotent: a second install does not double-wrap.
+    wrapped = audio.alureDestroyStream
+    assert patch.install_audio_guard(audio) is True
+    assert audio.alureDestroyStream is wrapped

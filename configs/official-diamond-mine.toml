@@ -1,5 +1,5 @@
 [server]
-name = "AoS Revival Official Diamond Mine"
+name = "AoS Revival Diamond Mine"  # <= 31 chars (retail MAX_SERVER_NAME_SIZE)
 port = 27029
 max_players = 24
 tick_rate = 60
@@ -44,3 +44,6 @@ query_port = 27030
 level = "INFO"
 file = "official-diamond-mine.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

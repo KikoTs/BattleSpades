@@ -379,7 +379,13 @@ def find_breach_project(world: SimpleVoxelWorld, player: PlayerSnapshot,
             # friendly reservation or the walking floor, including area swings.
             removed.update(cell for cell in footprint if world.solid(*cell))
             first_target = target if first_target is None else first_target
-            work += profile.fire_interval * profile.swings_per_block
+            # This aimed swing repeats until its toughest covered blocker
+            # breaks (built walls have health 9, map voxels 5).
+            work += profile.fire_interval * max(
+                profile.swings_for_health(world.block_health(*cell))
+                for cell in remaining
+                if cell in footprint
+            )
             if len(removed) > 64 or work > 8.0:
                 return None
             remaining = tuple(cell for cell in remaining if cell not in removed)
@@ -416,3 +422,146 @@ def find_decorative_site(world: SimpleVoxelWorld, player: PlayerSnapshot, *,
                            cells=(cell,), required_blocks=1,
                            support_cells=((node.x, node.y, node.support_z),))
     return None
+
+
+# --- Zombie refuge ramparts -------------------------------------------------
+# A survivor squad walls its elected refuge the way humans do in retail
+# Zombie rounds: a chest-high ring (two blocks above the plateau top, so a
+# standing player still sees and shoots over it while a crouched one is
+# covered) built from straight BlockLine runs shared out across the squad.
+RAMPART_HALF_WIDTH = 4
+RAMPART_HEIGHT = 2
+RAMPART_MAX_RUN = 9
+
+
+def _body_columns(positions: Sequence[Vector3]) -> frozenset[tuple[int, int]]:
+    """Columns under a body (the authority's 0.45-wide footprint), any height."""
+    columns: set[tuple[int, int]] = set()
+    for position in islice(positions, MAX_FRIENDLIES + 1):
+        px, py = float(position[0]), float(position[1])
+        columns.update((x, y)
+                       for x in range(math.floor(px - 0.45), math.floor(px + 0.45) + 1)
+                       for y in range(math.floor(py - 0.45), math.floor(py + 0.45) + 1))
+    return frozenset(columns)
+
+
+def _rampart_columns(cx: int, cy: int, half_width: int) -> list[tuple[list[tuple[int, int]], tuple[int, int]]]:
+    """Return the ring's four sides in walking order with their inward normals."""
+    hw = half_width
+    north = ([(x, cy - hw) for x in range(cx - hw, cx + hw + 1)], (0, 1))
+    east = ([(cx + hw, y) for y in range(cy - hw + 1, cy + hw + 1)], (-1, 0))
+    south = ([(x, cy + hw) for x in range(cx + hw - 1, cx - hw - 1, -1)], (0, -1))
+    west = ([(cx - hw, y) for y in range(cy + hw - 1, cy - hw, -1)], (1, 0))
+    return [north, east, south, west]
+
+
+def _rampart_floor(world: SimpleVoxelWorld, x: int, y: int, top: int) -> int | None:
+    """Topmost solid z of a ring column near the plateau plane (z grows down)."""
+    for z in range(max(1, top - RAMPART_HEIGHT - 1), min(238, top + 4)):
+        if world.solid(x, y, z):
+            return z
+    return None
+
+
+def rampart_cells(world: SimpleVoxelWorld, centre: Vector3, *,
+                  half_width: int = RAMPART_HALF_WIDTH,
+                  height: int = RAMPART_HEIGHT) -> dict[tuple[int, int], tuple[int, ...]]:
+    """Map each ring column to the wall cells it still needs (lowest first).
+
+    Columns that drop three or more blocks below the plateau are a natural
+    cliff and are left open; columns that already rise above the wall height
+    need nothing. Cells already solid are omitted.
+    """
+    node = world.surface(math.floor(centre[0]), math.floor(centre[1]), centre[2],
+                         vertical_span=2, clearance=3)
+    if node is None:
+        return {}
+    top = int(node.support_z)
+    needed: dict[tuple[int, int], tuple[int, ...]] = {}
+    for columns, _inward in _rampart_columns(node.x, node.y, half_width):
+        for x, y in columns:
+            if not (1 <= x < 511 and 1 <= y < 511):
+                continue
+            floor = _rampart_floor(world, x, y, top)
+            if floor is None or floor >= top + 3 or floor <= top - height:
+                continue
+            cells = tuple(z for z in range(floor - 1, top - height - 1, -1)
+                          if 1 <= z <= 237 and not world.solid(x, y, z))
+            if cells:
+                needed[(x, y)] = cells
+    return needed
+
+
+def find_rampart_segment(world: SimpleVoxelWorld, player: PlayerSnapshot,
+                         refuge: Vector3, *,
+                         friendly_positions: Sequence[Vector3] = (),
+                         reserved_cells: frozenset[Cell] = frozenset(),
+                         half_width: int = RAMPART_HALF_WIDTH,
+                         height: int = RAMPART_HEIGHT) -> ProjectSite | None:
+    """Pick the next straight, grounded wall run this builder can lay.
+
+    Only cells resting on something solid are offered, so the ring rises one
+    layer at a time and every BlockLine cell passes the client's face-contact
+    gate. Runs already reserved by a teammate, or passing through a body
+    column, are skipped; the nearest run on the lowest unfinished layer wins.
+    ``cells`` is the run in line order; ``approach`` is a standing spot two
+    blocks inside the ring, within ordinary build reach of every cell.
+    """
+    if (len(friendly_positions) > MAX_FRIENDLIES or not _eligible(player)
+            or int(C.BLOCK_TOOL) not in player.loadout or player.blocks < 2):
+        return None
+    node = world.surface(math.floor(refuge[0]), math.floor(refuge[1]), refuge[2],
+                         vertical_span=2, clearance=3)
+    if node is None:
+        return None
+    needed = rampart_cells(world, refuge, half_width=half_width, height=height)
+    if not needed:
+        return None
+    occupied = _body_columns((player.position, *tuple(islice(friendly_positions, MAX_FRIENDLIES))))
+    best: ProjectSite | None = None
+    best_key: tuple[float, float] | None = None
+    for columns, inward in _rampart_columns(node.x, node.y, half_width):
+        layers = sorted({z for column in columns for z in needed.get(column, ())}, reverse=True)
+        for z in layers:
+            run: list[Cell] = []
+            runs: list[list[Cell]] = []
+            for x, y in columns:
+                cell = (x, y, z)
+                buildable = (z in needed.get((x, y), ()) and world.solid(x, y, z + 1)
+                             and cell not in reserved_cells and (x, y) not in occupied)
+                if buildable and len(run) < min(RAMPART_MAX_RUN, player.blocks):
+                    run.append(cell)
+                    continue
+                if run:
+                    runs.append(run)
+                run = [cell] if buildable else []
+            if run:
+                runs.append(run)
+            for cells in runs:
+                mid = cells[len(cells) // 2]
+                approach = None
+                for depth in (2, 1, 3):
+                    ax, ay = mid[0] + inward[0] * depth, mid[1] + inward[1] * depth
+                    stand = world.surface(ax, ay, refuge[2], vertical_span=2, clearance=3)
+                    if stand is None:
+                        continue
+                    eye = (stand.position[0], stand.position[1], stand.position[2])
+                    if all(math.dist(eye, (cx + .5, cy + .5, cz + .5)) <= MAX_PROJECT_BUILD_REACH
+                           for cx, cy, cz in cells):
+                        approach = stand.position
+                        break
+                if approach is None:
+                    continue
+                key = (-float(z), math.dist(player.position, approach))
+                if best_key is None or key < best_key:
+                    supports = tuple((cx, cy, cz + 1) for cx, cy, cz in cells)
+                    best_key = key
+                    best = ProjectSite("rampart", (cells[0][0] + .5, cells[0][1] + .5, cells[0][2] + .5),
+                                       approach, (), cells=tuple(cells), required_blocks=len(cells),
+                                       support_cells=supports, tool_id=int(C.BLOCK_TOOL),
+                                       estimated_seconds=2.0)
+            if best is not None:
+                # Lowest unfinished layer of this side found; other sides may
+                # still offer a nearer run on the same layer.
+                break
+    return best

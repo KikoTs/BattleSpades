@@ -10,7 +10,7 @@ from shared.packet import SetScore
 def _world():
     server = SimpleNamespace(players={}, sent=[], mode=SimpleNamespace(ended=False),
                              config=SimpleNamespace(default_mode="tdm"))
-    server.broadcast = lambda data: server.sent.append(data)
+    server.broadcast = lambda data, **_kwargs: server.sent.append(data)
     for player_id, team in ((0, 2), (1, 2), (2, 3)):
         server.players[player_id] = SimpleNamespace(
             id=player_id, team=team, score=0, replication_generation=1,

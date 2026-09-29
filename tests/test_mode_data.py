@@ -16,16 +16,18 @@ def test_hosted_mode_aliases_share_wire_discovery_and_progression_metadata(alias
 
 
 def test_tdm_only_exposes_normal_battle_builder_classes():
-    allowed = set(get("tdm").allowed_classes)
-    assert allowed == {
+    # Retail TDM uses DEFAULT_TEAM_CLASSES (alias A93) in stock card order:
+    # Soldier, Scout, Engineer, Miner, Specialist, Medic -- no Rocketeer.
+    assert tuple(get("tdm").allowed_classes) == (
         int(C.CLASS_SOLDIER),
         int(C.CLASS_SCOUT),
-        int(C.CLASS_ROCKETEER),
-        int(C.CLASS_MINER),
         int(C.CLASS_ENGINEER),
+        int(C.CLASS_MINER),
         int(C.CLASS_SPECIALIST),
         int(C.CLASS_MEDIC),
-    }
+    )
+    allowed = set(get("tdm").allowed_classes)
+    assert int(C.CLASS_ROCKETEER) not in allowed
     assert int(C.CLASS_ZOMBIE) not in allowed
     assert int(C.CLASS_GANGSTER_1) not in allowed
     assert int(C.CLASS_CLASSIC_SOLDIER) not in allowed

@@ -24,6 +24,7 @@ from server.dig_profiles import DigProfile, best_navigation_dig_profile
 from server.game_constants import (
     CAT_SNIPER,
     SPADE_TOOL_IDS,
+    WEAPON_CATALOG,
     WEAPON_PROFILES,
 )
 from server.projectiles import BASE_GRAVITY, PROJECTILE_SPECS
@@ -76,6 +77,7 @@ from .policies import (
     ModeBotDecision,
     ModePolicyMemory,
     ModeBotPosture,
+    canonical_mode_id,
     mode_decision_allows_combat,
     mode_objective_committed,
 )
@@ -256,6 +258,12 @@ class _BotState:
     breach_key: tuple[object, ...] | None = None
     breach_started_at: float = 0.0
     next_breach_at: float = 0.0
+    # Demolition block work: the cell being dug/repaired, since when, and
+    # cells that would not yield (bad angle, contested) with their expiry.
+    block_work_cell: tuple[int, int, int] | None = None
+    block_work_since: float = 0.0
+    block_work_skip: dict[tuple[int, int, int], float] = field(default_factory=dict)
+    next_block_work_at: float = 0.0
     yielded_breach_edge: EdgeKey | None = None
     yielded_breach_started_at: float = 0.0
     next_water_build_at: float = 0.0
@@ -714,6 +722,16 @@ class SimpleBotBrain:
             if mining is not None:
                 return mining
 
+        if (
+            mode_decision is not None
+            and mode_decision.directive in ("demolish", "repair")
+        ):
+            work = self._objective_block_work_intent(
+                frame, observer, state, now, mode_decision,
+            )
+            if work is not None:
+                return work
+
         support = (
             self._medic_support_intent(
                 frame,
@@ -823,6 +841,7 @@ class SimpleBotBrain:
                 int(player.team) == int(observer.team)
                 or not player.alive
                 or not player.spawned
+                or getattr(player, "spawn_protected", False)
             ):
                 continue
             distance = math.dist(observer.eye, player.eye)
@@ -879,11 +898,15 @@ class SimpleBotBrain:
         # Public carrier/crown markers rank only enemies already admitted by
         # range, field of view and LOS above. A nearby threat still gets urgent
         # self-defence; a visible VIP should not be ignored for an old decoy.
+        mode = canonical_mode_id(frame.mode_id)
         objective_ids = {
             item.carrier_id for item in frame.objectives
             if item.carrier_id >= 0 and (
-                frame.mode_id == "vip" and item.kind == "vip" and item.team != observer.team
-                or frame.mode_id == "ctf" and item.kind == "ctf_intel" and item.team == observer.team)
+                mode == "vip" and item.kind == "vip" and item.team != observer.team
+                # Only already visible candidates are ranked here, so a
+                # Classic carrier seen with our intel is fair game too.
+                or mode in ("ctf", "cctf") and item.kind == "ctf_intel"
+                and item.team == observer.team)
         }
         marked = min((player for player in candidates if player.player_id in objective_ids),
                      key=lambda player: math.dist(observer.position, player.position), default=None)
@@ -1920,9 +1943,25 @@ class SimpleBotBrain:
             return None
         pressured = 0.0 <= now - observer.last_damage_at <= 1.0
         whim = tactical_mix(observer.player_id, observer.life_id, int(now / 2.5))
-        if not pressured and whim > 0.10 + 0.25 * profile.creativity:
+        climber = MovementAffordance.JETPACK_CLIMB in _movement_abilities(observer)
+        # Climbing packs are how Rocketeers and Engineers take high ground;
+        # they reach for it more often than a glider hops sideways.
+        eagerness = 0.10 + 0.25 * profile.creativity + (0.15 if climber else 0.0)
+        if not pressured and whim > eagerness:
             return None
         state.next_combat_hop_at = now + 2.5
+        if climber:
+            perch = self._high_ground_perch(observer, target)
+            if perch is not None:
+                state.engagement.relocations += 1
+                state.next_combat_hop_at = now + 10.0 + 6.0 * profile.caution
+                state.flight_step = RouteStep(perch, MovementAffordance.JETPACK)
+                state.flight_source = observer.position
+                state.flight_started_at = now
+                state.flight_departed = False
+                state.flight_watch = target.eye
+                self._set_goal(state, None, observer.position, now)
+                return self._flight_intent(frame, observer, state, now)
         heading = relocation_heading(self.world, observer, target, profile, state.engagement)
         if heading is None:
             return None
@@ -1948,6 +1987,33 @@ class SimpleBotBrain:
             self._set_goal(state, None, observer.position, now)
             return self._flight_intent(frame, observer, state, now)
         return None
+
+    def _high_ground_perch(
+        self, observer: PlayerSnapshot, target: PlayerSnapshot,
+    ) -> Vector3 | None:
+        """A dry ledge 3-8 blocks up beside the bot that still sees the target."""
+
+        clear = getattr(self.world, "_climb_column_is_clear", None)
+        if not callable(clear) or not observer.grounded or observer.wade:
+            return None
+        x0, y0 = int(math.floor(observer.position[0])), int(math.floor(observer.position[1]))
+        support = int(round(observer.position[2] + 2.25))
+        best = None
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            surface = self.world.surface(x0 + dx, y0 + dy, observer.position[2],
+                                         vertical_span=8, allow_water=False)
+            if surface is None:
+                continue
+            rise = support - int(surface.support_z)
+            if not 3 <= rise <= 8 or not clear(x0, y0, support, int(surface.support_z)):
+                continue
+            eye_offset = observer.eye[2] - observer.position[2]
+            eye = (surface.position[0], surface.position[1], surface.position[2] + eye_offset)
+            if not self.world.has_line_of_sight(eye, target.eye):
+                continue
+            if best is None or rise > best[0]:
+                best = (rise, surface.position)
+        return None if best is None else best[1]
 
     def _safe_tactical_hop(
         self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
@@ -2187,10 +2253,7 @@ class SimpleBotBrain:
         )
         if cell is None:
             return None
-        state.next_breach_at = float(now) + max(
-            0.35,
-            float(getattr(C, "PICKAXE_SHOOT_INTERVAL", 0.4)),
-        )
+        state.next_breach_at = float(now) + _melee_swing_interval(melee)
         target = tuple(float(value) + 0.5 for value in cell)
         return self._intent(
             frame,
@@ -2209,6 +2272,220 @@ class SimpleBotBrain:
             debug_goal=target,
             debug_role="diamond_mine_blocks",
         )
+
+    # Demolition block work. The melee ray is MELEE_RANGE long; stay inside
+    # it. A repair placement is an ordinary BlockLine-length reach.
+    _DEMOLISH_REACH = float(getattr(C, "MELEE_RANGE", 3)) - 0.15
+    _REPAIR_REACH = 4.5
+    _BLOCK_WORK_PATIENCE = 4.0
+    _BLOCK_WORK_SKIP_SECONDS = 20.0
+
+    def _objective_block_work_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        now: float,
+        decision: ModeBotDecision,
+    ) -> BotIntent | None:
+        """Dig the enemy Demolition base or re-place our destroyed blocks.
+
+        ``demolish`` swings the spade at a block of the enemy base within
+        melee reach (or whatever solid block the swing would meet first on
+        the way to one); ``repair`` places a block back into a destroyed
+        objective cell that has face contact, the retail client's placement
+        gate. ``None`` hands the bot to ordinary navigation toward the
+        decision's cell until one is in reach.
+        """
+
+        demolish = decision.directive == "demolish"
+        base = next(
+            (
+                item for item in frame.objectives
+                if item.kind == "dem_base"
+                and ((item.team != observer.team) if demolish else (item.team == observer.team))
+            ),
+            None,
+        )
+        if base is None or not observer.grounded:
+            return None
+        skip = state.block_work_skip
+        for cell, until in tuple(skip.items()):
+            if until <= now:
+                skip.pop(cell, None)
+        eye = tuple(float(value) for value in observer.eye)
+        if demolish:
+            tool = _melee_tool(observer)
+            cell = None if tool is None else self._demolish_cell(eye, base, skip)
+            cooldown = _melee_swing_interval(tool)
+        else:
+            tool = int(C.BLOCK_TOOL)
+            if tool not in {int(value) for value in observer.loadout} or int(observer.blocks) <= 0:
+                return None
+            cell = self._repair_cell(frame, observer, eye, base, skip)
+            cooldown = 0.5
+        if tool is None or cell is None:
+            state.block_work_cell = None
+            return None
+        if state.block_work_cell != cell:
+            state.block_work_cell = cell
+            state.block_work_since = now
+        elif now - state.block_work_since > self._BLOCK_WORK_PATIENCE:
+            # The swing never lands (the gateway's exact ray disagrees) or
+            # the placement keeps failing: try another cell for a while.
+            skip[cell] = now + self._BLOCK_WORK_SKIP_SECONDS
+            state.block_work_cell = None
+            return None
+        role = "demolition_dig_base" if demolish else "demolition_repair_block"
+        center = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+        self._set_goal(state, None, observer.position, now)
+        if now + 1e-9 < state.next_block_work_at:
+            # Between swings: stay put and keep the aim on the block.
+            return self._intent(
+                frame,
+                movement=MovementIntent(crouch=demolish),
+                look=LookIntent(center, visible=False),
+                tool_id=int(tool),
+                priority=BotIntentPriority.ROUTINE,
+                debug_goal=center,
+                debug_role=role,
+            )
+        state.next_block_work_at = float(now) + cooldown
+        if demolish:
+            return self._intent(
+                frame,
+                movement=MovementIntent(crouch=True, affordance=MovementAffordance.BREACH),
+                look=LookIntent(center, visible=False),
+                tool_id=int(tool),
+                action=BotAction(BotActionKind.MELEE, tool_id=int(tool), position=center),
+                priority=BotIntentPriority.ROUTINE,
+                debug_goal=center,
+                debug_role=role,
+            )
+        target = tuple(float(value) for value in cell)
+        return self._intent(
+            frame,
+            movement=MovementIntent(),
+            look=LookIntent(target, visible=False),
+            tool_id=int(tool),
+            action=BotAction(BotActionKind.BUILD, tool_id=int(tool), position=target),
+            priority=BotIntentPriority.ROUTINE,
+            debug_goal=center,
+            debug_role=role,
+        )
+
+    def _first_solid_on_ray(
+        self, origin: Vector3, target: Vector3, limit: float,
+    ) -> tuple[int, int, int] | None:
+        """Return the first solid voxel a ray from ``origin`` meets."""
+
+        dx, dy, dz = (float(target[i]) - float(origin[i]) for i in range(3))
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 1e-6:
+            return None
+        steps = max(1, int(math.ceil(min(length, limit) / 0.05)))
+        scale = min(length, limit) / length
+        last = None
+        for index in range(1, steps + 1):
+            fraction = scale * index / steps
+            cell = (
+                int(math.floor(origin[0] + dx * fraction)),
+                int(math.floor(origin[1] + dy * fraction)),
+                int(math.floor(origin[2] + dz * fraction)),
+            )
+            if cell == last:
+                continue
+            last = cell
+            if self.world.solid(*cell):
+                return cell
+        return None
+
+    def _demolish_cell(self, eye: Vector3, base, skip) -> tuple[int, int, int] | None:
+        """Pick the nearest reachable block of the enemy base volume.
+
+        Candidates are the published intact objective blocks plus, for an
+        authored base volume, every solid block of that volume within reach.
+        The swing takes whatever it meets first on the way to a candidate,
+        since that block (a wall built over the base, or the base itself) is
+        what stands between the bot and the objective.
+        """
+
+        reach = self._DEMOLISH_REACH
+        candidates: set[tuple[int, int, int]] = {
+            tuple(int(v) for v in cell) for cell in base.cells
+        }
+        bounds = tuple(int(value) for value in base.bounds)
+        if len(bounds) == 6:
+            x0, x1, y0, y1, z0, z1 = bounds
+            ex, ey, ez = (int(math.floor(value)) for value in eye)
+            radius = int(math.ceil(reach))
+            for x in range(max(x0, ex - radius), min(x1, ex + radius) + 1):
+                for y in range(max(y0, ey - radius), min(y1, ey + radius) + 1):
+                    for z in range(max(z0, ez - radius), min(z1, ez + radius) + 1):
+                        candidates.add((x, y, z))
+
+        def gap(cell) -> float:
+            return math.dist(eye, (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5))
+
+        ordered = sorted(
+            (cell for cell in candidates if gap(cell) <= reach and cell not in skip),
+            key=lambda cell: (gap(cell), cell),
+        )
+        for cell in ordered[:48]:
+            if not self.world.solid(*cell):
+                continue
+            hit = self._first_solid_on_ray(
+                eye, (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5), reach,
+            )
+            if hit is not None and hit not in skip and gap(hit) <= reach:
+                return hit
+        return None
+
+    def _repair_cell(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                     eye: Vector3, base, skip) -> tuple[int, int, int] | None:
+        """Pick a destroyed objective cell that a block can go back into.
+
+        The cell must be empty, touch a solid face (the retail client drops a
+        floating placement), lie within reach with a clear line from the eye,
+        and not overlap any player's body.
+        """
+
+        reach = self._REPAIR_REACH
+        bodies = [
+            player.position for player in frame.players
+            if player.alive and player.spawned
+        ]
+
+        def gap(cell) -> float:
+            return math.dist(eye, (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5))
+
+        ordered = sorted(
+            (tuple(int(v) for v in cell) for cell in base.repair_cells),
+            key=lambda cell: (gap(cell), cell),
+        )
+        for cell in ordered:
+            if gap(cell) > reach or cell in skip:
+                continue
+            x, y, z = cell
+            if self.world.solid(x, y, z):
+                continue
+            if not any(
+                self.world.solid(x + dx, y + dy, z + dz)
+                for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                   (0, -1, 0), (0, 0, 1), (0, 0, -1))
+            ):
+                continue
+            if any(
+                abs(position[0] - (x + 0.5)) < 0.9
+                and abs(position[1] - (y + 0.5)) < 0.9
+                and -0.5 <= (z + 0.5) - position[2] <= 3.2
+                for position in bodies
+            ):
+                continue
+            if not self.world.has_line_of_sight(eye, (x + 0.5, y + 0.5, z + 0.5)):
+                continue
+            return cell
+        return None
 
     @staticmethod
     def _deployable_near(
@@ -2352,6 +2629,17 @@ class SimpleBotBrain:
                 MovementAffordance.JUMP, MovementAffordance.DROP}:
             # Digging/traversal has its own authoritative progress contract.
             state.navigation_coverage_at = now
+            if current_step.affordance is MovementAffordance.BREACH:
+                # A stationary dig is progress under the breach timeout
+                # (estimated swings x the stock cadence). Retail cadence is
+                # slow (knife 5 x 0.5 s per voxel): without this, the
+                # physical-progress clock that kept running while digging
+                # expires on the very next step and blacklists the climb the
+                # dig just opened.
+                state.navigation_progress_position = observer.position
+                state.navigation_progress_at = float(now)
+                state.navigation_window_position = observer.position
+                state.navigation_window_at = float(now)
         elif repeated_coverage and state.escape_search is None:
             # Valid movement can still repeat the same closed loop forever.
             # Exclude this approach briefly, then use the bounded recovery
@@ -3210,7 +3498,8 @@ class SimpleBotBrain:
                               step.waypoint[1] - observer.position[1])
         state.flight_departed |= not observer.grounded
         landed = (state.flight_departed and observer.grounded and elapsed > 0.35)
-        if landed or observer.wade or elapsed >= 3.5:
+        climb_budget = max(0.0, source[2] - step.waypoint[2]) * 0.3
+        if landed or observer.wade or elapsed >= 3.5 + climb_budget:
             if distance > 1.0 or observer.wade:
                 edge = (tuple(int(math.floor(v)) for v in (*source[:2], source[2] + 2.25)),
                         tuple(int(math.floor(v)) for v in (*step.waypoint[:2], step.waypoint[2] + 2.25)))
@@ -3223,14 +3512,30 @@ class SimpleBotBrain:
             self._clear_route(state, now)
             return None
         altitude = source[2] - observer.position[2]
+        climb = source[2] - step.waypoint[2]
+        rising = max(0.0, -float(observer.velocity[2]))
+        coast = rising * rising / _COAST_DIVISOR
         direction = _normalized_xy(step.waypoint[0] - observer.position[0],
                                    step.waypoint[1] - observer.position[1])
-        # Rise above the bank before entering the gap, then brake over its
-        # known landing. Never hold thrust until fuel exhaustion.
-        if (altitude < 0.8 and elapsed < 0.6) or distance < 0.4:
-            direction = (0.0, 0.0, 0.0)
-        ceiling = 5.0 if observer.jetpack_id == int(C.JETPACK_ENGINEER) else 2.5
-        thrust = (elapsed < 0.5 or (altitude < ceiling and distance > 0.6 and elapsed < 2.3))
+        burst = observer.jetpack_id == int(C.JETPACK_NORMAL)
+        if climb > 1.0:
+            # Ledge climb: rise in the source column until the feet clear the
+            # lip, then drift over it. Thrust is cut early enough that the
+            # coast ends just above the ledge instead of launching the body.
+            target = climb + 1.3
+            above_lip = altitude >= climb + 0.6
+            if not above_lip or distance < 0.4:
+                direction = (0.0, 0.0, 0.0)
+            thrust = (elapsed < 0.2 or altitude + coast < target) and elapsed < 2.0 + climb * 0.3
+        else:
+            # Rise above the bank before entering the gap, then brake over its
+            # known landing. Never hold thrust until fuel exhaustion.
+            if (altitude < 0.8 and elapsed < 0.6) or distance < 0.4:
+                direction = (0.0, 0.0, 0.0)
+            ceiling = 5.0 if observer.jetpack_id == int(C.JETPACK_ENGINEER) else 2.5
+            takeoff = 0.25 if burst else 0.5
+            thrust = (elapsed < takeoff
+                      or (altitude + coast < ceiling and distance > 0.6 and elapsed < 2.3))
         return self._intent(frame,
             movement=MovementIntent(direction=direction, affordance=MovementAffordance.JETPACK,
                                     jetpack_thrust=thrust),
@@ -5334,6 +5639,19 @@ def _melee_tool(observer: PlayerSnapshot) -> int | None:
     )
 
 
+def _melee_swing_interval(tool: int | None) -> float:
+    """Stock swing cadence of one owned melee tool (the server's gate).
+
+    Player.consume_shot gates melee on the stock catalog interval (spade
+    0.8 s, pickaxe 0.6 s, knife 0.5 s); planning a faster cadence only
+    produces cooldown rejections.
+    """
+
+    profile = WEAPON_CATALOG.get(int(tool)) if tool is not None else None
+    interval = float(getattr(profile, "fire_interval", 0.0) or 0.0)
+    return max(0.35, interval)
+
+
 def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     """Return the fastest owned tool under the authoritative dig model."""
 
@@ -5359,14 +5677,33 @@ def _movement_abilities(
     abilities = {MovementAffordance.JUMP}
     pack = int(getattr(observer, "jetpack_id", 0))
     properties = C.JETPACK_PROPERTIES.get(pack)
-    if properties is not None and pack in {int(C.JETPACK2), int(C.JETPACK_ENGINEER)}:
+    flight_seconds = _PACK_FLIGHT_SECONDS.get(pack)
+    if properties is not None and flight_seconds is not None:
+        # Measured on server physics (2026-09-25): the Rocketeer's glide pack
+        # (67) never lifts more than a jump, the Rocketeer's burst pack (66)
+        # gains ~20 blocks per second of thrust, the Engineer pack (68) climbs
+        # steadily. Each needs fuel for its own longest planned burn.
         reserve = (properties[C.JETPACK_FUEL_ACTIVATION_COST]
-                   + properties[C.JETPACK_FUEL_FLYING_CONSUMPTION] * 2.3 + 5.0)
+                   + properties[C.JETPACK_FUEL_FLYING_CONSUMPTION] * flight_seconds + 5.0)
         if observer.grounded and not observer.wade and observer.jetpack_fuel >= reserve:
             abilities.add(MovementAffordance.JETPACK)
+            if pack in _CLIMBING_PACKS:
+                abilities.add(MovementAffordance.JETPACK_CLIMB)
     if _dig_profile(observer) is not None:
         abilities.add(MovementAffordance.BREACH)
     return frozenset(abilities)
+
+
+# Longest burn each pack's planned flights need (seconds of thrust).
+_PACK_FLIGHT_SECONDS = {
+    int(C.JETPACK_NORMAL): 0.6,
+    int(C.JETPACK2): 2.3,
+    int(C.JETPACK_ENGINEER): 2.3,
+}
+_CLIMBING_PACKS = frozenset((int(C.JETPACK_NORMAL), int(C.JETPACK_ENGINEER)))
+# Upward coast after thrust stops is roughly v^2 / (2 g) with the native
+# per-tick gravity; measured 0.29 v -> ~1.0 block coast on pack 66.
+_COAST_DIVISOR = 0.086
 
 
 def _normalized_xy(dx: float, dy: float) -> Vector3:

@@ -44,11 +44,21 @@ class MachineGunBehavior(EntityBehavior):
         if self.carrier_id is None:
             return False
         player = getattr(server, "players", {}).get(self.carrier_id)
-        if player is not None and getattr(player, "mounted_entity_id", None) == ent.entity_id:
+        was_mounted = (
+            player is not None
+            and getattr(player, "mounted_entity_id", None) == ent.entity_id
+        )
+        if was_mounted:
             player.mounted_entity_id = None
         self.carrier_id = None
         ent.player_id = UNMOUNTED_PLAYER_ID
         _broadcast_player(server, ent.entity_id, UNMOUNTED_PLAYER_ID)
+        if was_mounted:
+            # Drop the server-owned MG_TOOL so the 0.1 s mounted cadence and
+            # the MG tool byte cannot outlive the mount.
+            hook = getattr(player, "on_machine_gun_unmounted", None)
+            if callable(hook):
+                hook()
         return True
 
     def on_tick(self, ent, dt, ctx) -> None:

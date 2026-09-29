@@ -279,7 +279,11 @@ Gotchas:
   at server tick N-1. Inputs are buffered by loop_count and applied at the
   matching delayed tick (`INPUT_DELAY_TICKS = 1` in server/player.py). A burst
   remains buffered; the server consumes at most one client-history frame per
-  simulation tick.
+  simulation tick. ClientData is unsequenced on the wire and the client labels
+  every update contiguously, so a missing label (up to
+  `[debug] input_gap_fill_limit`, default 8) is a lost frame: the server
+  refills it with the held input, one per tick, before consuming the next real
+  packet (docs/RETAIL_INPUT_LOSS.md). `synth=` in `tick stats:` counts them.
 - WorldUpdate is built after a completed simulation step and sent UNRELIABLE at
   30 Hz. Production includes the recipient's safe self row at the same cadence;
   the row is stamped with that recipient's consumed input loop, never a global
@@ -399,7 +403,21 @@ py scripts\scenarios\combined_replication_stress.py `
   --server 127.0.0.1:27016 --duration 12 `
   --mover-team 2 --emitter-team 2 `
   --artifact-dir logs\combined-replication\snowball-order-validation
+
+# Internet-ping gate: put a UDP impairment proxy in front of the validation
+# server (~80 ms RTT, jitter, 0.5 % loss) and point the client at it. Add
+# --sniff to histogram ENet command types per direction (ClientData is
+# SEND_UNSEQUENCED). Local runs never exercise the lost-frame refill.
+py scripts\udp_lag_proxy.py --listen 27018 --target 127.0.0.1:27016 `
+  --delay-ms 40 --jitter-ms 8 --loss 0.005
+py scripts\scenarios\movement_stress.py --launch --server 127.0.0.1:27018 `
+  --class-id 0 --repeats 1 --segments settle,sprint,jump_run,slope_diagonal
 ```
+
+The launched client must be the jump-restore-patched build
+(`aceofspades_revival/tools/patch_character_jump_restore.py --check`); the
+stock binary produces one ADJUST per jump by design
+(docs/RETAIL_JUMP_RESTORE.md).
 
 The JSON artifact under `logs/movement/` contains every sample, per-segment
 analysis, explicit correction events, active tool IDs, palette state, and block
@@ -881,8 +899,9 @@ Bot administration is available after `/admin <password>`:
 Debug snapshots expose the bounded current goal, two-point path, action, and
 movement affordance plus the current mode role. They remain off by default (`bots.debug_visualization =
 false`) and do not render client packets. Prefab work is controlled by
-`network.prefab_queue_limit` and `network.prefab_cell_batch_limit`; do not make
-either unbounded to accelerate large models.
+`network.prefab_queue_limit`, `network.prefab_cell_batch_limit` (UGC editor
+cells per tick) and `network.prefab_competitive_cell_budget` (whole competitive
+prefabs per tick); do not make them unbounded to accelerate large models.
 
 ## Steam master-server listing
 
@@ -1002,6 +1021,24 @@ root, then permanently drops to UID/GID `10001` before Python or game data is
 loaded. The fleet example also drops Linux capabilities, keeps the source
 filesystem read-only, and writes runtime config, logs, and bans only beneath
 `/data`.
+
+The entrypoint places every file the server writes on that volume, so none of
+them depend on `/app` being writable and all of them survive container
+replacement:
+
+| State | Path in the container |
+| --- | --- |
+| Effective config | `/data/runtime/config.toml` |
+| Logs (`[logging] file`, fault log) | `/data/logs/` |
+| Bans (`[admin] bans_path`) | `/data/bans.json` (always) |
+| Pending AoSPlay round results (`[revival] results_path`) | `/data/state/round-results.sqlite3` |
+| Anti-cheat suspicion report (`[anticheat] report_path`) | `/data/logs/anticheat.jsonl` |
+
+A relative `results_path` or `report_path` in the template is rebased below
+`/data` (keeping its layout); an absolute path in a custom
+`BATTLESPADES_CONFIG_TEMPLATE` is kept as written, so point it at the volume
+yourself. Outside Docker nothing changes: relative paths stay anchored to the
+application root as before.
 
 Supported per-instance environment variables:
 

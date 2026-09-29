@@ -42,18 +42,116 @@ from shared.packet import (
     ShootResponse,
 )
 from server.world_mutations import PendingWorldMutation
+from server.colors import pack_rgb, unpack_rgb
+from server import block_damage_model as _damage_model
 
 logger = logging.getLogger(__name__)
 
 SHOT_ORIGIN_TOLERANCE = 8.0
+# Initial health of every player-built voxel.  Live-measured on the stock
+# client (2026-09-26): BlockBuild(32) type 0, BlockLine(40) and prefab
+# BuildPrefabAction(30) cells all enter BlockManager.user_blocks at 9.0
+# (DEFAULT_PREFAB_HEALTH); BlockBuildColored(33) enters at 3.0 and an
+# untouched map voxel uses DEFAULT_BLOCK_HEALTH (5.0).  The mode rules of
+# retail add_user_block (Classic -> 5, UGC -> untracked) are applied by
+# WorldManager.user_block_health for every caller.
+USER_BLOCK_HEALTH = float(getattr(C, "DEFAULT_PREFAB_HEALTH", 9))
+# Retail BlockToolCommon limits placement to MAX_BLOCK_DISTANCE (10) from the
+# client eye to the target cube. The server eye lags the client by the
+# reconciliation delay, so reuse the ShootPacket origin-drift allowance as
+# slack (+1 for the cube centre/diagonal). This only rejects map-wide edits;
+# every placement a stock client can make stays well inside it.
+BUILD_REACH = float(getattr(C, "MAX_BLOCK_DISTANCE", 10)) + 1.0 + SHOT_ORIGIN_TOLERANCE
+# Classic (``manager.classic``): BlockToolCommon/PaintbrushTool use
+# CLASSIC_MAX_BLOCK_DISTANCE (A1012 = 5) instead of A1017 = 10.
+CLASSIC_BUILD_REACH = (
+    float(getattr(C, "CLASSIC_MAX_BLOCK_DISTANCE", 5)) + 1.0 + SHOT_ORIGIN_TOLERANCE
+)
+# Stock server-only MIN_BLOCK_INTERVAL (A1016 = 0.1 s; no client pyc/pyd reads
+# it): the least time between two accepted block builds/lines of one player.
+# The stock BlockTool itself fires at most every 0.5 s. A small grace absorbs
+# two packets bunched by one late network frame.
+MIN_BLOCK_INTERVAL = float(getattr(C, "MIN_BLOCK_INTERVAL", 0.1))
+MIN_BLOCK_INTERVAL_GRACE = 0.02
+# Melee digging via legacy BlockLiberate(35): the swing reach plus the same
+# drift slack.
+DIG_REACH = float(MELEE_RANGE) + 1.0 + SHOT_ORIGIN_TOLERANCE
+# Minimum spacing between accepted block-tool BlockLiberate(35) removals.
+BLOCK_TOOL_LIBERATE_INTERVAL = 0.2
+# PaintBlock(7) token bucket: the UGC editor host replicates one packet per
+# brushed cell (a surface brush is capped at 128 cells every 30 ms), ordinary
+# block-tool paint is a single-cell action.
+PAINT_EDITOR_BURST = 256.0
+PAINT_EDITOR_RATE = 4400.0
+PAINT_BURST = 16.0
+PAINT_RATE = 30.0
 SHOT_ORIENTATION_DOT_TOLERANCE = 0.25
+# --- anti-cheat geometry ----------------------------------------------------
+# Voxel line-of-sight segments are shortened this much at each end so an eye
+# brushing a wall face (or a launch point nudged into it) is never occluded
+# by the wall it touches. A full 1-block wall is still always detected.
+LOS_SHRINK = 0.3
+# Extra reach a melee target/dug cell may have beyond MELEE_RANGE measured
+# from the SERVER eye (the client eye differs by the reconciliation drift).
+MELEE_EYE_SLACK = 1.5
+# Half-diagonal of a voxel: distance from a cell centre to its farthest corner.
+_CELL_HALF_DIAGONAL = math.sqrt(3.0) * 0.5
+# When the shot's own loop is not (yet) in the eye history the current eye can
+# be ahead of/behind the client by this much movement time.
+FALLBACK_LAG_SECONDS = 0.3
+MAX_LAG_SLACK = 4.0
+# Older applied loops also accepted as a line-of-sight source, so a player
+# rounding a corner under lag never has a real action rejected.
+_HISTORY_LOOKBACK = (6, 12, 24)
+# Histogram bucket upper bounds for per-player detection aggregates.
+ORIGIN_ERROR_BUCKETS = (0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0)
+AIM_ANGLE_BUCKETS = (0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 45.0, 90.0)
+# Pellet-seed skew: flag when one 8-bit seed dominates a player's shotgun fire.
+SEED_SKEW_MIN_SHOTS = 32
+SEED_SKEW_MIN_REPEATS = 6
+SEED_SKEW_SHARE = 0.2
+# Stock ``variable_accuracy`` hit-scan guns: (accuracy_spread_min,
+# accuracy_spread_max, accuracy_spread_increase_per_shot,
+# accuracy_spread_reduction_speed) from the stock Weapon subclasses
+# (aos.pkg bytecode; identical to the native client's generated
+# weapon_catalog RetailAimTuning). accuracy_min/max live on WeaponProfile.
+# Guns absent here fire at their constant class ``accuracy`` (profile.spread).
+RETAIL_ACCURACY_SPREAD = {
+    7: (1.0, 6.0, 0.2, 1.0),     # SMG
+    8: (2.0, 7.0, 0.3, 2.0),     # MINIGUN
+    9: (4.0, 7.0, 0.5, 1.0),     # SHOTGUN
+    10: (4.0, 7.0, 0.5, 1.0),    # SHOTGUN2
+    15: (1.0, 6.0, 0.2, 0.6),    # MG
+    35: (1.0, 5.0, 0.1, 0.5),    # TOMMYGUN
+    37: (4.0, 7.0, 0.5, 1.0),    # CLASSIC_SHOTGUN
+    38: (1.0, 6.0, 0.2, 0.6),    # CLASSIC_SMG
+    53: (1.5, 6.5, 0.3, 2.0),    # AUTOMATIC_PISTOL
+    60: (0.5, 1.0, 0.5, 0.7),    # ASSAULT_RIFLE
+    61: (2.0, 6.0, 0.5, 1.4),    # LIGHT_MACHINE_GUN
+    62: (4.0, 7.0, 0.5, 1.0),    # AUTO_SHOTGUN
+}
+# Stock ``accuracy_zoom`` where the class sets one (None elsewhere, so a
+# zoomed shot keeps the hip accuracy with the tighter 2/1 random mapping).
+RETAIL_ACCURACY_ZOOM = {
+    18: 0.0,  # SNIPER
+    19: 0.0,  # SNIPER2
+}
 HITBOX_SCALE = 0.05
 ASSAULT_BURST_SIZE = 3
 ASSAULT_BURST_WINDOW = 0.30
 ASSAULT_BURST_LOOP_INTERVAL = 6
+# Stock MinigunWeapon: shoot_interval_initial 0.3 (A1242), cap 0.3-0.2 (A1245),
+# -0.15/s while a trigger is held (A1243), +0.075/s when released (A1244).
 MINIGUN_INTERVAL_INITIAL = 0.30
 MINIGUN_INTERVAL_MIN = 0.10
 MINIGUN_INTERVAL_RAMP_PER_SECOND = 0.15
+MINIGUN_INTERVAL_RECOVER_PER_SECOND = 0.075
+# can_shoot_primary needs spin_speed > 0.5 (A1248) of 5 (A1247): the interval
+# is already below 0.3 - 0.2 * 0.1 = 0.28 when a cold gun fires its first round.
+MINIGUN_FIRST_SHOT_INTERVAL = 0.28
+# Packet-arrival jitter still counted as one continuous burst.
+MINIGUN_CONTINUITY_SLACK = 0.1
+MINIGUN_HELD_GAP_LIMIT = 1.0
 
 # Stock KV6 collision-model bounding boxes. Values are
 # ((size_x, size_y, size_z), (effective_pivot_x, pivot_y, pivot_z)); effective
@@ -116,6 +214,221 @@ _BLOCK_HIT_SOUND_BY_DAMAGE = {
 }
 
 
+def _finite_point(value):
+    """Return ``value`` as a finite 3-tuple of floats, or ``None``."""
+
+    try:
+        point = tuple(float(component) for component in value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if len(point) != 3 or not all(math.isfinite(c) for c in point):
+        return None
+    return point
+
+
+def segment_clear(
+    world,
+    start,
+    end,
+    *,
+    shrink_start: float = LOS_SHRINK,
+    shrink_end: float = LOS_SHRINK,
+    ignore=(),
+) -> bool:
+    """Whether the segment ``start``→``end`` crosses only air voxels.
+
+    Exact voxel traversal (Amanatides–Woo) over ``world.get_solid``; the
+    segment is shortened by ``shrink_start``/``shrink_end`` so geometry the
+    endpoints merely touch never occludes. Cells in ``ignore`` are treated as
+    air (the target cell of a dig/placement). Without a terrain oracle the
+    segment is considered clear.
+    """
+
+    get_solid = getattr(world, "get_solid", None)
+    if not callable(get_solid):
+        return True
+    start = _finite_point(start)
+    end = _finite_point(end)
+    if start is None or end is None:
+        return False
+    delta = tuple(end[i] - start[i] for i in range(3))
+    length = math.sqrt(sum(c * c for c in delta))
+    usable = length - float(shrink_start) - float(shrink_end)
+    if usable <= 1e-6:
+        return True
+    unit = tuple(c / length for c in delta)
+    origin = tuple(start[i] + unit[i] * float(shrink_start) for i in range(3))
+    cell = [int(math.floor(origin[i])) for i in range(3)]
+    last = tuple(
+        int(math.floor(origin[i] + unit[i] * usable)) for i in range(3)
+    )
+    step = [0, 0, 0]
+    t_max = [math.inf, math.inf, math.inf]
+    t_delta = [math.inf, math.inf, math.inf]
+    for axis in range(3):
+        if unit[axis] > 1e-12:
+            step[axis] = 1
+            t_max[axis] = (cell[axis] + 1 - origin[axis]) / unit[axis]
+            t_delta[axis] = 1.0 / unit[axis]
+        elif unit[axis] < -1e-12:
+            step[axis] = -1
+            t_max[axis] = (origin[axis] - cell[axis]) / -unit[axis]
+            t_delta[axis] = -1.0 / unit[axis]
+    ignore = set(ignore) if ignore else ()
+    # A segment of length L visits at most ~3L + 3 cells; the guard only
+    # protects against pathological float input.
+    for _ in range(int(usable * 3.0) + 8):
+        current = (cell[0], cell[1], cell[2])
+        if current not in ignore and get_solid(*current):
+            return False
+        if current == last:
+            return True
+        axis = min(range(3), key=lambda index: t_max[index])
+        if t_max[axis] > usable:
+            return True
+        cell[axis] += step[axis]
+        t_max[axis] += t_delta[axis]
+    return True
+
+
+def cell_sample_points(cell, inset: float = 0.1):
+    """Centre, six inset face centres and eight inset corners of ``cell``."""
+
+    x, y, z = (float(value) for value in cell)
+    low, high = inset, 1.0 - inset
+    points = [(x + 0.5, y + 0.5, z + 0.5)]
+    for axis in range(3):
+        for offset in (low, high):
+            face = [x + 0.5, y + 0.5, z + 0.5]
+            face[axis] = (x, y, z)[axis] + offset
+            points.append(tuple(face))
+    for ox in (low, high):
+        for oy in (low, high):
+            for oz in (low, high):
+                points.append((x + ox, y + oy, z + oz))
+    return points
+
+
+def cell_visible(world, eyes, cell, *, ignore=()) -> bool:
+    """Whether any sample point of ``cell`` is in line of sight of an eye.
+
+    Used for reach checks on dig/build/paint/deployable targets: the stock
+    client picks its target by raycasting from its eye, so the real ray
+    crosses the cell's interior. Sampling several points (with the target
+    cell itself treated as air) keeps grazing placements against a wall the
+    player looks at valid while a cell behind a wall is rejected.
+    """
+
+    cell = tuple(int(value) for value in cell)
+    skip = {cell}
+    skip.update(tuple(int(v) for v in extra) for extra in ignore)
+    for point in cell_sample_points(cell):
+        for eye in eyes:
+            if segment_clear(world, eye, point, shrink_end=0.0, ignore=skip):
+                return True
+    return False
+
+
+def reference_eyes(player, loop=None):
+    """Return ``(eye_at_loop | None, candidate eyes)`` for ``player``.
+
+    Candidates are the eye after the action's own input frame (when the
+    history has it), the current authoritative eye, and a few recently
+    applied frames. Every candidate is a position the server itself
+    simulated, so accepting any of them never grants a forged viewpoint.
+    """
+
+    history = getattr(player, "eye_at_loop", None)
+    at_loop = None
+    if callable(history) and loop is not None:
+        try:
+            at_loop = _finite_point(history(int(loop)) or ())
+        except Exception:  # noqa: BLE001 - tolerate partial Player doubles
+            at_loop = None
+    eyes = []
+    if at_loop is not None:
+        eyes.append(at_loop)
+    current = _finite_point(getattr(player, "eye", ()) or ())
+    if current is not None and current not in eyes:
+        eyes.append(current)
+    applied = getattr(player, "applied_loop", None)
+    if callable(history) and isinstance(applied, int):
+        for back in _HISTORY_LOOKBACK:
+            try:
+                past = _finite_point(history(applied - back) or ())
+            except Exception:  # noqa: BLE001
+                past = None
+            if past is not None and past not in eyes:
+                eyes.append(past)
+    return at_loop, eyes
+
+
+def lag_slack(player) -> float:
+    """Movement allowance for comparing against the current (not per-loop) eye."""
+
+    velocity = _finite_point(getattr(player, "velocity", ()) or ())
+    if velocity is None:
+        return 0.0
+    speed = math.sqrt(sum(c * c for c in velocity)) * 32.0  # blocks/second
+    return min(MAX_LAG_SLACK, speed * FALLBACK_LAG_SECONDS)
+
+
+def anticheat_stats(player) -> dict:
+    """Per-player detection aggregates (created on first use).
+
+    Cheap counters only; ``server.anticheat`` reporting builds summaries from
+    them. Keys: shots, hits, headshots, pellet_hits, weapons{tool: {shots,
+    hits, headshots}}, origin_error{bucket}, origin_error_fallback{bucket},
+    aim_angle{bucket}, aim_angle_fallback{bucket}, pellet_seeds{seed},
+    rejected{kind}.
+    """
+
+    stats = getattr(player, "anticheat_stats", None)
+    if isinstance(stats, dict):
+        return stats
+    from collections import Counter
+
+    stats = {
+        "shots": 0,
+        "hits": 0,
+        "headshots": 0,
+        "pellet_hits": 0,
+        "weapons": {},
+        "origin_error": Counter(),
+        "origin_error_fallback": Counter(),
+        "aim_angle": Counter(),
+        "aim_angle_fallback": Counter(),
+        "pellet_seeds": Counter(),
+        "rejected": Counter(),
+    }
+    try:
+        player.anticheat_stats = stats
+    except AttributeError:
+        pass
+    return stats
+
+
+def bucket_label(value: float, bounds) -> str:
+    """Histogram label ``"<=bound"`` (or ``">last"``) for ``value``."""
+
+    for bound in bounds:
+        if value <= bound:
+            return f"<={bound:g}"
+    return f">{bounds[-1]:g}"
+
+
+def seed_chi_square(seeds) -> float:
+    """Pearson chi-square of an 8-bit seed histogram against uniform."""
+
+    total = sum(seeds.values())
+    if total <= 0:
+        return 0.0
+    expected = total / 256.0
+    observed_sq = sum(count * count for count in seeds.values())
+    # sum((o-e)^2/e) over 256 bins, zero bins included.
+    return observed_sq / expected - total
+
+
 def get_combat_system(server):
     combat = getattr(server, "combat", None)
     if combat is None:
@@ -131,6 +444,9 @@ class CombatSystem:
         self._assault_bursts = {}
         self._minigun_runs = {}
         self._paintbrush_next_use = {}
+        self._liberate_next_use = {}
+        self._paint_budget = {}
+        self._shot_tally = None
 
     def forget_player(self, player_id: int) -> None:
         """Discard cadence/group state before a wire player id is reused."""
@@ -140,6 +456,77 @@ class CombatSystem:
         self._assault_bursts.pop(player_id, None)
         self._minigun_runs.pop(player_id, None)
         self._paintbrush_next_use.pop(player_id, None)
+        self._liberate_next_use.pop(player_id, None)
+        self._paint_budget.pop(player_id, None)
+
+    # ------------------------------------------------------------------
+    # Input-validation helpers shared by every client-driven terrain action
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _finite(*values) -> bool:
+        """Return whether every value is a finite real number."""
+
+        try:
+            return all(math.isfinite(float(value)) for value in values)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _cell_in_map(cell) -> bool:
+        x, y, z = cell
+        return (
+            0 <= int(x) < int(getattr(C, "MAP_X", 512))
+            and 0 <= int(y) < int(getattr(C, "MAP_Y", 512))
+            and 0 <= int(z) < int(getattr(C, "MAP_Z", 240))
+        )
+
+    def _cell_within_reach(self, player, cell, reach: float) -> bool:
+        """Is the centre of ``cell`` within ``reach`` blocks of the eye?"""
+
+        return self._eye_distance(player, cell) <= float(reach)
+
+    def _cell_in_sight(self, player, cell, *, loop=None, kind: str) -> bool:
+        """Hard line-of-sight gate for a client-selected terrain target.
+
+        The stock client picks every dig/build/paint cell by raycasting from
+        its eye, so some point of the cell is visible from it. Several
+        server-simulated eyes and fifteen sample points keep grazing and
+        moving placements valid; a cell behind a wall is rejected. Bots are
+        server-driven (their targets are planned on the authoritative map)
+        and are exempt.
+        """
+
+        if getattr(player, "is_bot", False):
+            return True
+        _, eyes = reference_eyes(player, loop)
+        if eyes and cell_visible(self.server.world_manager, eyes, cell):
+            return True
+        self._reject(player, kind, cell=tuple(int(v) for v in cell))
+        return False
+
+    def _consume_paint_budget(self, player, *, editor: bool) -> bool:
+        """Token-bucket cadence for PaintBlock(7) requests."""
+
+        burst = PAINT_EDITOR_BURST if editor else PAINT_BURST
+        rate = PAINT_EDITOR_RATE if editor else PAINT_RATE
+        now = time.monotonic()
+        player_id = int(player.id)
+        tokens, last = self._paint_budget.get(player_id, (burst, now))
+        tokens = min(burst, tokens + max(0.0, now - last) * rate)
+        if tokens < 1.0:
+            self._paint_budget[player_id] = (tokens, now)
+            return False
+        self._paint_budget[player_id] = (tokens - 1.0, now)
+        return True
+
+    def _queue_blocks_destroyed(self, player, cells, mined: bool) -> None:
+        """Tell the mode which cells an action removed (exactly once each)."""
+
+        queue = getattr(self.server, "queue_mode_event", None)
+        cells = tuple(tuple(int(value) for value in cell) for cell in cells)
+        if player is not None and cells and callable(queue):
+            queue("on_blocks_destroyed", player, cells, bool(mined))
 
     def _queue_canonical_terrain_repair(self, positions) -> None:
         """Schedule bounded repair for a client-predicted edit footprint.
@@ -181,8 +568,10 @@ class CombatSystem:
             return False
         if not (player.is_weapon_tool() or player.is_spade_tool()):
             return False
-        if not self._validate_shot_packet(player, packet):
+        validated = self._validate_shot_packet(player, packet)
+        if validated is None:
             return False
+        reach_eyes, reach_slack = validated
 
         profile = player.get_weapon_profile()
         now = time.monotonic()
@@ -192,10 +581,16 @@ class CombatSystem:
         elif int(player.tool) == int(getattr(C, "MINIGUN_TOOL", 8)):
             if not self._accept_minigun_packet(player, now):
                 return False
-        elif (
-            int(player.tool) == int(getattr(C, "MG_TOOL", 15))
-            and bool(getattr(player.input, "is_weapon_deployed", False))
-        ):
+        elif int(player.tool) == int(getattr(C, "MG_TOOL", 15)):
+            # MG_TOOL is only ever fired from a server-owned mounted gun
+            # (the stock client selects it after ChangeEntity attaches the
+            # Character). Deployment is the SERVER mount state: the client's
+            # ``is_weapon_deployed`` bit used to unlock the 0.1 s cadence.
+            from server.class_selection import _mounted_machine_gun_authorized
+
+            if not _mounted_machine_gun_authorized(player, self.server):
+                self._reject(player, "mg_fire_unmounted")
+                return False
             if not player.consume_shot(
                 now,
                 fire_interval=float(getattr(C, "MG_DEPLOYED_SHOOT_INTERVAL", 0.1)),
@@ -206,6 +601,19 @@ class CombatSystem:
 
         from server.profile_stats import shot
         shot(player)
+        from server.combat_scores import record_shot
+        record_shot(self.server, player)
+        self._begin_shot_tally(player)
+        # Statistical aim analysis (flag-only; server/anticheat_report.py).
+        from server.anticheat_report import observe_shot
+
+        observe_shot(self.server, player, packet, now=now)
+        if not player.is_spade_tool():
+            # Firing a gun ends this life's spawn protection (digging does not:
+            # a fresh spawn may still dig in or build cover).
+            end_protection = getattr(player, "end_spawn_protection", None)
+            if callable(end_protection):
+                end_protection()
 
         if not player.is_spade_tool():
             feedback = self._build_shoot_feedback_packet(player, packet)
@@ -218,7 +626,13 @@ class CombatSystem:
             # calls Character.shoot(), while SpadeTool/MacheteTool implement
             # use_primary() and have no shoot() method. Their remote swing and
             # sound are driven by WorldUpdate primary-action bit 0x01 instead.
-            self.server.broadcast(bytes(feedback.generate()), exclude=player)
+            #
+            # Packet 8 is purely presentational (the shot is resolved here),
+            # so it rides sequenced-unreliable: automatic fire must never
+            # head-of-line stall reliable gameplay state behind it.
+            self.server.broadcast(
+                bytes(feedback.generate()), exclude=player, reliable=False
+            )
 
         stimuli = getattr(self.server, "bot_stimuli", None)
         if stimuli is not None:
@@ -245,31 +659,127 @@ class CombatSystem:
             direction = player.orientation
             origin = player.eye
 
-        if player.is_spade_tool():
-            # MEASURED: the 1.x client digs terrain with the spade/pick by
-            # sending a ShootPacket (id 6), NOT BlockLiberate. The spade shot
-            # must destroy the block it points at, not only melee-hit players.
-            dug_terrain = self._resolve_spade_dig(
-                player, origin, direction, packet
+        # Lag compensation: player hits are tested against where targets
+        # were on the shooter's screen (server/lag_compensation.py).
+        from server import lag_compensation
+
+        with lag_compensation.compensated(self, self.server, player, packet):
+            try:
+                if player.is_spade_tool():
+                    # MEASURED: the 1.x client digs terrain with the spade/pick by
+                    # sending a ShootPacket (id 6), NOT BlockLiberate. The spade
+                    # shot must destroy the block it points at, not only
+                    # melee-hit players.
+                    dug_terrain = self._resolve_spade_dig(
+                        player, origin, direction, packet,
+                        reach_eyes=reach_eyes, reach_slack=reach_slack,
+                    )
+                    hit_player = self._resolve_melee_hit(
+                        player, origin, direction,
+                        reach_eyes=reach_eyes, reach_slack=reach_slack,
+                    )
+                    return dug_terrain or hit_player
+
+                # Character.shoot sends ONE central (unspread) ShootPacket for
+                # the trigger. It seeds Python's RNG from packet.seed and
+                # expands ``weapon.pellets`` directions locally -- INCLUDING
+                # pellets == 1 (rifle, SMG, pistol, ...: one seeded direction,
+                # three draws); observers repeat that expansion from the
+                # relayed packet. Resolve the same directions here so
+                # authoritative damage lands where every client drew/predicted
+                # the shot, not exactly on the crosshair (P2-18). The seed must
+                # therefore stay client-chosen; skew is detected.
+                self._observe_pellet_seed(player, packet)
+                hit_any = False
+                for pellet_direction in self._seeded_pellet_directions(
+                    player, direction, profile, packet, now
+                ):
+                    if self._resolve_hitscan(player, pellet_direction, origin):
+                        hit_any = True
+                return hit_any
+            finally:
+                self._end_shot_tally(player)
+
+    # ------------------------------------------------------------------
+    # Anti-cheat accounting
+    # ------------------------------------------------------------------
+
+    def _reject(self, player, kind: str, **detail) -> None:
+        """Report an enforced rejection and count it in the aggregates."""
+
+        from server import anticheat
+
+        anticheat.report(self.server, player, kind, enforced=True, **detail)
+        if not getattr(player, "is_bot", False):
+            anticheat_stats(player)["rejected"][kind] += 1
+
+    def _begin_shot_tally(self, player) -> None:
+        self._shot_tally = {
+            "player": player,
+            "hit": False,
+            "headshot": False,
+            "pellet_hits": 0,
+        }
+
+    def _note_player_hit(self, attacker, headshot: bool) -> None:
+        tally = getattr(self, "_shot_tally", None)
+        if tally is None or tally.get("player") is not attacker:
+            return
+        tally["hit"] = True
+        tally["headshot"] = tally["headshot"] or bool(headshot)
+        tally["pellet_hits"] += 1
+
+    def _end_shot_tally(self, player) -> None:
+        """Fold one accepted trigger pull into the player's aggregates."""
+
+        tally = getattr(self, "_shot_tally", None)
+        self._shot_tally = None
+        if tally is None or tally.get("player") is not player:
+            return
+        if getattr(player, "is_bot", False):
+            return
+        stats = anticheat_stats(player)
+        tool = int(getattr(player, "tool", -1))
+        weapon = stats["weapons"].setdefault(
+            tool, {"shots": 0, "hits": 0, "headshots": 0}
+        )
+        stats["shots"] += 1
+        weapon["shots"] += 1
+        if tally["hit"]:
+            stats["hits"] += 1
+            weapon["hits"] += 1
+        if tally["headshot"]:
+            stats["headshots"] += 1
+            weapon["headshots"] += 1
+        stats["pellet_hits"] += int(tally["pellet_hits"])
+
+    def _observe_pellet_seed(self, player, packet) -> None:
+        """Track the client-chosen 8-bit pellet seed for skew detection.
+
+        Retail expands the pellet cloud from ``ShootPacket.seed`` locally for
+        the shooter's own tracers/decals and on every observer through
+        ShootFeedback(8), so the server must resolve the same seed or damage
+        would disagree with what every client drew. A modified client can
+        pick the tightest pattern; that shows as a non-uniform histogram.
+        """
+
+        if getattr(player, "is_bot", False):
+            return
+        seeds = anticheat_stats(player)["pellet_seeds"]
+        seed = int(getattr(packet, "seed", 0)) & 0xFF
+        seeds[seed] += 1
+        total = sum(seeds.values())
+        if total < SEED_SKEW_MIN_SHOTS:
+            return
+        top = seeds.most_common(1)[0][1]
+        if top >= max(SEED_SKEW_MIN_REPEATS, SEED_SKEW_SHARE * total):
+            from server import anticheat
+
+            anticheat.report(
+                self.server, player, "pellet_seed_skew", enforced=False,
+                shots=total, top_seed_count=top,
+                chi_square=round(seed_chi_square(seeds), 1),
             )
-            hit_player = self._resolve_melee_hit(player, origin, direction)
-            return dug_terrain or hit_player
-
-        if profile.pellet_count <= 1:
-            return self._resolve_hitscan(player, direction, origin)
-
-        # Character.shoot sends ONE central ShootPacket for the trigger.  It
-        # seeds Python's RNG from packet.seed and expands all pellets locally;
-        # observers repeat that expansion from the relayed packet.  Resolve
-        # the same cloud here so authoritative damage is not a rifle-like
-        # single ray while both clients render a shotgun blast.
-        hit_any = False
-        for pellet_direction in self._seeded_pellet_directions(
-            player, direction, profile, packet, now
-        ):
-            if self._resolve_hitscan(player, pellet_direction, origin):
-                hit_any = True
-        return hit_any
 
     def _accept_assault_burst_packet(self, player, packet, now: float) -> bool:
         """Accept the stock three-round burst at 0.1s internal spacing."""
@@ -298,19 +808,56 @@ class CombatSystem:
         return True
 
     def _accept_minigun_packet(self, player, now: float) -> bool:
-        """Mirror the stock 0.30s -> 0.10s active-fire cadence ramp."""
+        """Mirror the stock MinigunWeapon.update spin model.
+
+        Stock: while primary OR secondary is held (and not reloading) the
+        shoot interval moves by -0.15/s toward the 0.10 cap; otherwise by
+        +0.075/s back toward 0.30 -- a gradual spin-down, never a reset.
+        Secondary alone spins the barrels without firing, so a pre-spun gun
+        legitimately fires its first rounds at 0.10 s.
+
+        Between packets the server only knows the trigger state at arrival:
+        during a continuous burst (gap within the current interval plus slack)
+        the gun was held; across a longer gap it spun down unless a trigger is
+        held now (pre-spin), in which case the stock cap is granted.
+        """
         run = self._minigun_runs.get(player.id)
-        if run is None or now - run["last_packet_at"] > MINIGUN_INTERVAL_INITIAL * 2:
-            run = {"started_at": now, "last_packet_at": now}
-            self._minigun_runs[player.id] = run
-        elapsed = max(0.0, now - run["started_at"])
-        interval = max(
+        user_input = getattr(player, "input", None)
+        pre_spun = bool(getattr(user_input, "secondary_fire", False))
+        still_firing = bool(getattr(user_input, "primary_fire", False))
+        if run is None:
+            interval = MINIGUN_INTERVAL_MIN if pre_spun else MINIGUN_FIRST_SHOT_INTERVAL
+        else:
+            gap = max(0.0, now - run["last_packet_at"])
+            interval = float(run["interval"])
+            # Packet stalls bunch shot arrivals; while the trigger is still
+            # down a gap is treated as held so no legitimate round is refused.
+            if gap <= interval + MINIGUN_CONTINUITY_SLACK or (
+                still_firing and gap <= MINIGUN_HELD_GAP_LIMIT
+            ):
+                interval -= MINIGUN_INTERVAL_RAMP_PER_SECOND * gap
+            elif pre_spun:
+                interval = MINIGUN_INTERVAL_MIN
+            else:
+                interval = min(
+                    MINIGUN_FIRST_SHOT_INTERVAL,
+                    interval + MINIGUN_INTERVAL_RECOVER_PER_SECOND * gap,
+                )
+        interval = min(MINIGUN_INTERVAL_INITIAL,
+                       max(MINIGUN_INTERVAL_MIN, interval))
+        # The stock gun keeps spinning up while held, so the NEXT round is
+        # due once the elapsed hold equals the interval at that moment:
+        # g = interval - 0.15 * g.
+        next_gap = max(
             MINIGUN_INTERVAL_MIN,
-            MINIGUN_INTERVAL_INITIAL - MINIGUN_INTERVAL_RAMP_PER_SECOND * elapsed,
+            interval / (1.0 + MINIGUN_INTERVAL_RAMP_PER_SECOND),
         )
-        if not player.consume_shot(now, fire_interval=interval):
+        if not player.consume_shot(now, fire_interval=next_gap):
             return False
-        run["last_packet_at"] = now
+        self._minigun_runs[player.id] = {
+            "last_packet_at": now,
+            "interval": interval,
+        }
         return True
 
     def _seeded_pellet_directions(
@@ -319,30 +866,46 @@ class CombatSystem:
         """Reproduce retail ``Character.shoot`` pellet expansion.
 
         IDA recovery of ``character.pyd:sub_10049DB0`` shows three RNG draws
-        per pellet.  Hip fire adds ``(random()*4-2)*accuracy`` to each axis;
-        zoom adds ``(random()*2-1)*accuracy``.  Stock shotguns share the same
-        variable-accuracy curve: range 3, +0.5 per shot, -1.0 per second.
-        The compact level below tracks that curve without coupling combat to
-        client render objects.
+        per pellet, for every hit-scan gun (``Weapon.pellets`` defaults to 1,
+        so a rifle/SMG/pistol shot is ONE seeded direction, never the raw
+        crosshair).  Hip fire adds ``(random()*4-2)*accuracy`` to each axis;
+        zoom adds ``(random()*2-1)*accuracy`` with ``accuracy_zoom`` when the
+        class defines one (both snipers: 0.0).  ``accuracy`` is the class
+        value, or for ``variable_accuracy`` guns ``Weapon.prep_shoot``'s
+        lerp(accuracy_min, accuracy_max) over the ``accuracy_spread`` bloom
+        reached BEFORE this round's ``shot_weapon`` increase; the bloom
+        recovers at ``accuracy_spread_reduction_speed`` per second and resets
+        on a weapon switch (``on_unset``).  Mirrors the native client's
+        ``observe_hitscan_bloom`` / ``replicated_hitscan_pellets``.
         """
         state = self._pellet_spread.get(player.id)
         tool = int(player.tool)
-        if state is None or state["tool"] != tool:
-            level = 0.0
-        else:
-            elapsed = max(0.0, now - state["last_at"])
-            level = max(0.0, float(state["level"]) - elapsed / 3.0)
-
-        # accuracy_max - accuracy_min equals accuracy_min for every stock
-        # shotgun in this build, so level 0..1 maps directly to min..max.
-        accuracy = float(profile.spread) * (1.0 + level)
+        accuracy = float(profile.spread)
+        curve = RETAIL_ACCURACY_SPREAD.get(tool)
+        spread = 0.0
+        if curve is not None:
+            spread_min, spread_max, increase, reduction = curve
+            if state is None or state.get("tool") != tool:
+                spread = spread_min
+            else:
+                elapsed = max(0.0, now - float(state["last_at"]))
+                spread = max(spread_min, float(state["spread"]) - elapsed * reduction)
+            ratio = 0.0
+            if spread_max > spread_min:
+                ratio = min(1.0, max(0.0, (spread - spread_min) / (spread_max - spread_min)))
+            accuracy = float(profile.accuracy_min) + ratio * (
+                float(profile.accuracy_max) - float(profile.accuracy_min)
+            )
+            spread = min(spread_max, spread + increase)
         self._pellet_spread[player.id] = {
             "tool": tool,
-            "level": min(1.0, level + (0.5 / 3.0)),
+            "spread": spread,
             "last_at": now,
         }
 
         zoomed = bool(getattr(getattr(player, "input", None), "zoom", False))
+        if zoomed and tool in RETAIL_ACCURACY_ZOOM:
+            accuracy = RETAIL_ACCURACY_ZOOM[tool]
         scale = 2.0 if zoomed else 4.0
         center = 1.0 if zoomed else 2.0
         rng = random.Random(int(getattr(packet, "seed", 0)) & 0xFF)
@@ -420,13 +983,31 @@ class CombatSystem:
         ):
             return False
 
-        x, y, z = packet.x, packet.y, packet.z
-        position = (int(x), int(y), int(z))
+        try:
+            x, y, z = int(packet.x), int(packet.y), int(packet.z)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        position = (x, y, z)
+        # Retail reach (MAX_BLOCK_DISTANCE from the eye) plus drift slack.
+        # A forged far placement is dropped without a repair: no stock client
+        # predicted a ghost there.
+        if not self._cell_in_map(position) or not self._cell_within_reach(
+            player, position, self._build_reach()
+        ):
+            return False
+        if not self._cell_in_sight(
+            player, position, loop=getattr(packet, "loop_count", None),
+            kind="build_occluded",
+        ):
+            self._queue_canonical_terrain_repair((position,))
+            return False
         if not self.server.world_manager.can_build(x, y, z):
             self._queue_canonical_terrain_repair((position,))
             return False
         if not self._block_supported(x, y, z):
             self._queue_canonical_terrain_repair((position,))
+            return False
+        if not self._block_interval_ok(player, (position,)):
             return False
         if not player.remove_block():
             self._queue_canonical_terrain_repair((position,))
@@ -454,10 +1035,42 @@ class CombatSystem:
         self._commit_block_build(player, action_loop, position, color)
         return True
 
+    def _build_reach(self) -> float:
+        """Server build reach: the retail block distance plus drift slack."""
+        mode = getattr(self.server, "mode", None)
+        if str(getattr(mode, "mode_code", "")).lower() == "cctf":
+            return CLASSIC_BUILD_REACH
+        return BUILD_REACH
+
+    def _block_interval_ok(self, player, cells) -> bool:
+        """Stock MIN_BLOCK_INTERVAL between one player's accepted builds.
+
+        ``[anticheat] enforce_block_interval`` (default off) rejects a too-early
+        build with a canonical repair; log-only otherwise. Bots always pace
+        themselves (BotActionGateway) so they never trip it.
+        """
+        from server import anticheat
+
+        now = time.monotonic()
+        last = getattr(player, "_last_block_build_at", None)
+        if last is not None and now - float(last) < (
+            MIN_BLOCK_INTERVAL - MIN_BLOCK_INTERVAL_GRACE
+        ):
+            enforce = anticheat.enforcing(self.server, "enforce_block_interval")
+            anticheat.report(
+                self.server, player, "block_interval", enforced=enforce,
+                gap=round(now - float(last), 3),
+            )
+            if enforce:
+                self._queue_canonical_terrain_repair(list(cells))
+                return False
+        player._last_block_build_at = now
+        return True
+
     def _commit_block_build(self, player, action_loop, position, color) -> None:
         """Commit a reserved single-block build after its movement frame."""
 
-        if self._bot_build_overlaps_player(player, (position,)):
+        if self._build_overlaps_player(player, (position,)):
             self._cancel_reserved_block_build(player, (position,))
             return
         x, y, z = position
@@ -468,21 +1081,24 @@ class CombatSystem:
             player.add_blocks(1)
             self._queue_canonical_terrain_repair((position,))
             return
-        if not wm.set_block(x, y, z, True, color):
+        color = self._commit_color(player, color)
+        if not wm.set_block(x, y, z, True, color, health=USER_BLOCK_HEALTH):
             player.add_blocks(1)
             self._queue_canonical_terrain_repair((position,))
             return
-        self._broadcast_block_mutation(
-            player, position, BLOCK_ACTION_BUILD, loop_count=action_loop
-        )
+        self._announce_block_build(player, position, color, action_loop)
         from server.profile_stats import add
         add(player, C.MAP_SINGLEBLOCKS_ADDED_TOTAL)
+        from server.combat_scores import record_blocks_placed
+        record_blocks_placed(self.server, player, (position,))
+        self._queue_blocks_built(player, (position,))
         # BlockTool sends the line but does not play BUILD_SOUND on success.
         # Include the actor so a solo builder receives the authoritative cue.
         play_sound(
             self.server,
             SND_BUILD,
             position=position,
+            reliable=False,
         )
 
     # Longest line the server will accept. The client regenerates the cells
@@ -514,8 +1130,47 @@ class CombatSystem:
         ):
             return False
 
-        x1, y1, z1 = packet.x1, packet.y1, packet.z1
-        x2, y2, z2 = packet.x2, packet.y2, packet.z2
+        try:
+            x1, y1, z1 = int(packet.x1), int(packet.y1), int(packet.z1)
+            x2, y2, z2 = int(packet.x2), int(packet.y2), int(packet.z2)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        start, end = (x1, y1, z1), (x2, y2, z2)
+        # Reject before expansion: a face-connected cube_line has exactly
+        # |dx|+|dy|+|dz|+1 cells, and signed-short endpoints would otherwise
+        # expand ~196k cells (tens of ms) per packet before the cap applied.
+        if not self._cell_in_map(start) or not self._cell_in_map(end):
+            return False
+        span = abs(x2 - x1) + abs(y2 - y1) + abs(z2 - z1) + 1
+        if span > self.BLOCK_LINE_MAX_CELLS:
+            return False
+        # BlockTool sends (drag start, current hit cube). The current hit is
+        # limited to the retail reach; the drag start may trail behind a
+        # moving builder but is still bounded by the line length.
+        near = min(
+            self._eye_distance(player, start), self._eye_distance(player, end)
+        )
+        far = max(
+            self._eye_distance(player, start), self._eye_distance(player, end)
+        )
+        reach = self._build_reach()
+        if near > reach or far > reach + self.BLOCK_LINE_MAX_CELLS:
+            return False
+        # The current hit cube is visible to the builder; the drag start may
+        # have scrolled out of view while moving, so either endpoint counts.
+        loop = getattr(packet, "loop_count", None)
+        if not getattr(player, "is_bot", False):
+            _, eyes = reference_eyes(player, loop)
+            world = self.server.world_manager
+            if not eyes or not (
+                cell_visible(world, eyes, start) or cell_visible(world, eyes, end)
+            ):
+                self._reject(player, "build_occluded", cell=end)
+                self._queue_canonical_terrain_repair(
+                    [c for c in self.block_line_cells(start, end)
+                     if not world.get_solid(*c)][: self.BLOCK_LINE_MAX_CELLS]
+                )
+                return False
 
         # The remote client regenerates this packet through world.cube_line,
         # whose face-connected path is different from VXL.block_line's rounded
@@ -528,7 +1183,12 @@ class CombatSystem:
         # rejecting the whole line loses valid player placements whenever a
         # drag crosses terrain or another just-built voxel.
         build_cells = [cell for cell in cells if not self.server.world_manager.get_solid(*cell)]
-        if not build_cells or player.blocks < len(build_cells):
+        # TeamInfiniteBlocks(82): the client skips its block-count checks for
+        # that team, so the server must neither refuse nor charge.
+        from server.hud_packets import team_infinite_blocks
+
+        infinite = team_infinite_blocks(self.server, getattr(player, "team", -1))
+        if not build_cells or (not infinite and player.blocks < len(build_cells)):
             if build_cells:
                 self._queue_canonical_terrain_repair(build_cells)
             return False
@@ -541,6 +1201,8 @@ class CombatSystem:
                 self._queue_canonical_terrain_repair(build_cells)
                 return False
             pending.add(cell)
+        if not self._block_interval_ok(player, build_cells):
+            return False
 
         # Reserve inventory now, but do not mutate collision geometry during
         # packet draining.  The retail client recorded movement through
@@ -548,7 +1210,7 @@ class CombatSystem:
         # voxels.  Production therefore commits after authoritative physics
         # consumes that same loop; otherwise build -> run/jump replays the old
         # movement frame against a newer map and visibly rolls the player back.
-        cost = len(build_cells)
+        cost = 0 if infinite else len(build_cells)
         player.blocks -= cost
         action_loop = max(0, int(packet.loop_count))
         cells_snapshot = tuple(build_cells)
@@ -596,12 +1258,15 @@ class CombatSystem:
     ) -> None:
         """Commit one validated BlockLine on the post-physics tick boundary."""
 
-        if self._bot_build_overlaps_player(player, build_cells):
+        if self._build_overlaps_player(player, build_cells):
             self._cancel_reserved_block_build(player, build_cells)
             return
+        color = self._commit_color(player, color)
         failed_cells = []
         for x, y, z in build_cells:
-            if not self.server.world_manager.set_block(x, y, z, True, color):
+            if not self.server.world_manager.set_block(
+                x, y, z, True, color, health=USER_BLOCK_HEALTH
+            ):
                 failed_cells.append((x, y, z))
         if failed_cells:
             player.add_blocks(len(failed_cells))
@@ -620,30 +1285,173 @@ class CombatSystem:
         own_echo.x2, own_echo.y2, own_echo.z2 = x2, y2, z2
         player.send(bytes(own_echo.generate()), reliable=True)
 
-        for x, y, z in build_cells:
+        successful_cells = [
+            cell for cell in build_cells if cell not in failed_cells
+        ]
+        # Only committed cells are announced (and journaled for MapSync
+        # joiners); echoing a rejected cell would leave ghost blocks on every
+        # observer and every late joiner.
+        for x, y, z in successful_cells:
             echo = BlockBuildColored()
             echo.loop_count = action_loop
             echo.player_id = player.id
             echo.x, echo.y, echo.z = x, y, z
             echo.color = color
             self.server.broadcast(bytes(echo.generate()), exclude=player)
-        successful_cells = [
-            cell for cell in build_cells if cell not in failed_cells
-        ]
+        self._send_observer_block_health(player, successful_cells)
+        self._send_owner_color_correction(
+            player, successful_cells, color, action_loop
+        )
         if successful_cells:
             from server.profile_stats import add
             add(player, C.MAP_SINGLEBLOCKS_ADDED_TOTAL, len(successful_cells))
+            from server.combat_scores import record_blocks_placed
+            record_blocks_placed(self.server, player, successful_cells)
             play_sound(
                 self.server,
                 SND_BUILD,
                 position=successful_cells[0],
+                reliable=False,
+            )
+            self._queue_blocks_built(player, successful_cells)
+
+    @staticmethod
+    def _commit_color(player, fallback) -> int:
+        """Return the builder's newest known palette colour as ``0xRRGGBB``.
+
+        The stock builder does not colour its own cells when it sends
+        BlockLine; it colours them from ``Character.block_color`` when the
+        server's echo ARRIVES. A SetColor sent after the BlockLine (same
+        frame, or while the build waited for its movement frame) is therefore
+        already part of the owner's colour, so the commit reads the latest
+        committed palette instead of the one seen when the request drained.
+        """
+
+        try:
+            return pack_rgb(player.block_color)
+        except (AttributeError, TypeError, ValueError):
+            return pack_rgb(fallback)
+
+    def _send_owner_color_correction(
+        self, player, cells, color: int, action_loop: int
+    ) -> None:
+        """Pin the builder's echoed cells to the authoritative colour.
+
+        Live-measured on the stock client: the builder's echo (BlockLine 40,
+        BlockBuild 32) paints with the palette held when the echo arrives, so
+        a colour change during the round trip left the owner with a different
+        colour than the VXL, observers and late joiners. BlockBuildColored(33)
+        cannot fix an already-solid cell (the client ignores it), but
+        PaintBlock(7) recolours exactly and is a no-op on air. Sent after the
+        echo on the same reliable stream, it always lands afterwards.
+        """
+
+        send = getattr(player, "send", None)
+        if not cells or not callable(send):
+            return
+        rgb = unpack_rgb(color)
+        for x, y, z in cells:
+            paint = PaintBlockPacket()
+            paint.loop_count = max(0, int(action_loop))
+            paint.x, paint.y, paint.z = int(x), int(y), int(z)
+            paint.color = rgb
+            send(bytes(paint.generate()), reliable=True)
+
+    def _announce_block_build(
+        self, player, position, color: int, action_loop: int
+    ) -> None:
+        """Replicate one committed single-block build with explicit RGB.
+
+        BlockBuild(32) carries no colour: every receiver paints it with its
+        own idea of the builder's palette, which lags behind the throttled
+        SetColor relay (and never matches for a joiner that missed it). The
+        builder keeps its native id-32 echo plus the colour pin; everyone
+        else gets BlockBuildColored(33), exactly like BlockLine observers.
+        """
+
+        packet = BlockBuild()
+        packet.loop_count = int(action_loop)
+        packet.player_id = player.id
+        packet.x, packet.y, packet.z = position
+        packet.block_type = 0  # material selector: 0 = normal build
+        send = getattr(player, "send", None)
+        if callable(send):
+            send(bytes(packet.generate()), reliable=True)
+        observer = BlockBuildColored()
+        observer.loop_count = int(action_loop)
+        observer.player_id = player.id
+        observer.x, observer.y, observer.z = position
+        observer.color = pack_rgb(color)
+        self.server.broadcast(bytes(observer.generate()), exclude=player)
+        self._send_observer_block_health(player, (position,))
+        self._send_owner_color_correction(player, (position,), color, action_loop)
+
+    def _send_observer_block_health(self, player, cells) -> None:
+        """Give observers the builder's user-block health for new cells.
+
+        Observers receive BlockBuildColored(33) for exact colour, but the
+        stock client stores a packet-33 voxel at 3.0 health while the builder
+        (BlockBuild 32 / BlockLine 40 echo) and the server hold 9.0.  One
+        BlockManagerState(38) user-row table, sent right after the 33s on the
+        same reliable stream, sets ``user_blocks`` to the server's health
+        (live 2026-09-26: 33 -> 3.0, then 38 row -> 9.0, colour unchanged).
+        Not journalled: MapSync joiners get the same rows from the reveal.
+        """
+
+        if not cells:
+            return
+        # Retail add_user_block pops the cell from user_blocks in the UGC
+        # Map Creator (untracked, map-default health): a user row would give
+        # observers an entry no stock client ever holds there.
+        if bool(getattr(self.server.config, "ugc_runtime", False)):
+            return
+        rows_of = getattr(self.server.world_manager, "block_manager_rows", None)
+        if not callable(rows_of):
+            return
+        user_rows, _damaged = rows_of(cells)
+        if not user_rows:
+            return
+        from server.prefab_actions import block_state_packets
+        for data in block_state_packets(user_rows):
+            # Packet 38 is never journalled (only 7/32/33/37/40 are).
+            self.server.broadcast(data, exclude=player)
+
+    def _queue_blocks_built(self, player, cells) -> None:
+        """Tell the mode which cells a player committed (Demolition repairs)."""
+        queue = getattr(self.server, "queue_mode_event", None)
+        if player is not None and cells and callable(queue):
+            queue(
+                "on_blocks_built",
+                player,
+                tuple(tuple(int(v) for v in cell) for cell in cells),
             )
 
-    def _bot_build_overlaps_player(self, player, cells) -> bool:
-        """Recheck bot construction after movement, before an atomic commit."""
+    def _build_overlaps_player(self, player, cells) -> bool:
+        """Recheck construction against living bodies before a commit.
+
+        Applies to humans and bots alike: the retail client refuses to place
+        a block inside any character (can_place_block_on_player), so only a
+        forged or stale request can reach this with an overlapping cell. It
+        runs at the post-physics commit boundary, where the authoritative
+        body matches the client's action frame.
+        """
         construction = getattr(self.server, "construction", None)
-        return bool(getattr(player, "is_bot", False) and construction is not None
+        return bool(construction is not None
                     and construction._overlaps_living_player(frozenset(cells)))
+
+    # Retained name for embedders/tests written before humans were checked.
+    _bot_build_overlaps_player = _build_overlaps_player
+
+    def _eye_distance(self, player, cell) -> float:
+        """Distance from the eye to a cell centre (inf on malformed state)."""
+
+        try:
+            eye = tuple(float(value) for value in player.eye)
+        except (AttributeError, TypeError, ValueError):
+            return math.inf
+        if len(eye) != 3 or not self._finite(*eye):
+            return math.inf
+        return self._distance(eye, tuple(float(v) + 0.5 for v in cell))
 
     def block_line_cells(self, a, b):
         """Return the stock face-connected cells for public action validation."""
@@ -680,11 +1488,10 @@ class CombatSystem:
     def _unpack_rgb(color) -> tuple[int, int, int]:
         """Normalize packed VXL or tuple colour values to wire RGB."""
 
-        if isinstance(color, (tuple, list)):
-            values = tuple(int(value) & 0xFF for value in color[:3])
-            return values if len(values) == 3 else (0, 0, 0)
-        packed = int(color) & 0xFFFFFF
-        return ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF)
+        try:
+            return unpack_rgb(color)
+        except ValueError:
+            return (0, 0, 0)
 
     def _paintbrush_surface_cells(
         self,
@@ -751,6 +1558,11 @@ class CombatSystem:
                 current = self._unpack_rgb(world.get_color(x, y, z))
             except (AttributeError, TypeError, ValueError):
                 current = None
+            # A damaged cell is displayed at its darkened shade, not its
+            # stored colour: painting it back to the original is a real change.
+            shade = getattr(world, "block_shade", {}).get((x, y, z))
+            if shade is not None:
+                current = self._unpack_rgb(int(shade) & 0xFFFFFF)
             if current == rgb:
                 continue
             if not world.set_block(x, y, z, True, rgb):
@@ -765,6 +1577,19 @@ class CombatSystem:
             self.server.broadcast(bytes(packet.generate()))
             changed += 1
         return changed
+
+    def _repair_rejected_paint(self, position) -> None:
+        """Undo a UGC brush's local recolour the server refused.
+
+        The retail brush host recolours its own VXL before sending packet 7,
+        so a dropped stroke would leave that client alone with the new
+        colour. Canonical repair re-sends the authoritative colour (packet 33
+        plus PaintBlock for solid cells). Only proven predictors call this;
+        a forged packet cannot enroll arbitrary cells.
+        """
+
+        if self._cell_in_map(position):
+            self._queue_canonical_terrain_repair((position,))
 
     def handle_paint_packet(self, player, packet) -> bool:
         """Validate a native packet-7 request and commit its one target cell."""
@@ -798,8 +1623,23 @@ class CombatSystem:
             dy = float(getattr(player, "y", 0.0)) - position[1]
             dz = float(getattr(player, "z", 0.0)) - position[2]
             reach = float(getattr(C, "PAINTBRUSH_RANGE", 15.0)) + 1.0
-            if dx * dx + dy * dy + dz * dz > reach * reach:
+            if not dx * dx + dy * dy + dz * dz <= reach * reach:
+                self._repair_rejected_paint(position)
                 return False
+        elif not self._cell_within_reach(player, position, self._build_reach()):
+            # Non-editor paint used to recolour any voxel on the map.
+            return False
+        # UGC brush strokes legitimately cover surface cells around corners
+        # (radius up to 4 from the hit), so only single-cell paint needs LOS.
+        if not is_editor_brush and not self._cell_in_sight(
+            player, position, loop=getattr(packet, "loop_count", None),
+            kind="paint_occluded",
+        ):
+            return False
+        if not self._consume_paint_budget(player, editor=is_editor_brush):
+            if is_editor_brush:
+                self._repair_rejected_paint(position)
+            return False
         return bool(
             self._commit_paint(
                 player,
@@ -899,14 +1739,26 @@ class CombatSystem:
             )
         return profile
 
-    def _resolve_spade_dig(self, player, origin, direction, packet) -> bool:
+    def _resolve_spade_dig(
+        self,
+        player,
+        origin,
+        direction,
+        packet,
+        *,
+        reach_eyes=None,
+        reach_slack: float = 0.0,
+    ) -> bool:
         """Raycast terrain from the CLIENT's reported origin/direction and dig
         per the player's CURRENT tool (MELEE_DIG_PROFILES).
 
-        - Ordinary spades remove the classic (z-1, z,z+1) column. The Miner
-          Super Spade and the UGC Super Spade's RMB remove the retail centered
-          3x3x3 cube; UGC LMB removes one block. One matching area-damage
-          packet makes each client self-expand once.
+        - Ordinary spades damage the classic (z-1, z, z+1) column by the
+          retail amount (5 per cell: map voxels break, 9-health built blocks
+          need two swings). The Miner Super Spade, Zombie hands and the UGC
+          Super Spade's RMB damage the centered 3x3x3 cube with the retail
+          seeded random extra; UGC LMB damages one block. One matching
+          area-damage packet (amount + seed) makes each client apply exactly
+          the per-cell damage the server applied (block_damage_model).
         - Pickaxe / knife / crowbar (single cell) and Machete (z,z+1):
           accumulate the tool's per-hit block damage (knife 1 -> 5
           hits/block, Machete 2 -> 3 hits, pickaxe 9 -> 1 hit); each block
@@ -923,6 +1775,16 @@ class CombatSystem:
             MELEE_RANGE,
         )
         if block_pos is None:
+            return False
+        # The swing origin is validated against the server eye, but a cell
+        # MELEE_RANGE beyond an 8-block-offset origin was still diggable.
+        if not self._within_eye_reach(
+            reach_eyes,
+            self._block_center(block_pos),
+            float(MELEE_RANGE) + MELEE_EYE_SLACK + _CELL_HALF_DIAGONAL + reach_slack,
+        ):
+            self._reject(player, "dig_out_of_reach")
+            self._queue_canonical_terrain_repair((tuple(block_pos),))
             return False
 
         dmg_type, block_dmg, pattern = self._spade_profile_for_packet(
@@ -947,20 +1809,17 @@ class CombatSystem:
                 block_damage=block_dmg,
             )
         if pattern != DIG_SINGLE:
-            # Commit the full footprint in one map operation. One matching
-            # area-damage packet then makes every native client expand once;
-            # sending per-cell Super Spade packets would expand each cell.
-            destroyed = wm.destroy_blocks(positions)
-            if not destroyed:
-                self._queue_canonical_terrain_repair(positions)
-                return False
-            player.add_blocks(len(destroyed))
-            self._broadcast_block_damage(
-                player, block_pos, self._BLOCK_KILL_DAMAGE, damage_type=dmg_type)
-            self._collapse_unsupported(player, destroyed)
-            return True
+            # One native area packet (retail amount + seed) makes every
+            # client apply the exact per-cell damage the server applies here:
+            # a spade column deals 5 to each cell (a 9-health built block
+            # needs two swings), Super Spade/Zombie cubes add the seeded
+            # random extra.  Sending per-cell packets would expand each cell.
+            return self._apply_native_dig(
+                player, block_pos, positions, dmg_type, block_dmg
+            )
 
         # Single-cell tool: accumulate damage until the block breaks.
+        block_dmg = _damage_model.wire_damage(block_dmg)
         total, destroyed = wm.apply_block_damage(
             x, y, z, block_dmg, threshold=DEFAULT_BLOCK_HEALTH)
         if destroyed:
@@ -968,6 +1827,7 @@ class CombatSystem:
             self._broadcast_block_damage(
                 player, block_pos, self._BLOCK_KILL_DAMAGE, damage_type=dmg_type)
             self._collapse_unsupported(player, [block_pos])
+            self._queue_blocks_destroyed(player, (block_pos,), True)
             return True
         if total > 0.0:
             # Partial crack — the client accumulates the same per-hit amount.
@@ -975,6 +1835,85 @@ class CombatSystem:
                 player, block_pos, block_dmg, damage_type=dmg_type)
             return True
         return False
+
+    def apply_native_terrain_damage(
+        self,
+        player,
+        position,
+        damage_type: int,
+        amount: float,
+        *,
+        seed: int | None = None,
+    ):
+        """Apply one retail Damage(37) footprint to the canonical map.
+
+        Mirrors ``BlockManager.handle_damage`` exactly (see
+        :mod:`server.block_damage_model`): the per-cell damage every client
+        derives from ``(type, position, wire amount, seed)`` is applied to
+        each solid cell through :meth:`WorldManager.apply_block_damage`, so
+        per-cell health (9 for built blocks, 5 for map voxels, scaled by
+        RULE_BLOCK_HEALTH) decides breakage identically on both sides.
+        Returns ``(seed, wire_amount, destroyed_cells, damaged_cells)`` where
+        ``damaged_cells`` lists ``(cell, damage)`` for surviving cells; the
+        caller broadcasts the one packet with that seed and amount.  Runs on
+        the gameplay thread.
+        """
+
+        wm = self.server.world_manager
+        amount = _damage_model.wire_damage(amount)
+        kind = _damage_model.footprint_kind(damage_type)
+        if seed is None:
+            seed = (
+                random.randrange(256)
+                if kind is not None
+                and kind[0] in (_damage_model.CUBE, _damage_model.RADIUS)
+                else 0
+            )
+        seed = int(seed) & 0xFF
+        destroyed = []
+        damaged = []
+        if amount > 0.0:
+            cells = _damage_model.footprint(damage_type, position, amount, seed)
+            for cell, damage in _damage_model.iter_damageable(cells):
+                if not wm.get_solid(*cell):
+                    continue
+                total, gone = wm.apply_block_damage(
+                    *cell, damage, threshold=DEFAULT_BLOCK_HEALTH
+                )
+                if gone:
+                    destroyed.append(tuple(cell))
+                elif total > 0.0:
+                    damaged.append((tuple(cell), damage))
+        return seed, amount, destroyed, damaged
+
+    def _apply_native_dig(
+        self, player, block_pos, positions, damage_type: int, amount: float
+    ) -> bool:
+        """Resolve one area melee swing (spade column / 3x3x3 cube)."""
+
+        if not _damage_model.is_native(damage_type):
+            self._queue_canonical_terrain_repair(positions)
+            return False
+        seed, wire_amount, destroyed, damaged = (
+            self.apply_native_terrain_damage(
+                player, block_pos, damage_type, amount
+            )
+        )
+        if not destroyed and not damaged:
+            self._queue_canonical_terrain_repair(positions)
+            return False
+        if destroyed:
+            player.add_blocks(len(destroyed))
+        self._broadcast_block_damage(
+            player, block_pos, wire_amount, damage_type=damage_type, seed=seed
+        )
+        if destroyed:
+            self._collapse_unsupported(player, destroyed)
+            # Melee digging never routes through _broadcast_block_destroy, so
+            # the mode (Diamond Mine discovery, Demolition destroy awards)
+            # learns about the removal only here.
+            self._queue_blocks_destroyed(player, destroyed, True)
+        return True
 
     def _apply_accumulating_melee_footprint(
         self,
@@ -1021,6 +1960,7 @@ class CombatSystem:
         )
         if destroyed_positions:
             self._collapse_unsupported(player, destroyed_positions)
+            self._queue_blocks_destroyed(player, destroyed_positions, True)
         return True
 
     def handle_block_destroy(self, player, packet) -> bool:
@@ -1032,10 +1972,31 @@ class CombatSystem:
         ):
             return False
 
-        if player.is_block_tool():
+        try:
             position = (int(packet.x), int(packet.y), int(packet.z))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        if not self._cell_in_map(position):
+            return False
+
+        if player.is_block_tool():
+            # A forged liberation must not delete (and refund) arbitrary
+            # terrain across the map: require the retail build reach and a
+            # per-player cadence before touching the world.
+            if not self._cell_within_reach(player, position, BUILD_REACH):
+                return False
+            if not self._cell_in_sight(
+                player, position, loop=getattr(packet, "loop_count", None),
+                kind="liberate_occluded",
+            ):
+                return False
+            now = time.monotonic()
+            player_id = int(player.id)
+            if now < float(self._liberate_next_use.get(player_id, 0.0)):
+                return False
             if not self.server.world_manager.get_solid(*position):
                 return False
+            self._liberate_next_use[player_id] = now + BLOCK_TOOL_LIBERATE_INTERVAL
             service = getattr(self.server, "world_mutations", None)
             if service is not None:
                 mutation = PendingWorldMutation(
@@ -1059,9 +2020,14 @@ class CombatSystem:
             damage_type, block_damage, pattern = MELEE_DIG_PROFILES.get(
                 getattr(player, "tool", None), DEFAULT_MELEE_PROFILE
             )
-            positions = _melee_dig_positions(
-                (packet.x, packet.y, packet.z), pattern
-            )
+            if not self._cell_within_reach(player, position, DIG_REACH):
+                return False
+            if not self._cell_in_sight(
+                player, position, loop=getattr(packet, "loop_count", None),
+                kind="liberate_occluded",
+            ):
+                return False
+            positions = _melee_dig_positions(position, pattern)
             if pattern == DIG_MACHETE:
                 # Retail MacheteTool uses ShootPacket. Accepting legacy
                 # BlockLiberate as well would apply one swing twice; repair a
@@ -1075,36 +2041,78 @@ class CombatSystem:
             if not player.consume_shot(now):
                 self._queue_canonical_terrain_repair(positions)
                 return False
-            destroyed = self.server.world_manager.destroy_blocks(positions)
-            if not destroyed:
-                self._queue_canonical_terrain_repair(positions)
-                return False
-            player.add_blocks(len(destroyed))
-            self._broadcast_block_damage(
-                player,
-                (packet.x, packet.y, packet.z),
-                self._BLOCK_KILL_DAMAGE,
-                damage_type=damage_type,
+            if pattern != DIG_SINGLE:
+                return self._apply_native_dig(
+                    player, position, positions, damage_type, block_damage
+                )
+            total, gone = self.server.world_manager.apply_block_damage(
+                *position, block_damage, threshold=DEFAULT_BLOCK_HEALTH
             )
-            self._collapse_unsupported(player, destroyed)
-            return True
+            if gone:
+                player.add_blocks(1)
+                self._broadcast_block_damage(
+                    player,
+                    position,
+                    self._BLOCK_KILL_DAMAGE,
+                    damage_type=damage_type,
+                )
+                self._collapse_unsupported(player, [position])
+                self._queue_blocks_destroyed(player, (position,), True)
+                return True
+            if total > 0.0:
+                self._broadcast_block_damage(
+                    player, position, block_damage, damage_type=damage_type
+                )
+                return True
+            self._queue_canonical_terrain_repair(positions)
+            return False
 
         return False
 
-    def _resolve_melee_hit(self, attacker, origin=None, direction=None) -> bool:
+    def _resolve_melee_hit(
+        self,
+        attacker,
+        origin=None,
+        direction=None,
+        *,
+        reach_eyes=None,
+        reach_slack: float = 0.0,
+    ) -> bool:
         if origin is None:
             origin = attacker.eye
         if direction is None:
             direction = attacker.orientation
-        hit = self._find_first_player_hit(attacker, origin, direction, MELEE_RANGE)
+        # Terrain between the swing origin and a body blocks the swing just
+        # like a shot; a knife used to connect through walls.
+        max_distance = float(MELEE_RANGE)
+        block_pos = self.server.world_manager.raycast(
+            origin[0], origin[1], origin[2],
+            direction[0], direction[1], direction[2],
+            MELEE_RANGE,
+        )
+        if block_pos is not None:
+            max_distance = min(
+                max_distance,
+                self._distance(origin, self._block_center(block_pos)),
+            )
+        hit = self._find_first_player_hit(attacker, origin, direction, max_distance)
         if hit is None:
             return False
 
-        target, headshot, _, position = hit
+        target, headshot, _, position, _part = hit
+        if not self._within_eye_reach(
+            reach_eyes, position, float(MELEE_RANGE) + MELEE_EYE_SLACK + reach_slack
+        ):
+            self._reject(attacker, "melee_out_of_reach")
+            return False
+        # A melee tool has ONE stock player-hit figure
+        # (<TOOL>_HITPLAYER_DAMAGE_AMOUNT) -- no per-part tuple, so no
+        # headshot multiplier; the victim's class multiplier still applies.
         damage = self._calculate_damage(
             attacker,
             attacker.get_weapon_profile(),
-            headshot=headshot,
+            headshot=False,
+            target=target,
         )
         damage = self._apply_riot_shield_mitigation(target, attacker, damage)
         if int(getattr(attacker, "tool", -1)) == int(C.RIOTSHIELD_TOOL):
@@ -1114,8 +2122,23 @@ class CombatSystem:
         if target.health < health_before:
             from server.profile_stats import hit
             hit(attacker, target)
+            self._note_player_hit(attacker, headshot)
             self._broadcast_player_hit_feedback(attacker, position)
         return True
+
+    def _within_eye_reach(self, eyes, point, reach: float) -> bool:
+        """Is ``point`` within ``reach`` of any server-simulated eye?
+
+        ``eyes`` of ``None`` skips the check (internal callers that already
+        start at the authoritative eye).
+        """
+
+        if eyes is None:
+            return True
+        point = _finite_point(point)
+        if point is None or not eyes:
+            return False
+        return any(self._distance(eye, point) <= reach for eye in eyes)
 
     def _resolve_hitscan(self, attacker, direction, origin=None) -> bool:
         if origin is None:
@@ -1126,9 +2149,12 @@ class CombatSystem:
         if hit is None:
             return False
 
-        kind, target, headshot, position = hit
+        kind, target, headshot, position, part = hit
         if kind == "player":
-            damage = self._calculate_damage(attacker, attacker.get_weapon_profile(), headshot=headshot)
+            damage = self._calculate_damage(
+                attacker, attacker.get_weapon_profile(), headshot=headshot,
+                target=target, part=part,
+            )
             damage = self._apply_riot_shield_mitigation(target, attacker, damage)
             kill_type = KILL_HEADSHOT if headshot else attacker.get_weapon_profile().kill_type
             health_before = target.health
@@ -1136,14 +2162,13 @@ class CombatSystem:
             if target.health < health_before:
                 from server.profile_stats import hit
                 hit(attacker, target)
+                self._note_player_hit(attacker, headshot)
                 self._broadcast_player_hit_feedback(attacker, position)
             return True
 
         if kind == "entity":
             self._broadcast_entity_hit(target, position)
-            damage = self._calculate_damage(
-                attacker, attacker.get_weapon_profile(), headshot=False
-            )
+            damage = self._entity_damage(attacker.get_weapon_profile())
             self.server.entity_registry.damage_entity(
                 target.entity_id, damage, attacker, self.server._build_entity_ctx()
             )
@@ -1182,6 +2207,7 @@ class CombatSystem:
             self.server,
             SND_DIG_HIT_BLOCK,
             position=position,
+            reliable=False,
         )
 
     def _broadcast_entity_hit(self, entity, position) -> None:
@@ -1214,7 +2240,8 @@ class CombatSystem:
         packet.position_x, packet.position_y, packet.position_z = (
             float(value) for value in position
         )
-        self.server.broadcast(bytes(packet.generate()))
+        # Blood + hit-confirm are cosmetic; health travels in SetHP/KillAction.
+        self.server.broadcast(bytes(packet.generate()), reliable=False)
 
     def _apply_block_damage(self, attacker, block_pos, damage: float,
                             damage_type: int = None,
@@ -1222,6 +2249,9 @@ class CombatSystem:
         if not getattr(self.server.config, "build_damage", True):
             return False
 
+        # Model the amount the client decodes from the quarter-unit byte
+        # (e.g. block fire 0.7 arrives as 0.75) so both ledgers agree.
+        damage = _damage_model.wire_damage(damage)
         total, destroyed = self.server.world_manager.apply_block_damage(
             block_pos[0],
             block_pos[1],
@@ -1325,10 +2355,13 @@ class CombatSystem:
         sound_id = _BLOCK_HIT_SOUND_BY_DAMAGE.get(int(packet.type))
         if sound_id is not None:
             from server.audio import play_sound
+            # The Damage(37) above is the reliable state change; its impact
+            # cue is cosmetic and must not stall the reliable channel.
             play_sound(
                 self.server,
                 sound_id,
                 position=block_pos,
+                reliable=False,
             )
 
     def record_exact_block_destroy_catchup(self, player, positions,
@@ -1386,14 +2419,23 @@ class CombatSystem:
         damage: float,
         damage_type: int,
         causer_entity_id: int,
+        seed: int = 0,
+        damaged=(),
     ) -> None:
         """Publish one native expanding blast and journal exact catch-up cells.
 
-        Dynamite and C4 handlers call ``handle_radius_damage(radius=2)`` in the
-        retail BlockManager. Sending one Damage packet preserves the original
-        effects while avoiding 81 reliable packets, 81 collapse scans, and 81
-        sound/particle paths on the render thread. Late joiners cannot resolve
-        the expired charge id, so their journal remains exact type-6 cells.
+        Dynamite/C4/landmine handlers expand ``handle_radius_damage`` from
+        ``(type, centre, amount, seed)`` exactly as
+        :mod:`server.block_damage_model` does, so the ONE packet makes every
+        client apply the same per-cell damage the server already applied
+        (``positions`` destroyed, ``damaged`` = surviving ``(cell, damage)``).
+        That avoids hundreds of reliable packets and keeps the native effects.
+        A peer that never saw the charge entity cannot take the native packet
+        (the handler dereferences ``causer_id``); it gets the exact outcome
+        instead: type-6 kills plus type-6 partial damage per surviving cell.
+        Late joiners cannot resolve the expired charge id either, so their
+        journal is exact type-6 kills and their damage arrives via the
+        BlockManagerState reveal.
         """
 
         packet = self._build_block_damage_packet(
@@ -1401,12 +2443,24 @@ class CombatSystem:
             center,
             damage,
             damage_type=int(damage_type),
+            seed=int(seed),
             causer_id=int(causer_entity_id),
         )
         data = bytes(packet.generate())
-        sender = getattr(self.server, "broadcast_known_entity_packet", None)
-        if callable(sender):
-            sender(data, int(causer_entity_id), reliable=True)
+        positions = tuple(tuple(int(value) for value in pos) for pos in positions)
+        connections = getattr(self.server, "connections", None)
+        if hasattr(self.server, "broadcast_known_entity_packet") and connections is not None:
+            exact = None
+            for connection in tuple(connections.values()):
+                if not bool(getattr(connection, "in_game", False)):
+                    continue
+                if int(causer_entity_id) in getattr(connection, "known_entity_ids", ()):
+                    connection.send(data, reliable=True)
+                    continue
+                if exact is None:
+                    exact = self._exact_outcome_packets(player, positions, damaged)
+                for item in exact:
+                    connection.send(item, reliable=True)
         else:
             self.server.broadcast(data, record_mutation=False)
 
@@ -1416,6 +2470,67 @@ class CombatSystem:
             causer_id=(int(player.id) if player is not None else 0),
         )
         self._collapse_unsupported(player, positions)
+        queue = getattr(self.server, "queue_mode_event", None)
+        if player is not None and positions and callable(queue):
+            queue("on_blocks_destroyed", player, positions, False)
+
+    def broadcast_native_terrain_damage(
+        self,
+        player,
+        center,
+        positions,
+        *,
+        damage: float,
+        damage_type: int,
+        seed: int,
+        mined: bool = False,
+    ) -> None:
+        """Publish one native (non-entity) footprint already applied here.
+
+        Used for projectile explosions whose visual entity is already gone:
+        the Damage causer is the thrower's player id (0 when unknown), which
+        the stock handler accepts for every terrain type (live 2026-09-26).
+        Joiners get exact type-6 kills through the canonical journal and the
+        surviving damage through the BlockManagerState reveal.
+        """
+
+        packet = self._build_block_damage_packet(
+            player,
+            center,
+            damage,
+            damage_type=int(damage_type),
+            seed=int(seed),
+            causer_id=(int(player.id) if player is not None else 0),
+        )
+        self.server.broadcast(bytes(packet.generate()), record_mutation=False)
+        positions = tuple(tuple(int(value) for value in pos) for pos in positions)
+        if positions:
+            self.record_exact_block_destroy_catchup(
+                player,
+                positions,
+                causer_id=(int(player.id) if player is not None else 0),
+            )
+            self._collapse_unsupported(player, positions)
+            queue = getattr(self.server, "queue_mode_event", None)
+            if player is not None and callable(queue):
+                queue("on_blocks_destroyed", player, positions, bool(mined))
+
+    def _exact_outcome_packets(self, player, destroyed, damaged) -> list[bytes]:
+        """Exact per-cell packets reproducing an already-applied footprint."""
+
+        packets = []
+        for cell in destroyed:
+            packets.append(bytes(self._build_block_damage_packet(
+                player, cell, self._BLOCK_KILL_DAMAGE,
+                damage_type=int(C.WEAPON_DAMAGE),
+            ).generate()))
+        for cell, amount in damaged:
+            packet = self._build_block_damage_packet(
+                player, cell, amount, damage_type=int(C.WEAPON_DAMAGE),
+            )
+            packet.chunk_check = 0
+            packets.append(bytes(packet.generate()))
+        return packets
 
     def _collapse_unsupported(self, player, removed_positions):
         """Floating-structure collapse: any solid chunk left disconnected from
@@ -1436,6 +2551,10 @@ class CombatSystem:
             collapsed.extend(wm.destroy_blocks(chunk))
 
         add(player, C.MAP_BLOCKS_DESTROYED_TOTAL, len(collapsed))
+        from server.combat_scores import record_blocks_destroyed
+        record_blocks_destroyed(
+            self.server, player, len(removed_positions) + len(collapsed), chunks,
+        )
 
         # A client whose topology differs by even one voxel can derive a
         # different falling component and retain visible blocks that no longer
@@ -1489,38 +2608,136 @@ class CombatSystem:
         feedback.seed = int(getattr(packet, "seed", 0)) & 0xFF
         return feedback
 
-    def _validate_shot_packet(self, player, packet) -> bool:
-        packet_origin = (packet.x, packet.y, packet.z)
+    def _validate_shot_packet(self, player, packet):
+        """Validate one ShootPacket; return ``(reach_eyes, reach_slack)`` or None.
+
+        Hard checks (can never misfire on a stock client, whose origin IS
+        its eye): finite values, non-zero direction, origin within
+        SHOT_ORIGIN_TOLERANCE of a server-simulated eye, and a clear voxel
+        line of sight from that eye to the claimed origin (a forged origin
+        on the far side of a wall used to shoot, knife and dig through it).
+
+        Soft checks (``[anticheat] enforce_shot_origin`` /
+        ``enforce_aim_direction``): origin distance from the eye of the
+        shot's own input frame, and aim angle against that frame's
+        orientation. Off by default: they only report the measurement.
+        """
+
+        # NaN compares false against every tolerance below, so a non-finite
+        # origin/orientation used to pass validation and then raise inside
+        # the native raycast on every shot. Reject it first.
+        try:
+            raw = (
+                packet.x, packet.y, packet.z,
+                packet.ori_x, packet.ori_y, packet.ori_z,
+            )
+        except AttributeError:
+            return None
+        if not self._finite(*raw):
+            logger.debug("Rejecting shoot packet from %s with non-finite values", player.name)
+            return None
+        packet_origin = (float(packet.x), float(packet.y), float(packet.z))
         packet_direction = self._normalize((packet.ori_x, packet.ori_y, packet.ori_z))
         if packet_direction is None:
             logger.debug("Rejecting shoot packet from %s with zero orientation", player.name)
-            return False
+            return None
 
-        origin_error = self._distance(packet_origin, player.eye)
-        if origin_error > SHOT_ORIGIN_TOLERANCE:
-            logger.debug(
-                "Rejecting shoot packet from %s due to origin drift %.2f",
-                player.name,
-                origin_error,
+        loop = getattr(packet, "loop_count", None)
+        at_loop, eyes = reference_eyes(player, loop)
+        if not eyes:
+            return None
+        current_eye = _finite_point(player.eye)
+        is_bot = bool(getattr(player, "is_bot", False))
+
+        nearest = min(self._distance(packet_origin, eye) for eye in eyes)
+        if not nearest <= SHOT_ORIGIN_TOLERANCE:
+            self._reject(player, "shot_origin_far", distance=round(nearest, 2))
+            return None
+        if not any(
+            segment_clear(self.server.world_manager, eye, packet_origin)
+            for eye in eyes
+        ):
+            self._reject(
+                player, "shot_origin_occluded", distance=round(nearest, 2)
             )
-            return False
+            return None
 
+        from server import anticheat
+
+        # Soft origin check. Claiming a position the server itself simulated
+        # (the per-loop or the current eye) grants nothing, so the error is
+        # the smaller of the two; without the per-loop eye the current one
+        # may lead/lag the client by the reconciliation delay.
+        slack = 0.0 if at_loop is not None else lag_slack(player)
+        references = [eye for eye in (at_loop, current_eye) if eye is not None]
+        origin_error = min(
+            self._distance(packet_origin, eye) for eye in references
+        ) if references else nearest
+        tolerance = float(anticheat.setting(
+            self.server, "shot_origin_tolerance", 1.5
+        )) + slack
+        if not is_bot:
+            stats = anticheat_stats(player)
+            key = "origin_error" if at_loop is not None else "origin_error_fallback"
+            stats[key][bucket_label(origin_error, ORIGIN_ERROR_BUCKETS)] += 1
+            if origin_error > tolerance:
+                enforce = anticheat.enforcing(self.server, "enforce_shot_origin")
+                anticheat.report(
+                    self.server, player, "shot_origin_drift", enforced=enforce,
+                    error=round(origin_error, 3), allowed=round(tolerance, 3),
+                    ref="loop" if at_loop is not None else "current",
+                )
+                if enforce:
+                    stats["rejected"]["shot_origin_drift"] += 1
+                    return None
+
+        # Coarse direction gate (kept from before): the shot must point
+        # within ~75 degrees of a reported orientation.
+        at_loop_aim = None
+        history = getattr(player, "orientation_at_loop", None)
+        if callable(history) and loop is not None:
+            try:
+                at_loop_aim = self._normalize(
+                    _finite_point(history(int(loop)) or ()) or (0.0, 0.0, 0.0)
+                )
+            except Exception:  # noqa: BLE001 - tolerate partial doubles
+                at_loop_aim = None
         server_direction = self._normalize(player.orientation)
-        if server_direction is None:
-            return False
-        dot = (
-            packet_direction[0] * server_direction[0]
-            + packet_direction[1] * server_direction[1]
-            + packet_direction[2] * server_direction[2]
-        )
-        if dot < SHOT_ORIENTATION_DOT_TOLERANCE:
-            logger.debug(
-                "Rejecting shoot packet from %s due to direction mismatch %.3f",
-                player.name,
-                dot,
+        aims = [aim for aim in (at_loop_aim, server_direction) if aim is not None]
+        if not aims:
+            return None
+        dots = [
+            sum(packet_direction[i] * aim[i] for i in range(3)) for aim in aims
+        ]
+        if not max(dots) >= SHOT_ORIENTATION_DOT_TOLERANCE:
+            self._reject(
+                player, "shot_direction_mismatch", dot=round(max(dots), 3)
             )
-            return False
-        return True
+            return None
+
+        # Soft aim check against the shot's own frame (fallback: latest).
+        if not is_bot:
+            reference_dot = dots[0]
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, reference_dot))))
+            stats = anticheat_stats(player)
+            key = "aim_angle" if at_loop_aim is not None else "aim_angle_fallback"
+            stats[key][bucket_label(angle, AIM_ANGLE_BUCKETS)] += 1
+            aim_tolerance = float(anticheat.setting(
+                self.server, "aim_direction_tolerance_deg", 10.0
+            ))
+            if angle > aim_tolerance:
+                enforce = anticheat.enforcing(self.server, "enforce_aim_direction")
+                anticheat.report(
+                    self.server, player, "aim_direction_mismatch",
+                    enforced=enforce, angle_deg=round(angle, 2),
+                    allowed_deg=aim_tolerance,
+                    ref="loop" if at_loop_aim is not None else "current",
+                    tool=int(getattr(player, "tool", -1)),
+                )
+                if enforce:
+                    stats["rejected"]["aim_direction_mismatch"] += 1
+                    return None
+        return eyes, slack
 
     def _trace_player_hit(self, attacker, origin, direction, max_range: float):
         block_pos = self.server.world_manager.raycast(
@@ -1538,16 +2755,18 @@ class CombatSystem:
 
         hit = self._find_first_player_hit(attacker, origin, direction, max_distance)
         if hit is not None:
-            target, headshot, distance, position = hit
+            target, headshot, distance, position, _part = hit
             return target, headshot, position, block_pos
         return None, False, None, block_pos
 
     def _trace_authoritative_hit(self, attacker, origin, direction, max_range: float):
         """Return the nearest player, Classic corpse, entity, or terrain hit.
 
-        Terrain caps the ray before dynamic-target tests. Players, corpses, and
-        entities are compared by actual entry distance so no farther target can
-        absorb a shot through nearer geometry.
+        ``(kind, target, headshot, position, part)``; ``part`` is the stock
+        PART_* id for a player hit and ``None`` otherwise. Terrain caps the ray
+        before dynamic-target tests. Players, corpses, and entities are
+        compared by actual entry distance so no farther target can absorb a
+        shot through nearer geometry.
         """
         block_pos = self.server.world_manager.raycast(
             origin[0], origin[1], origin[2],
@@ -1575,18 +2794,18 @@ class CombatSystem:
         ) and (
             corpse_hit is None or player_hit[2] <= corpse_hit[1]
         ):
-            target, headshot, _, position = player_hit
-            return "player", target, headshot, position
+            target, headshot, _, position, part = player_hit
+            return "player", target, headshot, position, part
         if corpse_hit is not None and (
             entity_hit is None or corpse_hit[1] <= entity_hit[1]
         ):
             corpse, _, position = corpse_hit
-            return "corpse", corpse, False, position
+            return "corpse", corpse, False, position, None
         if entity_hit is not None:
             entity, _, position = entity_hit
-            return "entity", entity, False, position
+            return "entity", entity, False, position, None
         if block_pos is not None:
-            return "block", block_pos, False, self._block_center(block_pos)
+            return "block", block_pos, False, self._block_center(block_pos), None
         return None
 
     def _find_first_entity_hit(self, origin, direction, max_distance: float):
@@ -1675,10 +2894,12 @@ class CombatSystem:
         return entry, position
 
     def _find_first_player_hit(self, attacker, origin, direction, max_distance: float):
+        """(target, headshot, distance, position, part) of the nearest body."""
         closest_target = None
         closest_headshot = False
         closest_distance = max_distance + 1.0
         closest_position = None
+        closest_part = None
 
         for target in self.server.players.values():
             if target is attacker or not target.alive or not target.spawned:
@@ -1689,25 +2910,32 @@ class CombatSystem:
             ):
                 continue
 
-            hit = self._ray_hits_target(origin, direction, max_distance, target)
+            from server import lag_compensation
+
+            hit = self._ray_hits_target(
+                origin, direction, max_distance,
+                lag_compensation.body_for(self, target),
+            )
             if hit is None:
                 continue
 
-            distance, position, headshot = hit
+            distance, position, headshot, part = hit
             if distance < closest_distance:
                 closest_target = target
                 closest_headshot = headshot
                 closest_distance = distance
                 closest_position = position
+                closest_part = part
 
         if closest_target is None:
             return None
-        return closest_target, closest_headshot, closest_distance, closest_position
+        return (closest_target, closest_headshot, closest_distance,
+                closest_position, closest_part)
 
     def _ray_hits_target(self, origin, direction, max_distance: float, target):
         """Match stock hitscan_player against oriented KV6 model bounds."""
         profile = _CLASS_HITBOXES.get(target.class_id, _CLASS_HITBOXES[C.CLASS_SOLDIER])
-        if target.input.crouch:
+        if getattr(target, "hitbox_crouched", target.input.crouch):
             parts = (
                 (C.PART_TORSO, _CROUCH_TORSO, (0.0, 0.0, 0.3)),
                 (C.PART_HEAD, profile[C.PART_HEAD], (0.0, 0.0, 0.3)),
@@ -1724,12 +2952,15 @@ class CombatSystem:
                 (C.PART_RIGHT_LEG, profile[C.PART_RIGHT_LEG], (-0.25, 0.0, 1.1)),
             )
 
+        # Stock aoslib.weapons.hitscan_player tests torso, head, arms, left
+        # leg, right leg IN THAT ORDER and returns the first box hit (not the
+        # nearest), so a ray grazing both torso and head counts as torso.
         for part_id, model_bounds, model_offset in parts:
             hit = self._ray_hits_model_bounds(
                 origin, direction, max_distance, target, model_offset, model_bounds)
             if hit is not None:
                 distance, position = hit
-                return distance, position, part_id == C.PART_HEAD
+                return distance, position, part_id == C.PART_HEAD, int(part_id)
         return None
 
     def _ray_hits_model_bounds(
@@ -1779,13 +3010,51 @@ class CombatSystem:
         position = tuple(origin[i] + direction[i] * enter for i in range(3))
         return enter, position
 
-    def _calculate_damage(self, attacker, profile, headshot: bool) -> int:
-        damage = profile.base_damage * attacker.movement_profile.damage_multiplier
-        if headshot:
-            damage *= attacker.movement_profile.headshot_damage_multiplier
-        return max(1, int(round(damage)))
+    def _calculate_damage(self, attacker, profile, headshot: bool,
+                          target=None, part=None) -> float:
+        """Stock hit damage: the weapon's per-part figure scaled by the
+        VICTIM's class (and flying-jetpack) multipliers.
 
-    def _apply_riot_shield_mitigation(self, target, attacker, damage: int) -> int:
+        The stock damage tuple is (torso, head, arms, left leg, right leg);
+        ``part`` is the PART_* id from the stock hitbox order. Without a part
+        the head/torso figure is chosen from ``headshot``. The class tables
+        (CLASS_DAMAGE_MULTIPLIER / CLASS_HEADSHOT_DAMAGE_MULTIPLIER) belong to
+        the class being hit: Scout 1.43 ("your health ... limited"), Miner
+        head 0.5 (helmet), UGC builder 0. ``target=None`` (legacy callers)
+        applies no victim multiplier.
+
+        The result stays a float: ``Player.damage`` rounds ONCE, after the
+        RULE_WEAPON_DAMAGE scale (rules audit 2026-09-27 #23 -- it used to be
+        rounded here with a floor of 1 and again there).
+        """
+        from server.weapons_retail import victim_damage_multiplier
+
+        if part is None:
+            part = C.PART_HEAD if headshot else C.PART_TORSO
+        damage_for_part = getattr(profile, "damage_for_part", None)
+        if callable(damage_for_part):
+            damage = float(damage_for_part(int(part)))
+        else:
+            damage = float(profile.base_damage)
+            if headshot:
+                damage *= float(getattr(profile, "headshot_multiplier", 1.0))
+        if target is not None:
+            damage *= victim_damage_multiplier(
+                target, headshot=bool(headshot) and not profile.is_melee
+            )
+        if damage <= 0.0:
+            return 0.0
+        return float(damage)
+
+    @staticmethod
+    def _entity_damage(profile) -> float:
+        """Stock <WEAPON>_DAMAGE_ENTITY: a bullet's damage to a deployable."""
+        entity_damage = float(getattr(profile, "entity_damage", 0.0) or 0.0)
+        if entity_damage > 0.0:
+            return entity_damage
+        return float(profile.base_damage)
+
+    def _apply_riot_shield_mitigation(self, target, attacker, damage: float) -> float:
         """Apply the retail shield's 50% absorption to frontal direct hits.
 
         The shield has no activation packet: it is held whenever tool 52 is
@@ -1799,7 +3068,7 @@ class CombatSystem:
             or not bool(getattr(getattr(target, "input", None),
                                 "can_display_weapon", False))
         ):
-            return int(damage)
+            return damage
 
         to_source = (
             float(attacker.x) - float(target.x),
@@ -1809,10 +3078,10 @@ class CombatSystem:
         source_direction = self._normalize(to_source)
         facing = self._normalize(target.orientation)
         if source_direction is None or facing is None:
-            return int(damage)
+            return damage
         dot = sum(facing[index] * source_direction[index] for index in range(3))
         if dot <= 0.0:
-            return int(damage)
+            return damage
 
         absorption = max(
             0.0,
@@ -1822,7 +3091,7 @@ class CombatSystem:
                 / 100.0,
             ),
         )
-        return max(0, int(round(float(damage) * (1.0 - absorption))))
+        return max(0.0, float(damage) * (1.0 - absorption))
 
     @staticmethod
     def _apply_riot_shield_knockback(attacker, target) -> None:

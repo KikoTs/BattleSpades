@@ -20,7 +20,7 @@ from server.main import BattleSpadesServer
 from server.runtime_vxl import ServerVXL
 from server.world_manager import WorldManager
 from shared.bytes import ByteReader
-from shared.packet import BlockBuildColored, Damage
+from shared.packet import PaintBlockPacket, BlockBuildColored, Damage
 
 
 CellState = tuple[bool, int]
@@ -64,6 +64,26 @@ def _column_state(vxl: ServerVXL, x: int, y: int) -> ColumnState:
     ]
 
 
+_PAD_COLUMNS = bytes((0, 240, 239, 0)) * 3
+
+
+def _decode_column_bytes(encoded: bytes) -> ServerVXL:
+    """Decode one MapSync column record the way the client does: unshifted.
+
+    The server loader normalizes short legacy *files* by shifting them down
+    so their deepest referenced z becomes 239. A single column record whose
+    last span ends above the floor (its interior is implicit, as in every
+    map file) must not be mistaken for such a file, so pad it to a 2x2
+    source with empty columns that reference z=239; the record still lands
+    at (255, 255).
+    """
+    padded = bytes(encoded) + _PAD_COLUMNS
+    decoded = ServerVXL(-1, padded, len(padded), 2)
+    assert decoded.ready
+    assert decoded.source_z_shift == 0
+    return decoded
+
+
 def _decode_sync_columns(payload: bytes) -> dict[tuple[int, int], ColumnState]:
     """Decode compressed MapSync records through the production VXL loader."""
 
@@ -92,8 +112,7 @@ def _decode_sync_columns(payload: bytes) -> dict[tuple[int, int], ColumnState]:
 
         encoded = raw[span_start:position]
         # A one-column source is centered in the 512x512 runtime map.
-        decoded = ServerVXL(-1, encoded, len(encoded), 2)
-        assert decoded.ready, f"client rejected MapSync column {(x, y)}"
+        decoded = _decode_column_bytes(encoded)
         columns[(x, y)] = _column_state(decoded, 255, 255)
     assert position == len(raw)
     return columns
@@ -131,9 +150,22 @@ def _find_encoded_sync_column(
     return found
 
 
+def _assert_column_matches(client: ColumnState, vxl: ServerVXL, x: int, y: int) -> None:
+    """Solidity must match everywhere; colours wherever the server holds one.
+
+    Solid voxels without an explicit server colour are implicit interior:
+    the VXL format never transmits them and the client colours them itself,
+    so their reconstructed colour is not part of the contract.
+    """
+    server = _column_state(vxl, x, y)
+    assert [solid for solid, _c in client] == [solid for solid, _c in server]
+    for z, ((_solid, actual), (_expected_solid, expected)) in enumerate(zip(client, server)):
+        if vxl.has_explicit_color(x, y, z):
+            assert actual == expected, f"colour mismatch at z={z}"
+
+
 def _decode_encoded_column(encoded: bytes) -> ColumnState:
-    decoded = ServerVXL(-1, encoded, len(encoded), 2)
-    assert decoded.ready
+    decoded = _decode_column_bytes(encoded)
     return _column_state(decoded, 255, 255)
 
 
@@ -161,6 +193,17 @@ def _apply_exact_packets(
             column = columns.setdefault((x, y), _blank_column())
             column[z] = (False, 0)
             continue
+        if packet_id == PaintBlockPacket.id:
+            # Colour pin for a solid cell (the client ignores 33 on solids).
+            packet = PaintBlockPacket(ByteReader(data[1:]))
+            column = columns.setdefault((packet.x, packet.y), _blank_column())
+            if column[packet.z][0]:
+                r, g, b = (int(value) for value in packet.color)
+                column[packet.z] = (True, (r << 16) | (g << 8) | b)
+            continue
+        if packet_id == 38:
+            # BlockManagerState: per-cell health only, no geometry/colour.
+            continue
         raise AssertionError(f"unexpected terrain catch-up packet {packet_id}")
 
 
@@ -172,9 +215,8 @@ def test_isolated_nonfinal_run_roundtrips_without_overlapping_span_colors() -> N
     record = bytes(source.serialize_columns(((100, 100),)))
     assert struct.unpack_from("<II", record, 0) == (100, 100)
 
-    decoded = ServerVXL(-1, record[8:], len(record) - 8, 2)
-    assert decoded.ready
-    assert _column_state(decoded, 255, 255) == _column_state(source, 100, 100)
+    decoded = _decode_column_bytes(record[8:])
+    _assert_column_matches(_column_state(decoded, 255, 255), source, 100, 100)
 
 
 def test_dirty_source_generation_uses_the_same_valid_span_contract() -> None:
@@ -186,7 +228,7 @@ def test_dirty_source_generation_uses_the_same_valid_span_contract() -> None:
 
     decoded = ServerVXL(-1, serialized, len(serialized), 2)
     assert decoded.ready
-    assert _column_state(decoded, 255, 255) == _column_state(source, 255, 255)
+    _assert_column_matches(_column_state(decoded, 255, 255), source, 255, 255)
 
 
 def test_seeded_dirty_column_fuzz_converges_solidity_and_rgb() -> None:
@@ -207,9 +249,8 @@ def test_seeded_dirty_column_fuzz_converges_solidity_and_rgb() -> None:
                 source.remove_point(x, y, z)
 
         record = bytes(source.serialize_columns(((x, y),)))
-        decoded = ServerVXL(-1, record[8:], len(record) - 8, 2)
-        assert decoded.ready
-        assert _column_state(decoded, 255, 255) == _column_state(source, x, y)
+        decoded = _decode_column_bytes(record[8:])
+        _assert_column_matches(_column_state(decoded, 255, 255), source, x, y)
 
 
 def test_delta_roundtrip_handles_cave_gaps_runs_recolor_and_deletion() -> None:
@@ -226,7 +267,7 @@ def test_delta_roundtrip_handles_cave_gaps_runs_recolor_and_deletion() -> None:
 
     payload = world.serialize_dirty_columns_compressed({(x, y)})
     decoded = _decode_sync_columns(payload)
-    assert decoded[(x, y)] == _column_state(world.map, x, y)
+    _assert_column_matches(decoded[(x, y)], world.map, x, y)
 
     # A deletion-only final state must replace the entire old client column,
     # not serialize an empty/no-op delta which would retain stale terrain.
@@ -235,7 +276,7 @@ def test_delta_roundtrip_handles_cave_gaps_runs_recolor_and_deletion() -> None:
     )
     payload = world.serialize_dirty_columns_compressed({(x, y)})
     decoded = _decode_sync_columns(payload)
-    assert decoded[(x, y)] == _column_state(world.map, x, y)
+    _assert_column_matches(decoded[(x, y)], world.map, x, y)
 
 
 def test_full_sync_dirty_overlay_roundtrips_legacy_shifted_column() -> None:
@@ -259,7 +300,7 @@ def test_full_sync_dirty_overlay_roundtrips_legacy_shifted_column() -> None:
     assert chunks is not None
     raw = zlib.decompress(b"".join(chunks))
     encoded = _find_encoded_sync_column(raw, (x, y))
-    assert _decode_encoded_column(encoded) == _column_state(world.map, x, y)
+    _assert_column_matches(_decode_encoded_column(encoded), world.map, x, y)
 
     # Repeat with a deletion-only overlay. Reusing the pristine raw column
     # here would silently resurrect every removed server-air voxel.
@@ -270,7 +311,7 @@ def test_full_sync_dirty_overlay_roundtrips_legacy_shifted_column() -> None:
     assert chunks is not None
     raw = zlib.decompress(b"".join(chunks))
     encoded = _find_encoded_sync_column(raw, (x, y))
-    assert _decode_encoded_column(encoded) == _column_state(world.map, x, y)
+    _assert_column_matches(_decode_encoded_column(encoded), world.map, x, y)
 
 
 def test_join_snapshot_plus_cross_boundary_mutations_converges_exactly() -> None:
@@ -314,9 +355,13 @@ def test_join_snapshot_plus_cross_boundary_mutations_converges_exactly() -> None
     }
     for x, y in tracked_columns:
         actual = client_columns.get((x, y), _blank_column())
-        assert actual == _column_state(world.map, x, y)
+        _assert_column_matches(actual, world.map, x, y)
 
-    changed_packet_count = len(joiner.sent)
+    # Colour pins (7) and health rows (38) ride along with solid cells; the
+    # coalescing contract is about geometry packets (33 builds, 37 removals).
+    changed_packet_count = len(
+        [data for data in joiner.sent if data[0] in (BlockBuildColored.id, Damage.id)]
+    )
     # Eleven canonical callbacks above collapse to seven final coordinates.
     assert changed_packet_count == 7
     assert joiner.map_cell_watermark == server._map_cell_sequence

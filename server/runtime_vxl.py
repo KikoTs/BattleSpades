@@ -7,7 +7,7 @@ import math
 import os
 from typing import Optional
 
-from aoslib.vxl import VXL
+from aoslib.vxl import VXL, find_marker_voxels, raw_vxl_size
 
 
 logger = logging.getLogger(__name__)
@@ -199,7 +199,9 @@ def _find_first_surface_column(data: bytes) -> tuple[int, int, int] | None:
 class ServerVXL(VXL):
     def __init__(self, state, source, size_or_detail, detail_level=2):
         raw_data = _read_source_bytes(source, size_or_detail)
-        columns, max_ref = _raw_vxl_size(raw_data) if raw_data else (0, EMPTY_TOP_END)
+        # C walks (GIL released): a map load runs on the transition worker
+        # thread while the live match keeps ticking on the main thread.
+        columns, max_ref = raw_vxl_size(raw_data) if raw_data else (0, EMPTY_TOP_END)
         edge = math.isqrt(columns) if columns > 0 else 0
         self.source_z_shift = (
             max(0, EMPTY_TOP_END - max_ref)
@@ -217,11 +219,12 @@ class ServerVXL(VXL):
         # voxel/light on the client, and authoritative collision restores the
         # same voxel. A marker with no valid UGC palette remains air on both.
         if raw_data:
+            # find_marker_voxels == filtering _iter_explicit_voxels by
+            # _is_retail_marker_color, in C.
             markers = tuple(
                 (x, y, z + self.source_z_shift, _retail_marker_family(color))
-                for x, y, z, color in _iter_explicit_voxels(raw_data)
-                if _is_retail_marker_color(color)
-                and self.get_solid(x, y, z + self.source_z_shift)
+                for x, y, z, color in find_marker_voxels(raw_data)
+                if self.get_solid(x, y, z + self.source_z_shift)
                 and not self.get_solid(x, y, z + self.source_z_shift - 1)
                 and not self.get_solid(x, y, z + self.source_z_shift - 2)
             )

@@ -3,6 +3,7 @@ from glob import glob
 from pathlib import Path
 
 from Cython.Build import cythonize
+import os
 from setuptools import Extension, setup
 
 
@@ -42,6 +43,9 @@ if sys.platform != "darwin":
     enet_define_macros.extend(
         [("HAS_GETHOSTBYNAME_R", None), ("HAS_GETHOSTBYADDR_R", None)]
     )
+
+
+_CHECKED_BUILD = os.environ.get("BATTLESPADES_CHECKED_BUILD", "") == "1"
 
 
 extensions = [
@@ -123,6 +127,9 @@ setup(
     version=PACKAGE_VERSION,
     description="Ace of Spades Battle Builders Server",
     author="AoS Revival",
+    # Releases up to 0.1.0-beta.1 were MIT; see LICENSING.md.
+    license="AGPL-3.0-or-later",
+    license_files=["LICENSE", "LICENSING.md", "THIRD_PARTY_NOTICES.md"],
     packages=[
         "shared", "aoslib", "server", "server.bot_ai", "protocol",
         "modes", "commands", "plugins",
@@ -132,8 +139,11 @@ setup(
         force=True,
         compiler_directives={
             "language_level": "3",
-            "boundscheck": False,
-            "wraparound": False,
+            # BATTLESPADES_CHECKED_BUILD=1 turns bounds and negative-index
+            # checks back on: a diagnostic build that raises IndexError at
+            # the exact line instead of silently corrupting memory.
+            "boundscheck": _CHECKED_BUILD,
+            "wraparound": _CHECKED_BUILD,
             "cdivision": True,
         },
         annotate=True,

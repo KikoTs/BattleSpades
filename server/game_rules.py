@@ -325,17 +325,18 @@ class GameRules:
         The retail lobby defaults respawn to ten seconds and exposes the flare
         tool. BattleSpades historically uses five seconds and suppresses the
         native flare-as-first-prefab menu defect; the exhaustive sample TOML
-        makes both differences visible and adjustable.
+        makes both differences visible and adjustable. Every other rule is
+        the retail GAME_RULES_LIST default (docs/RETAIL_VALUES.md); the CTF
+        score target (5) and crate respawn (25 s) were realigned 2026-09-26
+        from undocumented 10 / 15.
         """
 
         result = cls.retail_defaults()
         result.values["RULE_RESPAWN_TIMES"] = 5
-        result.values["RULE_CTF_SCORE_TARGET"] = 10
-        # Preserve established dedicated-server behavior unless the new
-        # exhaustive rule table explicitly opts into the retail three-second
-        # protection window.
+        # Code default stays off for bare/test configs; shipped configs turn
+        # on the retail three-second window, which ends early the moment the
+        # protected player attacks (Player.end_spawn_protection).
         result.values["RULE_SPAWN_PROTECTION_TIME"] = 0.0
-        result.values["RULE_CRATES_SPAWN_TIME"] = 15
         return result
 
     def apply(self, mapping: Mapping[str, Any]) -> None:

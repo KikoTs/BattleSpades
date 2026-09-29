@@ -11,9 +11,11 @@ movement_authority = "server"
 
 [lobby]
 match_length_minutes = 15
+# Retail demolition.txt also names GreatWall, but playlists.PlayList skips
+# it (mapinfo invalid_modes has "dem"), so retail never served it.
 map_rotation = [
     "Atlantis", "BlockNess", "CastleWars", "DoubleDragon", "DragonIsland",
-    "Frontier", "GreatWall", "LunarBase", "TokyoNeon",
+    "Frontier", "LunarBase", "TokyoNeon",
 ]
 
 [bots]
@@ -42,3 +44,6 @@ query_port = 27032
 level = "INFO"
 file = "official-demolition.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

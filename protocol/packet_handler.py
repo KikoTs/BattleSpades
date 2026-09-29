@@ -4,6 +4,7 @@ Uses reversed shared packets for serialization.
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from shared.bytes import ByteReader
@@ -16,6 +17,34 @@ if TYPE_CHECKING:
     from server.player import Player
 
 logger = logging.getLogger(__name__)
+
+# packet_id -> (last monotonic log time, suppressed count)
+_UNROUTABLE_LOG_STATE: dict[int, list] = {}
+_UNROUTABLE_LOG_INTERVAL_SECONDS = 60.0
+# packet_id -> (last monotonic log time, suppressed count) for handler errors
+_HANDLER_ERROR_LOG_STATE: dict[int, list] = {}
+_HANDLER_ERROR_LOG_INTERVAL_SECONDS = 10.0
+
+
+def _log_unroutable(kind: str, packet_id: int, player) -> None:
+    """Debug-log an unhandled/unknown client packet id, rate-limited per id."""
+
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    now = time.monotonic()
+    state = _UNROUTABLE_LOG_STATE.setdefault(int(packet_id), [float("-inf"), 0])
+    if now - state[0] < _UNROUTABLE_LOG_INTERVAL_SECONDS:
+        state[1] += 1
+        return
+    suppressed = state[1]
+    state[0], state[1] = now, 0
+    logger.debug(
+        "%s packet ID %s from %s (%d repeat(s) suppressed)",
+        kind,
+        packet_id,
+        getattr(player, "name", "?"),
+        suppressed,
+    )
 
 class PacketHandler:
     """Manages packet routing and handling."""
@@ -34,13 +63,15 @@ class PacketHandler:
         # Get handler
         handler = _handlers.get(packet_id)
         if handler is None:
-            logger.debug(f"Unhandled packet ID {packet_id} from {player.name}")
+            _log_unroutable("Unhandled", packet_id, player)
             return
         
         # Parse packet using aoslib
         packet_class = CLIENT_LOADERS.get(packet_id)
         if packet_class is None:
-            logger.warning(f"Unknown packet ID {packet_id}")
+            # Any client can send arbitrary ids; never let that become
+            # warning-level log spam.
+            _log_unroutable("Unknown", packet_id, player)
             return
         
         try:
@@ -54,7 +85,25 @@ class PacketHandler:
                 logger.debug(f"DECODE [{player.name}] {packet_class.__name__}")
             await handler(self.server, player, packet)
         except Exception as e:
-            logger.error(f"Error handling packet {packet_id}: {e}", exc_info=True)
+            # Malformed client input can raise on every packet; keep the
+            # traceback but at most once per packet id per interval.
+            state = _HANDLER_ERROR_LOG_STATE.setdefault(
+                int(packet_id), [float("-inf"), 0]
+            )
+            now = time.monotonic()
+            if now - state[0] < _HANDLER_ERROR_LOG_INTERVAL_SECONDS:
+                state[1] += 1
+                return
+            suppressed = state[1]
+            state[0], state[1] = now, 0
+            logger.error(
+                "Error handling packet %s from %s: %s (%d similar suppressed)",
+                packet_id,
+                getattr(player, "name", "?"),
+                e,
+                suppressed,
+                exc_info=True,
+            )
 
 
 async def handle_packet(server: 'BattleSpadesServer', player: 'Player', data: bytes):
@@ -70,7 +119,6 @@ from server.handlers import team as _team_handlers  # noqa: E402,F401
 from server.handlers import movement as _movement_handlers  # noqa: E402,F401
 from server.handlers import combat as _combat_handlers  # noqa: E402,F401
 from server.handlers import social as _social_handlers  # noqa: E402,F401
-from server.handlers import diagnostics as _diagnostic_handlers  # noqa: E402,F401
 from server.handlers import deployables as _deployable_handlers  # noqa: E402,F401
 from server.handlers import blocks as _block_handlers  # noqa: E402,F401
 from server.handlers import world as _world_handlers  # noqa: E402,F401

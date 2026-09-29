@@ -34,6 +34,51 @@ class SimulationRuntime:
         self._stat_max_ms = 0.0
         self._stat_sum_ms = 0.0
         self._subsystem_stat: dict[str, list[float]] = {}
+        # subsystem -> [last_log_monotonic, suppressed_count, total_failures]
+        self._failure_log: dict[str, list[float]] = {}
+
+    # A failing subsystem is logged with its traceback at most once per this
+    # many seconds; repeats in between are only counted.
+    FAILURE_LOG_INTERVAL_SECONDS = 10.0
+
+    def _report_failure(self, name: str, exc: BaseException) -> None:
+        """Log one isolated subsystem failure, rate-limited per subsystem."""
+
+        now = time.monotonic()
+        state = self._failure_log.setdefault(name, [float("-inf"), 0.0, 0.0])
+        state[2] += 1.0
+        metrics = getattr(self.server, "metrics", None)
+        if metrics is not None:
+            try:
+                failures = getattr(metrics, "subsystem_failures", None)
+                if not isinstance(failures, dict):
+                    failures = {}
+                    metrics.subsystem_failures = failures
+                failures[name] = failures.get(name, 0) + 1
+            except Exception:
+                pass
+        if now - state[0] < self.FAILURE_LOG_INTERVAL_SECONDS:
+            state[1] += 1.0
+            return
+        suppressed = int(state[1])
+        state[0] = now
+        state[1] = 0.0
+        logger.error(
+            "Tick subsystem %r failed (continuing; %d similar failure(s) "
+            "suppressed, %d total): %s",
+            name,
+            suppressed,
+            int(state[2]),
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+    def _guard_sync(self, name: str, operation: Callable[[], object]) -> object:
+        try:
+            return operation()
+        except Exception as exc:
+            self._report_failure(name, exc)
+            return None
 
     async def run(self) -> None:
         """Run until ``server.running`` becomes false."""
@@ -62,11 +107,19 @@ class SimulationRuntime:
                 accumulator -= server.tick_interval
                 steps += 1
                 server.loop_count += 1
-                await self.step()
+                try:
+                    await self.step()
+                except Exception as exc:
+                    # step() already isolates each subsystem; this is the
+                    # last line of defence so the fixed-step loop (and with
+                    # it the whole server) survives a bug in glue code.
+                    self._report_failure("step", exc)
                 # Publish every crossed 30 Hz cadence boundary.  Sending only
                 # once after a multi-step catch-up batch stretched anchors and
                 # produced visible observer/local motion gaps after a hitch.
-                server._broadcast_world_updates()
+                # One bad snapshot (e.g. an unencodable row) must not stop
+                # the simulation: log it and publish again next cadence.
+                self._guard_sync("world_updates", server._broadcast_world_updates)
                 # Give the sibling ENet service task a chance to flush/receive
                 # between bounded catch-up steps instead of monopolising all
                 # five simulation frames in one event-loop turn.
@@ -79,6 +132,11 @@ class SimulationRuntime:
         start = time.perf_counter()
         try:
             return await operation()
+        except Exception as exc:
+            # Isolate the failure to this subsystem for this tick; the other
+            # subsystems (and later ticks) keep running.
+            self._report_failure(name, exc)
+            return None
         finally:
             self._record_subsystem(name, (time.perf_counter() - start) * 1000.0)
 
@@ -86,6 +144,9 @@ class SimulationRuntime:
         start = time.perf_counter()
         try:
             return operation()
+        except Exception as exc:
+            self._report_failure(name, exc)
+            return None
         finally:
             self._record_subsystem(name, (time.perf_counter() - start) * 1000.0)
 
@@ -172,11 +233,15 @@ class SimulationRuntime:
             ),
         )
         self._measure_sync("fire", server.fire_controller.update)
-        self._update_second_schedulers()
+        goo_controller = getattr(server, "goo_controller", None)
+        if goo_controller is not None:
+            self._measure_sync("goo", goo_controller.update)
+        self._guard_sync("second_schedulers", self._update_second_schedulers)
+        self._guard_sync("conduct", self._tick_conduct)
 
         tick_ms = (time.perf_counter() - tick_start) * 1000.0
-        server.metrics.record_tick(tick_ms)
-        self._record_health(tick_ms)
+        self._guard_sync("metrics", lambda: server.metrics.record_tick(tick_ms))
+        self._guard_sync("health", lambda: self._record_health(tick_ms))
 
     async def _simulate_players(self) -> None:
         """Consume at most one observed input row per owner this server tick.
@@ -203,13 +268,19 @@ class SimulationRuntime:
                 # or retiring bodies here crosses native-scene/world epochs
                 # and caused a measurable rollover hitch.
                 continue
-            await player.simulate_tick(server.tick_interval)
-            from server.profile_stats import tick as profile_tick
-            profile_tick(player, server, server.tick_interval)
-            bots = getattr(server, "bots", None)
-            observe_physics = getattr(bots, "observe_player_physics", None)
-            if callable(observe_physics):
-                observe_physics(player, time.monotonic())
+            try:
+                await player.simulate_tick(server.tick_interval)
+                from server.profile_stats import tick as profile_tick
+                profile_tick(player, server, server.tick_interval)
+                from server.combat_scores import round_tick
+                round_tick(player, server, server.tick_interval)
+                bots = getattr(server, "bots", None)
+                observe_physics = getattr(bots, "observe_player_physics", None)
+                if callable(observe_physics):
+                    observe_physics(player, time.monotonic())
+            except Exception as exc:
+                # One player's bad state must not freeze every other body.
+                self._report_failure("players", exc)
 
     async def _tick_mode(self) -> None:
         server = self.server
@@ -230,11 +301,21 @@ class SimulationRuntime:
             # newer arrivals cannot add points or prolong a saturated queue.
             budget = min(budget, timeout_remaining)
         for _ in range(budget):
+            if not server._mode_events:
+                break
             name, args = server._mode_events.popleft()
+            # One faulty handler must not discard the rest of this tick's
+            # queued events (other players' kills/scores) or skip on_tick.
             handler = getattr(server.mode, name, None)
             if handler is not None:
-                await handler(*args)
-            await server.plugin_manager.call_event(name, *args)
+                try:
+                    await handler(*args)
+                except Exception as exc:
+                    self._report_failure(f"mode_event:{name}", exc)
+            try:
+                await server.plugin_manager.call_event(name, *args)
+            except Exception as exc:
+                self._report_failure(f"plugin_event:{name}", exc)
         if timeout_remaining is not None and not server.mode.ended:
             server.mode._timeout_events_remaining = max(0, timeout_remaining - budget)
         await server.mode.on_tick(server.loop_count)
@@ -261,9 +342,21 @@ class SimulationRuntime:
                 if callable(countdown)
                 else server.mode.time_limit - server.mode.elapsed_time
             )
-            send_round_timer(server, remaining)
+            # Periodic refresh: unreliable so a lost one cannot head-of-line
+            # block the WorldUpdate stream (docs/RETAIL_INPUT_LOSS.md).
+            send_round_timer(server, remaining, reliable=False)
         if server.vote_manager.active:
             server.vote_manager.tick()
+
+    def _tick_conduct(self) -> None:
+        """Once per second: AFK clocks and pending team-grief kicks."""
+
+        server = self.server
+        if server.loop_count % server.tick_rate != 0:
+            return
+        from server import conduct
+
+        conduct.tick(server, 1.0)
 
     def _record_health(self, tick_ms: float) -> None:
         server = self.server
@@ -282,12 +375,20 @@ class SimulationRuntime:
             stale = getattr(player, "input_frames_stale", 0)
             overflow = getattr(player, "input_frames_overflow", 0)
             starved = getattr(player, "input_starved_ticks", 0)
+            synthesized = getattr(player, "input_frames_synthesized", 0)
             position_reports = getattr(player, "position_reports_received", 0)
-            if applied or dropped or starved or position_reports:
+            if applied or dropped or starved or synthesized or position_reports:
+                peer = getattr(getattr(player, "connection", None), "peer", None)
+                throttle = getattr(peer, "packetThrottle", None)
+                rtt = getattr(peer, "roundTripTime", None)
                 inputs.append(
                     f"{player.name}:appl={applied} stale={stale} "
-                    f"overflow={overflow} starve={starved} pos={position_reports}"
+                    f"overflow={overflow} starve={starved} synth={synthesized} "
+                    f"pos={position_reports}"
+                    + (f" thr={throttle}/32" if throttle is not None else "")
+                    + (f" rtt={rtt}ms" if rtt is not None else "")
                 )
+                player.input_frames_synthesized = 0
                 player.input_frames_applied = 0
                 player.input_frames_dropped = 0
                 player.input_frames_stale = 0

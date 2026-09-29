@@ -134,3 +134,37 @@ def test_grounded_proof_reuse_preserves_results_and_bounds_solid_queries():
     assert actual == expected
     assert actual == [[(300, 300, 100), (301, 300, 100), (302, 300, 100)]]
     assert solid_queries <= 6_000
+
+
+def test_native_collapse_search_keeps_the_gil():
+    """Regression: 30-50 ms explosion ticks (2026-09-26).
+
+    ``VXL.find_unsupported_chunks`` used to wrap every microsecond-sized
+    ``_collapse_walk`` in ``with nogil``. Each release handed the interpreter
+    to the busy bot-AI thread for a full switch interval (~15.6 ms with the
+    Windows timer), dozens of times per explosion.
+    """
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "aoslib" / "vxl.pyx").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("cpdef list find_unsupported_chunks(")
+    end = source.index("\n    cpdef ", start + 1)
+    assert not re.search(r"with\s+nogil", source[start:end])
+
+
+def test_collapse_budget_is_the_retail_node_count():
+    """Retail sub_10036470 aborts past 10,000,000 visited NODES; our floods
+    count 18 probes per popped node, so the probe budget is 18x that."""
+    assert WorldManager.COLLAPSE_NODE_BUDGET == 0x989680 == 10_000_000
+    assert len(WorldManager.COLLAPSE_NEIGHBORS) == 18
+    assert WorldManager.COLLAPSE_WORK_BUDGET == 18 * 10_000_000
+    # A budget of N nodes completes an N-node component and exhausts N+1.
+    for nodes, collapses in ((10, True), (11, False)):
+        solids = {(100 + x, 100, 100) for x in range(nodes)}
+        manager = manager_with_solids(solids)
+        manager.COLLAPSE_WORK_BUDGET = 10 * len(manager.COLLAPSE_NEIGHBORS)
+        chunks = manager.find_unsupported_chunks([(99, 100, 100)])
+        assert bool(chunks) is collapses

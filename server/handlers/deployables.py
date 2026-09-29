@@ -17,14 +17,26 @@ from server.combat_runtime import get_combat_system
 logger = logging.getLogger(__name__)
 
 
+def _committed_placement(player, placed):
+    """A committed deployable placement ends a Disguise ("Must remain
+    stationary") and the placer's spawn protection, like an attack does
+    (rules audit 2026-09-27 #10/#25)."""
+    if placed:
+        for name in ("break_disguise", "end_spawn_protection"):
+            hook = getattr(player, name, None)
+            if callable(hook):
+                hook()
+    return placed
+
+
 @register_handler(90)  # PlaceMedPack
 async def handle_place_medpack(server, player, packet):
     """Place the visible Medic pack (25 HP per touch, three uses)."""
-    return server.deployable_actions.place_medpack(
+    return _committed_placement(player, server.deployable_actions.place_medpack(
         player,
         (packet.x, packet.y, packet.z),
         face=int(getattr(packet, "face", 4)),
-    )
+    ))
 
 
 def _deploy_pos(player, packet, max_distance: float = 15.0):
@@ -87,6 +99,17 @@ async def handle_place_flare_block(server, player, packet):
         return
     if not flare_is_supported(world, registry, cell):
         return
+    # The flare cube goes where the eye ray hits, like an ordinary block:
+    # a range-only check accepted cells behind walls.
+    if not getattr(player, "is_bot", False):
+        from server.combat_runtime import cell_visible, reference_eyes
+
+        _, eyes = reference_eyes(player, getattr(packet, "loop_count", None))
+        if not eyes or not cell_visible(world, eyes, cell):
+            from server import anticheat
+
+            anticheat.report(server, player, "placement_occluded", cell=cell)
+            return
 
     # Match the normal block tool's player-collision safety without applying
     # can_build(): flare blocks are explicitly allowed at the water plane.
@@ -128,30 +151,30 @@ async def handle_place_flare_block(server, player, packet):
 @register_handler(1)  # PlaceDynamite
 async def handle_place_dynamite(server, player, packet):
     """Miner dynamite: a timed charge that craters + damages on a 7s fuse."""
-    return server.deployable_actions.place_dynamite(
+    return _committed_placement(player, server.deployable_actions.place_dynamite(
         player,
         (packet.x, packet.y, packet.z),
         face=int(getattr(packet, "face", -1)),
-    )
+    ))
 
 
 @register_handler(89)  # PlaceLandmine
 async def handle_place_landmine(server, player, packet):
     """Scout landmine: arms, then detonates when an enemy walks near it."""
-    return server.deployable_actions.place_landmine(
+    return _committed_placement(player, server.deployable_actions.place_landmine(
         player, (packet.x, packet.y, packet.z)
-    )
+    ))
 
 
 @register_handler(92)  # PlaceC4
 async def handle_place_c4(server, player, packet):
     """Miner remote charge: attach to any valid block face, then persist until
     this owner sends DetonateC4."""
-    return server.deployable_actions.place_c4(
+    return _committed_placement(player, server.deployable_actions.place_c4(
         player,
         (packet.x, packet.y, packet.z),
         face=int(getattr(packet, "face", -1)),
-    )
+    ))
 
 
 @register_handler(93)  # DetonateC4
@@ -164,19 +187,19 @@ async def handle_detonate_c4(server, player, packet):
 async def handle_place_radar_station(server, player, packet):
     """Place the Scout radar station and expose enemies to that team until its
     stock lifetime expires."""
-    return server.deployable_actions.place_radar(
+    return _committed_placement(player, server.deployable_actions.place_radar(
         player, (packet.x, packet.y, packet.z)
-    )
+    ))
 
 
 @register_handler(87)  # PlaceMG
 async def handle_place_mg(server, player, packet):
     """Create the stock durable mounted machine-gun entity."""
-    return server.deployable_actions.place_machine_gun(
+    return _committed_placement(player, server.deployable_actions.place_machine_gun(
         player,
         (packet.x, packet.y, packet.z),
         yaw=float(getattr(packet, "yaw", 0.0)),
-    )
+    ))
 
 
 @register_handler(86)  # UseCommand
@@ -211,11 +234,11 @@ async def handle_use_command(server, player, packet):
 @register_handler(88)  # PlaceRocketTurret
 async def handle_place_rocket_turret(server, player, packet):
     """Place a server-owned Engineer/Rocketeer rocket turret."""
-    return server.deployable_actions.place_rocket_turret(
+    return _committed_placement(player, server.deployable_actions.place_rocket_turret(
         player,
         (packet.x, packet.y, packet.z),
         yaw=float(getattr(packet, "yaw", 0.0)),
-    )
+    ))
 
 
 @register_handler(95)  # DisguisePacket
@@ -230,6 +253,58 @@ async def handle_disguise(server, player, packet):
     return server.deployable_actions.set_disguise(
         player, active=bool(getattr(packet, "active", 0))
     )
+
+
+# Retail BlockSuckerWeapon: state=1 on press, state=2 once its own timer
+# reaches BLOCK_SUCKER_WARM_UP_DELAY (1.0 s), shots only at full power. Arrival
+# gaps can shrink when the state=1 packet is delayed (loss/retransmit), so the
+# wall-clock floor keeps this much slack; alternatively the client's own loop
+# stamps may prove the full delay (with a hard wall-clock minimum).
+BLOCK_SUCKER_WARMUP_JITTER_SLACK = 0.35
+BLOCK_SUCKER_WARMUP_MIN_WALL = 0.25
+
+
+def _block_sucker_warm_up(server, player, state, packet, now) -> bool:
+    """Track the warm-up for this life; return whether full power is earned.
+
+    A modified client used to send state=2 shots immediately, skipping the
+    retail one-second spin-up. Runs on the gameplay thread.
+    """
+    import shared.constants as C
+
+    life = int(getattr(player, "deaths", 0))
+    loop = int(getattr(packet, "loop_count", 0) or 0)
+    warm = getattr(player, "_block_sucker_warm", None)
+    if warm is not None and warm[0] != life:
+        warm = None
+    if state == int(C.BLOCK_SUCKER_STATE_INACTIVE):
+        player._block_sucker_warm = None
+        return False
+    if warm is None:
+        # First active packet of this press. A FULL_POWER packet without a
+        # preceding WARMING_UP starts the clock too (never grants power).
+        warm = (life, now, loop)
+        player._block_sucker_warm = warm
+    if state != int(C.BLOCK_SUCKER_STATE_FULL_POWER):
+        return False
+    delay = float(getattr(C, "BLOCK_SUCKER_WARM_UP_DELAY", 1.0))
+    elapsed = now - float(warm[1])
+    if elapsed >= delay - BLOCK_SUCKER_WARMUP_JITTER_SLACK:
+        return True
+    frame = float(getattr(C, "UPDATE_FREQUENCY", 1.0 / 60.0))
+    if (
+        elapsed >= BLOCK_SUCKER_WARMUP_MIN_WALL
+        and (loop - int(warm[2])) * frame >= delay - 2.0 * frame
+    ):
+        return True
+    if bool(getattr(packet, "shot", 0)):
+        from server import anticheat
+
+        anticheat.report(
+            server, player, "block_sucker_warmup",
+            elapsed=round(elapsed, 3), required=delay,
+        )
+    return False
 
 
 @register_handler(94)  # BlockSuckerPacket
@@ -248,6 +323,26 @@ async def handle_block_sucker(server, player, packet):
         return
     shot = bool(getattr(packet, "shot", 0))
 
+    # Gate the shot on its cooldown BEFORE relaying: every packet used to be
+    # broadcast reliably to all clients, so a client spamming packet 94 could
+    # amplify itself into a reliable flood. Relay only a state change or an
+    # accepted shot.
+    accepted_shot = False
+    now = time.monotonic()
+    warmed_up = _block_sucker_warm_up(server, player, state, packet, now)
+    if shot and state == int(C.BLOCK_SUCKER_STATE_FULL_POWER) and warmed_up:
+        if now >= float(getattr(player, "_block_sucker_next_shot", 0.0)):
+            player._block_sucker_next_shot = now + float(
+                C.BLOCK_SUCKER_SHOOT_INTERVAL
+            )
+            accepted_shot = True
+    # Keyed by life so a respawned player's first state is always relayed.
+    relay_key = (int(getattr(player, "deaths", 0)), state)
+    state_changed = relay_key != getattr(player, "_block_sucker_relayed_state", None)
+    if not accepted_shot and not state_changed:
+        return
+    player._block_sucker_relayed_state = relay_key
+
     # Remote clients explicitly consume this packet to animate the warm-up,
     # loop sound, and debris. Never trust the packet's claimed shooter id.
     from shared.packet import BlockSuckerPacket
@@ -255,15 +350,11 @@ async def handle_block_sucker(server, player, packet):
     out.loop_count = int(getattr(server, "loop_count", 0))
     out.shooter_id = player.id
     out.state = state
-    out.shot = int(shot)
+    out.shot = int(accepted_shot)
     server.broadcast(bytes(out.generate()))
 
-    if not shot or state != int(C.BLOCK_SUCKER_STATE_FULL_POWER):
+    if not accepted_shot:
         return
-    now = time.monotonic()
-    if now < float(getattr(player, "_block_sucker_next_shot", 0.0)):
-        return
-    player._block_sucker_next_shot = now + float(C.BLOCK_SUCKER_SHOOT_INTERVAL)
 
     direction = player.orientation
     hit = server.world_manager.raycast(

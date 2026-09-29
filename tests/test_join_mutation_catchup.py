@@ -7,6 +7,7 @@ from server.connection import Connection
 from server.game_constants import TEAM1
 from server.main import BattleSpadesServer
 from server.player import Player
+from server.prefab_actions import encode_block_manager_state
 from shared.bytes import ByteReader
 from shared.packet import (
     BlockBuild,
@@ -61,6 +62,19 @@ class CanonicalRecordingConnection(RecordingConnection):
         self.map_cell_watermark = None
         self.map_cell_overflow = False
         self.map_cell_replay = None
+        # Canonical replay pins every solid cell's colour with a PaintBlock(7)
+        # after its BlockBuildColored(33): the stock client ignores 33 on an
+        # already-solid voxel. Keep those apart so geometry assertions stay
+        # about 33/Damage order.
+        self.paints = []
+
+    def send(self, data, reliable=True, prefix=0x30):
+        from shared.packet import PaintBlockPacket
+
+        if bytes(data)[:1] == bytes((PaintBlockPacket.id,)):
+            self.paints.append(bytes(data))
+            return
+        super().send(data, reliable, prefix)
 
 
 class FailSecondCanonicalSendConnection(CanonicalRecordingConnection):
@@ -131,11 +145,15 @@ def test_canonical_join_replay_coalesces_repeated_cell_edits_to_final_color():
 
     server.replay_map_mutations(joiner)
 
-    assert len(joiner.sent) == 1
+    # 33 re-creates the voxel (stock client stores it at 3.0 health); the
+    # BlockManagerState(38) row that follows pins the server's health (5.0
+    # for a plain voxel) so the joiner breaks it on the same hit.
+    assert [data[0] for data in joiner.sent] == [33, 38]
     packet = BlockBuildColored(ByteReader(joiner.sent[0][1:]))
     assert packet.player_id == joiner.player.id
     assert (packet.x, packet.y, packet.z) == cell
     assert packet.color == 0xA1B2C3
+    assert joiner.sent[1] == encode_block_manager_state([(*cell, 5.0)])
 
 
 def test_canonical_coalescing_preserves_supported_build_order_after_recolor():
@@ -153,7 +171,8 @@ def test_canonical_coalescing_preserves_supported_build_order_after_recolor():
     server.replay_map_mutations(joiner)
 
     packets = [
-        BlockBuildColored(ByteReader(data[1:])) for data in joiner.sent
+        BlockBuildColored(ByteReader(data[1:]))
+        for data in joiner.sent if data[0] == BlockBuildColored.id
     ]
     assert [
         (packet.x, packet.y, packet.z) for packet in packets
@@ -195,7 +214,10 @@ def test_canonical_join_snapshot_excludes_earlier_edits_and_catches_later_ones()
     assert server.world_manager.set_block(*after, True, 0x405060)
 
     server.replay_map_mutations(joiner)
-    packets = [BlockBuildColored(ByteReader(data[1:])) for data in joiner.sent]
+    packets = [
+        BlockBuildColored(ByteReader(data[1:]))
+        for data in joiner.sent if data[0] == BlockBuildColored.id
+    ]
     assert [(packet.x, packet.y, packet.z) for packet in packets] == [after]
 
 
@@ -220,14 +242,14 @@ def test_simultaneous_canonical_joiners_keep_independent_topology_watermarks():
             getattr(BlockBuildColored(ByteReader(data[1:])), name)
             for name in ("x", "y", "z")
         )
-        for data in second.sent
+        for data in second.sent if data[0] == BlockBuildColored.id
     }
     first_cells = {
         tuple(
             getattr(BlockBuildColored(ByteReader(data[1:])), name)
             for name in ("x", "y", "z")
         )
-        for data in first.sent
+        for data in first.sent if data[0] == BlockBuildColored.id
     }
     assert second_cells == {cell_b}
     assert first_cells == {cell_a, cell_b}
@@ -585,14 +607,81 @@ def test_real_handshake_replays_post_mapsync_mutations_before_ingame():
     packet.weapon_deployment_yaw = 0.0
     asyncio.run(connection.on_receive(bytes([0x30]) + bytes(packet.generate())))
 
-    # Palette and the reliable remote-only roster WorldUpdate precede exact
-    # canonical terrain replay.
-    assert sent[0][0] == 11
-    assert sent[1][0] == WorldUpdate.id
-    built = BlockBuildColored(ByteReader(sent[2][1:]))
-    destroyed = Damage(ByteReader(sent[3][1:]))
+    # The reliable remote-only roster WorldUpdate precedes exact canonical
+    # terrain replay. The joiner is the only player and never gets its own
+    # palette echoed (it may be a choice still in flight); PaintBlock(7)
+    # colour pins follow solid 33 cells.
+    from shared.packet import PaintBlockPacket
+
+    assert not any(data[0] == 11 for data in sent)
+    # BlockManagerState(38) health rows (after each solid 33 and the final
+    # reveal) are not geometry, nor is the join audio (22/24 ambience,
+    # 23 flush, 27/26 music) that deliberately precedes the catch-up.
+    geometry = [
+        data for data in sent
+        if data[0] not in (PaintBlockPacket.id, 38, 22, 23, 24, 26, 27)
+    ]
+    assert geometry[0][0] == WorldUpdate.id
+    built = BlockBuildColored(ByteReader(geometry[1][1:]))
+    destroyed = Damage(ByteReader(geometry[2][1:]))
     assert (built.x, built.y, built.z) == build_cell
     assert built.color == 0x123456
     assert tuple(int(value) for value in destroyed.position) == destroy_cell
     assert destroyed.chunk_check == 0
     assert connection.in_game is True
+
+
+
+def test_canonical_join_replay_pins_solid_cell_colour_with_paint():
+    from shared.packet import PaintBlockPacket
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = CanonicalRecordingConnection()
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+    cell = (10, 20, 61)
+    assert server.world_manager.set_block(*cell, True, 0xA1B2C3)
+    server.replay_map_mutations(joiner)
+    assert len(joiner.paints) == 1
+    paint = PaintBlockPacket(ByteReader(joiner.paints[0][1:]))
+    assert (paint.x, paint.y, paint.z) == cell
+    assert tuple(paint.color) == (0xA1, 0xB2, 0xC3)
+
+
+def test_reveal_starts_join_music_and_ambience_before_terrain_catch_up():
+    """The catch-up burst (hit/build effects) exhausts the stock client's
+    128 OpenAL sources; a music/ambience stream started after it fails
+    (live 2026-09-26). The streams must precede every replayed 33/37, go out
+    once per scene epoch, and each stream burst starts with the silent
+    AL-error flush."""
+    from shared.packet import PlayMusic, PlaySound
+
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    joiner = RecordingConnection(in_game=False)
+    joiner.server = server
+    local = Player(9, "Joining", TEAM1, C.RIFLE_TOOL, joiner)
+    joiner.player = local
+    local.spawn(100.5, 100.5, 59.75)
+    server.players = {local.id: local}
+    server.connections = {9: joiner}
+    server.mark_map_snapshot_complete(joiner)
+    server.broadcast(_block_build_bytes())
+    server.broadcast(_damage_bytes())
+
+    server.reveal_world_to(joiner)
+
+    ids = [data[0] for data in joiner.sent]
+    assert PlayMusic.id in ids and 22 in ids
+    first_stream = min(ids.index(PlayMusic.id), ids.index(22))
+    terrain = [i for i, pid in enumerate(ids) if pid in (BlockBuild.id, BlockBuildColored.id, Damage.id)]
+    assert terrain and first_stream < terrain[0]
+    flush = PlaySound(ByteReader(joiner.sent[ids.index(22) - 1][1:]))
+    assert ids[ids.index(22) - 1] == PlaySound.id and flush.volume == 0.0
+    assert ids[ids.index(PlayMusic.id) - 2] == PlaySound.id
+
+    before = len(joiner.sent)
+    joiner.in_game = False
+    server.reveal_world_to(joiner)
+    assert PlayMusic.id not in [data[0] for data in joiner.sent[before:]]

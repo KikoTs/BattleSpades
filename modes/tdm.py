@@ -33,6 +33,8 @@ class TDMMode(BaseMode):
     """
 
     name = "Team Deathmatch"
+    # Reloading Kill / Defend / Distraction (BaseMode._award_teamplay_kill_events).
+    GENERIC_TEAMPLAY_AWARDS = True
     description = "Eliminate the enemy team to score points!"
 
     # Points per event.
@@ -67,6 +69,9 @@ class TDMMode(BaseMode):
         for team in self.server.teams.values():
             team.reset()
 
+        # Retail start cue to everyone in the scene at every round start
+        # (an in-place restart included); late joiners get it on reveal.
+        self.broadcast_start_cue()
         logger.info(
             "TDM mode started (score_limit=%d, time_limit=%.0fs)",
             self.score_limit, self.time_limit,
@@ -78,7 +83,7 @@ class TDMMode(BaseMode):
         if (self.ended or killer is victim or killer.team == victim.team
                 or killer.team not in (TEAM1, TEAM2) or victim.team not in (TEAM1, TEAM2)):
             return
-        from server.scoreboard import send_player_score, send_team_score
+        from server.scoreboard import send_team_score
 
         points = self.kill_points
         if kill_type == KILL_HEADSHOT:
@@ -89,17 +94,10 @@ class TDMMode(BaseMode):
             return
         team.add_score(points)
 
-        # Personal scoreboard: the client's per-player column. Award the
-        # generic per-kill score (100, +50 headshot) so the leaderboard fills.
+        # Personal scoreboard column: BaseMode awards the generic retail
+        # per-kill score (100 / 150 headshot / 150 melee) exactly once.
         # (killer.kills is already incremented in Player.die.)
-        if kill_type == KILL_HEADSHOT:
-            amount, reason = CG.GENERIC_SCORE_HEADSHOT, C.KILL_SCORE_HEADSHOT_REASON
-        elif kill_type == KILL_MELEE:
-            amount, reason = CG.GENERIC_SCORE_MELEE, C.KILL_SCORE_MELEE_REASON
-        else:
-            amount, reason = CG.GENERIC_SCORE_KILL, C.KILL_SCORE_REASON
-        killer.score += int(amount)
-        send_player_score(self.server, killer, reason=int(reason))
+        await super().on_player_kill(killer, victim, kill_type)
 
         # Audio stingers: a "good" cue to the killer, a "bad" cue to the victim.
         from server.audio import play_sound_to, SND_EVENT_POSITIVE, SND_EVENT_NEGATIVE
@@ -112,36 +110,17 @@ class TDMMode(BaseMode):
         # (reloads prefabs / UGC palette) and crashes.
         send_team_score(self.server, team)
 
-        if team.score >= self.score_limit:
+        if self.score_limit > 0 and team.score >= self.score_limit:
             await self._end_by_score(killer.team)
 
-    async def on_player_death(self, player, killer, kill_type: int) -> None:
-        """Apply retail personal penalties without changing the team kill count."""
-        if self.ended or kill_type in {
-            C.FORCED_TEAM_CHANGE_KILL, C.TEAM_CHANGE_KILL, C.CLASS_CHANGE_KILL
-        }:
-            return
-        from server.scoreboard import send_player_score
-        if killer is player or killer is None:
-            player.score += int(CG.GENERIC_SCORE_SUICIDE)
-            send_player_score(self.server, player, reason=int(C.SUICIDE_SCORE_REASON))
-        elif killer.team == player.team:
-            killer.score += int(CG.GENERIC_SCORE_TEAMKILL)
-            send_player_score(self.server, killer, reason=int(C.KILL_SCORE_TEAMKILL_REASON))
+    def start_cue_for(self, player):
+        return "TEAM_DEATHMATCH_START"
+
+    def reveal_to(self, connection) -> None:
+        """Retail mode-start cue for a settled GameScene."""
+        super().reveal_to(connection)
+        self.send_start_cue_to(connection)
 
     async def on_tick(self, tick: int):
-        """Periodic lead announcements."""
+        """Retail TDM has no lead announcements; the HUD shows both scores."""
         await super().on_tick(tick)
-        if self.ended:
-            return
-
-        # Every 60s, announce the lead.
-        if tick % (60 * self.server.tick_rate) == 0 and tick > 0:
-            blue = self.server.teams[TEAM1].score
-            green = self.server.teams[TEAM2].score
-            if blue != green:
-                leader = TEAM1 if blue > green else TEAM2
-                name = self.server.teams[leader].name
-                await self.broadcast_message(f"{name} leads by {abs(blue - green)} points!")
-            else:
-                await self.broadcast_message("Teams are tied!")

@@ -78,7 +78,9 @@ class Team:
         return point
     
     def add_score(self, points: int = 1):
-        """Add to team score."""
+        """Add to team score (unchanged while TeamLockScore(81) is on)."""
+        if getattr(self, "locked_score", False):
+            return
         self.score += points
     
     def add_capture(self):

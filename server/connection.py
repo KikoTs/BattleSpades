@@ -6,6 +6,7 @@ Handles map transfer and player state.
 import asyncio
 import inspect
 import logging
+import time
 import zlib
 from typing import Optional, TYPE_CHECKING, Dict, Type
 
@@ -117,7 +118,9 @@ SPAWN_HP_DAMAGE_TYPE = 2
 # WorldUpdate's embedded entity rows.  Letting an accidental five-byte packet
 # 3 escape makes the retail client read a missing short count and terminate
 # with NoDataLeft, so keep this unused packet closed at the final wire boundary.
-_BLOCKED_OUTBOUND_PACKET_IDS = frozenset({3})
+# 3: never a server packet. 65 ProgressBar: hud.pyd ProgressBar.draw calls
+# draw_progress_bar with 7 args (it takes 5) -> TypeError kills the client.
+_BLOCKED_OUTBOUND_PACKET_IDS = frozenset({3, 65})
 
 
 def outbound_packet_is_safe(data: bytes, *, cosmetic_capable: bool = False) -> bool:
@@ -170,6 +173,10 @@ class Connection:
         self.map_sent = False
         self._map_sync_generation = 0
         self.state_sent = False
+        # Map ambience + music went out on this scene epoch's world reveal.
+        self.join_audio_sent = False
+        # True while one NewPlayerConnection is being processed.
+        self._joining = False
         self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
         self.flight_profile = RETAIL_FLIGHT
         self.flight_profile_capable = False
@@ -228,8 +235,21 @@ class Connection:
         # without this proof InitialInfo must never be sent into GameScene.
         self._scene_transition_ready: asyncio.Event | None = None
     
-    def send(self, data: bytes, reliable: bool = True, prefix: int = 0x30):
-        """Send packet to this connection."""
+    def send(
+        self,
+        data: bytes,
+        reliable: bool = True,
+        prefix: int = 0x30,
+        *,
+        unsequenced: bool = False,
+    ):
+        """Send packet to this connection.
+
+        ``unsequenced`` selects ``ENET_PACKET_FLAG_UNSEQUENCED`` (overrides
+        ``reliable``): the packet bypasses channel 0's sequence gate, so it
+        is never held behind a lost reliable packet.  Retail uses it for the
+        ClockSync request (``send_packet(packet, unreliable=True)``).
+        """
         # ENetPeer storage belongs to the server's ENet Host.  This check must
         # precede logging (``peer.address`` also enters the native wrapper),
         # compression, and packet allocation so a delayed coroutine cannot
@@ -277,7 +297,10 @@ class Connection:
         # Match the known-good retail transport path. ENet flag zero keeps
         # ordinary WorldUpdate packets sequenced but unreliable; reliable
         # delivery is reserved for explicit transitions and control traffic.
-        flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
+        if unsequenced:
+            flags = enet.PACKET_FLAG_UNSEQUENCED
+        else:
+            flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
         packet = enet.Packet(prefixed_data, flags)
         self.peer.send(0, packet)
         
@@ -286,6 +309,7 @@ class Connection:
     def disconnect(self, reason: int = 0):
         """Disconnect this peer."""
         self._map_sync_generation += 1
+        self.disconnect_reason = int(reason)
         if getattr(self.server, "_stopping", False):
             return
         self.peer.disconnect(reason)
@@ -325,7 +349,12 @@ class Connection:
             self.server.loop_count
             + int(getattr(self.server.config, "clock_sync_loop_bias", 0))
         )
-        self.send(bytes(packet.generate()))
+        # Retail sends the request unsequenced (gs send_clock_sync ->
+        # send_packet(..., True)).  A reliable reply could sit behind a lost
+        # reliable packet and inflate the client's measured latency, so the
+        # reply is unsequenced too: a lost reply is simply replaced by the
+        # next one (every CLOCK_SYNC_RATE = 60 loops).
+        self.send(bytes(packet.generate()), reliable=False, unsequenced=True)
 
     def _cache_pre_join_loadout(self, packet: SetClassLoadout):
         """Normalize and store one complete selection for the first spawn."""
@@ -344,7 +373,9 @@ class Connection:
         self.pending_prefabs = list(selection.prefabs)
         self.pending_ugc_tools = list(selection.ugc_tools)
 
-    def _resolve_join_team(self, wire_team: int) -> tuple[int, int]:
+    def _resolve_join_team(
+        self, wire_team: int, *, balance: bool = True
+    ) -> tuple[int, int]:
         """Resolve the initial team without coercing a spectator into Blue."""
         internal_team = wire_team_to_internal(wire_team)
         if internal_team == TEAM_SPECTATOR:
@@ -361,6 +392,13 @@ class Connection:
             prepare_team = getattr(self.server.mode, "prepare_join_team", None)
             if callable(prepare_team):
                 internal_team = int(prepare_team(internal_team))
+            elif balance:
+                requested = internal_team
+                internal_team = self._balance_join_team(internal_team)
+                # They picked one side and will spawn on the other: tell
+                # them (retail TEAM_FULL "Team is full. Auto-balancing...")
+                # once they are in the GameScene.
+                self._join_rebalanced = internal_team != requested
             return internal_team, internal_team_to_wire(internal_team)
 
         fallback_internal = wire_team_to_internal(DEFAULT_WIRE_TEAM)
@@ -379,7 +417,114 @@ class Connection:
         prepare_team = getattr(self.server.mode, "prepare_join_team", None)
         if callable(prepare_team):
             fallback_internal = int(prepare_team(fallback_internal))
+        elif balance:
+            fallback_internal = self._balance_join_team(fallback_internal)
         return fallback_internal, internal_team_to_wire(fallback_internal)
+
+    def _send_join_rebalance_notice(self) -> None:
+        """TEAM_FULL to a joiner the join balance moved (after the reveal)."""
+        if not getattr(self, "_join_rebalanced", False):
+            return
+        self._join_rebalanced = False
+        from server.announcements import build_localised_overlay
+
+        try:
+            self.send(build_localised_overlay("TEAM_FULL"))
+        except Exception:  # noqa: BLE001 - presentation only
+            logger.debug("join TEAM_FULL notice failed", exc_info=True)
+
+    def _balance_join_team(self, requested: int) -> int:
+        """Apply ``[teams] auto_balance`` to a joiner's requested team.
+
+        When the requested side already has ``balance_threshold`` or more
+        players than the other, the joiner goes to the smaller side. Modes
+        that assign teams themselves (``prepare_join_team``: Zombie, ...)
+        never reach here.
+        """
+        config = self.server.config
+        if not bool(getattr(config, "auto_balance", False)):
+            return requested
+        if requested not in (TEAM1, TEAM2):
+            return requested
+        threshold = max(1, int(getattr(config, "balance_threshold", 2) or 1))
+        other = TEAM2 if requested == TEAM1 else TEAM1
+        counts = {TEAM1: 0, TEAM2: 0}
+        for player in getattr(self.server, "players", {}).values():
+            if player is self.player:
+                continue
+            team = int(getattr(player, "team", -1))
+            if team in counts:
+                counts[team] += 1
+        if counts[requested] - counts[other] >= threshold:
+            logger.info(
+                "Auto-balance: joiner moved from team %s (%d) to team %s (%d)",
+                requested, counts[requested], other, counts[other],
+            )
+            return other
+        return requested
+
+    def _enforce_join_class(self, selection, internal_team: int):
+        """Replace a join class the rules or the mode do not offer.
+
+        The in-game class handlers refuse such a class; the join path used to
+        accept it verbatim (a disabled or mode-foreign class spawned).
+        """
+        if internal_team == TEAM_SPECTATOR:
+            return selection
+        from server.class_selection import normalize_server_selection
+        from server.handlers.equipment import fallback_class_id, is_class_selectable
+
+        # Modes with their own class policy (VIP, Classic CTF, Tutorial, UGC)
+        # apply it right after this through prepare_join_selection.
+        if is_class_selectable(self.server, selection.class_id):
+            return selection
+        fallback = fallback_class_id(self.server)
+        if fallback is None:
+            return selection
+        replacement = normalize_server_selection(
+            self.server.config, fallback, fallback_class_id=fallback
+        )
+        logger.info(
+            "Join class %s is not available; using class %s",
+            selection.class_id,
+            replacement.class_id,
+        )
+        return replacement
+
+    def _send_join_death(self, player) -> None:
+        """Put the joiner's own Character into the dead/awaiting state.
+
+        Same representation as the roster repair for a dead player
+        (CreatePlayer followed by KillAction, see roster.send_player_death):
+        the client binds its local id from CreatePlayer, then KillAction
+        switches it to the death camera with the mode's respawn countdown.
+        """
+        from shared.packet import KillAction
+        from server.roster import known_player_deaths, player_life_token
+
+        respawn_time_for = getattr(self.server.mode, "respawn_time_for", None)
+        try:
+            respawn_time = (
+                float(respawn_time_for(player))
+                if callable(respawn_time_for)
+                else float(getattr(self.server.config, "respawn_time", 0))
+            )
+        except Exception:
+            respawn_time = 0.0
+        packet = KillAction()
+        packet.player_id = int(player.id)
+        packet.killer_id = int(player.id)
+        packet.kill_type = 0
+        packet.respawn_time = max(0, min(255, int(respawn_time)))
+        packet.kill_count = 0
+        packet.isDominationKill = 0
+        packet.isRevengeKill = 0
+        data = bytes(packet.generate())
+        player.last_kill_action_data = data
+        self.send(data)
+        known_player_deaths(self)[int(player.id)] = player_life_token(player)
+        # Lets reveal_world_to deliver a first life begun while still gated.
+        self.join_death_token = player_life_token(player)
 
     def _send_spawn_hp(self, hp: int = 100):
         """Send the initial HP packet expected immediately after first spawn."""
@@ -485,6 +630,7 @@ class Connection:
                     prune()
                 from server.join_greeting import send_join_greeting
                 send_join_greeting(self)
+                self._send_join_rebalance_notice()
             except Exception:
                 # Keep the connection gated so the next ClientData retries the
                 # complete reveal instead of admitting a partially synced
@@ -523,6 +669,9 @@ class Connection:
     def arm_scene_transition(self) -> None:
         """Require a fresh loader acknowledgement for the next scene epoch."""
 
+        # A NewPlayerConnection still awaiting the Revival bridge belongs to
+        # the retiring scene; the epoch bump makes it abandon the join.
+        self._map_sync_generation += 1
         self.in_menu = False
         self._scene_transition_ready = asyncio.Event()
 
@@ -684,9 +833,42 @@ class Connection:
         
         # NewPlayerConnection (15)
         elif packet_id == 15:
+            # The stock client (Steam or ticket-less legacy: both send
+            # SteamSessionTicket(105), the legacy one with an empty ticket)
+            # only offers team/class selection after InitialInfo -> MapSync
+            # -> StateData. A NewPlayerConnection before StateData was sent
+            # skipped map validation and the id reservation, so it can only
+            # come from a forged client: ignore it.
+            if not self.state_sent or not self.map_sent:
+                logger.debug(
+                    "Ignoring NewPlayerConnection from %s before the join "
+                    "handshake completed (map_sent=%s state_sent=%s)",
+                    self.peer.address,
+                    self.map_sent,
+                    self.state_sent,
+                )
+                return
+            if self._scene_transition_ready is not None:
+                # MapEnded already retired this scene (a team was picked as
+                # the round ended). The replacement handshake follows; the
+                # client selects again on the new map.
+                logger.debug(
+                    "Ignoring NewPlayerConnection from %s during scene transition",
+                    self.peer.address,
+                )
+                return
+            if self._joining:
+                # A duplicate while the first join awaits the Revival bridge
+                # would build two Players for one peer.
+                logger.debug("Ignoring duplicate NewPlayerConnection")
+                return
             logger.debug(f"Decoding NewPlayerConnection")
             packet = NewPlayerConnection(reader)
-            await self._on_new_player(packet)
+            self._joining = True
+            try:
+                await self._on_new_player(packet)
+            finally:
+                self._joining = False
         elif packet_id == SetClassLoadout.id:
             packet = decode_runtime_packet(packet_id, data[1:])
             if packet is None:  # Defensive fallback; packet 13 has a runtime decoder.
@@ -746,6 +928,8 @@ class Connection:
         self.reserved_player_id = None
         self.map_sent = False
         self.state_sent = False
+        # Map ambience + music went out on this scene epoch's world reveal.
+        self.join_audio_sent = False
         self.pending_selection = None
         self.pending_class_id = None
         self.pending_loadout = []
@@ -1072,6 +1256,10 @@ class Connection:
         revival_master = getattr(self.server, "revival_master", None)
         identity = None
         requested_name = str(packet.name or "")
+        # A map/mode rollover (or disconnect) during the awaits below retires
+        # this scene; building a Player afterwards would attach it to the
+        # replacement map before its handshake ran.
+        scene_generation = self._map_sync_generation
         if is_join_code(requested_name):
             if revival_master is None:
                 logger.warning(
@@ -1101,6 +1289,12 @@ class Connection:
                 self.disconnect(reason=int(DISCONNECT.ERROR_TIMEOUT))
                 return
             requested_name = identity.nickname
+            if self._map_sync_generation != scene_generation:
+                logger.info(
+                    "Abandoned join from %s: scene changed during ticket check",
+                    self.peer.address,
+                )
+                return
         elif bool(
             getattr(
                 getattr(self.server.config, "revival", None),
@@ -1127,6 +1321,8 @@ class Connection:
                 make_room = getattr(getattr(self.server, "bots", None), "make_room_for_human", None)
                 if callable(make_room) and await make_room():
                     player_id = self.server.get_next_player_id()
+                if self._map_sync_generation != scene_generation:
+                    return
         if player_id < 0:
             logger.warning("Server full, rejecting connection")
             self.disconnect(reason=int(DISCONNECT.ERROR_FULL))
@@ -1136,7 +1332,9 @@ class Connection:
         weapon = DEFAULT_WEAPON_TOOL
         assigned_team = getattr(identity, "assigned_team", None)
         internal_team, wire_team = self._resolve_join_team(
-            assigned_team if assigned_team in {2, 3} else packet.team
+            assigned_team if assigned_team in {2, 3} else packet.team,
+            # A host-assigned team (Revival matchmaking) is authoritative.
+            balance=assigned_team not in {2, 3},
         )
         is_spectator = internal_team == TEAM_SPECTATOR
         from server.player_names import allocate_unique_player_name
@@ -1144,6 +1342,14 @@ class Connection:
         player_name = allocate_unique_player_name(
             requested_name,
             self.server.players.values(),
+            extra_reserved=tuple(
+                getattr(
+                    getattr(self.server.config, "conduct", None),
+                    "reserved_names",
+                    (),
+                )
+                or ()
+            ),
         )
         if player_name != requested_name:
             logger.info(
@@ -1167,6 +1373,7 @@ class Connection:
             self.pending_ugc_tools,
             fallback_class_id=packet.class_id,
         )
+        selection = self._enforce_join_class(selection, internal_team)
         prepare_selection = getattr(
             self.server.mode, "prepare_join_selection", None
         )
@@ -1266,9 +1473,23 @@ class Connection:
         # server id — deliver it directly (one packet is safe mid-transition).
         # Other players only learn about the joiner once THEY'RE in-game, so
         # broadcast (gameplay-gated) reaches just settled clients.
+        # A mode may forbid a life right now (VIP sudden death, an Arena
+        # round in progress, the end-of-round screen). Such a joiner enters
+        # dead and awaiting respawn; RoundLifecycle.process_respawns creates
+        # the first life once can_player_respawn allows it.
+        can_respawn = getattr(self.server.mode, "can_player_respawn", None)
+        joins_dead = bool(
+            not is_spectator
+            and callable(can_respawn)
+            and not can_respawn(player)
+        )
+
         create_bytes = bytes(create_packet.generate())
         self.send(create_bytes)
-        self.server.broadcast(create_bytes, exclude=player)
+        if not joins_dead:
+            # A dead joiner has no body for others to see; like any other
+            # dead player it is announced to peers by its first respawn.
+            self.server.broadcast(create_bytes, exclude=player)
 
         # CreatePlayer carries no block palette. Publish it immediately after
         # character creation to both the joining client and settled peers;
@@ -1279,7 +1500,9 @@ class Connection:
         color_packet.value = int(player.block_color) & 0xFFFFFF
         color_bytes = bytes(color_packet.generate())
         self.send(color_bytes)
-        self.server.broadcast(color_bytes, exclude=player)
+        if not joins_dead:
+            # Peers do not know a dead joiner's id yet (see above).
+            self.server.broadcast(color_bytes, exclude=player)
         
         # Team 0 is a roster/camera state, not a Character simulation state.
         # Calling Player.spawn here is the exact bug that produced a visible
@@ -1289,18 +1512,27 @@ class Connection:
             player.alive = False
             player.spawned = False
             player.death_time = 0.0
+        elif joins_dead:
+            player.set_position(spawn[0], spawn[1], spawn[2])
+            player.alive = False
+            player.spawned = False
+            # A positive death time arms the ordinary respawn path.
+            player.death_time = time.time()
         else:
             player.spawn(spawn[0], spawn[1], spawn[2])
         from server.roster import remember_player_life
         remember_player_life(self, player)
-        # broadcast() delivered CreatePlayer only to settled connections.
-        # Record exactly those recipients so first-frame catch-up can identify
-        # clients that were still gated and therefore missed this new life.
-        for other in self.server.connections.values():
-            if other is self or not getattr(other, "in_game", False):
-                continue
-            remember_player_life(other, player)
-        if not is_spectator:
+        if joins_dead:
+            self._send_join_death(player)
+        else:
+            # broadcast() delivered CreatePlayer only to settled connections.
+            # Record exactly those recipients so first-frame catch-up can
+            # identify clients that were still gated and missed this life.
+            for other in self.server.connections.values():
+                if other is self or not getattr(other, "in_game", False):
+                    continue
+                remember_player_life(other, player)
+        if not is_spectator and not joins_dead:
             self._send_spawn_hp()
         if getattr(self.server, 'debug_parity', None) is not None:
             self.server.debug_parity.on_player_join(player)
@@ -1308,6 +1540,31 @@ class Connection:
         # Notify game mode
         if self.server.mode and not is_spectator:
             await self.server.mode.on_player_join(player)
+        if not is_spectator:
+            # Retail PLAYER_JOINED ("{0} has joined {1}"): the string exists
+            # only in the client's table, so the original server sent it as
+            # a localised overlay. broadcast() is gameplay-gated, so the
+            # joiner (not yet settled) never receives its own line.
+            team = getattr(self.server, "teams", {}).get(int(getattr(player, "team", -1)))
+            if team is not None:
+                from server.announcements import broadcast_localised_overlay
+
+                try:
+                    # localise_parameters is needed for the team id, but the
+                    # client would also look the NAME up (strings.get_by_id
+                    # = globals()[id]): a player called "OK" or "MAP" would
+                    # show the translated word.  A trailing space can never
+                    # be a string-table key and is invisible on screen.
+                    from server.announcements import localisation_safe_name
+
+                    broadcast_localised_overlay(
+                        self.server,
+                        "PLAYER_JOINED",
+                        (localisation_safe_name(player.name), str(team.name)),
+                        localise_parameters=True,
+                    )
+                except ValueError:
+                    logger.debug("PLAYER_JOINED skipped for %r", player.name)
 
         # NB: the live roster + map entities are revealed to this client on its
         # FIRST ClientData (server.reveal_world_to), i.e. once it's actually in

@@ -8,12 +8,15 @@ historic random rollback bug.
 
 from __future__ import annotations
 
+import math
+import zlib
 from typing import Optional, TYPE_CHECKING
 
 import shared.constants as C
 from shared.packet import WorldUpdate
 
 from server.class_selection import equipped_tool_authorized
+from server.lag_compensation import shooter_rtt_ms
 
 if TYPE_CHECKING:
     from .main import BattleSpadesServer
@@ -33,6 +36,71 @@ _WORLD_UPDATE_TRAILER_MIN_SIZE = 4  # entity count + turret count
 _WORLD_UPDATE_WEAPON_ACTION_MASK = 0x01 | 0x02 | 0x10 | 0x40 | 0x80
 
 
+def wire_entity_id(entity_id: int) -> int:
+    """Return the signed-short value the retail client knows ``entity_id`` by.
+
+    EntityRegistry allocates uint16 ids (0..65535).  CreateEntity/Entity rows,
+    DestroyEntity and ChangeEntity declare ``entity_id`` as a C ``int`` and
+    write it through ``write_short(short)``, so Cython truncates ids above
+    32767 to their two's-complement short (40000 -> -25536) and the client
+    reads that same signed value back.  WorldUpdate's rocket-turret rows pass
+    a Python object instead, which Cython range-checks and raises
+    ``OverflowError`` on.  Converting here produces identical wire bytes to
+    the CreateEntity the client received for the same turret.
+    """
+
+    return ((int(entity_id) + 0x8000) & 0xFFFF) - 0x8000
+
+
+def _wire_turret_row(row) -> tuple:
+    entity_id, yaw, pitch = row[0], row[1], row[2]
+    return (wire_entity_id(entity_id), float(yaw), float(pitch))
+
+
+# Scoreboard ping.  The retail client copies each WorldUpdate row's signed
+# short ``ping`` (row offset +37) into ``player.ping`` and the scoreboard
+# prints ``str(player.ping)`` in its PING column, so the unit is whole
+# milliseconds.  Clamp to three digits: the column is narrow and a peer this
+# far gone is about to time out anyway.
+WIRE_PING_MAX_MS = 999
+# Bots have no network peer.  A fixed 0 marks every bot on the scoreboard, so
+# each bot shows a stable, plausible ping of its own with a few milliseconds of
+# drift, re-rolled about every two seconds (120 loops at 60 Hz).
+_BOT_PING_BASE_MS = (24, 72)
+_BOT_PING_JITTER_MS = 3
+_BOT_PING_BUCKET_LOOPS = 120
+
+
+def human_ping_ms(player) -> int:
+    """Return one human's ENet smoothed round trip in whole milliseconds."""
+
+    # Same accessor lag compensation rewinds by (ENet peer.roundTripTime).
+    rtt = shooter_rtt_ms(player)
+    if not math.isfinite(rtt) or rtt <= 0.0:
+        return 0
+    return int(min(WIRE_PING_MAX_MS, round(rtt)))
+
+
+def bot_ping_ms(player, loop_count: int) -> int:
+    """Return a bot's stable per-bot ping with slow, small drift."""
+
+    seed = "%s:%s" % (getattr(player, "name", ""), getattr(player, "id", 0))
+    low, high = _BOT_PING_BASE_MS
+    base = low + zlib.crc32(seed.encode("utf-8", "replace")) % (high - low + 1)
+    bucket = max(0, int(loop_count)) // _BOT_PING_BUCKET_LOOPS
+    drift = zlib.crc32(("%s#%d" % (seed, bucket)).encode("utf-8", "replace"))
+    jitter = drift % (2 * _BOT_PING_JITTER_MS + 1) - _BOT_PING_JITTER_MS
+    return int(max(1, min(WIRE_PING_MAX_MS, base + jitter)))
+
+
+def wire_ping_ms(player, loop_count: int) -> int:
+    """Return the scoreboard ping carried in ``player``'s WorldUpdate row."""
+
+    if bool(getattr(player, "is_bot", False)):
+        return bot_ping_ms(player, loop_count)
+    return human_ping_ms(player)
+
+
 class ReplicationService:
     """Build and broadcast immutable 30 Hz WorldUpdate snapshots.
 
@@ -46,6 +114,9 @@ class ReplicationService:
         self._last_broadcast_bucket: Optional[int] = None
         self._last_self_row_loop: dict[int, int] = {}
         self._last_advertised_jetpack_active: dict[int, bool] = {}
+        # Parachute canopy (state bit 0x01) is also server-owned on the retail
+        # client: send its transitions as urgent owner rows like the jetpack.
+        self._last_advertised_parachute_active: dict[int, bool] = {}
 
     def forget_player(self, player_id: int) -> None:
         """Discard recipient state at disconnect or a new-life boundary.
@@ -59,6 +130,7 @@ class ReplicationService:
         player_id = int(player_id)
         self._last_self_row_loop.pop(player_id, None)
         self._last_advertised_jetpack_active.pop(player_id, None)
+        self._last_advertised_parachute_active.pop(player_id, None)
 
     def broadcast_world_updates(self) -> None:
         """Send one grouped snapshot at the configured retail cadence."""
@@ -132,6 +204,10 @@ class ReplicationService:
                 and player is not None
                 and self.self_row_is_safe(player)
                 and player.last_applied_input_loop is not None
+                # A refilled lost frame is a guess about a label the client
+                # simulated with inputs the server never saw; never stamp an
+                # owner row with it (see Player._synthesize_missing_frame).
+                and not getattr(player, "last_applied_input_synthesized", False)
                 and (
                     player.id in urgent_player_ids
                     or (
@@ -302,7 +378,11 @@ class ReplicationService:
             advertised = self._last_advertised_jetpack_active.get(
                 player.id, False
             )
-            if active != advertised:
+            canopy = bool(getattr(player, "parachute_active", False))
+            canopy_advertised = self._last_advertised_parachute_active.get(
+                player.id, False
+            )
+            if active != advertised or canopy != canopy_advertised:
                 urgent.append(connection)
         return urgent
 
@@ -366,6 +446,9 @@ class ReplicationService:
         self._last_self_row_loop[player.id] = self.server.loop_count
         self._last_advertised_jetpack_active[player.id] = bool(
             getattr(player, "jetpack_active", False)
+        )
+        self._last_advertised_parachute_active[player.id] = bool(
+            getattr(player, "parachute_active", False)
         )
         snapshot = getattr(player, "world_update_snapshot", None)
         if callable(snapshot):
@@ -451,13 +534,21 @@ class ReplicationService:
             snapshot = self._sanitize_player_snapshot(
                 player, player.world_update_snapshot()
             )
+            # Player.world_update_snapshot leaves the ping field 0; the
+            # scoreboard's PING column reads it, so fill in the real value.
+            snapshot = (
+                snapshot[:3]
+                + (wire_ping_ms(player, world_update.loop_count),)
+                + snapshot[4:]
+            )
             if player_id == local_player_id:
                 snapshot = snapshot[:9] + (0xFF,) + snapshot[10:]
             world_update[player_id] = snapshot
 
         world_update.updated_entities = list(server.entities.values())
         world_update.rocket_turrets = [
-            turret.world_update() for turret in server.rocket_turrets.values()
+            _wire_turret_row(turret.world_update())
+            for turret in server.rocket_turrets.values()
         ]
         return world_update
 

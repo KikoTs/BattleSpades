@@ -1,29 +1,128 @@
 BattleSpades Third-Party Notices
 ================================
 
-Portable archives contain or are produced with CPython (PSF License),
-PyInstaller (GPL-2.0-or-later with bootloader exception), pyenet (BSD-3-Clause),
-ENet (MIT), Cython (Apache-2.0), toml (MIT), and py_trees (BSD-3-Clause).
+BattleSpades is licensed under the GNU Affero General Public License v3.0 or
+later (AGPL-3.0-or-later); see LICENSE and LICENSING.md. The components below
+keep their own licenses, all of which are compatible with the AGPL.
+
+Portable archives contain or are produced with CPython 3.12 (PSF-2.0, plus
+the licenses of CPython's bundled libraries), PyInstaller 6.11.1 (GPL-2.0-or-
+later with the bootloader exception, which permits distributing the produced
+executables under any terms), Cython 3.0.12 (Apache-2.0), toml 0.10.2 (MIT),
+py_trees 2.5.0 (BSD-3-Clause), pydot and pyparsing (MIT), pyenet 1.3.17
+(BSD-3-Clause), ENet 1.3.17 (MIT) and Recast/Detour 1.6.0 (Zlib). Full texts
+for the compiled-in components follow.
 
 Valve Steam runtime files are not part of BattleSpades archives. Optional
 master-server registration loads only operator-supplied copies at runtime.
+
+Game content: the VXL maps, map sidecars and KV6 prefabs in this archive are
+Ace of Spades game content owned by their respective rights holders (Ace of
+Spades was created by Ben Aksoy and published by Jagex). They are included for
+preservation and compatibility, are not licensed under the AGPL, and are
+separate works distributed alongside it. No retail client code or executable
+is included.
+
+Earlier MIT-licensed code
+-------------------------
+
+Releases up to and including v0.1.0-beta.1 were published under the MIT
+License and remain available under it. Code from that period, now part of
+the AGPL work, keeps this notice:
+
+MIT License
+
+Copyright (c) 2026 KikoTs and the BattleSpades contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+pyenet
+------
+
+Copyright (C) 2003, Scott Robinson <scott@tranzoa.com>
+Copyright (c) 2009,2010 Andrew Resch <andrewresch@gmail.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the <ORGANIZATION> nor the names of its
+      contributors may be used to endorse or promote products derived from
+      this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+ENet
+----
+
+Copyright (c) 2002-2020 Lee Salzman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 Recast/Detour
 -------------
 
 Copyright (c) 2009 Mikko Mononen memon@inside.org
 
-This software is provided 'as-is', without any express or implied warranty.
-In no event will the authors be held liable for any damages arising from the
-use of this software.
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
 
 Permission is granted to anyone to use this software for any purpose,
-including commercial applications, and to alter it and redistribute it freely,
-subject to the following restrictions:
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
 
-1. The origin of this software must not be misrepresented; you must not claim
-   that you wrote the original software. An acknowledgment in product
-   documentation would be appreciated but is not required.
-2. Altered source versions must be plainly marked as such and must not be
-   misrepresented as being the original software.
+1. The origin of this software must not be misrepresented; you must not
+claim that you wrote the original software. If you use this software
+in a product, an acknowledgment in the product documentation would be
+appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.

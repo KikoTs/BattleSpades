@@ -466,4 +466,14 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+Copyright (c) 2026 Kiril Tsanov. BattleSpades is licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE)
+(`AGPL-3.0-or-later`). If you run a **modified** server that others connect
+to, you must offer those players its complete source code (AGPL section 13),
+for example with a link in `[server].motd`. See [`LICENSING.md`](LICENSING.md)
+for a short summary, the Steamworks permission and trademark notes, and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for bundled components and
+game content, which keep their own terms.
+
+Releases up to and including **v0.1.0-beta.1** were published under the MIT
+License and remain available under it for those copies.

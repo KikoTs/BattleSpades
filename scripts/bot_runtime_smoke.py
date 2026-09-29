@@ -29,6 +29,94 @@ if TYPE_CHECKING:
     from server.player import Player
 
 
+def _instrument_mode_objectives(server) -> Counter:
+    """Count the mode's objective events without changing its behaviour.
+
+    Demolition: objective blocks destroyed and re-placed (repairs). CTF:
+    intel pickups (and re-pickups of a dropped intel), drops, captures,
+    returns. Occupation: bomb spawns, pickups by team, drops, detonations.
+    """
+
+    events: Counter = Counter()
+    mode = server.mode
+    code = str(getattr(mode, "mode_code", "")).lower()
+
+    def wrap_async(name: str, before) -> None:
+        original = getattr(mode, name, None)
+        if original is None:
+            return
+
+        async def wrapped(*args, **kwargs):
+            before(*args, **kwargs)
+            return await original(*args, **kwargs)
+
+        setattr(mode, name, wrapped)
+
+    def wrap_sync(name: str, before) -> None:
+        original = getattr(mode, name, None)
+        if original is None:
+            return
+
+        def wrapped(*args, **kwargs):
+            before(*args, **kwargs)
+            return original(*args, **kwargs)
+
+        setattr(mode, name, wrapped)
+
+    if code == "dem":
+        def on_mutation(x, y, z, solid, color, topology_version):
+            if getattr(mode, "phase", "") not in ("active", "airstrike"):
+                return
+            cell = (int(x), int(y), int(z))
+            for team, cells in getattr(mode, "objective_cells", {}).items():
+                if cell in cells:
+                    events[f"team{team}_{'repaired' if solid else 'destroyed'}"] += 1
+        subscribe = getattr(server.world_manager, "subscribe_mutations", None)
+        if callable(subscribe):
+            subscribe(on_mutation)
+    elif code in ("ctf", "cctf"):
+        def pickup(player, intel_team):
+            events["intel_pickups"] += 1
+            if float(getattr(mode, "intel_drop_time", {}).get(intel_team, 0.0)) > 0.0:
+                events["dropped_intel_repicked"] += 1
+        wrap_async("_pickup_intel", pickup)
+        wrap_async("_drop_intel", lambda *a, **k: events.update(("intel_drops",)))
+        wrap_async("_capture_intel", lambda *a, **k: events.update(("intel_captures",)))
+        wrap_async("_return_intel", lambda *a, **k: events.update(("intel_returns",)))
+    elif code == "oc":
+        def bomb_pickup(player, bomb):
+            events[f"bomb_pickups_team{int(player.team)}"] += 1
+            if getattr(bomb, "armed", False):
+                events["armed_bomb_pickups"] += 1
+        wrap_sync("_pickup_bomb", bomb_pickup)
+        wrap_sync("_spawn_bomb", lambda *a, **k: events.update(("bomb_spawns",)))
+        wrap_async("_drop_bomb", lambda *a, **k: events.update(("bomb_drop_calls",)))
+        def detonate(bomb):
+            inside = False
+            try:
+                inside = bool(mode._bomb_inside_target(bomb.position))
+            except Exception:  # noqa: BLE001 - diagnostics only
+                pass
+            events["bomb_detonations_in_target" if inside else "bomb_detonations_outside"] += 1
+        wrap_async("_detonate_bomb", detonate)
+    return events
+
+
+def _objective_summary(server, events: Counter) -> dict:
+    summary = dict(events)
+    mode = server.mode
+    if str(getattr(mode, "mode_code", "")).lower() == "dem":
+        summary["destroyed_now"] = {
+            int(team): len(cells) for team, cells in getattr(mode, "destroyed_cells", {}).items()}
+        summary["objective_blocks"] = {
+            int(team): len(cells) for team, cells in getattr(mode, "objective_cells", {}).items()}
+        summary["phase"] = str(getattr(mode, "phase", ""))
+    if hasattr(mode, "teams") or hasattr(server, "teams"):
+        summary["scores"] = {int(team_id): int(getattr(team, "score", 0))
+                             for team_id, team in getattr(server, "teams", {}).items()}
+    return summary
+
+
 async def _run(
     *,
     seconds: float = 4.0,
@@ -88,6 +176,7 @@ async def _run(
         raise ValueError(f"unsupported mode: {config.default_mode}")
     server.mode = mode_class(server)
     await server.mode.on_mode_start()
+    objective_events = _instrument_mode_objectives(server)
     director = BotDirector(server)
     server.bots = director
     await director.start(initial_count=config.bots.max_bots)
@@ -625,6 +714,7 @@ async def _run(
             "planning_metrics": getattr(director.supervisor, "planning_metrics", lambda: {})(),
             "behavior_metrics": getattr(director.supervisor, "behavior_metrics", lambda: {})(),
             "role_samples": dict(role_samples), "action_results": dict(action_results),
+            "objective_events": _objective_summary(server, objective_events),
             "tick_ms": {"p95": sorted(tick_costs)[min(len(tick_costs) - 1, int(len(tick_costs) * .95))],
                         "p99": sorted(tick_costs)[min(len(tick_costs) - 1, int(len(tick_costs) * .99))],
                         "max": max(tick_costs, default=0)},
@@ -744,6 +834,7 @@ async def _run(
             f"bot_metrics={bot_metrics}",
             f"entities={[(entity.type, entity.player_id) for entity in server.entity_registry.all()]}",
         )
+        print("objective_events", json.dumps(_objective_summary(server, objective_events)))
     finally:
         if trace_stream is not None:
             trace_stream.close()

@@ -597,8 +597,10 @@ def test_diamond_mode_directive_performs_real_surface_mining() -> None:
 @pytest.mark.parametrize("previous_role", ("diamond_guard_dropoff", "combat_pursuit"))
 def test_unreachable_diamond_guard_mines_then_retries_without_abandoning_carried_loot(previous_role: str) -> None:
     observer = _player(8, TEAM1, (10., 10., 20.), is_bot=True)
+    # A lone bot never guards; the teammate makes observer the team's guard.
+    teammate = _player(9, TEAM1, (300., 300., 20.), is_bot=True)
     dropoff = ObjectiveSnapshot("dia_dropoff", int(C.TEAM_NEUTRAL), (80., 90., 20.), state=1)
-    frame = replace(_frame(observer, objectives=(dropoff,)), mode_id="dia")
+    frame = replace(_frame(observer, teammate, objectives=(dropoff,)), mode_id="dia")
     world = _TacticalWorld()
     world.solid = lambda *_args: True
     brain = SimpleBotBrain(world)
@@ -618,7 +620,7 @@ def test_unreachable_diamond_guard_mines_then_retries_without_abandoning_carried
     assert state.guard_retry_at == deadline
     # Carrying a diamond takes priority even during reassignment.
     carrier = replace(observer, carried_entity_id=int(C.DIAMOND_PICKUP))
-    brain.decide(replace(frame, frame_id=3, created_at=120., players=(carrier,)))
+    brain.decide(replace(frame, frame_id=3, created_at=120., players=(carrier, teammate)))
     state = brain._states[(observer.player_id, observer.generation)]
     assert state.goal is not None and state.goal.role == "diamond_cash_in"
     brain.decide(replace(frame, frame_id=4, created_at=deadline + 1.))

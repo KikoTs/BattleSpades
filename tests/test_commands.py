@@ -50,7 +50,7 @@ class FakePlayer:
 
 
 class FakeConfig:
-    admin_password = "secret"
+    admin_password = "long-enough-secret"
     log_commands = False
 
 
@@ -145,7 +145,7 @@ def test_ban_with_duration_persists(captured, tmp_path):
     assert entry is not None
     assert entry["reason"] == "spamming"
     assert entry["until"] > 0  # temporary ban has an expiry
-    assert target.disconnected == 1  # DISCONNECT_BANNED
+    assert target.disconnected == 19  # ERROR_TEMP_BANNED (timed ban)
     assert len(server.broadcasts) == 1
 
     # A fresh manager over the same file still sees the ban (persistence).
@@ -301,7 +301,9 @@ def test_bots_status_reports_worker_health(captured, tmp_path):
         status=lambda: SimpleNamespace(
             running=True,
             process_id=1234,
-            restarts=0,
+            restarts=15,
+            planned_recycles=15,
+            crash_restarts=0,
             queued_frames=2,
             queued_intents=1,
             pending_terrain_cells=7,
@@ -312,6 +314,7 @@ def test_bots_status_reports_worker_health(captured, tmp_path):
     run(server_cmds.cmd_bots(ctx(server, adminp, "status")))
 
     assert any("Bots=2 worker=up pid=1234" in message for _, message in captured)
+    assert any("recycles=15 crashes=0" in message for _, message in captured)
 
 
 def test_bots_difficulty_updates_new_profile_setting(captured, tmp_path):
@@ -435,46 +438,72 @@ def test_say_rejects_oversized_announcements(captured, tmp_path):
     assert any("too long" in message.lower() for _, message in captured)
 
 
-def test_balance_moves_and_respawns_players_through_replication_boundary(
-    captured, tmp_path
-):
+def test_balance_uses_the_retail_safe_balancer(captured, tmp_path, monkeypatch):
+    """Admin /balance: same rules as auto-balance (dead only, never a kill,
+    TEAM_FULL to each moved player), reported to the admin."""
+    from server.team_balance import TeamBalancer
+    import server.handlers.team as team_handlers
+
     server = FakeServer(BanManager(str(tmp_path / "bans.json")))
-    large = [FakePlayer(f"P{i}") for i in range(5)]
-    small = [FakePlayer("Other")]
-    team1 = server_cmds.TEAM1
-    team2 = server_cmds.TEAM2
-    server.teams = {
-        team1: SimpleNamespace(
-            name="Blue",
-            players=large,
-            remove_player=lambda player: large.remove(player),
-            add_player=lambda player: large.append(player),
-        ),
-        team2: SimpleNamespace(
-            name="Green",
-            players=small,
-            remove_player=lambda player: small.remove(player),
-            add_player=lambda player: small.append(player),
-        ),
-    }
-    for player in large:
-        player.team = team1
-    small[0].team = team2
-    respawned = []
-    mode_events = []
-    server.respawn_player = lambda player: respawned.append(player.name)
-    server.queue_mode_event = lambda *event: mode_events.append(event)
-    adminp = large[0]
-    expected_moved = [large[-1], large[-2]]
+    team1, team2 = server_cmds.TEAM1, server_cmds.TEAM2
+    roster = []
+    for index in range(5):
+        player = FakePlayer(f"P{index}")
+        player.id, player.team, player.is_bot = index, team1, False
+        player.connection = SimpleNamespace(in_game=True)
+        player.sent = []
+        player.send = player.sent.append
+        roster.append(player)
+    other = FakePlayer("Other")
+    other.id, other.team, other.is_bot = 9, team2, False
+    roster.append(other)
+    server.players = {player.id: player for player in roster}
+    server.mode = SimpleNamespace(started=True, ended=False)
+    server.bots = None
+    # P3 and P4 are dead; everyone else is alive and must not be killed.
+    for player in roster:
+        player.alive = player.name not in ("P3", "P4")
+    moves = []
 
-    run(server_cmds.cmd_balance(ctx(server, adminp)))
+    def fake_change_team(srv, player, new_team, *, force=False, explain=False):
+        assert force and not player.alive
+        moves.append(player.name)
+        player.team = new_team
+        return True
 
-    assert len(large) == len(small) == 3
-    assert respawned == ["P4", "P3"]
-    assert mode_events == [
-        ("on_player_team_change", expected_moved[0], team1, team2),
-        ("on_player_team_change", expected_moved[1], team1, team2),
-    ]
+    monkeypatch.setattr(team_handlers, "change_team", fake_change_team)
+    server.team_balance = TeamBalancer(server)
+
+    run(server_cmds.cmd_balance(ctx(server, roster[0])))
+
+    assert sorted(moves) == ["P3", "P4"]
+    assert all(player.alive for player in roster if player.name not in ("P3", "P4"))
+    assert any(b"TEAM_FULL" in data for name in ("P3", "P4")
+               for data in server.players[int(name[1])].sent)
+    assert any("2 player(s) moved" in message for _, message in captured)
+
+
+def test_balance_never_kills_live_players(captured, tmp_path, monkeypatch):
+    from server.team_balance import TeamBalancer
+
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    team1, team2 = server_cmds.TEAM1, server_cmds.TEAM2
+    roster = []
+    for index in range(4):
+        player = FakePlayer(f"P{index}")
+        player.id, player.is_bot = index, False
+        player.team = team1 if index else team2
+        player.connection = SimpleNamespace(in_game=True)
+        roster.append(player)
+    server.players = {player.id: player for player in roster}
+    server.mode = SimpleNamespace(started=True, ended=False)
+    server.bots = None
+    server.team_balance = TeamBalancer(server)
+    run(server_cmds.cmd_balance(ctx(server, roster[0])))
+    assert all(player.alive for player in roster)
+    assert [player.team for player in roster] == [team2, team1, team1, team1]
+    assert any("0 player(s) moved" in message and "never moved" in message
+               for _, message in captured)
 
 
 def test_admin_password_is_redacted_from_command_log(
@@ -485,8 +514,8 @@ def test_admin_password_is_redacted_from_command_log(
     player = FakePlayer("Admin")
 
     with caplog.at_level(logging.INFO, logger="commands.command_handler"):
-        run(handle_command(server, player, "admin secret"))
+        run(handle_command(server, player, "admin long-enough-secret"))
 
     assert player.admin is True
-    assert "secret" not in caplog.text
+    assert "long-enough-secret" not in caplog.text
     assert "<redacted>" in caplog.text

@@ -63,10 +63,9 @@ def test_set_color_updates_server_and_observers_without_echoing_sender(tool):
     [
         (False, True, C.BLOCK_TOOL),
         (True, False, C.BLOCK_TOOL),
-        (True, True, C.RIFLE_TOOL),
     ],
 )
-def test_set_color_rejects_dead_unspawned_or_non_block_tool_players(
+def test_set_color_rejects_dead_or_unspawned_players(
     alive, spawned, tool
 ):
     server = RecordingServer()
@@ -76,3 +75,13 @@ def test_set_color_rejects_dead_unspawned_or_non_block_tool_players(
 
     assert player.block_color == 0x707070
     assert server.broadcasts == []
+
+
+
+def test_set_color_is_accepted_whatever_tool_is_held():
+    # Live stock client (2026-09-26): colour picking with a non-palette tool
+    # (or SetColor racing a tool switch) still changes the client's colour.
+    server = RecordingServer()
+    player = PalettePlayer(alive=True, spawned=True, tool=C.RIFLE_TOOL)
+    asyncio.run(handle_set_color(server, player, SimpleNamespace(value=0xABCDEF)))
+    assert player.block_color == 0xABCDEF

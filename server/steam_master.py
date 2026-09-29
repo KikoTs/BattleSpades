@@ -67,6 +67,67 @@ class SteamAdvertisement:
     region: str
 
 
+@dataclass(frozen=True)
+class ServerPopulation:
+    """Advertised occupancy, shared by every public count.
+
+    ``players`` follows the Source A2S convention: it includes ``bots``, and
+    ``humans + bots == players <= max_players`` always holds (the Revival
+    master rejects a heartbeat that breaks it).
+    """
+
+    players: int
+    humans: int
+    bots: int
+    max_players: int
+
+
+def _is_bot(player) -> bool:
+    return bool(getattr(player, "is_bot", False))
+
+
+def server_population(server) -> ServerPopulation:
+    """Count the slots in use right now, as the server browser should see it.
+
+    A human holds a slot from the moment their id is reserved for the map
+    transfer (``get_next_player_id`` already treats it as taken) until the
+    ENet disconnect removes the connection, including the gap while a map
+    change reloads their scene.  Counting only the roster would under-report
+    loading players and drop every human to zero during a map transition.
+    Bots are roster entries without a network peer.
+    """
+
+    config = getattr(server, "config", None)
+    try:
+        max_players = int(getattr(config, "max_players", 0))
+    except (TypeError, ValueError):
+        max_players = 0
+    max_players = max(1, min(255, max_players))
+
+    players = tuple((getattr(server, "players", None) or {}).values())
+    bots = sum(1 for player in players if _is_bot(player))
+    counted = {id(player) for player in players if not _is_bot(player)}
+    humans = len(counted)
+    connections = getattr(server, "connections", None)
+    if isinstance(connections, dict):
+        for connection in tuple(connections.values()):
+            player = getattr(connection, "player", None)
+            if player is not None:
+                if _is_bot(player) or id(player) in counted:
+                    continue
+                counted.add(id(player))
+                humans += 1
+            elif (
+                getattr(connection, "reserved_player_id", None) is not None
+                or getattr(connection, "_scene_transition_ready", None)
+                is not None
+            ):
+                humans += 1
+    humans = min(humans, max_players)
+    bots = min(bots, max_players - humans)
+    return ServerPopulation(humans + bots, humans, bots, max_players)
+
+
 def build_game_tags(config: "ServerConfig", mode_code: Optional[str] = None) -> str:
     """Build the exact semicolon-delimited tags consumed by retail AoS.
 
@@ -342,14 +403,13 @@ class SteamMasterService:
         mode = get_mode_data(config.game_mode)
         world = getattr(self.server, "world_manager", None)
         map_name = str(getattr(world, "map_name", "") or config.map_name)
-        players = tuple(getattr(self.server, "players", {}).values())
-        bot_count = sum(bool(getattr(player, "is_bot", False)) for player in players)
+        population = server_population(self.server)
         return SteamAdvertisement(
             server_name=str(config.server_name)[:63],
             map_name=build_steam_map_name(mode.code, map_name),
-            max_players=max(1, min(255, int(config.max_players))),
-            player_count=min(255, len(players)),
-            bot_count=min(255, int(bot_count)),
+            max_players=population.max_players,
+            player_count=population.players,
+            bot_count=population.bots,
             tags=build_game_tags(config, mode.code),
             region=str(self.config.region),
         )

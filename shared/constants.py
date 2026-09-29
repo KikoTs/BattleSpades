@@ -1891,7 +1891,10 @@ PREFAB_LISTS = {
      CLASS_PREFABS_SOLDIER: ['prefab_ultrabarrier', 'prefab_superbarrier', 'prefab_supersmallwall', 'prefab_fort_wall'], 
      CLASS_PREFABS_SCOUT: ['prefab_supertower', 'prefab_superbridge', 'prefab_superminibunker', 'prefab_caltrop'], 
      CLASS_PREFABS_ROCKETEER: ['prefab_caltrop', 'prefab_superminibunker', 'prefab_safety_tube'], 
-     CLASS_PREFABS_ENGINEER: ['prefab_caltrop', 'prefab_supertower', 'prefab_ultrabarrier', 'prefab_platform', 'prefab_superminibunker', 'prefab_superdome', 'prefab_fort_wall', 'prefab_superbridge', 'prefab_superpole'], 
+     # Stock alias A475 (aceofspades_source/shared/backup/constants-copy.py:935)
+     # has these 7; the renamed/nonsteam decompile appended superbridge and
+     # superpole, which the stock client's Engineer never offered.
+     CLASS_PREFABS_ENGINEER: ['prefab_caltrop', 'prefab_supertower', 'prefab_ultrabarrier', 'prefab_platform', 'prefab_superminibunker', 'prefab_superdome', 'prefab_fort_wall'], 
      CLASS_PREFABS_MINER: ['prefab_superdome', 'prefab_superpole', 'prefab_safety_corridor'], 
      CLASS_PREFABS_ZOMBIE: ['prefab_zombiehand', 'prefab_zombiebone', 'prefab_zombiehead'], 
      CLASS_PREFABS_CLASSIC_SOLDIER: [],
@@ -7299,9 +7302,15 @@ RADAR_STATION_RESTOCK_AMOUNT = 1
 RADAR_STATION_FAR_RADIUS = 10
 RADAR_STATION_SHOOT_INTERVAL = 1.5
 RADAR_STATION_MODEL_SIZE = 0.03
-RADAR_STATION_HEALTH = 45
-RADAR_STATION_LIFETIME = 250
-RADAR_STATION_RANGE = 45
+# Retail block A1899/A1900/A1901. The stock client reads only A1900: it is
+# the squared-distance limit in RadarStationEntity.can_detect_player (the
+# minimap radar RANGE). A1899/A1901 are never read by the client; like the
+# C4/medpack blocks, HEALTH follows MODEL_SIZE, leaving A1901 as the lifetime
+# the server sends as the packet-21 fuse (the client only counts that fuse
+# down). 45 s is also the Jagex-era wiki figure. See docs/RETAIL_VALUES.md.
+RADAR_STATION_HEALTH = 45    # A1899
+RADAR_STATION_RANGE = 250    # A1900
+RADAR_STATION_LIFETIME = 45  # A1901
 RADAR_STATION_MODEL_Z_OFFSET = -0.55
 
 MEDPACK_STOCK = 2
@@ -7397,3 +7406,30 @@ UGCTOOL_FAR_RADIUS = 10.0
 
 THROWABLE_EXPLOSIVE_TOOLS = [ANTIPERSONNEL_GRENADE_TOOL, GRENADE_TOOL, MOLOTOV_TOOL, CHEMICALBOMB_TOOL, LANDMINE_TOOL, DYNAMITE_TOOL, RPG_TOOL, RPG2_TOOL]
 
+
+# ---------------------------------------------------------------------------
+# STOCK RESTORE (BattleSpades). The named block above (after the A#### alias
+# section) is a later nonsteam MOD the stock Steam client never runs: the
+# stock weapon classes read the A#### values (docs/WEAPONS_RETAIL.md). It
+# redefined these names, so restore the stock figures for every consumer.
+# ---------------------------------------------------------------------------
+SPADE_SHOOT_INTERVAL = 0.8           # mod 0.4
+PICKAXE_SHOOT_INTERVAL = 0.6         # mod 0.4
+PICKAXE_DAMAGE_AMOUNT = 7            # mod 9
+PICKAXE_HITPLAYER_DAMAGE_AMOUNT = 40  # mod 50
+KNIFE_SHOOT_INTERVAL = 0.5           # mod 0.25
+KNIFE_HITPLAYER_DAMAGE_AMOUNT = 80   # mod 20
+CROWBAR_SHOOT_INTERVAL = 0.5         # mod 0.6
+PISTOL_RANGE = 550                   # mod 800
+PISTOL_RELOAD_TIME = 0.6             # mod 0.5
+PISTOL_SHOOT_INTERVAL = 0.4          # mod 0.3
+PISTOL_RECOIL_UP = -0.05             # mod -0.005
+PISTOL_DAMAGE_HEAD = 45              # mod 50
+SMG_RANGE = 350                      # mod 250
+# Stock handle_rocket2_damage passes 40 (server/weapons_retail.py).
+ROCKET2_EXPLOSION_DAMAGE = 40        # mod 50
+# Stock DynamiteWeapon.ammo = (A1627, A1628, None, None, A1629) with
+# A1627 = 1 (backup/constants-copy.py:2601-2603): max 1, initial 1, restock 1.
+DYNAMITE_STOCK = 1                   # mod 3
+DYNAMITE_INITIAL_STOCK = 1
+DYNAMITE_RESTOCK_AMOUNT = 1          # mod 3 (= DYNAMITE_STOCK)

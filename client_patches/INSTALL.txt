@@ -8,6 +8,11 @@ The included session_transition_patch.py moves the frozen scene into
 LoadingMenu and sends ClientInMenu(110) as a loader-ready acknowledgement.
 The server withholds InitialInfo until this acknowledgement arrives, so a
 missing or late hook cannot receive a new-scene packet inside GameScene.
+The same patch clears any pending OpenAL error before each ALURE stream call.
+Without it the stock client can orphan a music stream when a map changes and
+then freeze (Not Responding) on the first menu sound after START; music and
+ambience also fail to load with "Existing OpenAL error". Clients running the
+older copy of this file need a restart after updating it.
 
 The stock EditBoxControl also has no clipboard keyboard handler. The included
 clipboard_input_patch.py adds Unicode Ctrl+V insertion at the current caret,

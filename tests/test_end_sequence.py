@@ -52,7 +52,9 @@ class _Server:
     def __init__(self):
         self.broadcast_packets = []
         self.teams = {0: _Team(0), 1: _Team(1)}
-        self.players = {7: _Player(7, 0)}
+        # TEAM1 (wire 2): a same-map restart respawns playing teams only;
+        # a spectator (team 0) keeps its camera.
+        self.players = {7: _Player(7, 2)}
         self.world_manager = _WorldMgr()
         self.respawned = []
         self.tick_rate = 60
@@ -60,7 +62,8 @@ class _Server:
         self.runtime_resets = 0
         self.client_rejoins = 0
 
-    def broadcast(self, data):
+    def broadcast(self, data, **_kwargs):
+        # known_player_id / reliable filters are the real server's concern.
         self.broadcast_packets.append(data)
 
     def respawn_player(self, player):
@@ -118,7 +121,9 @@ def test_end_sequence_emits_music_stats_and_restarts(monkeypatch):
     assert 67 in ids
     assert 53 not in ids
     assert 52 not in ids
-    assert 72 not in ids
+    # Retail scoreboard hold (72) is a HUD toggle: opened at the win and
+    # released by the in-place restart; see tests/test_retail_end_screen.py.
+    assert ids.count(72) == 2
     # Restart happened: teams reset + everyone respawned; mode revived.
     assert srv.teams[0].reset_called >= 1
     assert srv.respawned == [7]
@@ -146,7 +151,7 @@ def test_end_sequence_runs_once(monkeypatch):
     assert srv.teams[0].reset_called == 1
 
 
-def test_timed_round_opens_map_vote_during_final_minute(monkeypatch):
+def test_timed_round_opens_map_vote_in_the_last_ten_seconds(monkeypatch):
     calls = []
     srv = _Server()
     srv.vote_manager = SimpleNamespace(
@@ -155,9 +160,13 @@ def test_timed_round_opens_map_vote_during_final_minute(monkeypatch):
     mode = _Mode(srv)
     mode.time_limit = 120
     mode.started = True
+    # Stock TIME_AFTER_MAP_VOTE_START_BEFORE_END: 10 s before the end.
     mode.start_time = time.time() - 61.0
     monkeypatch.setattr("server.audio.play_timeout_music", lambda _server: None)
+    asyncio.run(mode.on_tick(1))
+    assert calls == []
 
+    mode.start_time = time.time() - 111.0
     asyncio.run(mode.on_tick(1))
 
     assert len(calls) == 1
@@ -205,6 +214,7 @@ def test_end_sequence_waits_for_vote_then_uses_configured_screen_dwell(
 ):
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
     order = []
+    headlines = []
 
     class _Vote:
         async def wait_for_map_result(self):
@@ -224,8 +234,10 @@ def test_end_sequence_waits_for_vote_then_uses_configured_screen_dwell(
             map_name,
             *,
             end_screen_seconds,
+            headline_message_id=None,
         ):
             order.append((map_name, end_screen_seconds))
+            headlines.append(headline_message_id)
             return SimpleNamespace(ok=True, message="ok")
 
         async def restart_round(self):

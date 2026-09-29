@@ -26,7 +26,8 @@ from modes import get_mode_class
 from modes.zombie import ZombiePhase
 from server.bot_ai import BotDirector
 from server.bot_ai.messages import WorldDelta
-from server.bot_ai.worker import BotBrain, WorkerVoxelWorld
+from server.bot_ai.simple_navigation import SimpleVoxelWorld
+from server.bot_ai.simple_worker import SimpleBotBrain, decide_current_frame
 from server.class_selection import normalize_class_selection
 from server.config import load_config
 from server.game_constants import DEFAULT_WEAPON_TOOL, TEAM1, TEAM2
@@ -53,14 +54,15 @@ class _InlineSmokeSupervisor:
     """Smoke-only worker adapter for sandboxes which forbid Windows pipes.
 
     Production never selects this adapter.  It preserves the exact immutable
-    perception/intent boundary while evaluating ``BotBrain`` synchronously so
+    perception/intent boundary while evaluating the production
+    ``SimpleBotBrain`` synchronously so
     the rest of the real director, motor, physics, gateway, combat, and packet
     pipeline can still be exercised in a restricted test runner.
     """
 
     def __init__(self) -> None:
-        self.world = WorkerVoxelWorld()
-        self.brain = BotBrain(self.world, seed=0)
+        self.world = SimpleVoxelWorld()
+        self.brain = SimpleBotBrain(self.world, decision_hz=8.0)
         self.intents = deque()
 
     @property
@@ -69,12 +71,14 @@ class _InlineSmokeSupervisor:
 
     def start(self, snapshot) -> None:
         self.world.load(snapshot)
+        self.brain.reset_for_map(snapshot.map_epoch)
 
     def close(self, timeout: float = 0.0) -> None:
         self.intents.clear()
 
     def publish_map(self, snapshot) -> None:
         self.world.load(snapshot)
+        self.brain.reset_for_map(snapshot.map_epoch)
 
     def publish_world_change(self, change, *, map_epoch, topology_version) -> None:
         self.world.apply(
@@ -86,7 +90,7 @@ class _InlineSmokeSupervisor:
         )
 
     def submit_frame(self, frame) -> bool:
-        intent = self.brain.decide(frame)
+        intent = decide_current_frame(self.world, self.brain, frame)
         if intent is not None:
             self.intents.append(intent)
         return True

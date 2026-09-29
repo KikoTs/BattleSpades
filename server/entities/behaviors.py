@@ -116,11 +116,166 @@ class PickupCrateBehavior(EntityBehavior):
     touch_radius = 2.5
     support_check_interval = 0.10
 
-    def __init__(self, refill, respawn_delay: float = 15.0, sound_id: int = None):
+    # Retail ``Crate`` (client crate.py, gameScene.pyd) air-drop physics,
+    # measured on the live client 2026-09-26: a crate created in the air
+    # free-falls at 30 blocks/s^2 (0.5 per 1/60 s frame).  Once the ground
+    # hit-scan below it is closer than CRATE_PARACHUTE_DEPLOYMENT_HEIGHT (10)
+    # the chute opens and every frame the stored velocity is multiplied by
+    # CRATE_PARACHUTE_SLOWDOWN (0.75) after the move (terminal 1.5, the crate
+    # moves 2.0 blocks/s); below CRATE_PARACHUTE_REMOVAL_HEIGHT (2) the chute
+    # is dropped and it free-falls onto the support voxel, where it rests at
+    # z == support z.  The server integrates the same fixed-step model so the
+    # authoritative pickup position follows the model the players see.
+    AIRDROP_GRAVITY = 30.0
+    AIRDROP_STEP = 1.0 / 60.0
+    AIRDROP_MAX_STEPS_PER_TICK = 30
+
+    def __init__(self, refill, respawn_delay: float = 15.0, sound_id: int = None,
+                 *, airdrop: bool = False, drop_start_z: float = 1.0,
+                 drop_cue=None):
         self.refill = refill
         self.respawn_delay = float(respawn_delay)
         # Client SOUND_ID for the pickup cue (ammo 13 / health 14 / blocks 15).
         self.sound_id = sound_id
+        # Map supply crates respawn by parachute from the sky above their
+        # drop point instead of reappearing on the ground.
+        self.airdrop = bool(airdrop)
+        self.drop_start_z = float(drop_start_z)
+        # Optional ``callable(ent)`` for the positioned aircraft fly-by cue.
+        self.drop_cue = drop_cue
+
+    # ------------------------------------------------------------------
+    # Air drop
+    # ------------------------------------------------------------------
+
+    def on_respawn(self, ent, ctx) -> None:
+        """Lift a respawning map crate to its drop altitude above home."""
+
+        if not self.airdrop:
+            return
+        world = getattr(ctx, "world", None)
+        if world is None or not callable(getattr(world, "get_solid", None)):
+            return
+        from shared import constants as C
+
+        home_x, home_y, home_z = (float(value) for value in ent.home)
+        x = int(math.floor(home_x))
+        y = int(math.floor(home_y))
+        if not (0 <= x < int(C.MAP_X) and 0 <= y < int(C.MAP_Y)):
+            return
+        landing = self._find_support(world, x, y, int(math.floor(home_z)))
+        water_limit = int(getattr(C, "Z_ABOVE_WATERPLANE", 238))
+        if landing is None or landing > water_limit:
+            anchor = getattr(world, "dry_surface_anchor", None)
+            if not callable(anchor):
+                return
+            try:
+                ax, ay, az = anchor(home_x, home_y, search=64)
+            except TypeError:
+                ax, ay, az = anchor(home_x, home_y)
+            home_x, home_y = float(ax), float(ay)
+            x = int(math.floor(home_x))
+            y = int(math.floor(home_y))
+            landing = self._find_support(world, x, y, int(math.floor(az)))
+            if landing is None or landing > water_limit:
+                return
+        # Blocks built on the drop point: the crate lands on top of them.
+        landing = int(landing)
+        while landing > 0 and world.get_solid(x, y, landing - 1):
+            landing -= 1
+        start_z = self._drop_start(world, x, y, landing)
+        ent.x, ent.y, ent.z = home_x, home_y, float(start_z)
+        ent.vel = (0.0, 0.0, 0.0)
+        ent.falling = float(start_z) < float(landing)
+        ent.fall_accumulator = 0.0
+        ent.fall_clock = float(getattr(ctx, "now", 0.0))
+        ent.parachute_deployed = False
+        ent.parachute_removed = False
+        ent.terrain_support_z = None
+        ent.terrain_offset_z = 0.0
+        if not ent.falling:
+            ent.z = float(landing)
+            ent.terrain_support_z = int(landing)
+            return
+        if self.drop_cue is not None:
+            try:
+                self.drop_cue(ent)
+            except Exception:  # noqa: BLE001 - a cosmetic cue must not stop the drop
+                pass
+
+    def _drop_start(self, world, x: int, y: int, landing: int) -> float:
+        """Highest free z over ``landing``: the sky, or just under a roof."""
+
+        top = int(math.floor(self.drop_start_z))
+        for z in range(int(landing) - 1, max(-1, top - 1), -1):
+            if world.get_solid(x, y, z):
+                # The crate model spans about one voxel above its origin, so
+                # keep one clear cell between it and the overhang.
+                return float(min(landing, z + 2))
+        return float(min(landing, self.drop_start_z))
+
+    def _advance_fall(self, ent, dt, ctx) -> None:
+        from shared import constants as C
+
+        world = getattr(ctx, "world", None)
+        x = int(math.floor(ent.x))
+        y = int(math.floor(ent.y))
+        landing = None
+        if world is not None and callable(getattr(world, "get_solid", None)):
+            landing = self._find_support(
+                world, x, y, max(0, int(math.floor(ent.z)))
+            )
+        if landing is None:
+            landing = int(C.MAP_Z) - 1
+        deploy = float(getattr(C, "CRATE_PARACHUTE_DEPLOYMENT_HEIGHT", 10))
+        removal = float(getattr(C, "CRATE_PARACHUTE_REMOVAL_HEIGHT", 2))
+        slowdown = float(getattr(C, "CRATE_PARACHUTE_SLOWDOWN", 0.75))
+        step = self.AIRDROP_STEP
+        vz = float(ent.vel[2])
+        z = float(ent.z)
+        # Integrate wall time, not ticks: the registry may round-robin skip
+        # an overloaded tick, while the retail client keeps its own clock.
+        now = float(getattr(ctx, "now", 0.0))
+        clock = float(getattr(ent, "fall_clock", 0.0))
+        elapsed = now - clock if clock > 0.0 and now >= clock else float(dt)
+        ent.fall_clock = now
+        ent.fall_accumulator += max(0.0, elapsed)
+        steps = 0
+        landed = False
+        while (ent.fall_accumulator >= step
+               and steps < self.AIRDROP_MAX_STEPS_PER_TICK):
+            ent.fall_accumulator -= step
+            steps += 1
+            vz += self.AIRDROP_GRAVITY * step
+            z += vz * step
+            if z >= landing:
+                landed = True
+                break
+            distance = float(landing) - z
+            if not ent.parachute_deployed and distance < deploy:
+                ent.parachute_deployed = True
+            if (ent.parachute_deployed and not ent.parachute_removed
+                    and distance < removal):
+                ent.parachute_removed = True
+            if ent.parachute_deployed and not ent.parachute_removed:
+                vz *= slowdown
+        if steps >= self.AIRDROP_MAX_STEPS_PER_TICK:
+            # A long server stall must not replay seconds of backlog in one
+            # tick; the client keeps falling on its own clock regardless.
+            ent.fall_accumulator = 0.0
+        if landed:
+            ent.z = float(landing)
+            ent.vel = (0.0, 0.0, 0.0)
+            ent.falling = False
+            ent.fall_accumulator = 0.0
+            ent.parachute_deployed = True
+            ent.parachute_removed = True
+            ent.terrain_support_z = int(landing)
+            ent.terrain_offset_z = 0.0
+            ent.terrain_check_at = float(getattr(ctx, "now", 0.0))
+            return
+        ent.z = z
+        ent.vel = (0.0, 0.0, vz)
 
     def on_tick(self, ent, dt, ctx) -> None:
         """Keep a map pickup attached to the live voxel column beneath it.
@@ -131,6 +286,10 @@ class PickupCrateBehavior(EntityBehavior):
         throttled to 10 Hz and only scan a column after the remembered support
         voxel actually disappears.
         """
+
+        if getattr(ent, "falling", False):
+            self._advance_fall(ent, dt, ctx)
+            return
 
         from shared import constants as C
 
@@ -287,7 +446,7 @@ class MedpackBehavior(DamageableEntityBehavior):
     def on_touch(self, ent, player, ctx) -> bool:
         if player.team != self.team:
             return False
-        if getattr(player, "health", 0) >= 100:
+        if getattr(player, "health", 0) >= getattr(player, "max_health", 100):
             return False
         player.heal(self.heal_amount)
         self.uses -= 1
@@ -296,14 +455,27 @@ class MedpackBehavior(DamageableEntityBehavior):
         return True
 
 
-class TimedExplosiveBehavior(EntityBehavior):
+class TimedExplosiveBehavior(DamageableEntityBehavior):
     """Dynamite / timed charge: detonates a fixed fuse after placement,
     regardless of proximity. Explosion runs through the server's shared blast
-    (crater + player damage)."""
+    (crater + player damage).
+
+    Retail gives the stick DYNAMITE_HEALTH = 1, the same one-point shell as
+    LANDMINE_HEALTH, so a bullet, melee hit or a neighbouring blast destroys
+    it early.  Like a shot mine it goes off through the normal blast rather
+    than vanishing silently (which consequence retail chose is not in any
+    client table; the mine precedent is followed).
+    """
+
+    hit_radius = 0.65
 
     def __init__(self, thrower_id, fuse, damage, block_damage, crater_radius,
                  kill_type, blast_radius=16.0, force_destroy=True,
-                 knockback_min=None, knockback_max=None):
+                 knockback_min=None, knockback_max=None, health=None):
+        import shared.constants as C
+        super().__init__(
+            getattr(C, "DYNAMITE_HEALTH", 1.0) if health is None else health
+        )
         self.thrower_id = int(thrower_id)
         self.fuse = float(fuse)
         self.damage = float(damage)
@@ -335,6 +507,14 @@ class TimedExplosiveBehavior(EntityBehavior):
         """Use the rendered attachment center, outside its support voxel."""
 
         return _attached_face_center(ent)
+
+    def get_hit_center(self, ent):
+        return _attached_face_center(ent)
+
+    def on_destroyed(self, ent, source, ctx) -> None:
+        if source is not None and hasattr(source, "team"):
+            self.triggered_by = source
+        _detonate_deployable(self, ent, ctx)
 
     def on_support_lost(self, ent, ctx) -> None:
         _detonate_deployable(self, ent, ctx)
@@ -447,8 +627,15 @@ class ProximityMineBehavior(DamageableEntityBehavior):
                 return
 
     def on_destroyed(self, ent, source, ctx) -> None:
-        """A shot mine explodes through the same authoritative blast path."""
+        """A shot mine explodes through the same authoritative blast path.
 
+        The player who shot/blasted it *instigated* the explosion: when that
+        is the owner's teammate, the owner's death (and any teammate harm)
+        is theirs for kill credit and grief accounting (server.conduct).
+        """
+
+        if source is not None and hasattr(source, "team"):
+            self.triggered_by = source
         _detonate_deployable(self, ent, ctx)
 
     def on_support_lost(self, ent, ctx) -> None:
@@ -514,14 +701,19 @@ class RemoteChargeBehavior(DamageableEntityBehavior):
 class RadarStationBehavior(DamageableEntityBehavior):
     """Short-lived Scout radar station.
 
-    Visibility is reference-counted by the server so overlapping stations do
-    not hide the enemy team when only one of them expires.
+    Detection is client-side: the stock Minimap asks every RadarStationEntity
+    of the viewer's team ``can_detect_player`` (250 blocks,
+    ``C.RADAR_STATION_RANGE``) for each enemy. The server only owns the
+    entity's lifetime, health and one-station-per-owner rule.
+
+    Retail values: 45 s lifetime (``C.RADAR_STATION_LIFETIME``, sent as the
+    packet-21 fuse the client counts down) and 45 health.
     """
 
     hit_radius = 0.9
     hit_center_offset = (0.5, 0.5, 0.55)
 
-    def __init__(self, team, lifetime=250.0, health=45.0):
+    def __init__(self, team, lifetime=45.0, health=45.0):
         super().__init__(health)
         self.team = int(team)
         self.lifetime = float(lifetime)
@@ -532,10 +724,17 @@ class RadarStationBehavior(DamageableEntityBehavior):
             self._expires_at = ctx.now + self.lifetime
             return
         if ctx.now < self._expires_at:
+            # Keep the wire fuse at the remaining lifetime so a late joiner's
+            # CreateEntity replay counts down from the live value, not 45.
+            ent.fuse = max(0.0, float(self._expires_at - ctx.now))
             return
         self.on_destroyed(ent, None, ctx)
 
     def on_destroyed(self, ent, source, ctx) -> None:
+        if not ent.alive:
+            # Already torn down (expiry, damage, replacement or support loss
+            # may race in one tick); never release the team count twice.
+            return
         if ctx.server is not None:
             ctx.server._radar_station_removed(self.team)
             owner = ctx.server.players.get(ent.player_id)
@@ -570,20 +769,13 @@ def _detonate_deployable(behavior, ent, ctx) -> None:
             gx, gy, gz = get_center(ent)
         else:
             gx, gy, gz = ent.x, ent.y, ent.z
-        ctx.server._apply_blast(
-            gx, gy, gz, behavior.damage, behavior.block_damage,
-            behavior.kill_type, thrower,
-            crater_radius=behavior.crater_radius,
-            force_destroy=getattr(behavior, "force_destroy", True),
-            blast_radius=getattr(behavior, "blast_radius", 16.0),
-            knockback_min=getattr(behavior, "knockback_min", 0.0),
-            knockback_max=getattr(behavior, "knockback_max", 0.0),
-            native_damage_type=getattr(behavior, "damage_type", None),
-            causer_entity_id=int(ent.entity_id),
-            ignore_player_los=bool(
-                getattr(behavior, "ignore_player_los", False)
-            ),
-        )
+        from server.conduct import blast_instigator
+
+        trigger = getattr(behavior, "triggered_by", None)
+        with blast_instigator(
+            ctx.server, trigger if trigger is not None else thrower
+        ):
+            _apply_deployable_blast(behavior, ent, ctx, thrower, gx, gy, gz)
     if ctx.destroy is not None:
         ctx.destroy(ent.entity_id)
     # One-shot entities must leave the registry as well as the clients.  A
@@ -592,6 +784,24 @@ def _detonate_deployable(behavior, ent, ctx) -> None:
     registry = getattr(ctx.server, "entity_registry", None) if ctx.server else None
     if registry is not None:
         registry.remove(ent.entity_id)
+
+
+def _apply_deployable_blast(behavior, ent, ctx, thrower, gx, gy, gz) -> None:
+    """Run the shared server blast for one deployable."""
+    ctx.server._apply_blast(
+        gx, gy, gz, behavior.damage, behavior.block_damage,
+        behavior.kill_type, thrower,
+        crater_radius=behavior.crater_radius,
+        force_destroy=getattr(behavior, "force_destroy", True),
+        blast_radius=getattr(behavior, "blast_radius", 16.0),
+        knockback_min=getattr(behavior, "knockback_min", 0.0),
+        knockback_max=getattr(behavior, "knockback_max", 0.0),
+        native_damage_type=getattr(behavior, "damage_type", None),
+        causer_entity_id=int(ent.entity_id),
+        ignore_player_los=bool(
+            getattr(behavior, "ignore_player_los", False)
+        ),
+    )
 
 
 def _remove_entity(ent, ctx) -> None:

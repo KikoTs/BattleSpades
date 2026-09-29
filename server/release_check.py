@@ -79,8 +79,9 @@ def _check_worker_spawn(
 
     The first phase reproduces production ordering with the staged default
     VXL as the worker's first message. The second empty-map phase is separate
-    so a heartbeat cannot substitute for proving :class:`BotBrain` emitted a
-    genuine intention. No gameplay listener is opened.
+    so a heartbeat cannot substitute for proving the production
+    :class:`SimpleBotBrain` emitted a genuine intention. No gameplay listener
+    is opened.
     """
 
     from server.bot_ai.messages import (
@@ -93,7 +94,8 @@ def _check_worker_spawn(
     )
     from server.bot_ai.profiles import ProfileFactory
     from server.bot_ai.snapshot_transport import encode_map_snapshot
-    from server.bot_ai.worker import run_worker
+    # The production brain (thread supervisor and process worker alike).
+    from server.bot_ai.simple_worker import run_worker
     from server.game_constants import DEFAULT_WEAPON_TOOL
 
     map_path = Path(default_map)
@@ -261,7 +263,8 @@ def _check_worker_spawn(
         return (
             f"AI child processed full map {map_path.name} "
             f"(heartbeat batch={full_map_heartbeat.batch_id}); "
-            f"intent frame={intent.frame_id}; exited {process.exitcode}"
+            f"SimpleBotBrain intent frame={intent.frame_id} "
+            f"role={intent.debug_role or '-'}; exited {process.exitcode}"
         )
     finally:
         if process.is_alive():

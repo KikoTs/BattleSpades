@@ -193,10 +193,19 @@ def test_target_destruction_and_block_line_complete_the_native_lessons():
         assert player.tool == int(C.SPADE_TOOL)
         assert mode.allows_equipped_tool(player, int(C.BLOCK_TOOL)) is True
 
+        # Every disc (21 cells) is gone, not only the shot red voxel.
+        for disc in mode._target_discs[0]:
+            assert len(disc) == 21
+            assert not any(server.world_manager.get_solid(*cell) for cell in disc)
+
+        # Building alone no longer finishes CLIMB ("to the top of the tower").
         assert server.world_manager.set_block(70, 70, 220, True, 0x123456)
         assert server.world_manager.set_block(71, 70, 220, True, 0x123456)
         asyncio.run(mode.on_tick(2))
+        assert session.stage is TutorialStage.CLIMB
 
+        player.x, player.y, player.z = 118.5 + 3.0, 51.5, 194.75
+        asyncio.run(mode.on_tick(3))
         assert session.stage is TutorialStage.COMPLETE
         assert {23, 84, 109}.issubset({data[0] for data in player.sent})
     finally:
@@ -222,3 +231,149 @@ def test_basic_lesson_advances_at_retail_capsule_collision_plane():
         assert session.stage is TutorialStage.JUMP
     finally:
         asyncio.run(mode.deactivate())
+
+
+def test_first_damage_on_a_red_cell_drops_the_whole_disc():
+    server, mode = _new_mode()
+    player = _Player(1)
+    player.x, player.y, player.z = mode.get_spawn_point(player)
+    asyncio.run(mode.on_player_join(player))
+    mode.reveal_to(SimpleNamespace(player=player, send=player.send))
+    session = mode.session_for(player)
+    try:
+        mode._enter_stage(session, TutorialStage.SHOOTING, 1.0)
+        red = next(iter(mode._target_voxels[0][2]))
+        # One pistol hit leaves a partial-damage entry, no destroyed voxel.
+        server.world_manager.block_damage[red] = 1.0
+        asyncio.run(mode.on_tick(1))
+        assert session.destroyed_targets == {2}
+        assert not any(
+            server.world_manager.get_solid(*cell) for cell in mode._target_discs[0][2]
+        )
+        # 21 checked kill-damage packets replicate the removal.
+        assert sum(data[0] == 37 for data, _ in server.sent) == 21
+        remaining = [data for data in player.sent if data[0] == 50]
+        assert len(remaining) == 1
+    finally:
+        asyncio.run(mode.deactivate())
+
+
+def test_tower_gate_requires_the_dome_not_the_ledge():
+    _server, mode = _new_mode()
+    player = _Player(1)
+    player.x, player.y, player.z = mode.get_spawn_point(player)
+    session = mode.session_for(player)
+    try:
+        player.x, player.y, player.z = 118.5, 51.5 + 9.0, 204.75  # ledge
+        assert not mode._on_tower_top(session, player)
+        player.z = 194.75
+        assert mode._on_tower_top(session, player)
+        player.x = 118.5 + 12.0  # a pillar beside the tower
+        assert not mode._on_tower_top(session, player)
+    finally:
+        asyncio.run(mode.deactivate())
+
+
+def test_reused_lane_restores_dug_and_built_cells():
+    server, mode = _new_mode()
+    world = server.world_manager
+    first = _Player(1)
+    mode.get_spawn_point(first)
+    try:
+        dug = (130, 76, 233)
+        assert world.get_solid(*dug)
+        color = int(world.get_color(*dug)) & 0xFFFFFF
+        assert world.destroy_blocks([dug])
+        built = (130, 70, 220)
+        assert not world.get_solid(*built)
+        assert world.set_block(*built, True, 0x123456)
+        asyncio.run(mode.on_player_leave(first))
+
+        second = _Player(2)
+        mode.get_spawn_point(second)
+        assert world.get_solid(*dug)
+        assert int(world.get_color(*dug)) & 0xFFFFFF == color
+        assert not world.get_solid(*built)
+        server.sent.clear()
+        asyncio.run(mode.on_player_join(second))
+        kinds = [data[0] for data, _ in server.sent]
+        assert kinds.count(37) == 1  # the built cell's removal
+        assert 33 in kinds  # the dug cell's BlockBuildColored
+    finally:
+        asyncio.run(mode.deactivate())
+
+
+def test_initial_info_overrides_only_the_retail_colour_picker():
+    _server, mode = _new_mode()
+    packet = SimpleNamespace(
+        enable_minimap=1, enable_deathcam=1, enable_spectator=1,
+        enable_fall_on_water_damage=1, enable_colour_picker=1,
+        enable_colour_palette=0, enable_player_score=1,
+    )
+    try:
+        mode.configure_initial_info(packet)
+        assert packet.enable_colour_picker == 0
+        assert packet.enable_colour_palette == 1
+        assert packet.enable_minimap == 1
+        assert packet.enable_deathcam == 1
+        assert packet.enable_spectator == 1
+        assert packet.enable_fall_on_water_damage == 1
+        assert packet.enable_player_score == 0
+    finally:
+        asyncio.run(mode.deactivate())
+
+
+def test_tutorial_script_matches_shared_fixture():
+    """Pins the server lesson script to the JSON shared with the client."""
+
+    import json
+
+    fixture = json.loads(
+        (ROOT / "tests" / "fixtures" / "tutorial_script.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    stages = [stage.name.lower() for stage in TutorialStage]
+    assert fixture["stages"] == stages
+    for stage in TutorialStage:
+        assert fixture["messages"][stage.name.lower()] == list(
+            TutorialMode.HELP_BY_STAGE[stage]
+        )
+    assert fixture["intro_seconds"] == TutorialMode.INTRO_SECONDS
+    assert fixture["help_transition_delay"] == TutorialMode.HELP_TRANSITION_DELAY
+    assert fixture["completion_seconds"] == TutorialMode.COMPLETION_SECONDS
+    tools = {
+        "pistol": int(C.PISTOL_TOOL),
+        "block": int(C.BLOCK_TOOL),
+        "spade": int(C.SPADE_TOOL),
+    }
+    loadouts = fixture["loadouts"]
+    assert [tools[t] for t in loadouts["movement"]] == list(TutorialMode.MOVEMENT_LOADOUT)
+    assert [tools[t] for t in loadouts["shooting"]] == list(TutorialMode.SHOOTING_LOADOUT)
+    assert [tools[t] for t in loadouts["climb"]] == list(TutorialMode.CLIMB_LOADOUT)
+    assert loadouts["climb_equips"] == loadouts["climb"][-1]
+    tower = fixture["tower"]
+    assert tuple(tower["center_local"]) == TutorialMode.TOWER_CENTER_LOCAL
+    assert tower["radius"] == TutorialMode.TOWER_RADIUS
+    assert tower["max_z"] == TutorialMode.TOWER_TOP_MAX_Z
+    targets = fixture["targets"]
+    assert [tuple(c) for c in targets["centers_local"]] == list(TutorialMode.TARGET_CENTERS)
+    assert targets["count"] == len(TutorialMode.TARGET_CENTERS) == 5
+    assert targets["rgb"] == TutorialMode.TARGET_RGB
+    assert targets["disc_cells"] == 21
+    assert targets["red_cells"] == 13
+    assert [tuple(o) for o in fixture["lane_origins"]] == list(TutorialMode.LANE_ORIGINS)
+    assert tuple(fixture["spawn_local"]) == TutorialMode.SPAWN_LOCAL
+    assert fixture["target_counter_string"] == "TUTORIAL_DESTROY_TARGET"
+    assert fixture["complete_sound_id"] == 27
+
+    # Gate thresholds are literals in on_tick; pin them by behaviour.
+    import inspect
+
+    source = inspect.getsource(TutorialMode.on_tick)
+    gates = fixture["gates"]
+    assert f"session.minimum_local_x <= {gates['basic_controls_max_local_x']}" in source
+    assert f"session.minimum_local_x <= {gates['jump_with_input_max_local_x']}" in source
+    assert f"session.minimum_local_x <= {gates['jump_fallback_max_local_x']}" in source
+    assert f"session.minimum_local_x <= {gates['crouch_with_input_max_local_x']}" in source
+    assert f"session.minimum_local_x <= {gates['crouch_fallback_max_local_x']}" in source

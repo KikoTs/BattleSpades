@@ -61,18 +61,18 @@ def test_block_selection_cancels_reload_but_keeps_depleted_weapon():
 
 
 def test_ammo_pickup_restocks_stowed_weapons_too():
+    # Retail Weapon.restock(AMMO_CRATE): reserve += restock amount (capped),
+    # the magazine is kept (sniper restock 7, pistol 30).
     player = scout()
-    full_sniper = (player.ammo_clip, player.ammo_reserve)
     player.ammo_clip, player.ammo_reserve = 0, 0
     player.set_tool(C.PISTOL_TOOL, raw=True)
-    full_pistol = (player.ammo_clip, player.ammo_reserve)
-    player.ammo_clip, player.ammo_reserve = 0, 0
+    player.ammo_clip, player.ammo_reserve = 2, 0
     player.set_tool(C.BLOCK_TOOL, raw=True)
     player.restock_ammo(restock_type=3)
     player.set_tool(C.SNIPER_TOOL, raw=True)
-    assert (player.ammo_clip, player.ammo_reserve) == full_sniper
+    assert (player.ammo_clip, player.ammo_reserve) == (0, 7)
     player.set_tool(C.PISTOL_TOOL, raw=True)
-    assert (player.ammo_clip, player.ammo_reserve) == full_pistol
+    assert (player.ammo_clip, player.ammo_reserve) == (2, 30)
 
 
 def test_new_life_replaces_all_previous_weapon_ammo():

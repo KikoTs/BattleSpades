@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import TYPE_CHECKING
 
 import shared.constants as C
@@ -130,10 +131,21 @@ class BotActionGateway:
         player.set_tool(tool_id, raw=True)
         return int(getattr(player, "tool", -1)) == tool_id
 
+    @staticmethod
+    def _block_interval_ready(player: "Player") -> bool:
+        """Bots respect the stock MIN_BLOCK_INTERVAL like any client."""
+
+        from server.combat_runtime import MIN_BLOCK_INTERVAL
+
+        last = getattr(player, "_last_block_build_at", None)
+        return last is None or time.monotonic() - float(last) >= MIN_BLOCK_INTERVAL
+
     def build(self, player: "Player", action: BotAction) -> bool:
         """Submit one normal block placement through ``CombatSystem``."""
 
-        if action.position is None or not self.select_tool(player, int(C.BLOCK_TOOL)):
+        if action.position is None or not self._block_interval_ready(player):
+            return False
+        if not self.select_tool(player, int(C.BLOCK_TOOL)):
             return False
         try:
             x, y, z = (int(round(value)) for value in action.position)
@@ -141,7 +153,7 @@ class BotActionGateway:
             return False
         construction = getattr(self.server, "construction", None)
         reservation = None
-        if construction is not None:
+        if construction is not None and not self._objective_repair(player, (x, y, z)):
             reservation, _reason = construction.reserve_construction(
                 int(player.id), int(player.team), ((x, y, z),)
             )
@@ -159,12 +171,31 @@ class BotActionGateway:
         # keeps the cell reserved until the normal mutation service catches up.
         return accepted
 
+    def _objective_repair(self, player: "Player", cell: tuple[int, int, int]) -> bool:
+        """Is ``cell`` a destroyed block of this player's own Demolition base?
+
+        Bot construction normally stays out of base zones so optional builds
+        never wall in an objective. Re-placing a destroyed objective block is
+        the one build a base exists for (humans do it under the same combat
+        checks: face support, inventory, and the commit-time body test).
+        """
+
+        mode = getattr(self.server, "mode", None)
+        if str(getattr(mode, "mode_code", "")).lower() != "dem":
+            return False
+        destroyed = getattr(mode, "destroyed_cells", None)
+        if not isinstance(destroyed, dict):
+            return False
+        cells = destroyed.get(int(getattr(player, "team", -1)), ())
+        return tuple(int(value) for value in cell) in cells
+
     def build_line(self, player: "Player", action: BotAction) -> bool:
         """Submit one atomic native BlockLine through the shared combat path."""
 
         if (
             action.position is None
             or action.end_position is None
+            or not self._block_interval_ready(player)
             or not self.select_tool(player, int(C.BLOCK_TOOL))
         ):
             return False

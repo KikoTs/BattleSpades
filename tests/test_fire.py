@@ -28,9 +28,11 @@ class _Player:
         self.health = 100
         self.damage_events = []
 
-    def damage(self, amount, source=None, kill_type=0):
+    def damage(self, amount, source=None, kill_type=0, hp_damage_type=None):
         self.health -= amount
         self.damage_events.append((amount, source, kill_type))
+        self.hp_damage_types = getattr(self, "hp_damage_types", [])
+        self.hp_damage_types.append(hp_damage_type)
         if self.health <= 0:
             self.alive = False
         return True
@@ -241,3 +243,81 @@ def test_blockfire_global_cap_replaces_oldest_emitters():
     assert len(fire.block_fires) == FireController.MAX_ACTIVE_BLOCK_FIRES
     assert len(server.destroyed) == count - FireController.MAX_ACTIVE_BLOCK_FIRES
     assert len(fire._clusters) == FireController.MAX_ACTIVE_BLOCK_FIRES
+
+
+def test_friendly_fire_off_keeps_teammates_from_catching_fire():
+    owner = _Player(player_id=1, team=0, position=(10.0, 10.0, 9.0))
+    mate = _Player(player_id=2, team=0, position=(11.0, 10.0, 9.0))
+    enemy = _Player(player_id=3, team=1, position=(10.0, 11.0, 9.0))
+    server = _Server(_World({(10, 10, 10)}), [owner, mate, enemy])
+    fire = FireController(server)
+    fire.ignite_block((10, 10, 10), owner, now=0.0)
+
+    fire.update(now=0.0)
+
+    assert mate.on_fire is False
+    assert enemy.on_fire is True
+    # The thrower is not shielded from his own Molotov.
+    assert owner.on_fire is True
+
+
+def test_friendly_fire_on_burns_teammates():
+    owner = _Player(player_id=1, team=0, position=(10.0, 10.0, 9.0))
+    mate = _Player(player_id=2, team=0, position=(11.0, 10.0, 9.0))
+    server = _Server(_World({(10, 10, 10)}), [owner, mate])
+    server.config.friendly_fire = True
+    fire = FireController(server)
+    fire.ignite_block((10, 10, 10), owner, now=0.0)
+
+    fire.update(now=0.0)
+
+    assert mate.on_fire is True
+
+
+def test_blockfire_drops_onto_the_voxel_below_its_vanished_block():
+    owner = _Player(position=(50.0, 50.0, 0.0))
+    world = _World({(10, 10, 10), (10, 10, 11)})
+    server = _Server(world, [owner])
+    fire = FireController(server)
+    first = fire.ignite_block((10, 10, 10), owner, now=0.0)
+
+    world.solids.discard((10, 10, 10))
+    fire.update(now=1.0)
+
+    assert first not in fire.block_fires
+    assert server.destroyed == [first]
+    (moved,) = fire.block_fires.values()
+    assert moved.block == (10, 10, 11)
+    # It keeps the remaining lifetime; it does not restart the clock.
+    assert moved.expires_at == C.BLOCKFIRE_MAX_LIFESPAN
+    assert server.entity_registry.get(moved.entity_id).fuse == (
+        C.BLOCKFIRE_MAX_LIFESPAN - 1.0
+    )
+
+
+def test_blockfire_fuse_tracks_remaining_life_for_late_joiners():
+    owner = _Player(position=(50.0, 50.0, 0.0))
+    server = _Server(_World({(10, 10, 10)}), [owner])
+    fire = FireController(server)
+    entity_id = fire.ignite_block((10, 10, 10), owner, now=0.0)
+
+    fire.update(now=1.5)
+
+    assert server.entity_registry.get(entity_id).fuse == (
+        C.BLOCKFIRE_MAX_LIFESPAN - 1.5
+    )
+
+
+def test_player_standing_on_a_burning_voxel_catches_fire():
+    """Range is measured to the body, not just the eye 2.25 above the feet."""
+    owner = _Player(player_id=1, team=0, position=(50.0, 50.0, 0.0))
+    # Eye 2.25 above the fire voxel's top face, 2.5 sideways: the eye is
+    # 3.2 from the voxel centre but the feet are within range.
+    target = _Player(player_id=2, team=1, position=(13.0, 10.5, 7.75))
+    server = _Server(_World({(10, 10, 10)}), [owner, target])
+    fire = FireController(server)
+    fire.ignite_block((10, 10, 10), owner, now=0.0)
+
+    fire.update(now=0.0)
+
+    assert target.on_fire is True

@@ -4,8 +4,10 @@
 The repository's ``config.toml`` remains the complete documented template.
 Each container copies that template, applies a deliberately small set of
 validated environment overrides, and writes the effective configuration under
-the instance data directory. Secrets are never printed or written back into
-the source tree.
+the instance data directory. Every file the server writes at runtime (bans,
+logs, pending AoSPlay round results, the anti-cheat report) is placed on that
+data volume too, because the hardened deployment mounts the application tree
+read-only. Secrets are never printed or written back into the source tree.
 """
 
 from __future__ import annotations
@@ -141,6 +143,25 @@ def _safe_map_name(value: str) -> str:
     return value
 
 
+def _data_path(value: Any, data_directory: Path, default: str) -> str:
+    """Place one writable state file on the instance data volume.
+
+    A relative (or missing) template path is rebased below ``data_directory``
+    so the container never writes into the read-only application tree. An
+    absolute path is an explicit operator choice and is returned unchanged.
+    """
+
+    text = str(value).strip() if value is not None else ""
+    configured = Path(text or default)
+    if configured.is_absolute():
+        return str(configured)
+    if ".." in configured.parts:
+        raise ContainerConfigurationError(
+            f"relative state path {text!r} cannot leave the data directory"
+        )
+    return str(data_directory / configured)
+
+
 def load_template(path: Path) -> dict[str, Any]:
     """Load a required TOML deployment template."""
 
@@ -232,6 +253,24 @@ def build_runtime_config(
             )
         admin["password"] = admin_password
     admin["bans_path"] = str(data_directory / "bans.json")
+
+    # Everything else the server writes at runtime must also live on the
+    # instance volume: the hardened Compose example mounts /app read-only,
+    # and anything written under it would be lost with the container anyway.
+    # Relative template paths are rebased below the data directory (keeping
+    # their layout, e.g. state/round-results.sqlite3); an absolute path set
+    # by a custom template is the operator's explicit choice and is kept.
+    revival["results_path"] = _data_path(
+        revival.get("results_path"),
+        data_directory,
+        "state/round-results.sqlite3",
+    )
+    anticheat = _table(document, "anticheat")
+    anticheat["report_path"] = _data_path(
+        anticheat.get("report_path"),
+        data_directory,
+        "logs/anticheat.jsonl",
+    )
 
     region = _optional_text(environment, "BATTLESPADES_REGION", maximum=32)
     if region is not None:

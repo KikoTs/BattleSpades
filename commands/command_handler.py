@@ -134,7 +134,11 @@ async def send_message(server: 'BattleSpadesServer', player: 'Player', message: 
     packet = ChatMessage()
     packet.player_id = 255
     packet.chat_type = CHAT_SYSTEM
-    packet.value = message
+    # Team names are string-table ids (TEAM1_COLOR...); packet 49 shows them
+    # raw, so resolve them to their display names for free text.
+    from server.announcements import resolve_freeform_variables
+
+    packet.value = resolve_freeform_variables(message)
     player.send(bytes(packet.generate()))
 
 

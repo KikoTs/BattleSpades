@@ -33,6 +33,32 @@ _PICKUP_TYPES = frozenset((
 ))
 _MAX_STATIC_LIGHTS = 2048
 
+# Air-drop altitude for a respawning supply crate. The retail client simulates
+# any crate created in the air (free fall, parachute below 10 blocks, landing),
+# but the altitude the retail server spawned it at is not in any client table.
+# The top of the world keeps the fall inside the 11.5 s ``cratedrop_freefall``
+# loop and lets a drop point under a roof start just below that roof instead.
+CRATE_DROP_START_Z = 1.0
+# Same world-space falloff the airstrike fly-by uses for its plane.
+CRATE_FLYBY_ATTENUATION = 0.25
+_WW_SKYBOXES = frozenset(("WW1.txt",))
+
+
+def _counted(service, award, action):
+    """Wrap a crate refill so the collector's round award counts it."""
+
+    def refill(player):
+        result = action(player)
+        server = getattr(service, "server", None) or getattr(
+            getattr(player, "connection", None), "server", None
+        )
+        from server.combat_scores import record_crate
+
+        record_crate(server, player, int(award))
+        return result
+
+    return refill
+
 
 class MapResourceService:
     """Own map-authored crates and hidden chroma-marker flare entities."""
@@ -69,31 +95,90 @@ class MapResourceService:
                 self.server.broadcast_destroy_entity(entity.entity_id)
             registry.remove(entity.entity_id)
 
+    def crate_flyby_sound(self) -> int:
+        """Server-sent CRATEDROP_FLYBY_*_SOUND_ID (24/25/26) for this map.
+
+        The three ids are network sounds, so only the server can play them:
+        the WW1-era plane on the WW1 skybox maps, the space craft on the
+        lunar skyboxes (the same split as the airstrike fly-by), else the
+        standard transport.
+        """
+
+        from server.audio import (
+            SND_CRATEDROP_FLYBY_POS,
+            SND_CRATEDROP_FLYBY_POS_WW,
+            SND_CRATEDROP_FLYBY_SPACE_POS,
+            is_space_map,
+        )
+
+        if is_space_map(self.server):
+            return SND_CRATEDROP_FLYBY_SPACE_POS
+        world = getattr(self.server, "world_manager", None)
+        metadata = getattr(world, "map_metadata", None)
+        if getattr(metadata, "skybox_name", None) in _WW_SKYBOXES:
+            return SND_CRATEDROP_FLYBY_POS_WW
+        return SND_CRATEDROP_FLYBY_POS
+
+    def _drop_cue(self, entity) -> None:
+        """Play the positioned aircraft fly-by over a starting air drop."""
+
+        server = self.server
+        if not getattr(server.config, "entities_wire_ready", False):
+            return
+        from server.audio import play_sound
+
+        play_sound(
+            server,
+            self.crate_flyby_sound(),
+            position=(float(entity.x), float(entity.y), float(entity.z)),
+            attenuation=CRATE_FLYBY_ATTENUATION,
+        )
+
     @staticmethod
-    def _behaviors() -> dict[int, tuple[str, PickupCrateBehavior]]:
+    def _behaviors(
+        service: "MapResourceService | None" = None,
+    ) -> dict[int, tuple[str, PickupCrateBehavior]]:
         from server.audio import SND_CRATE, SND_CRATE_BLOCKS, SND_HEALTHCRATE
 
+        # A live service drops respawning crates by parachute; the bare table
+        # (tests, tooling) keeps static in-place respawns.
+        airdrop = {} if service is None else {
+            "airdrop": True,
+            "drop_start_z": CRATE_DROP_START_Z,
+            "drop_cue": service._drop_cue,
+        }
         return {
             int(C.AMMO_CRATE): ("map_ammo", PickupCrateBehavior(
                 # Type zero is a full-life restock in Character.restock.
-                lambda player: player.restock_ammo(int(C.AMMO_CRATE)),
-                respawn_delay=15.0,
+                _counted(service, C.MOST_AMMO_CRATES_COLLECTED,
+                         lambda player: player.restock_ammo(int(C.AMMO_CRATE))),
+                respawn_delay=float(C.CRATE_SPAWN_DELAY),
                 sound_id=SND_CRATE,
+                **airdrop,
             )),
             int(C.HEALTH_CRATE): ("map_health", PickupCrateBehavior(
-                lambda player: player.heal(MAX_HEALTH),
-                respawn_delay=15.0,
+                # Heal to this body's own maximum (a 200% VIP boss is not
+                # reset to 100; a 50% VIP is not overhealed).
+                _counted(service, C.MOST_HEALTH_CRATES_COLLECTED,
+                         lambda player: player.heal(
+                             int(getattr(player, "max_health", MAX_HEALTH))
+                         )),
+                respawn_delay=float(C.CRATE_SPAWN_DELAY),
                 sound_id=SND_HEALTHCRATE,
+                **airdrop,
             )),
             int(C.BLOCK_CRATE): ("map_block", PickupCrateBehavior(
-                lambda player: player.restock_blocks(),
-                respawn_delay=15.0,
+                _counted(service, C.MOST_BLOCK_CRATES_COLLECTED,
+                         lambda player: player.restock_blocks()),
+                respawn_delay=float(C.CRATE_SPAWN_DELAY),
                 sound_id=SND_CRATE_BLOCKS,
+                **airdrop,
             )),
             int(C.JETPACK_CRATE): ("map_jetpack", PickupCrateBehavior(
                 lambda player: player.restock_jetpack(),
-                respawn_delay=15.0,
+                respawn_delay=float(C.CRATE_SPAWN_DELAY),
                 sound_id=SND_CRATE,
+                **airdrop,
             )),
         }
 
@@ -123,7 +208,7 @@ class MapResourceService:
         server = self.server
         world = server.world_manager
         registry = server.entity_registry
-        behaviors = self._behaviors()
+        behaviors = self._behaviors(self)
         from server.game_rules import get_rules
         respawn_delay = float(
             get_rules(server.config).get("RULE_CRATES_SPAWN_TIME")

@@ -38,7 +38,8 @@ class VoxelFixture:
     def get_height(self, x: int, y: int) -> int:
         return self.surface_z(x, y)
 
-    def set_block(self, x: int, y: int, z: int, solid: bool, color: object) -> bool:
+    def set_block(self, x: int, y: int, z: int, solid: bool, color: object,
+                  health: float | None = None) -> bool:
         if solid:
             self.solids.add((x, y, z))
         else:
@@ -173,8 +174,12 @@ def test_planned_prefab_passes_real_gateway_and_service_exactly(geometry, monkey
     assert BotActionGateway(server).execute(owner, BotAction(BotActionKind.PLACE_PREFAB,
         tool_id=int(C.PREFAB_TOOL), position=site.position, argument=site.prefab_name, yaw=site.yaw))
     assert world._vxl.solids - before == set(site.cells)
-    assert owner.blocks == bot.blocks - site.required_blocks
-    assert len(remote_packets) == 6 and len(owner_packets) == 7
+    # Retail wallet: every authored model voxel is charged (replace_solids).
+    assert owner.blocks == bot.blocks - site.authored_blocks
+    # One native BuildPrefabAction(30) for every client; the bot owner gets
+    # only PrefabComplete(29).
+    assert [packet[0] for packet in remote_packets] == [30]
+    assert [packet[0] for packet in owner_packets] == [29]
 
 
 def test_bridge_requires_complete_affordable_crossing_and_far_exit():

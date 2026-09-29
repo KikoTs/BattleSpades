@@ -69,7 +69,10 @@ def test_classic_uses_recovered_intel_offset_and_stock_vote_catalog() -> None:
     server = _native_server()
 
     assert server.mode.intel_offset_from_base == 3.0
-    assert server.vote_manager._mode_available_maps() == server.mode.stock_maps
+    # The catalogue is shuffled once at startup (retail random.shuffle).
+    assert sorted(server.vote_manager._mode_available_maps()) == sorted(
+        server.mode.stock_maps
+    )
 
 
 def test_classic_mode_specific_score_target_remains_operator_configurable() -> None:

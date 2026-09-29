@@ -23,9 +23,10 @@ Ground-truth constants extracted from the original client's constants.py
   DRILL    20 u/s, gravity x1.5, lifespan 3.0s: contact blast 50/5,
            lifespan-expiry ("destroyed") blast 95/10
   SNOWBALL 50 u/s, gravity x0.5, blast 10, no block damage
-Sticky/chemical-bomb blast numbers are NOT in the constant catalog (set in
-compiled projectile code) — conservative grenade-family values are used and
-flagged for live calibration.
+Sticky blast numbers are NOT in the constant catalog (set in compiled
+projectile code) — conservative grenade-family values are used and flagged
+for live calibration. The chemical bomb has no blast at all: its impact
+creates goo (server/chemical_goo.py).
 """
 from __future__ import annotations
 
@@ -135,6 +136,9 @@ def _kill(name: str, default: int) -> int:
 
 _GRENADE_KILL = _kill("GRENADE_KILL", 3)
 
+# Stock ExplosionDamageManager handler arguments (server/weapons_retail.py).
+from server.weapons_retail import RETAIL_EXPLOSIONS_BY_NAME as _RETAIL_BLAST
+
 # Tool id -> spec. The bounce family keeps the legacy verified blast numbers
 # (handled by the explosion path in main.py); damage listed for reference.
 PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
@@ -169,8 +173,11 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         blast_radius=4.0,
         knockback_min=float(getattr(C, "MOLOTOV_EXPLOSION_KNOCKBACK_MIN", 0.0)),
         knockback_max=float(getattr(C, "MOLOTOV_EXPLOSION_KNOCKBACK_MAX", 0.1))),
+    # Stock handle_dynamite_damage: 300 damage, radius 8 (the thrown-bounce
+    # path; placed dynamite runs through deployable_actions).
     int(getattr(C, "DYNAMITE_TOOL", 21)): ProjectileSpec(
-        "dynamite", "bounce", 1.0, 100.0, 5.0,
+        "dynamite", "bounce", 1.0,
+        _RETAIL_BLAST["dynamite"].damage, 5.0,
         _kill("DYNAMITE_KILL", 15), 16,
         blast_radius=8.0,
         knockback_min=float(getattr(C, "DYNAMITE_EXPLOSION_KNOCKBACK_MIN", 0.1)),
@@ -194,15 +201,19 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
     int(C.RPG2_TOOL): ProjectileSpec(
         "rocket2", "contact",
         float(getattr(C, "ROCKET2_GRAVITY_MULTIPLIER", 0.025)),
-        float(getattr(C, "ROCKET2_EXPLOSION_DAMAGE", 50)),
+        # Stock handle_rocket2_damage passes 40; our shared constant still
+        # carries the modded 50.
+        _RETAIL_BLAST["rocket2"].damage,
         float(getattr(C, "ROCKET2_EXPLOSION_BLOCK_DAMAGE", 2)),
         _kill("ROCKET2_KILL", 5), 9,
         entity_type=int(getattr(C, "ROCKET2_ENTITY", 22)),
         blast_radius=6.0,
         knockback_min=float(getattr(C, "ROCKET2_EXPLOSION_KNOCKBACK_MIN", 0.0)),
-        knockback_max=float(getattr(C, "ROCKET2_EXPLOSION_KNOCKBACK_MAX", 0.25)),
-        self_knockback_min=float(getattr(C, "ROCKET2_EXPLOSION_SELF_KNOCKBACK_MIN", 1.0)),
-        self_knockback_max=float(getattr(C, "ROCKET2_EXPLOSION_SELF_KNOCKBACK_MAX", 1.5))),
+        # Stock handle_rocket2_damage passes 0.0/0.25 for EVERY body,
+        # the thrower included. ROCKET2_EXPLOSION_SELF_KNOCKBACK_MIN/MAX
+        # (1.0/1.5) exist only in the modded constants tail and no stock
+        # client or server code reads them (rules audit 2026-09-27 #3).
+        knockback_max=float(getattr(C, "ROCKET2_EXPLOSION_KNOCKBACK_MAX", 0.25))),
     int(C.DRILLGUN_TOOL): ProjectileSpec(
         "drill", "contact",
         float(getattr(C, "DRILL_GRAVITY_MULTIPLIER", 1.5)),
@@ -247,6 +258,9 @@ PROJECTILE_SPECS: dict[int, ProjectileSpec] = {
         blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_BLAST_WAVE_RADIUS", 6.0)),
         knockback_min=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MIN", 0.75)),
         knockback_max=float(getattr(C, "LANDMINE_EXPLOSION_KNOCKBACK_MAX", 0.75))),
+    # Flight only: on contact _explode_projectile hands the impact to the
+    # goo controller (server/chemical_goo.py). Retail has no Chemical Bomb
+    # blast handler, so damage/block_damage below are never applied as one.
     int(getattr(C, "CHEMICALBOMB_TOOL", 54)): ProjectileSpec(
         "chemical_bomb", "contact", 1.0,
         float(getattr(C, "CHEMICALBOMB_EXPLOSION_DAMAGE", 50.0)),

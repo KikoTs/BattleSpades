@@ -140,3 +140,64 @@ def test_runtime_config_is_parseable_and_does_not_include_master_token(
 
     assert parsed["admin"]["password"] == "strong-local-password"
     assert "do-not-serialize-this-token" not in runtime_path.read_text(encoding="utf-8")
+
+
+def test_container_places_all_writable_state_on_the_data_volume(
+    tmp_path: Path,
+) -> None:
+    """The hardened Compose example mounts /app read-only: pending AoSPlay
+    round results and the anti-cheat report must land under the data dir."""
+
+    document = build_runtime_config(
+        _template(),
+        {"BATTLESPADES_ADMIN_PASSWORD": "strong-local-password"},
+        data_directory=tmp_path,
+    )
+
+    assert document["revival"]["results_path"] == str(
+        tmp_path / "state" / "round-results.sqlite3"
+    )
+    assert document["anticheat"]["report_path"] == str(
+        tmp_path / "logs" / "anticheat.jsonl"
+    )
+    assert document["admin"]["bans_path"] == str(tmp_path / "bans.json")
+
+
+def test_container_keeps_explicit_absolute_state_paths(tmp_path: Path) -> None:
+    template = _template()
+    custom_results = tmp_path / "elsewhere" / "results.sqlite3"
+    custom_report = tmp_path / "elsewhere" / "ac.jsonl"
+    template["revival"]["results_path"] = str(custom_results)
+    template["anticheat"]["report_path"] = str(custom_report)
+
+    document = build_runtime_config(
+        template,
+        {"BATTLESPADES_ADMIN_PASSWORD": "strong-local-password"},
+        data_directory=tmp_path / "data",
+    )
+
+    assert document["revival"]["results_path"] == str(custom_results)
+    assert document["anticheat"]["report_path"] == str(custom_report)
+
+
+def test_container_rebases_missing_and_rejects_escaping_state_paths(
+    tmp_path: Path,
+) -> None:
+    template = _template()
+    del template["revival"]["results_path"]
+    document = build_runtime_config(
+        template,
+        {"BATTLESPADES_ADMIN_PASSWORD": "strong-local-password"},
+        data_directory=tmp_path,
+    )
+    assert document["revival"]["results_path"] == str(
+        tmp_path / "state" / "round-results.sqlite3"
+    )
+
+    template["revival"]["results_path"] = "../outside.sqlite3"
+    with pytest.raises(ContainerConfigurationError):
+        build_runtime_config(
+            template,
+            {"BATTLESPADES_ADMIN_PASSWORD": "strong-local-password"},
+            data_directory=tmp_path,
+        )

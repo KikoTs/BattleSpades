@@ -61,3 +61,18 @@ Include: OS + arch, Python version, which client you tested with (stock Steam,
 non-Steam, or the `aceofspades_revival` build), and the relevant `logs/` output.
 For gameplay desync, note what the **server** did vs. what the **client showed** —
 that split is usually where the bug lives.
+
+## License of contributions
+
+BattleSpades is licensed under the GNU Affero General Public License v3.0 or
+later ([`LICENSE`](LICENSE), summary in [`LICENSING.md`](LICENSING.md)). By
+submitting a contribution you agree that:
+
+- it is licensed to everyone under AGPL-3.0-or-later, including the section 7
+  Steamworks permission described in `LICENSING.md`;
+- you also grant Kiril Tsanov a perpetual, worldwide, royalty-free,
+  irrevocable license to use, modify, distribute and relicense your
+  contribution as part of BattleSpades under other terms, so the project can
+  keep making licensing decisions in one place. You keep your copyright; and
+- you have the right to submit it. Point out any third-party material in the
+  pull request together with its license, which must be AGPL-compatible.

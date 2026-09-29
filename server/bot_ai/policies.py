@@ -148,23 +148,36 @@ _MODE_STRATEGIES: dict[str, ModeBotStrategy] = {
 _MODE_ALIASES = {
     "normal": "nor",
     "classic_ctf": "cctf",
-    "classic-ctf": "cctf",
+    "classicctf": "cctf",
+    "capture_the_flag": "ctf",
+    "team_deathmatch": "tdm",
+    "teamdeathmatch": "tdm",
     "zombie": "zom",
+    "zombies": "zom",
     "multihill": "mh",
-    "multi-hill": "mh",
+    "multi_hill": "mh",
     "demolition": "dem",
     "territory_control": "tc",
-    "territory-control": "tc",
+    "territorycontrol": "tc",
     "diamond": "dia",
     "diamond_mine": "dia",
+    "diamondmine": "dia",
     "occupation": "oc",
     "tutorial": "tut",
 }
 
 
 def _canonical_mode(mode_id: str) -> str:
-    normalized = str(mode_id).strip().lower()
+    # Spaces and hyphens are spelling noise ("Classic CTF", "multi-hill");
+    # class-name fallbacks arrive run together ("DiamondMine").
+    normalized = "_".join(str(mode_id).strip().lower().replace("-", " ").split())
     return _MODE_ALIASES.get(normalized, normalized)
+
+
+def canonical_mode_id(mode_id: str) -> str:
+    """Return the canonical policy code for any configured/class mode name."""
+
+    return _canonical_mode(mode_id)
 
 
 def mode_strategy_for(mode_id: str) -> ModeBotStrategy:
@@ -356,7 +369,7 @@ class CTFBotPolicy:
         frame: PerceptionFrame,
         observer: PlayerSnapshot,
     ) -> ModeBotDecision | None:
-        classic = str(frame.mode_id).lower() == "cctf"
+        classic = _canonical_mode(frame.mode_id) == "cctf"
         prefix = "classic_" if classic else ""
         own_base = _objective(frame, "ctf_base", observer.team)
         own_intel = _objective(frame, "ctf_intel", observer.team)
@@ -411,6 +424,26 @@ class CTFBotPolicy:
                     engagement_radius=32.0,
                 )
 
+        if (
+            own_intel is not None
+            and own_intel.carrier_id < 0
+            and int(own_intel.state) == 1
+            and self._visible_drop(classic, observer, own_intel.position)
+            and self._is_recoverer(frame, observer, own_intel.position)
+        ):
+            # A dropped friendly intel lies in the open: the nearest two
+            # teammates guard it (touch-return where the server allows it)
+            # instead of letting the enemy walk back and re-take it.
+            return ModeBotDecision(
+                own_intel.position,
+                f"{prefix}ctf_recover_intel",
+                sprint=True,
+                arrival_radius=1.5,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.9,
+                engagement_radius=60.0,
+            )
+
         if own_base is not None and self._is_defender(frame, observer, own_base.position):
             return ModeBotDecision(
                 self._guard_point(frame, observer, own_base.position, enemy_intel),
@@ -425,7 +458,13 @@ class CTFBotPolicy:
         if (
             enemy_intel is not None
             and enemy_intel.carrier_id < 0
-            and (not classic or int(enemy_intel.state) == 0)
+            and (
+                int(enemy_intel.state) == 0
+                or not classic
+                # A dropped intel is an ordinary visible ground entity; only
+                # Classic's missing minimap limits it to what a bot can see.
+                or self._visible_drop(classic, observer, enemy_intel.position)
+            )
         ):
             if own_base is not None and self._should_rally(
                     frame, observer, own_base.position, enemy_intel.position):
@@ -450,6 +489,31 @@ class CTFBotPolicy:
             )
         return None
 
+
+    # Perception range: a dropped Classic intel farther than this is off
+    # screen with no minimap marker to reveal it.
+    _CLASSIC_DROP_SIGHT = 160.0
+
+    @classmethod
+    def _visible_drop(cls, classic: bool, observer: PlayerSnapshot,
+                      position: Vector3) -> bool:
+        return not classic or math.dist(observer.position, position) <= cls._CLASSIC_DROP_SIGHT
+
+    @staticmethod
+    def _is_recoverer(frame: PerceptionFrame, observer: PlayerSnapshot,
+                      intel: Vector3) -> bool:
+        """Only the two living teammates nearest a dropped intel go for it."""
+
+        own = math.dist(observer.position, intel)
+        closer = sum(
+            1 for player in frame.players
+            if player.team == observer.team and player.alive and player.spawned
+            and player.player_id != observer.player_id
+            and player.carried_entity_id < 0
+            and (math.dist(player.position, intel), player.player_id)
+            < (own, observer.player_id)
+        )
+        return closer < 2
 
     @staticmethod
     def _should_rally(frame: PerceptionFrame, observer: PlayerSnapshot,
@@ -519,7 +583,13 @@ class CTFBotPolicy:
 
 
 class ZombieBotPolicy:
-    """Separate preparation, survivor, infected, and last-man behavior."""
+    """Separate preparation, survivor, infected, and last-man behavior.
+
+    Survivors play like humans do in the retail mode: they leave the spawn for
+    the team's elected refuge (``zombie_refuge`` objective, a high flat spot
+    chosen by the director for the whole team), fortify it, hold it together
+    and fall back to a new refuge when it is breached. Infected hunt.
+    """
 
     def decide(
         self,
@@ -528,12 +598,24 @@ class ZombieBotPolicy:
     ) -> ModeBotDecision | None:
         phase = str(frame.mode_phase).lower()
         own_anchor = _objective(frame, "team_anchor", observer.team)
+        refuge = _objective(frame, "zombie_refuge", observer.team)
+        enemy_anchor = next(
+            (
+                item for item in frame.objectives
+                if item.kind == "team_anchor" and item.team != observer.team
+            ),
+            None,
+        )
         survivor = next(
             (item for item in frame.objectives if item.kind == "last_survivor"),
             None,
         )
-
+        infected = int(observer.class_id) in _ZOMBIE_CLASSES
         if phase in ("", "waiting", "countdown"):
+            if refuge is not None and not infected:
+                return self._refuge_decision(
+                    frame, observer, refuge, enemy_anchor, "zombie_prepare_refuge"
+                )
             if own_anchor is None:
                 return None
             preparation = _formation_point(
@@ -551,7 +633,6 @@ class ZombieBotPolicy:
                 objective_priority=0.92,
                 engagement_radius=18.0,
             )
-
         if survivor is not None and survivor.team != observer.team:
             # This exact location is legal only because ZombieMode publishes
             # the native final-survivor marker to every infected client.
@@ -564,8 +645,7 @@ class ZombieBotPolicy:
                 objective_priority=1.0,
                 engagement_radius=160.0,
             )
-
-        if int(observer.class_id) in _ZOMBIE_CLASSES:
+        if infected:
             # Infection exposes the survivor roster as the horde's strategic
             # target set. This is a deliberate mode rule: infected pursue the
             # nearest living survivor even before ordinary weapon FOV/LOS can
@@ -593,19 +673,33 @@ class ZombieBotPolicy:
                     objective_priority=0.98,
                     engagement_radius=160.0,
                 )
-
         if survivor is not None and survivor.carrier_id == observer.player_id:
-            enemy_anchor = next(
-                (
-                    item for item in frame.objectives
-                    if item.kind == "team_anchor" and item.team != observer.team
-                ),
-                None,
-            )
+            nearest_zombie = self._nearest_enemy(frame, observer)
+            if (
+                refuge is not None
+                and math.dist(observer.position, refuge.position) < 48.0
+                and (
+                    nearest_zombie is None
+                    or math.dist(refuge.position, nearest_zombie.position)
+                    > math.dist(observer.position, nearest_zombie.position) + 4.0
+                )
+            ):
+                # The last human runs for the high ground, not into the open.
+                return ModeBotDecision(
+                    refuge.position,
+                    "zombie_last_survivor_escape",
+                    sprint=True,
+                    arrival_radius=1.5,
+                    posture=ModeBotPosture.EVASIVE,
+                    objective_priority=1.0,
+                    engagement_radius=7.0,
+                )
             escape = _away_from(
                 observer.position,
                 (
-                    enemy_anchor.position
+                    nearest_zombie.position
+                    if nearest_zombie is not None
+                    else enemy_anchor.position
                     if enemy_anchor is not None
                     else (256.0, 256.0, observer.position[2])
                 ),
@@ -620,17 +714,26 @@ class ZombieBotPolicy:
                 objective_priority=1.0,
                 engagement_radius=7.0,
             )
-
-        if own_anchor is not None:
+        if refuge is not None and not infected:
+            return self._refuge_decision(
+                frame, observer, refuge, enemy_anchor, "zombie_survivor_refuge"
+            )
+        # With nobody left in sight the horde sweeps the survivors' side of
+        # the map rather than milling around its own spawn.
+        sweep = enemy_anchor if infected and enemy_anchor is not None else own_anchor
+        if sweep is not None:
             fallback = _formation_point(
-                own_anchor.position,
+                sweep.position,
                 observer.player_id,
                 12.0,
             )
+            # Key on what the observer IS: an infected bot with no survivor
+            # in sight must breach, never pick up a survivor's block job.
             role = (
-                "zombie_survivor_regroup"
-                if survivor is None or survivor.team == observer.team
-                else "zombie_infected_breach"
+                "zombie_infected_breach"
+                if infected
+                or (survivor is not None and survivor.team != observer.team)
+                else "zombie_survivor_regroup"
             )
             return ModeBotDecision(
                 fallback,
@@ -650,6 +753,59 @@ class ZombieBotPolicy:
                 ),
             )
         return None
+
+    @staticmethod
+    def _nearest_enemy(
+        frame: PerceptionFrame, observer: PlayerSnapshot
+    ) -> PlayerSnapshot | None:
+        enemies = [
+            player for player in frame.players
+            if player.team != observer.team and player.alive and player.spawned
+        ]
+        if not enemies:
+            return None
+        return min(
+            enemies,
+            key=lambda player: _distance_squared(observer.position, player.position),
+        )
+
+    def _refuge_decision(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        refuge,
+        enemy_anchor,
+        role: str,
+    ) -> ModeBotDecision:
+        """Spread the squad over the refuge top and watch the approach."""
+
+        # Inside the squad's rampart ring (four blocks out), clear of the
+        # wall columns so builders never have to work around a body.
+        spot = _formation_point(
+            refuge.position,
+            observer.player_id,
+            1.0 + float(observer.player_id % 3) * 0.75,
+        )
+        spot = (spot[0], spot[1], float(refuge.position[2]))
+        nearest = self._nearest_enemy(frame, observer)
+        watch = (
+            nearest.position
+            if nearest is not None
+            else enemy_anchor.position
+            if enemy_anchor is not None
+            else None
+        )
+        return ModeBotDecision(
+            spot,
+            role,
+            sprint=True,
+            arrival_radius=2.0,
+            directive="fortify",
+            posture=ModeBotPosture.BUILD,
+            objective_priority=0.86,
+            engagement_radius=28.0,
+            watch_position=watch,
+        )
 
 
 class VIPBotPolicy:
@@ -820,7 +976,17 @@ class ArenaBotPolicy:
 
 
 class MultiHillBotPolicy:
-    """Converge on the live shared objective and fortify friendly control."""
+    """Claim hostile hills, guard owned ones, and clear out before the strike.
+
+    Every hill that rotates out is airstruck (five shells, 5 blocks apart,
+    6-block blasts). The rotation timer is on the native HUD, so bots may
+    leave in time and skip a hill that will expire before they arrive.
+    """
+
+    # Shell pattern reach plus blast radius, with a margin.
+    _STRIKE_CLEARANCE = 5.0 + float(getattr(C, "AIRSTRIKE_EXPLOSION_RADIUS", 6)) + 5.0
+    _LEAVE_SECONDS = 7.0
+    _SKIP_SECONDS = 14.0
 
     def decide(
         self,
@@ -830,13 +996,50 @@ class MultiHillBotPolicy:
         hills = [item for item in frame.objectives if item.kind == "mh_hill"]
         if not hills:
             return _FALLBACK.decide(frame, observer)
-        hill = min(
-            hills,
-            key=lambda item: _distance_squared(observer.position, item.position),
-        )
-        if hill.team == observer.team and not int(hill.state):
+
+        def xy(item) -> float:
+            return math.hypot(observer.position[0] - item.position[0],
+                              observer.position[1] - item.position[1])
+
+        doomed = [item for item in hills
+                  if 0.0 <= float(item.expires_in) <= self._LEAVE_SECONDS
+                  and xy(item) <= self._STRIKE_CLEARANCE]
+        if doomed:
+            hill = min(doomed, key=xy)
             return ModeBotDecision(
-                _formation_point(hill.position, observer.player_id, 4.0),
+                _away_from(observer.position, hill.position,
+                           self._STRIKE_CLEARANCE + 8.0 - xy(hill)),
+                "multihill_evade_airstrike",
+                sprint=True,
+                arrival_radius=3.0,
+                posture=ModeBotPosture.SURVIVE,
+                objective_priority=1.0,
+                engagement_radius=8.0,
+            )
+        live = [item for item in hills
+                if not 0.0 <= float(item.expires_in) <= self._SKIP_SECONDS]
+        if not live:
+            # Every hill is about to rotate out: hold outside the strike and
+            # be ready for the next activation instead of running into it.
+            return ModeBotDecision(
+                observer.position,
+                "multihill_await_rotation",
+                sprint=False,
+                arrival_radius=3.0,
+                posture=ModeBotPosture.BALANCED,
+                objective_priority=0.5,
+                engagement_radius=90.0,
+            )
+        owned = [item for item in live
+                 if item.team == observer.team and not int(item.state)]
+        targets = [item for item in live
+                   if item.team != observer.team or int(item.state)]
+        guard_hill = min(owned, key=xy) if owned else None
+        if guard_hill is not None and (
+            not targets or self._is_guard(frame, observer, guard_hill.position)
+        ):
+            return ModeBotDecision(
+                _formation_point(guard_hill.position, observer.player_id, 4.0),
                 "multihill_defend",
                 sprint=False,
                 arrival_radius=2.5,
@@ -845,6 +1048,7 @@ class MultiHillBotPolicy:
                 objective_priority=0.9,
                 engagement_radius=34.0,
             )
+        hill = min(targets, key=xy)
         return ModeBotDecision(
             hill.position,
             "multihill_contest" if int(hill.state) else "multihill_claim",
@@ -855,9 +1059,29 @@ class MultiHillBotPolicy:
             engagement_radius=72.0,
         )
 
+    @staticmethod
+    def _is_guard(frame: PerceptionFrame, observer: PlayerSnapshot,
+                  hill: Vector3) -> bool:
+        """The one or two teammates nearest an owned hill hold it."""
+
+        team = [player for player in frame.players
+                if player.team == observer.team and player.alive and player.spawned]
+        wanted = 1 if len(team) < 5 else 2
+        own = (math.dist(observer.position, hill), observer.player_id)
+        closer = sum(1 for player in team if player.player_id != observer.player_id
+                     and (math.dist(player.position, hill), player.player_id) < own)
+        return closer < wanted
+
 
 class DemolitionBotPolicy:
-    """Build/defend the friendly base and assault the opposing base."""
+    """Build/defend and repair the friendly base; tear down the enemy's.
+
+    The win condition is the enemy base's objective blocks, so attackers get
+    the ``demolish`` directive (dig/melee blocks inside the enemy base) and
+    defenders at a damaged base the ``repair`` directive (re-place destroyed
+    objective blocks). Both read the public base-health cell hints of the
+    ``dem_base`` objective.
+    """
 
     def decide(
         self,
@@ -886,17 +1110,44 @@ class DemolitionBotPolicy:
                 objective_priority=0.98,
                 engagement_radius=18.0,
             )
-        if phase == "airstrike" and enemy_base is not None:
+        if phase == "airstrike":
+            # The strike falls on the base that was destroyed, whichever
+            # team owns it; the winners may be standing right on it.
+            bases = [item for item in frame.objectives if item.kind == "dem_base"]
+            doomed = next((item for item in bases if int(item.state) >= 100), None)
+            if doomed is None and bases:
+                doomed = max(bases, key=lambda item: int(item.state))
+            if doomed is not None:
+                return ModeBotDecision(
+                    _away_from(observer.position, doomed.position, 28.0),
+                    "demolition_escape_airstrike",
+                    sprint=True,
+                    arrival_radius=5.0,
+                    posture=ModeBotPosture.SURVIVE,
+                    objective_priority=1.0,
+                    engagement_radius=6.0,
+                )
+        can_build = int(C.BLOCK_TOOL) in {int(tool) for tool in observer.loadout} and (
+            int(observer.blocks) > 0)
+        if (
+            own_base is not None
+            and own_base.repair_cells
+            and can_build
+            and self._is_repairer(frame, observer, own_base)
+        ):
+            cell = _nearest_cell(observer.position, own_base.repair_cells)
             return ModeBotDecision(
-                _away_from(observer.position, enemy_base.position, 28.0),
-                "demolition_escape_airstrike",
+                # Stand on the block under the hole, within placing reach.
+                _standing_on(cell[0], cell[1], cell[2] + 1),
+                "demolition_repair_base",
                 sprint=True,
-                arrival_radius=5.0,
-                posture=ModeBotPosture.SURVIVE,
-                objective_priority=1.0,
-                engagement_radius=6.0,
+                arrival_radius=3.0,
+                directive="repair",
+                posture=ModeBotPosture.BUILD,
+                objective_priority=0.9,
+                engagement_radius=40.0,
             )
-        if observer.player_id % 4 == 0 and own_base is not None:
+        if _passive_slot(frame, observer, 4) and own_base is not None:
             return ModeBotDecision(
                 _guard_beat(frame, observer, own_base.position, 6.0),
                 "demolition_defend_base",
@@ -908,16 +1159,45 @@ class DemolitionBotPolicy:
                 engagement_radius=40.0,
             )
         if enemy_base is not None:
+            target = (
+                _standing_on(*_nearest_cell(observer.position, enemy_base.cells))
+                if enemy_base.cells else enemy_base.position
+            )
+            # A sapper at the base keeps digging through distant fire; only
+            # a close enemy (or one that just hit it) pulls it into a duel.
+            # From midfield it fights like any assault.
+            at_base = math.dist(observer.position, target) <= 10.0
             return ModeBotDecision(
-                enemy_base.position,
+                target,
                 "demolition_assault_base",
                 sprint=True,
                 arrival_radius=2.0,
+                directive="demolish",
                 posture=ModeBotPosture.ASSAULT,
                 objective_priority=0.9,
-                engagement_radius=90.0,
+                engagement_radius=12.0 if at_base else 90.0,
             )
         return None
+
+    @staticmethod
+    def _is_repairer(frame: PerceptionFrame, observer: PlayerSnapshot, base) -> bool:
+        """The base guard always repairs; heavier damage recalls more hands.
+
+        Up to a quarter of the team per 25% of damage (at least one bot)
+        breaks off, nearest first, so the assault never stops entirely.
+        """
+
+        team = [player for player in frame.players
+                if player.team == observer.team and player.alive and player.spawned
+                and player.is_bot]
+        if _team_slot(frame, observer) % 4 == 0:
+            return True
+        damage = max(0, min(100, int(base.state)))
+        wanted = max(1, min(len(team) // 2, (len(team) * damage) // 100))
+        own = (math.dist(observer.position, base.position), observer.player_id)
+        closer = sum(1 for player in team if player.player_id != observer.player_id
+                     and (math.dist(player.position, base.position), player.player_id) < own)
+        return closer < wanted
 
 
 class TerritoryControlBotPolicy:
@@ -935,7 +1215,30 @@ class TerritoryControlBotPolicy:
             return _FALLBACK.decide(frame, observer)
         hostile = [item for item in territories if item.team != observer.team]
         friendly = [item for item in territories if item.team == observer.team]
-        if observer.player_id % 4 == 0 and friendly:
+        # The capture bar shows an enemy draining a friendly base even when
+        # no defender stands in it (the base is then "uncontested").
+        besieged = [item for item in friendly
+                    if int(item.attacker) >= 0 and int(item.attacker) != observer.team]
+        if besieged and (
+            _team_slot(frame, observer) % 4 == 0
+            # A second responder when it is already within reach.
+            or _team_slot(frame, observer) % 4 == 1
+            and min(math.dist(observer.position, item.position) for item in besieged) <= 90.0
+        ):
+            base = min(
+                besieged,
+                key=lambda item: _distance_squared(observer.position, item.position),
+            )
+            return ModeBotDecision(
+                base.position,
+                "territory_relieve_siege",
+                sprint=True,
+                arrival_radius=2.0,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.95,
+                engagement_radius=72.0,
+            )
+        if _passive_slot(frame, observer, 4) and friendly:
             base = min(
                 friendly,
                 key=lambda item: _distance_squared(observer.position, item.position),
@@ -1003,7 +1306,7 @@ class DiamondMineBotPolicy:
             and item.team == observer.team
             and item.carrier_id != observer.player_id
         ]
-        if friendly_carriers and observer.player_id % 3 == 0:
+        if friendly_carriers and _passive_slot(frame, observer, 3):
             carrier = min(
                 friendly_carriers,
                 key=lambda item: _distance_squared(observer.position, item.position),
@@ -1032,7 +1335,7 @@ class DiamondMineBotPolicy:
                 objective_priority=0.9,
                 engagement_radius=24.0,
             )
-        if dropoffs and observer.player_id % 4 == 0:
+        if dropoffs and _passive_slot(frame, observer, 4):
             target = min(
                 dropoffs,
                 key=lambda item: _distance_squared(observer.position, item.position),
@@ -1060,7 +1363,23 @@ class DiamondMineBotPolicy:
 
 
 class OccupationBotPolicy:
-    """Attackers deliver bombs; defenders intercept and clear the blast zone."""
+    """Attackers deliver/escort bombs; defenders intercept and dispose of them.
+
+    A defender carrying a bomb runs it to ONE disposal point, chosen when it
+    picked the bomb up (away from the target), where the mode drops it. The
+    point used to be recomputed from the moving carrier every decision, which
+    chased the goal to the map edge and hoarded the bomb out of play.
+    """
+
+    _DISPOSE_EXTRA = 26.0
+    _DISPOSE_MIN = 44.0
+    # Armed bombs this close to the target will score unless carried off.
+    _INTERCEPT_RADIUS = 36.0
+    # A loose, unarmed bomb is only worth denying with an attacker this close.
+    _DENY_RADIUS = 24.0
+
+    def __init__(self) -> None:
+        self._dispose: dict[tuple[int, int, int], Vector3] = {}
 
     def decide(
         self,
@@ -1072,8 +1391,10 @@ class OccupationBotPolicy:
             None,
         )
         bombs = [item for item in frame.objectives if item.kind == "oc_bomb"]
+        attacker = observer.team == int(C.TEAM1)
+        carry_key = (observer.player_id, observer.generation, observer.life_id)
         if observer.carried_entity_id == int(C.BOMB_PICKUP):
-            if observer.team == int(C.TEAM1) and target is not None:
+            if attacker and target is not None:
                 return ModeBotDecision(
                     target.position,
                     "occupation_deliver_bomb",
@@ -1084,55 +1405,135 @@ class OccupationBotPolicy:
                     engagement_radius=7.0,
                 )
             if observer.team == int(C.TEAM2) and target is not None:
+                point = self._dispose.get(carry_key)
+                if point is None:
+                    if len(self._dispose) >= 128:
+                        self._dispose.clear()
+                    here = math.hypot(observer.position[0] - target.position[0],
+                                      observer.position[1] - target.position[1])
+                    point = _away_from(
+                        observer.position, target.position,
+                        max(self._DISPOSE_EXTRA, self._DISPOSE_MIN - here),
+                    )
+                    self._dispose[carry_key] = point
                 return ModeBotDecision(
-                    _away_from(observer.position, target.position, 30.0),
+                    point,
                     "occupation_dispose_bomb",
                     sprint=True,
-                    arrival_radius=5.0,
+                    arrival_radius=4.0,
                     posture=ModeBotPosture.SURVIVE,
                     objective_priority=1.0,
                     engagement_radius=6.0,
                 )
+        self._dispose.pop(carry_key, None)
+
+        enemies = [player for player in frame.players
+                   if player.team != observer.team and player.alive and player.spawned]
+        allies = [player for player in frame.players
+                  if player.team == observer.team and player.alive and player.spawned]
+        carried = [item for item in bombs if item.carrier_id >= 0]
         loose = [item for item in bombs if item.carrier_id < 0]
-        if loose:
-            if observer.team == int(C.TEAM1):
-                candidates = loose
-            else:
-                candidates = [item for item in loose if int(item.state)] or loose
-            bomb = min(
-                candidates,
-                key=lambda item: _distance_squared(observer.position, item.position),
-            )
-            return ModeBotDecision(
-                bomb.position,
-                "occupation_intercept_live_bomb"
-                if observer.team == int(C.TEAM2) and int(bomb.state)
-                else "occupation_retrieve_bomb",
-                sprint=True,
-                arrival_radius=1.75,
-                posture=(
-                    ModeBotPosture.SURVIVE
-                    if observer.team == int(C.TEAM2) and int(bomb.state)
-                    else ModeBotPosture.ASSAULT
-                ),
-                objective_priority=0.96,
-                engagement_radius=(
-                    10.0
-                    if observer.team == int(C.TEAM2) and int(bomb.state)
-                    else 56.0
-                ),
-            )
-        if observer.team == int(C.TEAM2) and target is not None:
-            return ModeBotDecision(
-                _formation_point(target.position, observer.player_id, 6.0),
-                "occupation_defend_base",
-                sprint=False,
-                arrival_radius=3.0,
-                directive="fortify" if observer.player_id % 3 == 0 else "",
-                posture=ModeBotPosture.DEFEND,
-                objective_priority=0.9,
-                engagement_radius=40.0,
-            )
+
+        if attacker:
+            friendly_carrier = next(
+                (item for item in carried if item.team == observer.team
+                 and item.carrier_id != observer.player_id), None)
+            if friendly_carrier is not None and self._nearest_few(
+                    observer, allies, friendly_carrier.position, 2,
+                    exclude=friendly_carrier.carrier_id):
+                return ModeBotDecision(
+                    _formation_point(friendly_carrier.position, observer.player_id, 4.5),
+                    "occupation_escort_carrier",
+                    sprint=True,
+                    arrival_radius=2.5,
+                    posture=ModeBotPosture.ESCORT,
+                    objective_priority=0.92,
+                    engagement_radius=36.0,
+                )
+            if loose:
+                bomb = min(loose, key=lambda item: _distance_squared(
+                    observer.position, item.position))
+                return ModeBotDecision(
+                    bomb.position,
+                    "occupation_retrieve_bomb",
+                    sprint=True,
+                    arrival_radius=1.75,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.96,
+                    engagement_radius=56.0,
+                )
+            hostile_carrier = next(
+                (item for item in carried if item.team != observer.team), None)
+            if hostile_carrier is not None:
+                # A defender is walking the bomb away: kill the carrier so
+                # it drops, then bring it back in.
+                return ModeBotDecision(
+                    hostile_carrier.position,
+                    "occupation_hunt_carrier",
+                    sprint=True,
+                    arrival_radius=2.5,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.92,
+                    engagement_radius=100.0,
+                )
+        else:
+            live = [item for item in loose if int(item.state) and target is not None
+                    and math.dist(item.position, target.position) <= self._INTERCEPT_RADIUS]
+            if live:
+                bomb = min(live, key=lambda item: _distance_squared(
+                    observer.position, item.position))
+                return ModeBotDecision(
+                    bomb.position,
+                    "occupation_intercept_live_bomb",
+                    sprint=True,
+                    arrival_radius=1.75,
+                    posture=ModeBotPosture.SURVIVE,
+                    objective_priority=0.96,
+                    engagement_radius=10.0,
+                )
+            hostile_carrier = next(
+                (item for item in carried if item.team != observer.team), None)
+            if (hostile_carrier is not None
+                    and _team_slot(frame, observer) % 3 != 0
+                    and math.dist(observer.position, hostile_carrier.position) <= 140.0):
+                return ModeBotDecision(
+                    hostile_carrier.position,
+                    "occupation_hunt_carrier",
+                    sprint=True,
+                    arrival_radius=2.5,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.94,
+                    engagement_radius=100.0,
+                )
+            contested = [
+                item for item in loose if not int(item.state)
+                and any(math.dist(enemy.position, item.position) <= self._DENY_RADIUS
+                        for enemy in enemies)
+                and self._nearest_few(observer, allies, item.position, 1)
+            ]
+            if contested:
+                bomb = min(contested, key=lambda item: _distance_squared(
+                    observer.position, item.position))
+                return ModeBotDecision(
+                    bomb.position,
+                    "occupation_deny_bomb",
+                    sprint=True,
+                    arrival_radius=1.75,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.94,
+                    engagement_radius=56.0,
+                )
+            if target is not None:
+                return ModeBotDecision(
+                    _formation_point(target.position, observer.player_id, 6.0),
+                    "occupation_defend_base",
+                    sprint=False,
+                    arrival_radius=3.0,
+                    directive="fortify" if observer.player_id % 3 == 0 else "",
+                    posture=ModeBotPosture.DEFEND,
+                    objective_priority=0.9,
+                    engagement_radius=40.0,
+                )
         fallback = _FALLBACK.decide(frame, observer)
         if fallback is None:
             return None
@@ -1145,6 +1546,16 @@ class OccupationBotPolicy:
             objective_priority=0.62,
             engagement_radius=120.0,
         )
+
+    @staticmethod
+    def _nearest_few(observer: PlayerSnapshot, allies, position: Vector3,
+                     count: int, *, exclude: int = -1) -> bool:
+        own = (math.dist(observer.position, position), observer.player_id)
+        closer = sum(1 for player in allies
+                     if player.player_id not in (observer.player_id, exclude)
+                     and player.carried_entity_id < 0
+                     and (math.dist(player.position, position), player.player_id) < own)
+        return closer < count
 
 
 _FALLBACK = PatrolCombatPolicy()
@@ -1213,6 +1624,23 @@ def _watch_approach(frame: PerceptionFrame, observer: PlayerSnapshot,
     return replace(decision, watch_position=approach.position) if approach is not None else decision
 
 
+# Roles whose goal is a live player (or a point derived from one, such as a
+# flight away from the nearest zombie). Freezing their anchor for eight
+# seconds sent hunters to where the survivor used to be. Wounded regroups
+# (arena_regroup, tdm_regroup_wounded) deliberately stay anchored: the role
+# itself only lasts the 8 s after a hit, and re-routing after a teammate's
+# every step walked wounded London arena bots into the river (map matrix).
+_LIVE_TARGET_ROLE_WORDS = ("escort", "hunt", "escape", "evade", "intercept")
+_LIVE_TARGET_ROLES = frozenset({
+    "vip_guard_formation", "vip_flank_attack", "vip_sudden_death_assault",
+    "vip_rally", "vip_retreat", "tdm_squad_support",
+})
+
+
+def _tracks_live_position(role: str) -> bool:
+    return role in _LIVE_TARGET_ROLES or any(word in role for word in _LIVE_TARGET_ROLE_WORDS)
+
+
 @dataclass(slots=True)
 class _ModeCommitment:
     signature: tuple[object, ...]
@@ -1270,9 +1698,7 @@ class ModePolicyMemory:
                 assert decision is not None
             if decision.role == previous.decision.role:
                 separation = math.dist(decision.position, previous.decision.position)
-                moving_role = ("escort" in decision.role or decision.role in {
-                    "vip_guard_formation", "vip_flank_attack", "vip_sudden_death_assault",
-                    "vip_rally", "vip_retreat", "ctf_intercept_carrier"})
+                moving_role = _tracks_live_position(decision.role)
                 # Small motion must not rebuild an escort route every frame.
                 # Meaningful carrier movement still moves its escort promptly.
                 hold = separation <= 3 and abs(decision.position[2] - previous.decision.position[2]) <= 1
@@ -1375,6 +1801,55 @@ def _guard_beat(frame: PerceptionFrame, observer: PlayerSnapshot, center: Vector
     beat = int((float(frame.created_at) + observer.player_id * 5.3) // 18.0)
     return _formation_point(center, observer.player_id + beat * 5,
                             radius + 2.5 * ((beat + observer.player_id) % 3))
+
+
+def _team_slot(frame: PerceptionFrame, observer: PlayerSnapshot) -> int:
+    """The observer's index among its team's bots, ordered by player id.
+
+    Role splits used ``player_id % n``, but bots join the two teams
+    alternately, so even ids all landed on one team: Demolition gave Blue
+    three base guards and Green none, and Territory Control the same.
+    """
+
+    ids = sorted({player.player_id for player in frame.players
+                  if player.team == observer.team and player.is_bot}
+                 | {observer.player_id})
+    return ids.index(observer.player_id)
+
+
+def _team_bot_count(frame: PerceptionFrame, observer: PlayerSnapshot) -> int:
+    return len({player.player_id for player in frame.players
+                if player.team == observer.team and player.is_bot}
+               | {observer.player_id})
+
+
+def _passive_slot(frame: PerceptionFrame, observer: PlayerSnapshot, n: int) -> bool:
+    """Whether this bot takes a team's 1-in-``n`` passive role (guard/escort).
+
+    A bot alone on its team always plays the objective: a lone Diamond or
+    Demolition bot parked as a guard would never mine or attack.
+    """
+
+    return (_team_bot_count(frame, observer) >= 2
+            and _team_slot(frame, observer) % n == 0)
+
+
+def _nearest_cell(position: Vector3, cells) -> tuple[int, int, int]:
+    return min(
+        cells,
+        key=lambda cell: (
+            (cell[0] + 0.5 - position[0]) ** 2
+            + (cell[1] + 0.5 - position[1]) ** 2
+            + (cell[2] + 0.5 - position[2]) ** 2,
+            tuple(cell),
+        ),
+    )
+
+
+def _standing_on(x: int, y: int, support_z: int) -> Vector3:
+    """Player position (eye-level anchor) standing on voxel ``support_z``."""
+
+    return (float(x) + 0.5, float(y) + 0.5, float(support_z) - 2.25)
 
 
 def _formation_point(position: Vector3, key: int, radius: float) -> Vector3:

@@ -86,12 +86,28 @@ def test_stop_sound_rejects_ids_that_cannot_fit_on_wire():
             raise AssertionError("out-of-range loop id was serialized")
 
 
+def _assert_al_flush(data):
+    """The silent PlaySound that clears a stale client OpenAL error."""
+    from shared.packet import PlaySound
+
+    assert data[0] == 23
+    pkt = PlaySound(ByteReader(data[1:]))
+    assert not pkt.positioned and not pkt.looping
+    assert pkt.volume == 0.0
+
+
+def _without_flush(sent):
+    _assert_al_flush(sent[0])
+    return sent[1:]
+
+
 def test_play_timeout_music_sends_stop_then_specific_ending():
     srv = FakeServer()
     audio.play_timeout_music(srv)
-    # StopMusic(27) FIRST (clears any playing track), then PlayMusic(26).
-    assert srv.sent[0][0] == 27
-    pkt = PlayMusic(ByteReader(srv.sent[1][1:]))
+    # AL-error flush, StopMusic(27) (clears any playing track), PlayMusic(26).
+    sent = _without_flush(srv.sent)
+    assert sent[0][0] == 27
+    pkt = PlayMusic(ByteReader(sent[1][1:]))
     assert pkt.name in audio.GAME_ENDING_TRACKS   # a SPECIFIC track, not a range
 
 
@@ -114,6 +130,7 @@ def test_send_map_ambient_picks_global_map_bed_without_fake_grid():
                                         map_size_x=512, map_size_y=512)
     player = FakePlayer(1)
     audio.send_map_ambient(srv, player)
+    player.sent = _without_flush(player.sent)
     assert len(player.sent) == 2
     data = player.sent[0]
     assert data[0] == 22                    # CreateAmbientSound id
@@ -139,6 +156,7 @@ def test_send_map_ambient_falls_back_for_unknown_map():
                                         map_size_x=512, map_size_y=512)
     player = FakePlayer(1)
     audio.send_map_ambient(srv, player)
+    player.sent = _without_flush(player.sent)
     assert audio.DEFAULT_AMBIENT.encode() + b"\x00" in player.sent[0][:16]
     play = PlayAmbientSound(ByteReader(player.sent[1][1:]))
     assert play.name == audio.DEFAULT_AMBIENT
@@ -165,6 +183,7 @@ def test_send_map_ambient_preserves_authored_local_emitters():
     player.x, player.y, player.z = 360.0, 315.0, 235.0
 
     audio.send_map_ambient(srv, player)
+    player.sent = _without_flush(player.sent)
 
     assert len(player.sent) == 4
     assert b"amb_jungle\x00\x01\x00" in player.sent[0]
@@ -186,8 +205,9 @@ def test_send_map_ambient_preserves_authored_local_emitters():
 def test_play_gameplay_music_sends_stop_then_specific_track():
     srv = FakeServer()
     audio.play_gameplay_music(srv)
-    assert srv.sent[0][0] == 27                   # StopMusic first
-    pkt = PlayMusic(ByteReader(srv.sent[1][1:]))
+    sent = _without_flush(srv.sent)
+    assert sent[0][0] == 27                       # StopMusic first
+    pkt = PlayMusic(ByteReader(sent[1][1:]))
     assert pkt.name in audio.GAMEPLAY_TRACKS      # a SPECIFIC track
     assert "last_man_standing" in pkt.name
     assert "-" not in pkt.name                    # never a range string
@@ -221,7 +241,7 @@ def test_kick_vote_passes_at_majority():
     assert vm.active
     vm.cast(srv.players[1], yes=True)  # second yes -> passes
     assert not vm.active
-    assert srv.players[3].disconnected == 2   # DISCONNECT_KICKED
+    assert srv.players[3].disconnected == 25  # ERROR_KICK_ABUSE
 
 
 def test_kick_vote_target_cannot_vote():
@@ -493,7 +513,7 @@ def test_generic_candidate_cast_maps_kick_choice_by_exact_candidate_name():
     vm.cast_candidate(srv.players[1], "Kick P3")
 
     assert vm.active is False
-    assert srv.players[3].disconnected == 2
+    assert srv.players[3].disconnected == 25  # ERROR_KICK_ABUSE
 
 
 def test_retail_wire_candidate_round_trips_and_forged_names_are_rejected():
@@ -523,7 +543,7 @@ def test_kick_vote_wire_candidates_use_stock_localized_yes_no_labels():
     ]
     vm.cast_wire_candidate(srv.players[1], packet.candidates[0]["name"])
     assert vm.active is False
-    assert srv.players[3].disconnected == 2
+    assert srv.players[3].disconnected == 25  # ERROR_KICK_ABUSE
 
 
 def test_duplicate_and_ineligible_votes_do_not_change_tally_or_broadcast():
@@ -587,3 +607,21 @@ def test_kick_resolution_is_retired_before_disconnect_callback():
     closed = [data for data in srv.sent if data[0] == 47
               and GenericVoteMessage(ByteReader(data[1:])).message_type == voting.VOTE_CLOSED]
     assert len(closed) == 1
+
+
+def test_ending_music_keeps_an_already_playing_timeout_track():
+    """The game_ending tracks peak at 0:00; the win must not cut the one the
+    final minute started, but a score-limit win (no timeout track) gets one."""
+    srv = FakeServer()
+    audio.play_timeout_music(srv)
+    srv.sent.clear()
+    assert audio.play_ending_music(srv) is False
+    assert srv.sent == []
+
+    srv = FakeServer()
+    audio.play_gameplay_music(srv)
+    srv.sent.clear()
+    assert audio.play_ending_music(srv) is True
+    sent = _without_flush(srv.sent)
+    assert sent[0][0] == 27
+    assert PlayMusic(ByteReader(sent[1][1:])).name in audio.GAME_ENDING_TRACKS

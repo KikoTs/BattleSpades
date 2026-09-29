@@ -28,6 +28,8 @@ _FREEFORM_VARIABLES = {
     "TEAM_NEUTRAL": "Neutral",
     "TEAM1_COLOR": "Blue",
     "TEAM2_COLOR": "Green",
+    "ZOMBIE_TEAM": "Zombie",
+    "SURVIVOR_TEAM": "Survivor",
 }
 _FREEFORM_VARIABLE_PATTERN = re.compile(
     r"(?<![A-Z0-9_])(" + "|".join(map(re.escape, _FREEFORM_VARIABLES))
@@ -108,6 +110,22 @@ def build_localised_overlay(
     return bytes(packet.generate())
 
 
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def localisation_safe_name(name: object) -> str:
+    """A player name the client cannot mistake for a string-table id.
+
+    With ``localise_parameters`` the stock client runs every parameter
+    through ``strings.get_by_id`` (``globals()[id]``).  Every key there is a
+    Python identifier, so only identifier-shaped names can collide; they get
+    one trailing space, which no key contains and the HUD does not show.
+    """
+
+    text = str(name)
+    return text + " " if _IDENTIFIER.fullmatch(text) else text
+
+
 def broadcast_overlay(server, message: object) -> None:
     """Broadcast one free-form top-screen message to in-game clients."""
 
@@ -139,5 +157,6 @@ __all__ = [
     "broadcast_overlay",
     "build_localised_overlay",
     "build_overlay_message",
+    "localisation_safe_name",
     "resolve_freeform_variables",
 ]

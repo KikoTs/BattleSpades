@@ -410,7 +410,11 @@ def test_double_dragon_water_recovery_moves_real_player_physics_to_land() -> Non
         server = BattleSpadesServer(config)
         assert server.world_manager.load_map("DoubleDragon")
         director = BotDirector(server, supervisor=SimpleNamespace())
-        bot = await director.add_bot(team=TEAM1, name="NativeSwimmer")
+        # Pinned: the random class draw picked Specialist here until the
+        # bot pool became the stock six (no Rocketeer); Medic swims slower.
+        bot = await director.add_bot(
+            team=TEAM1, name="NativeSwimmer", class_id=int(C.CLASS_SPECIALIST)
+        )
         assert bot is not None
         runtime = director._runtime[bot.id]
         planner = VoxelActionPlanner(

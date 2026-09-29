@@ -43,7 +43,7 @@ def _map_filename(server: 'BattleSpadesServer') -> str:
     is the raw basename used for the .vxl / CRC; `map_name` is the display
     name (see _map_display_name)."""
     name = server.world_manager.map_name if server.world_manager else server.config.map_name
-    return name or 'classicgen'
+    return name or str(getattr(server.config, 'default_map', '') or 'MayanJungle')
 
 
 # The compiled client builds the end-of-round stats screenshot path as

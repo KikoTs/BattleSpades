@@ -77,14 +77,17 @@ LOBBY_MODES: dict[str, LobbyModeDefinition] = {
         tuple(name for name in _STANDARD if name != "Invasion"),
         (16, 20, 24, 24),
     ),
+    # demolition.txt / occupation.txt also name GreatWall / BranCastle, but
+    # retail playlists.PlayList skips a mode listed in the map's mapinfo
+    # invalid_modes, so neither pair was ever served.
     "dem": LobbyModeDefinition(
         "dem", "Demolition", 900.0,
-        ("Atlantis", "BlockNess", "CastleWars", "DoubleDragon", "DragonIsland", "Frontier", "GreatWall", "LunarBase", "TokyoNeon"),
+        ("Atlantis", "BlockNess", "CastleWars", "DoubleDragon", "DragonIsland", "Frontier", "LunarBase", "TokyoNeon"),
         (16,),
     ),
     "oc": LobbyModeDefinition(
         "oc", "Occupation", 900.0,
-        tuple(name for name in _STANDARD if name not in {"CastleWars", "DoubleDragon", "TokyoNeon"}),
+        tuple(name for name in _STANDARD if name not in {"BranCastle", "CastleWars", "DoubleDragon", "TokyoNeon"}),
         (16, 20, 24),
     ),
 }

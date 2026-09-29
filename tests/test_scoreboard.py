@@ -22,10 +22,12 @@ def _pkt_id(data):
 class FakeServer:
     def __init__(self):
         self.sent = []
+        self.reliability = []
         self.players = {}
 
-    def broadcast(self, data):
+    def broadcast(self, data, reliable=True, **_kwargs):
         self.sent.append(data)
+        self.reliability.append(bool(reliable))
 
 
 def test_send_player_score_emits_setscore_player():
@@ -53,6 +55,13 @@ def test_round_timer_sends_seconds_remaining():
     scoreboard.send_round_timer(srv, 125.5)
     pkt = DisplayCountdown(ByteReader(srv.sent[0][1:]))
     assert abs(pkt.timer - 125.5) < 0.01
+
+
+def test_round_timer_refresh_can_be_unreliable_but_defaults_reliable():
+    srv = FakeServer()
+    scoreboard.send_round_timer(srv, 60.0)
+    scoreboard.send_round_timer(srv, 59.0, reliable=False)
+    assert srv.reliability == [True, False]
 
 
 def test_round_timer_clamps_negative_to_zero():

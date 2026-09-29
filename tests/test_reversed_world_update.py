@@ -474,15 +474,28 @@ def test_runtime_client_data_decodes_native_sign_magnitude_orientation():
     assert math.isclose(packet.o_z, 0.5, abs_tol=1e-6)
 
 
-def test_world_update_snapshot_packs_remote_disguise_and_water_state():
+def test_world_update_snapshot_packs_remote_disguise_and_goo_state():
     player, _ = make_player()
     player.disguised = True
-    player.wade = True
+    player.touching_goo = True
 
     snapshot = player.world_update_snapshot()
 
     assert snapshot[-6] == 0x0A
     assert snapshot[-5] == player.tool
+
+
+def test_wading_is_not_advertised_as_touching_goo():
+    """State bit 0x08 is Character.set_touching_goo (chemical-burn loop).
+
+    Stock character.pyd 0x10029150 only starts/stops the Chemical Bomb burn
+    sound for it; advertising wade there made every wading player play the
+    chemical-burn loop on every observer.
+    """
+    player, _ = make_player()
+    player.wade = True
+
+    assert player.world_update_snapshot()[-6] & 0x08 == 0
 
 
 def test_world_update_snapshot_serializes_authoritative_jetpack_fuel():
@@ -878,11 +891,14 @@ def test_input_label_gap_consumes_only_observed_client_frames():
 
     asyncio.run(player.simulate_tick(1.0 / 60.0))
     asyncio.run(player.simulate_tick(1.0 / 60.0))
+    asyncio.run(player.simulate_tick(1.0 / 60.0))
 
-    # Retail loop_count is a clock label and can skip without producing a
-    # movement-history entry. ACKing invented label 101 would make the native
-    # client's exact lookup fail and hard-snap its prediction history.
-    assert applied == [100, 102]
+    # The client labels every update contiguously and ClientData is
+    # unsequenced on the wire, so 101 is a lost frame the client did
+    # simulate. It is refilled with the held input and acknowledged as 101;
+    # the real 102 follows one tick later (docs/RETAIL_INPUT_LOSS.md).
+    assert applied == [100, 101, 102]
+    assert player.input_frames_synthesized == 1
     assert player.last_applied_input_loop == 102
     assert player.input_history == {}
 
@@ -995,20 +1011,22 @@ def test_large_input_gap_does_not_leak_newest_transition_backwards():
     player.record_input_frame(100, walking, orientation)
     asyncio.run(player.simulate_tick(1.0 / 60.0))
 
-    # Packet 102 introduces sprint. Actual frame 102 uses the prior walking
-    # state, then actual frame 104 uses sprint. Missing integer labels are not
-    # frames and therefore neither simulate nor advance the input latch.
+    # Packet 102 introduces sprint and packet 104 crouch; 101 and 103 were
+    # lost. Lost frames are refilled with the held (latched) input, real
+    # frames compose as before, and the newest crouch never leaks backwards.
     player.record_input_frame(102, sprinting, orientation)
     player.record_input_frame(104, crouching, orientation)
     player.update_input(*crouching)
-    asyncio.run(player.simulate_tick(1.0 / 60.0))
-    asyncio.run(player.simulate_tick(1.0 / 60.0))
-    asyncio.run(player.simulate_tick(1.0 / 60.0))
+    for _ in range(4):
+        asyncio.run(player.simulate_tick(1.0 / 60.0))
 
     assert player.last_applied_input_loop == 104
+    assert player.input_frames_synthesized == 2
     assert simulated == [
         (False, False),
-        (False, False),
+        (False, False),  # 101 refilled with walking
+        (False, False),  # 102: locomotion latched from 100/101 walking
+        (True, False),   # 103 refilled with 102's sprint, no crouch yet
         # Crouch geometry is current-frame in retail even though locomotion
         # remains one observed ClientData frame latched.
         (True, True),
