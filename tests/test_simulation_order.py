@@ -248,7 +248,7 @@ def test_explosion_impulse_recomputes_after_two_observed_input_frames():
     # Move between impact detection and Damage's predicted history row.  A
     # frozen vector would still point +X; retail recomputes and points +Y.
     player.position = (0.0, 2.0, 0.0)
-    player.record_input_frame(103, (False,) * 8, (1.0, 0.0, 0.0))
+    player.record_input_frame(101, (False,) * 8, (1.0, 0.0, 0.0))
     asyncio.run(player.simulate_tick(1.0 / 60.0))
 
     assert observed[0][1] == pytest.approx((0.0, 0.0, 0.0))

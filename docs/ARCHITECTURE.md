@@ -283,7 +283,10 @@ The dedicated-client flow is:
 Large KV6 decode, rotation, raw-color expansion, and ordering run on a single
 editor preparation worker. The gameplay thread polls the immutable result,
 validates live-world contact in `prefab_validation_batch_limit` slices, and
-commits at most `prefab_cell_batch_limit` cells per tick. No worker may touch
+commits at most `prefab_cell_batch_limit` cells per tick. Competitive
+(non-editor) prefabs are small stock models and commit whole in one tick,
+bounded across players by `prefab_competitive_cell_budget`, so the client
+renders them in one frame. No worker may touch
 the VXL, player, connection, or packet queues. This split kept a live
 115,080-voxel placement below 1 ms packet-drain time while preserving bounded
 incremental commits.

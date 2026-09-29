@@ -20,12 +20,18 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from server.mode_data import get as get_mode_data
+from server.steam_master import server_population
 from server.result_outbox import ResultOutbox
 from server.profile_stats import snapshot as profile_snapshot
 from server.cosmetics import CAPABILITY, CosmeticReplication
 
 
 logger = logging.getLogger(__name__)
+
+# A join or leave is published this soon instead of waiting out the regular
+# heartbeat interval, but never more often than this.
+POPULATION_HEARTBEAT_MIN_GAP_SECONDS = 5.0
+POPULATION_POLL_SECONDS = 1.0
 
 JOIN_CODE_PATTERN = re.compile(r"^~[A-Za-z0-9_-]{14}$")
 SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -119,6 +125,8 @@ class RevivalMasterService:
         self.server = server
         self.config = getattr(server.config, "revival", None)
         self._heartbeat_task: asyncio.Task | None = None
+        # (players, humans, bots, max) last accepted by the master.
+        self._published_population: tuple[int, int, int, int] | None = None
         self.cosmetics = CosmeticReplication(self)
         self._closing = False
         self._player_baselines: dict[int, tuple[int, int, int, int]] = {}
@@ -275,16 +283,39 @@ class RevivalMasterService:
             except Exception:
                 logger.exception("Could not persist pending Revival results during shutdown")
 
+    def _population_key(self) -> tuple[int, int, int, int]:
+        population = server_population(self.server)
+        return (
+            population.players,
+            population.humans,
+            population.bots,
+            population.max_players,
+        )
+
     async def _heartbeat_loop(self) -> None:
         interval = min(
             60.0,
             max(15.0, float(getattr(self.config, "heartbeat_interval_seconds", 30.0))),
         )
+        loop = asyncio.get_running_loop()
+        last_attempt = loop.time()
         while not self._closing:
             try:
-                await asyncio.sleep(interval)
-                # Result retries must continue even if heartbeats are rejected.
-                self._start_result_flush()
+                await asyncio.sleep(POPULATION_POLL_SECONDS)
+                now = loop.time()
+                due = now - last_attempt >= interval
+                # The server list shows the live population, so a join or
+                # leave goes out within seconds rather than a full interval.
+                population_changed = (
+                    self._population_key() != self._published_population
+                    and now - last_attempt >= POPULATION_HEARTBEAT_MIN_GAP_SECONDS
+                )
+                if not due and not population_changed:
+                    continue
+                last_attempt = now
+                if due:
+                    # Result retries must continue even if heartbeats are rejected.
+                    self._start_result_flush()
                 await self.publish_heartbeat()
             except asyncio.CancelledError:
                 raise
@@ -359,12 +390,7 @@ class RevivalMasterService:
                 self.server.config.default_map,
             )
         )
-        players = tuple(getattr(self.server, "players", {}).values())
-        bot_count = min(
-            len(players),
-            sum(bool(getattr(player, "is_bot", False)) for player in players),
-        )
-        human_count = len(players) - bot_count
+        population = server_population(self.server)
         texture_skin = (
             str(getattr(steam, "texture_skin", "") or "") if steam else ""
         )
@@ -386,10 +412,11 @@ class RevivalMasterService:
             "queryPort": query_port,
             # `players` is the total browser population. The explicit fields
             # preserve human/bot semantics without making the retail UI lie.
-            "players": len(players),
-            "human_players": human_count,
-            "bots": bot_count,
-            "max_players": int(self.server.config.max_players),
+            # Loading players already hold a slot and are counted as humans.
+            "players": population.players,
+            "human_players": population.humans,
+            "bots": population.bots,
+            "max_players": population.max_players,
             "map": map_name,
             "game_mode": mode.code.upper(),
             "mode_tla": mode.code,
@@ -407,14 +434,21 @@ class RevivalMasterService:
         }
 
     async def publish_heartbeat(self) -> None:
+        heartbeat = self.heartbeat_payload()
         status, payload = await self._post(
             "/api/master/servers/heartbeat",
-            self.heartbeat_payload(),
+            heartbeat,
         )
         if status != 200 or not payload.get("accepted"):
             raise RevivalMasterError(
                 payload.get("detail") or payload.get("error") or "heartbeat rejected"
             )
+        self._published_population = (
+            int(heartbeat["players"]),
+            int(heartbeat["human_players"]),
+            int(heartbeat["bots"]),
+            int(heartbeat["max_players"]),
+        )
         logger.debug("Published Revival heartbeat for %s", self.server_id)
 
     async def consume_join_ticket(self, ticket: str) -> RevivalIdentity:

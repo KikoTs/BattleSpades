@@ -144,10 +144,15 @@ def test_dynamite_detonation_sends_one_native_radius_packet_to_known_peers():
     assert len(live_damage) == 1
     assert live_damage[0].type == int(C.DYNAMITE_DAMAGE)
     assert live_damage[0].causer_id == charge.entity_id
-    assert not [
-        raw for raw in missed_connection.sent
-        if raw[0] in (Damage.id, 19)
+    # A peer that never saw the charge cannot resolve its entity id: it gets
+    # exact per-cell outcome packets (type 6), never the native radius packet.
+    missed = [
+        Damage(ByteReader(raw[1:]))
+        for raw in missed_connection.sent
+        if raw[0] == Damage.id
     ]
+    assert missed and all(int(packet.type) == int(C.WEAPON_DAMAGE) for packet in missed)
+    assert not [raw for raw in missed_connection.sent if raw[0] == 19]
 
 
 def test_human_placed_rocket_turret_acquires_and_fires_at_an_enemy():
@@ -329,7 +334,7 @@ def test_spectator_can_rejoin_a_playable_team_and_schedule_respawn():
     assert player.death_time > 0.0
 
 
-def test_radar_packet_creates_real_entity_and_enables_team_visibility():
+def test_radar_packet_creates_real_entity_without_team_visibility_packet():
     server, player, connection = _server_player(
         C.RADAR_STATION_TOOL, [C.RADAR_STATION_TOOL]
     )
@@ -341,17 +346,19 @@ def test_radar_packet_creates_real_entity_and_enables_team_visibility():
               if entity.type == C.RADAR_STATION_ENTITY]
     assert len(radars) == 1
     assert radars[0].type == 36  # retail GameScene.ENTITIES wire index
-    assert radars[0].fuse == 35.0
-    assert radars[0].behavior.lifetime == 35.0
+    assert radars[0].fuse == 45.0  # retail RADAR_STATION_LIFETIME (A1901)
+    assert radars[0].behavior.lifetime == 45.0
     assert server._radar_station_counts[TEAM1] == 1
-    assert any(packet[0] == 83 for packet in connection.sent)
+    # The stock client detects enemies from the radar entity itself (250
+    # blocks); TeamMapVisibility(83) would be a range-less whole-team reveal.
+    assert not any(packet[0] == 83 for packet in connection.sent)
     creates = [
         CreateEntity(ByteReader(packet[1:]))
         for packet in connection.sent
         if packet[0] == CreateEntity.id
     ]
     assert creates
-    assert creates[-1].entity.fuse == 35.0
+    assert creates[-1].entity.fuse == 45.0
 
     assert radars[0].support_cell == (101, 100, 62)
     assert server.world_manager.destroy_blocks([(101, 100, 62)]) == [
@@ -506,6 +513,9 @@ def test_block_sucker_uses_client_block_granting_damage_type():
     hit = (101, 100, 60)
     server.world_manager.set_block(*hit, True, (80, 90, 100))
     server.world_manager.raycast = lambda *_args: hit
+    # The retail one-second warm-up already elapsed for this press.
+    import time as _time
+    player._block_sucker_warm = (int(player.deaths), _time.monotonic() - 2.0, 0)
     packet = BlockSuckerPacket()
     packet.loop_count = 10
     packet.shooter_id = player.id

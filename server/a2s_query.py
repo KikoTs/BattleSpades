@@ -13,10 +13,16 @@ import json
 import random
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
 from .game_constants import TEAM1, TEAM2
-from .steam_master import build_game_tags, STEAM_APP_ID, STEAM_DESCRIPTION
+from .steam_master import (
+    build_game_tags,
+    server_population,
+    STEAM_APP_ID,
+    STEAM_DESCRIPTION,
+)
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -83,6 +89,10 @@ class A2SHandler:
         self._transport = None
         self._protocol = None
         self._running = False
+        # id(player) -> (player, monotonic first-seen). Player has no join
+        # timestamp, so A2S_PLAYER durations are measured from the first
+        # roster sweep that saw each player (update() sweeps every second).
+        self._joined_at: Dict[int, Tuple[object, float]] = {}
     
     def _generate_challenge(self) -> int:
         """Generate a new random challenge value."""
@@ -91,9 +101,26 @@ class A2SHandler:
     def update(self):
         """Periodic update - refresh challenge occasionally."""
         self._challenge_counter += 1
+        if self._challenge_counter % 60 == 0:
+            self._track_join_times()
         if self._challenge_counter >= 18000:  # ~5 minutes at 60 ticks
             self.challenge = self._generate_challenge()
             self._challenge_counter = 0
+
+    def _track_join_times(self) -> Dict[int, float]:
+        """Record first-seen times for the roster and forget departed players."""
+        now = time.monotonic()
+        players = tuple((getattr(self.server, "players", None) or {}).values())
+        live = {id(player): player for player in players}
+        joined = {
+            key: entry for key, entry in self._joined_at.items()
+            if live.get(key) is entry[0]
+        }
+        for key, player in live.items():
+            if key not in joined:
+                joined[key] = (player, now)
+        self._joined_at = joined
+        return {key: now - entry[1] for key, entry in joined.items()}
     
     def intercept(self, address, data: bytes):
         """
@@ -194,10 +221,11 @@ class A2SHandler:
         config = self.server.config
         map_name = self.server.world_manager.map_name if self.server.world_manager else config.map_name
         
+        population = server_population(self.server)
         entry = {
             "name": config.server_name,
-            "players_current": len(self.server.players),
-            "players_max": config.max_players,
+            "players_current": population.players,
+            "players_max": population.max_players,
             "map": map_name,
             "game_mode": config.game_mode,
             "game_version": "1.0a1"
@@ -305,13 +333,13 @@ class A2SHandler:
         # A2S keeps a historical uint16 AppID plus the full uint64 GameID EDF.
         packet.extend(struct.pack("<H", STEAM_APP_ID & 0xFFFF))
         
-        # Player counts
-        packet.append(len(self.server.players))
-        packet.append(config.max_players)
-        packet.append(sum(
-            1 for player in self.server.players.values()
-            if bool(getattr(player, "is_bot", False))
-        ))
+        # Player counts. Source convention: ``players`` includes ``bots``
+        # (the Revival master and Steam sidecar derive humans as the
+        # difference), and loading players already hold a slot.
+        population = server_population(self.server)
+        packet.append(population.players)
+        packet.append(population.max_players)
+        packet.append(population.bots)
         
         # Server type: 'd' = dedicated
         packet.append(ord('d'))
@@ -358,17 +386,25 @@ class A2SHandler:
         packet = bytearray(A2SConstants.PREFIX_BYTES)
         packet.append(A2SConstants.A2S_PLAYER_RESPONSE)
         
-        players = list(self.server.players.values())
+        durations = self._track_join_times()
+        players = sorted(
+            (getattr(self.server, "players", None) or {}).values(),
+            key=lambda player: int(getattr(player, "id", 0)),
+        )[:255]
         packet.append(len(players))
-        
+
         for idx, player in enumerate(players):
             packet.append(idx)
             name = player.name if player.name else f"Player{player.id}"
             packet.extend(name.encode('utf-8', 'replace') + b'\0')
-            score = getattr(player, 'kills', 0)
+            # The in-game scoreboard's SCORE column, not raw kills.
+            try:
+                score = int(getattr(player, 'score', 0) or 0)
+            except (TypeError, ValueError):
+                score = 0
+            score = max(-2147483648, min(2147483647, score))
             packet.extend(struct.pack("<i", score))
-            duration = getattr(player, 'time_connected', 0.0)
-            packet.extend(struct.pack("<f", duration))
+            packet.extend(struct.pack("<f", float(durations.get(id(player), 0.0))))
         
         return bytes(packet)
     
@@ -378,11 +414,21 @@ class A2SHandler:
         
         rules = {
             "mode": config.game_mode,
-            "map": config.map_name,
+            # The live map, not the configured first map of the rotation.
+            "map": str(
+                getattr(getattr(self.server, "world_manager", None), "map_name", "")
+                or config.map_name
+            ),
             "friendly_fire": "1" if config.friendly_fire else "0",
             "fall_damage": "1" if config.fall_damage else "0",
             "respawn_time": str(int(config.respawn_time)),
-            "score_limit": str(config.score_limit),
+            # The active mode owns its limit (TDM 200, CTF 10, ...); the
+            # generic game.score_limit is only a CTF-era default.
+            "score_limit": str(int(getattr(
+                getattr(self.server, "mode", None),
+                "score_limit",
+                config.score_limit,
+            ))),
             "team1": config.team1_name,
             "team2": config.team2_name,
         }

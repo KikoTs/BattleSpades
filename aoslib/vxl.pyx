@@ -14,7 +14,7 @@ import random as _random
 import struct as _struct
 import zlib as _zlib
 from libc.math cimport sqrt
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport malloc, calloc, realloc, free
 from libc.string cimport memset
 
 
@@ -76,7 +76,8 @@ cdef class _ColorTable:
             free(keys)
             free(values)
             raise MemoryError()
-        memset(keys, 0xFF, capacity * sizeof(unsigned int))
+        with nogil:
+            memset(keys, 0xFF, capacity * sizeof(unsigned int))
         self._keys = keys
         self._values = values
         self._capacity = capacity
@@ -89,7 +90,7 @@ cdef class _ColorTable:
         free(old_values)
         return 0
 
-    cdef inline Py_ssize_t _home(self, unsigned int key) noexcept:
+    cdef inline Py_ssize_t _home(self, unsigned int key) noexcept nogil:
         cdef unsigned int mixed = key
         mixed ^= mixed >> 16
         mixed *= <unsigned int>0x7FEB352D
@@ -98,7 +99,7 @@ cdef class _ColorTable:
         mixed ^= mixed >> 16
         return <Py_ssize_t>mixed & (self._capacity - 1)
 
-    cdef Py_ssize_t _find(self, unsigned int key) noexcept:
+    cdef Py_ssize_t _find(self, unsigned int key) noexcept nogil:
         cdef Py_ssize_t index = self._home(key)
         while self._keys[index] != _FREE_SLOT:
             if self._keys[index] == key:
@@ -106,7 +107,7 @@ cdef class _ColorTable:
             index = (index + 1) & (self._capacity - 1)
         return -1
 
-    cdef void _insert(self, unsigned int key, unsigned int value) noexcept:
+    cdef void _insert(self, unsigned int key, unsigned int value) noexcept nogil:
         """Store into a table known to have room."""
         cdef Py_ssize_t index = self._home(key)
         cdef Py_ssize_t reusable = -1
@@ -133,6 +134,16 @@ cdef class _ColorTable:
             self._resize(self._capacity * 2 if self._live * 5 > self._capacity * 2
                          else self._capacity)
         self._insert(key, value)
+        return 0
+
+    cdef int _reserve(self, Py_ssize_t count) except -1:
+        """Size an empty table exactly as ``count`` distinct ``_store`` calls
+        would grow it, so a GIL-free loader can ``_insert`` without resizing."""
+        cdef Py_ssize_t capacity = self._capacity
+        while count * 5 > capacity * 3:
+            capacity *= 2
+        if capacity != self._capacity:
+            self._resize(capacity)
         return 0
 
     cdef bint _discard(self, unsigned int key) noexcept:
@@ -174,11 +185,11 @@ cdef bytes _EMPTY_COLUMN = b"\x00\xF0\xEF\x00"
 cdef bytes _BLANK_VXL = _EMPTY_COLUMN * MAP_AREA
 
 
-cdef inline int _column_index(int x, int y):
+cdef inline int _column_index(int x, int y) noexcept nogil:
     return x + (y << 9)
 
 
-cdef inline int _voxel_index(int x, int y, int z):
+cdef inline int _voxel_index(int x, int y, int z) noexcept nogil:
     return x + (y << 9) + (z << 18)
 
 
@@ -188,6 +199,15 @@ cdef inline unsigned int _read_u32_le(bytes data, Py_ssize_t pos):
         | (data[pos + 1] << 8)
         | (data[pos + 2] << 16)
         | (data[pos + 3] << 24)
+    )
+
+
+cdef inline unsigned int _read_u32_le_ptr(const unsigned char* data, Py_ssize_t pos) noexcept nogil:
+    return (
+        data[pos]
+        | (<unsigned int>data[pos + 1] << 8)
+        | (<unsigned int>data[pos + 2] << 16)
+        | (<unsigned int>data[pos + 3] << 24)
     )
 
 
@@ -248,19 +268,33 @@ cdef object _coerce_raw_bytes(object source):
     return b""
 
 
-cdef tuple _get_vxl_size(bytes data):
+cdef bint _scan_vxl_size(
+    const unsigned char* data,
+    Py_ssize_t limit,
+    Py_ssize_t* columns_out,
+    int* max_ref_out,
+    Py_ssize_t* colour_words_out,
+) noexcept nogil:
+    """Validate the column/span walk and count columns, max z and colours.
+
+    Pure C over the raw buffer so map loads can run without the GIL.
+    ``colour_words_out`` is the number of explicit colour words the loader
+    will store (every span word except headers)."""
     cdef Py_ssize_t pos = 0
-    cdef Py_ssize_t limit = len(data)
     cdef Py_ssize_t columns = 0
+    cdef Py_ssize_t colour_words = 0
     cdef int max_ref = 0
     cdef int span_words
     cdef int v1
     cdef int v2
     cdef int v3
 
+    columns_out[0] = 0
+    max_ref_out[0] = 0
+    colour_words_out[0] = 0
     while pos < limit:
         if pos + 4 > limit:
-            return (0, 0)
+            return False
 
         span_words = data[pos]
         v1 = data[pos + 1]
@@ -274,9 +308,10 @@ cdef tuple _get_vxl_size(bytes data):
             max_ref = v3
 
         while span_words:
+            colour_words += span_words - 1
             pos += 4 * span_words
             if pos + 4 > limit:
-                return (0, 0)
+                return False
             span_words = data[pos]
             v1 = data[pos + 1]
             v2 = data[pos + 2]
@@ -289,14 +324,198 @@ cdef tuple _get_vxl_size(bytes data):
                 max_ref = v3
 
         if v2 >= v1:
+            colour_words += v2 - v1 + 1
             pos += 8 + 4 * (v2 - v1)
         else:
             pos += 4
         columns += 1
 
     if pos != limit:
+        return False
+    columns_out[0] = columns
+    max_ref_out[0] = max_ref
+    colour_words_out[0] = colour_words
+    return True
+
+
+cdef tuple _get_vxl_size(bytes data):
+    cdef const unsigned char* buf = data
+    cdef Py_ssize_t limit = len(data)
+    cdef Py_ssize_t columns = 0
+    cdef Py_ssize_t colour_words = 0
+    cdef int max_ref = 0
+    cdef bint ok
+    with nogil:
+        ok = _scan_vxl_size(buf, limit, &columns, &max_ref, &colour_words)
+    if not ok:
         return (0, 0)
     return (columns, max_ref)
+
+
+cpdef tuple raw_vxl_size(object data):
+    """``(columns, max_z_reference)`` of a raw VXL, ``(0, 0)`` if malformed.
+
+    Same walk as ``server.runtime_vxl._raw_vxl_size`` without the GIL."""
+    return _get_vxl_size(_coerce_raw_bytes(data))
+
+
+cdef inline bint _is_marker_colour(unsigned int color) noexcept nogil:
+    cdef unsigned int masked = color & 0x00F0F0F0
+    return masked == 0x0000F000 or masked == 0x000000F0
+
+
+cdef Py_ssize_t _scan_marker_words(
+    const unsigned char* data,
+    Py_ssize_t limit,
+    unsigned int** out_ptr,
+) noexcept nogil:
+    """Collect (x, y, source_z, colour) quads of chroma-marker words.
+
+    Mirrors ``server.runtime_vxl._iter_explicit_voxels`` exactly (including
+    stopping silently at the first malformed span) but keeps only words in
+    the native blue/green marker families. Returns the quad count, or -1
+    when out of memory. ``out_ptr`` receives a malloc'd buffer to free."""
+    cdef Py_ssize_t columns = 0
+    cdef Py_ssize_t colour_words = 0
+    cdef int max_ref = 0
+    cdef int edge
+    cdef int offset
+    cdef Py_ssize_t pos = 0
+    cdef Py_ssize_t span_start
+    cdef Py_ssize_t next_header
+    cdef Py_ssize_t count = 0
+    cdef Py_ssize_t capacity = 0
+    cdef unsigned int* out = NULL
+    cdef unsigned int* grown
+    cdef unsigned int color
+    cdef int source_x
+    cdef int source_y
+    cdef int x
+    cdef int y
+    cdef int span_words
+    cdef int top_start
+    cdef int top_end
+    cdef int top_len
+    cdef int bottom_len
+    cdef int bottom_start
+    cdef int base_z
+    cdef int index
+    cdef int run
+    cdef int run_len
+    cdef Py_ssize_t run_pos
+
+    out_ptr[0] = NULL
+    if not _scan_vxl_size(data, limit, &columns, &max_ref, &colour_words):
+        return 0
+    edge = <int>sqrt(<double>columns) if columns > 0 else 0
+    while (edge + 1) * (edge + 1) <= columns:
+        edge += 1
+    while edge > 0 and edge * edge > columns:
+        edge -= 1
+    if edge <= 0 or edge * edge != columns or edge > MAP_SIZE:
+        return 0
+    offset = (MAP_SIZE - edge) // 2
+    for source_y in range(edge):
+        y = source_y + offset
+        for source_x in range(edge):
+            x = source_x + offset
+            while True:
+                if pos + 4 > limit:
+                    out_ptr[0] = out
+                    return count
+                span_start = pos
+                span_words = data[pos]
+                top_start = data[pos + 1]
+                top_end = data[pos + 2]
+                top_len = top_end - top_start + 1 if top_end >= top_start else 0
+                pos += 4
+                if pos + top_len * 4 > limit:
+                    out_ptr[0] = out
+                    return count
+                bottom_len = 0
+                bottom_start = 0
+                if span_words != 0:
+                    bottom_len = span_words - top_len - 1
+                    next_header = span_start + span_words * 4
+                    if (
+                        bottom_len < 0
+                        or next_header + 4 > limit
+                        or pos + top_len * 4 + bottom_len * 4 != next_header
+                    ):
+                        # Python yields the top run before this check fails.
+                        bottom_len = -1
+                    else:
+                        bottom_start = data[next_header + 3] - bottom_len
+                        if bottom_start < top_end + 1:
+                            bottom_len = -1
+                for run in range(2):
+                    if run == 0:
+                        run_len = top_len
+                        run_pos = pos
+                        base_z = top_start
+                    else:
+                        if span_words == 0 or bottom_len <= 0:
+                            break
+                        run_len = bottom_len
+                        run_pos = pos + top_len * 4
+                        base_z = bottom_start
+                    for index in range(run_len):
+                        color = _read_u32_le_ptr(data, run_pos + index * 4)
+                        if not _is_marker_colour(color):
+                            continue
+                        if count == capacity:
+                            capacity = 64 if capacity == 0 else capacity * 2
+                            grown = <unsigned int*>realloc(
+                                out, capacity * 4 * sizeof(unsigned int)
+                            )
+                            if grown == NULL:
+                                free(out)
+                                return -1
+                            out = grown
+                        out[count * 4] = x
+                        out[count * 4 + 1] = y
+                        out[count * 4 + 2] = base_z + index
+                        out[count * 4 + 3] = color
+                        count += 1
+                if span_words == 0:
+                    pos += top_len * 4
+                    break
+                if bottom_len < 0:
+                    out_ptr[0] = out
+                    return count
+                pos = span_start + span_words * 4
+    out_ptr[0] = out
+    return count
+
+
+cpdef list find_marker_voxels(object data):
+    """``[(x, y, source_z, colour)]`` for explicit chroma-marker words.
+
+    The C twin of filtering ``_iter_explicit_voxels`` by marker colour; the
+    walk runs without the GIL so a background map load does not stall the
+    main thread."""
+    cdef bytes raw = _coerce_raw_bytes(data)
+    cdef const unsigned char* buf = raw
+    cdef Py_ssize_t limit = len(raw)
+    cdef unsigned int* quads = NULL
+    cdef Py_ssize_t count
+    cdef Py_ssize_t index
+    cdef list result = []
+    with nogil:
+        count = _scan_marker_words(buf, limit, &quads)
+    if count < 0:
+        raise MemoryError()
+    try:
+        for index in range(count):
+            result.append((
+                <int>quads[index * 4],
+                <int>quads[index * 4 + 1],
+                <int>quads[index * 4 + 2],
+                quads[index * 4 + 3],
+            ))
+    finally:
+        free(quads)
+    return result
 
 
 cpdef object A2(object arg):
@@ -457,6 +676,105 @@ cdef class CChunk:
         return []
 
 
+cdef struct _CellMap:
+    # Open-addressing voxel index -> component id (bit 31 = grounded/safe).
+    unsigned int* keys
+    unsigned int* values
+    Py_ssize_t capacity
+    Py_ssize_t used
+
+
+cdef int _cellmap_init(_CellMap* table, Py_ssize_t capacity) noexcept nogil:
+    table.keys = <unsigned int*>malloc(capacity * sizeof(unsigned int))
+    table.values = <unsigned int*>malloc(capacity * sizeof(unsigned int))
+    table.capacity = capacity
+    table.used = 0
+    if table.keys == NULL or table.values == NULL:
+        free(table.keys)
+        free(table.values)
+        table.keys = NULL
+        table.values = NULL
+        return -1
+    memset(table.keys, 0xFF, capacity * sizeof(unsigned int))
+    return 0
+
+
+cdef void _cellmap_free(_CellMap* table) noexcept nogil:
+    free(table.keys)
+    free(table.values)
+    table.keys = NULL
+    table.values = NULL
+
+
+cdef inline Py_ssize_t _cellmap_slot(_CellMap* table, unsigned int key) noexcept nogil:
+    cdef unsigned int mixed = key
+    cdef Py_ssize_t mask = table.capacity - 1
+    cdef Py_ssize_t index
+    mixed ^= mixed >> 16
+    mixed *= <unsigned int>0x7FEB352D
+    mixed ^= mixed >> 15
+    mixed *= <unsigned int>0x846CA68B
+    mixed ^= mixed >> 16
+    index = <Py_ssize_t>mixed & mask
+    while table.keys[index] != _FREE_SLOT and table.keys[index] != key:
+        index = (index + 1) & mask
+    return index
+
+
+cdef int _cellmap_put(_CellMap* table, unsigned int key, unsigned int value) noexcept nogil:
+    cdef Py_ssize_t index
+    cdef _CellMap grown
+    cdef Py_ssize_t old
+    if (table.used + 1) * 2 > table.capacity:
+        if _cellmap_init(&grown, table.capacity * 2) < 0:
+            return -1
+        for old in range(table.capacity):
+            if table.keys[old] != _FREE_SLOT:
+                index = _cellmap_slot(&grown, table.keys[old])
+                grown.keys[index] = table.keys[old]
+                grown.values[index] = table.values[old]
+                grown.used += 1
+        _cellmap_free(table)
+        table[0] = grown
+    index = _cellmap_slot(table, key)
+    if table.keys[index] == _FREE_SLOT:
+        table.keys[index] = key
+        table.used += 1
+    table.values[index] = value
+    return 0
+
+
+cdef struct _CellList:
+    unsigned int* items
+    Py_ssize_t count
+    Py_ssize_t capacity
+
+
+cdef inline int _celllist_push(_CellList* items, unsigned int value) noexcept nogil:
+    cdef unsigned int* grown
+    cdef Py_ssize_t capacity
+    if items.count == items.capacity:
+        capacity = 256 if items.capacity == 0 else items.capacity * 2
+        grown = <unsigned int*>realloc(items.items, capacity * sizeof(unsigned int))
+        if grown == NULL:
+            return -1
+        items.items = grown
+        items.capacity = capacity
+    items.items[items.count] = value
+    items.count += 1
+    return 0
+
+
+cdef unsigned int _SAFE_BIT = 0x80000000
+
+
+cdef void _reset_column_bounds(short* top, short* bottom) noexcept nogil:
+    cdef Py_ssize_t col
+    for col in range(MAP_AREA):
+        top[col] = MAP_HEIGHT
+        bottom[col] = -1
+
+
 cdef class VXL:
     cdef public object minimap_texture
     cdef public int estimated_size
@@ -472,11 +790,30 @@ cdef class VXL:
     cdef bytes _overview_opaque
     cdef bytes _overview_transparent
     cdef _ColorTable _colors
-    cdef bytearray _solid_bits
-    cdef list _top_z
-    cdef list _bottom_z
+    # Plain C buffers (not bytearray/list) so the loader can fill them with
+    # the GIL released: a map load on the transition thread used to freeze
+    # the main thread for ~0.4 s.
+    cdef unsigned char* _solid_bits
+    cdef short* _top_z
+    cdef short* _bottom_z
+    # One fill colour per column for the implicit solid interior (the VXL
+    # format never stores those voxels). Explicit surface runs still live in
+    # ``_colors``; everything else that is solid takes the column fill.
+    cdef unsigned int* _column_fill
 
     def __cinit__(self):
+        self._column_fill = <unsigned int*>calloc(MAP_AREA, sizeof(unsigned int))
+        self._solid_bits = <unsigned char*>calloc(VOXEL_BITS, 1)
+        self._top_z = <short*>malloc(MAP_AREA * sizeof(short))
+        self._bottom_z = <short*>malloc(MAP_AREA * sizeof(short))
+        if (
+            self._column_fill == NULL
+            or self._solid_bits == NULL
+            or self._top_z == NULL
+            or self._bottom_z == NULL
+        ):
+            raise MemoryError()
+        _reset_column_bounds(self._top_z, self._bottom_z)
         self.minimap_texture = None
         self.estimated_size = 0
         self.ready = True
@@ -491,9 +828,16 @@ cdef class VXL:
         self._overview_opaque = b""
         self._overview_transparent = b""
         self._colors = _ColorTable()
-        self._solid_bits = bytearray(VOXEL_BITS)
-        self._top_z = [MAP_HEIGHT] * MAP_AREA
-        self._bottom_z = [-1] * MAP_AREA
+
+    def __dealloc__(self):
+        free(self._column_fill)
+        self._column_fill = NULL
+        free(self._solid_bits)
+        self._solid_bits = NULL
+        free(self._top_z)
+        self._top_z = NULL
+        free(self._bottom_z)
+        self._bottom_z = NULL
 
     def __init__(self, object state, object source, int size_or_detail, int detail_level=2):
         cdef object data = b""
@@ -526,13 +870,12 @@ cdef class VXL:
 
         # The compiled client force-fills the z=239 bed on every load (file and
         # MapSync paths); mirror it so the server collision world matches.
-        self._fill_floor()
+        with nogil:
+            self._fill_floor()
 
     cdef void _reset_blank(self):
         self._colors = _ColorTable()
-        self._solid_bits = bytearray(VOXEL_BITS)
-        self._top_z = [MAP_HEIGHT] * MAP_AREA
-        self._bottom_z = [-1] * MAP_AREA
+        self._clear_voxels()
         self._source_size = MAP_SIZE
         self._source_max_z = EMPTY_TOP_END
         self._source_offset = 0
@@ -545,10 +888,21 @@ cdef class VXL:
         self._overview_opaque = b""
         self._overview_transparent = b""
 
-    cdef inline bint _in_bounds(self, int x, int y, int z):
+    cdef void _clear_voxels(self) noexcept:
+        """All-air grid, empty column bounds and fills (colours untouched)."""
+        cdef unsigned char* solid = self._solid_bits
+        cdef short* top = self._top_z
+        cdef short* bottom = self._bottom_z
+        cdef unsigned int* fill = self._column_fill
+        with nogil:
+            memset(solid, 0, VOXEL_BITS)
+            memset(fill, 0, MAP_AREA * sizeof(unsigned int))
+            _reset_column_bounds(top, bottom)
+
+    cdef inline bint _in_bounds(self, int x, int y, int z) noexcept nogil:
         return 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE and 0 <= z < MAP_HEIGHT
 
-    cdef inline bint _solid_at(self, int x, int y, int z):
+    cdef inline bint _solid_at(self, int x, int y, int z) noexcept nogil:
         cdef int index
         cdef int byte_index
         cdef int shift
@@ -559,7 +913,7 @@ cdef class VXL:
         shift = index & 7
         return ((self._solid_bits[byte_index] >> shift) & 1) != 0
 
-    cdef inline void _set_solid(self, int x, int y, int z, bint value):
+    cdef inline void _set_solid(self, int x, int y, int z, bint value) noexcept nogil:
         cdef int index
         cdef int byte_index
         cdef int shift
@@ -579,14 +933,14 @@ cdef class VXL:
         else:
             self._solid_bits[byte_index] = current & (~mask & 0xFF)
 
-    cdef inline void _update_column_bounds(self, int x, int y, int z):
+    cdef inline void _update_column_bounds(self, int x, int y, int z) noexcept nogil:
         cdef int col = _column_index(x, y)
         if z < self._top_z[col]:
             self._top_z[col] = z
         if z > self._bottom_z[col]:
             self._bottom_z[col] = z
 
-    cdef void _recompute_column_bounds(self, int x, int y):
+    cdef void _recompute_column_bounds(self, int x, int y) noexcept nogil:
         cdef int col = _column_index(x, y)
         cdef int z
 
@@ -611,7 +965,44 @@ cdef class VXL:
         if color:
             self._colors._store(<unsigned int>_voxel_index(x, y, z), color)
 
-    cdef void _fill_floor(self):
+    cdef inline void _store_explicit(self, int x, int y, int z, unsigned int color):
+        """Store an authored surface colour, keeping colour 0 explicit.
+
+        A file may carry 0 inside a colour run; dropping it would split the
+        run on re-serialization and lose the colours behind it."""
+        if not self._in_bounds(x, y, z):
+            return
+        self._set_solid(x, y, z, True)
+        self._update_column_bounds(x, y, z)
+        self._colors._store(<unsigned int>_voxel_index(x, y, z), color)
+
+    cdef inline void _store_fill(self, int x, int y, int z) noexcept nogil:
+        """Mark an implicit interior voxel solid without a colour entry.
+
+        The colour of such a voxel is the column fill (see ``_color_at``);
+        storing it per voxel cost 8 bytes each and 286 MB for MayanJungle.
+        """
+        if not self._in_bounds(x, y, z):
+            return
+        self._set_solid(x, y, z, True)
+        self._update_column_bounds(x, y, z)
+
+    cdef inline unsigned int _color_at(self, int x, int y, int z):
+        """Explicit colour, else the column fill for a solid voxel, else 0.
+
+        Never 0 for a solid voxel with a filled column: a colour-0 solid is
+        invisible to the client mesher yet blocks bullets."""
+        cdef Py_ssize_t index
+        if not self._in_bounds(x, y, z):
+            return 0
+        index = self._colors._find(<unsigned int>_voxel_index(x, y, z))
+        if index >= 0:
+            return self._colors._values[index]
+        if self._solid_at(x, y, z):
+            return self._column_fill[_column_index(x, y)]
+        return 0
+
+    cdef void _fill_floor(self) noexcept nogil:
         """Force-fill the bottom row (z=239) solid for every column, mirroring
         the compiled engine's post_load_map_setup @0xd140 / initialise_floor.
 
@@ -628,45 +1019,37 @@ cdef class VXL:
         for y in range(MAP_SIZE):
             for x in range(MAP_SIZE):
                 if not self._solid_at(x, y, z):
-                    self._store_block(x, y, z, 0)
+                    # _store_block with colour 0 == _store_fill (no entry).
+                    self._store_fill(x, y, z)
 
     cdef bint _load_source(self, bytes data):
-        cdef tuple size_info = _get_vxl_size(data)
-        cdef int columns = int(size_info[0])
-        cdef int max_z = int(size_info[1])
+        cdef const unsigned char* buf = data
+        cdef Py_ssize_t limit = len(data)
+        cdef Py_ssize_t columns = 0
+        cdef Py_ssize_t colour_words = 0
+        cdef int max_z = 0
         cdef int edge
         cdef int offset
         cdef int z_shift
-        cdef Py_ssize_t pos = 0
-        cdef Py_ssize_t limit = len(data)
-        cdef int src_x
-        cdef int src_y
-        cdef int x
-        cdef int y
-        cdef int span_words
-        cdef int top_start
-        cdef int top_end
-        cdef int top_len
-        cdef int bottom_len
-        cdef int next_air_start
-        cdef int bottom_start
-        cdef int z
-        cdef int i
-        cdef int has_surface
-        cdef unsigned int color
-        cdef unsigned int surface_color
+        cdef bint ok
+        cdef _ColorTable colors
 
-        if columns <= 0:
+        # Every heavy loop below runs without the GIL: the transition service
+        # loads the next map on a worker thread while the live match ticks.
+        with nogil:
+            ok = _scan_vxl_size(buf, limit, &columns, &max_z, &colour_words)
+        if not ok or columns <= 0:
             return False
 
         edge = int(sqrt(columns))
         if edge * edge != columns or edge > MAP_SIZE or max_z >= 241:
             return False
 
-        self._colors = _ColorTable()
-        self._solid_bits = bytearray(VOXEL_BITS)
-        self._top_z = [MAP_HEIGHT] * MAP_AREA
-        self._bottom_z = [-1] * MAP_AREA
+        colors = _ColorTable()
+        # Same final capacity the incremental _store path reached.
+        colors._reserve(colour_words)
+        self._colors = colors
+        self._clear_voxels()
         self._overview_dirty = True
         self._overview_opaque = b""
         self._overview_transparent = b""
@@ -681,6 +1064,47 @@ cdef class VXL:
         self._source_max_z = max_z
         self._source_offset = offset
         self._z_shift = z_shift
+
+        with nogil:
+            ok = self._parse_columns(buf, limit, edge, offset, z_shift, colors)
+        return ok
+
+    cdef inline void _load_explicit(
+        self, _ColorTable colors, int x, int y, int z, unsigned int color
+    ) noexcept nogil:
+        """``_store_explicit`` into a table ``_reserve``d for the whole file."""
+        if not self._in_bounds(x, y, z):
+            return
+        self._set_solid(x, y, z, True)
+        self._update_column_bounds(x, y, z)
+        colors._insert(<unsigned int>_voxel_index(x, y, z), color)
+
+    cdef bint _parse_columns(
+        self,
+        const unsigned char* data,
+        Py_ssize_t limit,
+        int edge,
+        int offset,
+        int z_shift,
+        _ColorTable colors,
+    ) noexcept nogil:
+        cdef Py_ssize_t pos = 0
+        cdef int src_x
+        cdef int src_y
+        cdef int x
+        cdef int y
+        cdef int span_words
+        cdef int top_start
+        cdef int top_end
+        cdef int top_len
+        cdef int bottom_len
+        cdef int next_air_start
+        cdef int bottom_start
+        cdef int z
+        cdef int i
+        cdef int has_surface
+        cdef unsigned int color = 0
+        cdef unsigned int surface_color
 
         for src_y in range(edge):
             y = src_y + offset
@@ -702,8 +1126,8 @@ cdef class VXL:
                         if pos + (top_len * 4) > limit:
                             return False
                         for i in range(top_len):
-                            color = _read_u32_le(data, pos + (i * 4))
-                            self._store_block(x, y, top_start + z_shift + i, color)
+                            color = _read_u32_le_ptr(data, pos + (i * 4))
+                            self._load_explicit(colors, x, y, top_start + z_shift + i, color)
                         pos += top_len * 4
                         has_surface = 1
                         # Remember the deepest surface color so the underground
@@ -739,8 +1163,9 @@ cdef class VXL:
                         # surface color makes exposed underground render as
                         # terrain. Measured 2026-07-09: fill was color 0 at z>=176.
                         if has_surface:
+                            self._column_fill[_column_index(x, y)] = surface_color
                             for z in range(top_end + 1, MAP_HEIGHT):
-                                self._store_block(x, y, z + z_shift, surface_color)
+                                self._store_fill(x, y, z + z_shift)
                         break
 
                     bottom_len = span_words - top_len - 1
@@ -759,12 +1184,13 @@ cdef class VXL:
                     # solid block is invisible to the mesher yet blocks bullets,
                     # so exposed interior (cave mouths, cliffs) reads as
                     # "invisible blocks you can only see after shooting them".
+                    self._column_fill[_column_index(x, y)] = surface_color
                     for z in range(top_end + 1, bottom_start):
-                        self._store_block(x, y, z + z_shift, surface_color)
+                        self._store_fill(x, y, z + z_shift)
 
                     for i in range(bottom_len):
-                        color = _read_u32_le(data, pos + (i * 4))
-                        self._store_block(x, y, bottom_start + z_shift + i, color)
+                        color = _read_u32_le_ptr(data, pos + (i * 4))
+                        self._load_explicit(colors, x, y, bottom_start + z_shift + i, color)
                     pos += bottom_len * 4
 
         if pos != limit:
@@ -798,7 +1224,7 @@ cdef class VXL:
 
             x = col & 511
             y = col >> 9
-            color = self._colors._value(<unsigned int>_voxel_index(x, y, top_z))
+            color = self._color_at(x, y, top_z)
             color_tuple = _color_tuple(color)
             opaque[out_pos] = color_tuple[0]
             opaque[out_pos + 1] = color_tuple[1]
@@ -853,7 +1279,7 @@ cdef class VXL:
         return tuple(runs)
 
     cdef unsigned int _surface_color_source(self, int map_x, int map_y, int source_z):
-        return self._colors._value(<unsigned int>_voxel_index(map_x, map_y, source_z + self._z_shift))
+        return self._color_at(map_x, map_y, source_z + self._z_shift)
 
     cdef tuple _column_runs_world(self, int map_x, int map_y):
         cdef list runs = []
@@ -876,7 +1302,7 @@ cdef class VXL:
         return tuple(runs)
 
     cdef unsigned int _surface_color_world(self, int map_x, int map_y, int z):
-        return self._colors._value(<unsigned int>_voxel_index(map_x, map_y, z))
+        return self._color_at(map_x, map_y, z)
 
     cdef bytes _serialize_column(self, int map_x, int map_y):
         cdef bytearray out = bytearray()
@@ -908,8 +1334,16 @@ cdef class VXL:
             run_end = int(run[1])
 
             if run_index == run_count - 1:
-                out.extend((0, run_start, run_end, prev_air_start))
-                for z in range(run_start, run_end + 1):
+                # Last span: explicit colours only for the surface run; the
+                # solid interior below it is implicit in the VXL format and
+                # the client fills it exactly as it does for the map file.
+                top_end = run_start
+                for z in range(run_end, run_start, -1):
+                    if _voxel_index(map_x, map_y, z) in self._colors:
+                        top_end = z
+                        break
+                out.extend((0, run_start, top_end, prev_air_start))
+                for z in range(run_start, top_end + 1):
                     color = self._surface_color_world(map_x, map_y, z)
                     out.extend((
                         color & 0xFF,
@@ -919,17 +1353,19 @@ cdef class VXL:
                     ))
                 continue
 
-            top_end = run_start
-            while top_end < run_end:
-                if _voxel_index(map_x, map_y, top_end + 1) not in self._colors:
-                    break
-                top_end += 1
-
             bottom_start = run_end
-            while bottom_start > top_end + 1:
+            while bottom_start > run_start + 1:
                 if _voxel_index(map_x, map_y, bottom_start - 1) not in self._colors:
                     break
                 bottom_start -= 1
+            # The top run covers every authored colour above the bottom
+            # run (implicit voxels in between are sent with the column
+            # fill); only the trailing implicit stretch stays implicit.
+            top_end = run_start
+            for z in range(bottom_start - 1, run_start, -1):
+                if _voxel_index(map_x, map_y, z) in self._colors:
+                    top_end = z
+                    break
 
             top_colors = []
             for z in range(run_start, top_end + 1):
@@ -1011,8 +1447,13 @@ cdef class VXL:
                     run_end = int(run[1])
 
                     if run_index == run_count - 1:
-                        out.extend((0, run_start, run_end, prev_air_start))
-                        for z in range(run_start, run_end + 1):
+                        top_end = run_start
+                        for z in range(run_end, run_start, -1):
+                            if _voxel_index(map_x, map_y, z + self._z_shift) in self._colors:
+                                top_end = z
+                                break
+                        out.extend((0, run_start, top_end, prev_air_start))
+                        for z in range(run_start, top_end + 1):
                             color = self._surface_color_source(map_x, map_y, z)
                             out.extend((
                                 color & 0xFF,
@@ -1022,17 +1463,16 @@ cdef class VXL:
                             ))
                         continue
 
-                    top_end = run_start
-                    while top_end < run_end:
-                        if _voxel_index(map_x, map_y, top_end + 1 + self._z_shift) not in self._colors:
-                            break
-                        top_end += 1
-
                     bottom_start = run_end
-                    while bottom_start > top_end + 1:
+                    while bottom_start > run_start + 1:
                         if _voxel_index(map_x, map_y, bottom_start - 1 + self._z_shift) not in self._colors:
                             break
                         bottom_start -= 1
+                    top_end = run_start
+                    for z in range(bottom_start - 1, run_start, -1):
+                        if _voxel_index(map_x, map_y, z + self._z_shift) in self._colors:
+                            top_end = z
+                            break
 
                     top_colors = []
                     for z in range(run_start, top_end + 1):
@@ -1162,13 +1602,35 @@ cdef class VXL:
         cdef bint solid = self.get_solid(x, y, z)
         return (solid, self.get_color_tuple(x, y, z))
 
-    cpdef unsigned int get_color(self, object x, object y, object z):
+    cpdef bint has_explicit_color(self, object x, object y, object z):
+        """True when the voxel carries an authored/placed colour entry.
+
+        Solid voxels without one are implicit interior: their colour is
+        client-owned and never transmitted."""
         cdef int xi = int(x)
         cdef int yi = int(y)
         cdef int zi = int(z)
         if not self._in_bounds(xi, yi, zi):
+            return False
+        return self._colors._find(<unsigned int>_voxel_index(xi, yi, zi)) >= 0
+
+    cpdef Py_ssize_t color_entries(self):
+        """Number of voxels with an explicit colour (memory diagnostics)."""
+        return len(self._colors)
+
+    cpdef unsigned int column_fill_color(self, object x, object y):
+        """Fill colour used for a column's implicit solid interior."""
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        if not (0 <= xi < MAP_SIZE and 0 <= yi < MAP_SIZE):
             return 0
-        return self._colors.get(_voxel_index(xi, yi, zi), 0)
+        return self._column_fill[_column_index(xi, yi)]
+
+    cpdef unsigned int get_color(self, object x, object y, object z):
+        cdef int xi = int(x)
+        cdef int yi = int(y)
+        cdef int zi = int(z)
+        return self._color_at(xi, yi, zi)
 
     cpdef int get_z(self, object x, object y, object start=0):
         cdef int xi = int(x)
@@ -1189,6 +1651,253 @@ cdef class VXL:
             if self._solid_at(xi, yi, zi):
                 return zi
         return self._top_z[col]
+
+    cpdef int surface_z(self, int x, int y):
+        """Topmost solid z by a direct column scan, else ``MAP_HEIGHT - 1``.
+
+        Same answer as probing ``get_solid`` from z=0 downwards (the spawn
+        code's deliberate get_z-independent scan), at C speed."""
+        cdef int z
+        if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+            return MAP_HEIGHT - 1
+        for z in range(MAP_HEIGHT):
+            if self._solid_at(x, y, z):
+                return z
+        return MAP_HEIGHT - 1
+
+    cdef int _collapse_walk(
+        self,
+        _CellMap* seen,
+        _CellList* stack,
+        _CellList* comp,
+        _CellList* comp_seen,
+        unsigned int start_key,
+        unsigned int comp_id,
+        const int* ndx,
+        const int* ndy,
+        const int* ndz,
+        int neighbor_count,
+        long long work_budget,
+    ) noexcept nogil:
+        """One ``find_unsupported_chunks`` flood from ``start_key``.
+
+        Returns 1 grounded, 2 budget exhausted, 0 floating (``comp`` then
+        holds the component in pop order) or -1 out of memory. "Seen by this
+        flood" is ``seen[key] == comp_id``; bit 31 marks ``safe``.
+        """
+        cdef unsigned int key
+        cdef unsigned int next_key
+        cdef Py_ssize_t slot
+        cdef long long work = 0
+        cdef int j
+        cdef int cx
+        cdef int cy
+        cdef int cz
+        cdef int nx
+        cdef int ny
+        cdef int nz
+
+        comp.count = 0
+        comp_seen.count = 0
+        stack.count = 0
+        if (
+            _cellmap_put(seen, start_key, comp_id) < 0
+            or _celllist_push(comp_seen, start_key) < 0
+            or _celllist_push(stack, start_key) < 0
+        ):
+            return -1
+        while stack.count > 0:
+            stack.count -= 1
+            key = stack.items[stack.count]
+            cx = key & 511
+            cy = (key >> 9) & 511
+            cz = key >> 18
+            if cz > 238:
+                return 1
+            if _celllist_push(comp, key) < 0:
+                return -1
+            for j in range(neighbor_count):
+                work += 1
+                if work > work_budget:
+                    return 2
+                nx = cx + ndx[j]
+                ny = cy + ndy[j]
+                nz = cz + ndz[j]
+                if not self._in_bounds(nx, ny, nz):
+                    # Out of bounds: never safe, never solid.
+                    continue
+                next_key = <unsigned int>_voxel_index(nx, ny, nz)
+                slot = _cellmap_slot(seen, next_key)
+                if seen.keys[slot] == next_key:
+                    if seen.values[slot] & _SAFE_BIT:
+                        return 1
+                    if seen.values[slot] == comp_id:
+                        continue
+                if self._solid_at(nx, ny, nz):
+                    if (
+                        _cellmap_put(seen, next_key, comp_id) < 0
+                        or _celllist_push(comp_seen, next_key) < 0
+                        or _celllist_push(stack, next_key) < 0
+                    ):
+                        return -1
+        return 0
+
+    cpdef list find_unsupported_chunks(
+        self, object removed_positions, object neighbors, long long work_budget
+    ):
+        """Same result as ``WorldManager.find_unsupported_chunks``, in C.
+
+        The Python flood returns only the floating components: each one is
+        a whole 18-connected component that never reaches z > 238, listed in
+        its DFS pop order from the first start (in ``removed_positions`` x
+        ``neighbors`` order) that lies in it, and omitted when its flood runs
+        past ``work_budget`` probes. A complete flood probes every popped
+        cell 18 times, so that exhaustion depends only on the component's
+        size, never on the start or on what earlier floods marked ``safe``;
+        and grounded components never produce output however they are
+        proven grounded. So each new start is first probed with a
+        down-first order that reaches the base plane in ~one column instead
+        of wandering the terrain (1.6 ms/call in Python; ~0.2 ms with the
+        original order in C), and only a component that probe finds floating
+        is re-walked in the exact original order to produce its list.
+        Bounds and solidity match ``WorldManager.get_solid``.
+        """
+        cdef int neighbor_count = len(neighbors)
+        cdef int* ndx = NULL
+        cdef int* ndy = NULL
+        cdef int* ndz = NULL
+        cdef int* pdx = NULL
+        cdef int* pdy = NULL
+        cdef int* pdz = NULL
+        cdef _CellMap seen
+        cdef _CellList stack
+        cdef _CellList comp
+        cdef _CellList comp_seen
+        cdef list chunks = []
+        cdef list chunk
+        cdef list probe_order
+        cdef unsigned int comp_id = 0
+        cdef unsigned int key
+        cdef Py_ssize_t slot
+        cdef Py_ssize_t index
+        cdef int i
+        cdef int sx
+        cdef int sy
+        cdef int sz
+        cdef int cx
+        cdef int cy
+        cdef int cz
+        cdef int result
+        cdef object position
+
+        if neighbor_count <= 0:
+            return chunks
+        stack.items = NULL
+        stack.count = 0
+        stack.capacity = 0
+        comp.items = NULL
+        comp.count = 0
+        comp.capacity = 0
+        comp_seen.items = NULL
+        comp_seen.count = 0
+        comp_seen.capacity = 0
+        seen.keys = NULL
+        seen.values = NULL
+        ndx = <int*>malloc(neighbor_count * sizeof(int))
+        ndy = <int*>malloc(neighbor_count * sizeof(int))
+        ndz = <int*>malloc(neighbor_count * sizeof(int))
+        pdx = <int*>malloc(neighbor_count * sizeof(int))
+        pdy = <int*>malloc(neighbor_count * sizeof(int))
+        pdz = <int*>malloc(neighbor_count * sizeof(int))
+        try:
+            if (
+                ndx == NULL or ndy == NULL or ndz == NULL
+                or pdx == NULL or pdy == NULL or pdz == NULL
+            ):
+                raise MemoryError()
+            for i in range(neighbor_count):
+                ndx[i] = int(neighbors[i][0])
+                ndy[i] = int(neighbors[i][1])
+                ndz[i] = int(neighbors[i][2])
+            # Probe order: the stack pops the last push first, so push by
+            # ascending dz with straight-down (0, 0, +1) last.
+            probe_order = sorted([
+                (ndz[i], ndx[i] == 0 and ndy[i] == 0, i)
+                for i in range(neighbor_count)
+            ])
+            for i in range(neighbor_count):
+                pdx[i] = ndx[<int>probe_order[i][2]]
+                pdy[i] = ndy[<int>probe_order[i][2]]
+                pdz[i] = ndz[<int>probe_order[i][2]]
+            if _cellmap_init(&seen, 1 << 12) < 0:
+                raise MemoryError()
+
+            for position in removed_positions:
+                sx = int(position[0])
+                sy = int(position[1])
+                sz = int(position[2])
+                for i in range(neighbor_count):
+                    cx = sx + ndx[i]
+                    cy = sy + ndy[i]
+                    cz = sz + ndz[i]
+                    if not self._solid_at(cx, cy, cz):
+                        continue
+                    key = <unsigned int>_voxel_index(cx, cy, cz)
+                    slot = _cellmap_slot(&seen, key)
+                    if seen.keys[slot] != _FREE_SLOT:
+                        # Already in a probed component: grounded/exhausted
+                        # ones are safe, floating ones were emitted in full.
+                        continue
+                    comp_id += 1
+                    # Keep the GIL: each walk is microseconds (the
+                    # down-first probe reaches the base plane in about
+                    # one column). Releasing it per start handed the
+                    # interpreter to the busy bot-AI thread for a whole
+                    # switch interval (~15.6 ms on Windows timers) dozens
+                    # of times per explosion: the 30-50 ms projectile
+                    # tick spikes.
+                    result = self._collapse_walk(
+                        &seen, &stack, &comp, &comp_seen, key, comp_id,
+                        pdx, pdy, pdz, neighbor_count, work_budget,
+                    )
+                    if result < 0:
+                        raise MemoryError()
+                    if result == 0:
+                        # Floating: re-walk from the same start in the
+                        # original order under a fresh id for the exact list.
+                        comp_id += 1
+                        result = self._collapse_walk(
+                            &seen, &stack, &comp, &comp_seen, key, comp_id,
+                            ndx, ndy, ndz, neighbor_count, work_budget,
+                        )
+                        if result < 0:
+                            raise MemoryError()
+                    if result == 0:
+                        chunk = []
+                        for index in range(comp.count):
+                            key = comp.items[index]
+                            chunk.append((
+                                <int>(key & 511),
+                                <int>((key >> 9) & 511),
+                                <int>(key >> 18),
+                            ))
+                        chunks.append(chunk)
+                    else:
+                        for index in range(comp_seen.count):
+                            slot = _cellmap_slot(&seen, comp_seen.items[index])
+                            seen.values[slot] = comp_id | _SAFE_BIT
+        finally:
+            free(ndx)
+            free(ndy)
+            free(ndz)
+            free(pdx)
+            free(pdy)
+            free(pdz)
+            free(stack.items)
+            free(comp.items)
+            free(comp_seen.items)
+            _cellmap_free(&seen)
+        return chunks
 
     cpdef tuple get_color_tuple(self, object x, object y, object z):
         return _color_tuple(self.get_color(x, y, z))

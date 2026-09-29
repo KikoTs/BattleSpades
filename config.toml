@@ -74,17 +74,24 @@ request_timeout_seconds = 5.0
 results_path = "state/round-results.sqlite3"
 
 [network]
-timeout_ms = 10000
 max_connections = 64
-bandwidth_limit = 0  # 0 = unlimited
+# timeout_ms / bandwidth_limit were removed: retail and this server keep the
+# ENet library defaults (0/0 bandwidth, default peer timeout).
+# Refuse clients whose ENet connect data is not protocol 168 (retail and
+# native both send 168) with the retail CLIENT/SERVER_OUT_OF_DATE reason.
+require_protocol_version = true
 event_budget = 512
 max_pending_packets = 4096
 packet_drain_budget = 4096
 plugin_event_budget_ms = 2.0
 max_map_mutation_journal = 8192
-# Reassert this many pre-existing destroyed cells per joining ClientData.
-# The player remains gameplay-gated until the exact Drill/mining/explosion
-# repair is complete, preventing stale invisible collision after reconnect.
+# Post-join re-send of every destroyed cell since map load. The MapSync stream
+# already carries every edited column (live-verified: 0 mismatches over 1310
+# probed cells, docs/MAP_SYNC_JOIN.md), so this stays off; it made joiners
+# watch dug terrain "sync" after spawning.
+map_air_catchup_enabled = false
+# Reassert this many pre-existing destroyed cells per joining ClientData while
+# that catch-up is enabled. The player remains gameplay-gated meanwhile.
 map_air_catchup_batch_limit = 256
 entity_tick_batch_limit = 8192
 mode_event_queue_limit = 8192
@@ -95,13 +102,29 @@ world_mutation_queue_limit = 2048
 world_mutation_batch_limit = 256
 world_mutation_cell_budget = 4096
 world_mutation_timeout_ticks = 180
-# Large KV6 prefabs reserve their stock immediately, then commit through this
-# bounded queue so model expansion cannot monopolize a 60 Hz simulation tick.
+# Prefabs reserve their stock immediately and commit after physics. A
+# competitive prefab commits whole in one tick so the client shows it at once;
+# prefab_competitive_cell_budget caps those cells per tick across all players
+# (whole prefabs beyond it wait a tick, never split). UGC editor models drain
+# prefab_cell_batch_limit cells per tick.
 prefab_queue_limit = 32
 prefab_cell_batch_limit = 16
+prefab_competitive_cell_budget = 2048
 # Maximum already-decoded prefab cells checked for world contact per tick.
 # UGC model decoding/rotation is off-thread; this keeps validation bounded.
 prefab_validation_batch_limit = 1024
+# Damaged-block/prefab health rows per reliable BlockManager-state packet
+# sent to a joiner (1..4096).
+prefab_health_state_batch = 128
+# Lag compensation: hitscan/melee hits are checked against target hitboxes
+# where the shooter saw them, one round trip (+ lag_compensation_view_delay_ms,
+# 0..250) ago, never more than RTT + lag_compensation_extra_ms (0..250) or
+# lag_compensation_max_ms (0..1000). The retail client extrapolates remote
+# players, so view delay 0 is the measured contract (docs/LAG_COMPENSATION.md).
+lag_compensation_enabled = true
+lag_compensation_max_ms = 250
+lag_compensation_extra_ms = 50
+lag_compensation_view_delay_ms = 0
 # Delayed canonical reassertion of rejected or cancelled client predictions.
 # Successful ordinary builds/prefabs/digs are not replayed because that would
 # run native placement/damage particles twice. Unsupported collapses are the
@@ -144,7 +167,8 @@ fall_damage = true
 build_damage = true
 # Radar packet 21 carries this value as a native visible countdown. The server
 # removes the station on the same deadline, so team visibility cannot linger.
-radar_station_lifetime_seconds = 35.0
+# Retail: 45 s (retail constant A1901; docs/RETAIL_VALUES.md).
+radar_station_lifetime_seconds = 45.0
 
 [lobby]
 # Stock Match Lobby choices are 2,4,...24 players. Dedicated servers accept
@@ -152,13 +176,47 @@ radar_station_lifetime_seconds = 35.0
 # Uncomment to replace every mode's native clock. Allowed values are exactly:
 # 5,10,15,20,25,30,35,40,45,50,55,60,90. A [modes.<code>].time_limit wins.
 # match_length_minutes = 15
-# Empty discovers every .vxl in world.maps_path. Otherwise this exact order is
-# used for the F1/F2/F3 map vote; missing files are logged and skipped.
+# Empty uses the mode's retail playlist (playlists/<mode>.txt filtered like
+# retail PlayList: mapinfo invalid_modes, classic/mafia flags, release; e.g.
+# Territory Control = Alcatraz + CityOfChicago), falling back to every .vxl
+# in world.maps_path. Otherwise this list is used for the F1/F2/F3 map vote;
+# missing files are logged and skipped, and stock maps retail marks invalid
+# for the mode (e.g. GreatWall in Demolition) are dropped with a warning.
 map_rotation = []
+# Retail shuffles the lobby's map list once (baseSquadLobbyMenu
+# random.shuffle(map_list)); false keeps the listed order.
+map_rotation_shuffle = true
+# Offer maps whose retail mapinfo max_players is below the human count last.
+map_vote_retail_max_players = true
 # Full map rollovers hold the native scores/credits overlay for this many
 # seconds after voting resolves, then send MapEnded and reload every retained
 # peer. Same-map /restart never opens the terminal overlay.
 end_screen_seconds = 12.0
+# Retail end-of-round presentation on every round end (same-map restarts
+# included): ShowTextMessage(73) sets the scoreboard headline ("{team}
+# wins!", "Draw!", the Zombie/VIP/Occupation/Demolition variants) and
+# ForceShowScores(72) holds the scoreboard open for end_screen_seconds,
+# released when the next round starts. Both are plain HUD toggles.
+end_round_scoreboard = true
+end_round_headline = true
+# Map-vote candidates: maps sized for the lobby come first (players times
+# map_vote_area_per_player standable columns, never below map_vote_min_area;
+# bots count as map_vote_bot_weight of a player, 0..1). The last
+# map_vote_recent_exclude maps are offered last. Areas come from each map's
+# .botnav cache; map_size_overrides pins a map to an area or a size class.
+map_vote_size_fit = true
+map_vote_area_per_player = 8000
+map_vote_min_area = 24000
+map_vote_recent_exclude = 2
+map_vote_bot_weight = 1.0
+map_size_overrides = {}   # e.g. { WW1 = "large", DragonIsland = 27000 }
+# Kick votes (K). Retail MIN_TIME_BETWEEN_KICK_VOTES 300 s and
+# MIN_TIME_BETWEEN_CANCELLED_KICK_VOTES 45 s, per starter address; a starter
+# needs votekick_min_team_players on their team (retail 3; 0 disables).
+# Each refusal sends the stock KICK_DENIED_* message to the starter.
+votekick_cooldown_seconds = 300.0
+votekick_cancelled_cooldown_seconds = 45.0
+votekick_min_team_players = 3
 
 # Exact Match Lobby rule names recovered from gameRulesPanel.pyc. Values are
 # validated at startup; unknown names and unsupported slider values are fatal
@@ -178,14 +236,14 @@ RULE_ENABLE_DEATH_CAM = true
 RULE_ENABLE_MINI_MAP = true
 RULE_ENABLE_SPECTATORS = true
 RULE_ENABLE_FALL_ON_WATER_DAMAGE = true
-RULE_RESPAWN_TIMES = 5                 # 0..60 in five-second steps
+RULE_RESPAWN_TIMES = 5                 # 0..60 in five-second steps; retail default 10 (deliberate BattleSpades pace)
 RULE_BLOCK_HEALTH = "100%"             # 50%, 100%, 200%
 RULE_WEAPON_DAMAGE = "100%"            # 50%, 100%, 200%
-RULE_SPAWN_PROTECTION_TIME = "OFF"     # OFF, 1, 2, 3 seconds
+RULE_SPAWN_PROTECTION_TIME = "3"       # OFF, 1, 2, 3 seconds; ends early when the player attacks
 RULE_CHARACTER_BLOCK_WALLETS = "100%" # 50%, 100%, 200%
 RULE_CHARACTER_SPEED = "100%"          # 50%, 100%, 150%, 200%
 RULE_POINTS_FROM_TEABAGGING = false
-RULE_CRATES_SPAWN_TIME = 15            # 10..60 in five-second steps
+RULE_CRATES_SPAWN_TIME = 25            # 10..60 in five-second steps (retail default 25)
 RULE_ENABLE_COLOUR_PICKER = true
 # Recovered hidden lobby rule used by the server's GenericVote majority gate.
 RULE_VOTES_REQUIRED_FOR_KICK = "50%"   # 25%, 50%, 75%
@@ -259,7 +317,7 @@ RULE_ENABLE_WEAPON_BLOCKSUCKER = true
 RULE_TDM_SCORE_TARGET = 200
 RULE_CTF_ENABLE_SHOOT_WITH_INTEL = false
 RULE_CTF_ENABLE_INTEL_RETURN_ON_TOUCH = false
-RULE_CTF_SCORE_TARGET = 10
+RULE_CTF_SCORE_TARGET = 5              # retail Match Lobby default
 RULE_CTF_ENABLE_INTEL_AUTO_RETURN = true
 RULE_CTF_ENABLE_INTEL_IN_OWN_BASE_TO_SCORE = false # recovered hidden rule
 RULE_ZOMBIE_NOOF_ROUNDS = 3
@@ -308,6 +366,16 @@ debug_visualization = false
 # Purge all per-game bot state every round; additionally recycle the isolated
 # planner after this many completed game/map boundaries. Zero disables recycle.
 clean_slate_games = 3
+# Per-team bot skill balance: when one team's humans clearly out-kill the
+# other side, ease that team's bots and sharpen the others. Profile fields
+# shift by at most skill_balance_max_shift (0..0.9), moving skill_balance_rate
+# per second, ignoring edges inside skill_balance_deadband (0..0.95) and teams
+# with fewer than skill_balance_min_events kills+deaths.
+skill_balance = true
+skill_balance_max_shift = 0.35
+skill_balance_rate = 0.03
+skill_balance_deadband = 0.15
+skill_balance_min_events = 6
 
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.
@@ -334,13 +402,15 @@ round_intermission = 7.0
 
 [modes.zom]
 time_limit = 600
-infection_delay = 30.0
+infection_delay = 60.0 # retail ZOM_TIME_BEFORE_FIRST_INFECTION
 minimum_players = 2
 zombie_respawn_time = 0.0
 
-# The following five modes are registered scene-safe skeletons. Their clocks,
-# map resources, client mode IDs, and recovered settings work; their objective
-# scoring state machines remain explicit future implementation work.
+# The five objective modes below (Multi-Hill, Territory Control, Diamond Mine,
+# Demolition, Occupation) are fully playable: each runs its objective state
+# machine, scoring and win conditions (docs/GAMEPLAY.md). Their score targets
+# and timings come from the retail Match Lobby rules ([game_rules] RULE_*)
+# and server/mode_data.py; only the round clock is overridden here.
 [modes.mh]
 time_limit = 1500
 
@@ -365,23 +435,60 @@ team2_name = "TEAM2_COLOR"
 team2_color = [137, 179, 44]   # retail AoS green
 auto_balance = true
 balance_threshold = 2
+# Mid-match drift repair (auto_balance must be on), checked every
+# balance_check_interval seconds. A lead must last balance_grace_seconds; then
+# a dead bot switches sides, after balance_bot_wait_seconds a bot is retired
+# and replaced, and last a dead human is moved (never twice within
+# balance_player_cooldown seconds). Zombie/Tutorial/UGC are never balanced.
+balance_mid_match = true
+balance_grace_seconds = 5.0
+balance_player_cooldown = 600.0
+balance_bot_wait_seconds = 10.0
+balance_check_interval = 1.0
 
-[weapons]
-rifle_damage = 49
-smg_damage = 29
-shotgun_damage = 27
-spade_damage = 50
-grenade_damage = 100
+[objectives]
+# Escape watch: players outside the playable map get the retail high-minimap
+# marker so the enemy can hunt them. Checked every escape_watch_interval
+# seconds; above the map top for escape_watch_sky_seconds, inside solid
+# terrain for escape_watch_embedded_seconds, or (objective carriers, VIPs,
+# survivors, zone holders only) sealed in a tiny pocket for
+# escape_watch_entomb_seconds.
+escape_watch_enabled = true
+escape_watch_interval = 1.0
+escape_watch_sky_seconds = 5
+escape_watch_embedded_seconds = 3
+escape_watch_entomb_seconds = 5
+# A ground intel/diamond/bomb buried, sealed or left floating this long is
+# returned home or resettled onto the surface.
+objective_entomb_seconds = 5
+# Objective pickups need a clear line of sight (no grabbing through walls).
+objective_pickup_requires_los = true
+# Picking up an objective ends the carrier's spawn protection.
+objective_pickup_ends_spawn_protection = true
+# Idle players do not count toward holding a TC/MH zone after this many
+# seconds without input; 0 disables.
+objective_afk_seconds = 60
+# CTF: a carrier in an open-sky pit dug up to this many blocks below its own
+# base still scores, so defenders cannot excavate captures away.
+ctf_base_pit_depth = 24
+
+# [weapons] rifle_damage / smg_damage / shotgun_damage / spade_damage /
+# grenade_damage were removed: damage comes from the retail per-weapon and
+# per-body-part tables (server/weapons_retail.py, docs/WEAPONS_RETAIL.md).
+# Old configs that still set them load, but the values are ignored and a
+# warning is logged.
 
 [world]
 default_skybox = "User_Grassland.txt" # fallback for maps without a sidecar
 maps_path = "maps"
 prefabs_path = "prefabs"
+# Informational only: every retail VXL is 512x512x240 and the map loader
+# never reads these. A different value is ignored with a warning.
 map_size_x = 512
 map_size_y = 512
 map_size_z = 240
-water_level = 238
-water_damage = true
+# water_level / water_damage were removed: the water plane is fixed by the
+# retail VXL format (z 238/239) and retail has no water damage.
 fog_color_rgb = [12, 13, 11] # fallback; authored map metadata wins
 entities_wire_ready = true
 
@@ -394,7 +501,99 @@ path = "plugins"
 allowlist = []
 denylist = []
 
+[anticheat]
+# Checks that could reject legit play under packet loss start log-only;
+# watch the "anticheat" log lines for a session, then set enforce_* = true.
+enforce_shot_origin = false
+shot_origin_tolerance = 1.5
+enforce_aim_direction = false
+aim_direction_tolerance_deg = 10.0
+enforce_input_starvation = false
+starvation_airborne_ticks = 24
+starvation_timeout_seconds = 8.0
+enforce_input_backlog = false
+backlog_max_frames = 6
+kick_on_protocol_violation = true   # NaN/forged packets the stock client never sends
+admin_login_attempts = 3
+summary_interval_seconds = 60.0
+# Statistical suspicion report: evaluated every summary_interval_seconds,
+# written as JSON lines to report_path (rotated at report_max_bytes, keeping
+# report_backups). It only flags players (score >= flag_min_score); it never
+# kicks. Review with /acreport and /acstats. Thresholds per signal:
+report_enabled = true
+report_path = "logs/anticheat.jsonl"
+report_max_bytes = 5000000
+report_backups = 3
+flag_min_score = 1.0
+headshot_kill_ratio = 0.60       # headshot share of hitscan kills (0..1)
+headshot_kill_min_kills = 30
+headshot_hit_ratio = 0.55        # headshot share of single-ray hits (0..1)
+headshot_hit_min_hits = 60
+accuracy_min_shots = 100         # per-weapon accuracy vs the human population
+accuracy_min_population = 20
+accuracy_percentile = 99.0       # 0..100
+accuracy_min_margin = 0.15
+snap_min_deg = 20.0              # aim snaps onto a head within snap_frames
+snap_frames = 2
+snap_head_radius = 0.35
+snap_margin_deg = 0.75
+snap_min_events = 4
+snap_min_engaged = 20
+snap_ratio = 0.10
+reaction_acquire_deg = 10.0      # acquisition (reaction) time
+reaction_history_frames = 60
+reaction_min_samples = 15
+reaction_median_ms = 90.0
+reaction_reengage_seconds = 3.0
+engage_cone_deg = 4.0
+pellet_seed_min_shots = 64       # shotgun pellet-seed skew
+pellet_seed_top_share = 0.2
+sustained_min_minutes = 5.0      # sustained log-only violations
+sustained_min_count = 20
+sustained_per_minute = 3.0
+
+[audio]
+# In-round music bed: a looping last_man_standing_00N track at every round
+# start and for joiners. A DELIBERATE DEVIATION kept on request: retail rounds
+# were silent (map ambience only) until the final 61 s (game_ending_00N), and
+# last_man_standing played only for the Zombie last survivor. false = retail.
+mode_start_music = true
+
+[conduct]
+# Team griefing: grief points per 100 HP removed from teammates plus a bonus
+# per team kill -- including a teammate's death from a deployable YOU set off
+# (shooting their landmine). One point decays every grief_decay_seconds; one
+# burst (a single grenade into a crowd) is capped at grief_incident_max_points
+# so an accident alone never kicks. Private warning, then ERROR_KICK_GRIEFING.
+grief_kick_enabled = true
+grief_kick_points = 10.0
+grief_warn_points = 5.0
+grief_decay_seconds = 60.0
+grief_team_kill_points = 3.0
+grief_team_damage_points = 1.0
+grief_incident_seconds = 3.0
+grief_incident_max_points = 6.0
+grief_exempt_admins = true
+# AFK: only real input (keys/aim) counts; the clock pauses while loading,
+# dead, or between rounds. Warn at afk_warn_seconds, kick (ERROR_AFK_TIMEOUT)
+# at afk_kick_seconds; 0 disables. Spectators get their own limit (0 = exempt).
+# Not retail: retail only had the ERROR_AFK_TIMEOUT kick code; these times
+# and the warning are this server's choices.
+afk_kick_seconds = 600
+afk_warn_seconds = 540
+afk_spectator_kick_seconds = 1800
+afk_exempt_admins = true
+announce_kicks = true
+# Extra reserved names on top of Server/Admin/Console/System/Moderator/...
+reserved_names = []
+
 [admin]
+# In-game `/admin <password>` login. It is DISABLED (and startup logs a
+# WARNING) while this is the shipped "changeme", empty, or shorter than 12
+# characters -- set a unique secret before exposing the server. Three wrong
+# guesses from one address ([anticheat] admin_login_attempts) kick the player
+# and ban the address for 10 minutes. The container entrypoint takes it from
+# BATTLESPADES_ADMIN_PASSWORD instead.
 password = "changeme"
 log_commands = true
 bans_path = "bans.json"
@@ -415,6 +614,13 @@ suppress_packets = [2, 4, 11, 56, 57]  # Packet IDs to hide in debug logs (2 = W
 # One-frame retail button chronology currently used by production. Validation
 # can override this with --movement-input-latch 0 for controlled A/B runs.
 movement_input_latch_frames = 1
+# Retail ClientData is unsequenced on the wire and the client labels every
+# update contiguously, so a gap of up to this many labels is lost input: the
+# server refills each missing frame with the held input, one per tick, instead
+# of trailing the client by a frame for the rest of the round
+# (docs/RETAIL_INPUT_LOSS.md). Must stay below the client's clock-jump
+# threshold of 10; 0 disables the refill.
+input_gap_fill_limit = 8
 # Reverse-engineering capture is intentionally OFF in production. It owns a
 # localhost UDP transport and writes large physics snapshots when enabled.
 debug_parity = false
@@ -457,6 +663,13 @@ jetpack_owner_handoff_input_frames = 30
 # Exhaustion can leave SPACE held while the owner falls. Resume after release,
 # settle, and ground contact; this cap prevents an indefinite local-row holdoff.
 jetpack_owner_release_handoff_input_frames = 600
+# Pack thrust boundaries the owner cannot acknowledge: the simulation starts
+# thrust N accepted-input frames after announcing activation and keeps it N
+# frames after announcing exhaustion, matching when the retail client's
+# WorldUpdate row with the active bit lands (calibrated live 2026-09-24 with
+# the Rocketeer jump-pack gate; see docs/RETAIL_JUMP_RESTORE.md).
+jetpack_activation_defer_frames = 2
+jetpack_exhaustion_tail_frames = 3
 # Log every self-row's (stamp, position) to logs/selfrow_samples.ndjson so the
 # offline simulator (tmp/reconcile_sim.py) can replicate the client's exact
 # reconciliation and report the snap/adjust/no-op distribution. Turn ON for one

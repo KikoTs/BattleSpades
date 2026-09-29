@@ -259,10 +259,11 @@ def test_demolition_bots_build_then_split_defence_and_assault() -> None:
         builder,
     )
     defend = objective_decision_for(
-        _frame("dem", builder, objectives=(own, enemy)), builder
+        _frame("dem", builder, attacker, objectives=(own, enemy)), builder
     )
+    # Roles split by each bot's slot within its own team.
     assault = objective_decision_for(
-        _frame("dem", attacker, objectives=(own, enemy)), attacker
+        _frame("dem", attacker, builder, objectives=(own, enemy)), attacker
     )
 
     assert build.role == "demolition_build_defences"
@@ -279,10 +280,10 @@ def test_territory_bots_capture_hostile_and_periodically_defend_owned() -> None:
     neutral = ObjectiveSnapshot("tc_territory", 1, (200.0, 100.0, 60.0))
 
     defend = objective_decision_for(
-        _frame("tc", defender, objectives=(owned, neutral)), defender
+        _frame("tc", defender, attacker, objectives=(owned, neutral)), defender
     )
     capture = objective_decision_for(
-        _frame("tc", attacker, objectives=(owned, neutral)), attacker
+        _frame("tc", attacker, defender, objectives=(owned, neutral)), attacker
     )
 
     assert defend.role == "territory_defend"
@@ -300,7 +301,7 @@ def test_diamond_carrier_cashes_in_and_teammate_collects_loose_diamond() -> None
         _frame("dia", carrier, objectives=(dropoff, diamond)), carrier
     )
     collect = objective_decision_for(
-        _frame("dia", collector, objectives=(dropoff, diamond)), collector
+        _frame("dia", collector, carrier, objectives=(dropoff, diamond)), collector
     )
 
     assert cash.role == "diamond_cash_in"
@@ -309,7 +310,7 @@ def test_diamond_carrier_cashes_in_and_teammate_collects_loose_diamond() -> None
     assert collect.position == diamond.position
 
     mining = objective_decision_for(
-        _frame("dia", collector, objectives=(dropoff,)), collector
+        _frame("dia", collector, carrier, objectives=(dropoff,)), collector
     )
     assert mining.role == "diamond_mine_blocks"
     assert mining.directive == "mine"
@@ -361,7 +362,7 @@ def test_mode_roles_select_materially_different_playstyles() -> None:
         _frame("dia", collector, objectives=(dropoff, diamond)), collector
     )
     defend = objective_decision_for(
-        _frame("dia", guard, objectives=(dropoff,)), guard
+        _frame("dia", guard, _player(6, 2), objectives=(dropoff,)), guard
     )
 
     assert cash.posture is ModeBotPosture.EVASIVE

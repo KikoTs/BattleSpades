@@ -94,3 +94,15 @@ Support diagnostics
 
 Include the exact archive name, output of `--check`, operating system version,
 CPU architecture, and relevant files from `logs/` when reporting startup bugs.
+
+License
+-------
+
+Copyright (c) 2026 Kiril Tsanov. BattleSpades is free software under the GNU
+Affero General Public License v3.0 or later (LICENSE; summary in
+LICENSING.md). There is NO WARRANTY. If you run a MODIFIED server that other
+people connect to, AGPL section 13 requires you to offer those players its
+complete source code, for example with a link in [server].motd in config.toml.
+Releases up to v0.1.0-beta.1 were MIT-licensed and remain so. Third-party
+components and Ace of Spades game content keep their own terms
+(THIRD_PARTY_NOTICES.txt).

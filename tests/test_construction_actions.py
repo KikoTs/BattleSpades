@@ -19,17 +19,25 @@ from server.prefab_actions import PrefabActionService
 class _World:
     def __init__(self, solids=()):
         self.solids = set(solids)
+        self.colors = {}
+        self.block_health = {}
         self.map_metadata = SimpleNamespace(spawn_zones={}, base_zones={})
 
     def get_solid(self, x, y, z):
         return (int(x), int(y), int(z)) in self.solids
 
-    def set_block(self, x, y, z, solid=True, color=0):
+    def set_block(self, x, y, z, solid=True, color=0, health=None):
         coordinate = int(x), int(y), int(z)
         if solid:
             self.solids.add(coordinate)
+            self.colors[coordinate] = color
         else:
             self.solids.discard(coordinate)
+            self.colors.pop(coordinate, None)
+        if health is not None:
+            self.block_health[coordinate] = float(health)
+        else:
+            self.block_health.pop(coordinate, None)
         return True
 
     def get_height(self, x, y):
@@ -132,12 +140,13 @@ def test_ctf_capture_bounds_are_protected_from_construction():
     assert reason == "spawn or objective zone"
 
 
-def test_prefab_service_uses_colored_observer_and_plain_owner_paths(monkeypatch):
+def test_prefab_service_replicates_one_native_build_prefab_action(monkeypatch):
     world = _World(solids={(10, 10, 11)})
     server = _server(world)
     sent = []
     player = SimpleNamespace(
         id=5,
+        eye=(10.5, 12.5, 8.0),  # within build reach of the (10,10,10) footprint
         name="Builder",
         team=TEAM1,
         alive=True,
@@ -173,10 +182,15 @@ def test_prefab_service_uses_colored_observer_and_plain_owner_paths(monkeypatch)
     assert accepted is True
     assert player.blocks == 9
     assert world.get_solid(10, 10, 10)
-    assert [
-        payload[0] for payload, _kwargs in server.broadcasts
-        if payload[0] == 33
-    ] == [33]
+    assert world.block_health[(10, 10, 10)] == float(C.DEFAULT_PREFAB_HEALTH)
+    # Retail replication: one BuildPrefabAction(30) to every client (owner
+    # included), no per-cell BlockBuild(32)/BlockBuildColored(33) flood.
+    native = [
+        (payload, kwargs) for payload, kwargs in server.broadcasts
+        if payload[0] in (30, 32, 33)
+    ]
+    assert [payload[0] for payload, _kwargs in native] == [30]
+    assert native[0][1].get("exclude") is None
     placement_sounds = [
         PlaySound(ByteReader(payload[1:]))
         for payload, _kwargs in server.broadcasts
@@ -184,7 +198,7 @@ def test_prefab_service_uses_colored_observer_and_plain_owner_paths(monkeypatch)
     ]
     assert len(placement_sounds) == 1
     assert placement_sounds[0].sound_id == 32
-    assert [payload[0] for payload in sent] == [32, 29]
+    assert [payload[0] for payload in sent] == [29]
 
 
 def test_prefab_rejects_a_footprint_reaching_the_reserved_sky_layer(monkeypatch):
@@ -418,6 +432,7 @@ def test_prefab_service_authorizes_native_zombie_prefab_tool(monkeypatch):
     server = _server(world)
     player = SimpleNamespace(
         id=15,
+        eye=(10.5, 12.5, 8.0),  # within build reach of the (10,10,10) footprint
         name="ZombieBuilder",
         team=TEAM2,
         alive=True,
@@ -449,7 +464,7 @@ def test_prefab_service_authorizes_native_zombie_prefab_tool(monkeypatch):
     ) is True
 
 
-def test_production_prefab_queue_drains_in_bounded_cell_batches(monkeypatch):
+def test_production_competitive_prefab_commits_whole_in_one_tick(monkeypatch):
     world = _World(solids={(10, 10, 11)})
     server = _server(world)
     server.simulation_runtime = object()
@@ -457,6 +472,7 @@ def test_production_prefab_queue_drains_in_bounded_cell_batches(monkeypatch):
     sent = []
     player = SimpleNamespace(
         id=6,
+        eye=(10.5, 12.5, 8.0),  # within build reach of the (10,10,10) footprint
         name="QueuedBuilder",
         team=TEAM1,
         alive=True,
@@ -496,16 +512,17 @@ def test_production_prefab_queue_drains_in_bounded_cell_batches(monkeypatch):
     assert player.blocks == 8
     assert not world.get_solid(10, 10, 10)
 
-    assert service.tick() == 1
-    assert service.pending_count == 1
-    assert service.tick() == 1
+    # prefab_cell_batch_limit=1 bounds only the UGC editor lane; the whole
+    # competitive prefab lands in one tick so the client renders it at once.
+    assert service.tick() == 2
     assert service.pending_count == 0
+    assert world.get_solid(10, 10, 10) and world.get_solid(11, 10, 10)
     assert [
         payload[0] for payload, _kwargs in server.broadcasts
-        if payload[0] == 33
-    ] == [33, 33]
+        if payload[0] in (30, 32, 33)
+    ] == [30]
     assert sum(
         payload[0] == PlaySound.id
         for payload, _kwargs in server.broadcasts
     ) == 1
-    assert [payload[0] for payload in sent] == [32, 32, 29]
+    assert [payload[0] for payload in sent] == [29]

@@ -57,7 +57,8 @@ class _TDMServer:
     def queue_mode_event(self, name, *args):
         self._mode_events.append((name, args))
 
-    def broadcast(self, data, exclude=None):
+    def broadcast(self, data, exclude=None, **_kwargs):
+        # known_player_id / reliable filters are the real server's concern.
         self.broadcast_packets.append(data)
 
     def broadcast_state_data(self):

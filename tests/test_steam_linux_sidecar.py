@@ -1,10 +1,41 @@
 """Wire metadata and real occupancy contracts for the Linux Steam sidecar."""
 import struct
+from unittest.mock import Mock
 
 import pytest
 
 from scripts.check_steam_registration import ProbeError, parse_a2s_info
 from scripts import steam_linux_sidecar as sidecar
+
+
+@pytest.mark.parametrize("bind_ip, numeric_ip", [("0.0.0.0", 0), ("192.0.2.17", 0xC0000211)])
+def test_native_ipv4_binding_precedes_user_creation(monkeypatch, tmp_path, bind_ip, numeric_ip):
+    """SDK 1.37 requires binding before the local user opens backend sockets."""
+    calls = []
+    library = Mock()
+    library.CreateInterface.return_value = 10
+
+    def native_call(obj, index, result, types, *args):
+        calls.append((obj, index, args))
+        if obj == 10 and index == 3:
+            sidecar.c.cast(args[0], sidecar.c.POINTER(sidecar.c.c_int))[0] = 20
+            return 30
+        if obj == 10 and index == 6:
+            return 40
+        return True
+
+    monkeypatch.setattr(sidecar.sys, "platform", "linux")
+    monkeypatch.setattr(sidecar.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(sidecar.c, "CDLL", lambda *args, **kwargs: library)
+    monkeypatch.setattr(sidecar, "vcall", native_call)
+    monkeypatch.setenv("SteamAppId", "224540")
+    monkeypatch.setenv("SteamGameId", "224540")
+    sidecar.SteamServer(tmp_path, 32887, 32888, bind_ip)
+    client_methods = [index for obj, index, args in calls if obj == 10]
+    assert client_methods == ([7, 3, 6] if numeric_ip else [3, 6])
+    if numeric_ip:
+        assert calls[0] == (10, 7, (numeric_ip, 0))
+    assert (40, 0, (numeric_ip, 32887, 32888, 12, 224540, b"1.0.0.0")) in calls
 
 
 def upstream(**changes):

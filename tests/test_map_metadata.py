@@ -258,7 +258,8 @@ def test_rejects_skybox_paths_that_escape_client_mesh_assets(tmp_path: Path):
 def test_shipped_maps_declare_their_stock_skyboxes():
     expected = {
         "ArcticBase": "ArcticBase.txt",
-        "CastleWars": "Classic.txt",
+        # Retail loading art shows the Invasion dome's red volcanic sky.
+        "CastleWars": "Invasion.txt",
         "CityOfChicago": "Chicago.txt",
         "20thCenturyTown": "WW1.txt",
     }

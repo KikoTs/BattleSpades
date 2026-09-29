@@ -4,14 +4,19 @@ Player commands - available to all players.
 
 from server.game_constants import (
     CHAT_ALL,
-    KILL_TEAM_CHANGE,
+    KILL_CLASS_CHANGE,
     TEAM1,
     TEAM2,
     TEAM_SPECTATOR,
 )
+import shared.constants as C
 from shared.packet import ChatMessage, KillAction
 
 from .command_handler import register_command, CommandContext, send_message, get_all_commands
+
+# Player-authored text relayed by /pm and /me is bounded like ordinary chat
+# (the stock chat box's MAX_CHAT_MESSAGE_LENGTH).
+_CHAT_TEXT_LIMIT = int(getattr(C, "MAX_CHAT_MESSAGE_LENGTH", 200))
 
 
 @register_command(
@@ -63,9 +68,22 @@ async def cmd_kill(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "You're already dead!")
         return
     
-    # Player.die() already broadcasts the KillAction — don't send a second
-    # one here (that double-fired the death packet to every client).
-    ctx.player.die(killer=ctx.player, kill_type=KILL_TEAM_CHANGE)
+    # Player.die() already broadcasts the KillAction; don't send a second
+    # one here (that double-fired the death packet to every client). A
+    # suicide right after enemy fire is that enemy's kill, not a free
+    # transition death (end_life_for_transition credits it).
+    #
+    # CLASS_CHANGE_KILL, not TEAM_CHANGE_KILL: the stock
+    # process_packet_kill_action clears dominatingLocalPlayer /
+    # dominatedByLocalPlayer on TEAM_CHANGE kills (and the feed shows the
+    # team-change icon), so /kill would let a dominated player wipe the
+    # domination icon and the pending revenge.  The client does not treat
+    # CLASS_CHANGE_KILL as a relation reset, and neither does the server
+    # (kill_feed.DOMINATION_RESET_KILL_TYPES).  Retail had no player
+    # suicide command; a class change is the closest retail action.
+    from server.handlers.team import end_life_for_transition
+
+    end_life_for_transition(ctx.server, ctx.player, KILL_CLASS_CHANGE)
 
 
 @register_command(
@@ -74,13 +92,13 @@ async def cmd_kill(ctx: CommandContext):
     description="Change your team",
 )
 async def cmd_team(ctx: CommandContext):
-    """Change team."""
+    """Change team through the same rules as the retail ChangeTeam packet."""
     if not ctx.args:
         await send_message(ctx.server, ctx.player, "Usage: /team <team1|team2|spectator>")
         return
-    
+
     team_name = ctx.args[0].lower()
-    
+
     team_map = {
         "team1": TEAM1,
         str(TEAM1): TEAM1,
@@ -90,33 +108,22 @@ async def cmd_team(ctx: CommandContext):
         "spec": TEAM_SPECTATOR,
         str(TEAM_SPECTATOR): TEAM_SPECTATOR,
     }
-    
+
     if team_name not in team_map:
         await send_message(ctx.server, ctx.player, "Invalid team. Use: team1, team2, or spectator")
         return
-    
+
     new_team = team_map[team_name]
-    old_team = ctx.player.team
-    
-    if new_team == old_team:
-        await send_message(ctx.server, ctx.player, "You're already on that team!")
+    # One code path for the packet and the command: cooldown, auto-balance,
+    # mode team locks, deployable retirement, spectator roster, kill credit
+    # and on_player_team_change all live in change_team.
+    from server.handlers.team import change_team
+
+    if not change_team(ctx.server, ctx.player, new_team, explain=True):
         return
-    
-    # Change team
-    if old_team in ctx.server.teams:
-        ctx.server.teams[old_team].remove_player(ctx.player)
-    
-    ctx.player.team = new_team
-    
-    if new_team in ctx.server.teams:
-        ctx.server.teams[new_team].add_player(ctx.player)
-    
-    # Kill player to respawn on new team
-    if ctx.player.alive:
-        ctx.player.die(kill_type=KILL_TEAM_CHANGE)
-    
-    team_name = ctx.server.teams[new_team].name if new_team in ctx.server.teams else "Spectator"
-    await send_message(ctx.server, ctx.player, f"You joined {team_name}")
+
+    label = {TEAM1: "team 1", TEAM2: "team 2"}.get(new_team, "the spectators")
+    await send_message(ctx.server, ctx.player, f"You joined {label}")
 
 
 @register_command(
@@ -163,8 +170,13 @@ async def cmd_pm(ctx: CommandContext):
         await send_message(ctx.server, ctx.player, "Usage: /pm <player> <message>")
         return
     
+    if getattr(ctx.player, "muted", False):
+        # Mute covers every player-to-player channel, not just public chat.
+        await send_message(ctx.server, ctx.player, "You are muted.")
+        return
+
     target_name = ctx.args[0]
-    message = " ".join(ctx.args[1:])
+    message = " ".join(ctx.args[1:])[:_CHAT_TEXT_LIMIT]
     
     target = ctx.server.get_player_by_name(target_name)
     if not target:
@@ -182,15 +194,24 @@ async def cmd_pm(ctx: CommandContext):
 )
 async def cmd_me(ctx: CommandContext):
     """Action message."""
-    if not ctx.raw_args:
+    action = ctx.raw_args.strip()
+    if not action or getattr(ctx.player, "muted", False):
+        # /me is public chat: a muted player must not reach it this way.
         return
-    
-    message = f"* {ctx.player.name} {ctx.raw_args}"
+
+    # The stock HUD.create_line always prefixes a player-sent line with the
+    # sender's "Name: " (team colour), so the text carries only the action:
+    # clients render "Name: * waves" instead of "Name: * Name waves".
+    message = f"* {action}"[:_CHAT_TEXT_LIMIT]
     packet = ChatMessage()
     packet.player_id = ctx.player.id
     packet.chat_type = CHAT_ALL
     packet.value = message
-    ctx.server.broadcast(bytes(packet.generate()))
+    # Same delivery as ordinary chat: only in-game peers that know the
+    # sender (the retail HUD resolves player_id through its roster).
+    from server.handlers.social import _relay_chat
+
+    _relay_chat(ctx.server, ctx.player, bytes(packet.generate()), False)
 
 
 @register_command(

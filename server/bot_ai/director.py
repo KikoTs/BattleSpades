@@ -41,6 +41,8 @@ from .messages import (
     VoxelChange,
 )
 from .prefab_policy import bot_prefab_is_suitable, is_zombie_prefab
+from .policies import canonical_mode_id
+from .zombie_refuge import iter_elect_refuge, refuge_breached
 from .profiles import ProfileFactory
 from .supervisor import AIWorkerSupervisor, WorkerStatus
 from .thread_supervisor import AIThreadSupervisor
@@ -62,6 +64,11 @@ _MOTOR_PHASE_COUNT = 6
 # A latched FIRE/MELEE/ORIENTED action may outlive its 400 ms intent TTL by
 # this grace period while the aim motor finishes converging on the target.
 _ACTION_CONVERGENCE_GRACE = 0.15
+# Mirrors server.player.FIRE_RATE_GRACE: the arrival jitter consume_shot
+# admits against a melee tool's next_shot_time.
+_SWING_CADENCE_GRACE = 1.0 / 60.0
+# Longest a converged swing waits for that cadence before it is dropped.
+_SWING_CADENCE_MAX_HOLD = 0.25
 # The worker's native player-target claw gate (see _engage_zombie).  The
 # director mirrors it for positionless melee so contact DPS is unchanged.
 _PLAYER_MELEE_ALIGNMENT = 0.72
@@ -106,23 +113,34 @@ _PERCEPTION_PUBLISH_BUDGET_SHARE = 0.55
 # the bounded player cohort and control metadata instead of allowing a dense
 # custom map to recreate the frozen Windows large-write deadlock.
 _MAX_PERCEPTION_ENTITIES = 192
+# Purely decorative registry entities that no bot policy ever acts on. Static
+# map lights (20thCenturyTown alone places 524 ``map_flare`` entities) would
+# otherwise overflow the cap above, push crates/intel/hazards out of it, and
+# force a full priority sort every perception refresh. Their voxel is part of
+# the collision world the planner already sees, so nothing is lost.
+_DECORATIVE_ENTITY_KINDS = frozenset(("map_flare", "static_flare", "flare_block"))
+_DECORATIVE_ENTITY_TYPES = frozenset((int(getattr(C, "FLARE_BLOCK", 13)),))
+# When real entities still exceed the cap, the distance ranking of ordinary
+# (non-hazard, non-carried) entities is reused for this long instead of being
+# recomputed against every live player on every refresh. New entity ids force
+# an immediate re-rank; hazards and carried items bypass the cache entirely.
+_ENTITY_RANK_CACHE_SECONDS = 0.5
+# Gameplay-thread time one perception refresh may spend advancing a Zombie
+# refuge election. A cold election scans ~13k map columns (~70 ms on
+# SpookyMansion); spread it across refreshes instead of one 53 ms tick.
+_REFUGE_ELECTION_BUDGET_SECONDS = 0.002
 _WALK_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0)
 )
 _WATER_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0, 80.0)
 )
+# The stock DEFAULT_TEAM_CLASSES (alias A93): the six classes a human can pick
+# in every ordinary retail mode.  Rocketeer is not among them, so bots never
+# field a class the human class picker does not offer.
 _DEFAULT_CLASSES = tuple(
     int(value)
-    for value in (
-        getattr(C, "CLASS_SOLDIER", -1),
-        getattr(C, "CLASS_SCOUT", -1),
-        getattr(C, "CLASS_ROCKETEER", -1),
-        getattr(C, "CLASS_MINER", -1),
-        getattr(C, "CLASS_ENGINEER", -1),
-        getattr(C, "CLASS_SPECIALIST", -1),
-        getattr(C, "CLASS_MEDIC", -1),
-    )
+    for value in getattr(C, "DEFAULT_TEAM_CLASSES", ())
     if int(value) in C.CLASS_ITEMS
 )
 _BOT_TRAVERSAL_PREFAB_TOKENS = (
@@ -377,6 +395,13 @@ class BotDirector:
         self._runtime: dict[int, _RuntimeBot] = {}
         self._generation_counter: dict[int, int] = {}
         self._observed_player_objects: dict[int, tuple[int, int]] = {}
+        # Zombie survivors' elected refuge: team -> (position, elected_at,
+        # generation). Re-elected when breached or never reached.
+        self._zombie_refuge: dict[int, tuple[tuple[float, float, float], float, int]] = {}
+        self._zombie_refuge_history: list[tuple[tuple[float, float, float], float]] = []
+        self._zombie_refuge_epoch: object = None
+        # (reason, generator, previous refuge) of an in-progress election.
+        self._zombie_refuge_job: tuple | None = None
         self._frame_id = 0
         self._map_epoch = 0
         self._mode_epoch = 0
@@ -406,6 +431,9 @@ class BotDirector:
         self._perception_build_players: tuple[Player, ...] = ()
         self._perception_build_snapshots: list[PlayerSnapshot] = []
         self._perception_build_index = 0
+        self._entity_rank_order: tuple[int, ...] = ()
+        self._entity_rank_ids: frozenset[int] = frozenset()
+        self._entity_rank_until = 0.0
 
     @property
     def _config(self):
@@ -420,6 +448,7 @@ class BotDirector:
         self._refresh_epochs(force=True)
         self.supervisor.start(self._make_map_snapshot(current=False))
         self._bind_world_mutations()
+        self._publish_static_lights()
 
         if initial_count is None:
             population_mode = str(
@@ -523,6 +552,9 @@ class BotDirector:
         self._perception_build_players = ()
         self._perception_build_snapshots = []
         self._perception_build_index = 0
+        self._entity_rank_order = ()
+        self._entity_rank_ids = frozenset()
+        self._entity_rank_until = 0.0
 
     async def _reconnect_roster(self) -> None:
         """Restore the previous population using fresh mode-aware joins."""
@@ -570,6 +602,34 @@ class BotDirector:
         if callable(subscribe):
             self._mutation_subscription = subscribe(self._on_world_mutation)
             self._mutation_world = world
+        listeners = getattr(world, "static_light_listeners", None)
+        if not isinstance(listeners, list):
+            listeners = []
+            try:
+                world.static_light_listeners = listeners
+            except AttributeError:
+                listeners = None
+        if listeners is not None and self._on_static_light not in listeners:
+            listeners.append(self._on_static_light)
+
+    def _on_static_light(self, x: int, y: int, z: int, color: int) -> None:
+        """A retail FlareBlockEntity restored a stripped marker cell."""
+
+        publish = getattr(self.supervisor, "publish_world_change", None)
+        if not callable(publish):
+            return
+        publish(
+            VoxelChange(int(x), int(y), int(z), True, int(color)),
+            map_epoch=self._map_epoch,
+            topology_version=self._topology_version,
+        )
+
+    def _publish_static_lights(self) -> None:
+        """Replay restored flare cells after a (new) worker map snapshot."""
+
+        cells = getattr(self.server.world_manager, "static_light_cells", None) or {}
+        for (x, y, z), color in tuple(cells.items()):
+            self._on_static_light(x, y, z, color)
 
     def _unbind_world_mutations(self) -> None:
         """Release the listener from the world that issued its token."""
@@ -744,6 +804,7 @@ class BotDirector:
             key=lambda player: (
                 not self._safe_to_retire(player),
                 bool(getattr(player, "alive", False)),
+                self._mode_retire_rank(player),
                 int(player.id),
             ),
         )
@@ -773,11 +834,17 @@ class BotDirector:
         if connection is not None:
             connection.in_game = False
 
+        # The mode's leave hook (intel/bomb/diamond drops, VIP loss) sends
+        # packets naming this player, so it must run while every client still
+        # knows the id; PlayerLeft goes out last, as for departing humans.
+        if notify_mode and self.server.mode is not None:
+            try:
+                await self.server.mode.on_player_leave(bot)
+            except Exception:  # noqa: BLE001 - the slot must still be freed
+                logger.exception("Mode leave hook failed for bot %s", bot.name)
         packet = PlayerLeft()
         packet.player_id = int(bot.id)
         self.server.broadcast(bytes(packet.generate()))
-        if notify_mode and self.server.mode is not None:
-            await self.server.mode.on_player_leave(bot)
         if runtime is not None:
             self.profile_factory.release_name(runtime.profile.name)
         self.banter.forget(int(bot.id))
@@ -952,6 +1019,7 @@ class BotDirector:
             self._perception_cache_until = 0.0
             if self._started and not force:
                 self.supervisor.publish_map(self._make_map_snapshot(current=False))
+                self._publish_static_lights()
         if force or mode_signature != self._mode_signature:
             self._mode_signature = mode_signature
             self._mode_epoch += 1
@@ -982,8 +1050,19 @@ class BotDirector:
         topology_version: int,
     ) -> None:
         self._topology_version = max(self._topology_version, int(topology_version))
+        health = 0.0
+        if solid:
+            # WorldManager records the cell's initial health before it
+            # publishes the mutation; only non-default (built) cells appear.
+            recorded = getattr(
+                getattr(self.server, "world_manager", None), "block_health", None
+            )
+            if isinstance(recorded, dict):
+                health = float(recorded.get((int(x), int(y), int(z)), 0.0) or 0.0)
         self.supervisor.publish_world_change(
-            VoxelChange(int(x), int(y), int(z), bool(solid), int(color)),
+            VoxelChange(
+                int(x), int(y), int(z), bool(solid), int(color), health=health
+            ),
             map_epoch=self._map_epoch,
             topology_version=self._topology_version,
         )
@@ -1000,13 +1079,20 @@ class BotDirector:
             1 for player in self.server.players.values()
             if not bool(getattr(player, "is_bot", False))
         )
+        # Spectators hold a server slot but do not fight: they must not make a
+        # bot leave the teams (backfill counts only playing humans).
+        playing_humans = sum(
+            1 for player in self.server.players.values()
+            if not bool(getattr(player, "is_bot", False))
+            and int(getattr(player, "team", -1)) in _PLAYABLE_TEAMS
+        )
         maximum = max(0, int(getattr(config, "max_bots", 12)))
         if mode == "fixed":
             desired = maximum
         elif mode == "admin":
             return
         else:
-            desired = max(0, int(getattr(config, "fill_target", 12)) - humans)
+            desired = max(0, int(getattr(config, "fill_target", 12)) - playing_humans)
         # Bots never take a human's place. Every mode, including the fixed
         # count Create Match uses, keeps at least one slot free for the next
         # player; clients still loading already hold a reserved id.
@@ -1023,17 +1109,30 @@ class BotDirector:
         excess = len(self.bots) - desired
         if excess <= 0:
             return
-        candidates = sorted(
-            self.bots,
-            key=lambda player: (
-                bool(getattr(player, "alive", False)),
-                bool(getattr(player, "pickup_id", None) is not None),
-                int(player.id),
-            ),
-        )
-        for candidate in candidates:
-            if excess <= 0:
+        # Retire from the bigger side first so shrinking the bot population
+        # (a human joined) evens the teams instead of unbalancing them.
+        tried: set[int] = set()
+        while excess > 0:
+            team_sizes = {
+                team: sum(
+                    1 for player in self.server.players.values()
+                    if int(getattr(player, "team", -1)) == team
+                )
+                for team in _PLAYABLE_TEAMS
+            }
+            candidates = sorted(
+                (bot for bot in self.bots if id(bot) not in tried),
+                key=lambda player: (
+                    -team_sizes.get(int(getattr(player, "team", -1)), 0),
+                    bool(getattr(player, "alive", False)),
+                    bool(getattr(player, "pickup_id", None) is not None),
+                    int(player.id),
+                ),
+            )
+            if not candidates:
                 break
+            candidate = candidates[0]
+            tried.add(id(candidate))
             if await self.remove_bot(candidate):
                 excess -= 1
 
@@ -1316,6 +1415,10 @@ class BotDirector:
                     last_task_at=(runtime.feedback_task_at if runtime else 0.0),
                     can_shoot=self._can_shoot(player),
                     weapon_ammo=self._weapon_ammo_snapshot(player),
+                    spawn_protected=bool(
+                        callable(getattr(player, "spawn_protection_remaining", None))
+                        and player.spawn_protection_remaining() > 0.0
+                    ),
                 )
 
     def _can_shoot(self, player: "Player") -> bool:
@@ -1369,6 +1472,8 @@ class BotDirector:
         result: list[EntitySnapshot] = []
         for entity in tuple(registry.all()):
             kind = str(getattr(entity, "kind", ""))
+            if kind in _DECORATIVE_ENTITY_KINDS:
+                continue
             # The projectile engine owns the current moving coordinates.  Its
             # registry counterpart retains only the spawn transform for wire
             # replication and would make bots dodge a stale location.
@@ -1388,6 +1493,8 @@ class BotDirector:
             entity_type = int(
                 getattr(entity, "entity_type", getattr(entity, "type", -1))
             )
+            if entity_type in _DECORATIVE_ENTITY_TYPES:
+                continue
             behavior = getattr(entity, "behavior", None)
             turret = getattr(self.server, "rocket_turrets", {}).get(
                 int(getattr(entity, "entity_id", -1)))
@@ -1469,6 +1576,21 @@ class BotDirector:
             )
         if len(result) <= _MAX_PERCEPTION_ENTITIES:
             return tuple(result)
+        # Called unbound from tests with a namespace standing in for self.
+        return BotDirector._select_perception_entities(self, result, players)
+
+    def _select_perception_entities(
+        self,
+        result: list[EntitySnapshot],
+        players,
+    ) -> tuple[EntitySnapshot, ...]:
+        """Bound an overflowing entity list without a per-refresh full sort.
+
+        Hazards and carried items are always selected first (a small subset
+        ranked every refresh). The remaining entities follow a cached
+        objective/projectile/pickup/distance order that is recomputed only
+        when it expires or an unranked entity id appears.
+        """
 
         carried_ids = {
             int(pickup_id)
@@ -1484,21 +1606,8 @@ class BotDirector:
             and getattr(player, "position", None) is not None
         )
 
-        def priority(snapshot: EntitySnapshot) -> tuple[float, float, int]:
-            kind = snapshot.kind.lower()
-            if snapshot.hazardous:
-                rank = 0.0
-            elif snapshot.entity_id in carried_ids:
-                rank = 1.0
-            elif kind in {"objective", "intel", "base"}:
-                rank = 2.0
-            elif kind == "projectile":
-                rank = 3.0
-            elif kind in {"pickup", "crate", "resource"}:
-                rank = 4.0
-            else:
-                rank = 5.0
-            distance = min(
+        def distance(snapshot: EntitySnapshot) -> float:
+            return min(
                 (
                     (snapshot.position[0] - position[0]) ** 2
                     + (snapshot.position[1] - position[1]) ** 2
@@ -1507,9 +1616,61 @@ class BotDirector:
                 ),
                 default=0.0,
             )
-            return rank, distance, int(snapshot.entity_id)
 
-        selected = sorted(result, key=priority)[:_MAX_PERCEPTION_ENTITIES]
+        def priority(snapshot: EntitySnapshot) -> tuple[float, float, int]:
+            kind = snapshot.kind.lower()
+            if kind in {"objective", "intel", "base"}:
+                rank = 2.0
+            elif kind == "projectile":
+                rank = 3.0
+            elif kind in {"pickup", "crate", "resource"}:
+                rank = 4.0
+            else:
+                rank = 5.0
+            return rank, distance(snapshot), int(snapshot.entity_id)
+
+        urgent: list[EntitySnapshot] = []
+        ordinary: dict[int, EntitySnapshot] = {}
+        for snapshot in result:
+            if snapshot.hazardous or snapshot.entity_id in carried_ids:
+                urgent.append(snapshot)
+            else:
+                ordinary[int(snapshot.entity_id)] = snapshot
+        urgent.sort(
+            key=lambda snapshot: (
+                0.0 if snapshot.hazardous else 1.0,
+                distance(snapshot),
+                int(snapshot.entity_id),
+            )
+        )
+        now = time.monotonic()
+        if now >= float(
+            getattr(self, "_entity_rank_until", 0.0)
+        ) or not frozenset(
+            getattr(self, "_entity_rank_ids", frozenset())
+        ).issuperset(ordinary):
+            self._entity_rank_order = tuple(
+                int(snapshot.entity_id)
+                for snapshot in sorted(ordinary.values(), key=priority)
+            )
+            self._entity_rank_ids = frozenset(self._entity_rank_order)
+            self._entity_rank_until = now + _ENTITY_RANK_CACHE_SECONDS
+            metrics = getattr(self.server, "metrics", None)
+            if metrics is not None and hasattr(
+                metrics, "bot_perception_entity_reranks"
+            ):
+                metrics.bot_perception_entity_reranks += 1
+        selected = urgent[:_MAX_PERCEPTION_ENTITIES]
+        if len(selected) < _MAX_PERCEPTION_ENTITIES:
+            room = _MAX_PERCEPTION_ENTITIES - len(selected)
+            for entity_id in self._entity_rank_order:
+                snapshot = ordinary.get(entity_id)
+                if snapshot is None:
+                    continue
+                selected.append(snapshot)
+                room -= 1
+                if room <= 0:
+                    break
         metrics = getattr(self.server, "metrics", None)
         if metrics is not None:
             metrics.bot_perception_entity_overflow += len(result) - len(selected)
@@ -1520,203 +1681,301 @@ class BotDirector:
         if mode is None:
             return ()
         result: list[ObjectiveSnapshot] = []
+        # Each mode block reads live, concurrently edited mode state on the
+        # gameplay thread. One malformed zone or a mode refactor must cost
+        # only that objective, never the tick (or every other objective).
+        for name, block in (
+            ("mh_hill", self._objectives_multi_hill),
+            ("tc_territory", self._objectives_territory_control),
+            ("dia", self._objectives_diamond_mine),
+            ("oc", self._objectives_occupation),
+            ("dem_base", self._objectives_demolition),
+            ("ctf", self._objectives_ctf),
+            ("team_anchor", self._objectives_team_anchors),
+            ("zombie_refuge", self._objectives_zombie_refuge),
+            ("vip", self._objectives_vip),
+            ("last_survivor", self._objectives_last_survivor),
+        ):
+            try:
+                result.extend(block(mode))
+            except Exception:  # noqa: BLE001 - one objective, never the tick
+                self._log_objective_failure(name)
+        return tuple(result)
 
+    def _log_objective_failure(self, name: str) -> None:
+        """Log one failing objective block at most once a minute."""
+
+        now = time.monotonic()
+        failures = self.__dict__.setdefault("_objective_failure_logged", {})
+        if now - failures.get(name, -math.inf) < 60.0:
+            return
+        failures[name] = now
+        logger.exception("Bot objective snapshot %r failed; skipping it", name)
+
+    @staticmethod
+    def _mode_code(mode) -> str:
+        return str(getattr(mode, "mode_code", "")).lower()
+
+    def _objectives_multi_hill(self, mode) -> list[ObjectiveSnapshot]:
         active_hills = getattr(mode, "active_zones", None)
         hill_owners = getattr(mode, "zone_owner", None)
         hill_contested = getattr(mode, "zone_contested", None)
-        if isinstance(active_hills, list) and isinstance(hill_owners, dict):
-            for zone in active_hills:
-                owner = hill_owners.get(int(zone.index))
-                result.append(ObjectiveSnapshot(
-                    "mh_hill",
-                    int(owner) if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
-                    tuple(float(value) for value in zone.center),
-                    state=int(bool(
-                        hill_contested.get(int(zone.index), False)
-                        if isinstance(hill_contested, dict) else False
-                    )),
-                ))
+        if not isinstance(active_hills, list) or not isinstance(hill_owners, dict):
+            return []
+        rotation_at = getattr(mode, "_next_rotation_at", None)
+        expires_in = -1.0
+        if isinstance(rotation_at, (int, float)) and float(rotation_at) > 0.0:
+            # The mode schedules its rotation (and the expiry airstrike) on
+            # wall-clock time; the rotation timer is on the native HUD.
+            expires_in = max(0.0, float(rotation_at) - time.time())
+        result = []
+        for zone in active_hills:
+            owner = hill_owners.get(int(zone.index))
+            result.append(ObjectiveSnapshot(
+                "mh_hill",
+                int(owner) if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                tuple(float(value) for value in zone.center),
+                state=int(bool(
+                    hill_contested.get(int(zone.index), False)
+                    if isinstance(hill_contested, dict) else False
+                )),
+                bounds=tuple(int(value) for value in (getattr(zone, "bounds", ()) or ())),
+                expires_in=expires_in,
+            ))
+        return result
 
+    def _objectives_territory_control(self, mode) -> list[ObjectiveSnapshot]:
         territories = getattr(mode, "territories", None)
-        if (
-            str(getattr(mode, "mode_code", "")).lower() == "tc"
-            and isinstance(territories, list)
-        ):
-            for territory in territories:
-                zone = getattr(territory, "zone", None)
-                if zone is None:
-                    continue
-                owner = int(getattr(territory, "owner", TEAM_NEUTRAL))
-                result.append(ObjectiveSnapshot(
-                    "tc_territory",
-                    owner if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
-                    tuple(float(value) for value in zone.center),
-                    state=int(bool(getattr(territory, "contested", False))),
-                ))
+        if self._mode_code(mode) != "tc" or not isinstance(territories, list):
+            return []
+        result = []
+        for territory in territories:
+            zone = getattr(territory, "zone", None)
+            if zone is None:
+                continue
+            owner = int(getattr(territory, "owner", TEAM_NEUTRAL))
+            attacker = int(getattr(territory, "attacker", TEAM_NEUTRAL))
+            result.append(ObjectiveSnapshot(
+                "tc_territory",
+                owner if owner in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                tuple(float(value) for value in zone.center),
+                state=int(bool(getattr(territory, "contested", False))),
+                # Native capture bar: 0.0 is Blue's, 1.0 is Green's.
+                progress=float(getattr(territory, "progress", 0.5)),
+                attacker=attacker if attacker in _PLAYABLE_TEAMS else -1,
+            ))
+        return result
 
-        if str(getattr(mode, "mode_code", "")).lower() == "dia":
-            for dropoff in tuple(getattr(mode, "active_dropoffs", ()) or ()):
-                zone = getattr(dropoff, "zone", None)
-                if zone is None:
-                    continue
-                team = int(getattr(dropoff, "team", TEAM_NEUTRAL))
-                result.append(ObjectiveSnapshot(
-                    "dia_dropoff",
-                    team if team in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
-                    tuple(float(value) for value in zone.center),
-                    state=max(0, int(getattr(dropoff, "remaining", 0))),
-                ))
-            for diamond in tuple(
-                getattr(mode, "ground_diamonds", {}).values()
-            ):
-                result.append(ObjectiveSnapshot(
-                    "dia_diamond",
-                    TEAM_NEUTRAL,
-                    tuple(float(value) for value in diamond.position),
-                ))
-            for player_id in tuple(getattr(mode, "carriers", {})):
-                carrier = self.server.players.get(int(player_id))
-                if carrier is None:
-                    continue
-                result.append(ObjectiveSnapshot(
-                    "dia_diamond",
-                    int(carrier.team),
-                    tuple(float(value) for value in carrier.position),
-                    carrier_id=int(carrier.id),
-                    state=1,
-                ))
+    def _objectives_diamond_mine(self, mode) -> list[ObjectiveSnapshot]:
+        if self._mode_code(mode) != "dia":
+            return []
+        result = []
+        for dropoff in tuple(getattr(mode, "active_dropoffs", ()) or ()):
+            zone = getattr(dropoff, "zone", None)
+            if zone is None:
+                continue
+            team = int(getattr(dropoff, "team", TEAM_NEUTRAL))
+            result.append(ObjectiveSnapshot(
+                "dia_dropoff",
+                team if team in _PLAYABLE_TEAMS else TEAM_NEUTRAL,
+                tuple(float(value) for value in zone.center),
+                state=max(0, int(getattr(dropoff, "remaining", 0))),
+            ))
+        for diamond in tuple(getattr(mode, "ground_diamonds", {}).values()):
+            result.append(ObjectiveSnapshot(
+                "dia_diamond",
+                TEAM_NEUTRAL,
+                tuple(float(value) for value in diamond.position),
+            ))
+        for player_id in tuple(getattr(mode, "carriers", {})):
+            carrier = self.server.players.get(int(player_id))
+            if carrier is None:
+                continue
+            result.append(ObjectiveSnapshot(
+                "dia_diamond",
+                int(carrier.team),
+                tuple(float(value) for value in carrier.position),
+                carrier_id=int(carrier.id),
+                state=1,
+            ))
+        return result
 
-        if str(getattr(mode, "mode_code", "")).lower() == "oc":
-            target = getattr(mode, "target_zone", None)
-            if target is not None:
-                result.append(ObjectiveSnapshot(
-                    "oc_target",
-                    TEAM2,
-                    tuple(float(value) for value in target.center),
-                ))
-            for bomb in tuple(getattr(mode, "bombs", {}).values()):
-                carrier = (
-                    self.server.players.get(int(bomb.carrier_id))
-                    if getattr(bomb, "carrier_id", None) is not None
-                    else None
-                )
-                position = carrier.position if carrier is not None else bomb.position
-                result.append(ObjectiveSnapshot(
-                    "oc_bomb",
-                    int(getattr(carrier, "team", TEAM_NEUTRAL)),
-                    tuple(float(value) for value in position),
-                    carrier_id=int(getattr(carrier, "id", -1)),
-                    state=int(bool(getattr(bomb, "armed", False))),
-                ))
+    def _objectives_occupation(self, mode) -> list[ObjectiveSnapshot]:
+        if self._mode_code(mode) != "oc":
+            return []
+        result = []
+        target = getattr(mode, "target_zone", None)
+        if target is not None:
+            result.append(ObjectiveSnapshot(
+                "oc_target",
+                TEAM2,
+                tuple(float(value) for value in target.center),
+                bounds=tuple(int(value) for value in (getattr(target, "bounds", ()) or ())),
+            ))
+        for bomb in tuple(getattr(mode, "bombs", {}).values()):
+            carrier = (
+                self.server.players.get(int(bomb.carrier_id))
+                if getattr(bomb, "carrier_id", None) is not None
+                else None
+            )
+            position = carrier.position if carrier is not None else bomb.position
+            result.append(ObjectiveSnapshot(
+                "oc_bomb",
+                int(getattr(carrier, "team", TEAM_NEUTRAL)),
+                tuple(float(value) for value in position),
+                carrier_id=int(getattr(carrier, "id", -1)),
+                state=int(bool(getattr(bomb, "armed", False))),
+            ))
+        return result
 
+    # Demolition cell hints: enough to route to and work on, bounded so the
+    # frame stays small. Recomputed only when the base-health counts change.
+    _DEM_HINT_CELLS = 32
+
+    def _objectives_demolition(self, mode) -> list[ObjectiveSnapshot]:
         demolition_zones = getattr(mode, "base_zones", None)
-        if (
-            str(getattr(mode, "mode_code", "")).lower() == "dem"
-            and isinstance(demolition_zones, dict)
-        ):
-            destroyed = getattr(mode, "destroyed_cells", {})
-            objectives = getattr(mode, "objective_cells", {})
-            for team in _PLAYABLE_TEAMS:
-                zone = demolition_zones.get(team)
-                if zone is None:
-                    continue
-                total = max(1, len(objectives.get(team, ())))
-                damage_percent = min(
-                    100,
-                    int(100 * len(destroyed.get(team, ())) / total),
+        if self._mode_code(mode) != "dem" or not isinstance(demolition_zones, dict):
+            return []
+        destroyed = getattr(mode, "destroyed_cells", {}) or {}
+        objectives = getattr(mode, "objective_cells", {}) or {}
+        cache = self.__dict__.setdefault("_dem_hint_cache", {})
+        result = []
+        for team in _PLAYABLE_TEAMS:
+            zone = demolition_zones.get(team)
+            if zone is None:
+                continue
+            team_objectives = objectives.get(team, ()) or ()
+            team_destroyed = destroyed.get(team, ()) or ()
+            total = max(1, len(team_objectives))
+            damage_percent = min(100, int(100 * len(team_destroyed) / total))
+            key = (id(mode), id(team_objectives), len(team_objectives), len(team_destroyed))
+            hints = cache.get(team)
+            if hints is None or hints[0] != key:
+                intact = sorted(
+                    (cell for cell in team_objectives if cell not in team_destroyed),
+                    # AoS z grows downward: the highest (exposed) blocks first.
+                    key=lambda cell: (cell[2], cell[0], cell[1]),
                 )
-                result.append(ObjectiveSnapshot(
-                    "dem_base",
-                    team,
-                    tuple(float(value) for value in zone.center),
-                    state=damage_percent,
-                ))
+                # Keep the top layer but spread the sample across it, so
+                # attackers from every side find a nearby block to work on.
+                top = intact[: self._DEM_HINT_CELLS * 4]
+                spread = top[:: max(1, len(top) // self._DEM_HINT_CELLS)]
+                repair = sorted(
+                    team_destroyed,
+                    # Lowest holes first: they rest on intact ground.
+                    key=lambda cell: (-cell[2], cell[0], cell[1]),
+                )
+                hints = (
+                    key,
+                    tuple(tuple(int(v) for v in cell) for cell in spread[: self._DEM_HINT_CELLS]),
+                    tuple(tuple(int(v) for v in cell) for cell in repair[: self._DEM_HINT_CELLS]),
+                )
+                cache[team] = hints
+            # Every solid block of an authored base volume is objective;
+            # a dry fallback volume only counts its small top-surface core
+            # (all of it in the hints), so its bounds would mislead diggers.
+            authored = getattr(mode, "_authored_base", None)
+            whole_volume = (
+                bool(authored.get(team)) if isinstance(authored, dict)
+                else len(team_objectives) > self._DEM_HINT_CELLS
+            )
+            result.append(ObjectiveSnapshot(
+                "dem_base",
+                team,
+                tuple(float(value) for value in zone.center),
+                state=damage_percent,
+                bounds=(
+                    tuple(int(value) for value in (getattr(zone, "bounds", ()) or ()))
+                    if whole_volume else ()
+                ),
+                cells=hints[1],
+                repair_cells=hints[2],
+            ))
+        return result
 
+    def _objectives_ctf(self, mode) -> list[ObjectiveSnapshot]:
         base_positions = getattr(mode, "base_positions", None)
         intel_positions = getattr(mode, "intel_positions", None)
         intel_holders = getattr(mode, "intel_holder", None)
-        if isinstance(base_positions, dict) and isinstance(intel_positions, dict):
-            for team in _PLAYABLE_TEAMS:
-                base = base_positions.get(team)
-                if base is not None:
-                    result.append(
-                        ObjectiveSnapshot(
-                            "ctf_base",
-                            team,
-                            tuple(float(value) for value in base),
-                        )
-                    )
-                intel = intel_positions.get(team)
-                holder = (
-                    intel_holders.get(team)
-                    if isinstance(intel_holders, dict)
-                    else None
-                )
-                if holder is not None:
-                    intel = holder.position
-                if intel is not None:
-                    dropped_at = float(
-                        getattr(mode, "intel_drop_time", {}).get(team, 0.0)
-                    )
-                    result.append(
-                        ObjectiveSnapshot(
-                            "ctf_intel",
-                            team,
-                            tuple(float(value) for value in intel),
-                            carrier_id=int(getattr(holder, "id", -1)),
-                            state=2 if holder is not None else (1 if dropped_at > 0.0 else 0),
-                        )
-                    )
+        if not isinstance(base_positions, dict) or not isinstance(intel_positions, dict):
+            return []
+        result = []
+        for team in _PLAYABLE_TEAMS:
+            base = base_positions.get(team)
+            if base is not None:
+                result.append(ObjectiveSnapshot(
+                    "ctf_base", team, tuple(float(value) for value in base),
+                ))
+            intel = intel_positions.get(team)
+            holder = intel_holders.get(team) if isinstance(intel_holders, dict) else None
+            if holder is not None:
+                intel = holder.position
+            if intel is not None:
+                dropped_at = float(getattr(mode, "intel_drop_time", {}).get(team, 0.0))
+                result.append(ObjectiveSnapshot(
+                    "ctf_intel",
+                    team,
+                    tuple(float(value) for value in intel),
+                    carrier_id=int(getattr(holder, "id", -1)),
+                    state=2 if holder is not None else (1 if dropped_at > 0.0 else 0),
+                ))
+        return result
 
+    def _objectives_team_anchors(self, mode) -> list[ObjectiveSnapshot]:
         # Every team mode needs a strategic destination outside visual range.
         # These stable authored/dry base anchors are ordinary map knowledge,
         # not hidden live-player positions. Without them TDM teams spawned 400
         # blocks apart and random-patrolled forever because perception is
         # correctly capped at 160 blocks.
         anchor_reader = getattr(self.server.world_manager, "team_base_anchor", None)
-        if callable(anchor_reader):
-            for team in _PLAYABLE_TEAMS:
-                try:
-                    anchor = anchor_reader(team)
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    continue
-                result.append(
-                    ObjectiveSnapshot(
-                        "team_anchor",
-                        team,
-                        tuple(float(value) for value in anchor),
-                    )
-                )
+        if not callable(anchor_reader):
+            return []
+        result = []
+        for team in _PLAYABLE_TEAMS:
+            try:
+                anchor = anchor_reader(team)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+            result.append(ObjectiveSnapshot(
+                "team_anchor", team, tuple(float(value) for value in anchor),
+            ))
+        return result
 
+    def _objectives_zombie_refuge(self, mode) -> list[ObjectiveSnapshot]:
+        refuge = self._zombie_refuge_objective(mode)
+        return [refuge] if refuge is not None else []
+
+    def _objectives_vip(self, mode) -> list[ObjectiveSnapshot]:
         vips = getattr(mode, "vips", None)
-        if isinstance(vips, dict):
-            vip_alive = getattr(mode, "vip_alive", None)
-            for team, vip in vips.items():
-                if (vip is not None and bool(getattr(vip, "alive", False))
-                        and bool(getattr(vip, "spawned", False))
-                        and (not isinstance(vip_alive, dict) or vip_alive.get(team, False))):
-                    result.append(
-                        ObjectiveSnapshot(
-                            "vip",
-                            int(team),
-                            tuple(float(value) for value in vip.position),
-                            carrier_id=int(vip.id),
-                        )
-                    )
+        if not isinstance(vips, dict):
+            return []
+        vip_alive = getattr(mode, "vip_alive", None)
+        result = []
+        for team, vip in vips.items():
+            if (vip is not None and bool(getattr(vip, "alive", False))
+                    and bool(getattr(vip, "spawned", False))
+                    and (not isinstance(vip_alive, dict) or vip_alive.get(team, False))):
+                result.append(ObjectiveSnapshot(
+                    "vip",
+                    int(team),
+                    tuple(float(value) for value in vip.position),
+                    carrier_id=int(vip.id),
+                ))
+        return result
 
+    def _objectives_last_survivor(self, mode) -> list[ObjectiveSnapshot]:
         last_survivor_id = getattr(mode, "last_survivor_id", None)
-        if last_survivor_id is not None:
-            survivor = self.server.players.get(int(last_survivor_id))
-            if survivor is not None:
-                result.append(
-                    ObjectiveSnapshot(
-                        "last_survivor",
-                        int(survivor.team),
-                        tuple(float(value) for value in survivor.position),
-                        carrier_id=int(survivor.id),
-                    )
-                )
-        return tuple(result)
+        if last_survivor_id is None:
+            return []
+        survivor = self.server.players.get(int(last_survivor_id))
+        if survivor is None:
+            return []
+        return [ObjectiveSnapshot(
+            "last_survivor",
+            int(survivor.team),
+            tuple(float(value) for value in survivor.position),
+            carrier_id=int(survivor.id),
+        )]
 
     def _player_generation_readonly(self, player: "Player") -> int:
         """Read a player's generation without registering new observations.
@@ -2211,6 +2470,8 @@ class BotDirector:
                            player.id, player.position)
             self.terrain_recoveries += 1
             runtime.buried_since = None
+            # A server-forced unstick is not the bot's own suicide.
+            player.death_penalty_exempt = True
             player.die(kill_type=int(C.FALL_KILL))
 
     def observe_player_physics(self, player: "Player", now: float) -> None:
@@ -2483,6 +2744,22 @@ class BotDirector:
             return
         if action.kind is BotActionKind.FIRE and now < runtime.next_fire_at:
             # Sustained fire respects the weapon cadence between shots.
+            return
+        cadence_wait = (
+            float(getattr(player, "next_shot_time", 0.0) or 0.0)
+            - _SWING_CADENCE_GRACE - now
+        )
+        if action.kind is BotActionKind.MELEE and cadence_wait > 0.0:
+            # The worker schedules swings from its own emission time, but the
+            # previous swing landed when the aim converged. Hold a latched
+            # swing briefly until the authoritative stock cadence
+            # (Player.consume_shot) admits it instead of spending it on a
+            # certain cooldown rejection. A long hold would pin the aim on
+            # the dig cell (world-cell actions own the aim) and steer the
+            # body off its route, so a far-off swing is dropped instead; the
+            # worker re-issues it on its own cadence.
+            if cadence_wait > _SWING_CADENCE_MAX_HOLD:
+                self._clear_pending_action(runtime)
             return
         reference = action.position
         visible = True
@@ -3643,7 +3920,7 @@ class BotDirector:
                 int(C.CLASS_MEDIC): 1.35,
                 int(C.CLASS_SPECIALIST): 1.15,
             }
-        elif mode in ("zom", "zombie"):
+        elif mode == "zom":
             # Survivor picks favor fortification and sustain; infected
             # variants are forced later by prepare_bot_selection anyway.
             mode_weights = {
@@ -3662,6 +3939,19 @@ class BotDirector:
             mode_weights[int(C.CLASS_SCOUT)] = 0.2
         preferred = set(profile.class_preferences if profile is not None else ())
         candidates = list(_DEFAULT_CLASSES)
+        try:
+            from server.handlers.equipment import is_class_selectable
+
+            selectable = [
+                candidate for candidate in candidates
+                if is_class_selectable(self.server, candidate)
+            ]
+        except Exception:  # noqa: BLE001 - class choice must not fail a join
+            selectable = []
+        if selectable:
+            # Honour operator RULE_ENABLE_CLASS_* switches and the mode's
+            # advertised class list, exactly like a human SetClassLoadout.
+            candidates = selectable
         weights = []
         for candidate in candidates:
             diversity = 1.0 / (1.0 + counts[candidate] * 0.85)
@@ -3688,10 +3978,31 @@ class BotDirector:
             selected = loadout[0] if loadout else DEFAULT_WEAPON_TOOL
         player.set_tool(selected, raw=True)
 
+    def _mode_retire_rank(self, player: "Player") -> int:
+        """Mode preference among equally safe bots (Zombie: zombies first)."""
+        rank = getattr(getattr(self.server, "mode", None), "bot_retire_rank", None)
+        if not callable(rank):
+            return 0
+        try:
+            return int(rank(player))
+        except Exception:  # noqa: BLE001 - ordering only
+            logger.debug("bot_retire_rank failed for bot %s", player.id, exc_info=True)
+            return 0
+
     def _safe_to_retire(self, player: "Player") -> bool:
         if getattr(player, "pickup_id", None) is not None:
             return False
         mode = self.server.mode
+        # Mode veto: retiring this bot would decide the round (last
+        # survivor, a live arena fighter, a sudden-death team's last body).
+        veto = getattr(mode, "bot_retire_safe", None) if mode is not None else None
+        if callable(veto):
+            try:
+                if not veto(player):
+                    return False
+            except Exception:  # noqa: BLE001 - treat a broken hook as unsafe
+                logger.debug("bot_retire_safe failed for bot %s", player.id, exc_info=True)
+                return False
         vips = getattr(mode, "vips", {}) if mode is not None else {}
         if player in getattr(vips, "values", lambda: ())():
             return False
@@ -3707,11 +4018,213 @@ class BotDirector:
         return True
 
     def _mode_id(self) -> str:
-        configured = str(getattr(self.server.config, "game_mode", ""))
-        if configured:
-            return configured.lower()
+        """Return the one canonical policy code for the running mode.
+
+        The live mode's own ``mode_code`` wins (a rotation can run a mode the
+        static config does not name), then the configured name, then the
+        class name. Every spelling goes through the policy alias table once
+        here, so workers never see ``classic_ctf``/``diamondmine`` variants.
+        """
+
         mode = getattr(self.server, "mode", None)
-        return type(mode).__name__.removesuffix("Mode").lower() if mode else ""
+        code = str(getattr(mode, "mode_code", "") or "") if mode is not None else ""
+        if not code:
+            code = str(getattr(self.server.config, "game_mode", "") or "")
+        if not code and mode is not None:
+            code = type(mode).__name__.removesuffix("Mode")
+        return canonical_mode_id(code)
+
+    def _refuge_region_lookup(self):
+        """Walkable-region labels for the current map, from its .botnav cache.
+
+        Only a verified cache hit is used. Reading and decoding the
+        multi-megabyte atlas happens on a daemon thread, never on the
+        gameplay tick: until it is ready (or when there is no cache) this
+        returns ``None`` and the election falls back to heights only.
+        """
+        world = self.server.world_manager
+        key = (getattr(world, "map_name", ""), int(getattr(world, "map_file_crc", 0)))
+        cached = getattr(self, "_refuge_regions", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        loading = getattr(self, "_refuge_regions_loading", None)
+        if loading is not None and loading[0] == key:
+            holder = loading[1]
+            if not holder["done"].is_set():
+                return None
+            self._refuge_regions = (key, holder.get("lookup"))
+            self._refuge_regions_loading = None
+            return self._refuge_regions[1]
+        raw = getattr(world, "map_raw_bytes", b"") or b""
+        directory = str(getattr(world, "maps_path", "") or "")
+        if not raw or not directory or not key[0]:
+            self._refuge_regions = (key, None)
+            return None
+        import threading
+
+        holder: dict = {"done": threading.Event(), "lookup": None}
+        self._refuge_regions_loading = (key, holder)
+        thread = threading.Thread(
+            target=self._load_refuge_regions,
+            args=(raw, directory, key[0], holder),
+            name="BotRefugeRegions",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            self._refuge_regions_loading = None
+            self._refuge_regions = (key, None)
+        return None
+
+    @staticmethod
+    def _load_refuge_regions(raw, directory: str, map_name: str, holder: dict) -> None:
+        """Background half of :meth:`_refuge_region_lookup`."""
+
+        try:
+            from .navigation_atlas import NavigationAtlas, cache_path, source_digest
+
+            atlas = NavigationAtlas.from_cache_bytes(
+                cache_path(directory, map_name).read_bytes(),
+                expected_digest=source_digest(bytes(raw)),
+            )
+            regions, width, height = atlas.regions, atlas.width, atlas.height
+
+            def lookup(x: int, y: int) -> int:
+                if 0 <= x < width and 0 <= y < height:
+                    return int(regions[y * width + x])
+                return 0
+
+            holder["lookup"] = lookup
+        except Exception:  # noqa: BLE001 - optional quality filter
+            logger.debug("refuge region lookup unavailable", exc_info=True)
+            holder["lookup"] = None
+        finally:
+            holder["done"].set()
+
+    def _zombie_refuge_objective(self, mode) -> "ObjectiveSnapshot | None":
+        """Publish one high-ground refuge for the survivor team in Zombie.
+
+        Elected from ordinary map heights around the living survivors and
+        away from the horde, re-elected when a zombie stands on it or when
+        nobody has reached it after a while, and forgotten between rounds.
+        Any failure here degrades to "no refuge" (the old spawn regroup);
+        it can never take the gameplay tick down.
+        """
+
+        if not hasattr(mode, "phase") or not hasattr(mode, "_living_survivors"):
+            return None
+        try:
+            # Warm the off-thread region atlas before the first election.
+            self._refuge_region_lookup()
+            from modes.zombie import SURVIVOR_TEAM, ZombiePhase
+
+            phase = getattr(mode, "phase", None)
+            epoch = (id(mode), getattr(getattr(self.server, "world_manager", None), "map_name", ""))
+            if epoch != self._zombie_refuge_epoch or phase is ZombiePhase.WAITING:
+                self._zombie_refuge_epoch = epoch
+                self._zombie_refuge.clear()
+                self._zombie_refuge_history.clear()
+                self._zombie_refuge_job = None
+            if phase not in (ZombiePhase.COUNTDOWN, ZombiePhase.ACTIVE):
+                return None
+            now = time.monotonic()
+            survivors = [
+                tuple(float(v) for v in player.position)
+                for player in mode._living_survivors()
+            ]
+            if not survivors:
+                self._zombie_refuge.pop(int(SURVIVOR_TEAM), None)
+                self._zombie_refuge_job = None
+                return None
+            zombies = [
+                tuple(float(v) for v in player.position)
+                for player in mode._zombies()
+                if bool(getattr(player, "alive", False))
+                and bool(getattr(player, "spawned", False))
+            ]
+            current = self._zombie_refuge.get(int(SURVIVOR_TEAM))
+            self._zombie_refuge_history = [
+                item for item in self._zombie_refuge_history if now - item[1] < 90.0
+            ]
+            reason = ""
+            if current is None:
+                reason = "elect"
+            else:
+                position, elected_at, generation = current
+                if refuge_breached(position, zombies):
+                    reason = "breached"
+                elif (
+                    now - elected_at > 45.0
+                    and not any(
+                        math.hypot(s[0] - position[0], s[1] - position[1]) <= 12.0
+                        for s in survivors
+                    )
+                ):
+                    reason = "unreached"
+            job = getattr(self, "_zombie_refuge_job", None)
+            if reason and job is None:
+                exclude = [item[0] for item in self._zombie_refuge_history]
+                if current is not None and reason != "elect":
+                    exclude.append(current[0])
+                    self._zombie_refuge_history.append((current[0], now))
+                height = getattr(self.server.world_manager, "get_height", None)
+                if callable(height):
+                    job = (
+                        reason,
+                        iter_elect_refuge(
+                            height, survivors, zombies, exclude=exclude,
+                            region_of=self._refuge_region_lookup(),
+                        ),
+                        current,
+                    )
+                    self._zombie_refuge_job = job
+                elif reason != "elect":
+                    self._zombie_refuge.pop(int(SURVIVOR_TEAM), None)
+                    current = None
+            if job is not None:
+                job_reason, election, previous = job
+                finished = False
+                chosen = None
+                deadline = time.perf_counter() + _REFUGE_ELECTION_BUDGET_SECONDS
+                try:
+                    while True:
+                        next(election)
+                        if time.perf_counter() >= deadline:
+                            break
+                except StopIteration as done:
+                    finished = True
+                    chosen = done.value
+                if finished:
+                    self._zombie_refuge_job = None
+                    if chosen is not None:
+                        generation = (previous[2] + 1) if previous is not None else 1
+                        self._zombie_refuge[int(SURVIVOR_TEAM)] = (chosen, now, generation)
+                        logger.info(
+                            "Zombie refuge %s #%d at (%.1f, %.1f, %.1f)",
+                            job_reason, generation, chosen[0], chosen[1], chosen[2],
+                        )
+                        current = self._zombie_refuge[int(SURVIVOR_TEAM)]
+                    elif job_reason != "elect":
+                        self._zombie_refuge.pop(int(SURVIVOR_TEAM), None)
+                        current = None
+                # While a re-election runs the squad keeps the old refuge; a
+                # first election publishes nothing (the spawn regroup) until
+                # it completes a few refreshes later.
+            if current is None:
+                return None
+            position, _elected_at, generation = current
+            return ObjectiveSnapshot(
+                "zombie_refuge",
+                int(SURVIVOR_TEAM),
+                tuple(float(v) for v in position),
+                state=int(generation),
+            )
+        except Exception:  # noqa: BLE001 - bot planning must never stall the tick
+            logger.debug("zombie refuge election failed", exc_info=True)
+            self._zombie_refuge.clear()
+            self._zombie_refuge_job = None
+            return None
 
     def _mode_phase(self) -> str:
         """Return a pickle-safe phase name without exposing the mode object."""

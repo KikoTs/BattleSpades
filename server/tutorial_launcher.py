@@ -138,10 +138,8 @@ def configure_tutorial_runtime(
         "RULE_ENABLE_PREFABS": False,
         "RULE_ENABLE_GRAVESTONES": False,
         "RULE_ENABLE_CORPSE_EXPLOSION": False,
-        "RULE_ENABLE_DEATH_CAM": False,
-        "RULE_ENABLE_MINI_MAP": False,
-        "RULE_ENABLE_SPECTATORS": False,
-        "RULE_ENABLE_FALL_ON_WATER_DAMAGE": False,
+        # Retail playlists/tutorial.txt overrides only the colour picker;
+        # minimap, death cam, spectators and fall-on-water keep defaults.
         "RULE_ENABLE_COLOUR_PICKER": False,
         "RULE_RESPAWN_TIMES": 0,
         "RULE_ENABLE_EQUIPMENT_SPADE": True,

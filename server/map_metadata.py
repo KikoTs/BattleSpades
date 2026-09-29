@@ -151,6 +151,25 @@ class MapMetadata:
         default_factory=lambda: {TEAM1: 0, TEAM2: 0}
     )
     entities: list[MapEntitySpec] = field(default_factory=list)
+    # Retail ``team_one_spawn``/``team_two_spawn`` point lists (Trenches).  The
+    # authored spawn *areas* already enclose them and remain what spawning
+    # uses; the points are kept so tools and tests can check containment.
+    spawn_points: dict[int, list[tuple[float, float, float]]] = field(
+        default_factory=lambda: {TEAM1: [], TEAM2: []}
+    )
+    display_name: str | None = None
+    cap_limit: int | None = None
+    time_limit: float | None = None
+    # Which metadata key supplied each gameplay layout family for the active
+    # mode ("spawn", "base", "neutral", "occupation", "diamond"); absent
+    # families fall back to the modes' terrain inference.
+    layout_sources: dict[str, str] = field(default_factory=dict)
+    # Retail map catalogue (``aos.pkg`` playlists.mapinfo) for stock maps:
+    # modes the retail client allowed on this map, the modes its official
+    # playlists actually served, and the retail player cap.
+    retail_modes: tuple[str, ...] = ()
+    retail_playlist_modes: tuple[str, ...] = ()
+    retail_max_players: int | None = None
 
 
 _ITEM_IDS = {name: int(item_id) for item_id, name in C.UGC_TOOL_IMAGES.items()}
@@ -186,6 +205,16 @@ AMBIENT_SOUND_ASSETS = frozenset((
 # aliases are the shipped VXL basenames whose matching mesh manifest uses a
 # different resource name.  Unknown/community maps fall back to their sidecar
 # or the safe UGC grassland environment.
+#
+# Evidence (docs/MAP_METADATA.md has the full table): DragonIsland,
+# MayanJungle, SpookyMansion and Trenches are read from the retail ``.txtc``
+# sidecars.  CastleWars and DoubleDragon are identified from the retail
+# loading art (``png/ui/game_loading/map_images``): CastleWars shows the red
+# volcanic sky, mountain ranges and falling fireballs that only the Invasion
+# dome carries, DoubleDragon the stars, moon and meteor streak that only
+# SecretBase_Night carries.  Crossroads' art is the sepia smoke haze of the
+# WW dome family (not the cyan UGC grassland void) and Hiesville, the retail
+# Normandy map, is the only stock candidate for the otherwise unused WW2 dome.
 STOCK_MAP_SKYBOXES = {
     "20thcenturytown": "WW1.txt",
     "alcatraz": "Alcatraz.txt",
@@ -194,15 +223,15 @@ STOCK_MAP_SKYBOXES = {
     "atlantis": "Atlantis.txt",
     "blockness": "User_Grassland.txt",
     "brancastle": "BranCastle.txt",
-    "castlewars": "Classic.txt",
+    "castlewars": "Invasion.txt",
     "cityofchicago": "Chicago.txt",
     "classic": "Classic.txt",
-    "crossroads": "User_Grassland.txt",
-    "doubledragon": "GreatWall.txt",
+    "crossroads": "WW1.txt",
+    "doubledragon": "SecretBase_Night.txt",
     "dragonisland": "SecretBase.txt",
     "frontier": "Frontier.txt",
     "greatwall": "GreatWall.txt",
-    "hiesville": "User_Grassland.txt",
+    "hiesville": "WW2.txt",
     "invasion": "Invasion.txt",
     "london": "London.txt",
     "lunarbase": "LunarBase.txt",
@@ -224,10 +253,56 @@ STOCK_MAP_SKYBOXES = {
 _STOCK_MAP_GRAVITY = {
     "lunarbase": 0.4,
 }
+#
+# The other entries below are likewise read off team-coloured geometry that
+# the retail VXLs carry (``tools/map_metadata/survey_team_sides.py`` prints the
+# measurements; the retail menu previews in ``maps/*.png`` show the same art
+# rotated 90 degrees).  Blue is TEAM1 and Green TEAM2 on the wire.  Regions
+# are ``(x0, y0, x1, y1)``; the world manager clusters spawns around the dry
+# column nearest the region centre, so each box is centred on that team's
+# own base structures:
+#
+# * CastleWars: the blue-roofed castle fills the south-east corner and the
+#   green castle the north-west one (the old west/east default put Blue in
+#   the Green castle's half).
+# * Atlantis: the paired #0028BE/#00BE2A team markers sit at the north-west
+#   (Blue) and south-east (Green) jetty huts of the diagonal layout.
+# * DoubleDragon: all twelve marker blobs split along the island chain,
+#   Blue towards the south-west tower, Green the north-east tower.
+# * WW1: blue markers lie in the southern trench system (y 354-467) and green
+#   markers in the northern one (y 49-153): the map is split north/south.
+# * ToTheBridge: two islands joined by the one bridge; blue buildings stand
+#   on the southern island, green ones on the northern island.
+# * Crossroads: the blue-roofed town block and bunker are north of the
+#   crossroads, the green-roofed block and bunker south of it.
 _STOCK_FALLBACK_SPAWN_REGIONS = {
     "tokyoneon": {
         TEAM1: (320, 128, 448, 384),
         TEAM2: (64, 128, 192, 384),
+    },
+    "castlewars": {
+        TEAM1: (336, 336, 480, 480),
+        TEAM2: (32, 32, 176, 176),
+    },
+    "atlantis": {
+        TEAM1: (48, 48, 176, 176),
+        TEAM2: (336, 336, 464, 464),
+    },
+    "doubledragon": {
+        TEAM1: (160, 352, 288, 496),
+        TEAM2: (224, 16, 352, 160),
+    },
+    "ww1": {
+        TEAM1: (64, 352, 448, 464),
+        TEAM2: (64, 48, 448, 160),
+    },
+    "tothebridge": {
+        TEAM1: (64, 336, 448, 480),
+        TEAM2: (64, 32, 448, 176),
+    },
+    "crossroads": {
+        TEAM1: (160, 80, 352, 208),
+        TEAM2: (160, 304, 352, 432),
     },
 }
 
@@ -301,6 +376,13 @@ _LEGACY_ENVIRONMENT_KEYS = frozenset((
     "occupation_bomb_points",
     "diamond_base_points", "diamond_base_w_h_d",
     "diamond_base_teams", "diamond_base_capacity",
+    # Per-mode layout overrides found in the retail ``.txtc`` modules.
+    "ctf_base_points", "ctf_base_w_h_d",
+    "tc_base_points", "tc_base_w_h_d",
+    "oc_team_one_spawn_area", "oc_team_two_spawn_area",
+    "zombie_spawn_area", "survivor_spawn_area",
+    "team_one_spawn", "team_two_spawn",
+    "ground_colors", "name", "cap_limit", "time_limit",
 ))
 
 
@@ -322,6 +404,17 @@ def canonical_gravity(value: object, fallback: float = 1.0) -> float:
     return math.floor(gravity * 64.0 + 0.5) / 64.0
 
 
+def _is_ugc_override(skybox_source: Path | None, fog_source: Path | None) -> bool:
+    """Whether a ``.ugc`` skydome choice sits above a ``.txt`` fog pin."""
+
+    return (
+        skybox_source is not None
+        and skybox_source.suffix.casefold() == ".ugc"
+        and fog_source is not None
+        and fog_source.suffix.casefold() == ".txt"
+    )
+
+
 def _candidate_sidecars(map_path: Path) -> Iterable[Path]:
     # UGC projects use both .txt and .ugc.  The project sidecar is later than
     # its immutable baseplate .txt and therefore owns settings changed in the
@@ -333,11 +426,126 @@ def _candidate_sidecars(map_path: Path) -> Iterable[Path]:
     yield Path(str(map_path) + ".json")
 
 
+RETAIL_MAP_INFO_NAME = "retail_map_info.json"
+_RETAIL_MODE_CODES = frozenset((
+    "ctf", "tdm", "dem", "dia", "mh", "oc", "tc", "vip", "zom", "tut", "ugc",
+))
+_CATALOGUE_CACHE: dict[Path, tuple[float, dict[str, dict[str, object]]]] = {}
+
+
+def retail_map_catalogue(maps_dir: str | Path) -> dict[str, dict[str, object]]:
+    """Return the recovered retail map catalogue keyed by casefolded map name.
+
+    ``maps/retail_map_info.json`` is generated from the client's
+    ``playlists.mapinfo`` by ``tools/map_metadata/extract_retail.py``. It is
+    optional: an operator map directory without it simply has no catalogue.
+    """
+
+    path = Path(maps_dir) / RETAIL_MAP_INFO_NAME
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _CATALOGUE_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        rows = document.get("maps", {})
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        logger.warning("Ignoring unreadable retail map catalogue %s", path)
+        rows = {}
+    catalogue = {
+        str(name).casefold(): entry
+        for name, entry in (rows.items() if isinstance(rows, dict) else ())
+        if isinstance(entry, dict)
+    }
+    _CATALOGUE_CACHE[path] = (mtime, catalogue)
+    return catalogue
+
+
+# Single-mode retail playlist per server mode code ("cctf" = the classic
+# playlist, whose own mode code is "ctf").
+_RETAIL_MODE_PLAYLISTS = {
+    "ctf": "ctf", "cctf": "classic", "dem": "demolition", "dia": "diamond",
+    "mh": "multihill", "oc": "occupation", "tc": "tc", "tdm": "tdm",
+    "vip": "vip", "zom": "zombie", "tut": "tutorial", "ugc": "ugc",
+}
+
+
+def retail_mode_pool(maps_dir: str | Path, mode: object) -> tuple[str, ...]:
+    """Return the maps retail's single-mode playlist served for ``mode``.
+
+    Mirrors ``playlists.PlayList.__init__``: every map named by the mode's
+    playlist ``.txt``, skipping maps whose ``invalid_modes`` contain the
+    mode, whose classic/mafia flag differs from the playlist's, or which are
+    not ``release``.  The playlist's own map order is kept.  Empty when the
+    catalogue is absent or the mode has no retail playlist.
+    """
+
+    code = canonical_mode_code(mode)
+    playlist_name = _RETAIL_MODE_PLAYLISTS.get(code)
+    if playlist_name is None:
+        return ()
+    path = Path(maps_dir) / RETAIL_MAP_INFO_NAME
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        playlist = document["playlists"][playlist_name]
+        rows = document["maps"]
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        return ()
+    if not isinstance(playlist, dict) or not isinstance(rows, dict):
+        return ()
+    modes = [str(value) for value in playlist.get("modes", ())]
+    classic = bool(playlist.get("classic", False))
+    mafia = bool(playlist.get("mafia", code in ("tc", "vip")))
+    by_name = {str(name).casefold(): (str(name), entry)
+               for name, entry in rows.items() if isinstance(entry, dict)}
+    pool: list[str] = []
+    for name in playlist.get("maps", ()):
+        found = by_name.get(str(name).casefold())
+        if found is None:
+            continue
+        real_name, entry = found
+        invalid = {str(value) for value in entry.get("invalid_modes", ())}
+        if any(value in invalid for value in modes):
+            continue
+        if bool(entry.get("classic", False)) != classic:
+            continue
+        if bool(entry.get("mafia", False)) != mafia:
+            continue
+        if not bool(entry.get("release", False)):
+            continue
+        if real_name not in pool:
+            pool.append(real_name)
+    return tuple(pool)
+
+
+def canonical_mode_code(mode: object) -> str:
+    """Return the retail short code for ``mode`` ("occupation" -> "oc").
+
+    Admin commands and config accept human aliases; map sidecars and the
+    objective filters below compare against the protocol short codes. An
+    unknown name is kept verbatim (lowercase) instead of collapsing into
+    "nor", so a custom registered mode keeps its own tag.
+    """
+    from server import mode_data
+
+    value = str(mode or "").strip().lower()
+    if not value:
+        return value
+    code = mode_data.get(value).code
+    return value if code == "nor" and value != "nor" else code
+
+
 def _mode_applies(entity_mode: object, active_mode: str) -> bool:
-    value = str(entity_mode or "nor").lower()
+    value = str(entity_mode or "nor").strip().lower()
     # The editor writes "nor" for map-global drop points.  Explicit mode
-    # zones remain restricted to that mode.
-    return value in ("", "nor", "all", "any") or value == active_mode.lower()
+    # zones remain restricted to that mode (aliases compare by short code).
+    return (
+        value in ("", "nor", "all", "any")
+        or canonical_mode_code(value) == canonical_mode_code(active_mode)
+    )
 
 
 def normalize_skybox_name(value: object) -> str | None:
@@ -489,22 +697,72 @@ def _centered_extents(
     return (-half_x, half_x, -half_y, half_y, -half_z, half_z)
 
 
+def _spawn_area_zones(areas: object, team: int, item: str) -> list[MapZone]:
+    """Translate retail ``[(centre, (w, h, d)), ...]`` spawn rows.
+
+    A retail spawn box is a volume a player is dropped into, not a surface
+    filter: SpookyMansion's Blue box is centred at z=222 (212..232) over a
+    shore whose ground is z=233, and MayanJungle's first Blue box overhangs
+    terrain up to 12 voxels lower.  A player placed in the box falls onto
+    that ground, so the zone's floor extends down to the bottom of the map
+    (VXL z grows downward).  The top stays authored, which keeps roofs and
+    raised structures above the box out of the zone.
+    """
+
+    zones: list[MapZone] = []
+    if not isinstance(areas, (list, tuple)):
+        return zones
+    floor = float(int(C.MAP_Z) - 1)
+    for area in areas:
+        if not isinstance(area, (list, tuple)) or len(area) < 2:
+            continue
+        center = _point3(area[0])
+        extents = _centered_extents(area[1])
+        if center is None or extents is None:
+            continue
+        x0, x1, y0, y1, z0, z1 = extents
+        extents = (x0, x1, y0, y1, z0, max(z1, floor - center[2]))
+        zones.append(MapZone("spawn", team, *center, extents, item))
+    return zones
+
+
+def _parallel_zones(
+    payload: dict[str, object],
+    points_key: str,
+    sizes_key: str,
+    team_for_index,
+) -> list[MapZone]:
+    """Translate parallel retail ``*_points``/``*_w_h_d`` arrays."""
+
+    points = payload.get(points_key, ())
+    sizes = payload.get(sizes_key, ())
+    if not isinstance(points, (list, tuple)) or not isinstance(sizes, (list, tuple)):
+        return []
+    zones: list[MapZone] = []
+    for index, (point, size) in enumerate(zip(points, sizes)):
+        center = _point3(point)
+        extents = _centered_extents(size)
+        if center is None or extents is None:
+            continue
+        zones.append(MapZone(
+            "base", int(team_for_index(index)), *center, extents,
+            f"{points_key}[{index}]",
+        ))
+    return zones
+
+
 def _append_legacy_team_zones(result: MapMetadata, payload: dict[str, object]) -> None:
     """Translate stock server spawn/base volumes into canonical map zones."""
     teams = (("team_one", TEAM1), ("team_two", TEAM2))
     for prefix, team in teams:
-        areas = payload.get(f"{prefix}_spawn_area", ())
-        if isinstance(areas, (list, tuple)):
-            for area in areas:
-                if not isinstance(area, (list, tuple)) or len(area) < 2:
-                    continue
-                center = _point3(area[0])
-                extents = _centered_extents(area[1])
-                if center is None or extents is None:
-                    continue
-                result.spawn_zones[team].append(MapZone(
-                    "spawn", team, *center, extents, f"{prefix}_spawn_area",
-                ))
+        result.spawn_zones[team].extend(_spawn_area_zones(
+            payload.get(f"{prefix}_spawn_area", ()), team, f"{prefix}_spawn_area",
+        ))
+        points = payload.get(f"{prefix}_spawn", ())
+        if isinstance(points, (list, tuple)):
+            result.spawn_points[team].extend(
+                point for point in (_point3(row) for row in points) if point is not None
+            )
 
         center = _point3(payload.get(f"{prefix}_base_point"))
         extents = _centered_extents(payload.get(f"{prefix}_base_w_h_d"))
@@ -549,6 +807,81 @@ def _append_legacy_neutral_zones(
             extents,
             f"mh_base_points[{index}]",
         ))
+
+
+def _apply_mode_layout(
+    result: MapMetadata,
+    payload: dict[str, object],
+    active_mode: str,
+) -> None:
+    """Apply the retail per-mode layout overrides for ``active_mode``.
+
+    Retail map descriptions carry a default layout (``team_*_spawn_area``,
+    ``team_*_base_point``, ``mh_base_points``) plus optional mode-specific
+    replacements. Recovered from the shipped ``.txtc`` modules:
+
+    * ``ctf_base_points``/``ctf_base_w_h_d`` -- CTF capture bases, index 0 is
+      Blue/TEAM1 and index 1 Green/TEAM2 (Trenches: west/east, matching its
+      team spawn areas).
+    * ``tc_base_points``/``tc_base_w_h_d`` -- Territory Control territories,
+      which differ from the Multi-Hill hills on the same map.
+    * ``oc_team_one_spawn_area``/``oc_team_two_spawn_area`` -- Occupation
+      attacker/defender spawns (SpookyMansion's defenders spawn inside the
+      occupation base, attackers on the four shores).
+    * ``zombie_spawn_area``/``survivor_spawn_area`` -- Zombie mode spawns for
+      the zombie (TEAM1) and survivor (TEAM2) roles.
+    """
+
+    # Classic CTF ("cctf") is retail CTF on the classic playlist (Trenches,
+    # WW1, ...), so it reads the same capture-base keys.
+    if active_mode in ("ctf", "cctf"):
+        bases = _parallel_zones(
+            payload, "ctf_base_points", "ctf_base_w_h_d",
+            lambda index: TEAM1 if index == 0 else TEAM2,
+        )
+        if len(bases) >= 2:
+            result.base_zones = {TEAM1: [bases[0]], TEAM2: [bases[1]]}
+            result.layout_sources["base"] = "ctf_base_points"
+    elif active_mode == "tc":
+        territories = _parallel_zones(
+            payload, "tc_base_points", "tc_base_w_h_d",
+            lambda _index: int(C.TEAM_NEUTRAL),
+        )
+        if territories:
+            result.neutral_base_zones = territories
+            result.layout_sources["neutral"] = "tc_base_points"
+    elif active_mode == "oc":
+        for key, team in (
+            ("oc_team_one_spawn_area", TEAM1),
+            ("oc_team_two_spawn_area", TEAM2),
+        ):
+            zones = _spawn_area_zones(payload.get(key, ()), team, key)
+            if zones:
+                result.spawn_zones[team] = zones
+                result.layout_sources[f"spawn{team}"] = key
+    elif active_mode == "zom":
+        survivors = _spawn_area_zones(
+            payload.get("survivor_spawn_area", ()), TEAM2, "survivor_spawn_area"
+        )
+        if survivors:
+            result.spawn_zones[TEAM2] = survivors
+            result.layout_sources[f"spawn{TEAM2}"] = "survivor_spawn_area"
+        zombies = _spawn_area_zones(
+            payload.get("zombie_spawn_area", ()), TEAM1, "zombie_spawn_area"
+        )
+        if zombies:
+            # Retail zombies rise out of the sea: SpookyMansion's eight
+            # zombie areas cover only the z=239 water ring around the island,
+            # which the world manager deliberately never spawns on.  Keep the
+            # retail areas first (any dry column in them is used) and the
+            # map's default Blue spawn after them so zombies still start on
+            # the retail team-one shore instead of a generic terrain guess.
+            result.spawn_zones[TEAM1] = zombies + result.spawn_zones[TEAM1]
+            result.layout_sources[f"spawn{TEAM1}"] = (
+                "zombie_spawn_area+team_one_spawn_area"
+                if len(result.spawn_zones[TEAM1]) > len(zombies)
+                else "zombie_spawn_area"
+            )
 
 
 def _append_legacy_occupation(result: MapMetadata, payload: dict[str, object]) -> None:
@@ -703,6 +1036,7 @@ def _read_sidecar(sidecar: Path) -> dict[str, object] | None:
 def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     """Load map-owned environment and gameplay metadata beside a VXL."""
     map_path = Path(map_path)
+    active_mode = canonical_mode_code(active_mode)
     map_key = map_path.stem.casefold()
     official_map = map_key in STOCK_MAP_SKYBOXES
     # A retail Map Creator project is intentionally split across siblings:
@@ -715,6 +1049,7 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     sidecar = None
     payload: dict[str, object] = {}
     contributing_sidecars: list[Path] = []
+    key_sources: dict[str, Path] = {}
     for candidate in _candidate_sidecars(map_path):
         if not candidate.is_file():
             continue
@@ -725,7 +1060,9 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
             sidecar = candidate
         contributing_sidecars.append(candidate)
         for key, value in candidate_payload.items():
-            payload.setdefault(key, value)
+            if key not in payload:
+                payload[key] = value
+                key_sources[key] = candidate
 
     raw_skybox = next(
         (
@@ -750,6 +1087,14 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     fog_color = normalize_rgb(payload.get("fog_color"))
     if fog_color is None and skybox_name is not None:
         fog_color = normalize_rgb(C.FOG_COLORS.get(skybox_name))
+    elif skybox_name is not None and _is_ugc_override(
+        key_sources.get("skybox_name"), key_sources.get("fog_color")
+    ):
+        # Retail GameScene.set_skybox_name (0x1012d4c0) sends FogColor(74)
+        # with FOG_COLORS[name] whenever the editor picks a skydome, so an
+        # authored project's skydome choice owns the fog, not the immutable
+        # baseplate .txt ``fog_color`` pin beneath it.
+        fog_color = normalize_rgb(C.FOG_COLORS.get(skybox_name)) or fog_color
 
     # Many retail VXL files preserve their hidden chroma markers but not the
     # companion map-description file.  Recognized stock maps inherit the
@@ -806,6 +1151,53 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     _append_legacy_neutral_zones(result, payload)
     _append_legacy_occupation(result, payload)
     _append_legacy_diamond_zones(result, payload)
+    for team, prefix in ((TEAM1, "team_one"), (TEAM2, "team_two")):
+        if result.spawn_zones[team]:
+            result.layout_sources[f"spawn{team}"] = f"{prefix}_spawn_area"
+        if result.base_zones[team]:
+            result.layout_sources[f"base{team}"] = f"{prefix}_base_point"
+    if result.neutral_base_zones:
+        result.layout_sources["neutral"] = "mh_base_points"
+    if result.occupation_base_zone is not None:
+        result.layout_sources["occupation"] = "occupation_base_point"
+    if result.diamond_base_zones:
+        result.layout_sources["diamond"] = "diamond_base_points"
+    _apply_mode_layout(result, payload, active_mode)
+    if result.layout_sources.get("base") == "ctf_base_points":
+        result.layout_sources.pop("base")
+        for team in (TEAM1, TEAM2):
+            result.layout_sources[f"base{team}"] = "ctf_base_points"
+    raw_name = payload.get("name")
+    result.display_name = raw_name.strip()[:64] if isinstance(raw_name, str) else None
+    try:
+        result.cap_limit = max(1, int(payload["cap_limit"]))
+    except (KeyError, TypeError, ValueError):
+        result.cap_limit = None
+    try:
+        time_limit = float(payload["time_limit"])
+        result.time_limit = time_limit if math.isfinite(time_limit) and time_limit > 0 else None
+    except (KeyError, TypeError, ValueError):
+        result.time_limit = None
+    catalogue_entry = retail_map_catalogue(map_path.parent).get(map_key)
+    if catalogue_entry is not None:
+        result.retail_modes = tuple(catalogue_entry.get("valid_modes", ()))
+        result.retail_playlist_modes = tuple(catalogue_entry.get("playlist_modes", ()))
+        try:
+            result.retail_max_players = int(catalogue_entry["max_players"])
+        except (KeyError, TypeError, ValueError):
+            result.retail_max_players = None
+        # Retail PlayList skips a pair whose mode is in the map's
+        # invalid_modes even when the raw playlist .txt names the map
+        # (GreatWall in demolition.txt, BranCastle in occupation.txt).
+        retail_code = "ctf" if active_mode == "cctf" else active_mode
+        if (
+            retail_code in _RETAIL_MODE_CODES
+            and retail_code in tuple(catalogue_entry.get("invalid_modes", ()))
+        ):
+            logger.warning(
+                "Retail catalogue lists %s as invalid for mode %s (valid: %s)",
+                map_path.stem, active_mode, ",".join(result.retail_modes) or "none",
+            )
     rows = payload.get("ugc_entities", [])
     if not isinstance(rows, list):
         logger.warning("Ignoring malformed ugc_entities in %s", sidecar)
@@ -876,7 +1268,7 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     logger.info(
         "Loaded map metadata %s (sources %d, official %s, skybox %s, fog %s, ambience %s, static lights %d, "
         "spawn zones %d/%d, bases %d/%d, neutral bases %d, occupation %s/%d, "
-        "diamond bases %d, entities %d)",
+        "diamond bases %d, entities %d, layout %s)",
         sidecar or "<stock inference>",
         len(contributing_sidecars),
         result.official_map,
@@ -893,5 +1285,8 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         len(result.occupation_bomb_points),
         len(result.diamond_base_zones),
         len(result.entities),
+        ",".join(
+            f"{family}={key}" for family, key in sorted(result.layout_sources.items())
+        ) or "terrain fallback",
     )
     return result

@@ -87,6 +87,21 @@ class MapEntity:
     # are normalised by the placement service).  The registry indexes it so a
     # terrain removal can resolve support loss without scanning every entity.
     support_cell: Optional[Tuple[int, int, int]] = None
+    # Runtime-only supply-crate air drop (see PickupCrateBehavior). While
+    # ``falling`` the server integrates the same fall the retail Crate runs
+    # locally; ``vel`` mirrors the current fall speed so a late joiner's
+    # CreateEntity starts its local simulation from the live state.
+    falling: bool = False
+    fall_accumulator: float = 0.0
+    fall_clock: float = 0.0
+    parachute_deployed: bool = False
+    parachute_removed: bool = False
+    # Map Creator markers (type UGC_ENTITY=29) only.  Retail gameScene
+    # create_entity (0x10178b80) sets ``mode_placed_in = packet.ugc_mode``
+    # and UGCEntity reads ``ugc_item_id = packet.int_properties[0]``.  Every
+    # other entity keeps the historical all-zero wire tail.
+    ugc_mode: int = 0
+    int_properties: Tuple[int, ...] = ()
 
     def to_wire_entity(self) -> Entity:
         ent = Entity()
@@ -101,9 +116,9 @@ class MapEntity:
         ent.player_id = int(self.player_id)
         ent.state = int(self.state)
         ent.face = int(self.face)
-        ent.ugc_mode = 0
+        ent.ugc_mode = int(self.ugc_mode) & 0xFF
         ent.float_properties = []
-        ent.int_properties = []
+        ent.int_properties = [int(value) for value in self.int_properties]
         return ent
 
 
@@ -320,6 +335,11 @@ class EntityRegistry:
         for ent in self.due_respawns(ctx.now):
             ent.alive = True
             ent.respawn_at = 0.0
+            on_respawn = getattr(ent.behavior, "on_respawn", None)
+            if callable(on_respawn):
+                # e.g. a supply crate moves back up to its drop altitude
+                # before the CreateEntity that starts the retail air drop.
+                on_respawn(ent, ctx)
             if ctx.create is not None:
                 ctx.create(ent)
         return skipped

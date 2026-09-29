@@ -158,7 +158,7 @@ def test_territory_control_initialises_native_hud_and_captures_neutral_base(
     middle = mode.territories[1]
     player = _Player(7, TEAM1, middle.zone.center)
     server.players[player.id] = player
-    asyncio.run(mode._capture_tick(10.0))
+    asyncio.run(mode._capture_tick(50.0))
 
     assert middle.owner == TEAM1
     assert middle.progress == 0.0

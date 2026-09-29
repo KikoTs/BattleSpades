@@ -28,6 +28,7 @@ from server.runtime_paths import RuntimePaths, read_version
 from server.ugc_project import (
     TERRAINS,
     TARGET_MODES,
+    UNDESCRIBED_DESCRIPTION,
     UGCAssetLayout,
     UGCProject,
     create_project_files,
@@ -330,7 +331,7 @@ def prepare_ugc_project(
     skybox, ground_colors = read_baseplate_presentation(source_metadata)
     project = UGCProject(
         title=arguments.title or slug,
-        description=arguments.description or arguments.title or slug,
+        description=arguments.description or UNDESCRIBED_DESCRIPTION,
         author=arguments.author or "Unknown",
         baseplate=terrain.stem,
         target_mode=arguments.target_mode or "tdm",

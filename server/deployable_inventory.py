@@ -130,8 +130,9 @@ def deployable_stock(player: Player, tool: int) -> int:
         )
         return min(stock, max(0, int(C.C4_STOCK) - live))
     if tool == int(C.RADAR_STATION_TOOL):
-        entity = registry.get(getattr(player, "_radar_entity_id", None))
-        return 0 if entity is not None and entity.alive else stock
+        # Retail: placing a new station replaces the owner's live one, so a
+        # live station does not block the next placement (stock still does).
+        return stock
     if tool == int(C.MG_TOOL):
         from server.entities.machine_gun import MachineGunBehavior
 

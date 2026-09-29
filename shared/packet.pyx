@@ -2152,6 +2152,9 @@ cdef class TeamProgress(Loader): # Fixed
             
         writer.write_byte(self.icon_id)
 
+_TC_DETAIL_NOT_REQUIRED = frozenset((3, 4, 6, 7))
+
+
 cdef class TerritoryBaseState(Loader): # Fixed
     id: int = 106
     compress_packet: bool = False
@@ -2159,9 +2162,18 @@ cdef class TerritoryBaseState(Loader): # Fixed
         int action, attacked_by, base_index, controlled_by
         float capture_amount
 
+    # Retail packet.pyd (TerritoryBaseState.read/write) only carries
+    # controlled_by, attacked_by and capture_amount when the action is NOT in
+    # constants.TC_DETAIL_NOT_REQUIRED (ENTERING 3, LEAVING 4, CONTENDED 6,
+    # UNCONTENDED 7); for those it reads just base_index + action. Writing the
+    # long form for them left 4 trailing bytes that the client parsed as the
+    # next packet in the datagram (byte 3 -> EntityUpdates -> NoDataLeft).
     cpdef read(self, ByteReader reader):
         self.base_index = reader.read_byte()
         self.action = reader.read_byte()
+        if self.action in _TC_DETAIL_NOT_REQUIRED:
+            self.capture_amount = 0.5
+            return
         self.controlled_by = reader.read_byte()
         self.attacked_by = reader.read_byte()
         self.capture_amount = fromfixed(reader.read_short())
@@ -2170,6 +2182,8 @@ cdef class TerritoryBaseState(Loader): # Fixed
         writer.write_byte(self.id)
         writer.write_byte(self.base_index)
         writer.write_byte(self.action)
+        if self.action in _TC_DETAIL_NOT_REQUIRED:
+            return
         writer.write_byte(self.controlled_by)
         writer.write_byte(self.attacked_by)
         writer.write_short(tofixed(self.capture_amount))
@@ -3463,7 +3477,8 @@ cdef class WorldUpdate(Loader): # Fixed
             # STATE bitfield byte (NOT the tool id!). MEASURED: the compiled
             # client bit-splits this byte into per-player display state —
             # 0x01=parachute_active, 0x02=disguise_active,
-            # 0x04=UGC jetpack hover, 0x08=touching_goo (in-water look). It
+            # 0x04=UGC jetpack hover, 0x08=touching_goo (Chemical Bomb burn
+            # loop sound only; not a water flag). It
             # writes NOTHING to the equipped tool from
             # here (the weapon comes from CreatePlayer/loadout). The old code
             # wrote the raw tool id here, so switching weapons set these bits

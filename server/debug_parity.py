@@ -729,6 +729,48 @@ class DebugParityManager:
             record=record,
         ))
 
+    def write_input_sample(
+        self,
+        player,
+        loop: int | None,
+        applied_flags: tuple | None,
+        starved: bool = False,
+        synthesized: bool = False,
+    ) -> None:
+        """Queue one authoritative input-consumption record if enabled.
+
+        Unlike ``write_selfrow_sample`` this is not rate limited: one record
+        per simulated owner tick is exactly what a label-alignment audit needs
+        (which ClientData loop the server consumed at which tick, and where the
+        body was afterwards). It shares the bounded writer queue, so overflow
+        drops diagnostics instead of stalling the gameplay thread.
+        """
+        if not getattr(self.server.config, 'debug_selfrow', False):
+            return
+        if self._writer_thread is None:
+            return
+        record = {
+            'kind': 'input',
+            'timestamp': round(time.time(), 6),
+            'server_tick': int(getattr(self.server, 'loop_count', 0)),
+            'loop': None if loop is None else int(loop),
+            'starved': bool(starved),
+            'synthesized': bool(synthesized),
+            'flags': None if applied_flags is None else [int(bool(v)) for v in applied_flags],
+            'queued': sorted(int(k) for k in getattr(player, 'input_history', {}) or ())[:8],
+            'player_id': int(getattr(player, 'id', -1)),
+            'x': round(float(getattr(player, 'x', 0.0)), 5),
+            'y': round(float(getattr(player, 'y', 0.0)), 5),
+            'z': round(float(getattr(player, 'z', 0.0)), 5),
+            'airborne': bool(getattr(player, 'airborne', False)),
+        }
+        self._enqueue_capture(_CaptureWorkItem(
+            kind='record',
+            path=self.base_directory / 'input_samples.ndjson',
+            session_id='input',
+            record=record,
+        ))
+
     def _write_latest_summary(self, session: DebugParitySession, record: dict[str, Any]) -> None:
         lines = [
             'session_id=%s' % session.session_id,

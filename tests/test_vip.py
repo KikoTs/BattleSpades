@@ -153,7 +153,10 @@ def test_vip_uses_the_two_shipped_gangster_maps_for_default_votes():
     server.mode = VIPMode(server)
 
     assert server.mode.stock_maps == ("Alcatraz", "CityOfChicago")
-    assert server.vote_manager._mode_available_maps() == server.mode.stock_maps
+    # The catalogue is shuffled once at startup (retail random.shuffle).
+    assert sorted(server.vote_manager._mode_available_maps()) == sorted(
+        server.mode.stock_maps
+    )
 
 
 def test_vip_join_selection_rejects_non_gangster_class_and_loadout():
@@ -206,7 +209,8 @@ def test_live_vip_death_uses_native_boss_kill_and_zero_respawn_timer():
         green_vip,
         int(C.KILL.WEAPON_KILL),
     ) == int(C.KILL.VIP_MODE_KILL)
-    assert mode.respawn_time_for(blue_vip) == 0.0
+    # Stock NEVER_RESPAWN_TIME: the dying VIP's HUD shows "No respawns!".
+    assert mode.respawn_time_for(blue_vip) == float(C.NEVER_RESPAWN_TIME)
     ordinary = green if green is not green_vip else blue
     if ordinary is not blue_vip:
         assert mode.death_kill_type_for(

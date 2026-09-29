@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import shared.constants as C
+from server import anticheat, conduct
 from server.flight_profile import profile_for
+from server.lag_compensation import record_player as _record_lag_history
 from server.deployable_inventory import (
     commit_deployable_use,
     deployable_ready,
@@ -53,6 +55,35 @@ _JETPACK_PROPERTIES: dict = dict(getattr(C, "JETPACK_PROPERTIES", {}) or {})
 # not reveal the original server's activation schedule. Preserve this existing
 # two-frame estimate until the server-side resource timeline is recovered.
 JETPACK_ACTIVATION_DEFER_FRAMES = 2
+# Live 60 Hz captures (docs/RETAIL_JUMP_RESTORE.md, 2026-09-24): the retail
+# owner stops thrust 2-3 frames after the inactive row is sent; three frames
+# keeps any residual a forward nudge. Config overrides these fallbacks.
+JETPACK_EXHAUSTION_TAIL_FRAMES = 3
+# Parachute (equipment 72) policy; docs/PARACHUTE.md has the evidence and the
+# measurements. The canopy arithmetic itself (0.05 gravity, per-frame fall
+# reset) is the stock native mover and is not touched here. Every value below
+# may be overridden by a same-named lower-case ``[debug]``/config attribute.
+PARACHUTE_ID = int(C.A370)
+# Feet-to-ground clearance required to open. A flat-ground jump apex is ~1.3
+# blocks, so no hop can open a canopy; a 6-block drop still can.
+PARACHUTE_MIN_DEPLOY_CLEARANCE = 6.0
+# A canopy that has been open this long collapses (single deploy per fall, so
+# it cannot be reopened before landing). 30 s is ~48 blocks of canopy descent.
+PARACHUTE_MAX_OPEN_SECONDS = 30.0
+# Native vz is positive downward. Rising faster than the canopy's own terminal
+# descent (0.05 native = 1.6 blocks/s) means an explosion or collision is
+# lifting the player; 0.05 gravity would turn that into a long float, so the
+# canopy spills. Ordinary deployment never sees upward speed (descent only).
+PARACHUTE_MAX_RISE_VELOCITY = 0.05
+# Retail owners learn canopy state only from WorldUpdate state bit 0x01 and
+# apply it when the row is processed. Server canopy physics therefore follows
+# the advertised state this many accepted input frames after the owner row
+# carrying the change is queued, plus the connection's round trip in frames.
+PARACHUTE_OWNER_HANDOFF_FRAMES = 3
+PARACHUTE_OWNER_HANDOFF_MAX_FRAMES = 30
+# Safety net: an advertised change that no owner row has carried after this
+# many frames (self rows disabled/unsafe) is applied to physics anyway.
+PARACHUTE_UNSENT_HANDOFF_FRAMES = 30
 
 JUMP_BUFFER_SECONDS = 0.25
 POSITION_SAMPLE_FRESHNESS_SECONDS = 0.50
@@ -69,6 +100,81 @@ OWNER_ANCHOR_HISTORY_LIMIT = 128
 IDLE_INPUT_FLAGS = (False, False, False, False, False, False, False, False)
 # Slack on the server-side fire-rate gate: one 60Hz sim tick (~16.7ms).
 FIRE_RATE_GRACE = 1.0 / 60.0
+# Per-label eye/aim history for shot-origin validation (combat_runtime).
+EYE_HISTORY_LIMIT = 128
+# A stock client's label is its ClockSync estimate of the server loop plus
+# one-way latency (gameScene process_packet_clock_sync), so it never runs
+# seconds ahead of the tick on which the server received it. A label beyond
+# both of these bounds cannot come from the retail client; accepting it made
+# every later real label "stale" and froze the body for the rest of the life.
+INPUT_LABEL_AHEAD_OF_APPLIED = 64
+INPUT_LABEL_AHEAD_OF_SERVER = 256
+# Samples retained for per-player ClientData queue-delay statistics.
+INPUT_QUEUE_DELAY_SAMPLES = 600
+# Launcher reload gate. Live retail RPG: 4 rockets take ~6.6 s, i.e. each
+# emptied clip waits shoot_interval + reload_time (0.7 + 1.5 s) before the
+# next round. The grace absorbs packet jitter between two shots.
+LAUNCHER_RELOAD_GRACE_SECONDS = 0.25
+LAUNCHER_RELOAD_GRACE_FRACTION = 0.1
+# Horizontal drift (blocks) a disguised player may take -- knockback, a
+# settling step -- before "Must remain stationary" breaks the Disguise.
+DISGUISE_MOVE_TOLERANCE = 0.5
+# Stock server-only ONE_HIT_KILL_WEAPONS (A2382, kill types).
+_ONE_HIT_KILL_TYPES = frozenset(
+    int(value) for value in getattr(
+        C, "ONE_HIT_KILL_WEAPONS",
+        (0, 1, 2, 3, 4, 5, 6, 21, 22, 23, 24, 18, 13, 14, 15, 16, 17, 19),
+    )
+)
+# Stock server-only fall rules (A2396-A2398): a landing after an own-rocket
+# self-push takes ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER of the damage, and a
+# landing with almost no air time (teleport/correction artefacts) is scaled
+# from 0 at ZERO_FALL_DAMAGE_AIR_TIME to full at MAX_FALL_DAMAGE_AIR_TIME.
+ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER = float(
+    getattr(C, "ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER", 0.2)
+)
+ZERO_FALL_DAMAGE_AIR_TIME = float(getattr(C, "ZERO_FALL_DAMAGE_AIR_TIME", 1.0 / 60.0))
+MAX_FALL_DAMAGE_AIR_TIME = float(getattr(C, "MAX_FALL_DAMAGE_AIR_TIME", 4.0 / 60.0))
+# An own blast counts as the launch of the following airborne phase when it
+# lands up to this long before take-off (the push is applied a few accepted
+# frames after the blast).
+ROCKET_JUMP_TAKEOFF_WINDOW_SECONDS = 0.5
+# Kill types of the self-pushing blasts that make a "rocket jump".
+_ROCKET_JUMP_KILL_TYPES = frozenset(
+    int(getattr(C.KILL, name, default))
+    for name, default in (
+        ("ROCKET_KILL", 4), ("ROCKET2_KILL", 5), ("UGC_ROCKET2_KILL", 27),
+    )
+)
+# Stock per-life stock of every server-tracked oriented tool, as the stock
+# aos.pkg class attributes resolve (scratchpad stock_weapons.txt):
+#   tool -> (magazine max, magazine initial, reserve max, reserve initial,
+#            crate restock amount)
+# Count tools (GrenadeTool & co.) store ``(default_count, initial_count, 0, 0,
+# restock_amount)``; Weapon subclasses store their ``ammo`` tuple verbatim.
+# ``Tool.restock(AMMO_CRATE)`` = ``min(count + restock, default_count)``;
+# ``Weapon.restock(AMMO_CRATE)`` tops the RESERVE up to its max, or the
+# magazine when the weapon has no reserve. Any other restock type resets to
+# the initial values. RPG2 is (3, 3, 3, 3, 3): 6 rockets per life -- the
+# ``RPG2_AMMO_MAX = 6`` constant only exists in the modded constants tail.
+ORIENTED_STOCK_AMMO: dict[int, tuple[int, int, int, int, int]] = {
+    int(C.GRENADE_TOOL): (4, 2, 0, 0, 4),
+    int(getattr(C, "CLASSIC_GRENADE_TOOL", 31)): (4, 2, 0, 0, 4),
+    int(getattr(C, "ANTIPERSONNEL_GRENADE_TOOL", 32)): (4, 2, 0, 0, 4),
+    int(getattr(C, "MOLOTOV_TOOL", 33)): (3, 3, 0, 0, 3),
+    int(getattr(C, "CHEMICALBOMB_TOOL", 54)): (4, 2, 0, 0, 2),
+    int(getattr(C, "STICKY_GRENADE_TOOL", 57)): (4, 2, 0, 0, 2),
+    int(C.RPG_TOOL): (1, 1, 3, 3, 3),
+    int(C.RPG2_TOOL): (3, 3, 3, 3, 3),
+    int(C.DRILLGUN_TOOL): (1, 1, 3, 1, 2),
+    int(getattr(C, "GRENADE_LAUNCHER_WEAPON_TOOL", 55)): (1, 1, 5, 3, 5),
+    int(getattr(C, "MINE_LAUNCHER_TOOL", 58)): (1, 1, 5, 3, 5),
+}
+# Gun reload vs. a shot that arrives just before the server's own reload
+# timer (retail Character.end_reload runs on the client's clock). A shot this
+# close to the end of the current cycle completes that cycle first.
+RELOAD_FIRE_GRACE_SECONDS = 0.1
+RELOAD_FIRE_GRACE_FRACTION = 0.1
 # Input consumption (see Player.simulate_tick): at most one physics step per
 # tick, paced so the server can never outrun the client.
 POSITION_DRIFT_DEADZONE = 0.6
@@ -214,6 +320,9 @@ class BufferedInputFrame:
     # Unnamed ClientData byte between orientation and movement flags. Retained
     # losslessly for protocol analysis; no gameplay semantics are assumed here.
     wire_unknown_byte: int | None = None
+    # World topology revision when this frame arrived. Backlog catch-up only
+    # replays two frames in one tick when no terrain edit sits between them.
+    topology_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -307,6 +416,9 @@ class Player:
         self.pitch: float = 0.0
 
         self.health: int = MAX_HEALTH
+        # Per-body maximum: VIP bosses carry RULE_VIP_HEALTH x 100. Every
+        # spawn resets it; heals and crates cap at it.
+        self.max_health: int = MAX_HEALTH
         self.grenades: int = MAX_GRENADES
         self.tool: int = self.weapon
         self.tool_is_raw: bool = True
@@ -366,18 +478,25 @@ class Player:
         self._jetpack_idle_seconds: float = 0.0
         self._last_damage_at: float = 0.0
         self._last_combat_damage_at: float = 0.0
+        # Fall-rule bookkeeping (scaled_fall_damage).
+        self._fall_air_time: float = 0.0
+        self._airborne_since: float = 0.0
+        self._rocket_jump_blast_at: Optional[float] = None
         self._last_damage_source_id: int = -1
         self._last_damage_source_position = None
         self.parachute_id: int = 0
+        # ``parachute_active`` is the advertised canopy (WorldUpdate state bit
+        # 0x01, HUD, sounds, observers). ``_parachute_physics_active`` is what
+        # the native mover uses; for retail owners it trails the advertised
+        # state by the owner handoff (see _advance_parachute_physics).
         self.parachute_active: bool = False
-        # Our maintained client patch routes the Z key to the hover bit for
-        # parachutes. Stock Character.set_hover accepts only pack 69, so this
-        # deployment latch is compatibility policy, not original input logic.
-        self._parachute_deploy_last_held: bool = False
-        self._parachute_deploy_pending: bool = False
+        self._reset_parachute_state()
         self.disguised: bool = False        # specialist disguise toggle
         self.mounted_entity_id = None        # mounted MACHINE_GUN entity, if any
         self.on_fire: bool = False          # authoritative Molotov burn state
+        # Chemical Bomb goo contact (WorldUpdate state bit 0x08, stock
+        # Character.set_touching_goo). Owned by server.chemical_goo.
+        self.touching_goo: bool = False
         self.pickup_id = None               # objective entity type 14/15/16
         self.pickup_burdensome = False
         self.pickup_state = None             # owning/team state restored on drop
@@ -394,10 +513,20 @@ class Player:
         self.grounded: bool = True
         self.airborne: bool = False
         self.wade: bool = False
+        # The native mover holds its wade flag while airborne and only
+        # re-evaluates it on ground contact. A teleport is not a physical
+        # move, so the flag it carried from the old position is ignored until
+        # the mover next reports the player on the ground.
+        self._wade_stale_after_teleport: bool = False
 
         self.respawn_time: float = 0.0
         self.death_time: float = 0.0
         self.spawned_at: float = 0.0
+        # Spawn protection lasts RULE_SPAWN_PROTECTION_TIME or until this
+        # life first attacks (end_spawn_protection), whichever comes first.
+        self.spawn_protection_cancelled: bool = False
+        # Mode-set cap for this life (Zombie patient zero: 0.5 s); None = rule.
+        self.spawn_protection_cap: Optional[float] = None
         self._grave_entity_id = None
 
         self.input = InputState()
@@ -443,7 +572,32 @@ class Player:
         self.input_frames_overflow: int = 0
         self.input_frames_applied: int = 0
         self.input_starved_ticks: int = 0
+        self.input_frames_synthesized: int = 0
+        # True while the newest authoritative frame was a refilled (guessed)
+        # lost frame. Replication skips the owner self row for that label: the
+        # client's history entry for it may include an input change the lost
+        # packet carried (crouch geometry alone is a 0.9-block difference).
+        self.last_applied_input_synthesized: bool = False
+        self._orientation_after_synth: bool = False
         self.rejected_tool_updates: int = 0
+        # Anti-cheat input accounting (docs: server/anticheat.py).
+        # label -> (eye xyz, aim xyz) right after that frame was simulated.
+        self._eye_history: dict[int, tuple] = {}
+        self._starved_streak: int = 0
+        self._last_client_data_at: Optional[float] = None
+        self._starvation_baseline: float = 0.0
+        self._last_simulated_at: Optional[float] = None
+        self._starvation_timeout_flagged: bool = False
+        self._backlog_over_ticks: int = 0
+        self._backlog_catchup: bool = False
+        self.input_queue_delays: deque[int] = deque(
+            maxlen=INPUT_QUEUE_DELAY_SAMPLES
+        )
+        self.input_frames_catchup: int = 0
+        self.input_frames_backlog_dropped: int = 0
+        self.input_frames_starvation_steps: int = 0
+        self.input_frames_rejected_ahead: int = 0
+        self._tool_before_mg: Optional[int] = None
         self.last_reported_position: Optional[Tuple[float, float, float]] = None
         # The client loop_count of the input frame the simulation last
         # consumed — the ONLY correct stamp for this player's WorldUpdate
@@ -478,9 +632,8 @@ class Player:
         self.last_native_post_update: dict = {}
 
         self.kills: int = 0
-        # Current-life streak sent in KillAction.kill_count. Scoreboard kills
-        # remain cumulative for the match, but the native multikill HUD resets
-        # this value when the killer dies.
+        # Current-life streak (profile/award stats). KillAction.kill_count is
+        # the separate MULTIKILLMAXTIMEGAP chain in server/kill_feed.py.
         self.kill_streak: int = 0
         self.deaths: int = 0
         self.captures: int = 0
@@ -688,7 +841,9 @@ class Player:
                 and self._jetpack_physics_active
             )
             world_object.parachute = int(self.parachute_id or 0)
-            world_object.parachute_active = bool(self.parachute_active)
+            world_object.parachute_active = bool(
+                self._parachute_physics_active
+            )
         except Exception:
             pass
         if collisions is None:
@@ -813,6 +968,24 @@ class Player:
             )),
         }
 
+    def _jetpack_boundary_frames(self, name: str, default: int) -> int:
+        """Configured accepted-input frames for one unacknowledged pack boundary.
+
+        Native BattleSpades clients (BSCF flight capability) predict these
+        boundaries locally with the same retail-calibrated constants (defer 2,
+        tail 3; the client's ``jetpack_activation_defer_frames`` /
+        ``jetpack_exhaustion_tail_frames`` in flight_profile.hpp). A host's
+        ``[debug]`` override tunes the retail owner handoff only, so native
+        owners keep the defaults and never diverge at a burn's end.
+        """
+        if bool(getattr(self.connection, "flight_profile_capable", False)):
+            return int(default)
+        config = getattr(getattr(self.connection, "server", None), "config", None)
+        try:
+            return max(0, min(30, int(getattr(config, name, default))))
+        except (TypeError, ValueError):
+            return int(default)
+
     def _note_jetpack_physics_started(self) -> None:
         """Persist the exact consumed frame that first applied active thrust.
 
@@ -858,7 +1031,13 @@ class Player:
         self.head_x, self.head_y, self.head_z = self._compute_head_vector()
         self.eye_x, self.eye_y, self.eye_z = self.x, self.y, self.z
         self.airborne = bool(self._world_object.airborne)
-        self.wade = bool(self._world_object.wade)
+        wade = bool(self._world_object.wade)
+        if self._wade_stale_after_teleport:
+            if self.airborne:
+                wade = False
+            else:
+                self._wade_stale_after_teleport = False
+        self.wade = wade
         self.grounded = not self.airborne
 
     @property
@@ -960,6 +1139,67 @@ class Player:
         return (self.eye_x, self.eye_y, self.eye_z)
 
     @property
+    def applied_loop(self) -> Optional[int]:
+        """Client loop label of the last input frame authority simulated."""
+        return self.last_applied_input_loop
+
+    def eye_at_loop(
+        self, loop_count: int
+    ) -> Optional[Tuple[float, float, float]]:
+        """Server eye right after input frame ``loop_count`` was simulated.
+
+        Covers the last ``EYE_HISTORY_LIMIT`` applied labels of this life,
+        including refilled lost frames. ``None`` when the label is unknown
+        (never applied, evicted, dropped as backlog, or a previous life).
+        """
+        try:
+            entry = self._eye_history.get(int(loop_count))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return None if entry is None else entry[0]
+
+    def orientation_at_loop(
+        self, loop_count: int
+    ) -> Optional[Tuple[float, float, float]]:
+        """Aim carried by input frame ``loop_count`` (see ``eye_at_loop``)."""
+        try:
+            entry = self._eye_history.get(int(loop_count))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        return None if entry is None else entry[1]
+
+    def _record_eye_history(self, loop: int, aim) -> None:
+        history = getattr(self, "_eye_history", None)
+        if not isinstance(history, dict):
+            history = {}
+            self._eye_history = history
+        history[int(loop)] = (
+            (float(self.eye_x), float(self.eye_y), float(self.eye_z)),
+            tuple(float(value) for value in aim),
+        )
+        while len(history) > EYE_HISTORY_LIMIT:
+            del history[next(iter(history))]
+
+    @property
+    def hitbox_crouched(self) -> bool:
+        """Crouch state of the simulated body, not the raw input bit.
+
+        The native mover refuses to stand up under a low ceiling and ignores
+        crouch while hovering, so ``input.crouch`` can disagree with the
+        hitbox the client renders.
+        """
+        world_object = self._world_object
+        if world_object is not None:
+            try:
+                # Character.is_crouching excludes active hover (0x10023760).
+                return bool(world_object.crouch) and not bool(
+                    getattr(world_object, "hover", False)
+                )
+            except Exception:
+                pass
+        return bool(self.input.crouch)
+
+    @property
     def orientation(self) -> Tuple[float, float, float]:
         return (self.o_x, self.o_y, self.o_z)
 
@@ -1011,12 +1251,37 @@ class Player:
         if world_object is not None:
             world_object.set_position(x, y, z)
             self._sync_cached_vectors()
+        self._clear_transient_movement_state()
+
+    def _clear_transient_movement_state(self) -> None:
+        """Drop per-fall movement state a teleport must not carry over.
+
+        A player teleported out of water kept ``wade`` until the mover next
+        touched ground, so ``_update_parachute`` treated the new fall as
+        grounded and refused its first canopy. The canopy's per-fall latch
+        belongs to the old fall as well; an armed deploy press is the
+        player's own intent and survives.
+        """
+        self.wade = False
+        self._wade_stale_after_teleport = True
+        self._parachute_used_this_fall = False
 
     def set_orientation(self, yaw: float, pitch: float):
         self.yaw = yaw
         self.pitch = pitch
 
     def set_orientation_vector(self, x: float, y: float, z: float):
+        try:
+            x, y, z = float(x), float(y), float(z)
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            # ClientData carries fixed-point shorts, so the stock wire cannot
+            # produce this; keep the previous aim rather than poisoning the
+            # native mover and every later ray.
+            server = self.connection.server if self.connection else None
+            anticheat.report(server, self, "orientation_nonfinite")
+            return
         raw_x, raw_y, raw_z = x, y, z
         magnitude = math.sqrt(x * x + y * y + z * z)
         if magnitude <= 0.000001:
@@ -1069,8 +1334,11 @@ class Player:
         self.last_kill_action_data = None
         self._teabagged_deaths.clear()
         self.damage_contributions = {}
+        self.max_health = MAX_HEALTH
         self.health = MAX_HEALTH
         self.spawned_at = time.monotonic()
+        self.spawn_protection_cancelled = False
+        self.spawn_protection_cap = None
         self.alive = True
         self.spawned = True
         self.input = InputState()
@@ -1100,6 +1368,13 @@ class Player:
         self._pending_packet_wire_unknown_byte = None
         self._applied_input_source_wire_unknown_byte = None
         self.last_applied_input_loop = None
+        self._eye_history = {}
+        self._starved_streak = 0
+        self._starvation_timeout_flagged = False
+        self._last_simulated_at = None
+        self._backlog_over_ticks = 0
+        self._backlog_catchup = False
+        self._tool_before_mg = None
         self.blocks = self._block_wallet_start()
         self.grenades = MAX_GRENADES
         self._reset_ammo()
@@ -1131,10 +1406,12 @@ class Player:
             else 0
         )
         self.parachute_active = False
-        self._parachute_deploy_last_held = False
-        self._parachute_deploy_pending = False
+        # Retail Character.set_parachute_active(False) on spawn is client-local
+        # and immediate, so both sides start closed with no handoff.
+        self._reset_parachute_state()
         self.disguised = False
         self.on_fire = False
+        self.touching_goo = False
         self.pickup_id = None
         self.pickup_burdensome = False
         self.pickup_state = None
@@ -1208,15 +1485,25 @@ class Player:
             WEAPON_PROFILES[next(iter(WEAPON_PROFILES))],
         )
 
+    @staticmethod
+    def _initial_reserve(profile) -> int:
+        """Stock spawn reserve (``Weapon.ammo[3]``), e.g. rifle 30 of 50."""
+        initial = int(getattr(profile, "initial_reserve", -1))
+        return int(profile.reserve_ammo) if initial < 0 else initial
+
     def _reset_ammo(self):
-        """Grant one fresh per-life/restock wallet for each retail weapon.
+        """Grant one fresh per-life wallet for each retail weapon.
+
+        Retail ``Weapon.restock`` (any type but AMMO_CRATE) sets the magazine
+        to the initial clip and the reserve to the INITIAL reserve -- not the
+        maximum (rifle 30 of 50, classic shotgun 20 of 45).
 
         Keep the active pair as the compatibility facade used by combat and
         bots. Stowed pairs are saved on selection; selecting is never a grant.
         The bounded catalog also covers Tutorial unlocks and mounted weapons.
         """
         self._weapon_ammo = {
-            tool: (profile.clip_size, profile.reserve_ammo)
+            tool: (profile.clip_size, self._initial_reserve(profile))
             for tool, profile in WEAPON_PROFILES.items()
         }
         profile = WEAPON_PROFILES.get(
@@ -1224,7 +1511,125 @@ class Player:
             WEAPON_PROFILES[next(iter(WEAPON_PROFILES))],
         )
         self.ammo_clip = profile.clip_size
-        self.ammo_reserve = profile.reserve_ammo
+        self.ammo_reserve = self._initial_reserve(profile)
+
+    @staticmethod
+    def _crate_reserve(profile, reserve: int) -> int:
+        restock = int(getattr(profile, "restock_amount", -1))
+        if restock < 0:
+            restock = int(profile.reserve_ammo)
+        return min(int(reserve) + restock, int(profile.reserve_ammo))
+
+    def _restock_ammo_crate(self) -> None:
+        """Retail ``Weapon.restock(AMMO_CRATE)`` on every weapon.
+
+        The crate ADDS the stock restock amount to the reserve, capped at the
+        stock maximum; the loaded magazine is untouched (the client then
+        auto-reloads an empty held weapon and sends its own WeaponReload).
+        """
+        for tool, (clip, reserve) in tuple(self._weapon_ammo.items()):
+            profile = WEAPON_PROFILES.get(tool)
+            if profile is not None:
+                self._weapon_ammo[tool] = (clip, self._crate_reserve(profile, reserve))
+        profile = WEAPON_PROFILES.get(self.weapon)
+        if profile is not None:
+            self.ammo_reserve = self._crate_reserve(profile, self.ammo_reserve)
+            self._weapon_ammo[self.weapon] = (self.ammo_clip, self.ammo_reserve)
+
+    def _reload_profile(self):
+        """The gun whose reload is running (``get_weapon_profile`` facade)."""
+        return self.get_weapon_profile()
+
+    def _reload_fire_grace(self, profile) -> float:
+        return RELOAD_FIRE_GRACE_SECONDS + RELOAD_FIRE_GRACE_FRACTION * float(
+            profile.reload_time
+        )
+
+    def _load_reload_cycle(self, profile) -> None:
+        """Apply one completed reload cycle (``get_ammo_after_reload``).
+
+        Stock clip_reload weapons (shotguns, snub pistol) load ONE round per
+        cycle; every other gun fills the magazine from the reserve.
+        """
+        needed = max(0, int(profile.clip_size) - int(self.ammo_clip))
+        if bool(getattr(profile, "clip_reload", False)):
+            needed = min(1, needed)
+        loaded = min(needed, int(self.ammo_reserve))
+        self.ammo_clip += loaded
+        self.ammo_reserve -= loaded
+
+    def _reloadable(self, profile) -> bool:
+        """Stock ``Weapon.is_reloadable``: room in the clip and reserve left."""
+        return self.ammo_clip < int(profile.clip_size) and self.ammo_reserve > 0
+
+    def _stop_reload(self) -> None:
+        self.reloading = False
+        self.reload_end_time = 0.0
+
+    def _advance_reload(self, now: Optional[float] = None) -> bool:
+        """Apply every reload cycle due by ``now``; True when reloading ends.
+
+        Retail ``Character.end_reload`` applies the cycle and, while the gun
+        is still reloadable and the trigger is not pressed, immediately calls
+        ``reload()`` again: a clip_reload gun keeps loading one round per
+        ``reload_time`` until full. The next cycle is scheduled from the exact
+        end of the previous one, like the client's pullout timer.
+        """
+        if not self.reloading:
+            return False
+        current_time = time.monotonic() if now is None else float(now)
+        profile = self._reload_profile()
+        while self.reloading and current_time >= self.reload_end_time:
+            self._load_reload_cycle(profile)
+            if (
+                bool(getattr(profile, "clip_reload", False))
+                and float(profile.reload_time) > 0.0
+                and self._reloadable(profile)
+            ):
+                self.reload_end_time += float(profile.reload_time)
+                continue
+            self._stop_reload()
+            self._reload_done_pending = True
+            return True
+        return False
+
+    def _advance_reload_and_announce(self) -> None:
+        """Tick the reload and relay its completion (WeaponReload is_done=1).
+
+        Remote clients' ``Character.receive_reload`` only plays the weapon's
+        reload / reload-done sound for the flag it receives.
+        """
+        if self.reloading:
+            self._advance_reload()
+        if getattr(self, "_reload_done_pending", False):
+            self._reload_done_pending = False
+            self._broadcast_reload_state(True)
+
+    def _reload_blocks_shot(self, current_time: float, *, commit: bool) -> bool:
+        """Whether a running reload rejects a shot at ``current_time``.
+
+        Retail ``Weapon.use_primary`` refuses while ``character.reloading``,
+        but pressing fire makes ``end_reload`` stop a clip_reload chain after
+        the current round, so a shotgun can fire mid-reload with the rounds
+        loaded so far. A shot within the jitter grace of the current cycle's
+        end completes that cycle first; any other shot during a clip_reload
+        cycle interrupts the chain (the partial round is not loaded). A
+        magazine reload still blocks the trigger until it completes.
+        """
+        if not self.reloading:
+            return False
+        profile = self._reload_profile()
+        remaining = float(self.reload_end_time) - float(current_time)
+        if remaining <= self._reload_fire_grace(profile):
+            if commit:
+                self._load_reload_cycle(profile)
+                self._stop_reload()
+            return False
+        if bool(getattr(profile, "clip_reload", False)) and self.ammo_clip > 0:
+            if commit:
+                self._stop_reload()
+            return False
+        return True
 
     def can_fire(
         self,
@@ -1234,9 +1639,9 @@ class Player:
         if not self.alive or not self.spawned:
             return False
 
-        profile = self.get_weapon_profile()
         current_time = time.monotonic() if now is None else now
-        if self.reloading and current_time < self.reload_end_time:
+        self._advance_reload(current_time)
+        if self._reload_blocks_shot(current_time, commit=False):
             return False
         # Admit up to one tick of arrival jitter against a stable cadence
         # schedule. The grace is never subtracted from every accepted interval,
@@ -1246,7 +1651,17 @@ class Player:
 
         if self.is_spade_tool():
             return True
-        return self.is_weapon_tool() and self.ammo_clip > 0
+        if not self.is_weapon_tool():
+            return False
+        if self.ammo_clip > 0:
+            return True
+        # An empty clip whose reload cycle ends within the jitter grace.
+        return bool(
+            self.reloading
+            and float(self.reload_end_time) - float(current_time)
+            <= self._reload_fire_grace(self._reload_profile())
+            and self.ammo_reserve > 0
+        )
 
     def consume_shot(
         self,
@@ -1257,6 +1672,10 @@ class Player:
             return False
 
         current_time = time.monotonic() if now is None else now
+        if self.is_weapon_tool():
+            self._reload_blocks_shot(current_time, commit=True)
+            if self.ammo_clip <= 0:
+                return False
         profile = self.get_weapon_profile()
         interval = profile.fire_interval if fire_interval is None else float(fire_interval)
         previous_due = self.next_shot_time
@@ -1272,29 +1691,36 @@ class Player:
         return True
 
     def start_reload(self, now: Optional[float] = None) -> bool:
+        """Accept one retail ``Character.reload`` request (WeaponReload 76).
+
+        The client sends ``is_done=0`` from every ``reload()`` call, i.e.
+        once per round of a clip_reload chain. A request that arrives while
+        that chain is still running is acknowledged (True: the caller relays
+        the round's reload sound) without restarting the cycle.
+        """
         if not self.alive or not self.spawned or not self.is_weapon_tool():
             return False
 
+        current_time = time.monotonic() if now is None else now
         profile = self.get_weapon_profile()
-        if self.reloading or self.ammo_reserve <= 0 or self.ammo_clip >= profile.clip_size:
+        if self.reloading:
+            self._advance_reload(current_time)
+        if self.reloading:
+            return bool(getattr(profile, "clip_reload", False))
+        if not self._reloadable(profile):
             return False
 
-        current_time = time.monotonic() if now is None else now
         self.reloading = True
         self.reload_end_time = current_time + profile.reload_time
         return True
 
     def finish_reload(self) -> bool:
+        """Complete the running reload cycle now and end the reload."""
         if not self.reloading:
             return False
 
-        profile = self.get_weapon_profile()
-        needed = max(0, profile.clip_size - self.ammo_clip)
-        loaded = min(needed, self.ammo_reserve)
-        self.ammo_clip += loaded
-        self.ammo_reserve -= loaded
-        self.reloading = False
-        self.reload_end_time = 0.0
+        self._load_reload_cycle(self.get_weapon_profile())
+        self._stop_reload()
         return True
 
     def _broadcast_reload_state(self, is_done: bool):
@@ -1310,27 +1736,83 @@ class Player:
         packet.is_done = 1 if is_done else 0
         server.broadcast(bytes(packet.generate()))
 
-    def damage(self, amount: int, source: Optional["Player"] = None, kill_type: int = 0) -> bool:
+    def spawn_protection_remaining(self) -> float:
+        """Seconds of spawn protection left (0 once this life attacked)."""
+
+        if not self.alive or self.spawn_protection_cancelled:
+            return 0.0
+        server = self.connection.server if self.connection else None
+        config = getattr(server, "config", None)
+        if config is None:
+            return 0.0
+        from server.game_rules import get_rules
+
+        duration = float(get_rules(config).get("RULE_SPAWN_PROTECTION_TIME"))
+        cap = getattr(self, "spawn_protection_cap", None)
+        if cap is not None:
+            duration = min(duration, float(cap))
+        if duration <= 0.0:
+            return 0.0
+        return max(0.0, duration - (time.monotonic() - self.spawned_at))
+
+    def end_spawn_protection(self) -> bool:
+        """Drop spawn protection because this life attacked.
+
+        The WorldUpdate timer (``world_update_snapshot``) reads the same
+        state, so every client's protection effect ends on the next row.
+        Returns True when protection was active.
+        """
+
+        if self.spawn_protection_remaining() <= 0.0:
+            return False
+        self.spawn_protection_cancelled = True
+        return True
+
+    def damage(
+        self,
+        amount: int,
+        source: Optional["Player"] = None,
+        kill_type: int = 0,
+        *,
+        hp_damage_type: Optional[int] = None,
+    ) -> bool:
+        """Apply ``amount`` HP of damage and tell the victim with SetHP.
+
+        ``hp_damage_type`` overrides SetHP.damage_type. The stock
+        process_packet_set_hp (gameScene.pyd 0x10191E90) reads it as
+        0 = plain HP update, 1 = hit (sound + direction indicator from the
+        source position), 2 = heal, 3 = burn (burn sound + BURN_INDICATOR),
+        4 = sudden death (SUDDEN_DEATH_INDICATOR). The default picks 1 for
+        another player's damage and 0 for world/self damage.
+        """
         if not self.alive:
             return False
         if self.god_mode:
             return False
 
         server = self.connection.server if self.connection else None
+        # A teammate who set off this player's own deployable (shot their
+        # landmine) owns the resulting damage: kill feed, team-kill scoring
+        # and grief accounting name the instigator, not a "suicide".
+        source = conduct.attribute_damage_source(server, self, source)
         rules = None
         config = getattr(server, "config", None)
         if config is not None:
             from server.game_rules import get_rules
 
             rules = get_rules(config)
-            protection = float(rules.get("RULE_SPAWN_PROTECTION_TIME"))
             if (
                 source is not None
                 and source is not self
-                and protection > 0.0
-                and time.monotonic() - self.spawned_at < protection
+                and self.spawn_protection_remaining() > 0.0
             ):
                 return False
+            if source is not None and source is not self:
+                # Dealing damage (melee, blasts, fire, turrets) ends the
+                # attacker's own spawn protection.
+                end_protection = getattr(source, "end_spawn_protection", None)
+                if callable(end_protection):
+                    end_protection()
         modify_damage = getattr(
             getattr(server, "mode", None), "modify_incoming_damage", None
         )
@@ -1348,7 +1830,10 @@ class Player:
                 int(C.CLASS_JUMP_ZOMBIE),
             }:
                 amount *= float(rules.get("RULE_ZOMBIE_CLASS_DAMAGE"))
-            if rules.enabled("RULE_ONE_HIT_KILL"):
+            # Stock server-only ONE_HIT_KILL_WEAPONS (A2382): only these
+            # kill types become instakills (not burn ticks, sticky, GL,
+            # mines, C4, chemical goo...). Rules audit 2026-09-27 #22.
+            if rules.enabled("RULE_ONE_HIT_KILL") and int(kill_type) in _ONE_HIT_KILL_TYPES:
                 amount = max(float(amount), float(self.health))
 
         # Pauses jetpack fuel regen for the type's refill-delay window.
@@ -1360,28 +1845,54 @@ class Player:
 
         health_before = self.health
         self.health = max(0, self.health - amount)
-        from server.combat_scores import record_damage
+        from server.combat_scores import record_damage, record_damage_taken
         record_damage(server, self, source, health_before - self.health)
+        record_damage_taken(
+            server, self, source, health_before - self.health, int(kill_type)
+        )
+        conduct.record_team_harm(
+            server,
+            self,
+            source,
+            health_before - self.health,
+            self.health <= 0,
+            int(kill_type),
+        )
         source_position = self.position if source is None else source.position
-        self._last_combat_damage_at = time.monotonic()
-        self._last_damage_source_id = int(
-            getattr(source, "id", -1) if source is not None else -1
-        )
-        self._last_damage_source_position = tuple(
-            float(value) for value in source_position
-        )
+        # World damage (falls, mode DoT) does not erase the last player
+        # interaction: a fall right after an enemy hit is still credited to
+        # that enemy (rules audit 2026-09-27 #7).
+        if source is not None:
+            self._last_combat_damage_at = time.monotonic()
+            self._last_damage_source_id = int(getattr(source, "id", -1))
+            self._last_damage_source_position = tuple(
+                float(value) for value in source_position
+            )
         damage_type = 0 if source is None or source == self else 1
-        if self.connection:
+        if hp_damage_type is not None:
+            damage_type = int(hp_damage_type)
+        # A gated (still loading) client gets its HP in the join reveal;
+        # a mid-handshake SetHP reaches no GameScene.
+        if self.connection and getattr(self.connection, "in_game", True):
             from shared.packet import SetHP
 
             packet = SetHP()
-            packet.hp = self.health
+            packet.hp = max(0, min(255, int(self.health)))
             packet.damage_type = damage_type
             packet.source_x, packet.source_y, packet.source_z = source_position
             self.connection.send(bytes(packet.generate()))
 
         if self.health <= 0:
-            self.die(killer=source, kill_type=kill_type)
+            killer = source
+            if source is None and int(kill_type) == int(C.KILL.FALL_KILL):
+                # Knocked or blasted into a lethal fall: the enemy who last
+                # damaged this life within PLAYER_INTERACTION_EXPIRY_SECONDS
+                # (A100 = 5 s, stock server-only) gets the kill instead of
+                # the victim being charged a suicide.
+                from server.handlers.team import recent_enemy_attacker
+
+                killer = recent_enemy_attacker(server, self)
+            self.die(killer=killer, kill_type=kill_type)
             return True
         return False
 
@@ -1495,6 +2006,7 @@ class Player:
         self.airborne = False
         self.wade = False
         self.disguised = False
+        self.touching_goo = False
         self.death_time = time.time()
         transition_death = kill_type in {
             C.FORCED_TEAM_CHANGE_KILL, C.TEAM_CHANGE_KILL, C.CLASS_CHANGE_KILL
@@ -1502,12 +2014,14 @@ class Player:
         if not transition_death:
             self.deaths += 1
         self.kill_streak = 0
+        # "Reloading Kill" (GENERIC_SCORE_RELOAD) needs the state at death.
+        self.died_reloading = bool(getattr(self, "reloading", False))
         self.reloading = False
         self.reload_end_time = 0.0
         self.jetpack_active = False
         self.parachute_active = False
-        self._parachute_deploy_last_held = False
-        self._parachute_deploy_pending = False
+        # Death closes the retail canopy client-side too (0x1003393B).
+        self._reset_parachute_state()
         self._jetpack_physics_active = False
         self._jetpack_activation_defer_remaining = 0
         self._jetpack_exhaustion_tail_remaining = 0
@@ -1531,16 +2045,44 @@ class Player:
             world_object.parachute_active = False
             self._sync_cached_vectors()
 
+        from server import kill_feed
+
+        # KillAction.kill_count is the retail multikill chain (kills no more
+        # than MULTIKILLMAXTIMEGAP apart), not the life streak; the flags are
+        # the domination/revenge pair (server/kill_feed.py).
         kill_count = 0
+        is_domination = is_revenge = False
+        kill_feed.reset_multikill(self)
         if killer and killer != self and killer.team != self.team and not transition_death:
             killer.kills += 1
             killer.kill_streak = min(255, int(killer.kill_streak) + 1)
-            kill_count = killer.kill_streak
+            kill_count = kill_feed.register_multikill(killer, time.monotonic())
+            is_domination, is_revenge = kill_feed.register_domination(
+                killer, self
+            )
+            # Retail REVENGE (kill whoever dominates you) and PAYBACK (kill the
+            # player who last killed you) bonus popups, paid with the kill
+            # score by BaseMode.award_generic_kill_score.
+            payback = int(getattr(killer, "last_killed_by_id", -1)) == int(self.id)
+            bonuses = getattr(killer, "kill_bonuses", None)
+            if not isinstance(bonuses, dict):
+                bonuses = {}
+                killer.kill_bonuses = bonuses
+            bonuses[int(self.id)] = (bool(is_revenge), bool(payback))
+            if payback:
+                killer.last_killed_by_id = -1
+            self.last_killed_by_id = int(killer.id)
+        elif int(kill_type) in kill_feed.DOMINATION_RESET_KILL_TYPES:
+            # The client clears this player's domination flags on the same
+            # packet; keep the server relation in step.
+            kill_feed.clear_player(server, self)
 
         from server.profile_stats import death
         death(self, killer, int(kill_type))
         from server.combat_scores import record_death
-        record_death(server, self, killer, int(kill_type))
+        record_death(
+            server, self, killer, int(kill_type), domination=is_domination
+        )
 
         if server is not None:
             from shared.packet import KillAction
@@ -1557,12 +2099,23 @@ class Player:
                 if callable(respawn_time_for)
                 else server.config.respawn_time
             )
-            packet.respawn_time = max(0, min(255, int(respawn_time)))
+            # Round a fractional mode delay up so the countdown never reaches
+            # zero before the server respawns the player.
+            packet.respawn_time = max(
+                0, min(255, int(math.ceil(float(respawn_time) - 1e-6)))
+            )
             packet.kill_count = kill_count
+            packet.isDominationKill = int(bool(is_domination))
+            packet.isRevengeKill = int(bool(is_revenge))
+            death_data = bytes(packet.generate())
+            # Roster repair replays this packet to late joiners, and a joiner
+            # can inherit the killer's freed id. The replay only has to
+            # establish the death, never re-announce banners.
+            packet.kill_count = 0
             packet.isDominationKill = 0
             packet.isRevengeKill = 0
             self.last_kill_action_data = bytes(packet.generate())
-            server.broadcast(self.last_kill_action_data)
+            server.broadcast(death_data)
 
             corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
             on_player_death = getattr(corpse_lifecycle, "on_player_death", None)
@@ -1609,14 +2162,16 @@ class Player:
     def heal(self, amount: int):
         if self.alive:
             health_before = self.health
-            self.health = min(MAX_HEALTH, self.health + amount)
+            cap = max(1, int(getattr(self, "max_health", MAX_HEALTH)))
+            # Never heal below the current HP (a heal is not damage).
+            self.health = max(health_before, min(cap, self.health + amount))
             from server.combat_scores import record_healing
             record_healing(self, self.health - health_before)
-            if self.connection:
+            if self.connection and getattr(self.connection, "in_game", True):
                 from shared.packet import SetHP
 
                 packet = SetHP()
-                packet.hp = self.health
+                packet.hp = max(0, min(255, int(self.health)))
                 packet.damage_type = 2
                 packet.source_x = 0.0
                 packet.source_y = 0.0
@@ -1624,30 +2179,46 @@ class Player:
                 self.connection.send(bytes(packet.generate()))
 
     def restock_ammo(self, restock_type: int = 0):
-        """Refill ammo reserve+clip (server-side) and tell the client to
-        refill its own ammo counters via Restock(69).
+        """Restock gun ammo (server-side) and tell the client to restock its
+        own counters via Restock(69).
 
-        ``type=0`` is the full spawn restock used by RoundLifecycle. A physical
+        ``type=0`` is the full spawn restock used by RoundLifecycle (initial
+        clip + initial reserve); AMMO_CRATE adds each gun's stock restock
+        amount to its reserve, capped at the maximum. A physical
         ammo crate must pass ``AMMO_CRATE`` (3); the retail Character receiver
         treats zero as a general restock and also restores health.
         """
         if not self.alive:
             return
-        self._reset_ammo()
+        disguise_before = int(getattr(self, "disguise_stock", 0))
+        if int(restock_type) == int(getattr(C, "AMMO_CRATE", 3)):
+            # Retail Weapon.restock(AMMO_CRATE): reserve += restock amount
+            # (capped at the stock max); the magazine is kept.
+            self._restock_ammo_crate()
+        else:
+            self._reset_ammo()
         self.rocket_turret_stock = min(
             int(getattr(C, "ROCKET_TURRET_STOCK", 4)),
             int(getattr(self, "rocket_turret_stock", 0))
             + int(getattr(C, "ROCKET_TURRET_RESTOCK_AMOUNT", 2)),
         )
-        # A stock ammo crate calls restock() on every equipped weapon/tool in
-        # the client. Mirror that complete reset, including late Battle Builder
-        # projectile weapons and Disguise, rather than only the primary gun.
-        self._reset_equipment_state()
+        # A stock ammo crate calls restock(AMMO_CRATE) on every equipped
+        # weapon/tool in the client: each oriented stock is TOPPED UP
+        # (min(count + restock, max)), cadence and the loaded launcher clip
+        # are kept. Every other restock type is the per-life reset.
+        if int(restock_type) == int(getattr(C, "AMMO_CRATE", 3)):
+            self._restock_oriented_crate()
+        else:
+            self._reset_equipment_state()
         # RoundLifecycle and bot creation send type zero immediately after
         # spawn. New-life deployable stock was already granted by spawn();
         # that notification must not add a second set of consumable items.
         if int(restock_type) != 0:
             restock_deployable_inventory(self)
+            # Retail crate restock: +DISGUISE_RESTOCK_AMOUNT (3), capped at 3,
+            # rather than resetting to the spawn stock of 2.
+            restock = int(getattr(C, "DISGUISE_RESTOCK_AMOUNT", 3))
+            self.disguise_stock = min(restock, disguise_before + restock)
         if self.connection:
             from shared.packet import Restock
             pkt = Restock()
@@ -1706,6 +2277,13 @@ class Player:
             self.connection.send(bytes(pkt.generate()))
 
     def remove_block(self) -> bool:
+        server = self.connection.server if self.connection else None
+        if server is not None:
+            # TeamInfiniteBlocks(82): the client skips its wallet checks.
+            from server.hud_packets import team_infinite_blocks
+
+            if team_infinite_blocks(server, getattr(self, "team", -1)):
+                return True
         if self.blocks > 0:
             self.blocks -= 1
             return True
@@ -1719,53 +2297,120 @@ class Player:
         initial reserve. Snowblower is deliberately absent because it consumes
         the player's shared block wallet instead of weapon ammo.
         """
-        def total(clip_name: str, reserve_name: str, clip_default: int,
-                  reserve_default: int) -> int:
-            return int(getattr(C, clip_name, clip_default)) + int(
-                getattr(C, reserve_name, reserve_default)
-            )
-
         self.oriented_stock = {
-            int(C.GRENADE_TOOL): int(getattr(C, "GRENADE_INITIAL_STOCK", 2)),
-            int(getattr(C, "CLASSIC_GRENADE_TOOL", 31)): int(
-                getattr(C, "CLASSIC_GRENADE_INITIAL_STOCK", 2)
-            ),
-            int(getattr(C, "ANTIPERSONNEL_GRENADE_TOOL", 32)): int(
-                getattr(C, "ANTIPERSONNEL_GRENADE_INITIAL_STOCK", 2)
-            ),
-            int(getattr(C, "MOLOTOV_TOOL", 33)): int(
-                getattr(C, "MOLOTOV_INITIAL_STOCK", 3)
-            ),
-            int(C.RPG_TOOL): total(
-                "RPG_AMMO_CLIP_SIZE", "RPG_AMMO_INITIAL_STOCK", 1, 3
-            ),
-            int(C.RPG2_TOOL): total(
-                "RPG2_AMMO_CLIP_SIZE", "RPG2_AMMO_INITIAL_STOCK", 3, 3
-            ),
-            int(C.DRILLGUN_TOOL): total(
-                "DRILLGUN_AMMO_CLIP_SIZE", "DRILLGUN_AMMO_INITIAL_STOCK", 1, 1
-            ),
-            int(getattr(C, "CHEMICALBOMB_TOOL", 54)): 2,
-            int(getattr(C, "GRENADE_LAUNCHER_WEAPON_TOOL", 55)): total(
-                "GRENADE_LAUNCHER_AMMO_CLIP_SIZE",
-                "GRENADE_LAUNCHER_AMMO_INITIAL_STOCK",
-                1,
-                3,
-            ),
-            int(getattr(C, "STICKY_GRENADE_TOOL", 57)): 2,
-            int(getattr(C, "MINE_LAUNCHER_TOOL", 58)): total(
-                "MINE_LAUNCHER_AMMO_CLIP_SIZE",
-                "MINE_LAUNCHER_AMMO_INITIAL_STOCK",
-                1,
-                3,
-            ),
+            tool: int(magazine_initial) + int(reserve_initial)
+            for tool, (_mag_max, magazine_initial, _reserve_max,
+                       reserve_initial, _restock) in ORIENTED_STOCK_AMMO.items()
         }
         self.grenades = self.oriented_stock[int(C.GRENADE_TOOL)]
         self._oriented_next_use = {}
+        # launcher tool -> [rounds left in the clip, monotonic last use]
+        self._launcher_rounds = {}
         self.disguise_stock = int(getattr(C, "DISGUISE_INITIAL_STOCK", 2))
         self._disguise_next_use = 0.0
 
-    def can_use_oriented_item(self, tool: int, now: Optional[float] = None) -> bool:
+    def _restock_oriented_crate(self, now: Optional[float] = None) -> None:
+        """Retail ``restock(AMMO_CRATE)`` on every oriented tool.
+
+        Tops each stock up (never resets it) and keeps cadence and the loaded
+        launcher clip, exactly as the stock client (and the native
+        ``WeaponReplicationState::restock_from_ammo_crate``) predicts. The
+        server keeps one combined magazine+reserve total per launcher, so the
+        magazine part is taken from the inferred clip state.
+        """
+        current_time = time.monotonic() if now is None else float(now)
+        stock = getattr(self, "oriented_stock", None)
+        if not isinstance(stock, dict):
+            self._reset_equipment_state()
+            return
+        for tool, (mag_max, _mag_init, reserve_max, _reserve_init,
+                   restock) in ORIENTED_STOCK_AMMO.items():
+            total = max(0, int(stock.get(tool, 0)))
+            if reserve_max <= 0:
+                stock[tool] = min(total + int(restock), int(mag_max))
+                continue
+            clip_left = self._launcher_clip_left(tool, current_time)
+            magazine = min(total, int(mag_max) if clip_left is None else int(clip_left))
+            reserve = total - magazine
+            stock[tool] = magazine + min(reserve + int(restock), int(reserve_max))
+        self.grenades = stock.get(int(C.GRENADE_TOOL), self.grenades)
+
+    # Retail launchers with a clip: an emptied clip auto-reloads before the
+    # next round. UGC editor launchers are deliberately excluded.
+    _RELOADING_LAUNCHERS = frozenset(
+        int(getattr(C, name))
+        for name in (
+            "RPG_TOOL",
+            "RPG2_TOOL",
+            "DRILLGUN_TOOL",
+            "GRENADE_LAUNCHER_WEAPON_TOOL",
+            "MINE_LAUNCHER_TOOL",
+        )
+        if hasattr(C, name)
+    )
+
+    # Stock ``clip_reload = True`` launchers (RPG2Weapon only).
+    _CLIP_RELOAD_LAUNCHERS = frozenset((int(C.RPG2_TOOL),))
+
+    @staticmethod
+    def _launcher_timing(tool: int) -> Optional[tuple[int, float]]:
+        """(clip size, minimum seconds from an emptying shot to the next)."""
+        from server.game_constants import WEAPON_CATALOG
+
+        profile = WEAPON_CATALOG.get(int(tool))
+        if profile is None:
+            return None
+        clip = int(getattr(profile, "clip_size", 0) or 0)
+        reload_time = float(getattr(profile, "reload_time", 0.0) or 0.0)
+        if clip <= 0 or reload_time <= 0.0:
+            return None
+        interval = max(0.0, float(getattr(profile, "fire_interval", 0.0) or 0.0))
+        grace = LAUNCHER_RELOAD_GRACE_SECONDS + (
+            LAUNCHER_RELOAD_GRACE_FRACTION * reload_time
+        )
+        return clip, max(interval, interval + reload_time - grace)
+
+    def _launcher_clip_left(self, tool: int, current_time: float) -> Optional[int]:
+        """Rounds the retail clip holds at ``current_time`` (None: no clip).
+
+        The server never sees WeaponReload for launchers, so a reload is
+        inferred from time: any gap long enough to reload refills the clip.
+        This also covers a manual reload of a partly used RPG2 clip.
+        """
+        if tool not in self._RELOADING_LAUNCHERS or bool(
+            getattr(self, "is_bot", False)
+        ):
+            return None
+        timing = self._launcher_timing(tool)
+        if timing is None:
+            return None
+        clip, reload_gap = timing
+        rounds = getattr(self, "_launcher_rounds", None)
+        state = rounds.get(tool) if isinstance(rounds, dict) else None
+        if state is None:
+            return clip
+        left, last_use = state
+        gap = current_time - float(last_use)
+        if gap < reload_gap:
+            return int(left)
+        if tool in self._CLIP_RELOAD_LAUNCHERS:
+            # Stock ``clip_reload`` (RPG2): each reload cycle loads ONE round
+            # (``reload_time`` apart), so a gap refills only the cycles that
+            # fit rather than the whole clip.
+            from server.game_constants import WEAPON_CATALOG
+
+            reload_time = float(WEAPON_CATALOG[int(tool)].reload_time)
+            cycles = 1 + int((gap - reload_gap) // max(reload_time, 1e-6))
+            return min(clip, int(left) + cycles)
+        return clip
+
+    def can_use_oriented_item(
+        self,
+        tool: int,
+        now: Optional[float] = None,
+        *,
+        report_violation: bool = True,
+    ) -> bool:
         """Validate cadence and authoritative ammo for packet 10.
 
         This is a read-only preflight. The handler consumes inventory only
@@ -1778,6 +2423,21 @@ class Player:
             return deployable_ready(self, tool, current_time)
         if current_time + FIRE_RATE_GRACE < self._oriented_next_use.get(tool, 0.0):
             return False
+        if self._launcher_clip_left(tool, current_time) == 0:
+            # The clip is empty and no reload fits since the emptying shot:
+            # the stock client cannot fire here (reload skip).
+            if report_violation:
+                state = self._launcher_rounds.get(tool)
+                connection = getattr(self, "connection", None)
+                anticheat.report(
+                    getattr(connection, "server", None),
+                    self,
+                    "launcher_reload_skip",
+                    tool=tool,
+                    since=round(current_time - float(state[1]), 3)
+                    if state else None,
+                )
+            return False
         if tool in (
             int(getattr(C, "SNOWBLOWER_TOOL", 29)),
             int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
@@ -1786,16 +2446,36 @@ class Player:
             # editor's only limit is the client's global BlockManager capacity.
             if tool == int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)):
                 return True
-            return int(self.blocks) > 0
+            # Stock SnowBlowerWeapon.get_has_enough_ammo honours
+            # TeamInfiniteBlocks(82) like the block tool.
+            return self._team_infinite_blocks() or int(self.blocks) > 0
         return int(self.oriented_stock.get(tool, 1)) > 0
+
+    def _team_infinite_blocks(self) -> bool:
+        connection = getattr(self, "connection", None)
+        server = getattr(connection, "server", None) if connection else None
+        if server is None:
+            return False
+        from server.hud_packets import team_infinite_blocks
+
+        return bool(team_infinite_blocks(server, getattr(self, "team", -1)))
 
     def consume_oriented_item(self, tool: int,
                               now: Optional[float] = None) -> bool:
         """Commit one successfully spawned oriented projectile."""
         tool = int(tool)
         current_time = time.monotonic() if now is None else float(now)
-        if not self.can_use_oriented_item(tool, current_time):
+        if not self.can_use_oriented_item(
+            tool, current_time, report_violation=False
+        ):
             return False
+        clip_left = self._launcher_clip_left(tool, current_time)
+        if clip_left is not None:
+            rounds = getattr(self, "_launcher_rounds", None)
+            if not isinstance(rounds, dict):
+                rounds = {}
+                self._launcher_rounds = rounds
+            rounds[tool] = [max(0, clip_left - 1), current_time]
 
         if tool in (int(C.DYNAMITE_TOOL), int(C.LANDMINE_TOOL)):
             commit_deployable_use(self, tool, current_time)
@@ -1806,7 +2486,9 @@ class Player:
             int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
         ):
             if tool != int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)):
-                self.blocks = max(0, int(self.blocks) - 1)
+                # Free under TeamInfiniteBlocks(82), like remove_block().
+                if not self._team_infinite_blocks():
+                    self.blocks = max(0, int(self.blocks) - 1)
         elif tool in self.oriented_stock:
             self.oriented_stock[tool] = max(0, self.oriented_stock[tool] - 1)
             if tool == int(C.GRENADE_TOOL):
@@ -1831,6 +2513,9 @@ class Player:
             # gun-to-gun switch. Repeated ClientData for one tool does not.
             self.reloading = False
             self.reload_end_time = 0.0
+            if int(tool) == int(C.MG_TOOL) and int(self.tool) != int(C.MG_TOOL):
+                # Remember the hand tool so an MG unmount can restore it.
+                self._tool_before_mg = int(self.tool)
         self.tool = tool
         self.tool_is_raw = raw
         if raw and tool in WEAPON_PROFILES:
@@ -1841,6 +2526,47 @@ class Player:
         if not self.is_weapon_tool():
             self.reloading = False
             self.reload_end_time = 0.0
+
+    def ensure_legal_tool(self) -> Optional[int]:
+        """Replace a held tool this life may no longer hold.
+
+        Returns the tool switched to, or ``None`` when the current tool is
+        still authorized (or nothing legal exists, in which case it is kept).
+        Candidates: the tool held before mounting an MG, the active weapon,
+        then the committed loadout in order.
+        """
+        from server.class_selection import equipped_tool_authorized
+
+        if not self.alive or not self.spawned:
+            return None
+        if equipped_tool_authorized(self, int(self.tool)):
+            return None
+        candidates = [self._tool_before_mg, self.weapon]
+        candidates.extend(getattr(self, "loadout", None) or ())
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            candidate = int(candidate)
+            if candidate == int(self.tool) or candidate == int(C.MG_TOOL):
+                continue
+            if equipped_tool_authorized(self, candidate):
+                self.set_tool(candidate, raw=True)
+                return candidate
+        return None
+
+    def on_machine_gun_unmounted(self) -> Optional[int]:
+        """Hook for ``MachineGunBehavior.unmount``: drop the mounted MG tool.
+
+        Leaving the gun (movement, damage, death) must not leave the server
+        believing the player still holds MG_TOOL, which ClientData can no
+        longer replace once the mount no longer authorizes it.
+        """
+        if int(self.tool) != int(C.MG_TOOL):
+            self._tool_before_mg = None
+            return None
+        switched = self.ensure_legal_tool()
+        self._tool_before_mg = None
+        return switched
 
     def reset_block_color_for_spawn(self) -> int:
         """Reset the held-block palette to the current team's RGB color.
@@ -1900,6 +2626,9 @@ class Player:
         )
         self._owner_anchor_history.append(anchor)
         self.last_advertised_owner_position = anchor.position
+        # This row carries WorldUpdate state bit 0x01 to the retail owner;
+        # a changed canopy bit starts the physics handoff from here.
+        self._note_parachute_owner_row()
 
     def _claim_owner_timeline_sequence(
         self, supplied: Optional[int] = None
@@ -1995,9 +2724,7 @@ class Player:
         if world_object is None:
             return
 
-        if self.reloading and time.monotonic() >= self.reload_end_time:
-            if self.finish_reload():
-                self._broadcast_reload_state(True)
+        self._advance_reload_and_announce()
 
         self.last_update = time.time()
         self.movement_time += dt
@@ -2033,20 +2760,31 @@ class Player:
                 "position", pre_position
             )
         self._update_jetpack(dt)
-        self._update_parachute()
+        self._update_parachute(dt)
         self._apply_input_state_to_world(
             trigger_jump=trigger_jump, collisions=positions
         )
+        chute_pre_vz = float(world_object.velocity.z)
+        chute_physics = bool(self._parachute_physics_active)
         result = world_object.update(dt, positions)
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
-        # The landing row must close the canopy immediately. Waiting for the
-        # next pre-movement ability update publishes a grounded open chute and
-        # can carry its no-fall-damage state into the next jump.
-        if not self.airborne or self.wade:
-            self.parachute_active = False
-            self._parachute_deploy_pending = False
-            world_object.parachute_active = False
+        # The landing row must close the advertised canopy immediately, and
+        # the same landing re-arms the one-deploy-per-fall latch. Physics
+        # follows through the owner handoff (retail owner still has it open).
+        self.last_fall_result = self._parachute_after_move(
+            dt,
+            was_airborne,
+            chute_pre_vz,
+            chute_physics,
+            self.last_fall_result,
+        )
+        self._check_disguise_stationary()
+        now_airborne = bool(self.airborne)
+        if was_airborne:
+            self._fall_air_time = float(getattr(self, "_fall_air_time", 0.0)) + float(dt)
+        elif now_airborne:
+            self._airborne_since = time.monotonic()
         if self.last_fall_result > 0:
             server = self.connection.server if self.connection else None
             config = getattr(server, "config", None)
@@ -2060,11 +2798,20 @@ class Player:
                         "RULE_ENABLE_FALL_ON_WATER_DAMAGE"
                     )
                 ):
-                    self.damage(
+                    amount = self.scaled_fall_damage(
                         self.last_fall_result,
-                        source=None,
-                        kill_type=int(C.KILL.FALL_KILL),
+                        float(getattr(self, "_fall_air_time", 0.0)),
                     )
+                    if amount > 0.0:
+                        self.damage(
+                            amount,
+                            source=None,
+                            kill_type=int(C.KILL.FALL_KILL),
+                        )
+        if not now_airborne:
+            self._fall_air_time = 0.0
+            if was_airborne:
+                self._rocket_jump_blast_at = None
         self._apply_client_authority_pin()
         self.last_landed = bool(was_airborne and self.grounded)
         self.last_step_delta = round(float(self.z - pre_position[2]), 4)
@@ -2073,6 +2820,69 @@ class Player:
             self.last_native_post_update = self._capture_native_debug_state(
                 world_object, "post_update", positions
             )
+
+    def break_disguise(self) -> bool:
+        """End an active Disguise ("- Must remain stationary")."""
+        if not bool(getattr(self, "disguised", False)):
+            return False
+        self.disguised = False
+        return True
+
+    def _check_disguise_stationary(self) -> None:
+        """Retail Disguise lasts only while its wearer stays still.
+
+        The stock client only ever SENDS the activation (no deactivate path in
+        character/gameScene/player), so the retail server cleared WorldUpdate
+        state bit 0x02 itself. Any walk/jump input, or being displaced
+        horizontally more than DISGUISE_MOVE_TOLERANCE from where it was put
+        on, breaks it (threshold inferred; rules audit 2026-09-27 #10).
+        """
+        if not bool(getattr(self, "disguised", False)):
+            return
+        state = getattr(self, "input", None)
+        if state is not None and any(
+            bool(getattr(state, name, False))
+            for name in ("up", "down", "left", "right", "jump")
+        ):
+            self.break_disguise()
+            return
+        anchor = getattr(self, "_disguise_anchor", None)
+        if anchor is None:
+            self._disguise_anchor = (float(self.x), float(self.y), float(self.z))
+            return
+        if math.hypot(float(self.x) - anchor[0], float(self.y) - anchor[1]) > (
+            DISGUISE_MOVE_TOLERANCE
+        ):
+            self.break_disguise()
+
+    def note_own_blast_push(self, kill_type: int) -> None:
+        """Remember an own-rocket self-push (ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER)."""
+        if int(kill_type) in _ROCKET_JUMP_KILL_TYPES:
+            self._rocket_jump_blast_at = time.monotonic()
+
+    def scaled_fall_damage(self, raw: float, air_time: float) -> float:
+        """Apply the stock server-only fall rules to one landing's damage.
+
+        * ``ZERO/MAX_FALL_DAMAGE_AIR_TIME`` (1/60 s, 4/60 s): a landing whose
+          airborne phase was that short (a correction or teleport, never a
+          real fall) is scaled linearly from 0 to full.
+        * ``ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER`` (0.2): the airborne phase was
+          launched by (or included) the player's own rocket blast.
+
+        Both semantics are inferred from the constant names (rules audit
+        2026-09-27 #6/#18); a normal fall is unchanged.
+        """
+        amount = float(raw)
+        span = MAX_FALL_DAMAGE_AIR_TIME - ZERO_FALL_DAMAGE_AIR_TIME
+        if span > 0.0:
+            fraction = (float(air_time) - ZERO_FALL_DAMAGE_AIR_TIME) / span
+            amount *= max(0.0, min(1.0, fraction))
+        blast_at = getattr(self, "_rocket_jump_blast_at", None)
+        if blast_at is not None:
+            airborne_since = float(getattr(self, "_airborne_since", 0.0) or 0.0)
+            if float(blast_at) >= airborne_since - ROCKET_JUMP_TAKEOFF_WINDOW_SECONDS:
+                amount *= ROCKET_JUMP_FALL_DAMAGE_MULTIPLIER
+        return amount
 
     def _update_jetpack(self, dt: float) -> None:
         """Advance the negotiated fuel policy using original native thrust.
@@ -2164,7 +2974,10 @@ class Player:
                     # the unobservable GameScene boundary settles.
                     self._jetpack_physics_active = False
                     self._jetpack_activation_defer_remaining = (
-                        JETPACK_ACTIVATION_DEFER_FRAMES
+                        self._jetpack_boundary_frames(
+                            "jetpack_activation_defer_frames",
+                            JETPACK_ACTIVATION_DEFER_FRAMES,
+                        )
                     )
                     self._jetpack_exhaustion_tail_remaining = 0
                     newly_activated = True
@@ -2199,7 +3012,11 @@ class Player:
                 self._jetpack_requires_release = True
                 self._jetpack_activation_defer_remaining = 0
                 self._jetpack_exhaustion_tail_remaining = (
-                    1 if self._jetpack_physics_active else 0
+                    self._jetpack_boundary_frames(
+                        "jetpack_exhaustion_tail_frames",
+                        JETPACK_EXHAUSTION_TAIL_FRAMES,
+                    )
+                    if self._jetpack_physics_active else 0
                 )
 
         if (
@@ -2220,31 +3037,352 @@ class Player:
         if not physics_was_active and self._jetpack_physics_active:
             self._note_jetpack_physics_started()
 
-    def _update_parachute(self) -> None:
-        """Open the parachute using the maintained client's Z-key extension.
+    # ------------------------------------------------------------------
+    # Parachute (equipment 72). Evidence, rules and measurements live in
+    # docs/PARACHUTE.md. The canopy arithmetic is the stock native mover;
+    # everything here decides WHEN the canopy is open and what it protects.
+    # ------------------------------------------------------------------
+    def _reset_parachute_state(self) -> None:
+        """Close the canopy on both sides with no owner handoff.
 
-        The custom parachute_key_patch bypasses stock Character.set_hover,
-        which only accepts UGC pack 69, to send ClientData action bit 0x80.
-        Keep the existing airborne rising-edge policy pending recovery of the
-        original server's deployment rule; this is not stock-client behavior.
+        Construction, spawn and death: the retail Character clears its own
+        canopy on spawn and death (0x1001700B / 0x1003393B), so no WorldUpdate
+        row has to carry this transition and physics may close immediately.
         """
-        deploy_held = bool(self.input.hover)
-        deploy_pressed = bool(
-            deploy_held and not self._parachute_deploy_last_held
+        self.parachute_active = False
+        self._parachute_physics_active = False
+        self._parachute_physics_schedule = deque()
+        self._parachute_owner_state = False
+        self._parachute_unsent_frames = 0
+        self._parachute_deploy_last_held = False
+        self._parachute_jump_last_held = False
+        self._parachute_deploy_pending = False
+        self._parachute_used_this_fall = False
+        self._parachute_open_frames = 0
+        self._parachute_fall_touched = False
+        self._parachute_fallback_clock = 0
+        self.last_parachute_event = None
+
+    def _parachute_setting(self, name: str, default):
+        """Numeric policy knob from config (lower-case name), else default."""
+        config = getattr(
+            getattr(self.connection, "server", None), "config", None
         )
-        self._parachute_deploy_last_held = deploy_held
-        equipped = self.alive and self.parachute_id == int(C.A370)
-        if not equipped or not self.airborne or self.wade:
-            self.parachute_active = False
-            self._parachute_deploy_pending = False
-            return
-        if deploy_pressed:
-            self._parachute_deploy_pending = True
-        if self._parachute_deploy_pending and (
-            not profile_for(self).descending_parachute_only or self.vz >= 0.0
+        value = getattr(config, name.lower(), None) if config is not None else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        return type(default)(value)
+
+    def _parachute_native_owner(self) -> bool:
+        """Negotiated BattleSpades clients predict their own Z-key canopy."""
+        return bool(profile_for(self).descending_parachute_only)
+
+    def _parachute_immediate_physics(self) -> bool:
+        """Whether canopy physics may follow the advertised state at once.
+
+        Bots and connection-less players have no predicting owner. The native
+        BattleSpades client opens its canopy in the same step as its Z edge.
+        Only retail owners need the WorldUpdate handoff.
+        """
+        if self.connection is None or bool(getattr(self, "is_bot", False)):
+            return True
+        return self._parachute_native_owner()
+
+    def _parachute_can_hold_canopy(self) -> bool:
+        """Alive, carrying equipment 72, and no jetpack (no flight stacking)."""
+        return bool(
+            self.alive
+            and int(self.parachute_id or 0) == PARACHUTE_ID
+            and int(self.jetpack_id or 0) not in _JETPACK_PROPERTIES
+        )
+
+    def _parachute_ground_clearance(self) -> Optional[float]:
+        """Blocks from the feet to the nearest solid voxel below the body.
+
+        Takes the minimum over the centre and the four hull corners, so a
+        player skimming a ledge does not count as high. ``None`` without a map.
+        """
+        server = getattr(self.connection, "server", None)
+        world = getattr(getattr(server, "world_manager", None), "world", None)
+        game_map = getattr(world, "map", None)
+        if game_map is None:
+            return None
+        feet =float(self.z) + float(self._current_contact_offset())
+        start = max(0, int(math.floor(feet)))
+        radius = 0.45
+        best = None
+        for dx, dy in (
+            (0.0, 0.0), (-radius, -radius), (radius, -radius),
+            (-radius, radius), (radius, radius),
         ):
-            self.parachute_active = True
+            try:
+                ground = int(game_map.get_z(
+                    int(math.floor(self.x + dx)),
+                    int(math.floor(self.y + dy)),
+                    start,
+                ))
+            except Exception:
+                return None
+            clearance = float(ground) - feet
+            best = clearance if best is None else min(best, clearance)
+        return best
+
+    def _set_parachute_advertised(self, active: bool, reason: str) -> None:
+        active = bool(active)
+        if active == bool(self.parachute_active):
+            return
+        self.parachute_active = active
+        if active:
+            self._parachute_open_frames = 0
+            self._parachute_used_this_fall = True
             self._parachute_deploy_pending = False
+        self.last_parachute_event = {
+            "active": active,
+            "reason": reason,
+            "loop": self.last_applied_input_loop,
+            "z": round(float(self.z), 3),
+            "vz": round(float(self.vz), 4),
+        }
+        logger.debug(
+            "parachute %s %s: %s loop=%s z=%.2f vz=%.4f",
+            "open" if active else "close",
+            self.name,
+            reason,
+            self.last_applied_input_loop,
+            float(self.z),
+            float(self.vz),
+        )
+
+    def _update_parachute(self, dt: float = 1.0 / 60.0) -> None:
+        """Advance the canopy rules for one accepted input frame.
+
+        Retail has no parachute control (the Z binding is UGC-only and
+        ClientData has no parachute field); the canopy state is server-owned
+        and replicated in WorldUpdate state bit 0x01. Stock world.pyd keeps
+        the airborne SPACE request only for jetpack and parachute holders
+        (0x10012D32), so an airborne SPACE press opens a retail owner's canopy.
+        The ClientData hover bit (patched/native Z) is accepted as well.
+        """
+        hover_held = bool(self.input.hover)
+        jump_held = bool(self.input.jump)
+        hover_pressed = hover_held and not self._parachute_deploy_last_held
+        jump_pressed = jump_held and not self._parachute_jump_last_held
+        self._parachute_deploy_last_held = hover_held
+        self._parachute_jump_last_held = jump_held
+        # Retail owners and native BattleSpades owners both deploy with an
+        # airborne SPACE press; the native client predicts that edge through
+        # these same rules (client parity item P1-19), and keeps Z as an extra
+        # binding. Bot jump presses are locomotion only; bot AI opens a canopy
+        # explicitly through the same hover action it uses for pack 69.
+        pressed = hover_pressed or (
+            jump_pressed
+            and not bool(getattr(self, "is_bot", False))
+        )
+        grounded = (not self.airborne) or bool(self.wade)
+        if grounded:
+            self._parachute_used_this_fall = False
+        if grounded or not self._parachute_can_hold_canopy():
+            self._parachute_deploy_pending = False
+            if self.parachute_active:
+                self._set_parachute_advertised(
+                    False, "grounded" if grounded else "unequipped"
+                )
+        elif self.parachute_active:
+            self._parachute_open_frames += 1
+            max_open = float(self._parachute_setting(
+                "parachute_max_open_seconds", PARACHUTE_MAX_OPEN_SECONDS
+            ))
+            max_rise = float(self._parachute_setting(
+                "parachute_max_rise_velocity", PARACHUTE_MAX_RISE_VELOCITY
+            ))
+            if max_open > 0.0 and self._parachute_open_frames * dt >= max_open:
+                self._set_parachute_advertised(False, "timeout")
+            elif float(self.vz) < -max_rise:
+                self._set_parachute_advertised(False, "lifted")
+        else:
+            if pressed and not self._parachute_used_this_fall:
+                self._parachute_deploy_pending = True
+            # A press during ascent (or over a ledge) stays armed for this
+            # fall; it opens only while descending with enough clearance, so
+            # it can neither boost a jump nor float a hop.
+            if self._parachute_deploy_pending and float(self.vz) >= 0.0:
+                clearance = self._parachute_ground_clearance()
+                minimum = float(self._parachute_setting(
+                    "parachute_min_deploy_clearance",
+                    PARACHUTE_MIN_DEPLOY_CLEARANCE,
+                ))
+                if clearance is None or clearance >= minimum:
+                    self._set_parachute_advertised(True, "deploy")
+        self._advance_parachute_physics()
+
+    def _parachute_clock(self) -> int:
+        """Label of the input frame being simulated (the owner's clock)."""
+        if self.last_applied_input_loop is not None:
+            return int(self.last_applied_input_loop)
+        return int(self._parachute_fallback_clock)
+
+    def _parachute_handoff_frames(self) -> int:
+        """Labels from the current clock to the retail owner's onset.
+
+        Measured on loopback (docs/PARACHUTE.md): the stock owner first moves
+        with a new canopy state on label ``S + 3``, where ``S`` is the input
+        label whose simulation queued the row, and never before ``N + 2``,
+        where ``N`` is the newest label already received (it was sent before
+        the row could arrive). Real latency adds the round trip in frames.
+        """
+        base = int(self._parachute_setting(
+            "parachute_owner_handoff_frames", PARACHUTE_OWNER_HANDOFF_FRAMES
+        ))
+        frames = base
+        applied = self.last_applied_input_loop
+        history = getattr(self, "input_history", None)
+        if applied is not None and history:
+            try:
+                newest = int(max(history))
+            except (TypeError, ValueError):
+                newest = int(applied)
+            frames = max(base, min(newest - int(applied), 10) + base - 1)
+        rtt_frames = 0
+        peer = getattr(self.connection, "peer", None)
+        rtt = getattr(peer, "roundTripTime", None)
+        if isinstance(rtt, (int, float)) and not isinstance(rtt, bool):
+            rtt_frames = int(round(max(0.0, float(rtt)) * 60.0 / 1000.0))
+        return max(1, min(PARACHUTE_OWNER_HANDOFF_MAX_FRAMES, frames + rtt_frames))
+
+    def _queue_parachute_physics(self, state: bool, frames: int) -> None:
+        self._parachute_owner_state = bool(state)
+        self._parachute_unsent_frames = 0
+        self._parachute_physics_schedule.append(
+            [self._parachute_clock() + max(1, int(frames)), bool(state)]
+        )
+
+    def _note_parachute_owner_row(self) -> None:
+        """An owner self row was queued; start the handoff if its bit changed."""
+        state = bool(self.parachute_active)
+        if state == self._parachute_owner_state:
+            return
+        if self._parachute_immediate_physics():
+            self._parachute_owner_state = state
+            return
+        self._queue_parachute_physics(state, self._parachute_handoff_frames())
+
+    def _advance_parachute_physics(self) -> None:
+        """Move the native canopy flag along the owner handoff timeline."""
+        self._parachute_fallback_clock += 1
+        if self._parachute_immediate_physics():
+            self._parachute_physics_schedule.clear()
+            self._parachute_owner_state = bool(self.parachute_active)
+            self._parachute_unsent_frames = 0
+            self._parachute_physics_active = bool(self.parachute_active)
+            return
+        schedule = self._parachute_physics_schedule
+        clock = self._parachute_clock()
+        while schedule and clock >= schedule[0][0]:
+            self._parachute_physics_active = bool(schedule.popleft()[1])
+        if bool(self.parachute_active) != self._parachute_owner_state:
+            self._parachute_unsent_frames += 1
+            if self._parachute_unsent_frames >= PARACHUTE_UNSENT_HANDOFF_FRAMES:
+                self._queue_parachute_physics(
+                    self.parachute_active, self._parachute_handoff_frames()
+                )
+        else:
+            self._parachute_unsent_frames = 0
+
+    def _parachute_after_move(
+        self,
+        dt: float,
+        was_airborne: bool,
+        pre_vz: float,
+        physics_active: bool,
+        native_result: int,
+    ) -> int:
+        """Close on landing/water, re-arm, and apply the canopy damage rule.
+
+        The native mover zeroes the fall distance on every canopy frame, which
+        would let a canopy opened a frame before impact erase any fall. A
+        canopy instead protects only as far as it has actually braked: a
+        landing that touched a canopy costs the damage of a free fall that
+        reaches the same landing speed (never less than the native result).
+        """
+        if was_airborne and (physics_active or self.parachute_active):
+            self._parachute_fall_touched = True
+        if self.airborne and not self.wade:
+            return native_result
+        if self.parachute_active:
+            self._set_parachute_advertised(
+                False, "water" if self.wade else "landed"
+            )
+        self._parachute_deploy_pending = False
+        self._parachute_used_this_fall = False
+        if self._parachute_immediate_physics():
+            self._advance_parachute_physics_now()
+        touched = self._parachute_fall_touched
+        self._parachute_fall_touched = False
+        if not touched or not was_airborne:
+            return native_result
+        speed_damage = self._parachute_speed_damage(dt, pre_vz, physics_active)
+        if speed_damage > max(0, int(native_result)):
+            return speed_damage
+        return native_result
+
+    def _advance_parachute_physics_now(self) -> None:
+        self._parachute_physics_schedule.clear()
+        self._parachute_owner_state = bool(self.parachute_active)
+        self._parachute_physics_active = bool(self.parachute_active)
+        world_object = self._world_object
+        if world_object is not None:
+            try:
+                world_object.parachute_active = bool(self.parachute_active)
+            except Exception:
+                pass
+
+    def _parachute_gravity(self) -> float:
+        server = getattr(self.connection, "server", None)
+        world = getattr(getattr(server, "world_manager", None), "world", None)
+        getter = getattr(world, "get_gravity", None)
+        if callable(getter):
+            try:
+                return float(getter())
+            except Exception:
+                pass
+        return 1.0
+
+    def _parachute_speed_damage(
+        self, dt: float, pre_vz: float, physics_active: bool
+    ) -> int:
+        """Free-fall-equivalent damage for this frame's landing speed."""
+        gravity = self._parachute_gravity()
+        dt = float(dt) if dt and dt > 0.0 else 1.0 / 60.0
+        if gravity <= 0.0:
+            return 0
+        factor = 0.05000000074505806 if physics_active else 1.0
+        landing_speed = (float(pre_vz) + dt * gravity * factor) / (1.0 + dt)
+        if landing_speed <= 0.0:
+            return 0
+        # Same recurrence as the native mover's free fall from rest; the
+        # distance travelled before reaching ``landing_speed`` is the fall
+        # that would have produced this impact without a canopy.
+        velocity = 0.0
+        distance = 0.0
+        for _ in range(1800):
+            velocity = (velocity + dt * gravity) / (1.0 + dt)
+            if velocity >= landing_speed:
+                break
+            distance += velocity * dt * 32.0
+        profile = self.movement_profile
+        fall = distance * gravity
+        minimum = float(profile.falling_damage_min_distance)
+        maximum = float(profile.falling_damage_max_distance)
+        span = maximum - minimum
+        if span > 0.0:
+            ratio = (fall - minimum) / span
+        else:
+            ratio = 1.0 if fall >= maximum else 0.0
+        ratio = min(1.0, max(0.0, ratio))
+        damage = int(float(profile.falling_damage_max_damage) * ratio)
+        if float(self.z) > 237.0:
+            damage = int(damage * float(profile.fall_on_water_damage_multiplier))
+        return damage
 
     def update_input(
         self,
@@ -2274,34 +3412,14 @@ class Player:
         # consumed directly each tick in update() (client-pipeline mirror).
 
     def _award_teabag_point(self) -> None:
-        """Award one configured point per enemy death on a crouch edge."""
+        """Crouch edge: retail teabag rule (server/combat_scores.py)."""
 
         server = self.connection.server if self.connection else None
-        config = getattr(server, "config", None)
-        if config is None or not self.alive:
+        if server is None or not self.alive:
             return
-        from server.game_rules import get_rules
+        from server.combat_scores import record_teabag_crouch
 
-        if not get_rules(config).enabled("RULE_POINTS_FROM_TEABAGGING"):
-            return
-        for victim in server.players.values():
-            if victim is self or victim.alive or victim.team == self.team:
-                continue
-            death_key = (int(victim.id), float(victim.death_time))
-            if death_key in self._teabagged_deaths or victim.death_time <= 0.0:
-                continue
-            distance_sq = sum(
-                (float(self.position[index]) - float(victim.position[index])) ** 2
-                for index in range(3)
-            )
-            if distance_sq > 2.5 ** 2:
-                continue
-            self._teabagged_deaths.add(death_key)
-            self.score += 1
-            from server.scoreboard import send_player_score
-
-            send_player_score(server, self)
-            break
+        record_teabag_crouch(server, self)
 
     def queue_velocity_impulse(
         self,
@@ -2455,6 +3573,10 @@ class Player:
         intervals reflect transport/event-loop scheduling and made previously
         exact straight movement diverge when used as client frame dt.
         """
+        self._last_client_data_at = time.monotonic()
+        # AFK: idle clients keep streaming identical rows, so only a change
+        # of keys/aim counts as activity (server.conduct).
+        conduct.observe_input(self, flags, orientation, action_flags)
         if not self.alive or not self.spawned:
             # The retail client keeps sending ClientData during the class-change
             # death screen. Those frames describe the old body and spawn()
@@ -2482,10 +3604,27 @@ class Player:
             self.input_frames_stale += 1
             self.input_frames_dropped += 1
             return
+        server = self.connection.server if self.connection else None
+        if self._label_far_ahead(server, loop_count, received_server_tick):
+            return
+        try:
+            orientation = tuple(float(value) for value in orientation)
+        except (TypeError, ValueError):
+            orientation = ()
+        if len(orientation) != 3 or not all(
+            math.isfinite(value) for value in orientation
+        ):
+            anticheat.report(server, self, "orientation_nonfinite")
+            orientation = tuple(
+                self._applied_orientation or self.orientation
+            )
         self._input_receive_sequence += 1
+        world_manager = getattr(server, "world_manager", None)
+        topology = getattr(world_manager, "topology_version", None)
         self.input_history[loop_count] = BufferedInputFrame(
             movement_flags=tuple(flags),
-            orientation=tuple(orientation),
+            orientation=orientation,
+            topology_version=None if topology is None else int(topology),
             action_flags=None if action_flags is None else tuple(action_flags),
             received_server_tick=(
                 None
@@ -2516,16 +3655,24 @@ class Player:
         looks up its OWN movement_history at the self-row's loop_count and, if
         the server position differs, ADJUSTs (>0.1 block) or SNAPs (>4 blocks,
         wiping history — the "random rollback"). Each authoritative position
-        must therefore represent a loop label received in ClientData. Retail
-        loop labels can skip integers without producing history entries, so a
-        synthetic acknowledgement is an immediate native-client SNAP.
+        must therefore represent a loop label the client simulated. The client
+        advances loop_count by exactly one per update (IDA: GameScene.update),
+        one physics step, one history row and one unsequenced ClientData per
+        label, and only rewrites the counter on a ClockSync drift of more than
+        ten loops. A small missing label is therefore a lost packet for a frame
+        the client did simulate; it is refilled with the held input under that
+        label (``_synthesize_missing_frame``) so authority never trails by a
+        frame. Wider gaps are clock jumps and are never refilled.
 
         A packet burst remains queued for later server ticks. Empty ticks freeze
-        movement and its acknowledgement.  The next real ClientData always
-        advances exactly one fixed frame: retail loop labels can skip by two in
-        an ordinary 17 ms update, so neither the label gap nor server starvation
+        movement and its acknowledgement.  Every consumed or refilled frame is
+        exactly one fixed step: neither arrival timing nor server starvation
         encodes a client physics duration.
         """
+        # Lag-compensation target history: the state the previous tick's
+        # WorldUpdate published, labelled loop_count - 1 (dead bodies too, so
+        # a rewind never crosses a death). See server/lag_compensation.py.
+        _record_lag_history(self)
         if not self.alive or not self.spawned:
             return
 
@@ -2535,6 +3682,10 @@ class Player:
         # human-client starvation freeze below.
         if self.is_bot:
             await self.update(dt)
+            return
+
+        server = self.connection.server if self.connection else None
+        if self._check_starvation_timeout(server):
             return
 
         if self.last_applied_input_loop is not None:
@@ -2552,11 +3703,56 @@ class Player:
             # Freeze movement and its acknowledgement together.  Never roll
             # this server-side wait into a later nonlinear physics step.
             self.input_starved_ticks += 1
+            self._starved_streak += 1
+            self._backlog_over_ticks = 0
+            if await self._starvation_gravity_step(server, dt):
+                self._trace_input_sample(None, None, starved=True)
+                return
             self._tick_idle()
+            self._trace_input_sample(None, None, starved=True)
             return
+        self._starved_streak = 0
 
+        catch_up = self._input_backlog_policy(server)
+        await self._consume_input_frame(server, dt)
+        if (
+            catch_up
+            and self.alive
+            and self.spawned
+            and self.last_applied_input_loop is not None
+            and (self.last_applied_input_loop + 1) in self.input_history
+        ):
+            # Backlog catch-up: a second contiguous frame whose pair was
+            # proven transition-free by _input_backlog_policy.
+            self.input_frames_catchup += 1
+            await self._consume_input_frame(server, dt)
+
+    async def _consume_input_frame(self, server, dt: float) -> None:
+        """Simulate the oldest buffered frame (or refill one lost label)."""
         loop = min(self.input_history)
+        gap_limit = int(getattr(
+            getattr(server, "config", None), "input_gap_fill_limit", 8
+        ))
+        if (
+            gap_limit > 0
+            and self.last_applied_input_loop is not None
+            and 1 < loop - self.last_applied_input_loop <= gap_limit + 1
+        ):
+            # ClientData is unsequenced on the wire and the client labels
+            # every update contiguously, so a small gap is a lost packet.
+            # Take that frame with the held input now; the real packet stays
+            # queued for the next tick so pacing stays one frame per tick.
+            await self._synthesize_missing_frame(
+                self.last_applied_input_loop + 1, dt
+            )
+            return
         frame = self.input_history.pop(loop)
+        if frame.received_server_tick is not None and server is not None:
+            self.input_queue_delays.append(max(
+                0,
+                int(getattr(server, "loop_count", 0))
+                - int(frame.received_server_tick),
+            ))
         self._current_input_receive_sequence = int(
             frame.received_input_sequence
         )
@@ -2600,7 +3796,20 @@ class Player:
         applied_orientation = (
             (self._applied_orientation or orientation) if latch_frames else orientation
         )
+        if latch_frames and self._orientation_after_synth and self._applied_orientation:
+            # The client's frame for this packet used the LOST packet's aim.
+            # For a continuous mouse turn the midpoint of the last known and
+            # the current aim is the best estimate of that missing sample.
+            mid = tuple(
+                float(a) + float(b)
+                for a, b in zip(self._applied_orientation, orientation)
+            )
+            norm = math.sqrt(sum(v * v for v in mid))
+            if norm > 1e-6:
+                applied_orientation = tuple(v / norm for v in mid)
+        self._orientation_after_synth = False
         self.last_applied_input_loop = loop
+        self.last_applied_input_synthesized = False
         self.set_orientation_vector(*applied_orientation)
         self.update_input(*flags)
         if frame.action_flags is not None:
@@ -2635,12 +3844,308 @@ class Player:
             # The latch belongs only to physics. Shooting and remote facing
             # must continue to use the current packet's responsive aim.
             self.set_orientation_vector(*orientation)
+        self._record_eye_history(loop, orientation)
+        self._trace_input_sample(loop, flags)
+
+    # -- Anti-cheat input policies ------------------------------------------
+    #
+    # Every behaviour change below is gated by an ``[anticheat] enforce_*``
+    # switch; with the switch off the check only reports (log-only) and the
+    # retail-parity input pipeline above is untouched. Bots never reach here.
+
+    def _label_far_ahead(
+        self,
+        server,
+        loop_count: int,
+        received_server_tick: Optional[int],
+    ) -> bool:
+        """Whether to drop a label no stock client can send (see constants)."""
+        if received_server_tick is None:
+            return False
+        if int(loop_count) <= int(received_server_tick) + INPUT_LABEL_AHEAD_OF_SERVER:
+            # A ClockSync relabel lands near the server loop: a legit jump.
+            return False
+        applied = self.last_applied_input_loop
+        if applied is not None and int(loop_count) <= applied + INPUT_LABEL_AHEAD_OF_APPLIED:
+            return False
+        enforced = anticheat.enforcing(server, "enforce_input_starvation")
+        anticheat.report(
+            server,
+            self,
+            "input_label_ahead",
+            enforced=enforced,
+            label=int(loop_count),
+            server_tick=int(received_server_tick),
+            applied=applied,
+        )
+        if enforced:
+            self.input_frames_rejected_ahead += 1
+        return enforced
+
+    def _check_starvation_timeout(self, server) -> bool:
+        """Disconnect a live body whose client stopped sending ClientData.
+
+        Measured from the newest ClientData, the spawn, or the first tick of
+        a simulation stretch (map rollover/death pauses rebase it). Returns
+        True when the player was disconnected.
+        """
+        now = time.monotonic()
+        last_simulated = self._last_simulated_at
+        self._last_simulated_at = now
+        if last_simulated is None or now - last_simulated > 1.0:
+            self._starvation_baseline = now
+        timeout = float(anticheat.setting(
+            server, "starvation_timeout_seconds", 8.0
+        ))
+        if timeout <= 0.0 or server is None:
+            return False
+        last_input = max(
+            float(self._last_client_data_at or 0.0),
+            float(self._starvation_baseline),
+            float(getattr(self, "spawned_at", 0.0) or 0.0),
+        )
+        silent = now - last_input
+        if silent < timeout:
+            self._starvation_timeout_flagged = False
+            return False
+        if self._starvation_timeout_flagged:
+            return False
+        self._starvation_timeout_flagged = True
+        enforced = anticheat.enforcing(server, "enforce_input_starvation")
+        anticheat.report(
+            server,
+            self,
+            "input_starvation_timeout",
+            enforced=enforced,
+            seconds=round(silent, 2),
+        )
+        if not enforced:
+            return False
+        self.disconnect(int(C.DISCONNECT.ERROR_TIMEOUT))
+        return True
+
+    async def _starvation_gravity_step(self, server, dt: float) -> bool:
+        """Let gravity act on an airborne body whose input stopped.
+
+        Withholding ClientData otherwise freezes the body mid-air forever.
+        Grounded/wading stalls keep the seamless freeze-and-resume path.
+        Returns True when a neutral-input physics step was taken.
+        """
+        limit = int(anticheat.setting(server, "starvation_airborne_ticks", 24))
+        if limit <= 0 or self._starved_streak < limit:
+            return False
+        if not self.airborne or self.wade:
+            return False
+        enforced = anticheat.enforcing(server, "enforce_input_starvation")
+        if self._starved_streak == limit:
+            anticheat.report(
+                server,
+                self,
+                "input_starvation_airborne",
+                enforced=enforced,
+                ticks=int(self._starved_streak),
+            )
+        if not enforced:
+            return False
+        # Neutral locomotion (crouch kept: flipping it moves the eye 0.9),
+        # no thrust, no hover. The acknowledged label does not advance, so
+        # the owner's next self row corrects it onto the falling body.
+        self.update_input(
+            False, False, False, False, False,
+            bool(self.input.crouch), False, False,
+        )
+        self.input.hover = False
+        self.input_frames_starvation_steps += 1
+        await self.update(dt)
+        return True
+
+    def _input_backlog_policy(self, server) -> bool:
+        """Track queue delay and decide this tick's backlog catch-up.
+
+        Returns True when a second contiguous frame may be simulated this
+        tick. When the pair is not provably transition-free the oldest
+        frames are dropped down to the cap instead (enforced mode only).
+        """
+        if not self.input_history or server is None:
+            return False
+        head = self.input_history[min(self.input_history)]
+        if head.received_server_tick is None:
+            return False
+        cap = max(1, int(anticheat.setting(server, "backlog_max_frames", 6)))
+        delay = int(getattr(server, "loop_count", 0)) - int(head.received_server_tick)
+        if self._backlog_catchup:
+            if delay <= max(1, cap // 2):
+                self._backlog_catchup = False
+                self._backlog_over_ticks = 0
+                return False
+        else:
+            if delay <= cap:
+                self._backlog_over_ticks = 0
+                return False
+            self._backlog_over_ticks += 1
+            window = max(1, int(getattr(server, "tick_rate", 60) or 60))
+            if self._backlog_over_ticks <= window:
+                return False
+            enforced = anticheat.enforcing(server, "enforce_input_backlog")
+            anticheat.report(
+                server,
+                self,
+                "input_backlog",
+                enforced=enforced,
+                delay=delay,
+                depth=len(self.input_history),
+            )
+            if not enforced:
+                self._backlog_over_ticks = 0
+                return False
+            self._backlog_catchup = True
+        if self._backlog_pair_safe(server):
+            return True
+        excess = len(self.input_history) - cap
+        if excess > 0:
+            self._drop_backlog_frames(excess)
+        return False
+
+    def _backlog_pair_safe(self, server) -> bool:
+        """Two frames may share a tick only across no state transition.
+
+        _simulate_players documents the hazard: batches crossing a terrain
+        mutation or a jetpack/hover transition reconcile old client history
+        against new server state (ADJUST/SNAP). Require two contiguous
+        labels, no topology change since the older one arrived, no queued
+        mutation, no pending impulse, and no jetpack/parachute/hover use.
+        """
+        applied = self.last_applied_input_loop
+        if applied is None:
+            return False
+        first = self.input_history.get(applied + 1)
+        second = self.input_history.get(applied + 2)
+        if first is None or second is None:
+            return False
+        world_manager = getattr(server, "world_manager", None)
+        topology = getattr(world_manager, "topology_version", None)
+        if topology is not None and (
+            first.topology_version != topology
+            or second.topology_version != topology
+        ):
+            return False
+        mutations = getattr(server, "world_mutations", None)
+        if int(getattr(mutations, "pending_count", 0) or 0) > 0:
+            return False
+        if self._pending_velocity_impulses or self._pending_explosion_impulses:
+            return False
+        if (
+            self.jetpack_active
+            or self._jetpack_physics_active
+            or self._jetpack_activation_defer_remaining
+            or self._jetpack_exhaustion_tail_remaining
+            or self.parachute_active
+            or self._parachute_deploy_pending
+            or self._parachute_physics_active
+            or self._parachute_physics_schedule
+        ):
+            return False
+        pack = bool(self.jetpack_id or self.parachute_id)
+        for flags in (
+            first.movement_flags,
+            second.movement_flags,
+            self._pending_packet_flags,
+        ):
+            if pack and len(flags) > 4 and flags[4]:
+                return False
+        for frame in (first, second):
+            actions = frame.action_flags
+            if actions is not None and len(actions) > 7 and actions[7]:
+                return False
+        return True
+
+    def _drop_backlog_frames(self, count: int) -> None:
+        """Discard the oldest queued frames (enforced backlog only).
+
+        The dropped labels are never simulated; their input is latched so
+        the next real frame composes exactly as after them, and the label
+        cursor advances past them so they are not refilled as lost frames.
+        """
+        for _ in range(max(0, int(count))):
+            if not self.input_history:
+                return
+            loop = min(self.input_history)
+            frame = self.input_history.pop(loop)
+            self.last_applied_input_loop = loop
+            self._pending_packet_flags = frame.movement_flags
+            self._pending_packet_loop = loop
+            self._pending_packet_received_server_tick = frame.received_server_tick
+            self._pending_packet_received_owner_sequence = (
+                frame.received_owner_sequence
+            )
+            self._pending_packet_wire_unknown_byte = frame.wire_unknown_byte
+            self._applied_orientation = frame.orientation
+            if frame.action_flags is not None:
+                self.update_action_input(*frame.action_flags)
+            self._apply_velocity_impulses_through(loop)
+            self._apply_explosion_impulses_through(frame.received_input_sequence)
+            self.input_frames_backlog_dropped += 1
+            self.input_frames_dropped += 1
+
+    def input_queue_delay_stats(self) -> dict:
+        """p50/max ticks consumed frames waited in the queue (recent window)."""
+        samples = sorted(self.input_queue_delays)
+        if not samples:
+            return {"samples": 0, "p50": None, "max": None}
+        return {
+            "samples": len(samples),
+            "p50": samples[len(samples) // 2],
+            "max": samples[-1],
+        }
+
+    async def _synthesize_missing_frame(self, loop: int, dt: float) -> None:
+        """Simulate one client frame whose ClientData never arrived.
+
+        The client held the previous packet's buttons in that frame with
+        overwhelming probability, and under the one-frame latch the step for
+        label ``loop`` already uses the previous packet's locomotion buttons
+        and orientation.  The pending packet state is left untouched so the
+        next real packet composes exactly as it would have after the lost one,
+        which keeps the step count equal to the client's frame count.
+
+        The lost packet may still have carried an input change for this very
+        label (the client applies crouch and aim from the current packet), so
+        no owner self row is stamped with a refilled label
+        (``last_applied_input_synthesized``); the next real label carries the
+        exact state. Measured: a lost crouch release produced a 0.9-block
+        native correction when its refilled row was sent.
+        """
+        flags = tuple(self._pending_packet_flags)
+        orientation = self._applied_orientation or self.orientation
+        self.last_applied_input_loop = int(loop)
+        self.last_applied_input_synthesized = True
+        self._orientation_after_synth = True
+        self.set_orientation_vector(*orientation)
+        self.update_input(*flags)
+        self._applied_input_flags = flags
+        self.input_frames_synthesized += 1
+        self._apply_velocity_impulses_through(int(loop))
+        await self.update(dt)
+        self._record_eye_history(int(loop), orientation)
+        self._trace_input_sample(int(loop), flags, synthesized=True)
+
+    def _trace_input_sample(
+        self,
+        loop: Optional[int],
+        flags: tuple | None,
+        starved: bool = False,
+        synthesized: bool = False,
+    ) -> None:
+        """Optional per-tick input audit record (``[debug] debug_selfrow``)."""
+        server = self.connection.server if self.connection else None
+        manager = getattr(server, "debug_parity", None)
+        writer = getattr(manager, "write_input_sample", None)
+        if callable(writer):
+            writer(self, loop, flags, starved=starved, synthesized=synthesized)
 
     def _tick_idle(self) -> None:
         """Per-tick housekeeping on a held frame (no physics step)."""
-        if self.reloading and time.monotonic() >= self.reload_end_time:
-            if self.finish_reload():
-                self._broadcast_reload_state(True)
+        self._advance_reload_and_announce()
 
     def update_action_input(
         self,
@@ -2836,7 +4341,12 @@ class Player:
             and self.input.hover
         ):
             byte |= 0x04
-        if self.wade:
+        # 0x08 is Character.set_touching_goo (gameScene.pyd
+        # process_packet_world_update -> character.pyd 0x10029150): it only
+        # starts/stops the Chemical Bomb burn loop (A2920/A2921/A2922). It is
+        # NOT a water flag: advertising wade here made every wading player
+        # play the chemical-burn loop on every observer.
+        if getattr(self, "touching_goo", False):
             byte |= 0x08
         return byte
 
@@ -2846,18 +4356,7 @@ class Player:
         # `pong` carries wu_ack_loop — the client input loop_count this row's
         # position corresponds to. It is what the client pairs against its own
         # movement_history to decide NO-OP / ADJUST / SNAP.
-        spawn_protection = 0.0
-        server = self.connection.server if self.connection else None
-        config = getattr(server, "config", None)
-        if config is not None and self.alive:
-            from server.game_rules import get_rules
-
-            duration = float(get_rules(config).get(
-                "RULE_SPAWN_PROTECTION_TIME"
-            ))
-            spawn_protection = max(
-                0.0, duration - (time.monotonic() - self.spawned_at)
-            )
+        spawn_protection = self.spawn_protection_remaining()
         return (
             self.position,
             self.orientation,

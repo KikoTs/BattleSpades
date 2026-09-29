@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes as c
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -104,7 +105,8 @@ def query_players(host: str, port_number: int) -> list[tuple[str, int]]:
 class SteamServer:
     """Own the Steam connection and its public query socket."""
 
-    def __init__(self, runtime: Path, game_port: int, query_port: int) -> None:
+    def __init__(self, runtime: Path, game_port: int, query_port: int,
+                 bind_ip: str = "0.0.0.0") -> None:
         if sys.platform != "linux" or platform.machine() != "x86_64":
             raise RuntimeError("This helper requires Linux x86-64")
         os.environ["SteamAppId"] = os.environ["SteamGameId"] = "224540"
@@ -114,6 +116,11 @@ class SteamServer:
         self.client = self.library.CreateInterface(b"SteamClient017", None)
         if not self.client:
             raise RuntimeError("SteamClient017 unavailable")
+        local_ip = int(ipaddress.IPv4Address(bind_ip))
+        if local_ip:
+            # SDK 1.37 requires this before CreateLocalUser. Binding only the
+            # query socket would leave backend registration on the primary IP.
+            vcall(self.client, 7, None, [c.c_uint32, c.c_uint16], local_ip, 0)
         self.pipe = c.c_int()
         self.user = vcall(self.client, 3, c.c_int, [c.POINTER(c.c_int), c.c_int],
                           c.byref(self.pipe), 3)
@@ -125,7 +132,7 @@ class SteamServer:
         initialized = vcall(
             self.server, 0, c.c_bool,
             [c.c_uint32, c.c_uint16, c.c_uint16, c.c_uint32, c.c_uint32, c.c_char_p],
-            0, game_port, query_port, 4 | 8, 224540, b"1.0.0.0",
+            local_ip, game_port, query_port, 4 | 8, 224540, b"1.0.0.0",
         )
         if not initialized:
             raise RuntimeError("InitGameServer failed; check query port availability")
@@ -205,6 +212,8 @@ def main() -> int:
     """Keep a live advertisement, withdrawing it when its upstream fails."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--bind-ip", type=ipaddress.IPv4Address, default="0.0.0.0",
+                        help="Locally assigned IPv4 for Steam traffic and queries; use one per listing")
     parser.add_argument("--source-host", default="127.0.0.1")
     parser.add_argument("--source-port", type=port, required=True)
     parser.add_argument("--game-port", type=port, default=32887)
@@ -223,7 +232,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     upstream = advertisement(query_a2s(args.source_host, args.source_port, 1), args.mode, args.region)
-    steam = SteamServer(args.runtime, args.game_port, args.query_port)
+    steam = SteamServer(args.runtime, args.game_port, args.query_port, str(args.bind_ip))
     try:
         rows = query_players(args.source_host, args.source_port)
         steam.update(upstream, rows)

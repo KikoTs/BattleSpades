@@ -133,16 +133,17 @@ def test_zombie_mode_is_registered_with_asymmetric_native_snapshot():
     assert state.mode_type == 2
     assert ZOMBIE_TEAM == TEAM1
     assert SURVIVOR_TEAM == TEAM2
-    assert state.team1_name == "Zombies"
-    assert state.team2_name == "Survivors"
+    assert state.team1_name == "ZOMBIE_TEAM"
+    assert state.team2_name == "SURVIVOR_TEAM"
     assert state.team1_classes == [int(C.CLASS_ZOMBIE)]
-    assert int(C.CLASS_ROCKETEER) in state.team2_classes
+    assert state.team2_classes == [int(x) for x in C.DEFAULT_TEAM_CLASSES]
+    assert int(C.CLASS_ROCKETEER) not in state.team2_classes
     assert state.team1_locked is True
     assert state.team1_locked_class is True
     assert state.lock_team_swap is True
     assert info.friendly_fire == 0
     assert info.exposed_teams_always_on_minimap == 1
-    assert int(C.CLASS_ROCKETEER) not in info.disabled_classes
+    assert int(C.CLASS_ROCKETEER) in info.disabled_classes
     assert int(C.CLASS_ZOMBIE) not in info.disabled_classes
     assert int(C.CLASS_FAST_ZOMBIE) in info.disabled_classes
     assert int(C.CLASS_JUMP_ZOMBIE) in info.disabled_classes
@@ -157,7 +158,7 @@ def test_human_facing_zombie_alias_keeps_retail_mode_id_two():
 
     assert state.mode_type == 2
     assert info.mode_key == 2
-    assert state.team1_name == "Zombies"
+    assert state.team1_name == "ZOMBIE_TEAM"
 
 
 def test_pre_infection_countdown_uses_native_hud_timer():
@@ -360,4 +361,4 @@ def test_time_limit_awards_survivors_when_one_is_still_alive():
     mode._finish_round = finish
     asyncio.run(mode._end_by_time())
 
-    assert winners == [(SURVIVOR_TEAM, "The survivors endured the outbreak!")]
+    assert winners == [(SURVIVOR_TEAM, "SURVIVOR_WIN")]

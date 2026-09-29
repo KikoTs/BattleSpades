@@ -230,10 +230,13 @@ def test_unused_entity_updates_packet_cannot_reach_retail_transport(
 
 
 def test_production_defaults_admit_fifty_players_with_headroom():
+    # The omitted-key default is the shipped Match Lobby maximum (24, same as
+    # config.toml); a 50-player dedicated config still fits the connection
+    # budget with headroom.
     config = ServerConfig()
 
-    assert config.max_players >= 50
-    assert config.max_connections > config.max_players
+    assert config.max_players == 24
+    assert config.max_connections > 50 > config.max_players
 
 
 def test_packet_drain_budget_preserves_remaining_backlog_for_next_tick():

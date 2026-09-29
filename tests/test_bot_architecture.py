@@ -360,7 +360,11 @@ def test_supervisor_clean_slate_restart_is_non_blocking(supervisor_type) -> None
         assert supervisor._restart_request.is_set()
     else:
         assert supervisor._snapshot_serial == 2
-        assert supervisor.status().restarts == 1
+        status = supervisor.status()
+        assert status.restarts == 1
+        # A scheduled clean-slate recycle is not a crash.
+        assert status.planned_recycles == 1
+        assert status.crash_restarts == 0
 
 
 def test_spawned_bot_advertises_real_weapon_and_remote_display_bit() -> None:

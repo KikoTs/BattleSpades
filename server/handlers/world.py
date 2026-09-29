@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shared.constants as C
+
 from protocol.handler_registry import register_handler
 
 
@@ -12,6 +14,15 @@ async def handle_oriented_item(server, player, packet):
     renders and simulates the projectile (arc + explosion FX + sound), and we
     register a server-authoritative grenade that applies blast damage and
     block destruction when the fuse expires."""
+    from server.ugc_capacity import ugc_capacity_full
+
+    if ugc_capacity_full(server) and int(getattr(packet, "tool", -1)) in (
+        int(getattr(C, "SNOWBLOWER_TOOL", 29)),
+        int(getattr(C, "UGC_SNOWBLOWER_TOOL", 48)),
+    ):
+        # Retail ugcSnowBlowerWeapon.py:47-56 does not fire while
+        # block_manager.is_space_to_add_blocks() is false.
+        return None
     service = getattr(server, "oriented_actions", None)
     if service is None:
         # Focused protocol tests/embedders may construct only the legacy
@@ -25,6 +36,8 @@ async def handle_oriented_item(server, player, packet):
         position=getattr(packet, "position", (0.0, 0.0, 0.0)),
         velocity=getattr(packet, "velocity", (0.0, 0.0, 0.0)),
         fuse=float(getattr(packet, "value", 0.0)),
+        # The client stamps its input frame: validate against that frame's eye.
+        loop=getattr(packet, "loop_count", None),
     )
 
 

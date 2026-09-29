@@ -58,7 +58,8 @@ def test_round_reset_clears_every_transient_owner_and_controller_index():
     # Same-map restarts deliberately keep GameScene alive, so its entity
     # dictionary must be cleared before the registry ids are reused.
     assert server.destroyed == [10, 11]
-    assert server.hidden == [(1, False)]
+    # Radar sends no TeamMapVisibility(83), so there is no team flag to clear.
+    assert server.hidden == []
     assert server._radar_station_counts == {TEAM1: 0, TEAM2: 0}
     assert server.entity_registry.cleared is True
     assert server.entities == {}

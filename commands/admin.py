@@ -2,11 +2,16 @@
 Admin commands - requires admin permission.
 """
 
+import hmac
+import logging
 import math
+import time
 
 import shared.constants as C
 
 from .command_handler import register_command, CommandContext, send_message
+
+logger = logging.getLogger(__name__)
 
 
 @register_command(
@@ -87,7 +92,9 @@ async def cmd_ban(ctx: CommandContext):
         ctx.server, f"{target.name} was banned {when}: {reason}"
     )
 
-    target.disconnect(reason=1)  # DISCONNECT_BANNED
+    # Retail DISCONNECT enum: ERROR_BANNED (1) is permanent, a timed ban is
+    # ERROR_TEMP_BANNED (19).
+    target.disconnect(reason=1 if duration <= 0 else 19)
 
 
 @register_command(
@@ -235,15 +242,115 @@ async def cmd_god(ctx: CommandContext):
     description="Login as admin",
 )
 async def cmd_admin_login(ctx: CommandContext):
-    """Login as admin."""
-    if not ctx.args:
-        await send_message(ctx.server, ctx.player, "Usage: /admin <password>")
+    """Log in as admin with the ``[admin] password``.
+
+    Disabled while that password is the shipped default, empty or short
+    (see :func:`server.config.admin_password_problem`). The comparison is
+    constant-time, and ``[anticheat] admin_login_attempts`` consecutive
+    failures from one address kick the player and ban the address for
+    :data:`ADMIN_LOGIN_BAN_SECONDS`. Slash commands are also rate-limited
+    per player (``server.handlers.social``), so guessing is slow.
+    """
+    server, player = ctx.server, ctx.player
+    if getattr(player, "admin", False):
+        await send_message(server, player, "You are already an admin.")
         return
-    
-    password = ctx.args[0]
-    
-    if password == ctx.server.config.admin_password:
-        ctx.player.admin = True
-        await send_message(ctx.server, ctx.player, "You are now an admin.")
-    else:
-        await send_message(ctx.server, ctx.player, "Invalid password.")
+    configured = getattr(server.config, "admin_password", "")
+    from server.config import admin_password_problem
+
+    problem = admin_password_problem(configured)
+    if problem is not None:
+        logger.warning(
+            "Refused /admin from %s: login disabled (%s)",
+            getattr(player, "name", "?"), problem,
+        )
+        await send_message(
+            server,
+            player,
+            "Admin login is disabled on this server: the operator has not "
+            "set a secure admin password.",
+        )
+        return
+    attempt = ctx.raw_args.strip()
+    if not attempt:
+        await send_message(server, player, "Usage: /admin <password>")
+        return
+
+    key = _login_key(player)
+    if hmac.compare_digest(
+        attempt.encode("utf-8"), str(configured).encode("utf-8")
+    ):
+        _login_failures(server).pop(key, None)
+        player.admin = True
+        logger.info(
+            "Admin login: %s (%s)", getattr(player, "name", "?"), key
+        )
+        await send_message(server, player, "You are now an admin.")
+        return
+
+    from server import anticheat
+
+    failures = _record_login_failure(server, key)
+    limit = max(1, int(anticheat.setting(server, "admin_login_attempts", 3)))
+    anticheat.report(
+        server, player, "admin_login_failed", attempts=failures, limit=limit
+    )
+    if failures < limit:
+        await send_message(server, player, "Invalid password.")
+        return
+    _login_failures(server).pop(key, None)
+    logger.warning(
+        "Kicking %s (%s) after %d failed /admin attempts; address banned "
+        "for %d s",
+        getattr(player, "name", "?"), key, failures, ADMIN_LOGIN_BAN_SECONDS,
+    )
+    ban_manager = getattr(server, "ban_manager", None)
+    if key.startswith("ip:") and ban_manager is not None:
+        ban_manager.add(
+            key[3:],
+            getattr(player, "name", ""),
+            "Too many failed admin login attempts",
+            ADMIN_LOGIN_BAN_SECONDS,
+        )
+    player.disconnect(int(C.DISCONNECT.ERROR_KICKED))
+
+
+# A kicked brute-forcer's address is banned this long (bans.json, expiring).
+ADMIN_LOGIN_BAN_SECONDS = 600
+# Failed attempts older than this are forgotten.
+_LOGIN_FAILURE_WINDOW_SECONDS = 600.0
+
+
+def _login_key(player) -> str:
+    """Count failures per client address so reconnecting does not reset them."""
+    from server.bans import address_host
+
+    connection = getattr(player, "connection", None)
+    peer = getattr(connection, "peer", None)
+    if peer is not None:
+        host = address_host(peer)
+        if host and host != "unknown":
+            return f"ip:{host}"
+    return f"player:{getattr(player, 'id', id(player))}"
+
+
+def _login_failures(server) -> dict:
+    failures = getattr(server, "_admin_login_failures", None)
+    if not isinstance(failures, dict):
+        failures = {}
+        server._admin_login_failures = failures
+    return failures
+
+
+def _record_login_failure(server, key: str) -> int:
+    """Record one failure for ``key``; return the count inside the window."""
+    now = time.monotonic()
+    failures = _login_failures(server)
+    for stale in [
+        name for name, (_, last) in failures.items()
+        if now - last > _LOGIN_FAILURE_WINDOW_SECONDS
+    ]:
+        del failures[stale]
+    count, _ = failures.get(key, (0, now))
+    failures[key] = (count + 1, now)
+    return count + 1

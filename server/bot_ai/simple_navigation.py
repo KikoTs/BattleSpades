@@ -26,6 +26,7 @@ from server.dig_profiles import (
     DIG_CUBE,
     DIG_MACHETE,
     DIG_SINGLE,
+    MAP_BLOCK_HEALTH,
     DigProfile,
     melee_dig_positions,
 )
@@ -65,6 +66,9 @@ MAX_ROUTE_VALIDATION_STEPS = 64
 _MAX_WATER_EXPANSIONS = 8192
 _WATER_FLOW_LOOKAHEAD = 4
 _WALK_SECONDS_PER_CELL = 0.25
+# Highest ledge a climbing jetpack edge may target (the adjacent-column surface
+# search spans 8 cells).
+_MAX_JETPACK_CLIMB = 8
 _BREACH_SETUP_COST = 1.5
 _WALL_CLEARANCE_BIAS = 0.18
 
@@ -186,6 +190,7 @@ class SimpleVoxelWorld:
         "_column_versions",
         "_column_version_base",
         "_column_version_latest",
+        "_cell_health",
     )
 
     def __init__(self, *, planning_budget: PlanningBudget | None = None) -> None:
@@ -204,6 +209,28 @@ class SimpleVoxelWorld:
         self._column_versions = array("q", [-1]) * (MAP_SIZE * MAP_SIZE)
         self._column_version_base = -1
         self._column_version_latest = -1
+        # Non-default break thresholds (player-built walls) learned from
+        # canonical terrain deltas; absent cells are authored map voxels.
+        self._cell_health: dict[tuple[int, int, int], float] = {}
+
+    def block_health(self, x: int, y: int, z: int) -> float:
+        """Undamaged health of a solid cell as the gameplay server tracks it.
+
+        Accumulated partial damage is not mirrored, so this is the
+        conservative full-health figure a fresh dig plan must budget for.
+        """
+
+        return float(
+            self._cell_health.get((int(x), int(y), int(z)), MAP_BLOCK_HEALTH)
+        )
+
+    def _record_cell_health(self, change) -> None:
+        cell = (int(change.x), int(change.y), int(change.z))
+        health = float(getattr(change, "health", 0.0) or 0.0)
+        if bool(change.solid) and health > 0.0:
+            self._cell_health[cell] = health
+        else:
+            self._cell_health.pop(cell, None)
 
     def begin_planning(self, observer: ObserverKey, now: float) -> None:
         """Attribute expensive route work to one current observer decision."""
@@ -251,6 +278,7 @@ class SimpleVoxelWorld:
         self._atlas = None
         self._dirty_columns.clear()
         self._corridor_supports = None
+        self._cell_health = {}
         self.end_planning()
         if self.planning_budget is not None:
             self.planning_budget.reset()
@@ -260,6 +288,7 @@ class SimpleVoxelWorld:
         vxl = CompactVoxelMap(raw_vxl)
         for change in snapshot.changed_cells:
             vxl.set_solid(change.x, change.y, change.z, change.solid)
+            self._record_cell_health(change)
             self._dirty_columns.add((int(change.x), int(change.y)))
         self._vxl = vxl
         try:
@@ -306,6 +335,7 @@ class SimpleVoxelWorld:
                     int(change.z),
                     bool(change.solid),
                 )
+                self._record_cell_health(change)
                 self._dirty_columns.add((int(change.x), int(change.y)))
         self.topology_version = int(delta.topology_version)
         self._column_version_latest = self.topology_version
@@ -1439,7 +1469,9 @@ class SimpleVoxelWorld:
         if not targets or profile.swings_per_block <= 0:
             return None
         covered, _height, target_cell = max(targets)
-        estimated_swings = math.ceil(len(blockers) / covered) * profile.swings_per_block
+        estimated_swings = math.ceil(len(blockers) / covered) * max(
+            profile.swings_for_health(self.block_health(*cell)) for cell in blockers
+        )
         breach = BreachPlan(
             source=(source_x, source_y, WATER_SUPPORT_Z),
             destination=(target_x, target_y, support_z),
@@ -1977,6 +2009,24 @@ class SimpleVoxelWorld:
                             )
                     continue
                 if (
+                    -_MAX_JETPACK_CLIMB <= delta < -2
+                    and MovementAffordance.JETPACK_CLIMB in abilities
+                    # Packs cannot take off while wading: a climb out of a
+                    # river is a swim to the bank, not a flight.
+                    and int(support_z) < WATER_SUPPORT_Z - 1
+                    and self._climb_column_is_clear(x, y, support_z,
+                                                    int(sample.support_z))
+                ):
+                    # Too high to jump: a climbing pack rises in this column
+                    # and settles on the ledge (cliffs, roofs, walls).
+                    yield (
+                        neighbor,
+                        MovementAffordance.JETPACK,
+                        3.0 + abs(delta) * 0.35,
+                        None,
+                    )
+                    continue
+                if (
                     1 < delta <= 4
                     and MovementAffordance.DROP in abilities
                     # The body walks into the lower column at the height it
@@ -2094,6 +2144,14 @@ class SimpleVoxelWorld:
                         None,
                     )
                     break
+
+    def _climb_column_is_clear(self, x: int, y: int, source_support: int,
+                               landing_support: int) -> bool:
+        """The body can rise in its own column until its feet clear the lip."""
+        low = int(landing_support) - 4
+        if low < 1:
+            return False
+        return not any(self.solid(x, y, z) for z in range(low, int(source_support)))
 
     def _flight_gap_is_clear(self, x: int, y: int, dx: int, dy: int,
                              distance: int, source_support: int,
@@ -2215,7 +2273,10 @@ class SimpleVoxelWorld:
             # Clear the head-height voxel first so the next swing remains
             # reachable even when the bot is pressed against the wall.
             target = min(blockers, key=lambda cell: cell[2])
-            return target, len(blockers) * profile.swings_per_block
+            return target, sum(
+                profile.swings_for_health(self.block_health(*cell))
+                for cell in blockers
+            )
 
         # A planned melee ray must terminate on a real solid voxel.  Merely
         # aiming at an air cell whose area footprint would include a blocker
@@ -2241,12 +2302,16 @@ class SimpleVoxelWorld:
         if not candidates:
             return None, 0
         covered, _height_order, target = max(candidates)
-        if profile.pattern in {DIG_CUBE}:
-            return target, 1
-        if profile.pattern == DIG_MACHETE:
-            return target, profile.swings_per_block
-        # Ordinary/classic spades use the recovered vertical-column handler.
-        return target, 1
+        # Every footprint cell accumulates damage to its own health: one spade
+        # swing clears a map column, a player-built wall (health 9) needs two,
+        # zombie hands about two and up to five. The aimed swing repeats until
+        # the toughest covered blocker breaks.
+        footprint = set(melee_dig_positions(target, profile.pattern))
+        return target, max(
+            profile.swings_for_health(self.block_health(*cell))
+            for cell in blockers
+            if cell in footprint
+        )
 
     @staticmethod
     def _compact_straight_steps(

@@ -9,6 +9,7 @@ bot code only submits intentions through :class:`server.bot_ai.gateway.BotAction
 
 from __future__ import annotations
 
+from server.audio import SND_BUILD_DYNAMITE, SND_BUILD_LANDMINE, SND_TURRET_PLACE
 import logging
 import math
 import time
@@ -28,6 +29,10 @@ from server.entities.behaviors import (
 )
 from server.entities.machine_gun import MachineGunBehavior
 from server.game_constants import KILL_TYPES
+# Stock handle_dynamite_damage / handle_landmine_damage radii (8 / 6). The
+# DYNAMITE/LANDMINE_EXPLOSION_RADIUS constants (5 / 3) are not the player
+# damage radius the stock ExplosionDamageManager uses.
+from server.weapons_retail import RETAIL_EXPLOSIONS_BY_NAME
 
 if TYPE_CHECKING:
     from server.main import BattleSpadesServer
@@ -65,6 +70,41 @@ class DeployableActionService:
         if dx * dx + dy * dy + dz * dz > float(max_distance) ** 2:
             return None
         return x, y, z
+
+    def placement_visible(
+        self,
+        player: "Player",
+        position: Vector3,
+        support_cell: tuple[int, int, int],
+    ) -> bool:
+        """Hard line-of-sight gate for a client-chosen placement.
+
+        The stock client places gadgets on the voxel face its eye ray hits,
+        so either the placement cell or its support voxel is visible from a
+        server-simulated eye. A range-only check let a forged packet attach
+        C4/dynamite/mines on the far side of a wall. Bots are server-planned
+        and exempt.
+        """
+
+        if getattr(player, "is_bot", False):
+            return True
+        from server.combat_runtime import cell_visible, reference_eyes
+
+        world = getattr(self.server, "world_manager", None)
+        _, eyes = reference_eyes(player)
+        cell = tuple(int(math.floor(float(value))) for value in position)
+        support = tuple(int(value) for value in support_cell)
+        if eyes and (
+            cell_visible(world, eyes, cell, ignore=(support,))
+            or cell_visible(world, eyes, support)
+        ):
+            return True
+        from server import anticheat
+
+        anticheat.report(
+            self.server, player, "placement_occluded", cell=cell,
+        )
+        return False
 
     def find_support_cell(
         self,
@@ -120,6 +160,8 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
             return False
+        if not self.placement_visible(player, pos, support_cell):
+            return False
         entity = self.server.entity_registry.place(
             int(getattr(C, "MEDPACK_ENTITY", 30)),
             *pos,
@@ -139,6 +181,15 @@ class DeployableActionService:
         self.server.broadcast_create_entity(entity)
         logger.info("MEDPACK id=%d placed by %s at %s", entity.entity_id, player.name, pos)
         return True
+
+    def _placement_sound(self, sound_id: int, position) -> None:
+        """Retail server-sent placement cue (no client code plays 21/30/31)."""
+        try:
+            from server.audio import play_sound
+
+            play_sound(self.server, int(sound_id), position=tuple(float(v) for v in position))
+        except Exception:
+            logger.debug("placement sound failed", exc_info=True)
 
     def place_dynamite(
         self,
@@ -167,6 +218,8 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos, search_depth=0)
         if support_cell is None:
             return False
+        if not self.placement_visible(player, pos, support_cell):
+            return False
         behavior = TimedExplosiveBehavior(
             player.id,
             fuse=float(getattr(C, "DYNAMITE_EXPLOSION_FUSE", 7.0)),
@@ -174,8 +227,9 @@ class DeployableActionService:
             block_damage=float(getattr(C, "DYNAMITE_EXPLOSION_BLOCK_DAMAGE", 7.0)),
             crater_radius=2,
             kill_type=KILL_TYPES.get("DYNAMITE_KILL", 15),
-            blast_radius=float(getattr(C, "DYNAMITE_EXPLOSION_RADIUS", 5.0)),
+            blast_radius=RETAIL_EXPLOSIONS_BY_NAME["dynamite"].radius,
             force_destroy=True,
+            health=float(getattr(C, "DYNAMITE_HEALTH", 1.0)),
         )
         entity = self.server.entity_registry.place(
             int(getattr(C, "DYNAMITE_ENTITY", 10)),
@@ -190,6 +244,7 @@ class DeployableActionService:
         commit_deployable_use(player, int(C.DYNAMITE_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info("DYNAMITE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
+        self._placement_sound(SND_BUILD_DYNAMITE, pos)
         return True
 
     def place_landmine(self, player: "Player", position: Vector3) -> bool:
@@ -210,6 +265,8 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
             return False
+        if not self.placement_visible(player, pos, support_cell):
+            return False
         behavior = ProximityMineBehavior(
             player.id,
             player.team,
@@ -219,7 +276,7 @@ class DeployableActionService:
             kill_type=KILL_TYPES.get("LANDMINE_KILL", 14),
             trigger_radius=float(getattr(C, "LANDMINE_DETECTION_RANGE", 2.5)),
             arm_delay=float(getattr(C, "LANDMINE_ACTIVATION_TIMER", 4.0)),
-            blast_radius=float(getattr(C, "LANDMINE_EXPLOSION_RADIUS", 3.0)),
+            blast_radius=RETAIL_EXPLOSIONS_BY_NAME["landmine"].radius,
             force_destroy=False,
             detection_layers=int(getattr(C, "LANDMINE_DETECTION_LAYERS", 3)),
             health=float(getattr(C, "LANDMINE_HEALTH", 1.0)),
@@ -242,6 +299,7 @@ class DeployableActionService:
         commit_deployable_use(player, int(C.LANDMINE_TOOL), now)
         self.server.broadcast_create_entity(entity)
         logger.info("LANDMINE id=%d placed by %s at %s", entity.entity_id, player.name, pos)
+        self._placement_sound(SND_BUILD_LANDMINE, pos)
         return True
 
     def place_c4(
@@ -263,6 +321,8 @@ class DeployableActionService:
             return False
         support_cell = self.find_support_cell(pos, search_depth=0)
         if support_cell is None:
+            return False
+        if not self.placement_visible(player, pos, support_cell):
             return False
         live_ids: list[int] = []
         for entity_id in list(getattr(player, "_c4_entity_ids", ()) or ()):
@@ -325,23 +385,18 @@ class DeployableActionService:
         return detonated
 
     def place_radar(self, player: "Player", position: Vector3) -> bool:
-        """Place the one-live-station Scout radar and enable visibility."""
+        """Place the Scout radar; a new station replaces the owner's old one.
+
+        Retail (AoS wiki, Radar Station): the station self-destructs after
+        45 seconds, when shot enough, or when the same player places another.
+        The client detects enemies from the entity itself, so placing sends
+        only CreateEntity (and DestroyEntity for a replaced station).
+        """
 
         if not deployable_authorized(player, C.RADAR_STATION_TOOL):
             return False
         now = time.monotonic()
         if not deployable_ready(player, int(C.RADAR_STATION_TOOL), now):
-            return False
-        # Radar expiry and round cleanup deliberately use ``None`` to mean
-        # "no live station".  Do not coerce that nullable owner slot into an
-        # entity id; this path is hit whenever a bot replaces an expired radar.
-        old_entity_id = getattr(player, "_radar_entity_id", None)
-        old = (
-            self.server.entity_registry.get(old_entity_id)
-            if old_entity_id is not None
-            else None
-        )
-        if old is not None and old.alive:
             return False
         pos = self.validate_position(
             player,
@@ -353,13 +408,31 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
             return False
-        lifetime = float(
-            getattr(
-                self.server.config,
-                "radar_station_lifetime_seconds",
-                35.0,
-            )
+        if not self.placement_visible(player, pos, support_cell):
+            return False
+        # Only a valid new placement retires the old station. Expiry and
+        # round cleanup use ``None`` for "no live station"; never coerce that
+        # nullable owner slot into an entity id.
+        old_entity_id = getattr(player, "_radar_entity_id", None)
+        old = (
+            self.server.entity_registry.get(old_entity_id)
+            if old_entity_id is not None
+            else None
         )
+        if (
+            old is not None
+            and old.alive
+            and isinstance(old.behavior, RadarStationBehavior)
+        ):
+            # Normal teardown: releases the team count, clears the owner
+            # slot and broadcasts DestroyEntity(19) for the old model.
+            old.behavior.on_destroyed(old, None, self.server._build_entity_ctx())
+            logger.info(
+                "RADAR id=%d replaced by %s's new station",
+                old.entity_id,
+                player.name,
+            )
+        lifetime = float(self.server.config.radar_station_lifetime_seconds)
         entity = self.server.entity_registry.place(
             int(getattr(C, "RADAR_STATION_ENTITY", 36)),
             *pos,
@@ -403,6 +476,8 @@ class DeployableActionService:
             return False
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
+            return False
+        if not self.placement_visible(player, pos, support_cell):
             return False
         if any(
             entity.alive
@@ -454,6 +529,8 @@ class DeployableActionService:
         support_cell = self.find_support_cell(pos)
         if support_cell is None:
             return False
+        if not self.placement_visible(player, pos, support_cell):
+            return False
         stock_before = player.rocket_turret_stock
         try:
             turret = self.server.rocket_turret_controller.place(
@@ -472,6 +549,7 @@ class DeployableActionService:
             player.name,
             pos,
         )
+        self._placement_sound(SND_TURRET_PLACE, pos)
         return True
 
     def set_disguise(self, player: "Player", *, active: bool) -> bool:
@@ -496,5 +574,8 @@ class DeployableActionService:
             getattr(C, "DISGUISE_SHOOT_INTERVAL", 0.5)
         )
         player.disguised = True
+        player._disguise_anchor = tuple(
+            float(value) for value in getattr(player, "position", (0.0, 0.0, 0.0))
+        )
         logger.info("DISGUISE %s activated (%d remaining)", player.name, player.disguise_stock)
         return True

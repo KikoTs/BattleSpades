@@ -343,7 +343,7 @@ def test_pre_join_clock_sync_and_menu_state_are_handled():
     server = DummyServer()
     connection = make_connection(server)
     sent_packets = []
-    connection.send = lambda data, reliable=True, prefix=0x30: sent_packets.append(data)
+    connection.send = lambda data, reliable=True, prefix=0x30, **kw: sent_packets.append(data)
 
     menu_packet = ClientInMenu()
     menu_packet.in_menu = 1
@@ -527,7 +527,7 @@ def test_joined_clock_sync_replies_with_server_loop_count():
     server = DummyServer()
     connection = make_connection(server)
     sent_packets = []
-    connection.send = lambda data, reliable=True, prefix=0x30: sent_packets.append(data)
+    connection.send = lambda data, reliable=True, prefix=0x30, **kw: sent_packets.append(data)
 
     player = Player(0, "KikoTs", TEAM1, C.RIFLE_TOOL, connection)
 

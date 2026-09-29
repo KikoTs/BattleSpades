@@ -18,18 +18,26 @@ if TYPE_CHECKING:
     from server.main import BattleSpadesServer
 
 
-# These visual constants come from the original London-style preset and
-# work for most maps. Per-map skybox/light overrides belong in map metadata
-# parsing once we wire that up — for now serve consistent values.
-_DEFAULT_LIGHT_COLOR = (180, 192, 220)
-_DEFAULT_LIGHT_DIR = (0.203125, 0.796875, 0.0)
-_DEFAULT_BACK_LIGHT_COLOR = (64, 64, 64)
-_DEFAULT_BACK_LIGHT_DIR = (-0.078125, -0.578125, 0.296875)
-_DEFAULT_AMBIENT_COLOR = (52, 56, 64)
-_DEFAULT_AMBIENT_INTENSITY = 0.203125
+# Fallback lighting for maps without retail/authored metadata.  Only four
+# retail .txtc layouts survive; two of them (MayanJungle and Trenches, a
+# jungle map and a WW1 classic map) carry byte-identical lighting rows, which
+# is the retail map editor's default template, so that row is the evidenced
+# fallback (audit3 world W5).  The former (180,192,220) "London-style"
+# preset came from the community reimplementation (aceofspades_source
+# server/aosserver/protocol.py), not from retail.
+_DEFAULT_LIGHT_COLOR = (236, 244, 203)
+_DEFAULT_LIGHT_DIR = (-0.7, 0.3, 0.0)
+_DEFAULT_BACK_LIGHT_COLOR = (15, 20, 10)
+_DEFAULT_BACK_LIGHT_DIR = (0.0, 0.7, 0.3)
+_DEFAULT_AMBIENT_COLOR = (15, 30, 10)
+_DEFAULT_AMBIENT_INTENSITY = 0.3
 
-# `team_headcount_type` controls UI rendering of team sizes. 6 mirrors the
-# original CTF default; it's safe for most modes.
+# `team_headcount_type` selects the HeadCount widget (retail enum
+# TEAM_PLAYERS_COUNT_VALUE 0 / TEAM_SCORE_VALUE 1 / TEAM_4DIGIT_SCORE_VALUE 2 /
+# TEAM_SCORE_INACTIVE 3; any other value draws like 1 with a 4 px wider
+# frame, IDA HeadCount.activate 0x100314D0). 6 is our long-standing default
+# (team scores); the per-mode retail value is server-side and unrecovered, so
+# only modes with a reason override it in configure_state_data (Zombie: 0).
 _DEFAULT_TEAM_HEADCOUNT_TYPE = 6
 
 

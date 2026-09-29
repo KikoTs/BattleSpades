@@ -89,7 +89,26 @@ async def handle_place_ugc(server, player, packet):
     dz = float(getattr(player, "z", 0.0)) - z
     if dx * dx + dy * dy + dz * dz > 12.0 * 12.0:
         return
+    if placing and not _has_top_face_support(server, x, y, z):
+        # Retail UGCTool.draw_ghosting -> can_place_object(...,
+        # can_place_vertical=False) (weapons/ugcTool.py:223-229, gameScene
+        # 0x101270b0) accepts only a hit on a TOP face, i.e. the marker cell
+        # rests on the solid voxel below it (AoS z grows downward).
+        return
     mode.place_object(player, x, y, z, item, placing)
+
+
+def _has_top_face_support(server, x: int, y: int, z: int) -> bool:
+    """Whether the marker cell is air resting on a solid voxel below it."""
+
+    world = getattr(server, "world_manager", None)
+    get_solid = getattr(world, "get_solid", None)
+    if not callable(get_solid):
+        return True
+    try:
+        return bool(get_solid(x, y, z + 1)) and not bool(get_solid(x, y, z))
+    except (TypeError, ValueError, IndexError):
+        return False
 
 
 @register_handler(99)  # ReqestUGCEntities (retail spelling)
@@ -102,6 +121,9 @@ async def handle_request_ugc_entities(server, player, packet):
         return
     mode.send_initial_batch(connection)
     mode.send_objectives(connection)
+    reveal = getattr(mode, "reveal_markers", None)
+    if callable(reveal):
+        reveal(connection)
 
 
 @register_handler(100)  # UGCMessage
@@ -127,10 +149,16 @@ async def handle_ugc_message(server, player, packet):
             getattr(player, "name", "?"),
         )
         return
-    if message in (
-        int(C.UGC_REQUEST_MAP_VALIDATION),
-        int(C.UGC_CONVERT_TO_GAME),
-    ) and mode.is_host(player):
+    if message == int(C.UGC_CONVERT_TO_GAME):
+        # No shipped client sends CONVERT_TO_GAME; the native F10 quick save
+        # and Esc SAVE use it as the explicit "flush project now" request.
+        # The host receives LocalisedMessage(50) UGC_MAP_SAVE_SUCCESSFULLY or
+        # UGC_MAP_SAVE_ERROR when the VXL + sidecar are on disk.
+        if mode.is_host(player):
+            mode.send_objectives(connection)
+            mode.request_save(player)
+        return
+    if message == int(C.UGC_REQUEST_MAP_VALIDATION) and mode.is_host(player):
         mode.send_objectives(connection)
         mode.request_checkpoint()
 

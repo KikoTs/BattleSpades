@@ -461,7 +461,13 @@ class CorpseLifecycle:
         if connection is not None:
             connection.send(data, reliable=True)
             return
-        self.server.broadcast(data, reliable=True)
+        # Only GameScenes that created this id have a Character to explode.
+        # A dead joiner, or a life that began while a peer was loading, is
+        # unknown there; packet 36 would index a missing roster entry.
+        # Loading peers repair through send_catchup_state on first ClientData.
+        self.server.broadcast(
+            data, reliable=True, known_player_id=int(player_id)
+        )
 
 
 __all__ = [

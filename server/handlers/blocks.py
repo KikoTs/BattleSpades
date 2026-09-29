@@ -10,30 +10,81 @@ import logging
 
 from protocol.handler_registry import register_handler
 from server.combat_runtime import get_combat_system
+from server.ugc_capacity import ugc_capacity_full
 
 
 logger = logging.getLogger(__name__)
+
+
+def _break_disguise(player) -> None:
+    """Building ends a Disguise ("Must remain stationary")."""
+    breaker = getattr(player, "break_disguise", None)
+    if callable(breaker):
+        breaker()
 
 
 @register_handler(7)  # PaintBlockPacket
 async def handle_paint_block(server, player, packet):
     """Route native packet 7 through shared paint authorization/replication."""
 
-    get_combat_system(server).handle_paint_packet(player, packet)
+    accepted = get_combat_system(server).handle_paint_packet(player, packet)
+    if accepted:
+        _ugc_single_paint_cue(server, player, packet)
+
+
+def _ugc_single_paint_cue(server, player, packet) -> None:
+    """Map Creator PAINT_PRIMARY_SOUND for a single-cell (LMB) paint.
+
+    The RMB surface spray also arrives as packet 7 per cell; ClientData's
+    held secondary bit (recorded by the movement handler) excludes it.
+    """
+
+    if not bool(getattr(getattr(server, "config", None), "ugc_runtime", False)):
+        return
+    if bool(getattr(player, "ugc_paint_secondary_held", False)):
+        return
+    cue = getattr(getattr(server, "mode", None), "on_single_paint", None)
+    if not callable(cue):
+        return
+    try:
+        cue(player, int(packet.x), int(packet.y), int(packet.z))
+    except (AttributeError, TypeError, ValueError):
+        return
 
 
 @register_handler(32)  # BlockBuild
 async def handle_block_build(server, player, packet):
     """Submit one ordinary block placement to combat authority."""
 
+    if ugc_capacity_full(server):
+        return
     if player.alive:
-        get_combat_system(server).handle_block_build(player, packet)
+        if get_combat_system(server).handle_block_build(player, packet):
+            _break_disguise(player)
 
 
 @register_handler(35)  # BlockLiberate
 async def handle_block_destroy(server, player, packet):
-    """Submit one ordinary block-destruction request."""
+    """Reject BlockLiberate(35): the stock retail client never sends it.
 
+    Evidence (2026-09-26): byte-grepping the stock Steam and non-Steam
+    installs finds "BlockLiberate" only in ``shared.packet.pyd`` (the class)
+    and ``aoslib.scenes.main.gameScene.pyd``, where IDA shows the global used
+    solely by the incoming dispatch table (``process_packet_block_liberate``
+    -> ``block_manager.liberate_block``). Unlike ShootPacket/BlockLine/
+    BlockSuckerPacket, no send instance is ever built; digging travels as
+    ShootPacket(6) (``diggingTool.py`` -> ``send_shoot_packet``). Packet 35
+    therefore only comes from a modified client -- it used to delete any
+    voxel within 19 blocks (block tool) or 13 blocks (spade) through walls,
+    with refund. Outside the UGC runtime it is a protocol violation; the
+    UGC editor keeps the reach/LOS-validated legacy path.
+    """
+
+    if not bool(getattr(getattr(server, "config", None), "ugc_runtime", False)):
+        from server import anticheat
+
+        anticheat.protocol_violation(server, player, "block_liberate")
+        return
     if player.alive:
         get_combat_system(server).handle_block_destroy(player, packet)
 
@@ -42,8 +93,13 @@ async def handle_block_destroy(server, player, packet):
 async def handle_block_line(server, player, packet):
     """Submit a face-connected block line to combat authority."""
 
+    if ugc_capacity_full(server):
+        # Retail blockToolCommon.py:67-71 refuses every line with
+        # BLOCK_PLACE_UGC_CAPACITY while the editor map is full.
+        return
     if player.alive:
-        get_combat_system(server).handle_block_line(player, packet)
+        if get_combat_system(server).handle_block_line(player, packet):
+            _break_disguise(player)
 
 
 @register_handler(30)  # BuildPrefabAction
@@ -52,6 +108,9 @@ async def handle_build_prefab(server, player, packet):
 
     from server.game_rules import get_rules
     if not get_rules(server.config).enabled("RULE_ENABLE_PREFABS"):
+        return
+    if ugc_capacity_full(server):
+        # Retail ugcPrefabTool.py:361-391 gates construct placement too.
         return
     service = getattr(server, "prefab_actions", None)
     if service is None:
@@ -74,8 +133,13 @@ async def handle_erase_prefab(server, player, packet):
         or not get_rules(server.config).enabled("RULE_ENABLE_PREFABS")
     ):
         return
+    # Retail competitive play has no erase action; packet 31 belongs to the
+    # UGC Map Creator. Outside it, this used to delete an arbitrary prefab
+    # footprint anywhere on the map with no range, cost, or cooldown.
+    if not bool(getattr(server.config, "ugc_runtime", False)):
+        return
     service = getattr(server, "prefab_actions", None)
-    if service is not None and bool(getattr(server.config, "ugc_runtime", False)):
+    if service is not None:
         service.erase_packet(player, packet)
         return
     from server import prefabs

@@ -139,9 +139,22 @@ def test_use_command_mounts_and_unmounts_nearest_machine_gun():
     assert unmounted.player_id == 0xFF
 
 
+def _mounted_shot_packet(player):
+    return type("Shot", (), {
+        "loop_count": 1,
+        "x": player.eye[0], "y": player.eye[1], "z": player.eye[2],
+        "ori_x": 1.0, "ori_y": 0.0, "ori_z": 0.0,
+        "seed": 0, "shot_on_world_update": 0,
+    })()
+
+
 def test_deployed_mg_uses_recovered_tenth_second_fire_interval(monkeypatch):
     server, player, _ = _server_player()
-    player.input.is_weapon_deployed = True
+    # Deployment is the SERVER mount state, not the client's bit.
+    _place(server, player)
+    gun = server.entity_registry.all()[0]
+    assert gun.behavior.mount(gun, player, server)
+    player.set_tool(C.MG_TOOL, raw=True)
     observed = []
 
     def consume(_now=None, fire_interval=None):
@@ -161,6 +174,40 @@ def test_deployed_mg_uses_recovered_tenth_second_fire_interval(monkeypatch):
     get_combat_system(server).handle_shot(player, packet)
 
     assert observed == [float(C.MG_DEPLOYED_SHOOT_INTERVAL)]
+
+
+def test_unmounted_mg_fire_is_rejected_even_when_client_claims_deployed(monkeypatch):
+    server, player, _ = _server_player()
+    player.input.is_weapon_deployed = True  # forged/untrusted client bit
+    observed = []
+
+    def consume(_now=None, fire_interval=None):
+        observed.append(fire_interval)
+        return True
+
+    monkeypatch.setattr(player, "consume_shot", consume)
+    server.combat = None
+    from server.combat_runtime import get_combat_system
+
+    assert get_combat_system(server).handle_shot(
+        player, _mounted_shot_packet(player)
+    ) is False
+    assert observed == []
+    assert player.anticheat_counts["mg_fire_unmounted"] == 1
+
+
+def test_unmount_calls_player_hook():
+    server, player, _ = _server_player()
+    _place(server, player)
+    gun = server.entity_registry.all()[0]
+    assert gun.behavior.mount(gun, player, server)
+    calls = []
+    player.on_machine_gun_unmounted = lambda: calls.append(True)
+
+    assert gun.behavior.unmount(gun, server)
+
+    assert calls == [True]
+    assert player.mounted_entity_id is None
 
 
 def test_machine_gun_health_destruction_uses_recovered_blast_and_despawns():

@@ -57,7 +57,7 @@ def _damage_cell(data: bytes) -> tuple[int, int, int]:
 def test_preexisting_drill_hole_replays_every_air_cell_in_bounded_batches() -> None:
     """Disconnect/rejoin must not rely only on the native VXL column merge."""
 
-    config = ServerConfig(map_air_catchup_batch_limit=17)
+    config = ServerConfig(map_air_catchup_batch_limit=17, map_air_catchup_enabled=True)
     server = BattleSpadesServer(config)
     world = server.world_manager
     world.map = ServerVXL(-1, b"", 0, 2)
@@ -119,7 +119,7 @@ def test_rebuilt_voxel_is_removed_from_future_reconnect_air_masks() -> None:
 def test_air_replay_retry_keeps_the_first_unaccepted_voxel() -> None:
     """A failed reliable send must not advance the compact bitmask cursor."""
 
-    server = BattleSpadesServer(ServerConfig(map_air_catchup_batch_limit=8))
+    server = BattleSpadesServer(ServerConfig(map_air_catchup_batch_limit=8, map_air_catchup_enabled=True))
     world = server.world_manager
     world.map = ServerVXL(-1, b"", 0, 2)
     cell = (22, 33, 44)
@@ -142,7 +142,7 @@ def test_air_replay_retry_keeps_the_first_unaccepted_voxel() -> None:
 def test_mutation_during_batched_air_replay_finishes_at_current_vxl_state() -> None:
     """Post-snapshot builds/removals must win over the frozen air masks."""
 
-    server = BattleSpadesServer(ServerConfig(map_air_catchup_batch_limit=1))
+    server = BattleSpadesServer(ServerConfig(map_air_catchup_batch_limit=1, map_air_catchup_enabled=True))
     world = server.world_manager
     world.map = ServerVXL(-1, b"", 0, 2)
     rebuilt = (50, 60, 70)

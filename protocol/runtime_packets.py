@@ -325,8 +325,35 @@ def decode_set_class_loadout_payload(payload: bytes) -> RuntimeSetClassLoadout:
     )
 
 
+@dataclass(slots=True)
+class RuntimeVoiceData:
+    """VoiceData(103) kept as raw bytes.
+
+    The compiled ``shared.packet.VoiceData`` turns the Steam voice payload
+    into ``str`` with ``decode('utf-8', 'replace')``, which would corrupt
+    every frame.  Voice relay is out of scope; this decoder only guarantees
+    that any receive/trace path sees the payload byte-for-byte.
+    """
+
+    player_id: int
+    data_size: int
+    data: bytes
+
+
+def decode_voice_data_payload(payload: bytes) -> RuntimeVoiceData:
+    if len(payload) < 3:
+        raise ValueError("VoiceData too short")
+    size = int(payload[1]) | (int(payload[2]) << 8)
+    data = bytes(payload[3:3 + size])
+    if len(data) != size:
+        raise ValueError("VoiceData truncated")
+    return RuntimeVoiceData(player_id=int(payload[0]), data_size=size, data=data)
+
+
 def decode_runtime_packet(packet_id: int, payload: bytes) -> Optional[object]:
     """Decode only the packet types that need live runtime compatibility."""
+    if packet_id == 103:
+        return decode_voice_data_payload(payload)
     if packet_id == 4:
         return decode_client_data_payload(payload)
     if packet_id == 13:

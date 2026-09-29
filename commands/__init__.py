@@ -13,6 +13,8 @@ from .command_handler import (
 from .admin import *
 from .player import *
 from .server_commands import *
+from .anticheat_admin import *
+from .hud_admin import *
 
 __all__ = [
     "handle_command",

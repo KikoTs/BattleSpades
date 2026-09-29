@@ -48,7 +48,33 @@ _modes = {
 
 def get_mode_class(name: str) -> Optional[Type[BaseMode]]:
     """Get mode class by name."""
-    return _modes.get(name.lower())
+    return _modes.get(str(name).strip().lower())
+
+
+def canonical_mode_code(name: str) -> Optional[str]:
+    """Return the one registry code for a mode name or alias.
+
+    ``occupation``/``diamond``/``zombie``/``classic_ctf`` resolve to the
+    retail short codes (``oc``/``dia``/``zom``/``cctf``) that map metadata,
+    mode_data and config overlays key on. Returns ``None`` for an unknown
+    mode. A registered name without a retail short code (``arena``) is
+    returned as-is.
+    """
+    normalized = str(name).strip().lower()
+    mode_class = _modes.get(normalized)
+    if mode_class is None:
+        return None
+    from server import mode_data
+
+    code = mode_data.get(normalized).code
+    if code != "nor" and _modes.get(code) is mode_class:
+        return code
+    return normalized
+
+
+def registered_mode_codes() -> tuple[str, ...]:
+    """Every accepted mode name, sorted (for operator error messages)."""
+    return tuple(sorted(_modes))
 
 
 def register_mode(name: str, mode_class: Type[BaseMode]):
@@ -69,6 +95,8 @@ __all__ = [
     "DiamondMineMode",
     "DemolitionMode",
     "OccupationMode",
+    "canonical_mode_code",
     "get_mode_class",
     "register_mode",
+    "registered_mode_codes",
 ]

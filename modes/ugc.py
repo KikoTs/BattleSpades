@@ -19,6 +19,7 @@ import zlib
 import shared.constants as C
 import shared.constants_gamemode as MG
 from shared.packet import (
+    FogColor,
     ForceTeamJoin,
     InitialUGCBatch,
     MapDataChunk,
@@ -34,9 +35,17 @@ from shared.packet import (
 )
 
 from modes.base_mode import BaseMode
+from server.announcements import build_localised_overlay
+from server.audio import SND_PAINT, play_sound
 from server.class_selection import ClassSelection, normalize_server_selection
-from server.game_constants import TEAM1
-from server.ugc_project import UGCProject, mode_id, normalize_target_mode
+from server.game_constants import TEAM1, TEAM_NEUTRAL
+from server.ugc_capacity import UGCCapacity
+from server.ugc_project import (
+    UGCPlacement,
+    UGCProject,
+    mode_id,
+    normalize_target_mode,
+)
 
 if TYPE_CHECKING:
     from server.connection import Connection
@@ -55,6 +64,11 @@ class UGCMode(BaseMode):
     never in the 60 Hz path.
     """
 
+    # No combat score economy: no generic kill/suicide SetScore.
+    generic_scoring_enabled = False
+    # No combat stakes: never reveal builders as map escapers.
+    escape_watch_enabled = False
+
     name = "Map Creator"
     description = "Retail-compatible hosted UGC editor"
     score_limit = 0
@@ -65,6 +79,11 @@ class UGCMode(BaseMode):
     # lobby host feeds this many raw VXL bytes into one persistent zlib stream
     # before deciding whether packet 56 has output ready.
     VXL_SOURCE_CHUNK_SIZE = 1048
+    # One positional PAINT_PRIMARY_SOUND per editor per interval; the retail
+    # brush fires every 30 ms, which would otherwise flood the audio lane.
+    PAINT_SOUND_INTERVAL = 0.1
+    SAVE_SUCCESS_STRING = "UGC_MAP_SAVE_SUCCESSFULLY"
+    SAVE_ERROR_STRING = "UGC_MAP_SAVE_ERROR"
 
     def __init__(self, server) -> None:
         if not bool(getattr(server.config, "ugc_runtime", False)):
@@ -83,6 +102,13 @@ class UGCMode(BaseMode):
         self._last_checkpoint = 0.0
         self._checkpoint_task: asyncio.Task | None = None
         self._preview_task: asyncio.Task | None = None
+        self._save_task: asyncio.Task | None = None
+        self._save_waiters: list[object] = []
+        # Stock clients only see markers as CreateEntity(21) type
+        # UGC_ENTITY(29); packets 97/98 have no gameScene receive handler.
+        self._marker_entities: dict[UGCPlacement, int] = {}
+        self.capacity: UGCCapacity | None = None
+        self._paint_sound_next: dict[int, float] = {}
 
     async def on_mode_start(self) -> None:
         """Start the non-competitive editor without match music or pickups."""
@@ -94,9 +120,12 @@ class UGCMode(BaseMode):
         self.elapsed_time = 0.0
         for team in self.server.teams.values():
             team.infinite_blocks = True
+        self._build_capacity()
         subscribe = getattr(self.server.world_manager, "subscribe_mutations", None)
         if callable(subscribe):
             self._mutation_listener_token = subscribe(self._on_world_mutation)
+        for placement in tuple(self.project.placements):
+            self._create_marker(placement, announce=False)
         logger.info(
             "UGC editor ready: project=%s terrain=%s target=%s entities=%d",
             self.project.title,
@@ -125,6 +154,12 @@ class UGCMode(BaseMode):
                 await task
             except (OSError, asyncio.CancelledError):
                 logger.warning("UGC metadata checkpoint did not finish", exc_info=True)
+        save_task = self._save_task
+        if save_task is not None:
+            try:
+                await save_task
+            except (OSError, asyncio.CancelledError):
+                logger.warning("UGC save request did not finish", exc_info=True)
         preview_task = self._preview_task
         if preview_task is not None:
             try:
@@ -234,6 +269,8 @@ class UGCMode(BaseMode):
         """Keep authors alive while carving or flying around their terrain."""
 
         return 0
+
+    smart_spawns = False
 
     def get_spawn_point(self, player: "Player") -> tuple[float, float, float]:
         """Use the map's prewarmed safe terrain resolver near its first side."""
@@ -422,6 +459,126 @@ class UGCMode(BaseMode):
 
         self.send_initial_batch(connection)
         self.send_objectives(connection)
+        self.reveal_markers(connection)
+
+    # ------------------------------------------------------------------
+    # Stock-client marker entities (UGC-1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _marker_team(item_id: int) -> int:
+        """Wire team for one marker; UGC_ENTITY_TEAMS values are wire ids."""
+
+        team = int(C.UGC_ENTITY_TEAMS.get(int(item_id), C.TEAM_NEUTRAL))
+        return team if team in (int(C.TEAM1), int(C.TEAM2)) else TEAM_NEUTRAL
+
+    def _create_marker(self, placement: UGCPlacement, *, announce: bool = True) -> None:
+        """Register one type-29 entity mirroring a placement.
+
+        The native client materializes markers from 97/98 and ignores type
+        29; the stock client needs this entity to draw, point at and remove
+        a marker (gameScene 0x10178b80 / UGCEntity, weapons/ugcTool.py).
+        """
+
+        registry = getattr(self.server, "entity_registry", None)
+        if registry is None or placement in self._marker_entities:
+            return
+        try:
+            entity = registry.place(
+                int(C.UGC_ENTITY),
+                float(placement.x),
+                float(placement.y),
+                float(placement.z),
+                state=self._marker_team(placement.item_id),
+                kind="ugc_marker",
+            )
+        except RuntimeError:
+            logger.warning("UGC marker entity id space exhausted")
+            return
+        entity.ugc_mode = mode_id(placement.mode)
+        entity.int_properties = (int(placement.item_id),)
+        self._marker_entities[placement] = int(entity.entity_id)
+        if announce:
+            broadcast = getattr(self.server, "broadcast_create_entity", None)
+            if callable(broadcast):
+                broadcast(entity)
+
+    def _destroy_marker(self, placement: UGCPlacement) -> None:
+        """Remove the type-29 entity of one removed placement."""
+
+        entity_id = self._marker_entities.pop(placement, None)
+        registry = getattr(self.server, "entity_registry", None)
+        if entity_id is None or registry is None:
+            return
+        registry.remove(entity_id)
+        destroy = getattr(self.server, "broadcast_destroy_entity", None)
+        if callable(destroy):
+            destroy(entity_id)
+
+    def reveal_markers(self, connection: "Connection") -> None:
+        """Create every live marker once in a GameScene (join/refresh)."""
+
+        registry = getattr(self.server, "entity_registry", None)
+        if registry is None:
+            return
+        from server.entities.registry import send_create_entity_to
+
+        for entity_id in tuple(self._marker_entities.values()):
+            entity = registry.get(entity_id)
+            if entity is not None:
+                send_create_entity_to(connection, entity)
+
+    # ------------------------------------------------------------------
+    # Retail map capacity (UGC-8)
+    # ------------------------------------------------------------------
+
+    def _build_capacity(self) -> None:
+        raw = getattr(self.server.world_manager, "map_raw_bytes", None)
+        if not isinstance(raw, (bytes, bytearray)) or not raw:
+            self.capacity = None
+            return
+        try:
+            self.capacity = UGCCapacity.from_vxl(bytes(raw))
+        except ValueError:
+            logger.warning("UGC capacity model could not parse the project VXL")
+            self.capacity = None
+            return
+        logger.info(
+            "UGC capacity: %d solids, %d chunks (limits 2800000/3200)",
+            self.capacity.solid_count,
+            self.capacity.chunk_count,
+        )
+
+    def has_block_space(self) -> bool:
+        """Retail ``is_space_to_add_blocks`` for UGC voxel additions."""
+
+        capacity = self.capacity
+        return capacity is None or capacity.has_space()
+
+    # ------------------------------------------------------------------
+    # Paintbrush single-block cue (UGC-9)
+    # ------------------------------------------------------------------
+
+    def on_single_paint(self, player: "Player", x: int, y: int, z: int) -> bool:
+        """Send PAINT_PRIMARY_SOUND (id 47) at one accepted single-cell paint.
+
+        ``constants_audio.PAINT_PRIMARY_SOUND`` has no client-side caller in
+        any retail .py/.pyd, so it is a server PlaySound.  Throttled per
+        editor; the RMB spray loop is client-local.
+        """
+
+        now = time.monotonic()
+        key = int(getattr(player, "id", -1))
+        if now < self._paint_sound_next.get(key, 0.0):
+            return False
+        self._paint_sound_next[key] = now + self.PAINT_SOUND_INTERVAL
+        play_sound(
+            self.server,
+            SND_PAINT,
+            position=(float(x) + 0.5, float(y) + 0.5, float(z) + 0.5),
+            reliable=False,
+        )
+        return True
 
     def send_initial_batch(self, connection: "Connection") -> None:
         """Send bounded packet-98 chunks in recovered record order."""
@@ -466,28 +623,34 @@ class UGCMode(BaseMode):
         item_id: int,
         placing: bool,
     ) -> bool:
-        """Commit one host-authorized object and echo packet 97 to observers."""
+        """Commit one host-authorized object and echo packet 97 to observers.
+
+        A removal echoes the REMOVED placement's stored position and item
+        (the native client deletes by exact position+item) and destroys its
+        type-29 entity for stock clients.
+        """
 
         if not self.is_host(player):
             return False
         if placing:
-            changed = self.project.place(x, y, z, item_id)
-            output_item = int(item_id)
+            placement = self.project.place_placement(x, y, z, item_id)
         else:
-            removed = self.project.remove(x, y, z, item_id)
-            changed = removed is not None
-            output_item = int(removed.item_id if removed is not None else item_id)
-        if not changed:
+            placement = self.project.remove(x, y, z, item_id)
+        if placement is None:
             return False
         self._metadata_dirty = True
         packet = PlaceUGC()
         packet.loop_count = int(self.server.loop_count)
-        packet.x, packet.y, packet.z = int(x), int(y), int(z)
-        packet.ugc_item_id = output_item
+        packet.x, packet.y, packet.z = placement.position
+        packet.ugc_item_id = int(placement.item_id)
         packet.placing = int(bool(placing))
         self.server.broadcast(
             bytes(packet.generate()), reliable=True, record_mutation=False
         )
+        if placing:
+            self._create_marker(placement)
+        else:
+            self._destroy_marker(placement)
         self.send_objectives()
         return True
 
@@ -562,6 +725,22 @@ class UGCMode(BaseMode):
             reliable=True,
             record_mutation=False,
         )
+        # Retail GameScene.set_skybox_name (0x1012d4c0): when the skydome is
+        # a FOG_COLORS key, send FogColor(74) with make_color(FOG_COLORS[n])
+        # and apply it locally.  The dedicated server is the host, so every
+        # editor INCLUDING the requester receives it.
+        fog = C.FOG_COLORS.get(skybox)
+        if fog is not None:
+            rgb = tuple(int(component) & 0xFF for component in fog[:3])
+            if metadata is not None:
+                metadata.fog_color = rgb
+            fog_packet = FogColor()
+            fog_packet.color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+            self.server.broadcast(
+                bytes(fog_packet.generate()),
+                reliable=True,
+                record_mutation=False,
+            )
         return True
 
     def set_ground_colors(self, player: "Player", values) -> bool:
@@ -643,6 +822,59 @@ class UGCMode(BaseMode):
 
         self._metadata_dirty = True
 
+    def request_save(self, player: "Player") -> bool:
+        """Flush VXL + sidecar now and acknowledge the requesting host.
+
+        Sent by the native F10 quick save / Esc SAVE as UGCMessage(100)
+        UGC_CONVERT_TO_GAME (no shipped client sends that id).  Requests
+        coalesce: one arriving while a save runs is served by one more save
+        after it, so an ack never predates edits made before the request.
+        Non-host requests are ignored (only the retail lobby owner saves).
+        """
+
+        if not self.is_host(player) or self.ended:
+            return False
+        connection = getattr(player, "connection", None)
+        if connection is None:
+            return False
+        self._save_waiters.append(connection)
+        if self._save_task is None or self._save_task.done():
+            self._save_task = asyncio.create_task(self._run_saves())
+        return True
+
+    async def _run_saves(self) -> None:
+        while self._save_waiters:
+            waiters, self._save_waiters = self._save_waiters, []
+            ok = True
+            try:
+                # Serialization is a consistent snapshot taken on the
+                # gameplay thread; only the disk writes run off-thread.
+                raw = bytes(self.server.world_manager.map.generate_vxl(False))
+                sidecar_text = json.dumps(
+                    self.project.to_sidecar(), indent=4, ensure_ascii=False
+                ) + "\n"
+                self._metadata_dirty = False
+                self._world_dirty = False
+                await asyncio.to_thread(
+                    self._write_project_files, raw, sidecar_text
+                )
+            except Exception:
+                logger.exception("UGC save request failed")
+                ok = False
+            data = build_localised_overlay(
+                self.SAVE_SUCCESS_STRING if ok else self.SAVE_ERROR_STRING,
+                override_previous=True,
+            )
+            for connection in waiters:
+                try:
+                    connection.send(data, reliable=True)
+                except Exception:
+                    logger.debug("UGC save ack send failed", exc_info=True)
+
+    def _write_project_files(self, raw: bytes, sidecar_text: str) -> None:
+        _atomic_write_bytes(Path(self.server.config.ugc_vxl_path), raw)
+        _atomic_write_text(Path(self.server.config.ugc_sidecar_path), sidecar_text)
+
     def _on_world_mutation(
         self,
         x: int,
@@ -652,9 +884,12 @@ class UGCMode(BaseMode):
         color: int,
         topology_version: int,
     ) -> None:
-        """Record only a dirty bit; serializer work never runs in the publisher."""
+        """Record a dirty bit and keep the O(1) capacity counters current."""
 
         self._world_dirty = True
+        capacity = self.capacity
+        if capacity is not None:
+            capacity.apply(int(x), int(y), int(z), bool(solid))
 
     def _save_complete_project(self) -> None:
         """Serialize canonical VXL and sidecar during the stopped lifecycle."""

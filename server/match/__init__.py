@@ -36,6 +36,23 @@ class TransitionResult:
     reconnect_required: bool = False
 
 
+def _carries_over_scene(connection) -> bool:
+    """Whether a peer can take the in-place MapEnded -> reload handshake.
+
+    True for in-game peers and for peers whose loader handshake finished
+    (MapSync delivered and StateData sent) but who have not produced
+    ClientData yet: team select, class select, or a join in flight. False only
+    for a peer still inside InitialInfo/MapSync, whose own handshake
+    coroutine would otherwise interleave with the replacement one.
+    """
+
+    if bool(getattr(connection, "in_game", False)):
+        return True
+    return bool(getattr(connection, "map_sent", False)) and bool(
+        getattr(connection, "state_sent", False)
+    )
+
+
 class MatchTransitionService:
     """Own atomic round restarts and full map/mode session rollovers."""
 
@@ -88,10 +105,11 @@ class MatchTransitionService:
 
         if self._transition_busy():
             return TransitionResult(False, "Another match transition is already in progress")
-        normalized = str(mode_name).strip().lower()
-        if self._resolve_mode_class(normalized) is None:
-            return TransitionResult(False, f"Unknown mode: {normalized}")
-        if str(self.server.config.default_mode).strip().lower() == normalized:
+        requested = str(mode_name).strip().lower()
+        normalized = self._canonical_mode(requested)
+        if normalized is None:
+            return TransitionResult(False, f"Unknown mode: {requested}")
+        if self._is_current_mode(normalized):
             return TransitionResult(True, f"Mode {normalized.upper()} is already active")
         self._request_task = asyncio.create_task(
             self._run_mode_request(normalized, requester)
@@ -124,6 +142,11 @@ class MatchTransitionService:
                     return TransitionResult(False, "No active game mode")
                 await self._cancel_mode_end(mode)
                 self._reset_vote_state()
+                # Queued leaves may still decide the old round; the retiring
+                # flag keeps them from opening a vote or an end sequence
+                # underneath the restart (on_mode_start clears it).
+                self._begin_mode_retirement(mode, end_round=False)
+                await self._drain_leave_events(mode)
                 self._discard_old_timeline_work()
                 await mode._restart_round()
                 return TransitionResult(True, "Match restarted")
@@ -143,6 +166,7 @@ class MatchTransitionService:
         map_name: str,
         *,
         end_screen_seconds: float,
+        headline_message_id: int | None = None,
     ) -> TransitionResult:
         """Preflight a voted map, show scores, then commit the rollover.
 
@@ -155,6 +179,7 @@ class MatchTransitionService:
         return await self._change_map(
             map_name,
             end_screen_seconds=end_screen_seconds,
+            headline_message_id=headline_message_id,
         )
 
     async def _change_map(
@@ -162,6 +187,7 @@ class MatchTransitionService:
         map_name: str,
         *,
         end_screen_seconds: float | None,
+        headline_message_id: int | None = None,
     ) -> TransitionResult:
         """Prepare one map and optionally hold the native statistics screen."""
 
@@ -172,7 +198,8 @@ class MatchTransitionService:
             return TransitionResult(False, "Invalid or empty map name")
         if self._is_current_map(normalized):
             return TransitionResult(True, f"Map {normalized} is already loaded")
-        mode_name = str(self.server.config.default_mode).lower()
+        current_mode = str(self.server.config.default_mode).strip().lower()
+        mode_name = self._canonical_mode(current_mode) or current_mode
         self._preparing_map = True
         try:
             try:
@@ -192,10 +219,33 @@ class MatchTransitionService:
 
                 dwell = min(120.0, max(0.0, float(end_screen_seconds)))
                 if supports_game_stats_screen(self.server):
+                    # The round end holds ViewScores with ForceShowScores(1),
+                    # which locks the menu (manager.locked_to_scene): live
+                    # 2026-09-26, packet 53 then left the plain scoreboard up
+                    # and the stats screen, its headline (73) and the
+                    # client's own end-screen music never appeared. Release
+                    # the hold first so show_game_statistics can switch to
+                    # ViewGameStats.
+                    from server.audio import al_error_flush_bytes
+                    from server.scoreboard import force_show_scores
+
+                    # ViewGameStats starts its own menu music stream; clear a
+                    # stale client OpenAL error first (server/audio.py).
+                    self.server.broadcast(al_error_flush_bytes())
+                    force_show_scores(self.server, False)
                     # IDA: packet 53 calls GameScene.show_game_statistics(False).
                     # It is a terminal overlay for this scene, but the scene
                     # remains available to receive packet 52 after the dwell.
                     show_game_stats(self.server)
+                    if headline_message_id is not None:
+                        # IDA: GameScene.show_text_message only sets the
+                        # message when the active menu is ViewGameStats,
+                        # so the retail headline must follow packet 53.
+                        from server.scoreboard import send_show_text_message
+
+                        send_show_text_message(
+                            self.server, int(headline_message_id), dwell
+                        )
                     host = getattr(self.server, "host", None)
                     if host is not None:
                         host.flush()
@@ -219,10 +269,11 @@ class MatchTransitionService:
 
         if self._transition_busy(allow_current_request=True):
             return TransitionResult(False, "Another match transition is already in progress")
-        normalized = str(mode_name).strip().lower()
-        if self._resolve_mode_class(normalized) is None:
-            return TransitionResult(False, f"Unknown mode: {normalized}")
-        if str(self.server.config.default_mode).strip().lower() == normalized:
+        requested = str(mode_name).strip().lower()
+        normalized = self._canonical_mode(requested)
+        if normalized is None:
+            return TransitionResult(False, f"Unknown mode: {requested}")
+        if self._is_current_mode(normalized):
             return TransitionResult(True, f"Mode {normalized.upper()} is already active")
         map_name = self._normalize_map_name(self.server.config.default_map)
         self._preparing_map = True
@@ -273,19 +324,31 @@ class MatchTransitionService:
             self.in_progress = True
             server = self.server
             all_connections = tuple(server.connections.values())
-            # Packet 52 is gameplay-gated and therefore cannot reach a peer
-            # still inside InitialInfo/MapSync. Starting reload_scene on such
-            # a peer would cancel its waiter while its original coroutine can
-            # still emit old VXL chunks, splicing two map epochs. Retire these
-            # rare mid-handshake peers explicitly; settled peers retain ENet.
+            # Two kinds of peer are carried into the new map over their
+            # retained ENet peer (MapEnded -> ClientInMenu ack -> InitialInfo
+            # -> MapSync -> StateData):
+            #   * in-game peers (first ClientData seen), and
+            #   * pre-game peers whose loader handshake already COMPLETED
+            #     (StateData sent) — they sit in the GameScene on team /
+            #     class select without ClientData yet. Before 2026-09-26 these
+            #     were kicked with ERROR_MATCH_ENDED on every rollover, so a
+            #     player choosing a team during a round end never came back.
+            # Only a peer still inside InitialInfo/MapSync is retired: starting
+            # reload_scene on it would cancel its waiter while its original
+            # coroutine can still emit old VXL chunks, splicing two map epochs.
             connections = tuple(
                 connection
                 for connection in all_connections
-                if bool(getattr(connection, "in_game", False))
+                if _carries_over_scene(connection)
             )
             loading_connections = tuple(
                 connection
                 for connection in all_connections
+                if not _carries_over_scene(connection)
+            )
+            pregame_connections = tuple(
+                connection
+                for connection in connections
                 if not bool(getattr(connection, "in_game", False))
             )
             old_mode = server.mode
@@ -310,7 +373,25 @@ class MatchTransitionService:
                 # MapEnded(52) freezes the compiled GameScene. BattleSpades'
                 # maintained client opens LoadingMenu on the same GameClient
                 # and acknowledges that state with ClientInMenu(110).
-                server.broadcast(bytes(MapEnded().generate()))
+                map_ended = bytes(MapEnded().generate())
+                # The loader swaps the menu music and retires the in-game
+                # stream right after packet 52. With an OpenAL error pending
+                # the stock client orphans that stream in ALURE and freezes
+                # on its next sound (live 2026-09-26, START after rollover).
+                # A silent one-shot processed just before 52 clears the
+                # error; client_patches/session_transition_patch.py closes
+                # the hole on patched clients.
+                from server.audio import al_error_flush_bytes
+
+                flush = al_error_flush_bytes()
+                server.broadcast(flush)
+                server.broadcast(map_ended)
+                # broadcast() is gameplay-gated on in_game; a peer on team /
+                # class select has a live GameScene too and must see the
+                # same freeze to open its loader and acknowledge.
+                for connection in pregame_connections:
+                    connection.send(flush)
+                    connection.send(map_ended)
                 host = getattr(server, "host", None)
                 if host is not None:
                     host.flush()
@@ -326,16 +407,26 @@ class MatchTransitionService:
                     )
                 if old_mode is not None:
                     await self._cancel_mode_end(old_mode)
+                    # Bot retirement and roster detach run the old mode's
+                    # leave hooks. A retiring mode must not finish a round
+                    # (Zombie/VIP/Arena elimination), open a map vote that
+                    # leaks into the new map, or start its end sequence.
+                    self._begin_mode_retirement(old_mode, end_round=True)
                 bots = getattr(server, "bots", None)
                 prepare_bots = getattr(bots, "prepare_for_game_transition", None)
                 if callable(prepare_bots):
                     await prepare_bots()
+                if old_mode is not None:
+                    await self._drain_leave_events(old_mode)
                 for connection in all_connections:
                     await self._detach_transition_player(connection, old_mode)
                 if old_mode is not None:
                     deactivate = getattr(old_mode, "deactivate", None)
                     if callable(deactivate):
                         await deactivate()
+                # Defense in depth: nothing the old mode did while retiring
+                # may carry a ballot or a staged next map into the new one.
+                self._reset_vote_state()
                 self._discard_old_timeline_work()
                 ready_timeout = min(
                     5.0,
@@ -382,7 +473,19 @@ class MatchTransitionService:
                 if repair is not None:
                     repair.reset()
                 self._reset_map_journal()
+                # New map, new match: admin team rules (81/82) and billboards
+                # do not carry over.
+                from server import hud_packets
 
+                hud_packets.reset_state(server)
+
+                # Map-vote history: the map being left counts as played even
+                # when an admin (not a ballot) chose the next one.
+                note_played = getattr(
+                    getattr(server, "vote_manager", None), "note_map_played", None
+                )
+                if callable(note_played):
+                    note_played(old_map)
                 server.config.default_map = map_name
                 server.config.default_mode = mode_name
                 if candidate_world is not None:
@@ -471,6 +574,7 @@ class MatchTransitionService:
                 if callable(bind_journal):
                     bind_journal()
                 server.fog_color_override = old_fog_override
+                failed_mode = server.mode
                 server.mode = old_mode
                 for connection in all_connections:
                     connection.in_game = False
@@ -478,6 +582,7 @@ class MatchTransitionService:
                         connection.disconnect(reason=int(DISCONNECT.ERROR_DATA))
                     except Exception:
                         logger.debug("failed to retire transition client", exc_info=True)
+                await self._revive_rolled_back_mode(failed_mode, old_mode)
                 return TransitionResult(
                     False,
                     "Session change failed safely; reconnect after checking server log",
@@ -485,6 +590,74 @@ class MatchTransitionService:
                 )
             finally:
                 self.in_progress = False
+
+    async def _revive_rolled_back_mode(self, failed_mode, old_mode) -> None:
+        """Restart the restored mode after a failed rollover.
+
+        The old mode was already deactivated (``ended``) and the bots retired
+        by the time most failures can happen. Restoring ``server.mode``
+        alone left a dead round forever: no clock, no win checks, no bots.
+        Every step is individually guarded; this runs inside an ``except``.
+        """
+
+        server = self.server
+        if failed_mode is not None and failed_mode is not old_mode:
+            deactivate = getattr(failed_mode, "deactivate", None)
+            if callable(deactivate):
+                try:
+                    await deactivate()
+                except Exception:
+                    logger.exception("failed to retire the aborted mode")
+        self._discard_old_timeline_work()
+        if old_mode is not None:
+            try:
+                for team in server.teams.values():
+                    team.reset()
+                await old_mode.on_mode_start()
+            except Exception:
+                logger.exception("failed to restart the restored mode")
+        bots = getattr(server, "bots", None)
+        rebind_bots = getattr(bots, "rebind_after_match_transition", None)
+        if callable(rebind_bots):
+            try:
+                result = rebind_bots()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("failed to rebind bots after rollback")
+
+    async def _drain_leave_events(self, mode) -> None:
+        """Run queued ``on_player_leave`` events before the queue is dropped.
+
+        Leave hooks release mode ownership (VIP, intel, bomb, diamond). A
+        restart that simply cleared ``_mode_events`` could lose one and keep
+        a departed id as a carrier or VIP into the next round.
+        """
+
+        queue = getattr(self.server, "_mode_events", None)
+        if not queue:
+            return
+        leaves = [args for name, args in list(queue) if name == "on_player_leave"]
+        if not leaves:
+            return
+        kept = [item for item in list(queue) if item[0] != "on_player_leave"]
+        queue.clear()
+        queue.extend(kept)
+        plugins = getattr(self.server, "plugin_manager", None)
+        for args in leaves:
+            handler = getattr(mode, "on_player_leave", None)
+            try:
+                if callable(handler):
+                    result = handler(*args)
+                    if inspect.isawaitable(result):
+                        await result
+                call_event = getattr(plugins, "call_event", None)
+                if callable(call_event):
+                    result = call_event("on_player_leave", *args)
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception:
+                logger.exception("queued on_player_leave failed during transition")
 
     async def _detach_transition_player(self, connection, old_mode) -> None:
         """Retire one old-scene Player while preserving its network peer.
@@ -515,6 +688,21 @@ class MatchTransitionService:
         if self.server.players.get(player_id) is player:
             self.server.players.pop(player_id, None)
         connection.player = None
+
+    @staticmethod
+    def _begin_mode_retirement(mode, *, end_round: bool) -> None:
+        """Flag ``mode`` as being replaced before its roster is detached."""
+
+        begin = getattr(mode, "begin_retirement", None)
+        if callable(begin):
+            begin(end_round=end_round)
+            return
+        try:
+            mode.retiring = True
+            if end_round:
+                mode.ended = True
+        except AttributeError:
+            pass
 
     async def _cancel_mode_end(self, mode) -> None:
         """Cancel a delayed victory task before another lifecycle mutates state."""
@@ -550,6 +738,9 @@ class MatchTransitionService:
         consume = getattr(vote_manager, "consume_next_map", None)
         if callable(consume):
             consume()
+        clear_kicks = getattr(vote_manager, "clear_match_kicks", None)
+        if callable(clear_kicks):
+            clear_kicks()
 
     def _reset_map_journal(self) -> None:
         """Forget terrain replay packets belonging to a replaced VXL."""
@@ -612,6 +803,25 @@ class MatchTransitionService:
 
         current = self._normalize_map_name(self.server.config.default_map)
         return current.casefold() == map_name.casefold()
+
+    @staticmethod
+    def _canonical_mode(mode_name: str) -> str | None:
+        """Collapse an admin alias ("occupation") to its registry short code.
+
+        Map metadata, mode_data and ``[modes.*]`` overlays key on the short
+        code, so storing the alias verbatim silently dropped mode-tagged map
+        objectives (occupation base, diamond bases) after ``/mode``.
+        """
+
+        from modes import canonical_mode_code
+
+        return canonical_mode_code(mode_name)
+
+    def _is_current_mode(self, mode_code: str) -> bool:
+        """Alias-aware "already active" check."""
+
+        current = str(self.server.config.default_mode).strip().lower()
+        return (self._canonical_mode(current) or current) == mode_code
 
     @staticmethod
     def _resolve_mode_class(mode_name: str):

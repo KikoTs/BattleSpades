@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -11,10 +12,10 @@ from typing import TYPE_CHECKING
 
 import shared.constants as C
 from shared.packet import (
-    BlockBuild,
-    BlockBuildColored,
     BuildPrefabAction,
+    Damage,
     ErasePrefabAction,
+    PaintBlockPacket,
     PrefabComplete,
 )
 
@@ -28,6 +29,124 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+# BlockManagerState(38) user-block rows per packet.  Seven bytes each; the
+# default keeps one packet near the 1 KB MapSync slice size.
+BLOCK_STATE_DEFAULT_ROWS = 128
+BLOCK_STATE_MAX_ROWS = 4096
+_BLOCK_STATE_ID = 38
+
+
+def encode_block_manager_state(rows, damaged_rows=()) -> bytes:
+    """Encode a retail BlockManagerState(38).
+
+    Wire layout recovered from the stock client's own ``shared.packet``
+    (generate/read round trip, live 2026-09-26), little-endian::
+
+        u8  id = 38
+        i32 damaged_count, damaged rows: i16 x, i16 y, i16 z,
+            u8 remaining_health * 4, u8 b, u8 g, u8 r
+        i32 user_count, user rows: i16 x, i16 y, i16 z, u8 health * 4
+        i32 occupied_count, occupied rows (always 0 here)
+
+    ``receive_block_manager_state`` MERGES both tables (live 2026-09-26): a
+    user row sets ``user_blocks[cell]`` (initial health, unscaled); a damaged
+    row sets ``damaged_blocks[cell] = DamagedBlock(health, original_color)``
+    (scaled remaining health) and darkens the voxel from ``original_color``
+    exactly like live damage.  The server's reconstructed
+    ``BlockManagerState``/``ServerBlockItem`` classes do not match this
+    layout, hence the explicit encoder.  User health is rounded UP to the
+    0.25 wire step so a joiner never breaks a cell before the server;
+    remaining health is already on the 0.25 grid (retail damage quanta).
+    """
+
+    rows = tuple(rows)
+    damaged_rows = tuple(damaged_rows)
+    out = bytearray(struct.pack("<Bi", _BLOCK_STATE_ID, len(damaged_rows)))
+    for x, y, z, health, color in damaged_rows:
+        quarters = max(1, min(255, int(math.floor(float(health) * 4.0 + 0.5))))
+        r, g, b = (int(value) & 0xFF for value in tuple(color)[:3])
+        out += struct.pack("<hhhBBBB", int(x), int(y), int(z), quarters, b, g, r)
+    out += struct.pack("<i", len(rows))
+    for x, y, z, health in rows:
+        quarters = max(1, min(255, int(math.ceil(float(health) * 4.0 - 1e-9))))
+        out += struct.pack("<hhhB", int(x), int(y), int(z), quarters)
+    out += struct.pack("<i", 0)
+    return bytes(out)
+
+
+def block_state_packets(user_rows, damaged_rows=(), batch=BLOCK_STATE_DEFAULT_ROWS):
+    """Split BlockManagerState rows into bounded packets (bytes list).
+
+    Every user-row packet precedes every damaged-row packet.  The stock
+    client darkens a damaged row's voxel by ``0.125`` per point of damage
+    measured against ``get_initial_health`` AT THAT MOMENT (live
+    2026-09-26: a 4.0/9 row before its 9.0 user row darkened like 4.0/5), so
+    the initial health must already be merged.
+    """
+
+    user_rows = list(user_rows)
+    damaged_rows = list(damaged_rows)
+    batch = max(1, min(BLOCK_STATE_MAX_ROWS, int(batch)))
+    packets = [
+        encode_block_manager_state(user_rows[start:start + batch])
+        for start in range(0, len(user_rows), batch)
+    ]
+    packets.extend(
+        encode_block_manager_state((), damaged_rows[start:start + batch])
+        for start in range(0, len(damaged_rows), batch)
+    )
+    return packets
+
+
+def block_shade_packets(shade_rows, loop_count: int = 0) -> list[bytes]:
+    """PaintBlock(7) per ``(x, y, z, (r, g, b))`` live damage shade.
+
+    Sent AFTER the damaged rows: the stock ``add_damage`` compounds
+    ``dim`` on the current colour per hit while a damaged row darkens its
+    original colour once by the total (IDA 2026-09-26), so multi-hit or
+    painted-after-damage cells need the live shade restated.  PaintBlock's
+    ``color_block`` only sets the voxel colour; the DamagedBlock health and
+    original colour the row installed are untouched.
+    """
+
+    out = []
+    for x, y, z, color in shade_rows:
+        paint = PaintBlockPacket()
+        paint.loop_count = max(0, int(loop_count))
+        paint.x, paint.y, paint.z = int(x), int(y), int(z)
+        paint.color = tuple(int(value) & 0xFF for value in tuple(color)[:3])
+        out.append(bytes(paint.generate()))
+    return out
+
+
+def block_hit_replay_packets(replays, actor_id: int) -> list[bytes]:
+    """Single-cell Damage(37) per recorded hit of a client-coloured cell.
+
+    ``replays`` rows are ``(x, y, z, (amount, ...))`` from
+    :meth:`WorldManager.block_hit_replays`.  Type 6 (WEAPON_DAMAGE) applies
+    the packet amount to exactly the centre cell, the same ``add_damage``
+    the live hit made, so the joiner reproduces the health and the per-hit
+    darkening of a colour only the client knows.  ``chunk_check=0``: no hit
+    breaks the cell, and no collapse work is replayed.  Only for a joiner
+    whose client holds no damage for these cells (after its user rows).
+    """
+
+    out = []
+    for x, y, z, amounts in replays:
+        for amount in amounts:
+            packet = Damage()
+            packet.player_id = int(actor_id)
+            packet.type = int(C.WEAPON_DAMAGE)
+            packet.damage = float(amount)
+            packet.face = 0
+            packet.chunk_check = 0
+            packet.seed = 0
+            packet.causer_id = int(actor_id)
+            packet.position = (float(x), float(y), float(z))
+            out.append(bytes(packet.generate()))
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +189,13 @@ class _BotPrefabOwner:
 
 @dataclass(slots=True)
 class _PendingPrefab:
-    """One validated prefab drained in bounded per-tick cell batches."""
+    """One validated prefab awaiting its post-physics commit.
+
+    Competitive placements commit whole in one tick; UGC editor builds and
+    erases drain in bounded per-tick cell batches.  ``pitch``, ``roll`` and
+    ``base_color`` are the exact BuildPrefabAction(30) fields echoed to every
+    client for a competitive commit.
+    """
 
     player: object
     name: str
@@ -84,6 +209,9 @@ class _PendingPrefab:
     erase: bool = False
     placed: int = 0
     bot_owner: _BotPrefabOwner | None = None
+    pitch: int = 0
+    roll: int = 0
+    base_color: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +258,9 @@ class PrefabActionService:
     Failures are atomic before VXL mutation; an unexpected per-cell VXL
     rejection is skipped without charging that cell.
     """
+
+    # Competitive prefabs one player may have queued at once.
+    PER_PLAYER_PENDING_LIMIT = 4
 
     def __init__(self, server: "BattleSpadesServer") -> None:
         self.server = server
@@ -292,7 +423,29 @@ class PrefabActionService:
             and 0 <= int(y) < 512
             and build_z_is_safe(int(z))
         ]
+        if not editor_native and len(in_world) != len(cells):
+            # Retail replication is one BuildPrefabAction(30): every client
+            # expands the WHOLE model and debits the owner once per model
+            # voxel.  A partially out-of-world footprint would make the
+            # server's committed cells and wallet diverge from every client,
+            # so it is refused whole (retail's allowed_on_beach_layer gate
+            # likewise rejects rather than clips).
+            return False
         if not in_world or not prefabs.touches_world(world, in_world):
+            return False
+        # Server-owned bots are trusted actors (and snap their anchor to the
+        # surface); only client packets need the reach bound.
+        if (
+            not editor_native
+            and not bool(getattr(player, "is_bot", False))
+            and not self._within_build_reach(player, in_world)
+        ):
+            return False
+        if (
+            not editor_native
+            and not bool(getattr(player, "is_bot", False))
+            and not self._footprint_visible(player, in_world)
+        ):
             return False
         if (
             not editor_native
@@ -337,7 +490,32 @@ class PrefabActionService:
                 reservation=reservation,
                 infinite=infinite,
                 editor_native=editor_native,
+                pitch=pitch,
+                roll=roll,
+                base_color=base_color,
             )
+        if not editor_native:
+            # Lightweight embedders without SimulationRuntime commit the same
+            # whole-model action immediately.
+            pending = self._new_pending(
+                player,
+                name=name,
+                anchor=anchor,
+                yaw=yaw,
+                cells=in_world,
+                action_loop=action_loop,
+                reservation=reservation,
+                infinite=infinite,
+                editor_native=False,
+                pitch=pitch,
+                roll=roll,
+                base_color=base_color,
+            )
+            if pending is None:
+                return False
+            self._commit_whole(pending)
+            self._finish(pending)
+            return pending.placed > 0
         try:
             placed, new_cells = self._commit(
                 player,
@@ -350,6 +528,7 @@ class PrefabActionService:
                 construction.release(reservation)
 
         if new_cells and not infinite:
+            # Native UGC builders only; competitive prefabs returned above.
             player.blocks = max(0, int(player.blocks) - new_cells)
 
         complete = PrefabComplete()
@@ -371,27 +550,53 @@ class PrefabActionService:
                 SND_PREFAB_BUILD,
                 position=anchor,
                 exclude=player,
+                reliable=False,
             )
         return placed > 0
 
+    # Hard ceiling for whole competitive prefabs committed in one tick.  The
+    # largest stock model (superdome) is 675 cells; a single prefab larger
+    # than the budget is still committed alone so it can never starve.
+    COMPETITIVE_TICK_CELL_CEILING = 8192
+
     def tick(self) -> int:
-        """Adopt prepared editor work and commit bounded cells after physics."""
+        """Adopt prepared editor work and commit queued prefabs after physics.
+
+        Competitive prefabs commit whole in one tick: every cell of one
+        placement is written in the same simulation frame and replicated as
+        one retail BuildPrefabAction(30), so every client expands the model
+        at once (with its smoke ring).  ``prefab_competitive_cell_budget``
+        caps the cells committed
+        across all players per tick; whole prefabs beyond it wait for the next
+        tick and a prefab is never split.  UGC editor builds and erases keep
+        the bounded per-cell ``prefab_cell_batch_limit`` lane.
+        """
 
         self._collect_editor_preparations()
         self._validate_editor_preparations()
 
         if not self._pending:
             return 0
-        hard_limit = 2048 if bool(getattr(self.server.config, "ugc_runtime", False)) else 128
+        config = self.server.config
+        hard_limit = 2048 if bool(getattr(config, "ugc_runtime", False)) else 128
         budget = max(
             1,
             min(
                 hard_limit,
-                int(getattr(self.server.config, "prefab_cell_batch_limit", 16)),
+                int(getattr(config, "prefab_cell_batch_limit", 16)),
+            ),
+        )
+        whole_budget = max(
+            1,
+            min(
+                self.COMPETITIVE_TICK_CELL_CEILING,
+                int(getattr(config, "prefab_competitive_cell_budget", 2048)),
             ),
         )
         committed = 0
-        while self._pending and committed < budget:
+        cell_lane = 0
+        whole_lane = 0
+        while self._pending:
             pending = self._pending[0]
             player = pending.player
             current = self.server.players.get(int(player.id))
@@ -408,21 +613,33 @@ class PrefabActionService:
                 self._pending.popleft()
                 self._cancel(pending)
                 continue
-            construction = getattr(self.server, "construction", None)
-            if (getattr(player, "is_bot", False) and not pending.erase
-                    and construction is not None
-                    and construction._overlaps_living_player(
-                        frozenset(cell[0] for cell in pending.cells))):
-                # Competitive bot prefabs emit explicit cell packets. Stop
-                # and refund the remaining cells if a body enters between
-                # reservation and one of the bounded post-physics batches.
+            if self._commits_whole(pending):
+                size = len(pending.cells)
+                if whole_lane and whole_lane + size > whole_budget:
+                    break
                 self._pending.popleft()
-                self._cancel(pending)
+                construction = getattr(self.server, "construction", None)
+                if construction is not None and construction._overlaps_living_player(
+                    frozenset(cell[0] for cell in pending.cells)
+                ):
+                    # A body entered the footprint between admission and this
+                    # post-physics commit. Retail validated and built in one
+                    # step, so refuse the whole prefab rather than entomb.
+                    self._cancel(pending)
+                    self._finish(pending)
+                    continue
+                self._commit_whole(pending)
+                whole_lane += size
+                committed += size
+                self._finish(pending)
                 continue
+            if cell_lane >= budget:
+                break
             coordinate, color, charged = pending.cells.popleft()
             if pending.erase:
                 if self._erase_cell(coordinate):
                     pending.placed += 1
+                cell_lane += 1
                 committed += 1
                 if not pending.cells:
                     self._pending.popleft()
@@ -441,11 +658,135 @@ class PrefabActionService:
                     self._refund(pending, 1)
             elif charged:
                 self._refund(pending, 1)
+            cell_lane += 1
             committed += 1
             if not pending.cells:
                 self._pending.popleft()
                 self._finish(pending)
         return committed
+
+    @staticmethod
+    def _commits_whole(pending: _PendingPrefab) -> bool:
+        """Competitive placements commit atomically; editor work is batched."""
+
+        return not pending.editor_native and not pending.erase
+
+    def _commit_whole(self, pending: _PendingPrefab) -> None:
+        """Commit one competitive prefab and replicate it the retail way.
+
+        Retail ``PrefabManager.build_prefab`` adds every model voxel with
+        ``add_user_block(..., DEFAULT_PREFAB_HEALTH, replace_solids=True)``:
+        existing solids are overwritten, every cell starts at prefab health
+        (9), and the owner's ``on_single_block_added`` debits one block per
+        model voxel.  The server mirrors that ledger (cells, colours, health,
+        wallet) and broadcasts ONE BuildPrefabAction(30) with
+        ``add_to_user_blocks=True`` to every in-game client, the owner
+        included: the stock client's ``send_build_prefab`` only sends the
+        request, so the owner builds and debits on this echo (measured live
+        2026-09-26: wallet 500 -> 432 for the 68-voxel superminibunker, all
+        cells health 9.0, one smoke ring per top-layer voxel).
+        """
+
+        world = self.server.world_manager
+        health = float(prefabs.DEFAULT_PREFAB_HEALTH)
+        charged = 0
+        while pending.cells:
+            coordinate, color, paid = pending.cells.popleft()
+            charged += int(bool(paid))
+            try:
+                committed = world.set_block(
+                    *coordinate, solid=True, color=color, health=health
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                logger.exception("Prefab VXL commit failed at %s", coordinate)
+                committed = False
+            if committed:
+                pending.placed += 1
+        if not pending.placed:
+            # Nothing reached the canonical map, so no client will build or
+            # debit either: return the whole reservation.
+            if charged:
+                self._refund(pending, charged)
+            return
+        # A cell the VXL refused after full-footprint admission stays paid:
+        # every client expands and debits the complete model regardless.
+        self._broadcast_competitive_build(pending)
+
+    def _broadcast_competitive_build(self, pending: _PendingPrefab) -> None:
+        """Send the one native packet that builds this prefab on clients."""
+
+        packet = BuildPrefabAction()
+        packet.loop_count = int(self.server.loop_count)
+        packet.prefab_name = str(pending.name)
+        packet.player_id = int(pending.player.id)
+        packet.prefab_yaw = int(pending.yaw) & 3
+        packet.prefab_pitch = int(pending.pitch) & 3
+        packet.prefab_roll = int(pending.roll) & 3
+        # Ignored by the add_to_user_blocks expansion; the native index range
+        # is only read by the UGC ``place_prefab_in_world`` path.
+        packet.from_block_index = 0
+        packet.to_block_index = 0
+        packet.position = tuple(int(value) for value in pending.anchor)
+        # The client blends this colour 50/50 with each model voxel exactly
+        # like prefabs.expand_prefab did for the canonical server colours.
+        base = pending.base_color or (0, 0, 0)
+        packet.color = tuple(int(value) & 0xFF for value in base[:3])
+        packet.add_to_user_blocks = True
+        self.server.broadcast(
+            bytes(packet.generate()), reliable=True, record_mutation=False
+        )
+
+    def reveal_to(self, connection) -> int:
+        """Give a late joiner every block's health, which MapSync lacks.
+
+        MapSync/VXL voxels carry no block health (client default 5.0) and
+        packet-33 join catch-up cells are added at 3.0 (both measured), so a
+        joiner would break a player-built cell (9.0) before the server does
+        and would not show damage cracks.  One BlockManagerState(38) table
+        (merged by the stock client, live 2026-09-26) carries every recorded
+        non-default initial health (builds, lines, prefabs, block-cannon
+        cells) plus every partially damaged cell's remaining health and
+        original colour, so the joiner breaks each cell on the same hit as
+        everyone else.  The live shade follows: PaintBlock(7) for cells whose
+        per-hit (or painted) shade the rows' one-shot darkening misses, and
+        the recorded hits themselves (single-cell Damage) for cells whose
+        colour only the client knows (implicit interior / black voxels).
+        Runs on the gameplay thread after the terrain catch-up replay and
+        before ``in_game`` is set.  Returns the number of rows sent.
+        """
+
+        world = getattr(self.server, "world_manager", None)
+        rows_of = getattr(world, "block_manager_rows", None)
+        shade_of = getattr(world, "block_shade_rows", None)
+        replays_of = getattr(world, "block_hit_replays", None)
+        exact = callable(shade_of) and callable(replays_of)
+        if callable(rows_of):
+            user_rows, damaged_rows = (
+                rows_of(replay_hits=True) if exact else rows_of()
+            )
+        else:
+            iterate = getattr(world, "iter_block_health_state", None)
+            if not callable(iterate):
+                return 0
+            user_rows, damaged_rows = list(iterate()), []
+        batch = int(
+            getattr(
+                getattr(self.server, "config", None),
+                "prefab_health_state_batch",
+                BLOCK_STATE_DEFAULT_ROWS,
+            )
+        )
+        for data in block_state_packets(user_rows, damaged_rows, batch):
+            connection.send(data, reliable=True)
+        if exact and callable(rows_of):
+            loop_count = int(getattr(self.server, "loop_count", 0) or 0)
+            for data in block_shade_packets(shade_of(), loop_count):
+                connection.send(data, reliable=True)
+            player = getattr(connection, "player", None)
+            actor_id = int(getattr(player, "id", 0) or 0)
+            for data in block_hit_replay_packets(replays_of(), actor_id):
+                connection.send(data, reliable=True)
+        return len(user_rows) + len(damaged_rows)
 
     def cancel_owner(self, owner_id: int) -> int:
         """Cancel queued work before a compact player id can be reused."""
@@ -742,48 +1083,113 @@ class PrefabActionService:
         reservation: int | None,
         infinite: bool,
         editor_native: bool = False,
+        pitch: int = 0,
+        roll: int = 0,
+        base_color: tuple[int, int, int] | None = None,
     ) -> bool:
         limit = max(
             1,
             min(128, int(getattr(self.server.config, "prefab_queue_limit", 32))),
         )
-        if len(self._pending) >= limit:
+        # The queue is shared by every player; without a per-owner share one
+        # client spamming packet 30 could fill it and starve everyone else's
+        # (and every bot's) prefab placement.
+        owner_id = int(getattr(player, "id", -1))
+        owner_pending = sum(
+            1 for pending in self._pending
+            if int(getattr(pending.player, "id", -2)) == owner_id
+        )
+        if len(self._pending) >= limit or (
+            not editor_native and owner_pending >= self.PER_PLAYER_PENDING_LIMIT
+        ):
             construction = getattr(self.server, "construction", None)
             if construction is not None:
                 construction.release(reservation)
             return False
+        pending = self._new_pending(
+            player,
+            name=name,
+            anchor=anchor,
+            yaw=yaw,
+            cells=cells,
+            action_loop=action_loop,
+            reservation=reservation,
+            infinite=infinite,
+            editor_native=editor_native,
+            pitch=pitch,
+            roll=roll,
+            base_color=base_color,
+        )
+        if pending is None:
+            return False
+        self._pending.append(pending)
+        return True
+
+    def _new_pending(
+        self,
+        player: "Player",
+        *,
+        name: str,
+        anchor: tuple[int, int, int],
+        yaw: int,
+        cells,
+        action_loop: int,
+        reservation: int | None,
+        infinite: bool,
+        editor_native: bool,
+        pitch: int,
+        roll: int,
+        base_color: tuple[int, int, int] | None,
+    ) -> _PendingPrefab | None:
+        """Reserve the wallet and build one pending action (or refuse it).
+
+        Competitive prefabs charge every model voxel, including voxels that
+        replace existing solids: the retail client's ``add_user_block``
+        callback debits the owner once per model voxel on packet 30, so the
+        server wallet must drop by exactly ``len(model points)``.  Native UGC
+        editor builds keep charging only newly solid cells.
+        """
+
         queued_cells = deque()
         reserved_blocks = 0
         world = self.server.world_manager
         for coordinate, color in cells:
-            charged = not infinite and not world.get_solid(*coordinate)
+            if infinite:
+                charged = False
+            elif editor_native:
+                charged = not world.get_solid(*coordinate)
+            else:
+                charged = True
             queued_cells.append((coordinate, color, charged))
             reserved_blocks += int(charged)
         if reserved_blocks > int(player.blocks):
             construction = getattr(self.server, "construction", None)
             if construction is not None:
                 construction.release(reservation)
-            return False
+            return None
         player.blocks -= reserved_blocks
-        self._pending.append(
-            _PendingPrefab(
-                player=player,
-                name=name,
-                anchor=anchor,
-                yaw=yaw,
-                action_loop=action_loop,
-                cells=queued_cells,
-                total_cells=len(queued_cells),
-                reservation=reservation,
-                editor_native=editor_native,
-                bot_owner=(
-                    _BotPrefabOwner.capture(player)
-                    if bool(getattr(player, "is_bot", False)) and not editor_native
-                    else None
-                ),
-            )
+        return _PendingPrefab(
+            player=player,
+            name=name,
+            anchor=anchor,
+            yaw=yaw,
+            action_loop=action_loop,
+            cells=queued_cells,
+            total_cells=len(queued_cells),
+            reservation=reservation,
+            editor_native=editor_native,
+            bot_owner=(
+                _BotPrefabOwner.capture(player)
+                if bool(getattr(player, "is_bot", False)) and not editor_native
+                else None
+            ),
+            pitch=int(pitch) & 3,
+            roll=int(roll) & 3,
+            base_color=(
+                None if base_color is None
+                else tuple(int(value) & 0xFF for value in base_color[:3])
+            ),
         )
-        return True
 
     def _enqueue_erase(
         self,
@@ -855,6 +1261,7 @@ class PrefabActionService:
                 SND_PREFAB_BUILD,
                 position=pending.anchor,
                 exclude=pending.player,
+                reliable=False,
             )
         if pending.editor_native and not pending.erase and pending.placed:
             self._relocate_entombed_players()
@@ -946,6 +1353,73 @@ class PrefabActionService:
         if not bool(getattr(player, "tool_is_raw", False)):
             return False
         return bool(prefabs.prefab_allowed(player, name))
+
+    @staticmethod
+    def _within_build_reach(player: "Player", cells) -> bool:
+        """Require the prefab footprint to be within the builder's reach.
+
+        The retail ghost is anchored on the surface the crosshair hits, so
+        the nearest footprint voxel is always within the ordinary block reach
+        (MAX_BLOCK_DISTANCE plus the shared drift slack). Without this a
+        forged packet 30 could build anywhere on the map.
+        """
+
+        from server.combat_runtime import BUILD_REACH
+
+        eye = getattr(player, "eye", None)
+        if eye is None:
+            eye = (
+                getattr(player, "x", math.nan),
+                getattr(player, "y", math.nan),
+                getattr(player, "z", math.nan),
+            )
+        try:
+            ex, ey, ez = (float(value) for value in eye)
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in (ex, ey, ez)):
+            return False
+        limit = float(BUILD_REACH) ** 2
+        for (x, y, z), _rgb in cells:
+            dx = x + 0.5 - ex
+            dy = y + 0.5 - ey
+            dz = z + 0.5 - ez
+            if dx * dx + dy * dy + dz * dz <= limit:
+                return True
+        return False
+
+    # Nearest footprint cells tried for line of sight (bounded work per packet).
+    _VISIBILITY_SAMPLE_CELLS = 8
+
+    def _footprint_visible(self, player: "Player", cells) -> bool:
+        """Require the prefab ghost's anchor to be visible to the builder.
+
+        The retail ghost sits on the surface the crosshair hits, so some
+        footprint voxel near the eye is in line of sight. Reach alone let a
+        forged packet 30 build inside sealed rooms behind walls.
+        """
+
+        from server.combat_runtime import cell_visible, reference_eyes
+
+        _, eyes = reference_eyes(player)
+        if not eyes:
+            return False
+        eye = eyes[0]
+        ordered = sorted(
+            (position for position, _rgb in cells),
+            key=lambda c: sum((c[i] + 0.5 - eye[i]) ** 2 for i in range(3)),
+        )
+        world = getattr(self.server, "world_manager", None)
+        for cell in ordered[: self._VISIBILITY_SAMPLE_CELLS]:
+            if cell_visible(world, eyes, cell):
+                return True
+        from server import anticheat
+
+        anticheat.report(
+            self.server, player, "prefab_occluded",
+            cell=ordered[0] if ordered else None,
+        )
+        return False
 
     def authorized(self, player: "Player", name: str) -> bool:
         """Public framing gate shared by build and erase packet handlers."""
@@ -1096,7 +1570,7 @@ class PrefabActionService:
         action_loop: int,
         editor_native: bool = False,
     ) -> tuple[int, int]:
-        """Commit validated cells and emit the two proven observer paths."""
+        """Commit validated native UGC cells (non-deferred embedders)."""
 
         placed = 0
         new_cells = 0
@@ -1125,46 +1599,26 @@ class PrefabActionService:
         action_loop: int,
         editor_native: bool = False,
     ) -> bool:
-        """Commit and replicate one cell from an already validated footprint."""
+        """Commit one native UGC editor cell to the canonical VXL.
+
+        Packet 30 already makes every settled retail client expand the exact
+        KV6.  Canonical WorldManager mutations still protect a client whose
+        MapSync was in flight during this bounded commit.  Competitive
+        prefabs never use this per-cell path (see :meth:`_commit_whole`).
+        """
 
         x, y, z = coordinate
         if not build_z_is_safe(z):
             return False
         try:
-            if not self.server.world_manager.set_block(
-                x, y, z, solid=True, color=color
-            ):
-                return False
+            return bool(
+                self.server.world_manager.set_block(
+                    x, y, z, solid=True, color=color
+                )
+            )
         except (AttributeError, RuntimeError, TypeError, ValueError):
             logger.exception("Prefab VXL commit failed at %s", coordinate)
             return False
-
-        if editor_native:
-            # Packet 30 already makes every settled retail client expand the
-            # exact KV6. Canonical WorldManager mutations still protect a
-            # client whose MapSync was in flight during this bounded commit.
-            return True
-
-        observer = BlockBuildColored()
-        observer.loop_count = action_loop
-        observer.player_id = int(player.id)
-        observer.x, observer.y, observer.z = x, y, z
-        observer.color = (
-            (int(color[0]) << 16) | (int(color[1]) << 8) | int(color[2])
-        )
-        self.server.broadcast(
-            bytes(observer.generate()), reliable=True, exclude=player
-        )
-
-        # Native builders debit/finalize only their ordinary BlockBuild echo.
-        # Colored packet 33 is the stable remote/rejoin path.
-        owner = BlockBuild()
-        owner.loop_count = action_loop
-        owner.player_id = int(player.id)
-        owner.x, owner.y, owner.z = x, y, z
-        owner.block_type = 0
-        player.send(bytes(owner.generate()), reliable=True)
-        return True
 
     def _erase_cell(self, coordinate: tuple[int, int, int]) -> bool:
         """Remove one canonical editor cell; packet 31 owns live rendering."""

@@ -1,5 +1,5 @@
 [server]
-name = "AoS Revival Official Territory Control"
+name = "AoS Revival Territory Control"  # <= 31 chars (retail MAX_SERVER_NAME_SIZE)
 port = 27027
 max_players = 24
 tick_rate = 60
@@ -39,3 +39,6 @@ query_port = 27028
 level = "INFO"
 file = "official-territory-control.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

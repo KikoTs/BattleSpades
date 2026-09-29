@@ -70,6 +70,13 @@ class CompactVoxelMap:
     __slots__ = ("_columns", "source_z_shift")
 
     def __init__(self, raw_data: bytes) -> None:
+        if not isinstance(raw_data, (bytes, bytearray, memoryview)):
+            raise ValueError(
+                f"VXL snapshot must be bytes, not {type(raw_data).__name__}"
+            )
+        # Own an immutable copy: a bytearray or memoryview handed across a
+        # thread boundary can change or be released while we walk it.
+        raw_data = bytes(raw_data)
         columns, maximum_reference = _raw_vxl_size(raw_data)
         edge = math.isqrt(columns) if columns > 0 else 0
         if edge <= 0 or edge * edge != columns or edge > MAP_SIZE:

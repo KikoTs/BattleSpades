@@ -1,0 +1,50 @@
+{
+    "_comment": "Shared tutorial lesson script. BattleSpades tests/test_tutorial.py pins modes/tutorial.py to it; the native client keeps a byte-identical copy for TutorialLessons/TutorialWorldSession. Retail strings: aoslib/strings/english.py 971-1006. Tower/targets measured from Training.vxl (SHA-256 aea9cc55...).",
+    "stages": ["intro", "basic_controls", "jump", "crouch", "shooting", "climb", "complete"],
+    "messages": {
+        "intro": ["TUTORIAL_INTRO"],
+        "basic_controls": ["TUTORIAL_BASIC_CONTROLS_1", "TUTORIAL_BASIC_CONTROLS_2", "TUTORIAL_BASIC_CONTROLS_3"],
+        "jump": ["TUTORIAL_JUMP_1", "TUTORIAL_JUMP_2"],
+        "crouch": ["TUTORIAL_CROUCH_1", "TUTORIAL_CROUCH_2"],
+        "shooting": ["TUTORIAL_SHOOTING_1", "TUTORIAL_SHOOTING_2", "TUTORIAL_SHOOTING_3"],
+        "climb": ["TUTORIAL_CLIMB1", "TUTORIAL_CLIMB2", "TUTORIAL_CLIMB3"],
+        "complete": ["TUTORIAL_COMPLETE_1", "TUTORIAL_COMPLETE_2", "TUTORIAL_COMPLETE_3"]
+    },
+    "intro_seconds": 3.0,
+    "help_transition_delay": 0.35,
+    "completion_seconds": 10.0,
+    "complete_sound_id": 27,
+    "target_counter_string": "TUTORIAL_DESTROY_TARGET",
+    "gates": {
+        "basic_controls_max_local_x": 135.0,
+        "jump_with_input_max_local_x": 128.0,
+        "jump_fallback_max_local_x": 119.0,
+        "crouch_with_input_max_local_x": 108.0,
+        "crouch_fallback_max_local_x": 99.0
+    },
+    "loadouts": {
+        "movement": [],
+        "shooting": ["pistol"],
+        "climb": ["pistol", "block", "spade"],
+        "climb_equips": "spade"
+    },
+    "tower": {
+        "center_local": [118.5, 51.5],
+        "radius": 9.5,
+        "max_z": 200.0
+    },
+    "targets": {
+        "count": 5,
+        "rgb": 14955316,
+        "red_cells": 13,
+        "disc_cells": 21,
+        "one_hit_drops_disc": true,
+        "centers_local": [[39, 62, 221], [39, 91, 221], [43, 60, 229], [43, 93, 229], [53, 78, 229]]
+    },
+    "lane_origins": [[0, 0], [148, 0], [298, 0], [0, 126], [148, 126], [298, 126], [0, 246], [148, 246], [298, 246], [0, 372], [148, 372], [298, 372]],
+    "lane_size": [146, 120],
+    "spawn_local": [140.5, 76.5, 230.75],
+    "colour_picker": false,
+    "colour_palette": true,
+    "player_score": false
+}

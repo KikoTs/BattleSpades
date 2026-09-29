@@ -72,6 +72,9 @@ class AIThreadSupervisor:
         self._running = False
         self._ready = False
         self._restarts = 0
+        self._planned_recycles = 0
+        self._crash_restarts = 0
+        self._snapshot_rejections = 0
         self._dropped_frames = 0
         self._dropped_intents = 0
         self._last_processed_at = 0.0
@@ -143,6 +146,7 @@ class AIThreadSupervisor:
                 changed_cells=tuple(self._terrain_overlay.values()),
             )
             self._restarts += 1
+            self._crash_restarts += 1
         logger.warning("AI thread exited unexpectedly; restoring current map and bots")
         self.start(snapshot)
         return True
@@ -186,6 +190,7 @@ class AIThreadSupervisor:
             self._awaiting_frame_id = None
             self._ready = False
             self._restarts += 1
+            self._planned_recycles += 1
         self._wake.set()
 
     def publish_world_change(
@@ -258,6 +263,9 @@ class AIThreadSupervisor:
                 process_id=None,
                 restarts=int(self._restarts),
                 stalled_restarts=0,
+                planned_recycles=int(self._planned_recycles),
+                crash_restarts=int(self._crash_restarts),
+                snapshot_rejections=int(self._snapshot_rejections),
                 intent_silence_seconds=silence,
                 queued_frames=len(self._frames),
                 queued_intents=len(self._intents),
@@ -295,6 +303,7 @@ class AIThreadSupervisor:
         brain = SimpleBotBrain(world, decision_hz=self.decision_hz)
         applied_snapshot_serial = -1
         batch_id = 0
+        consecutive_failures = 0
         while not self._stop.is_set():
             self._wake.wait(0.25)
             self._wake.clear()
@@ -328,7 +337,32 @@ class AIThreadSupervisor:
 
             try:
                 if snapshot is not None:
-                    world.load(snapshot)
+                    try:
+                        world.load(snapshot)
+                    except Exception:
+                        # A snapshot the parser rejects (truncated or
+                        # corrupt VXL bytes, an unexpected payload type)
+                        # is poisoned for this serial: retrying the same
+                        # bytes every batch would only spin the thread
+                        # and flood the log. Stay not-ready until the
+                        # director publishes a fresh snapshot or asks
+                        # for a restart.
+                        logger.exception(
+                            "AI thread rejected map snapshot serial %d (%s); "
+                            "waiting for a new one",
+                            snapshot_serial,
+                            getattr(snapshot, "map_name", ""),
+                        )
+                        world = SimpleVoxelWorld(planning_budget=PlanningBudget(
+                            self.path_requests_per_second,
+                            decision_hz=self.decision_hz,
+                        ))
+                        brain = SimpleBotBrain(world, decision_hz=self.decision_hz)
+                        applied_snapshot_serial = snapshot_serial
+                        with self._lock:
+                            self._snapshot_rejections += 1
+                            self._ready = False
+                        continue
                     # Every full snapshot is a clean ownership boundary. A
                     # periodic same-map recycle has the same map epoch, so a
                     # guarded reset_for_map alone would retain team caches.
@@ -363,7 +397,9 @@ class AIThreadSupervisor:
             except Exception:
                 # This is the owner-thread fault boundary, not an ignored
                 # decision error. Recreate all private state from the retained
-                # canonical snapshot on the next batch.
+                # canonical snapshot on the next batch, backing off when the
+                # failures repeat so a persistent planner fault cannot pin a
+                # core or fill the log at the wake cadence.
                 logger.exception("Bounded AI thread batch failed; rebuilding")
                 world = SimpleVoxelWorld(planning_budget=PlanningBudget(
                     self.path_requests_per_second, decision_hz=self.decision_hz))
@@ -371,8 +407,12 @@ class AIThreadSupervisor:
                 applied_snapshot_serial = -1
                 with self._lock:
                     self._restarts += 1
+                    self._crash_restarts += 1
                     self._ready = False
+                    consecutive_failures += 1
+                self._stop.wait(min(2.0, 0.25 * consecutive_failures))
                 continue
+            consecutive_failures = 0
 
             batch_id += 1
             processed_at = time.monotonic()

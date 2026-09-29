@@ -22,6 +22,7 @@ from server.game_constants import (
     TEAM2,
     WATER_LEVEL,
 )
+from server.block_damage_model import MAX_DAMAGEABLE_Z, dim_rgb
 from server.map_metadata import MapMetadata, MapZone, load_map_metadata
 from server.runtime_vxl import ServerVXL as VXL
 
@@ -30,6 +31,11 @@ logger = logging.getLogger(__name__)
 MAP_X = int(C.MAP_X)
 MAP_Y = int(C.MAP_Y)
 MAP_Z = int(C.MAP_Z)
+
+# Authored spawn areas whose retail spawns stood in the sea. Retail dropped
+# SpookyMansion's zombies into the z=239 water ring around the island; every
+# other spawn keeps rejecting open water.
+WATER_SPAWN_ITEMS = frozenset(("zombie_spawn_area",))
 
 
 def _shift_vxl_spans(data: bytes, z_shift: int) -> bytes:
@@ -212,6 +218,36 @@ class WorldManager:
         self.map_name = ""
         self.maps_path = config.maps_path if hasattr(config, 'maps_path') else "maps"
         self.block_damage: dict[tuple[int, int, int], float] = {}
+        # Initial health of cells that do NOT use the map default
+        # (DEFAULT_BLOCK_HEALTH).  The retail client stores these in
+        # BlockManager.user_blocks: a BuildPrefabAction(30) cell is added with
+        # DEFAULT_PREFAB_HEALTH (9), measured live 2026-09-26.  Absent cells
+        # break at the caller's threshold.  Cleared whenever the cell changes
+        # topology; a recolour of an existing solid keeps it.
+        self.block_health: dict[tuple[int, int, int], float] = {}
+        # Retail FlareBlockEntity restores of stripped marker cells -> RGB.
+        self.static_light_cells: dict[tuple[int, int, int], int] = {}
+        # What live clients DISPLAY for a damaged cell.  The stock
+        # ``BlockManager.add_damage`` darkens the voxel's current colour with
+        # ``shared.common.dim`` on every hit, so the shade compounds per hit,
+        # while a BlockManagerState(38) damaged row darkens its original
+        # colour once by the total damage (IDA, 2026-09-26).  Late joiners
+        # therefore need the per-hit result explicitly:
+        #
+        # * ``block_shade``: explicit-colour cells -> packed
+        #   ``(original_rgb << 24) | shown_rgb``; ``original`` is the colour
+        #   the client's DamagedBlock recorded at the first hit, ``shown`` the
+        #   compounded (or painted-over) colour.
+        # * ``block_hits``: cells whose colour the CLIENT owns at the first
+        #   hit (implicit interior voxels, and pure black voxels, which
+        #   ``add_damage`` re-colours through the native ``map.color_block``)
+        #   -> the per-hit amounts in quarter units, replayed to joiners as
+        #   the same single-cell Damage packets.  ``None`` = history lost
+        #   (too long / off-grid amount), falling back to a health-only row.
+        #
+        # Both only exist while the cell has an entry in ``block_damage``.
+        self.block_shade: dict[tuple[int, int, int], int] = {}
+        self.block_hits: dict[tuple[int, int, int], Optional[bytes]] = {}
         # CRC32 of the raw .vxl bytes this world was loaded from. The client
         # compares InitialInfo.checksum / our MapDataValidation reply against
         # the CRC of its local copy of `filename` to decide whether its local
@@ -246,7 +282,9 @@ class WorldManager:
         self._air_override_masks: dict[tuple[int, int], int] = {}
         self.map_metadata = MapMetadata()
         self._surface_cache: dict[tuple[int, int], int] = {}
-        self._spawn_candidates: dict[int, list[tuple[int, int]]] = {
+        # (x, y) top-surface columns and, inside authored boxes only,
+        # (x, y, floor_z) storeys/sea spawns -- see ``_zone_candidates``.
+        self._spawn_candidates: dict[int, list[tuple[int, ...]]] = {
             TEAM1: [], TEAM2: []
         }
         # Team anchors describe authored/fallback map locations, not moving
@@ -287,6 +325,11 @@ class WorldManager:
             self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
             self.dirty_columns = set()
             self._air_override_masks = {}
+            self.block_damage = {}
+            self.block_health = {}
+            self.static_light_cells = {}
+            self.block_shade = {}
+            self.block_hits = {}
             self.topology_version = 0
             self._surface_cache.clear()
             self._spawn_candidates = {TEAM1: [], TEAM2: []}
@@ -334,6 +377,11 @@ class WorldManager:
         self.map_file_crc = zlib.crc32(raw) & 0xFFFFFFFF
         self.dirty_columns = set()
         self._air_override_masks = {}
+        self.block_damage = {}
+        self.block_health = {}
+        self.static_light_cells = {}
+        self.block_shade = {}
+        self.block_hits = {}
         self.topology_version = 0
         self._surface_cache.clear()
         self._spawn_candidates = {TEAM1: [], TEAM2: []}
@@ -386,11 +434,67 @@ class WorldManager:
         # prefabs already use, so live and rejoined blocks shade identically.
         return 0x80000000 | rgb
 
-    def set_block(self, x: int, y: int, z: int, solid: bool, color: int = 0) -> bool:
-        """Set one block and publish the committed canonical mutation."""
+    def user_block_health(self, health: float) -> float | None:
+        """Apply retail ``BlockManager.add_user_block``'s mode rules.
+
+        Stock gameScene ``add_user_block`` (IDA 0x10070530): in the UGC Map
+        Creator the cell is popped from ``user_blocks`` (untracked, so it
+        breaks at the map default); in Classic every user block is stored at
+        DEFAULT_BLOCK_HEALTH (5) whatever the caller asked for (build 9,
+        prefab 9, BlockBuildColored 3).  ``None`` = no user-block entry.
+        """
+
+        config = self.config
+        if bool(getattr(config, "ugc_runtime", False)):
+            return None
+        try:
+            from server import mode_data
+
+            classic = bool(mode_data.get(config.game_mode).classic)
+        except (AttributeError, TypeError, ValueError):
+            classic = False
+        if classic:
+            return float(DEFAULT_BLOCK_HEALTH)
+        return float(health)
+
+    def set_block(
+        self,
+        x: int,
+        y: int,
+        z: int,
+        solid: bool,
+        color: int = 0,
+        health: float | None = None,
+    ) -> bool:
+        """Set one block and publish the committed canonical mutation.
+
+        ``health`` records a non-default initial block health (retail
+        ``add_user_block`` health, e.g. DEFAULT_PREFAB_HEALTH for prefab
+        cells).  Without it, a newly solid cell uses the damage caller's
+        default threshold, while re-colouring an already solid cell (paint)
+        keeps its recorded health like the client's ``color_block``.
+        """
         x, y, z = int(x), int(y), int(z)
         if self.map is None or not self._valid_block_position(x, y, z):
             return False
+        position = (x, y, z)
+        user_block = health is not None
+        if user_block:
+            health = self.user_block_health(health)
+        # A recolour of an existing solid (paint) keeps the cell's health AND
+        # its accumulated damage, exactly like the client's ``color_block``
+        # (live 2026-09-26: PaintBlock on a damaged cell left
+        # DamagedBlock.health unchanged).  Anything that creates or replaces a
+        # voxel starts it undamaged.
+        recolour = bool(solid) and not user_block and self.get_solid(x, y, z)
+        if health is not None and float(health) > 0.0:
+            self.block_health[position] = float(health)
+        elif not recolour:
+            self.block_health.pop(position, None)
+        if recolour and position in self.block_damage:
+            self._repaint_damaged(
+                position, self._canonical_vxl_color(color) & 0xFFFFFF
+            )
         if solid:
             self.map.set_point(x, y, z, self._canonical_vxl_color(color))
             self._set_air_override(x, y, z, False)
@@ -399,7 +503,8 @@ class WorldManager:
             self._set_air_override(x, y, z, True)
         self._surface_cache.pop((x, y), None)
         self.dirty_columns.add((x, y))
-        self.clear_block_damage(x, y, z)
+        if not recolour:
+            self.clear_block_damage(x, y, z)
         published_color = self._canonical_vxl_color(color) & 0xFFFFFF
         self._publish_mutations(((x, y, z, bool(solid), published_color),))
         return True
@@ -428,9 +533,24 @@ class WorldManager:
         x, y, z = int(x), int(y), int(z)
         if self.map is None or not self._valid_block_position(x, y, z):
             return False
-        self.map.set_point(x, y, z, self._canonical_vxl_color(color))
+        packed = self._canonical_vxl_color(color)
+        self.map.set_point(x, y, z, packed)
         self._surface_cache.pop((x, y), None)
+        # Bot workers load the raw VXL (markers stripped, no restore): tell
+        # them about the restored cell so their collision matches (not a
+        # player mutation: no journal / dirty column / reconnect record).
+        cells = getattr(self, "static_light_cells", None)
+        if not isinstance(cells, dict):
+            cells = {}
+            self.static_light_cells = cells
+        cells[(x, y, z)] = int(packed) & 0xFFFFFF
+        for listener in tuple(getattr(self, "static_light_listeners", ()) or ()):
+            try:
+                listener(x, y, z, int(packed) & 0xFFFFFF)
+            except Exception:
+                logger.debug("static light listener failed", exc_info=True)
         self.clear_block_damage(x, y, z)
+        self.block_health.pop((x, y, z), None)
         return True
 
     def _set_air_override(self, x: int, y: int, z: int, air: bool) -> None:
@@ -527,6 +647,14 @@ class WorldManager:
         cached = self._surface_cache.get((x, y))
         if cached is not None:
             return cached
+        # Spawn prewarm runs this ~70k times while a map loads on the
+        # transition worker thread; the C column scan (same z=0 downward
+        # get_solid probe) keeps that from competing with the live tick.
+        scan = getattr(self.map, "surface_z", None)
+        if scan is not None:
+            z = int(scan(x, y))
+            self._surface_cache[(x, y)] = z
+            return z
         for z in range(MAP_Z):
             if self.map.get_solid(x, y, z):
                 self._surface_cache[(x, y)] = z
@@ -540,14 +668,21 @@ class WorldManager:
         return self._get_surface_z(x, y) > MAP_Z - 2
 
     def spawn_position_is_safe(
-        self, position: Tuple[float, float, float]
+        self,
+        position: Tuple[float, float, float],
+        *,
+        team: int | None = None,
     ) -> bool:
         """Return whether a mode-authored player position is usable as-is.
 
         Mode spawns may be inside authored buildings, so this deliberately
         validates the body position instead of replacing it with the column's
         topmost surface. Open water, non-finite/out-of-world coordinates, and
-        positions embedded in terrain are never valid life anchors.
+        positions embedded in terrain are never valid life anchors -- except
+        that a ``team`` whose authored spawn area is a retail sea spawn
+        (SpookyMansion's ``zombie_spawn_area`` ring) may stand in that water,
+        exactly as retail dropped zombies there. Without ``team`` (bot
+        landing checks, generic callers) water stays rejected.
         """
         try:
             x, y, z = (float(position[index]) for index in range(3))
@@ -560,8 +695,18 @@ class WorldManager:
         if not (-float(MAP_Z) <= z < float(MAP_Z)):
             return False
         cell_x, cell_y = int(math.floor(x)), int(math.floor(y))
-        if self.map is None or self.is_water_column(cell_x, cell_y):
+        if self.map is None:
             return False
+        if self.is_water_column(cell_x, cell_y):
+            if team is None or self._water_spawn_zone(int(team), cell_x, cell_y) is None:
+                return False
+            # Wading: the waterbed carries the body (clipbox folds z=239 into
+            # the air above it, so the terrain support probe cannot see it).
+            # Require the retail sea-spawn height, not a body hanging in air.
+            return (
+                self._player_body_is_clear(x, y, z)
+                and z + PLAYER_STANDING_POS_ABOVE_GROUND >= float(MAP_Z - 2) - 0.75
+            )
         return self._player_body_is_clear(x, y, z) and self._player_has_support(
             x, y, z
         )
@@ -661,7 +806,7 @@ class WorldManager:
         to nearby safe terrain when possible, then fall back to the team's
         prewarmed production spawn pool.
         """
-        if self.spawn_position_is_safe(position):
+        if self.spawn_position_is_safe(position, team=team):
             return tuple(float(position[index]) for index in range(3))
 
         try:
@@ -838,17 +983,220 @@ class WorldManager:
             return False
         return True
 
-    def _zone_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
-        candidates: list[tuple[int, int]] = []
+    # ------------------------------------------------------------------
+    # Authored spawn volumes.
+    #
+    # A spawn candidate is either ``(x, y)`` -- stand on the column's topmost
+    # surface (the historical form; every unauthored/fallback candidate) -- or
+    # ``(x, y, floor_z)`` -- stand on an explicit floor voxel inside an
+    # authored box: a storey under a roof (MayanJungle's temple, the
+    # SpookyMansion mansion floors) or the waterbed of a retail sea spawn.
+    # Retail dropped a player into the box volume; they landed on the first
+    # solid below the drop point, which is what these floors enumerate.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _zone_allows_water(zone: MapZone | None) -> bool:
+        return zone is not None and zone.item in WATER_SPAWN_ITEMS
+
+    @staticmethod
+    def _zone_drop_range(zone: MapZone) -> tuple[int, int]:
+        """Vertical (top, bottom) voxel range a retail drop may start in.
+
+        Retail ``*_spawn_area`` boxes are centred; the metadata loader extends
+        their floor to the map bottom so a box hovering over terrain still
+        admits the ground below it. The authored bottom is the mirror of the
+        top, which keeps basements and caves far beneath a box out of it.
+        """
+        _x0, _x1, _y0, _y1, z0, z1 = zone.extents
+        top = int(math.floor(zone.z + z0))
+        bottom = zone.z + z1
+        if zone.item.endswith("spawn_area") and z1 > -z0:
+            bottom = zone.z - z0
+        return top, min(MAP_Z - 1, int(math.ceil(bottom)))
+
+    def _zone_floor_levels(self, x: int, y: int, zone: MapZone) -> list[int]:
+        """Floors a player dropped anywhere in ``zone``'s box at (x, y) lands on."""
+        top, bottom = self._zone_drop_range(zone)
+        floors: list[int] = []
+        run_start: int | None = None
+        for z in range(max(0, top), MAP_Z):
+            if not self.get_solid(x, y, z):
+                if run_start is None:
+                    run_start = z
+                continue
+            if run_start is not None and run_start <= bottom:
+                floors.append(z)
+            run_start = None
+            if z >= bottom:
+                break
+        return floors
+
+    def _safe_spawn_floor(
+        self, x: int, y: int, floor_z: int, zone: MapZone
+    ) -> bool:
+        """Validate one authored-box floor (indoor storey or retail sea spawn).
+
+        Same guarantees as ``_safe_spawn_column`` for the top surface: the
+        floor is reachable from the box, the standing body is clear (not
+        embedded), it is dry unless the box is a retail water spawn, and the
+        spot is not a pillar edge over a pit.
+        """
+        if not (1 <= x < MAP_X - 1 and 1 <= y < MAP_Y - 1):
+            return False
+        if not (0 < floor_z < MAP_Z) or not self.get_solid(x, y, floor_z):
+            return False
+        if floor_z > int(C.Z_ABOVE_WATERPLANE) and not self._zone_allows_water(zone):
+            return False
+        top, bottom = self._zone_drop_range(zone)
+        # The air run above the floor must intersect the box: that is where
+        # a retail drop that lands on this floor started.
+        z = floor_z - 1
+        if z < top or self.get_solid(x, y, z):
+            return False
+        while z - 1 >= top and not self.get_solid(x, y, z - 1):
+            z -= 1
+        if z > bottom:
+            return False
+        # A standing body needs three air voxels above the floor.
+        if any(self.get_solid(x, y, floor_z - h) for h in (1, 2, 3)):
+            return False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if (dx or dy) and not any(
+                    self.get_solid(x + dx, y + dy, level)
+                    for level in range(floor_z - 3, min(MAP_Z, floor_z + 3))
+                ):
+                    return False
+        if not self._player_body_is_clear(
+            float(x) + 0.5,
+            float(y) + 0.5,
+            float(floor_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
+        ):
+            return False
+        return floor_z == self._get_surface_z(x, y) or not self._sealed_air_pocket(
+            x, y, floor_z - 1
+        )
+
+    def _sealed_air_pocket(self, x: int, y: int, z: int, limit: int = 64) -> bool:
+        """True when (x, y, z) is in a closed air pocket under ``limit`` voxels.
+
+        Trenches' spawn band holds 11-voxel voids under the trench boards; a
+        floor inside one would trap the player. A bounded flood fill that
+        escapes past ``limit`` cells is treated as open.
+        """
+        start = (x, y, z)
+        seen = {start}
+        frontier = [start]
+        while frontier:
+            cx, cy, cz = frontier.pop()
+            for nx, ny, nz in (
+                (cx + 1, cy, cz), (cx - 1, cy, cz), (cx, cy + 1, cz),
+                (cx, cy - 1, cz), (cx, cy, cz - 1), (cx, cy, cz + 1),
+            ):
+                if (nx, ny, nz) in seen:
+                    continue
+                if not (0 <= nx < MAP_X and 0 <= ny < MAP_Y and 0 <= nz < MAP_Z):
+                    continue
+                if self.get_solid(nx, ny, nz):
+                    continue
+                seen.add((nx, ny, nz))
+                if len(seen) > limit:
+                    return False
+                frontier.append((nx, ny, nz))
+        return True
+
+    def _water_spawn_zone(self, team: int, x: int, y: int) -> MapZone | None:
+        """The team's authored retail sea-spawn zone covering (x, y), if any."""
         for zone in self.map_metadata.spawn_zones.get(team, []):
+            if not self._zone_allows_water(zone):
+                continue
             x0, x1, y0, y1 = zone.xy_bounds()
-            for x in range(max(1, x0), min(MAP_X - 2, x1) + 1):
-                for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1):
-                    if self._safe_spawn_column(
-                        x, y, authored_zone=zone, reject_roofs=False
-                    ):
-                        candidates.append((x, y))
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return zone
+        return None
+
+    def _zone_candidates(self, zone: MapZone) -> list[tuple[int, ...]]:
+        candidates: list[tuple[int, ...]] = []
+        x0, x1, y0, y1 = zone.xy_bounds()
+        for x in range(max(1, x0), min(MAP_X - 2, x1) + 1):
+            for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1):
+                surface_ok = self._safe_spawn_column(
+                    x, y, authored_zone=zone, reject_roofs=False
+                )
+                if surface_ok:
+                    candidates.append((x, y))
+                surface_z = self._get_surface_z(x, y)
+                for floor_z in self._zone_floor_levels(x, y, zone):
+                    if floor_z == surface_z and surface_ok:
+                        # Already a top-surface candidate. A top surface that
+                        # failed the terrain-only rules (a jetty or bridge
+                        # deck with air beneath it, open water) is still
+                        # where a retail drop into this box landed, so it is
+                        # judged by the floor rules below instead.
+                        continue
+                    if self._safe_spawn_floor(x, y, floor_z, zone):
+                        candidates.append((x, y, floor_z))
         return candidates
+
+    def _zone_spawn_candidates(self, team: int) -> list[tuple[int, ...]]:
+        zones = self.map_metadata.spawn_zones.get(team, [])
+        water_zones = [zone for zone in zones if self._zone_allows_water(zone)]
+        if water_zones:
+            # Retail zombies rose only out of their ``zombie_spawn_area``
+            # boxes; the metadata appends the team-one shore purely as a dry
+            # complement for when those boxes yield nothing.
+            candidates = [c for zone in water_zones for c in self._zone_candidates(zone)]
+            if candidates:
+                return candidates
+        return [c for zone in zones for c in self._zone_candidates(zone)]
+
+    def _zones_containing(
+        self, zones, x: int, y: int
+    ) -> list[MapZone]:
+        result = []
+        for zone in zones or ():
+            x0, x1, y0, y1 = zone.xy_bounds()
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                result.append(zone)
+        return result
+
+    def spawn_candidate_position(
+        self, candidate, authored_zones=None
+    ) -> Tuple[float, float, float] | None:
+        """Revalidate one spawn candidate against the live world.
+
+        Returns the standing position (half a block above equilibrium, as
+        every spawn does) or None when the candidate is no longer safe. A
+        top-surface ``(x, y)`` candidate inside an authored zone skips roof
+        rejection (authored boxes may be on raised ground); outside one it
+        gets the full terrain checks. A ``(x, y, floor_z)`` candidate is only
+        valid inside an authored zone that admits that floor.
+        """
+        x, y = int(candidate[0]), int(candidate[1])
+        if len(candidate) >= 3:
+            floor_z = int(candidate[2])
+            if not any(
+                self._safe_spawn_floor(x, y, floor_z, zone)
+                for zone in self._zones_containing(authored_zones, x, y)
+            ):
+                return None
+        else:
+            authored_zone = (
+                self._zone_at(authored_zones, x, y) if authored_zones else None
+            )
+            if not self._safe_spawn_column(
+                x, y,
+                authored_zone=authored_zone,
+                reject_roofs=authored_zone is None,
+            ):
+                return None
+            floor_z = self._get_surface_z(x, y)
+        return (
+            float(x) + 0.5,
+            float(y) + 0.5,
+            float(floor_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
+        )
 
     def _fallback_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
         x0, y0, x1, y1 = self._spawn_region(team)
@@ -869,7 +1217,7 @@ class WorldManager:
             if self._get_surface_z(x, y) <= int(C.Z_ABOVE_WATERPLANE)
         ]
 
-    def _get_spawn_candidates(self, team: int) -> list[tuple[int, int]]:
+    def _get_spawn_candidates(self, team: int) -> list[tuple[int, ...]]:
         cached = self._spawn_candidates.get(team)
         if cached:
             return cached
@@ -955,12 +1303,22 @@ class WorldManager:
         if spawn_zones:
             zone = spawn_zones[0]
             candidates = self._zone_spawn_candidates(team)
-            if candidates:
-                x, y = min(
-                    candidates,
+            # A base anchor is a dry place to regroup: prefer top-surface
+            # columns; otherwise the nearest floor slot (a sea spawn is
+            # snapped to the nearest shore by dry_ground_anchor).
+            pool = [c for c in candidates if len(c) == 2] or candidates
+            if pool:
+                best = min(
+                    pool,
                     key=lambda pos: (pos[0] - zone.x) ** 2 + (pos[1] - zone.y) ** 2,
                 )
-                return self.dry_ground_anchor(x, y)
+                if len(best) >= 3 and best[2] <= int(C.Z_ABOVE_WATERPLANE):
+                    return (
+                        float(best[0]) + 0.5,
+                        float(best[1]) + 0.5,
+                        float(best[2]) - PLAYER_STANDING_POS_ABOVE_GROUND,
+                    )
+                return self.dry_ground_anchor(best[0], best[1])
         candidates = self._get_spawn_candidates(team)
         if candidates:
             x, y = self._fallback_base_candidate(team, candidates)
@@ -1014,23 +1372,13 @@ class WorldManager:
                     if clustered:
                         choices = clustered
             random.shuffle(choices)
-            for x, y in choices:
-                authored_zone = self._zone_at(authored_zones, x, y)
-                if self._safe_spawn_column(
-                    x,
-                    y,
-                    authored_zone=authored_zone,
-                    reject_roofs=authored_zone is None,
-                ):
-                    surface_z = self._get_surface_z(x, y)
-                    # Spawn slightly above equilibrium and let physics settle.
-                    return (
-                        float(x) + 0.5,
-                        float(y) + 0.5,
-                        float(surface_z) - PLAYER_STANDING_POS_ABOVE_GROUND - 0.5,
-                    )
-                if (x, y) in candidates:
-                    candidates.remove((x, y))
+            for candidate in choices:
+                # Spawn slightly above equilibrium and let physics settle.
+                position = self.spawn_candidate_position(candidate, authored_zones)
+                if position is not None:
+                    return position
+                if candidate in candidates:
+                    candidates.remove(candidate)
 
         x0, y0, x1, y1 = self._spawn_region(team)
         center_x, center_y = (x0 + x1) // 2, (y0 + y1) // 2
@@ -1062,7 +1410,328 @@ class WorldManager:
         return 0 <= x < MAP_X and 0 <= y < MAP_Y and 0 <= z < MAP_Z
 
     def clear_block_damage(self, x: int, y: int, z: int):
-        self.block_damage.pop((x, y, z), None)
+        position = (x, y, z)
+        self.block_damage.pop(position, None)
+        self.block_shade.pop(position, None)
+        self.block_hits.pop(position, None)
+
+    # Longest per-cell hit history kept for a client-coloured cell.  A map
+    # voxel (5.0) takes at most 20 quarter-point hits; longer histories (big
+    # RULE_BLOCK_HEALTH) fall back to a health-only row.
+    MAX_REPLAY_HITS = 64
+
+    def _client_coloured(self, position, rgb: int) -> bool:
+        """True when the stock client, not the VXL, owns the colour a hit
+        darkens: implicit interior voxels, and black voxels, which
+        ``add_damage`` first re-colours through the native
+        ``map.color_block`` (IDA, 2026-09-26)."""
+
+        explicit = getattr(self.map, "has_explicit_color", None)
+        if callable(explicit) and not explicit(*position):
+            return True
+        return (int(rgb) & 0xFFFFFF) == 0
+
+    def _record_hit_shade(self, position, damage: float, first: bool) -> None:
+        """Advance the displayed shade exactly like ``add_damage`` does.
+
+        Called for a hit the cell survives (the client darkens only then).
+        """
+
+        if first:
+            self.block_shade.pop(position, None)
+            self.block_hits.pop(position, None)
+            rgb = int(self.get_color(*position)) & 0xFFFFFF
+            if self._client_coloured(position, rgb):
+                self.block_hits[position] = b""
+            else:
+                self.block_shade[position] = (rgb << 24) | rgb
+        if position in self.block_hits:
+            history = self.block_hits[position]
+            if history is None:
+                return  # lost history stays lost until the cell is replaced
+            quarters = int(round(float(damage) * 4.0))
+            if (
+                0 < quarters <= 255
+                and abs(quarters / 4.0 - float(damage)) < 1e-9
+                and len(history) < self.MAX_REPLAY_HITS
+            ):
+                self.block_hits[position] = history + bytes((quarters,))
+            else:
+                self.block_hits[position] = None
+            return
+        packed = self.block_shade.get(position)
+        if packed is None:
+            # Damage recorded before shade tracking (or set directly):
+            # best effort from the canonical colour.
+            rgb = int(self.get_color(*position)) & 0xFFFFFF
+            packed = (rgb << 24) | rgb
+        original = packed >> 24
+        shown = packed & 0xFFFFFF
+        self.block_shade[position] = (original << 24) | dim_rgb(shown, damage)
+
+    def _repaint_damaged(self, position, rgb: int) -> None:
+        """PaintBlock on a damaged cell: the client's ``color_block`` sets the
+        new colour undarkened and leaves its DamagedBlock (health and
+        original colour) alone; later hits darken the paint colour."""
+
+        packed = self.block_shade.get(position)
+        if packed is not None:
+            original = packed >> 24
+        else:
+            # Client-coloured history: the painted colour is now explicit.
+            # The DamagedBlock original colour is the client's own (only
+            # restored transiently while the cell is being removed).
+            original = int(self.get_color(*position)) & 0xFFFFFF
+            self.block_hits.pop(position, None)
+        self.block_shade[position] = (int(original) << 24) | (int(rgb) & 0xFFFFFF)
+
+    def _hit_history(self, position) -> Optional[bytes]:
+        """Replayable hit history for a client-coloured cell, or ``None``."""
+
+        history = self.block_hits.get(position)
+        if not history:
+            return None
+        total = float(self.block_damage.get(position, 0.0))
+        if abs(sum(history) / 4.0 - total) > 1e-6:
+            return None
+        return history
+
+    def initial_block_health(
+        self, x: int, y: int, z: int, default: float = DEFAULT_BLOCK_HEALTH
+    ) -> float:
+        """Return a cell's undamaged health (recorded override or default)."""
+
+        return float(self.block_health.get((int(x), int(y), int(z)), default))
+
+    def iter_block_health_state(self):
+        """Yield ``(x, y, z, remaining_health)`` for every live override.
+
+        Remaining health is the recorded initial health minus the damage
+        accumulated so far, expressed in the same unscaled units the retail
+        ``BlockManagerState(38)`` user-block table carries.  Stale entries
+        for cells that are no longer solid are dropped on the way.
+        """
+
+        from server.game_rules import get_rules
+
+        try:
+            scale = float(get_rules(self.config).get("RULE_BLOCK_HEALTH"))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            scale = 1.0
+        if not scale > 0.0:
+            scale = 1.0
+        for position, health in tuple(self.block_health.items()):
+            if not self.get_solid(*position):
+                self.block_health.pop(position, None)
+                continue
+            damage = float(self.block_damage.get(position, 0.0)) / scale
+            remaining = float(health) - damage
+            if remaining > 0.0:
+                yield position[0], position[1], position[2], remaining
+
+    def _health_scale(self) -> float:
+        from server.game_rules import get_rules
+
+        try:
+            scale = float(get_rules(self.config).get("RULE_BLOCK_HEALTH"))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            scale = 1.0
+        return scale if scale > 0.0 else 1.0
+
+    def block_manager_rows(self, cells=None, *, replay_hits: bool = False):
+        """Return the retail BlockManagerState(38) rows for live cells.
+
+        ``(user_rows, damaged_rows)``:
+
+        * user rows ``(x, y, z, initial_health)`` in the client's UNSCALED
+          ``user_blocks`` units -- every cell with a recorded non-default
+          health (player builds 9, prefabs 9, block-cannon 3);
+        * damaged rows ``(x, y, z, remaining_health, (r, g, b))`` -- every
+          partially damaged cell.  The client stores these as
+          ``DamagedBlock(health, original_color)`` where health is the SCALED
+          remaining health (``initial * RULE_BLOCK_HEALTH - damage``) and
+          darkens the voxel from ``original_color`` (live 2026-09-26).
+
+        ``cells`` limits the rows to those coordinates; for those, cells
+        without an override get an explicit default-health user row so a
+        client that re-created the voxel through BlockBuildColored(33) (which
+        the stock client stores at 3.0) converges to the server's health.
+        Stale entries for cells that are no longer solid are dropped.
+
+        A damaged row's colour is the ORIGINAL colour live clients recorded
+        at the first hit; the per-hit shade they display differs from the
+        row's one-shot darkening and is sent separately
+        (:meth:`block_shade_rows`).  With ``replay_hits`` a client-coloured
+        cell with a replayable hit history (:meth:`block_hit_replays`) gets
+        a user row at its INITIAL health instead of a health-only row, for a
+        fresh joiner that then receives the hits themselves.
+        """
+
+        scale = self._health_scale()
+        user_rows = []
+        damaged_rows = []
+        if cells is None:
+            health_cells = tuple(self.block_health.items())
+            damage_cells = tuple(self.block_damage.items())
+        else:
+            wanted = [tuple(int(v) for v in cell) for cell in cells]
+            health_cells = tuple(
+                (cell, self.block_health.get(cell, DEFAULT_BLOCK_HEALTH))
+                for cell in wanted
+            )
+            damage_cells = tuple(
+                (cell, self.block_damage[cell])
+                for cell in wanted if cell in self.block_damage
+            )
+        explicit = getattr(self.map, "has_explicit_color", None)
+        user_index = {}
+        for position, health in health_cells:
+            if not self.get_solid(*position):
+                self.block_health.pop(position, None)
+                continue
+            user_index[position] = len(user_rows)
+            user_rows.append((position[0], position[1], position[2],
+                              float(health)))
+        for position, damage in damage_cells:
+            if not self.get_solid(*position):
+                self.clear_block_damage(*position)
+                continue
+            unscaled = float(
+                self.block_health.get(position, DEFAULT_BLOCK_HEALTH)
+            )
+            initial = unscaled * scale
+            remaining = initial - float(damage)
+            if remaining <= 0.0:
+                continue
+            if replay_hits and self._hit_history(position) is not None:
+                # The joiner re-applies the hits itself (exact health and
+                # the client-owned colour's per-hit darkening).
+                row = (position[0], position[1], position[2], unscaled)
+                if position in user_index:
+                    user_rows[user_index[position]] = row
+                else:
+                    user_rows.append(row)
+                continue
+            if (
+                callable(explicit) and not explicit(*position)
+            ) or position in self.block_hits:
+                # Implicit interior (and black, see _client_coloured) colours
+                # are client-owned; a damaged row
+                # would repaint the voxel with the server's column fill.  An
+                # equivalent user row (remaining health, unscaled) keeps the
+                # hits-to-break identical without touching the colour.
+                row = (position[0], position[1], position[2],
+                       remaining / scale)
+                if position in user_index:
+                    user_rows[user_index[position]] = row
+                else:
+                    user_rows.append(row)
+                continue
+            packed = self.block_shade.get(position)
+            if packed is not None:
+                rgb = (packed >> 24) & 0xFFFFFF
+            else:
+                rgb = int(self.get_color(*position)) & 0xFFFFFF
+            damaged_rows.append((
+                position[0], position[1], position[2], remaining,
+                ((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF),
+            ))
+        return user_rows, damaged_rows
+
+    def _client_initial_health(self, position, scale: float) -> float:
+        """``get_initial_health`` a client holds once the user rows landed:
+        the recorded health on the 0.25 user-row grid (rounded up), else
+        the map default, scaled by RULE_BLOCK_HEALTH."""
+
+        health = self.block_health.get(position)
+        if health is None:
+            return float(DEFAULT_BLOCK_HEALTH) * scale
+        quarters = max(1, min(255, int(math.ceil(float(health) * 4.0 - 1e-9))))
+        return quarters / 4.0 * scale
+
+    def block_shade_rows(self, cells=None):
+        """Return ``(x, y, z, (r, g, b))`` for damaged cells whose displayed
+        shade a BlockManagerState(38) damaged row would get wrong.
+
+        The row darkens its original colour ONCE by ``get_initial_health -
+        remaining`` while live clients compounded ``dim`` hit by hit (and a
+        paint after damage shows the paint colour undarkened), so a cell hit
+        more than once, or painted, needs its live shade restated after the
+        row.  PaintBlock(7) does that exactly: ``color_block`` only sets the
+        voxel colour and leaves the DamagedBlock alone.  Cells whose one-shot
+        shade already matches (every single-hit cell) are omitted.
+        """
+
+        scale = self._health_scale()
+        if cells is None:
+            wanted = tuple(self.block_shade.items())
+        else:
+            wanted = tuple(
+                (cell, self.block_shade[cell])
+                for cell in (tuple(int(v) for v in raw) for raw in cells)
+                if cell in self.block_shade
+            )
+        rows = []
+        for position, packed in wanted:
+            damage = self.block_damage.get(position)
+            if damage is None or not self.get_solid(*position):
+                self.block_shade.pop(position, None)
+                continue
+            remaining = (
+                float(self.block_health.get(position, DEFAULT_BLOCK_HEALTH))
+                * scale - float(damage)
+            )
+            if remaining <= 0.0:
+                continue
+            row_health = max(
+                1, min(255, int(math.floor(remaining * 4.0 + 0.5)))
+            ) / 4.0
+            original = (packed >> 24) & 0xFFFFFF
+            shown = packed & 0xFFFFFF
+            predicted = dim_rgb(
+                original,
+                self._client_initial_health(position, scale) - row_health,
+            )
+            if predicted == shown:
+                continue
+            rows.append((
+                position[0], position[1], position[2],
+                ((shown >> 16) & 0xFF, (shown >> 8) & 0xFF, shown & 0xFF),
+            ))
+        return rows
+
+    def block_hit_replays(self, cells=None):
+        """Return ``(x, y, z, (amount, ...))`` for client-coloured cells.
+
+        The client owns an implicit (or black) voxel's colour, so the server
+        cannot state its shade.  Replaying the recorded per-hit amounts as
+        single-cell Damage packets, after a user row at the cell's initial
+        health (``block_manager_rows(replay_hits=True)``), makes a fresh
+        joiner's ``add_damage`` produce the live health AND darkening.
+        Only for a client that holds no damage for these cells yet.
+        """
+
+        if cells is None:
+            positions = tuple(self.block_hits)
+        else:
+            positions = tuple(
+                cell
+                for cell in (tuple(int(v) for v in raw) for raw in cells)
+                if cell in self.block_hits
+            )
+        rows = []
+        for position in positions:
+            if not self.get_solid(*position):
+                self.clear_block_damage(*position)
+                continue
+            history = self._hit_history(position)
+            if history is None:
+                continue
+            rows.append((
+                position[0], position[1], position[2],
+                tuple(quarters / 4.0 for quarters in history),
+            ))
+        return rows
 
     def destroy_blocks(self, positions: list[tuple[int, int, int]]):
         """Destroy a set of solid blocks and return the positions actually removed."""
@@ -1078,6 +1747,7 @@ class WorldManager:
             seen.add(pos)
             if not self.get_solid(x, y, z):
                 self.clear_block_damage(x, y, z)
+                self.block_health.pop(pos, None)
                 continue
 
             self.map.remove_point_nochecks(x, y, z)
@@ -1085,6 +1755,7 @@ class WorldManager:
             self._surface_cache.pop((x, y), None)
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)
+            self.block_health.pop(pos, None)
             destroyed.append(pos)
         self._publish_mutations(
             tuple((x, y, z, False, 0) for x, y, z in destroyed)
@@ -1101,7 +1772,14 @@ class WorldManager:
         for dz in (-1, 0, 1)
         if 1 <= abs(dx) + abs(dy) + abs(dz) <= 2
     )
-    COLLAPSE_WORK_BUDGET = 10_000_000
+    # Retail vxl.pyd flood (sub_10036470) gives up once its visited-node
+    # counter exceeds 0x989680 (10,000,000 NODES) and treats the chunk as
+    # supported.  Our floods (this one and the C twin in aoslib.vxl) count
+    # neighbour PROBES, and every popped node probes all 18 neighbours, so
+    # the probe budget is the retail node budget x 18: exhaustion happens on
+    # the first probe of node 10,000,001, as in retail.
+    COLLAPSE_NODE_BUDGET = 10_000_000
+    COLLAPSE_WORK_BUDGET = COLLAPSE_NODE_BUDGET * len(COLLAPSE_NEIGHBORS)
 
     def find_unsupported_chunks(self, removed_positions):
         """Classic AoS floating-structure detection: after removing cells,
@@ -1110,6 +1788,21 @@ class WorldManager:
         unsupported and should collapse. Returns a list of cell-lists."""
         if self.map is None or not removed_positions:
             return []
+
+        # Same traversal in C (aoslib.vxl VXL.find_unsupported_chunks): this
+        # runs once per destroyed cell, and a grave's 3x3x3 crater paid
+        # ~1.6 ms per call walking grounded terrain down to the base plane.
+        fast = getattr(self.map, "find_unsupported_chunks", None)
+        if (
+            fast is not None
+            and type(self).get_solid is WorldManager.get_solid
+            and "get_solid" not in vars(self)
+        ):
+            return fast(
+                removed_positions,
+                self.COLLAPSE_NEIGHBORS,
+                int(self.COLLAPSE_WORK_BUDGET),
+            )
 
         neighbors = self.COLLAPSE_NEIGHBORS
         chunks = []
@@ -1168,24 +1861,36 @@ class WorldManager:
         damage: float,
         threshold: float = DEFAULT_BLOCK_HEALTH,
     ) -> tuple[float, bool]:
-        """Accumulate damage on a block and destroy it when the threshold is reached."""
+        """Accumulate damage on a block and destroy it when the threshold is reached.
+
+        A cell with a recorded initial health (:attr:`block_health`, e.g. a
+        prefab cell at DEFAULT_PREFAB_HEALTH) breaks at that health instead
+        of the caller's default, matching the retail client's
+        ``BlockManager.get_initial_health`` ledger for the same cell.
+        """
         if self.map is None or damage <= 0.0:
+            return 0.0, False
+        if z > MAX_DAMAGEABLE_Z and self._valid_block_position(x, y, z):
+            # Retail BlockManager.valid_to_damage: z > max_modifiable_z (238)
+            # is the indestructible base layer on every client.
             return 0.0, False
         if not self._valid_block_position(x, y, z) or not self.get_solid(x, y, z):
             self.clear_block_damage(x, y, z)
+            self.block_health.pop((x, y, z), None)
             return 0.0, False
 
-        from server.game_rules import get_rules
-        threshold = float(threshold) * float(
-            get_rules(self.config).get("RULE_BLOCK_HEALTH")
-        )
         pos = (x, y, z)
-        total = self.block_damage.get(pos, 0.0) + damage
+        threshold = float(self.block_health.get(pos, threshold)) * (
+            self._health_scale()
+        )
+        previous = self.block_damage.get(pos)
+        total = (previous or 0.0) + damage
         if total >= threshold:
             self.destroy_blocks([pos])
             return total, True
 
         self.block_damage[pos] = total
+        self._record_hit_shade(pos, float(damage), previous is None)
         return total, False
     
     def get_chunker(self):

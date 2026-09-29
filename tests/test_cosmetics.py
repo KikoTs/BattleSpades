@@ -36,7 +36,8 @@ def test_only_explicit_consumed_ticket_capability_enables_extensions():
     assert not outbound_packet_is_safe(bytes([240]) + b"other", cosmetic_capable=True)
     assert not outbound_packet_is_safe(MAGIC + bytes(8192), cosmetic_capable=True)
     for packet_id in range(256):
-        if packet_id not in (3, 240):
+        # 3 is never a server packet; 65 ProgressBar crashes the stock client.
+        if packet_id not in (3, 65, 240):
             assert outbound_packet_is_safe(bytes([packet_id]))
 
 

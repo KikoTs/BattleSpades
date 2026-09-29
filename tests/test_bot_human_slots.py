@@ -69,3 +69,26 @@ def test_server_full_of_humans_has_no_bot_to_swap():
         finally:
             await director.close()
     asyncio.run(scenario())
+
+
+def test_full_server_refuses_with_retail_error_full_not_out_of_date():
+    """Retail DISCONNECT 4 is ERROR_FULL; 3 is ERROR_SERVER_OUT_OF_DATE."""
+    from server.connection import Connection
+    from shared.constants import DISCONNECT
+
+    reasons: list[int] = []
+    connection = Connection.__new__(Connection)
+    connection.reserved_player_id = None
+    connection._map_sync_generation = 0
+    connection.peer = SimpleNamespace(address="127.0.0.1:1", disconnect=reasons.append)
+
+    async def no_room() -> bool:
+        return False
+
+    connection.server = SimpleNamespace(
+        get_next_player_id=lambda: -1,
+        bots=SimpleNamespace(make_room_for_human=no_room),
+        _stopping=False,
+    )
+    assert not asyncio.run(connection._claim_player_slot())
+    assert reasons == [int(DISCONNECT.ERROR_FULL)] == [4]

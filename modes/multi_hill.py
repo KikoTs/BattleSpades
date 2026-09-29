@@ -14,6 +14,7 @@ from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL
 
 from .airstrike import trigger_airstrike
 from .base_mode import BaseMode
+from .territory_control import CapturePointResupply
 from .objective_zones import (
     ObjectiveZone,
     around,
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
 _NEUTRAL_COLOR = (255, 255, 255)
 _FALLBACK_RADIUS = 16.0
+# Boundary flicker must not replay "Hill contested!" every capture tick; the
+# retail TC shout cooldown (TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN) is reused.
+_CONTESTED_SHOUT_COOLDOWN = float(CG.TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN)
 
 
 def _configured_rule(server, key: str, rule: str, fallback):
@@ -63,9 +67,16 @@ class MultiHillMode(BaseMode):
     def __init__(self, server) -> None:
         super().__init__(server)
         data = mode_data.get(self.mode_code)
-        self.score_limit = max(1, int(_configured_rule(
-            server, "score_limit", "RULE_MH_SCORE_TARGET",
-            data.default_score_limit,
+        # Retail has no Multi-Hill score-target rule: the Match Lobby's mh
+        # rules are only RULE_MULTIHILL_MAX_ACTIVE_BASES and
+        # RULE_BASE_ACTIVE_TIME (constants_matchmaking MODE_RULES,
+        # docs/RETAIL_VALUES.md). The target is therefore the server's
+        # [modes.mh] score_limit, defaulting to mode_data's 100. (This used
+        # to query a nonexistent RULE_MH_SCORE_TARGET.)
+        overlay = getattr(getattr(server, "config", None), "mode_settings", {})
+        overlay = overlay.get(self.mode_code, {}) if isinstance(overlay, dict) else {}
+        self.score_limit = max(1, int(overlay.get(
+            "score_limit", data.default_score_limit
         )))
         resolve_time = getattr(getattr(server, "config", None), "configured_time_limit", None)
         self.time_limit = (
@@ -90,24 +101,40 @@ class MultiHillMode(BaseMode):
         self.active_zones: list[ObjectiveZone] = []
         self.zone_owner: dict[int, int | None] = {}
         self.zone_contested: dict[int, bool] = {}
+        # Live occupant ids per active hill, refreshed every control pass.
+        self.zone_occupants: dict[int, dict[int, set[int]]] = {}
+        # Active hills whose "First to Hill" award was already paid.
+        self._first_paid: set[int] = set()
+        self._contested_shout_at: dict[int, float] = {}
+        self._next_personal_score_at = 0.0
         self.phase = "waiting"
         self._rotation_cursor = 0
         self._next_rotation_at = 0.0
         self._next_activation_at = 0.0
         self._last_score_at = 0.0
+        self.resupply = CapturePointResupply(server, self.mode_code)
 
     async def on_mode_start(self) -> None:
         await super().on_mode_start()
         for team in self.server.teams.values():
             team.reset()
+        # An in-place restart reuses this instance: retire the previous
+        # round's hill icons before the new rotation, or clients keep a
+        # stale packet-43 zone next to the fresh one.
+        self._clear_active_zones()
         self.zones = self._build_zones()
         self.active_zones = []
         self.zone_owner = {zone.index: None for zone in self.zones}
         self.zone_contested = {zone.index: False for zone in self.zones}
+        self.zone_occupants = {}
+        self._contested_shout_at = {}
+        self.resupply.reset()
+        self.phase = "waiting"
         self._rotation_cursor = 0
         now = time.time()
         self._last_score_at = now
         self._activate_next(now)
+        self.broadcast_start_cue()
         logger.info(
             "Multi-Hill started with %d zones (%d active, %.0fs rotation)",
             len(self.zones),
@@ -130,21 +157,84 @@ class MultiHillMode(BaseMode):
                 self._activate_next(now)
             return
 
-        self._update_control()
+        self._update_control(now)
         await self._award_team_ticks(now)
         if self.ended:
             return
+        self._award_presence_scores(now)
         if now >= self._next_rotation_at:
             expired = tuple(self.active_zones)
+            if expired:
+                # Retail BASE_DEPLETED "Hill depleted! \nAirstrike incoming!"
+                # (server-sent; no client binary references it). Timing: at
+                # the hill timeout that launches the airstrike (inferred from
+                # the text).
+                self.announce_localised("BASE_DEPLETED", override_previous=True)
             for zone in expired:
                 trigger_airstrike(self.server, zone.center)
             self._clear_active_zones()
+            self.zone_occupants = {}
             self.phase = "intermission"
             self._next_activation_at = now + float(CG.MH_TIME_BETWEEN_BASE_ACTIVATIONS)
 
     def reveal_to(self, connection) -> None:
+        super().reveal_to(connection)
         for zone in self.active_zones:
             self._send_zone(zone, connection=connection)
+        # Retail mode-start cue (string-table only, no client binary sends
+        # it), replayed per settled GameScene like TDM/Diamond.
+        self.send_start_cue_to(connection)
+
+    def start_cue_for(self, player):
+        return "MULTI_HILL_START"
+
+    async def on_player_kill(self, killer, victim, kill_type: int) -> None:
+        """Generic retail kill score, then the hill defend/assault extras."""
+        await super().on_player_kill(killer, victim, kill_type)
+        if (
+            self.ended
+            or killer is None
+            or killer is victim
+            or int(getattr(killer, "team", -1)) not in _PLAYABLE_TEAMS
+            or int(getattr(victim, "team", -1)) not in _PLAYABLE_TEAMS
+            or int(killer.team) == int(victim.team)
+            or self.phase != "active"
+        ):
+            return
+        killer_zone = self._active_zone_at(killer)
+        victim_zone = self._active_zone_at(victim)
+        team = int(killer.team)
+        if (
+            killer_zone is not None
+            and self.zone_owner.get(killer_zone.index) == team
+        ):
+            self._award_player_score(
+                killer,
+                int(CG.MH_SCORE_DEFEND),
+                int(C.SCORE_REASON.MH_DEFEND_SCORE_REASON),
+            )
+        elif (
+            victim_zone is not None
+            and self.zone_owner.get(victim_zone.index) != team
+        ):
+            self._award_player_score(
+                killer,
+                int(CG.MH_SCORE_ASSAULT),
+                int(C.SCORE_REASON.MH_ASSAULT_SCORE_REASON),
+            )
+
+    def _active_zone_at(self, player) -> ObjectiveZone | None:
+        position = getattr(player, "position", None)
+        if position is None:
+            position = (player.x, player.y, player.z)
+        return next(
+            (zone for zone in self.active_zones if zone.contains(position)),
+            None,
+        )
+
+    def escape_watch_objective_player(self, player) -> bool:
+        """A player standing on an active hill is holding an objective."""
+        return self._active_zone_at(player) is not None
 
     def _build_zones(self) -> list[ObjectiveZone]:
         wm = getattr(self.server, "world_manager", None)
@@ -214,12 +304,16 @@ class MultiHillMode(BaseMode):
             selected.append(self.zones[(self._rotation_cursor + offset) % len(self.zones)])
         self._rotation_cursor = (self._rotation_cursor + count) % len(self.zones)
         self.active_zones = selected
+        self.zone_occupants = {}
         for zone in selected:
+            self._first_paid.discard(zone.index)
             self.zone_owner[zone.index] = None
             self.zone_contested[zone.index] = False
+            self.zone_occupants[zone.index] = {TEAM1: set(), TEAM2: set()}
             self._send_zone(zone)
         self.phase = "active"
         self._last_score_at = now
+        self._next_personal_score_at = now + float(CG.MH_SCORE_OCCUPY_INTERVAL)
         self._next_rotation_at = now + self.base_active_time
 
     def _clear_active_zones(self) -> None:
@@ -247,7 +341,9 @@ class MultiHillMode(BaseMode):
         else:
             connection.send(data, reliable=True)
 
-    def _update_control(self) -> None:
+    def _update_control(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.time()
         players = tuple(getattr(self.server, "players", {}).values())
         for zone in self.active_zones:
             occupants = {TEAM1: [], TEAM2: []}
@@ -262,16 +358,46 @@ class MultiHillMode(BaseMode):
                 position = getattr(player, "position", None)
                 if position is None:
                     position = (player.x, player.y, player.z)
-                if zone.contains(position):
+                # AFK bodies and escape-flagged (sealed/out-of-map) players
+                # cannot hold or contest a hill.
+                if zone.contains(position) and self.objective_presence_eligible(player):
                     occupants[team].append(player)
 
+            self.zone_occupants[zone.index] = {
+                team: {int(player.id) for player in occupants[team]}
+                for team in _PLAYABLE_TEAMS
+            }
             blue, green = len(occupants[TEAM1]), len(occupants[TEAM2])
+            if zone.index not in self._first_paid and (blue or green):
+                # "First to Hill": the first body onto a freshly activated
+                # hill, whichever team (lowest id breaks a same-tick tie).
+                self._first_paid.add(zone.index)
+                first = min(
+                    occupants[TEAM1] + occupants[TEAM2],
+                    key=lambda p: int(getattr(p, "id", 0)),
+                )
+                self._award_player_score(
+                    first,
+                    int(CG.MH_SCORE_FIRST),
+                    int(C.SCORE_REASON.MH_FIRST_SCORE_REASON),
+                )
             was_contested = self.zone_contested.get(zone.index, False)
             contested = blue > 0 and green > 0
             self.zone_contested[zone.index] = contested
             if contested and not was_contested:
-                self._broadcast_localised("MULTIHILL_CONTESTED")
-            if blue == green:
+                last = self._contested_shout_at.get(zone.index)
+                if last is None or now - last >= _CONTESTED_SHOUT_COOLDOWN:
+                    self._contested_shout_at[zone.index] = now
+                    self.announce_localised("MULTIHILL_CONTESTED")
+            # Same rule as TC: a contested hill is held -- nobody claims or
+            # flips it until one team has it alone (rules audit 2026-09-27
+            # #19, inferred from the CONTESTED/"Contend" retail events).
+            if not contested:
+                holder = self.zone_owner.get(zone.index)
+                if holder in _PLAYABLE_TEAMS:
+                    for player in occupants[holder]:
+                        self.resupply.offer(player, now)
+            if contested or blue == green:
                 continue
             claimant = TEAM1 if blue > green else TEAM2
             old_owner = self.zone_owner.get(zone.index)
@@ -280,17 +406,22 @@ class MultiHillMode(BaseMode):
             self.zone_owner[zone.index] = claimant
             self._send_zone(zone)
 
-            # Recovered personal scoring distinguishes the first arrival from
-            # later neutral claims.  Award the decisive participant only;
-            # ordinary hold scoring remains the team's one-point clock.
-            decisive = min(occupants[claimant], key=lambda p: int(getattr(p, "id", 0)))
+            # Personal claim scoring mirrors TC's CLAIM/CONTROL pair: taking
+            # the neutral hill is "Claim Hill" (MH_SCORE_CLAIM), taking it
+            # from the enemy is "Control Hill" (MH_SCORE_CONTROL); "First to
+            # Hill" is paid separately above. Every claiming occupant is
+            # paid; holding is scored per interval. The announcement names
+            # the lowest id, as before.
+            claimers = sorted(occupants[claimant], key=lambda p: int(getattr(p, "id", 0)))
+            decisive = claimers[0]
             if old_owner is None:
-                reason = int(C.SCORE_REASON.MH_FIRST_SCORE_REASON)
-                points = int(CG.MH_SCORE_FIRST)
-            else:
                 reason = int(C.SCORE_REASON.MH_CLAIM_SCORE_REASON)
                 points = int(CG.MH_SCORE_CLAIM)
-            self._award_player_score(decisive, points, reason)
+            else:
+                reason = int(C.SCORE_REASON.MH_CONTROL_SCORE_REASON)
+                points = int(CG.MH_SCORE_CONTROL)
+            for claimer in claimers:
+                self._award_player_score(claimer, points, reason)
             self._announce_claim(decisive, claimant, old_owner)
 
     async def _award_team_ticks(self, now: float) -> None:
@@ -308,7 +439,10 @@ class MultiHillMode(BaseMode):
             team = self.server.teams[owner]
             team.add_score(ticks * int(CG.MH_TEAM_SCORE_PER_TICK))
             changed.add(owner)
-        for team_id in changed:
+        # Fixed team order: a set's iteration order must not pick the winner.
+        for team_id in _PLAYABLE_TEAMS:
+            if team_id not in changed:
+                continue
             team = self.server.teams[team_id]
             try:
                 self.server.broadcast_set_score(
@@ -317,47 +451,95 @@ class MultiHillMode(BaseMode):
                 )
             except TypeError:
                 self.server.broadcast_set_score(team)
-            if team.score >= self.score_limit:
-                await self._end_by_score(team_id)
-                break
+        if not any(
+            self.server.teams[team_id].score >= self.score_limit
+            for team_id in _PLAYABLE_TEAMS
+        ):
+            return
+        # Both teams can cross the limit on the same tick (two hills held).
+        # Higher score wins; an exact tie is a draw, like the base time end.
+        blue = self.server.teams[TEAM1].score
+        green = self.server.teams[TEAM2].score
+        if blue == green:
+            await self._end_in_draw()
+        else:
+            await self._end_by_score(TEAM1 if blue > green else TEAM2)
+
+    async def _end_in_draw(self) -> None:
+        if self.ended:
+            return
+        await self.broadcast_localised_message("GAME_DRAWN")
+        await self.on_mode_end(None)
+
+    def _award_presence_scores(self, now: float) -> None:
+        """MH_SCORE_OCCUPY / MH_SCORE_CONTEST every MH_SCORE_OCCUPY_INTERVAL.
+
+        Mirrors TC's presence scoring: on a contested hill every occupant
+        earns the contest award; otherwise the owner's occupants earn the
+        occupy award.  Missed intervals (a stalled tick) are paid in one row.
+        """
+        if self.phase != "active" or now < self._next_personal_score_at:
+            return
+        interval = float(CG.MH_SCORE_OCCUPY_INTERVAL)
+        periods = int((now - self._next_personal_score_at) / interval) + 1
+        self._next_personal_score_at += periods * interval
+        players = getattr(self.server, "players", {})
+        for zone in self.active_zones:
+            occupants = self.zone_occupants.get(zone.index) or {}
+            if self.zone_contested.get(zone.index):
+                awards = [
+                    (player_id, team, int(CG.MH_SCORE_CONTEST),
+                     int(C.SCORE_REASON.MH_CONTEST_SCORE_REASON))
+                    for team in _PLAYABLE_TEAMS
+                    for player_id in sorted(occupants.get(team, ()))
+                ]
+            else:
+                owner = self.zone_owner.get(zone.index)
+                if owner not in _PLAYABLE_TEAMS:
+                    continue
+                awards = [
+                    (player_id, owner, int(CG.MH_SCORE_OCCUPY),
+                     int(C.SCORE_REASON.MH_OCCUPY_SCORE_REASON))
+                    for player_id in sorted(occupants.get(owner, ()))
+                ]
+            for player_id, team, points, reason in awards:
+                player = players.get(player_id)
+                if player is None or not bool(getattr(player, "alive", False)):
+                    continue
+                if int(getattr(player, "team", -1)) != int(team):
+                    # A reused id or a team switch since the last capture
+                    # sample: that body did not hold this hill.
+                    continue
+                self._award_player_score(player, periods * points, reason)
 
     def _award_player_score(self, player, points: int, reason: int) -> None:
+        if not self._owns_slot(player):
+            return
         from server.scoreboard import send_player_score
 
         player.score = int(getattr(player, "score", 0)) + int(points)
         send_player_score(self.server, player, reason=int(reason))
 
-    def _broadcast_localised(self, string_id: str, parameters=()) -> None:
-        from server.announcements import build_localised_overlay
-
-        self.server.broadcast(build_localised_overlay(string_id, parameters))
-
     def _announce_claim(self, claimant, team: int, old_owner) -> None:
-        from server.announcements import build_localised_overlay
-
+        """Team-relative claim cue through the in-game-gated base helpers."""
         name = str(getattr(claimant, "name", f"Player {claimant.id}"))
-        rows = {
-            "you": build_localised_overlay("MULTIHILL_OCCUPIED_YOU", (name,)),
-            "friendly": build_localised_overlay(
-                "MULTIHILL_OCCUPIED_FRIENDLY", (name,)
-            ),
-            "enemy": build_localised_overlay("MULTIHILL_OCCUPIED_ENEMY", (name,)),
-            "lost": build_localised_overlay("MULTIHILL_LOST"),
-        }
-        for player in tuple(getattr(self.server, "players", {}).values()):
-            send = getattr(player, "send", None)
-            if not callable(send):
-                continue
-            if player is claimant:
-                send(rows["you"], reliable=True)
-            elif int(getattr(player, "team", -1)) == int(team):
-                send(rows["friendly"], reliable=True)
-            elif old_owner in _PLAYABLE_TEAMS and int(
-                getattr(player, "team", -1)
-            ) == int(old_owner):
-                send(rows["lost"], reliable=True)
-            else:
-                send(rows["enemy"], reliable=True)
+        team = int(team)
+        enemy = TEAM2 if team == TEAM1 else TEAM1
+        self.announce_localised_to_player(
+            claimant, "MULTIHILL_OCCUPIED_YOU", (name,)
+        )
+        self.announce_localised_to_team(
+            team, "MULTIHILL_OCCUPIED_FRIENDLY", (name,), exclude=claimant
+        )
+        if old_owner == enemy:
+            self.announce_localised_to_team(enemy, "MULTIHILL_LOST")
+        else:
+            self.announce_localised_to_team(
+                enemy, "MULTIHILL_OCCUPIED_ENEMY", (name,)
+            )
+        from server.audio import play_team_relative
+
+        play_team_relative(self.server, team)
 
 
 __all__ = ["MultiHillMode"]

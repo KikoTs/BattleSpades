@@ -387,12 +387,13 @@ def test_radar_station_expires_and_releases_team_visibility():
     srv.entity_registry = reg
     ent = reg.place(
         C.RADAR_STATION_ENTITY, 10, 20, 30,
-        behavior=RadarStationBehavior(team=2, lifetime=250.0),
+        behavior=RadarStationBehavior(team=2),
     )
+    # Default is the retail 45 s lifetime (A1901), not the 250 range.
     reg.tick(deploy_ctx(srv, [], now=1000.0))
-    reg.tick(deploy_ctx(srv, [], now=1249.9))
+    reg.tick(deploy_ctx(srv, [], now=1044.9))
     assert ent.alive
-    c = deploy_ctx(srv, [], now=1250.0)
+    c = deploy_ctx(srv, [], now=1045.0)
     reg.tick(c)
     assert not ent.alive
     assert reg.get(ent.entity_id) is None
@@ -529,7 +530,7 @@ def test_radar_station_uses_recovered_45_health_and_releases_visibility_once():
     srv.entity_registry = reg
     ent = reg.place(
         C.RADAR_STATION_ENTITY, 10, 20, 30, player_id=7,
-        behavior=RadarStationBehavior(team=2, lifetime=250.0, health=45.0),
+        behavior=RadarStationBehavior(team=2, lifetime=45.0, health=45.0),
     )
     c = deploy_ctx(srv, [], now=1000.0)
 

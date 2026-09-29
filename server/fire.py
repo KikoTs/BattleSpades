@@ -15,6 +15,21 @@ from typing import Optional
 
 import shared.constants as C
 
+# SetHP.damage_type read by GameScene.process_packet_set_hp (gameScene.pyd
+# 0x10191E90): A984 (=3) plays the burn sound and sets character.burn_time.
+BURN_HP_DAMAGE_TYPE = 3
+
+
+def _contact_offset(player) -> float:
+    """Eye-to-feet height of ``player`` (standing 2.25, crouching 1.35)."""
+    offset = getattr(player, "_current_contact_offset", None)
+    if callable(offset):
+        try:
+            return float(offset())
+        except Exception:
+            pass
+    return float(getattr(C, "PLAYER_STANDING_POS_ABOVE_GROUND", 2.25))
+
 
 @dataclass
 class _BlockFire:
@@ -157,7 +172,9 @@ class FireController:
     def ignite_block(self, block: tuple[int, int, int], owner,
                      now: Optional[float] = None, *,
                      _cluster_id: Optional[int] = None,
-                     _replace_oldest: bool = True) -> Optional[int]:
+                     _replace_oldest: bool = True,
+                     _lifespan: Optional[float] = None,
+                     _spread_pending: bool = True) -> Optional[int]:
         """Create one replicated BLOCKFIRE entity unless already burning."""
         block = tuple(int(value) for value in block)
         if block in self._burning_blocks:
@@ -192,7 +209,11 @@ class FireController:
 
         from server.connection import internal_team_to_wire
 
-        lifespan = float(getattr(C, "BLOCKFIRE_MAX_LIFESPAN", 4.0))
+        lifespan = (
+            float(getattr(C, "BLOCKFIRE_MAX_LIFESPAN", 4.0))
+            if _lifespan is None
+            else max(0.05, float(_lifespan))
+        )
         anchor, _surface_face = self._surface_anchor(block)
         ent = self.server.entity_registry.place(
             int(getattr(C, "BLOCKFIRE", 28)),
@@ -220,6 +241,7 @@ class FireController:
             ),
             next_spread=now + float(getattr(C, "BLOCKFIRE_SPREAD_TIMER", 0.5)),
             cluster_id=_cluster_id,
+            spread_pending=bool(_spread_pending),
         )
         cluster.members += 1
         self._burning_blocks[block] = ent.entity_id
@@ -262,10 +284,29 @@ class FireController:
         x, y, z = block
         return (x + 0.5, y + 0.5, z - 0.01), int(C.FACE_TOP)
 
+    def _friendly_protected(self, player, owner_id: int) -> bool:
+        """True when friendly fire shields ``player`` from ``owner_id``.
+
+        Mirrors the blast policy in ``BattleSpadesServer._apply_blast``: with
+        friendly fire off a teammate of the thrower takes no HP from the
+        thrower's explosives. The thrower still burns in his own fire.
+        """
+        if int(getattr(player, "id", -1)) == int(owner_id):
+            return False
+        config = getattr(self.server, "config", None)
+        if bool(getattr(config, "friendly_fire", False)):
+            return False
+        owner = self.server.players.get(int(owner_id))
+        if owner is None:
+            return False
+        return getattr(owner, "team", None) == getattr(player, "team", None)
+
     def ignite_player(self, player, owner_id: int,
                       now: Optional[float] = None) -> None:
         """Start or refresh the retail ten-second character burn."""
         if not player.alive or not player.spawned:
+            return
+        if self._friendly_protected(player, owner_id):
             return
         if now is None:
             now = time.time()
@@ -301,19 +342,40 @@ class FireController:
         char_interval = float(getattr(C, "BLOCKFIRE_CHARACTER_DAMAGE_TIMER", 0.3))
         block_interval = float(getattr(C, "BLOCKFIRE_BLOCK_DAMAGE_TIMER", 0.4))
         block_damage = float(getattr(C, "BLOCKFIRE_BLOCK_DAMAGE", 0.7))
+        world = self.server.world_manager
         for state in list(self.block_fires.values()):
             owner = self.server.players.get(state.owner_id)
-            if now >= state.expires_at or not self.server.world_manager.get_solid(*state.block):
+            if now >= state.expires_at:
                 self._remove_block_fire(state)
                 continue
+            if not world.get_solid(*state.block):
+                # BLOCKFIRE_MAX_FALLING_DISTANCE (1.0): a fire whose block
+                # burned or was dug away drops onto the voxel directly below
+                # and keeps its remaining lifetime instead of vanishing.
+                # Drop first: the fire keeps its cluster alive while moving.
+                self._drop_fire(state, owner, now)
+                self._remove_block_fire(state)
+                continue
+            entity = self.server.entity_registry.get(state.entity_id)
+            if entity is not None:
+                # Late joiners receive the live remaining fuse, so their
+                # hot->cold colour ramp matches everyone else's.
+                entity.fuse = max(0.0, state.expires_at - now)
 
             if now >= state.next_character_damage:
                 state.next_character_damage = now + char_interval
                 ex, ey, ez = state.block
+                ex, ey, ez = ex + 0.5, ey + 0.5, ez + 0.5
                 for player in self.server.players.values():
                     if not player.alive or not player.spawned:
                         continue
-                    dx, dy, dz = player.x - ex, player.y - ey, player.z - ez
+                    # Nearest point of the body (eye down to the feet) to
+                    # the burning voxel's centre: measuring from the eye
+                    # alone missed a player standing right on the fire.
+                    top = float(player.z)
+                    feet = top + _contact_offset(player)
+                    nearest_z = min(max(ez, top), feet)
+                    dx, dy, dz = player.x - ex, player.y - ey, nearest_z - ez
                     if dx * dx + dy * dy + dz * dz <= char_range * char_range:
                         self.ignite_player(player, state.owner_id, now=now)
 
@@ -342,6 +404,28 @@ class FireController:
                 cluster.spreads_left -= 1
                 if owner is not None:
                     self._spread_one(state, owner, now)
+
+    def _drop_fire(self, state: _BlockFire, owner, now: float) -> None:
+        """Re-light a vanished fire on the voxel below it, if any."""
+        if owner is None:
+            return
+        fall = int(math.floor(float(getattr(C, "BLOCKFIRE_MAX_FALLING_DISTANCE", 1.0))))
+        x, y, z = state.block
+        for dz in range(1, max(0, fall) + 1):
+            below = (x, y, z + dz)
+            if below[2] > 238:
+                return
+            if self.server.world_manager.get_solid(*below):
+                self.ignite_block(
+                    below,
+                    owner,
+                    now=now,
+                    _cluster_id=state.cluster_id,
+                    _replace_oldest=False,
+                    _lifespan=state.expires_at - now,
+                    _spread_pending=False,
+                )
+                return
 
     def _spread_one(self, state: _BlockFire, owner, now: float) -> None:
         radius = int(math.ceil(float(getattr(C, "BLOCKFIRE_SPREAD_RADIUS", 2.0))))
@@ -393,7 +477,15 @@ class FireController:
                 state.fractional_damage -= whole_damage
                 if whole_damage:
                     owner = self.server.players.get(state.owner_id)
-                    player.damage(whole_damage, source=owner, kill_type=kill_type)
+                    # SetHP type 3 is the stock client's burn branch (burn
+                    # sound + BURN_INDICATOR_TIME flash); type 1 would draw
+                    # a hit arrow toward the Molotov's thrower instead.
+                    player.damage(
+                        whole_damage,
+                        source=owner,
+                        kill_type=kill_type,
+                        hp_damage_type=BURN_HP_DAMAGE_TYPE,
+                    )
 
     def _remove_block_fire(self, state: _BlockFire) -> None:
         self.block_fires.pop(state.entity_id, None)

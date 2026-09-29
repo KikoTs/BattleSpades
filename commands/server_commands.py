@@ -62,6 +62,21 @@ async def cmd_netcode(ctx: CommandContext):
         ))
 
 
+def _isolated_runtime_refusal(server) -> str | None:
+    """Map Creator and the Tutorial are single-purpose sessions.
+
+    Their modes have no round lifecycle (``on_mode_end`` just checkpoints /
+    deactivates) and their launchers own the map and mode, so a restart,
+    forced end or rollover would detach the editor/lesson from its project.
+    """
+    config = getattr(server, "config", None)
+    if bool(getattr(config, "ugc_runtime", False)):
+        return "Not available in the Map Creator session."
+    if bool(getattr(config, "tutorial_runtime", False)):
+        return "Not available in the Tutorial."
+    return None
+
+
 @register_command(
     name="map",
     aliases=["changemap"],
@@ -71,6 +86,10 @@ async def cmd_netcode(ctx: CommandContext):
 )
 async def cmd_map(ctx: CommandContext):
     """Change map through a crash-safe full client-session rollover."""
+    refusal = _isolated_runtime_refusal(ctx.server)
+    if refusal is not None:
+        await send_message(ctx.server, ctx.player, refusal)
+        return
     if not ctx.args:
         await send_message(ctx.server, ctx.player, f"Current map: {ctx.server.world_manager.map_name}")
         await send_message(ctx.server, ctx.player, "Usage: /map <mapname>")
@@ -98,6 +117,10 @@ async def cmd_map(ctx: CommandContext):
 )
 async def cmd_mode(ctx: CommandContext):
     """Change mode through a crash-safe full client-session rollover."""
+    refusal = _isolated_runtime_refusal(ctx.server)
+    if refusal is not None:
+        await send_message(ctx.server, ctx.player, refusal)
+        return
     if not ctx.args:
         current = ctx.server.mode.name if ctx.server.mode else "None"
         await send_message(ctx.server, ctx.player, f"Current mode: {current}")
@@ -129,6 +152,10 @@ async def cmd_mode(ctx: CommandContext):
 )
 async def cmd_restart(ctx: CommandContext):
     """Restart the round immediately (skips the end-of-round stats screen)."""
+    refusal = _isolated_runtime_refusal(ctx.server)
+    if refusal is not None:
+        await send_message(ctx.server, ctx.player, refusal)
+        return
     result = await ctx.server.match_transition.restart_round()
     if not result.ok:
         await send_message(ctx.server, ctx.player, result.message)
@@ -149,6 +176,10 @@ async def cmd_restart(ctx: CommandContext):
 async def cmd_endround(ctx: CommandContext):
     """Force-trigger the end-of-round sequence. Optional team arg (1/2) sets
     the winner; otherwise the current score leader wins."""
+    refusal = _isolated_runtime_refusal(ctx.server)
+    if refusal is not None:
+        await send_message(ctx.server, ctx.player, refusal)
+        return
     mode = ctx.server.mode
     if mode is None or mode.ended:
         await send_message(ctx.server, ctx.player, "No active round to end.")
@@ -263,53 +294,34 @@ async def cmd_time(ctx: CommandContext):
     description="Force team balance",
 )
 async def cmd_balance(ctx: CommandContext):
-    """Force team balance."""
-    team_counts = {
-        TEAM1: len(ctx.server.teams[TEAM1].players),
-        TEAM2: len(ctx.server.teams[TEAM2].players),
-    }
-    
-    diff = abs(team_counts[TEAM1] - team_counts[TEAM2])
-    
-    if diff <= 1:
+    """Force team balance through the retail-safe balancer.
+
+    Same eligibility as ``[teams] auto_balance`` (server/team_balance.py):
+    bots first, only dead players move (nobody is killed), objective
+    carriers, VIPs, last survivors and mode team locks are respected, and
+    each moved player gets the retail TEAM_FULL notice.
+    """
+    balancer = getattr(ctx.server, "team_balance", None)
+    force = getattr(balancer, "force_balance", None)
+    if not callable(force):
+        await send_message(ctx.server, ctx.player, "Team balancing is unavailable")
+        return
+    from server.team_balance import team_counts
+
+    counts = team_counts(ctx.server)
+    if abs(counts[TEAM1] - counts[TEAM2]) <= 1:
         await send_message(ctx.server, ctx.player, "Teams are already balanced")
         return
-    
-    # Determine larger team
-    larger_team = TEAM1 if team_counts[TEAM1] > team_counts[TEAM2] else TEAM2
-    smaller_team = TEAM2 if larger_team == TEAM1 else TEAM1
-    
-    to_move = diff // 2
-    
-    # Move players (last joined first). A raw ``player.team =`` mutation is
-    # invisible to other clients; KillAction + the ordinary respawn boundary
-    # re-announces class/loadout/team through CreatePlayer.
-    moved = 0
-    for player in reversed(list(ctx.server.teams[larger_team].players)):
-        if moved >= to_move:
-            break
-
-        old_team = player.team
-        ctx.server.teams[larger_team].remove_player(player)
-        player.team = smaller_team
-        ctx.server.teams[smaller_team].add_player(player)
-
-        die = getattr(player, "die", None)
-        if player.alive and callable(die):
-            from server.game_constants import KILL_TEAM_CHANGE
-            die(kill_type=KILL_TEAM_CHANGE)
-        queue_event = getattr(ctx.server, "queue_mode_event", None)
-        if callable(queue_event):
-            queue_event("on_player_team_change", player, old_team, smaller_team)
-        ctx.server.respawn_player(player)
-        
-        await send_message(ctx.server, player, 
-                           f"You were moved to {ctx.server.teams[smaller_team].name}")
-        moved += 1
-    
-    from server.announcements import broadcast_overlay
-
-    broadcast_overlay(ctx.server, f"Teams balanced ({moved} players moved)")
+    moved = await force()
+    counts = team_counts(ctx.server)
+    remaining = abs(counts[TEAM1] - counts[TEAM2])
+    note = "" if remaining <= 1 else (
+        f"; still {remaining} apart (live, carrying or mode-locked players "
+        "are never moved)"
+    )
+    await send_message(
+        ctx.server, ctx.player, f"Teams balanced: {moved} player(s) moved{note}"
+    )
 
 
 async def _ensure_bot_director(ctx: CommandContext):
@@ -351,7 +363,9 @@ async def cmd_bots(ctx: CommandContext):
             ctx.player,
             (
                 f"Bots={len(director.bots)} worker={'up' if worker.running else 'down'} "
-                f"pid={worker.process_id or '-'} restarts={worker.restarts} "
+                f"pid={worker.process_id or '-'} "
+                f"recycles={getattr(worker, 'planned_recycles', 0)} "
+                f"crashes={getattr(worker, 'crash_restarts', worker.restarts)} "
                 f"stalls={getattr(worker, 'stalled_restarts', 0)} "
                 f"silence={getattr(worker, 'intent_silence_seconds', 0.0):.1f}s "
                 f"frames={worker.queued_frames} intents={worker.queued_intents} "

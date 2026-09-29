@@ -116,6 +116,7 @@ def stage_release(
         root / "config.toml": "config.toml",
         root / "fleet.toml": "fleet.toml",
         root / "LICENSE": "LICENSE",
+        root / "LICENSING.md": "LICENSING.md",
         root / "VERSION": "VERSION",
         root / "release" / "README.txt": "README.txt",
         root / "release" / "THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",

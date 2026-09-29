@@ -43,6 +43,9 @@ class MovementAffordance(str, Enum):
     JUMP = "jump"
     DROP = "drop"
     JETPACK = "jetpack"
+    # Capability only (never a route edge): the pack can lift the body onto
+    # ledges several blocks higher. Climb edges still execute as JETPACK.
+    JETPACK_CLIMB = "jetpack_climb"
     BREACH = "breach"
     BUILD_STEP = "build_step"
     BUILD_BRIDGE = "build_bridge"
@@ -84,6 +87,10 @@ class VoxelChange:
     z: int
     solid: bool
     color: int = 0
+    # Undamaged break threshold of a solid cell that differs from the map
+    # default (player-built blocks and prefab cells: 9). 0 = map default.
+    # Lets bot dig plans budget the extra swings a built wall costs.
+    health: float = 0.0
 
     @property
     def coordinate(self) -> VoxelCoordinate:
@@ -242,6 +249,9 @@ class PlayerSnapshot:
     # (tool, clip, reserve) for each owned firearm, so a bot can draw its
     # sidearm when the primary runs dry. Policies read only the observer's.
     weapon_ammo: tuple[tuple[int, int, int], ...] = ()
+    # Still shielded by spawn protection (the client shows the shield): bots
+    # hold fire like a human would instead of wasting it on a fresh spawn.
+    spawn_protected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +284,18 @@ class ObjectiveSnapshot:
     position: Vector3
     carrier_id: int = -1
     state: int = 0
+    # Optional mode detail. Every field is public HUD/minimap knowledge:
+    # ``bounds`` is an objective volume (x0, x1, y0, y1, z0, z1) drawn on the
+    # minimap; ``cells`` samples intact objective blocks and ``repair_cells``
+    # destroyed ones (Demolition's native base-health bar); ``progress`` and
+    # ``attacker`` mirror Territory Control's capture bar; ``expires_in`` is
+    # the seconds until a Multi-Hill base rotates out (and is airstruck).
+    bounds: tuple[int, ...] = ()
+    cells: tuple[VoxelCoordinate, ...] = ()
+    repair_cells: tuple[VoxelCoordinate, ...] = ()
+    progress: float = 0.0
+    attacker: int = -1
+    expires_in: float = -1.0
 
 
 @dataclass(frozen=True, slots=True)

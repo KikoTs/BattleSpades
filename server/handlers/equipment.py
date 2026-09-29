@@ -7,6 +7,7 @@ complete :class:`ClassSelection`, never independently mutate class and tools.
 from __future__ import annotations
 
 import logging
+import time
 
 from protocol.handler_registry import register_handler
 import shared.constants as C
@@ -16,6 +17,50 @@ from server.game_constants import KILL_CLASS_CHANGE
 from shared.packet import SetClassLoadout
 
 logger = logging.getLogger(__name__)
+
+
+def is_class_selectable(server, class_id: int) -> bool:
+    """Whether ``class_id`` passes the rules and the mode's class list.
+
+    ``RULE_ENABLE_CLASS_*`` is the operator switch; ``mode_data``'s
+    ``allowed_classes`` is what InitialInfo/StateData advertise to the class
+    picker (empty = every class). A mode with ``allows_class_selection``
+    owns finer (per-team) policy and is consulted by the callers.
+    """
+    from server import mode_data
+
+    class_id = int(class_id)
+    if not get_rules(server.config).is_class_enabled(class_id):
+        return False
+    mode = getattr(server, "mode", None)
+    if callable(getattr(mode, "allows_class_selection", None)):
+        return True
+    if bool(getattr(server.config, "ugc_runtime", False)):
+        # The Map Creator session owns its builder class list.
+        return True
+    allowed = mode_data.get(
+        getattr(server.config, "game_mode", getattr(server.config, "default_mode", ""))
+    ).allowed_classes
+    return not allowed or class_id in {int(value) for value in allowed}
+
+
+def fallback_class_id(server) -> int | None:
+    """First class a joiner may legally take (mode list order first)."""
+    from server import mode_data
+
+    allowed = [
+        int(value)
+        for value in mode_data.get(
+            getattr(server.config, "game_mode", getattr(server.config, "default_mode", ""))
+        ).allowed_classes
+    ]
+    candidates = allowed + [int(C.DEFAULT_CLASS)] + sorted(
+        int(value) for value in C.CLASS_ITEMS
+    )
+    for class_id in dict.fromkeys(candidates):
+        if class_id in C.CLASS_ITEMS and is_class_selectable(server, class_id):
+            return class_id
+    return None
 
 
 def _matches_active_selection(player, selection) -> bool:
@@ -55,6 +100,46 @@ def _broadcast_live_selection(server, player, selection) -> None:
         broadcast(bytes(acknowledgement.generate()), reliable=True)
 
 
+# Minimum seconds between two class/loadout changes that END A LIVE
+# Character. Picking a class while dead (the retail menu flow between lives)
+# never kills anyone and stays instant; inside the window the choice is
+# staged for the next respawn instead of killing the player again.
+CLASS_CHANGE_DEATH_COOLDOWN_SECONDS = 3.0
+
+
+def _tell_player(player, message: str) -> None:
+    from server.handlers.team import _tell_player as tell
+
+    tell(player, message)
+
+
+def _end_life_for_class_change(server, player) -> bool:
+    """Kill ``player`` for a staged class change unless on cooldown.
+
+    The death goes through :func:`server.handlers.team.end_life_for_transition`
+    so a class change right after taking enemy fire is the kill it would
+    otherwise deny. Returns whether the Character was retired now.
+    """
+    from server.handlers.team import end_life_for_transition
+
+    now = time.monotonic()
+    last = getattr(player, "_last_class_change_death_at", None)
+    if (
+        last is not None
+        and now - float(last) < CLASS_CHANGE_DEATH_COOLDOWN_SECONDS
+    ):
+        _tell_player(
+            player, "Your new class/loadout applies on your next respawn."
+        )
+        return False
+    try:
+        player._last_class_change_death_at = now
+    except AttributeError:
+        pass
+    end_life_for_transition(server, player, KILL_CLASS_CHANGE)
+    return True
+
+
 @register_handler(13)  # SetClassLoadout
 async def handle_set_class_loadout(server, player, packet) -> None:
     """Normalize and atomically stage or commit a client menu selection."""
@@ -66,7 +151,7 @@ async def handle_set_class_loadout(server, player, packet) -> None:
         getattr(packet, "ugc_tools", ()) or (),
         fallback_class_id=player.class_id,
     )
-    if not get_rules(server.config).is_class_enabled(selection.class_id):
+    if not is_class_selectable(server, selection.class_id):
         logger.debug("Ignoring disabled class/loadout from %s", player.name)
         return
     mode = getattr(server, "mode", None)
@@ -92,7 +177,7 @@ async def handle_set_class_loadout(server, player, packet) -> None:
         # its CreatePlayer/restock path never ran.
         player.stage_class_selection(selection)
         if player.alive:
-            player.die(kill_type=KILL_CLASS_CHANGE)
+            _end_life_for_class_change(server, player)
     logger.info(
         "LOADOUT %s -> class=%d loadout=%s instant=%s",
         player.name,
@@ -115,7 +200,7 @@ async def handle_change_class(server, player, packet) -> None:
             requested_class,
             fallback_class_id=player.class_id,
         )
-    if not get_rules(server.config).is_class_enabled(selection.class_id):
+    if not is_class_selectable(server, selection.class_id):
         logger.debug("Ignoring disabled class change from %s", player.name)
         return
     mode = getattr(server, "mode", None)
@@ -125,4 +210,4 @@ async def handle_change_class(server, player, packet) -> None:
         return
     player.stage_class_selection(selection)
     if selection.class_id != int(player.class_id) and player.alive:
-        player.die(kill_type=KILL_CLASS_CHANGE)
+        _end_life_for_class_change(server, player)

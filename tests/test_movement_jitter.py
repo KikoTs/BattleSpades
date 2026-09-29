@@ -1,11 +1,14 @@
-"""Regression coverage for retail loop-label skips and client frame hitches.
+"""Regression coverage for lost ClientData frames and client frame hitches.
 
-The retail ``loop_count`` is a clock label, not proof that the client emitted
-one ClientData packet (or one movement-history record) for every intervening
-integer.  Captured retail frames regularly jump by two at an ordinary ~17 ms
-frame, and a 50 ms hitch jumped by three.  A WorldUpdate must therefore never
-acknowledge a loop label that was synthesized only by the server: the client's
-exact history lookup cannot find that label and immediately snaps its player.
+IDA of ``GameScene.update`` shows the retail client advancing ``loop_count``
+by exactly one per update (one physics step, one movement-history record and
+one ClientData per label); ``process_packet_clock_sync`` rewrites the counter
+only when it is more than ``MAX_CLOCK_SYNC_DIFFERENCE`` (10) loops off.  The
+ClientData stream is ENet SEND_UNSEQUENCED, so a missing label smaller than
+that threshold is a lost frame the client did simulate.  Authority refills
+such a frame with the held input (one per tick) so its step count keeps
+matching the client's; a gap wider than ``input_gap_fill_limit`` is a clock
+jump and is never refilled (docs/RETAIL_INPUT_LOSS.md).
 """
 
 import asyncio
@@ -120,12 +123,16 @@ def _consume(player) -> list[float]:
     return deltas
 
 
-def test_clock_label_skip_acks_only_the_observed_client_frame() -> None:
-    """A 100 -> 102 clock jump must not invent acknowledgement 101.
+def test_small_label_gap_is_a_lost_packet_and_gets_one_held_frame() -> None:
+    """A 100 -> 102 gap is a lost unsequenced ClientData, not a clock jump.
 
-    Retail evidence: capture ``53a2149823e9`` contains 2303 -> 2305 with
-    ``dt=17.5615 ms``.  That is one ordinary physics frame carrying label 2305,
-    not two frames that the server may replay as 2304 and 2305.
+    IDA of ``GameScene.update`` shows ``self.loop_count += 1`` once per update
+    and ``process_packet_clock_sync`` only rewrites the counter when it is more
+    than ``MAX_CLOCK_SYNC_DIFFERENCE`` (10) loops off; the wire stream is ENet
+    SEND_UNSEQUENCED (scripts/enet_sniff.py). The client therefore simulated a
+    frame 101 that the server never heard about. Authority takes that frame
+    with the held input on the next tick and acknowledges it as 101, then
+    consumes 102 on the tick after, so its step count matches the client's.
     """
     player, _ = make_player()
     player.record_input_frame(100, FORWARD, ORIENTATION)
@@ -134,8 +141,54 @@ def test_clock_label_skip_acks_only_the_observed_client_frame() -> None:
     player.record_input_frame(102, FORWARD, ORIENTATION)
     deltas = _consume(player)
 
+    assert player.last_applied_input_loop == 101
+    assert deltas == pytest.approx([TICK_DT])
+    assert player.input_frames_synthesized == 1
+    assert list(player.input_history) == [102]
+
+    deltas = _consume(player)
+
     assert player.last_applied_input_loop == 102
     assert deltas == pytest.approx([TICK_DT])
+    assert player.input_history == {}
+
+
+def test_late_arrival_of_a_synthesized_label_is_dropped_as_stale() -> None:
+    """Unsequenced delivery can reorder: 102 before 101.
+
+    Once 101 was synthesized the real packet must not move the body a second
+    time, and telemetry keeps counting it as a stale duplicate.
+    """
+    player, _ = make_player()
+    player.record_input_frame(100, FORWARD, ORIENTATION)
+    assert _consume(player) == pytest.approx([TICK_DT])
+    player.record_input_frame(102, FORWARD, ORIENTATION)
+    assert _consume(player) == pytest.approx([TICK_DT])
+    assert player.last_applied_input_loop == 101
+
+    player.record_input_frame(101, FORWARD, ORIENTATION)
+
+    assert list(player.input_history) == [102]
+    assert player.input_frames_stale == 1
+
+
+def test_gap_beyond_the_fill_limit_is_treated_as_a_clock_jump() -> None:
+    """A jump wider than ``input_gap_fill_limit`` is a ClockSync correction.
+
+    The client only rewrites its counter when it drifted by more than ten
+    loops, and no frames exist for the skipped labels, so nothing is
+    synthesized and the next real packet is one ordinary step.
+    """
+    player, _ = make_player()
+    player.record_input_frame(100, FORWARD, ORIENTATION)
+    assert _consume(player) == pytest.approx([TICK_DT])
+
+    player.record_input_frame(112, FORWARD, ORIENTATION)
+    deltas = _consume(player)
+
+    assert player.last_applied_input_loop == 112
+    assert deltas == pytest.approx([TICK_DT])
+    assert player.input_frames_synthesized == 0
     assert player.input_history == {}
 
 
@@ -187,13 +240,12 @@ def test_dead_class_change_frames_do_not_fill_next_life_history() -> None:
     assert player.input_frames_dropped == 0
 
 
-def test_starvation_and_a_label_skip_still_advance_one_observed_frame() -> None:
-    """Transport starvation must not turn a clock-label skip into ``dt*3``.
+def test_starvation_and_a_label_gap_never_produce_a_multi_frame_step() -> None:
+    """Transport starvation must not turn missing labels into ``dt*3``.
 
-    Retail captures contain ordinary single frames labelled 1698 -> 1700
-    (16.93 ms), 1424 -> 1426 (17 ms), and 2387 -> 2389 (18 ms).  ClientData
-    carries no rendered-frame duration, so a consumed packet is exactly one
-    authoritative fixed step regardless of coincident server starvation.
+    ClientData carries no rendered-frame duration, so every authoritative step
+    is exactly one fixed frame.  Two lost frames after a stall are refilled one
+    per tick (101, 102) before the real 103 is consumed.
     """
     player, _ = make_player()
     player.record_input_frame(100, FORWARD, ORIENTATION)
@@ -204,10 +256,14 @@ def test_starvation_and_a_label_skip_still_advance_one_observed_frame() -> None:
     assert player.input_starved_ticks == 2
 
     player.record_input_frame(103, FORWARD, ORIENTATION)
-    deltas = _consume(player)
+    applied = []
+    for _ in range(3):
+        deltas = _consume(player)
+        assert deltas == pytest.approx([TICK_DT])
+        applied.append(player.last_applied_input_loop)
 
-    assert player.last_applied_input_loop == 103
-    assert deltas == pytest.approx([TICK_DT])
+    assert applied == [101, 102, 103]
+    assert player.input_frames_synthesized == 2
     assert player.input_history == {}
 
 
@@ -375,10 +431,10 @@ def test_real_jump_physics_is_invariant_to_starvation_and_label_skips() -> None:
     """Transport gaps must not stretch or lose a one-frame jump pulse.
 
     The two players consume the same three observed ClientData states.  The
-    second stream uses non-contiguous retail loop labels, has two empty server
-    ticks, and then receives both transitions in one burst.  Empty ticks freeze
-    the acknowledged state, so both native world objects must finish
-    bit-for-bit-equivalent physics despite the different packet cadence.
+    second stream has two empty server ticks and then receives both
+    transitions in one burst.  Empty ticks freeze the acknowledged state, so
+    both native world objects must finish bit-for-bit-equivalent physics
+    despite the different packet cadence.
     """
     baseline, _ = make_player()
     delayed, _ = make_player()
@@ -413,13 +469,13 @@ def test_real_jump_physics_is_invariant_to_starvation_and_label_skips() -> None:
     asyncio.run(delayed.simulate_tick(TICK_DT))
     # Both transitions arrive in one drain.  The handler-visible state is now
     # idle again, but the buffered loop 102 must retain the jump pulse.
-    receive(delayed, 102, jump_pulse)
-    receive(delayed, 104, idle)
+    receive(delayed, 101, jump_pulse)
+    receive(delayed, 102, idle)
     asyncio.run(delayed.simulate_tick(TICK_DT))
     asyncio.run(delayed.simulate_tick(TICK_DT))
 
     assert baseline.last_applied_input_loop == 102
-    assert delayed.last_applied_input_loop == 104
+    assert delayed.last_applied_input_loop == 102
     assert delayed.position == pytest.approx(baseline.position, abs=1e-6)
     assert delayed.velocity == pytest.approx(baseline.velocity, abs=1e-6)
     assert delayed.airborne is baseline.airborne is True
@@ -526,6 +582,7 @@ def test_batched_arrivals_fall_back_to_fixed_dt_including_burst_head() -> None:
 
 
 def test_long_input_arrival_delay_without_starvation_uses_fixed_dt() -> None:
+    """Arrival timing never becomes physics dt, not even across a lost gap."""
     player, _ = make_player()
     player.record_input_frame(
         100, FORWARD, ORIENTATION, received_at=30.000
@@ -536,8 +593,12 @@ def test_long_input_arrival_delay_without_starvation_uses_fixed_dt() -> None:
         105, FORWARD, ORIENTATION, received_at=31.000
     )
 
-    assert _consume(player) == pytest.approx([TICK_DT])
-    assert player.last_applied_input_loop == 105
+    applied = []
+    for _ in range(5):
+        assert _consume(player) == pytest.approx([TICK_DT])
+        applied.append(player.last_applied_input_loop)
+    assert applied == [101, 102, 103, 104, 105]
+    assert player.input_frames_synthesized == 4
 
 
 def test_invalid_or_regressing_input_arrival_time_uses_fixed_dt() -> None:
@@ -1144,3 +1205,73 @@ def test_jetpack_exhaustion_is_urgent_without_waiting_for_ground_or_release(airb
     replication = ReplicationService(server)
     replication._last_advertised_jetpack_active[player.id] = True
     assert replication._jetpack_transition_connections((connection,)) == [connection]
+
+
+def test_refilled_frame_is_flagged_and_the_next_real_frame_clears_it() -> None:
+    """A refilled label is a guess; the flag drives self-row suppression."""
+    player, _ = make_player()
+    player.record_input_frame(100, FORWARD, ORIENTATION)
+    assert _consume(player) == pytest.approx([TICK_DT])
+    assert player.last_applied_input_synthesized is False
+
+    player.record_input_frame(102, FORWARD, ORIENTATION)
+    assert _consume(player) == pytest.approx([TICK_DT])
+    assert player.last_applied_input_loop == 101
+    assert player.last_applied_input_synthesized is True
+
+    assert _consume(player) == pytest.approx([TICK_DT])
+    assert player.last_applied_input_loop == 102
+    assert player.last_applied_input_synthesized is False
+
+
+def test_no_owner_self_row_is_stamped_with_a_refilled_label() -> None:
+    """The client's history for a lost frame may hold an input change the
+    server never saw (crouch alone is 0.9 blocks), so the owner row waits for
+    the next real label; observers still get the snapshot."""
+    sent: list[bytes] = []
+    player = SimpleNamespace(
+        id=0,
+        last_applied_input_loop=101,
+        last_applied_input_synthesized=True,
+        wu_ack_loop=0,
+        is_block_tool=lambda: False,
+    )
+    connection = SimpleNamespace(
+        in_game=True,
+        player=player,
+        send=lambda data, reliable=False: sent.append(data),
+    )
+    calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def build_world_update_data(
+        *, exclude_player_id=None, loop_count_override=None,
+        local_player_id=None,
+    ) -> bytes:
+        calls.append((exclude_player_id, loop_count_override, local_player_id))
+        return b"row"
+
+    server = SimpleNamespace(
+        config=SimpleNamespace(
+            broadcast_world_updates=True,
+            worldupdate_broadcast_interval=2,
+            worldupdate_self_row_interval=2,
+            worldupdate_loop_offset=0,
+            worldupdate_include_self=True,
+            debug_selfrow=False,
+        ),
+        connections={object(): connection},
+        players={0: player},
+        loop_count=2,
+        metrics=SimpleNamespace(record_world_packet=lambda *_args: None),
+        build_world_update_data=build_world_update_data,
+    )
+    replication = ReplicationService(server)
+
+    replication.broadcast_world_updates()
+    assert calls == [(0, 2, None)]  # own row excluded while the label is a guess
+
+    server.loop_count = 4
+    player.last_applied_input_loop = 102
+    player.last_applied_input_synthesized = False
+    replication.broadcast_world_updates()
+    assert calls[-1] == (None, 4, None)  # real label: owner row resumes

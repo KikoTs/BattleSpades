@@ -27,3 +27,23 @@ Do not flush the host firewall or replace its existing ruleset.
 
 See [the deployment record](../../docs/STEAM_VPS_2026-09-21.md) for the live
 addresses, verification, limitations, status commands and narrow rollback.
+
+## Several public IPv4 addresses on one host
+
+The retail client connects to UDP 32887 regardless of the advertised game
+port. Each separately joinable instance therefore needs a distinct IPv4.
+Use a separate sidecar process and writable state directory per instance,
+with `--bind-ip <locally-assigned-ipv4>` and its own `--source-port`/`--mode`.
+The binding configures both Steam backend traffic and the query listener;
+assign the address to the host before starting the service. The default
+`0.0.0.0` retains the existing single-IP deployment behavior.
+
+For every address, route UDP 32887 to the intended game's local port and
+permit UDP 32888 queries. Provider-side NAT or tunnels also need matching
+outbound source translation. An arbitrary public IP that is not locally
+assigned cannot be passed as a binding address.
+
+The optional binding's ABI call order and IPv4 encoding have unit coverage.
+Multiple simultaneous public-IP registrations still require a deployment
+check: verify each Steam endpoint, A2S response and retail join before
+migrating players or retiring an old host.

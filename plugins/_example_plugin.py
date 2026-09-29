@@ -21,7 +21,7 @@ class ExamplePlugin(BasePlugin):
 
     async def on_load(self):
         self._streaks = {}
-        logger.info("[Example plugin] loaded — override hooks in plugins/example_plugin.py")
+        logger.info("[Example plugin] loaded — copy plugins/_example_plugin.py to a public name to enable")
 
     async def on_player_kill(self, killer, victim, kill_type):
         if killer is None or killer is victim:

@@ -20,8 +20,100 @@ logger = logging.getLogger(__name__)
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
 _NEUTRAL_COLOR = (255, 255, 255)
-_BASE_CAPTURE_PER_SECOND = 0.05
+# Stock A2550 TC_CAPTURE_RATE: (capturing players, capture % per 0.5 s
+# TC_CAPTURE_TICK_RATE tick). The wire capture_amount is 0..100 % of one
+# ownership step; internally one step is 0.5 of ``progress``.
+TC_CAPTURE_RATE_TABLE = tuple(
+    (int(players), float(rate)) for players, rate in CG.TC_CAPTURE_RATE
+)
+
+
+def tc_capture_percent_per_tick(players: int) -> float:
+    """Capture % one tick adds for ``players`` capturers.
+
+    Linear between the stock table's points and flat past its last point.
+    The interpolation (vs a step lookup) is inferred: the table only lists
+    1, 5, 10 and 15 players, so a step would give 2-4 players the one-player
+    rate.
+    """
+    players = max(0, int(players))
+    table = TC_CAPTURE_RATE_TABLE
+    if players <= table[0][0]:
+        return float(table[0][1])
+    for (low_n, low_rate), (high_n, high_rate) in zip(table, table[1:]):
+        if players <= high_n:
+            span = float(high_n - low_n)
+            return low_rate + (high_rate - low_rate) * (players - low_n) / span
+    return float(table[-1][1])
+
 _FALLBACK_RADIUS = 15.0
+_ENTER_SHOUT_COOLDOWN = float(CG.TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN)
+# Retail capture-point resupply interval (shared/constants.py
+# CAPTURE_POINT_REFILL_TIME = 10.0).
+CAPTURE_POINT_REFILL_TIME = float(C.CAPTURE_POINT_REFILL_TIME)
+
+
+class CapturePointResupply:
+    """Refill players standing on a capture point their team owns.
+
+    The client tables carry CAPTURE_POINT_REFILL_TIME (10 s) but no code in
+    either client tree reads it, so it is server behaviour. Owned TC
+    territories and held Multi-Hill hills are the capture points: a live
+    member of the owning team inside an uncontested zone is restocked at
+    once and then at most every CAPTURE_POINT_REFILL_TIME seconds - health
+    to its maximum (SetHP heal), weapons and tools (Restock type
+    AMMO_CRATE, which unlike type 0 does not also restore health) and the
+    block wallet (Restock type 5). Operators can turn it off per mode with
+    ``capture_point_resupply = false`` in ``[modes.tc]`` / ``[modes.mh]``.
+    """
+
+    def __init__(self, server, mode_code: str) -> None:
+        overlay = getattr(getattr(server, "config", None), "mode_settings", {})
+        overlay = overlay.get(mode_code, {}) if isinstance(overlay, dict) else {}
+        self.enabled = bool(overlay.get("capture_point_resupply", True))
+        self.interval = max(0.5, float(overlay.get(
+            "capture_point_refill_time", CAPTURE_POINT_REFILL_TIME
+        )))
+        self._last: dict[int, tuple[object, float]] = {}
+
+    def reset(self) -> None:
+        self._last = {}
+
+    def forget(self, player) -> None:
+        self._last.pop(int(getattr(player, "id", -1)), None)
+
+    def offer(self, player, now: float) -> bool:
+        """Resupply ``player`` when its interval has elapsed."""
+        if not self.enabled or not bool(getattr(player, "alive", False)):
+            return False
+        player_id = int(getattr(player, "id", -1))
+        previous = self._last.get(player_id)
+        if (
+            previous is not None
+            and previous[0] is player
+            and now - float(previous[1]) < self.interval
+        ):
+            return False
+        self._last[player_id] = (player, now)
+        heal = getattr(player, "heal", None)
+        if callable(heal):
+            maximum = int(getattr(player, "max_health", 100) or 100)
+            if int(getattr(player, "health", maximum)) < maximum:
+                heal(maximum)
+        restock = getattr(player, "restock_ammo", None)
+        if callable(restock):
+            restock(int(C.AMMO_CRATE))
+        blocks = getattr(player, "restock_blocks", None)
+        if callable(blocks):
+            blocks()
+        return True
+
+
+def territory_name(index: int) -> str:
+    """Retail base letter ("A".."J") used by the TC_* string templates."""
+    names = CG.TC_BASENAMES
+    index = int(index)
+    return str(names[index]) if 0 <= index < len(names) else str(index + 1)
 
 
 def _configured_rule(server, key: str, rule: str, fallback):
@@ -53,13 +145,39 @@ class Territory:
         default_factory=lambda: {TEAM1: set(), TEAM2: set()}
     )
     last_non_neutral_owner: int = TEAM_NEUTRAL
+    # Identity of each occupant id: a departed player's reused compact id
+    # must never be paid (or messaged) for the previous body's presence.
+    occupant_players: dict[int, dict[int, object]] = field(
+        default_factory=lambda: {TEAM1: {}, TEAM2: {}}
+    )
+
+
+def _wire_capture(territory: "Territory") -> tuple[int, float]:
+    """Packet-106 ``(attacked_by, capture_amount)`` for one territory.
+
+    The stock TerritoryBasesHud stretches the attacker plate to
+    ``capture_amount / 100`` in the ``attacked_by`` colour over the owner's
+    backplate, so the wire amount is a 0..100 percentage of the way to the
+    next ownership change. ``progress`` is ours (0 Blue, 0.5 neutral,
+    1 Green): the amount is the distance from the owner's anchor, and the
+    attacker is the team the progress leans toward (a half-taken base keeps
+    showing its partial plate after the attackers leave).
+    """
+    anchor = 0.0 if territory.owner == TEAM1 else 1.0 if territory.owner == TEAM2 else 0.5
+    delta = float(territory.progress) - anchor
+    amount = max(0.0, min(100.0, abs(delta) / 0.5 * 100.0))
+    if amount <= 0.0:
+        return int(territory.attacker), 0.0
+    return (TEAM2 if delta > 0.0 else TEAM1), amount
 
 
 class TerritoryControlMode(BaseMode):
     """Capture a line of territories until one team owns every active base.
 
-    Packet 106 is the native TC HUD state machine.  Progress is continuous:
-    ``0`` is Blue, ``0.5`` neutral, and ``1`` Green.  Packet 43 supplies the
+    Packet 106 is the native TC HUD state machine.  Internal progress is
+    continuous: ``0`` is Blue, ``0.5`` neutral, and ``1`` Green; the wire
+    carries the retail 0..100 attacker percentage (``_wire_capture``).
+    Packet 43 supplies the
     matching lettered minimap/billboard zones.
     """
 
@@ -87,8 +205,11 @@ class TerritoryControlMode(BaseMode):
             server, "capture_rate", "RULE_CAPTURE_RATE", 1.0
         )))
         self.territories: list[Territory] = []
+        # (territory index, team) -> last TC_ENTER_BASE_* shout time.
+        self._enter_shout_at: dict[tuple[int, int], float] = {}
         self._next_capture_at = 0.0
         self._next_personal_score_at = 0.0
+        self.resupply = CapturePointResupply(server, self.mode_code)
 
     async def on_mode_start(self) -> None:
         await super().on_mode_start()
@@ -96,6 +217,11 @@ class TerritoryControlMode(BaseMode):
             team.reset()
         zones = self._select_active_zones(self._build_zones())
         self.territories = self._initialise_territories(zones)
+        # The win is owning every active territory and team.score counts
+        # owned territories, so StateData/HUD must advertise that target.
+        self.score_limit = max(1, len(self.territories))
+        self._enter_shout_at = {}
+        self.resupply.reset()
         now = time.time()
         self._next_capture_at = now
         self._next_personal_score_at = now + float(CG.TC_SCORE_OCCUPY_INTERVAL)
@@ -104,6 +230,7 @@ class TerritoryControlMode(BaseMode):
             self._send_state(territory, int(C.TC_INITIAL_INFO))
             self._send_state(territory, int(C.TC_BASE_ACTIVATE))
         self._refresh_team_scores()
+        self.broadcast_start_cue()
         logger.info(
             "Territory Control started with %d active bases at %.2fx capture rate",
             len(self.territories),
@@ -136,6 +263,7 @@ class TerritoryControlMode(BaseMode):
             self._award_presence_scores(periods)
 
     def reveal_to(self, connection) -> None:
+        super().reveal_to(connection)
         for territory in self.territories:
             self._send_zone(territory, connection=connection)
             self._send_state(
@@ -145,10 +273,25 @@ class TerritoryControlMode(BaseMode):
                 self._send_state(
                     territory, int(C.TC_BASE_ACTIVATE), connection=connection
                 )
+                if territory.contested:
+                    # Contention is edge-triggered; a joiner never saw it.
+                    self._send_state(
+                        territory,
+                        int(C.TC_BASE_CONTENDED),
+                        connection=connection,
+                    )
+        # Retail mode-start cue (string-table only; no client binary sends
+        # it), replayed per settled GameScene like TDM/Diamond.
+        self.send_start_cue_to(connection)
+
+    def start_cue_for(self, player):
+        return "TC_START"
 
     async def on_player_kill(self, killer, victim, kill_type: int) -> None:
+        await super().on_player_kill(killer, victim, kill_type)
         if (
             self.ended
+            or killer is None
             or killer is victim
             or int(getattr(killer, "team", -1)) not in _PLAYABLE_TEAMS
             or int(getattr(victim, "team", -1)) not in _PLAYABLE_TEAMS
@@ -263,9 +406,11 @@ class TerritoryControlMode(BaseMode):
 
     async def _capture_tick(self, elapsed: float) -> None:
         changed_score = False
+        captures: list[tuple[Territory, int, bool]] = []
+        now = time.time()
         for territory in self.territories:
             occupants = self._occupants(territory.zone)
-            self._send_presence_transitions(territory, occupants)
+            self._send_presence_transitions(territory, occupants, now)
             blue = len(occupants[TEAM1])
             green = len(occupants[TEAM2])
             contested = blue > 0 and green > 0
@@ -275,7 +420,13 @@ class TerritoryControlMode(BaseMode):
                     territory,
                     int(C.TC_BASE_CONTENDED if contested else C.TC_BASE_UNCONTENDED),
                 )
-            net = green - blue
+            if not contested and territory.owner in _PLAYABLE_TEAMS:
+                for player in occupants[territory.owner]:
+                    self.resupply.offer(player, now)
+            # A contested base is frozen (TC_BASE_CONTENDED; contending
+            # players are paid TC_Contend for exactly that). Otherwise the
+            # present team moves the base by the stock per-tick table.
+            net = 0 if contested else green - blue
             territory.attacker = (
                 TEAM2 if net > 0 else TEAM1 if net < 0 else TEAM_NEUTRAL
             )
@@ -284,11 +435,17 @@ class TerritoryControlMode(BaseMode):
 
             previous_progress = territory.progress
             previous_owner = territory.owner
-            territory.progress = min(1.0, max(
-                0.0,
-                territory.progress
-                + net * _BASE_CAPTURE_PER_SECOND * self.capture_multiplier * elapsed,
-            ))
+            ticks = float(elapsed) / float(CG.TC_CAPTURE_TICK_RATE)
+            step = (
+                tc_capture_percent_per_tick(abs(net)) / 100.0 * 0.5
+                * self.capture_multiplier * ticks
+            )
+            progress = territory.progress + (step if net > 0 else -step)
+            # Snap float residue from summing many small ticks (0.005 each).
+            for anchor in (0.0, 0.5, 1.0):
+                if abs(progress - anchor) < 1e-9:
+                    progress = anchor
+            territory.progress = min(1.0, max(0.0, progress))
             if territory.progress <= 0.0:
                 territory.owner = TEAM1
             elif territory.progress >= 1.0:
@@ -304,32 +461,70 @@ class TerritoryControlMode(BaseMode):
                 changed_score = True
                 self._send_zone(territory)
                 if territory.owner in _PLAYABLE_TEAMS:
-                    decisive = min(
-                        occupants[territory.owner],
-                        key=lambda player: int(getattr(player, "id", 0)),
-                    )
                     was_enemy = (
                         territory.last_non_neutral_owner in _PLAYABLE_TEAMS
                         and territory.last_non_neutral_owner != territory.owner
                     )
-                    self._award_player(
-                        decisive,
-                        int(CG.TC_SCORE_CONTROL if was_enemy else CG.TC_SCORE_CLAIM),
-                        int(
-                            C.SCORE_REASON.TC_CONTROL_SCORE_REASON
-                            if was_enemy
-                            else C.SCORE_REASON.TC_CLAIM_SCORE_REASON
-                        ),
-                    )
+                    captures.append((territory, territory.owner, was_enemy))
+                    # Every capturing occupant took part in the capture and
+                    # is paid Claim/Control (it used to be the lowest id only).
+                    for capturer in sorted(
+                        occupants[territory.owner],
+                        key=lambda player: int(getattr(player, "id", 0)),
+                    ):
+                        self._award_player(
+                            capturer,
+                            int(CG.TC_SCORE_CONTROL if was_enemy else CG.TC_SCORE_CLAIM),
+                            int(
+                                C.SCORE_REASON.TC_CONTROL_SCORE_REASON
+                                if was_enemy
+                                else C.SCORE_REASON.TC_CLAIM_SCORE_REASON
+                            ),
+                        )
                     territory.last_non_neutral_owner = territory.owner
             self._send_state(territory, int(C.TC_BASE_CAPTURE_UPDATE))
 
         if changed_score:
             self._refresh_team_scores()
+            for territory, capturer, was_enemy in captures:
+                self._announce_capture(territory, capturer, was_enemy)
             for team_id in _PLAYABLE_TEAMS:
-                if self.server.teams[team_id].score >= len(self.territories):
+                if self.server.teams[team_id].score >= self.score_limit:
                     await self._end_by_score(team_id)
                     break
+
+    def _announce_capture(
+        self, territory: Territory, capturer: int, was_enemy: bool
+    ) -> None:
+        """TC_CAPTURED_* / TC_NEUTRALCAPTURED_*, once per ownership change.
+
+        ``{0}`` is the base letter and ``{1} of {2} left`` counts, for the
+        capturing team, the territories it still has to take and, for the
+        other team, the territories it still holds (inferred reading; the
+        retail server source is not recovered).
+        """
+        capturer = int(capturer)
+        loser = TEAM2 if capturer == TEAM1 else TEAM1
+        total = len(self.territories)
+        owned = {
+            team: sum(1 for item in self.territories if item.owner == team)
+            for team in _PLAYABLE_TEAMS
+        }
+        letter = territory_name(territory.zone.index)
+        prefix = "TC_CAPTURED" if was_enemy else "TC_NEUTRALCAPTURED"
+        self.announce_localised_to_team(
+            capturer,
+            f"{prefix}_CAPTURINGTEAM",
+            (letter, str(total - owned[capturer]), str(total)),
+        )
+        self.announce_localised_to_team(
+            loser,
+            f"{prefix}_LOSINGTEAM",
+            (letter, str(owned[loser]), str(total)),
+        )
+        from server.audio import play_team_relative
+
+        play_team_relative(self.server, capturer)
 
     def _occupants(self, zone: ObjectiveZone) -> dict[int, list]:
         result = {TEAM1: [], TEAM2: []}
@@ -344,35 +539,106 @@ class TerritoryControlMode(BaseMode):
             position = getattr(player, "position", None)
             if position is None:
                 position = (player.x, player.y, player.z)
-            if zone.contains(position):
+            # AFK bodies and escape-flagged (sealed/out-of-map) players
+            # cannot hold or contest a territory.
+            if zone.contains(position) and self.objective_presence_eligible(player):
                 result[team].append(player)
         return result
 
-    def _send_presence_transitions(self, territory: Territory, occupants) -> None:
+    def escape_watch_objective_player(self, player) -> bool:
+        """A player standing in a territory is holding an objective."""
+        position = getattr(player, "position", None)
+        if position is None:
+            return False
+        return any(t.zone.contains(position) for t in self.territories)
+
+    def _send_presence_transitions(
+        self, territory: Territory, occupants, now: float | None = None
+    ) -> None:
+        if now is None:
+            now = time.time()
+        players = getattr(self.server, "players", {})
         for team in _PLAYABLE_TEAMS:
             current = {int(player.id) for player in occupants[team]}
-            entered = current - territory.occupants[team]
-            left = territory.occupants[team] - current
-            for player_id in entered:
-                player = getattr(self.server, "players", {}).get(player_id)
+            previous = territory.occupants[team]
+            previous_players = territory.occupant_players[team]
+            entered = current - previous
+            left = previous - current
+            for player_id in sorted(entered):
+                player = players.get(player_id)
                 if player is not None:
-                    self._send_state(
-                        territory, int(C.TC_BASE_ENTERING), connection=player
+                    self._send_state_to_player(
+                        territory, int(C.TC_BASE_ENTERING), player
                     )
-            for player_id in left:
-                player = getattr(self.server, "players", {}).get(player_id)
-                if player is not None:
-                    self._send_state(
-                        territory, int(C.TC_BASE_LEAVING), connection=player
+            for player_id in sorted(left):
+                player = players.get(player_id)
+                if player is not None and player is previous_players.get(player_id):
+                    self._send_state_to_player(
+                        territory, int(C.TC_BASE_LEAVING), player
                     )
             territory.occupants[team] = current
+            territory.occupant_players[team] = {
+                int(player.id): player for player in occupants[team]
+            }
+            if current and not previous and territory.owner != team:
+                self._announce_team_entered(territory, team, occupants[team], now)
+
+    def _announce_team_entered(self, territory: Territory, team: int, entrants, now: float) -> None:
+        """TC_ENTER_BASE_* when a team moves onto a territory it does not own.
+
+        Rate limited per (territory, team) by the retail
+        TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN so boundary flicker cannot spam.
+        """
+        key = (int(territory.zone.index), int(team))
+        last = self._enter_shout_at.get(key)
+        if last is not None and now - last < _ENTER_SHOUT_COOLDOWN:
+            return
+        self._enter_shout_at[key] = now
+        leader = min(entrants, key=lambda player: int(getattr(player, "id", 0)))
+        name = str(getattr(leader, "name", f"Player {leader.id}"))
+        letter = territory_name(territory.zone.index)
+        inside = {int(player.id) for player in entrants}
+        for player in tuple(getattr(self.server, "players", {}).values()):
+            player_team = int(getattr(player, "team", -1))
+            if player_team == int(team):
+                if int(player.id) in inside:
+                    self.announce_localised_to_player(
+                        player, "TC_ENTER_BASE_PLAYER", (letter,)
+                    )
+                else:
+                    self.announce_localised_to_player(
+                        player, "TC_ENTER_BASE_TEAMMATES", (letter, name)
+                    )
+            elif player_team in _PLAYABLE_TEAMS:
+                self.announce_localised_to_player(
+                    player, "TC_ENTER_BASE_OPPOSITION", (letter, name)
+                )
+
+    def _send_state_to_player(self, territory: Territory, action: int, player) -> None:
+        """Per-player HUD state, only to a settled GameScene (bots have none)."""
+        connection = getattr(player, "connection", None)
+        if connection is None or not getattr(connection, "in_game", True):
+            return
+        self._send_state(territory, action, connection=connection)
+
+    def _occupant(self, territory: Territory, team: int, player_id: int):
+        """The live body behind an occupant id, or None when it departed."""
+        player = getattr(self.server, "players", {}).get(player_id)
+        if player is None:
+            return None
+        expected = territory.occupant_players.get(team, {}).get(player_id)
+        if expected is not None and expected is not player:
+            return None
+        if int(getattr(player, "team", -1)) != int(team):
+            return None
+        return player
 
     def _award_presence_scores(self, periods: int) -> None:
         for territory in self.territories:
             if territory.contested:
                 for team in _PLAYABLE_TEAMS:
                     for player_id in territory.occupants[team]:
-                        player = getattr(self.server, "players", {}).get(player_id)
+                        player = self._occupant(territory, team, player_id)
                         if player is not None:
                             self._award_player(
                                 player,
@@ -383,7 +649,7 @@ class TerritoryControlMode(BaseMode):
             if territory.owner not in _PLAYABLE_TEAMS:
                 continue
             for player_id in territory.occupants[territory.owner]:
-                player = getattr(self.server, "players", {}).get(player_id)
+                player = self._occupant(territory, territory.owner, player_id)
                 if player is not None:
                     self._award_player(
                         player,
@@ -425,8 +691,9 @@ class TerritoryControlMode(BaseMode):
         packet.base_index = int(territory.zone.index)
         packet.action = int(action)
         packet.controlled_by = int(territory.owner)
-        packet.attacked_by = int(territory.attacker)
-        packet.capture_amount = float(territory.progress)
+        attacked_by, amount = _wire_capture(territory)
+        packet.attacked_by = int(attacked_by)
+        packet.capture_amount = float(amount)
         self._send_packet(packet, connection)
 
     def _send_packet(self, packet, connection=None) -> None:
@@ -448,6 +715,8 @@ class TerritoryControlMode(BaseMode):
         )
 
     def _award_player(self, player, points: int, reason: int) -> None:
+        if not self._owns_slot(player):
+            return
         from server.scoreboard import send_player_score
 
         player.score = int(getattr(player, "score", 0)) + int(points)

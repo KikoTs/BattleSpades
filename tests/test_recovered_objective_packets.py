@@ -60,6 +60,50 @@ def test_territory_base_state_matches_retail_python2_vector():
     assert bytes(packet.generate()).hex() == "6a040201032800"
 
 
+def test_territory_base_state_detail_free_actions_are_three_bytes():
+    """ENTERING/LEAVING/CONTENDED/UNCONTENDED carry no owner/attacker/amount.
+
+    The retail reader stops after base_index + action for the actions in
+    constants.TC_DETAIL_NOT_REQUIRED. The old always-long writer left four
+    trailing bytes that the client parsed as the next packet in the same
+    datagram: ``03`` -> EntityUpdates -> NoDataLeft, killing the client
+    whenever a Territory Control base became contested.
+    """
+    from shared import constants as C
+    from shared.bytes import ByteReader
+
+    assert sorted(C.TC_DETAIL_NOT_REQUIRED) == [3, 4, 6, 7]
+    for action in C.TC_DETAIL_NOT_REQUIRED:
+        packet = _set(
+            TerritoryBaseState(),
+            base_index=2,
+            action=action,
+            controlled_by=3,
+            attacked_by=3,
+            capture_amount=1.0,
+        )
+        data = bytes(packet.generate())
+        assert data.hex() == "6a02%02x" % action
+        reader = ByteReader(data[1:])
+        decoded = TerritoryBaseState(reader)
+        assert (decoded.base_index, decoded.action) == (2, action)
+        assert reader.data_left() == 0
+    # The crash vector captured live (base C contested): exactly 3 bytes now.
+    contested = _set(
+        TerritoryBaseState(),
+        base_index=2,
+        action=int(C.TC_BASE_CONTENDED),
+        controlled_by=3,
+        attacked_by=3,
+        capture_amount=1.0,
+    )
+    assert bytes(contested.generate()) == bytes.fromhex("6a0206")
+    # Detail actions keep the full 7-byte form.
+    for action in (0, 1, 2, 5):
+        packet = _set(TerritoryBaseState(), base_index=1, action=action)
+        assert len(bytes(packet.generate())) == 7
+
+
 def test_help_message_matches_retail_big_endian_delay_vector():
     packet = _set(
         HelpMessage(),

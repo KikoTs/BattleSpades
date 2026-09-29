@@ -494,6 +494,12 @@ def _run_server(
     paths.logs.mkdir(parents=True, exist_ok=True)
     logging_runtime = configure_logging(config, paths.logs)
     logger = logging.getLogger("BattleSpades")
+    from server.config import admin_password_problem
+
+    # load_config warned before file logging existed; repeat it into server.log.
+    password_problem = admin_password_problem(getattr(config, "admin_password", ""))
+    if password_problem is not None:
+        logger.warning("In-game /admin login is DISABLED: %s.", password_problem)
     log_stem = Path(str(getattr(config, "log_file", "server.log"))).stem
     fault_file = paths.logs / f"{log_stem or 'server'}.fault.log"
 

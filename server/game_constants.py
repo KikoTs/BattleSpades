@@ -234,18 +234,71 @@ class WeaponProfile:
     is_projectile: bool = False
     blast_radius: float = 0.0
     fuse_time: float = 0.0
+    # --- retail per-part / ammo metadata (docs/WEAPONS_RETAIL.md) ---
+    # Stock ``Weapon.damage`` is ordered (torso, head, arms, left leg,
+    # right leg) -- NOT by the PART_* ids (PART_HEAD == 0, PART_TORSO == 1).
+    # Empty for tools without a hit-scan damage tuple.
+    part_damage: tuple = ()
+    # Stock ``<WEAPON>_DAMAGE_ENTITY``: a bullet's damage to a deployable.
+    entity_damage: float = 0.0
+    # Stock ``Weapon.ammo`` = (clip, initial clip, max reserve, initial
+    # reserve, crate restock). ``reserve_ammo`` above is the max reserve.
+    initial_reserve: int = -1
+    restock_amount: int = -1
+    # ``clip_reload``: each reload cycle loads ONE round (shotguns, snub).
+    clip_reload: bool = False
+    # Stock ``short_ranged_distance`` (shotguns). The original server's use
+    # of it is not recoverable from the client; recorded, not applied.
+    short_ranged_distance: float = 0.0
+    accuracy_min: float = 0.0
+    accuracy_max: float = 0.0
+    # Melee alternate-fire cadence (stock ``secondary_shoot_interval``).
+    secondary_fire_interval: float = 0.0
+
+    def damage_for_part(self, part: int) -> float:
+        """Stock per-part damage for a ``PART_*`` body part id."""
+        if not self.part_damage:
+            if int(part) == PART_HEAD and self.head_damage:
+                return float(self.head_damage)
+            return float(self.base_damage)
+        slot = _PART_DAMAGE_SLOT.get(int(part), 0)
+        return float(self.part_damage[slot])
 
 
-def _gun(tool_id, name, category, torso, head, fire_interval, clip, reserve,
-         reload_time, pellets, rng, block_dmg, spread=0.0):
+# PART_* id -> index into the stock damage tuple (torso, head, arms, l, r).
+PART_HEAD = int(C.PART_HEAD)
+PART_TORSO = int(C.PART_TORSO)
+PART_ARMS = int(C.PART_ARMS)
+PART_LEFT_LEG = int(C.PART_LEFT_LEG)
+PART_RIGHT_LEG = int(C.PART_RIGHT_LEG)
+_PART_DAMAGE_SLOT = {
+    PART_TORSO: 0,
+    PART_HEAD: 1,
+    PART_ARMS: 2,
+    PART_LEFT_LEG: 3,
+    PART_RIGHT_LEG: 4,
+}
+
+
+def _gun(tool_id, name, category, parts, fire_interval, ammo,
+         reload_time, pellets, rng, block_dmg, entity_dmg, spread=0.0,
+         accuracy_max=None, clip_reload=False, short_range=0.0):
+    """Hit-scan gun row from the stock class attributes.
+
+    ``parts`` is the stock (torso, head, arms, left leg, right leg) tuple and
+    ``ammo`` the stock (clip, initial clip, max reserve, initial reserve,
+    restock) tuple.
+    """
+    torso, head = float(parts[0]), float(parts[1])
+    clip, _initial_clip, max_reserve, initial_reserve, restock = ammo
     return WeaponProfile(
-        base_damage=float(torso),
-        headshot_multiplier=(float(head) / float(torso)) if torso else 1.0,
+        base_damage=torso,
+        headshot_multiplier=(head / torso) if torso else 1.0,
         block_damage=float(block_dmg),
         fire_interval=float(fire_interval),
         max_range=float(rng),
         clip_size=int(clip),
-        reserve_ammo=int(reserve),
+        reserve_ammo=int(max_reserve),
         reload_time=float(reload_time),
         pellet_count=int(pellets),
         spread=float(spread),
@@ -253,12 +306,21 @@ def _gun(tool_id, name, category, torso, head, fire_interval, clip, reserve,
         tool_id=int(tool_id),
         name=name,
         category=category,
-        head_damage=float(head),
+        head_damage=head,
         damage_type=DMG_WEAPON,
+        part_damage=tuple(float(v) for v in parts),
+        entity_damage=float(entity_dmg),
+        initial_reserve=int(initial_reserve),
+        restock_amount=int(restock),
+        clip_reload=bool(clip_reload),
+        short_ranged_distance=float(short_range),
+        accuracy_min=float(spread),
+        accuracy_max=float(spread if accuracy_max is None else accuracy_max),
     )
 
 
-def _melee(tool_id, name, player_dmg, block_dmg, fire_interval):
+def _melee(tool_id, name, player_dmg, block_dmg, fire_interval,
+           secondary_interval=0.0):
     return WeaponProfile(
         base_damage=float(player_dmg),
         headshot_multiplier=1.0,
@@ -275,6 +337,7 @@ def _melee(tool_id, name, player_dmg, block_dmg, fire_interval):
         name=name,
         category=CAT_MELEE,
         is_melee=True,
+        secondary_fire_interval=float(secondary_interval),
     )
 
 
@@ -320,68 +383,115 @@ def _util(tool_id, name, category, fire_interval=0.5, clip=0, reload_time=0.0):
     )
 
 
-# The full catalog, keyed by tool id. Rows transcribed from CONTENT_TABLES.md.
+# The full catalog, keyed by tool id. Every combat row is the stock Steam
+# client's own resolved class attribute / constant (aos.pkg PYZ bytecode run
+# against the stock obfuscated shared.constants; docs/WEAPONS_RETAIL.md).
+# NOTE: the nonsteam decompile of shared/constants.py ends with a later,
+# modded override block (pistol .3/800/head 50, pickaxe .4/50, knife .25/20,
+# spade .4, crowbar .6, SMG range 250). Stock never executes those values.
 _CATALOG_LIST = [
-    # --- melee (block dig / player hit) ---
-    _melee(0,  "PICKAXE",        50, 7,   0.4),
-    # These three player-hit values come from the original pre-overwrite
-    # constants (A1111/A1856/A1859).  A later decompiler name collision reused
-    # the block-damage values and made every melee weapon nearly harmless.
-    _melee(1,  "KNIFE",          80, 1,   0.25),
-    _melee(2,  "SPADE",          35, 5,   0.4),
-    _melee(3,  "SUPERSPADE",     50, 7.5, 0.6),
-    _melee(4,  "CLASSIC_SPADE",  50, 3,   0.3),
-    _melee(24, "ZOMBIEHAND",     70, 2,   0.4),
-    _melee(34, "CROWBAR",        80, 5,   0.6),
-    _melee(44, "UGC_PICKAXE",     0, 9,   0.2),
-    _melee(45, "UGC_SUPERSPADE",  0, 7.5, 0.2),
+    # --- melee: (id, name, player-hit damage, block damage, interval[, alt]) ---
+    # Player damage = stock <TOOL>_HITPLAYER_DAMAGE_AMOUNT (riot stick A1856,
+    # machete A1859); block damage/interval = the stock DiggingTool class.
+    _melee(0,  "PICKAXE",        40, 7,    0.6),
+    _melee(1,  "KNIFE",          80, 1,    0.5),
+    _melee(2,  "SPADE",          35, 5,    0.8, secondary_interval=1.0),
+    _melee(3,  "SUPERSPADE",     50, 7.5,  0.6),
+    _melee(4,  "CLASSIC_SPADE",  50, 3,    0.3, secondary_interval=0.8),
+    _melee(24, "ZOMBIEHAND",     70, 2,    0.4),
+    _melee(34, "CROWBAR",        80, 5,    0.5),
+    _melee(44, "UGC_PICKAXE",     0, 9,    0.2),
+    _melee(45, "UGC_SUPERSPADE",  0, 7.5,  0.2, secondary_interval=0.2),
     _melee(49, "RIOTSTICK",      85, 1.75, 0.5),
     _melee(50, "MACHETE",       100, 2,    0.7),
-    _melee(52, "RIOTSHIELD",      2, 0,   1.0),
-    # --- hit-scan guns: (id, name, cat, torso, head, fire_int, clip, reserve, reload, pellets, range, block_dmg) ---
-    _gun(6,  "RIFLE",             CAT_RIFLE,   70, 150, 0.5,  10, 50,  2.5, 1, 10000, 2),
-    # SMG range 350 (A1151), was 250.
-    _gun(7,  "SMG",               CAT_SMG,     10, 15,  0.1,  25, 100, 1.25, 1, 350,   1),
-    _gun(8,  "MINIGUN",           CAT_MG,      15, 30,  0.3,  100, 300, 2.0, 1, 100,   2.5),
-    _gun(9,  "SHOTGUN",           CAT_SHOTGUN, 20, 30,  1.0,  5, 20,  0.5, 10, 60,    1, spread=0.04),
-    _gun(10, "SHOTGUN2",          CAT_SHOTGUN, 40, 50,  1.0,  2, 14,  1.0, 10, 20,    2.5, spread=0.05),
-    _gun(15, "MG",                CAT_MG,      30, 20,  0.5,  100, 400, 4.0, 1, 300,   2),
-    # PISTOL named constants loaded by stock pistolWeapon.pyc: damage tuple
-    # (20,50,20,20,20), interval .3, reload .5, range 800, ammo 6/30.
-    _gun(17, "PISTOL",            CAT_PISTOL,  20, 50,  0.3,  6, 30,  0.5, 1, 800,   3),
-    _gun(18, "SNIPER",            CAT_SNIPER,  50, 175, 1.0,  1, 7,   2.0, 1, 10000, 5),
-    _gun(19, "SNIPER2",           CAT_SNIPER,  34, 85,  1.1,  5, 15,  3.0, 1, 10000, 3),
-    _gun(35, "TOMMYGUN",          CAT_SMG,     30, 35,  0.12, 30, 120, 2.0, 1, 500,   1),
-    _gun(36, "SNUB_PISTOL",       CAT_PISTOL,  40, 70,  0.5,  6, 30,  0.75, 1, 500,   1),
-    _gun(37, "CLASSIC_SHOTGUN",   CAT_SHOTGUN, 20, 30,  1.0,  5, 45,  0.5, 12, 75,    1, spread=0.04),
-    _gun(38, "CLASSIC_SMG",       CAT_SMG,     20, 20,  0.1,  25, 100, 1.25, 1, 100,   2),
-    _gun(53, "AUTOMATIC_PISTOL",  CAT_PISTOL,  15, 30,  0.175, 15, 50, 1.0, 1, 300,   2.5),
-    _gun(60, "ASSAULT_RIFLE",     CAT_RIFLE,   20, 40,  0.5,  15, 60,  0.9, 1, 400,   2.5),
-    _gun(61, "LIGHT_MACHINE_GUN", CAT_MG,      20, 37,  0.15, 50, 250, 2.0, 1, 175,   2.5),
-    _gun(62, "AUTO_SHOTGUN",      CAT_SHOTGUN, 20, 25,  0.35, 8, 40,  2.5, 10, 60,    2, spread=0.05),
-    # --- projectiles / explosives: (id, name, cat, blast, radius, fire_int, clip, reserve, reload, block_dmg, fuse) ---
+    # The shield has no HITPLAYER constant: its only damage constant (A1882,
+    # the class ``damage``) is 2 -- "Low damage" in its tool description.
+    _melee(52, "RIOTSHIELD",      2, 2,    1.0),
+    # --- hit-scan guns ---
+    # (id, name, cat, (torso, head, arms, l.leg, r.leg), interval,
+    #  (clip, initial clip, max reserve, initial reserve, restock),
+    #  reload, pellets, range, block damage, entity damage)
+    _gun(6,  "RIFLE",             CAT_RIFLE,   (70, 150, 35, 35, 35), 0.5,
+         (10, 10, 50, 30, 50), 2.5, 1, 10000, 2, 25, spread=0.003),
+    _gun(7,  "SMG",               CAT_SMG,     (10, 15, 10, 10, 10), 0.1,
+         (25, 25, 100, 100, 100), 1.25, 1, 350, 1, 15,
+         spread=0.02, accuracy_max=0.04),
+    _gun(8,  "MINIGUN",           CAT_MG,      (15, 30, 15, 15, 15), 0.3,
+         (100, 100, 300, 300, 300), 2.0, 1, 100, 2.5, 20,
+         spread=0.015, accuracy_max=0.03),
+    _gun(9,  "SHOTGUN",           CAT_SHOTGUN, (20, 30, 12, 12, 12), 1.0,
+         (5, 5, 20, 20, 20), 0.5, 10, 60, 1, 25,
+         spread=0.04, accuracy_max=0.08, clip_reload=True, short_range=25),
+    _gun(10, "SHOTGUN2",          CAT_SHOTGUN, (40, 50, 50, 50, 50), 1.0,
+         (2, 2, 14, 14, 14), 1.0, 10, 20, 2.5, 25,
+         spread=0.05, accuracy_max=0.1, clip_reload=True, short_range=25),
+    # Undeployed stock MG cadence is 0.5 s; the mounted gun fires at
+    # MG_DEPLOYED_SHOOT_INTERVAL (0.1 s, combat_runtime). Head < torso is
+    # the stock data (MG_DAMAGE_TORSO 30, MG_DAMAGE_HEAD 20).
+    _gun(15, "MG",                CAT_MG,      (30, 20, 20, 20, 20), 0.5,
+         (100, 100, 400, 400, 400), 4.0, 1, 300, 2, 20,
+         spread=0.01, accuracy_max=0.06),
+    _gun(17, "PISTOL",            CAT_PISTOL,  (20, 45, 20, 20, 20), 0.4,
+         (6, 6, 30, 30, 30), 0.6, 1, 550, 3, 20, spread=0.015),
+    _gun(18, "SNIPER",            CAT_SNIPER,  (50, 175, 50, 50, 50), 1.0,
+         (1, 1, 7, 7, 7), 2.0, 1, 10000, 5, 100, spread=0.025),
+    _gun(19, "SNIPER2",           CAT_SNIPER,  (34, 85, 34, 34, 34), 1.1,
+         (5, 5, 15, 15, 15), 3.0, 1, 10000, 3, 100, spread=0.025),
+    _gun(35, "TOMMYGUN",          CAT_SMG,     (30, 35, 30, 30, 30), 0.12,
+         (30, 30, 120, 120, 120), 2.0, 1, 500, 1, 30,
+         spread=0.01, accuracy_max=0.05),
+    _gun(36, "SNUB_PISTOL",       CAT_PISTOL,  (40, 70, 30, 30, 30), 0.5,
+         (6, 6, 30, 30, 30), 0.75, 1, 500, 1, 20, spread=0.01,
+         clip_reload=True),  # stock SNUB_PISTOL_ACCURACY (A1138) = 0.01
+    _gun(37, "CLASSIC_SHOTGUN",   CAT_SHOTGUN, (20, 30, 12, 12, 12), 1.0,
+         (5, 5, 45, 20, 20), 0.5, 12, 75, 1, 25,
+         spread=0.04, accuracy_max=0.08, clip_reload=True, short_range=25),
+    _gun(38, "CLASSIC_SMG",       CAT_SMG,     (20, 20, 20, 20, 20), 0.1,
+         (25, 25, 100, 100, 100), 1.25, 1, 100, 2, 20,
+         spread=0.01, accuracy_max=0.06),
+    _gun(53, "AUTOMATIC_PISTOL",  CAT_PISTOL,  (15, 30, 15, 15, 15), 0.175,
+         (15, 15, 50, 50, 50), 1.0, 1, 300, 2.5, 15,
+         spread=0.02, accuracy_max=0.04),
+    _gun(60, "ASSAULT_RIFLE",     CAT_RIFLE,   (20, 40, 20, 20, 20), 0.5,
+         (15, 15, 60, 60, 60), 0.9, 1, 400, 2.5, 20,
+         spread=0.01, accuracy_max=0.02),
+    _gun(61, "LIGHT_MACHINE_GUN", CAT_MG,      (20, 37, 20, 20, 20), 0.15,
+         (50, 50, 250, 250, 250), 2.0, 1, 175, 2.5, 20,
+         spread=0.02, accuracy_max=0.04),
+    _gun(62, "AUTO_SHOTGUN",      CAT_SHOTGUN, (20, 25, 10, 10, 10), 0.35,
+         (8, 8, 40, 40, 40), 2.5, 10, 60, 2, 20,
+         spread=0.05, accuracy_max=0.1, short_range=25),
+    # --- projectiles / explosives ---
+    # (id, name, cat, player blast damage, blast radius, interval, clip,
+    #  max reserve, reload, block damage, fuse). Blast damage/radius are the
+    # stock ExplosionDamageManager.handle_*_damage arguments
+    # (server/weapons_retail.py RETAIL_EXPLOSIONS).
     _proj(11, "GRENADE",               CAT_GRENADE,  230, 4, 0.5,  4, 0, 0.0, 0, 2.5),
-    _proj(12, "RPG",                   CAT_LAUNCHER, 140, 4, 0.7,  1, 3, 1.5, 5, 0.0, kill_type=KILL_TYPES.get("ROCKET_KILL")),
-    _proj(13, "RPG2",                  CAT_LAUNCHER, 50,  4, 0.75, 3, 3, 1.0, 0, 0.0, kill_type=KILL_TYPES.get("ROCKET2_KILL")),
+    _proj(12, "RPG",                   CAT_LAUNCHER, 140, 6, 0.7,  1, 3, 1.5, 5, 0.0, kill_type=KILL_TYPES.get("ROCKET_KILL")),
+    _proj(13, "RPG2",                  CAT_LAUNCHER, 40,  6, 0.75, 3, 3, 1.0, 0, 0.0, kill_type=KILL_TYPES.get("ROCKET2_KILL")),
     _proj(14, "DRILLGUN",              CAT_LAUNCHER, 50,  3, 0.2,  1, 3, 4.0, 5, 0.0, kill_type=KILL_TYPES.get("DRILL_KILL")),
-    _proj(16, "ROCKET_TURRET",         CAT_DEPLOYABLE, 100, 3, 1.5, 4, 0, 0.0, 0, 0.0, kill_type=KILL_TYPES.get("ROCKET_KILL")),
-    _proj(20, "LANDMINE",              CAT_DEPLOYABLE, 100, 3, 1.0, 5, 0, 0.0, 0, 0.0, kill_type=KILL_TYPES.get("LANDMINE_KILL")),
-    _proj(21, "DYNAMITE",              CAT_DEPLOYABLE, 300, 5, 1.0, 1, 0, 0.0, 0, 7.0, kill_type=KILL_TYPES.get("DYNAMITE_KILL")),
+    # The turret's rockets (handle_rocket_turret_rocket_damage); the turret's
+    # own destruction blast is 100 / r3 (ROCKET_TURRET_EXPLOSION_*).
+    _proj(16, "ROCKET_TURRET",         CAT_DEPLOYABLE, 50, 3, 1.5, 4, 0, 0.0, 0, 0.0, kill_type=KILL_TYPES.get("ROCKET_TURRET_KILL")),
+    _proj(20, "LANDMINE",              CAT_DEPLOYABLE, 100, 6, 1.0, 5, 0, 0.0, 0, 0.0, kill_type=KILL_TYPES.get("LANDMINE_KILL")),
+    _proj(21, "DYNAMITE",              CAT_DEPLOYABLE, 300, 8, 1.0, 1, 0, 0.0, 0, 7.0, kill_type=KILL_TYPES.get("DYNAMITE_KILL")),
     _proj(25, "BOMB",                  CAT_OBJECTIVE, 500, 7, 0.0, 0, 0, 0.0, 0, 10.0, kill_type=KILL_TYPES.get("BOMB_KILL")),
     _proj(29, "SNOWBLOWER",            CAT_LAUNCHER, 10,  5, 0.2,  0, 0, 3.0, 0, 0.0, kill_type=KILL_TYPES.get("SNOWBALL_KILL")),
-    _proj(31, "CLASSIC_GRENADE",       CAT_GRENADE,  130, 2, 0.5,  4, 0, 0.0, 0, 3.0),
-    _proj(32, "ANTIPERSONNEL_GRENADE", CAT_GRENADE,  500, 2, 0.5,  4, 0, 0.0, 0, 2.5),
-    _proj(33, "MOLOTOV",               CAT_GRENADE,  50,  4, 1.0,  3, 0, 0.0, 3, 0.0),
-    _proj(46, "UGC_RPG2",              CAT_LAUNCHER, 50,  4, 0.5,  1, 1, 1.0, 0, 0.0),
-    _proj(47, "UGC_DRILLGUN",          CAT_LAUNCHER, 50,  3, 0.2,  1, 3, 4.0, 0, 0.0),
-    _proj(48, "UGC_SNOWBLOWER",        CAT_LAUNCHER, 10,  5, 0.2,  0, 0, 3.0, 0, 0.0),
+    _proj(31, "CLASSIC_GRENADE",       CAT_GRENADE,  130, 9, 0.5,  4, 0, 0.0, 0, 3.0, kill_type=KILL_TYPES.get("CLASSIC_GRENADE_KILL")),
+    _proj(32, "ANTIPERSONNEL_GRENADE", CAT_GRENADE,  500, 6, 0.5,  4, 0, 0.0, 0, 2.5, kill_type=KILL_TYPES.get("ANTIPERSONNEL_GRENADE_KILL")),
+    _proj(33, "MOLOTOV",               CAT_GRENADE,  50,  4, 1.0,  3, 0, 0.0, 3, 0.0, kill_type=KILL_TYPES.get("MOLOTOV_KILL")),
+    _proj(46, "UGC_RPG2",              CAT_LAUNCHER, 50,  4, 0.5,  1, 1, 1.0, 0, 0.0, kill_type=KILL_TYPES.get("UGC_ROCKET2_KILL")),
+    _proj(47, "UGC_DRILLGUN",          CAT_LAUNCHER, 50,  3, 0.2,  1, 3, 4.0, 0, 0.0, kill_type=KILL_TYPES.get("UGC_DRILL_KILL")),
+    _proj(48, "UGC_SNOWBLOWER",        CAT_LAUNCHER, 10,  5, 0.2,  0, 0, 3.0, 0, 0.0, kill_type=KILL_TYPES.get("UGC_SNOWBALL_KILL")),
+    # No stock ExplosionDamageManager handler exists for the chemical bomb
+    # (its gas cloud is a separate system); these numbers are unverified.
     _proj(54, "CHEMICALBOMB",          CAT_GRENADE,  50, 3, 1.0,  4, 0, 0.0, 3, 0.0,
           kill_type=KILL_TYPES.get("CHEMICALBOMB_KILL")),
     _proj(55, "GRENADE_LAUNCHER_WEAPON", CAT_LAUNCHER, 100, 4, 0.35, 1, 5, 2.0, 6, 3.0,
           kill_type=KILL_TYPES.get("GRENADE_LAUNCHER_KILL")),
     _proj(57, "STICKY_GRENADE",        CAT_GRENADE, 200, 5, 1.0, 4, 0, 0.0, 6, 5.0,
           kill_type=KILL_TYPES.get("STICKY_GRENADE_KILL")),
-    _proj(58, "MINE_LAUNCHER",         CAT_LAUNCHER, 100, 3, 0.35, 1, 5, 2.0, 15, 0.0,
+    _proj(58, "MINE_LAUNCHER",         CAT_LAUNCHER, 100, 6, 0.35, 1, 5, 2.0, 15, 0.0,
           kill_type=KILL_TYPES.get("MINE_KILL")),
     _proj(59, "C4",                    CAT_DEPLOYABLE, 300, 8, 1.0, 2, 0, 0.0, 7, 0.0,
           kill_type=KILL_TYPES.get("C4_KILL")),

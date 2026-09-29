@@ -128,15 +128,18 @@ def test_stock_maps_have_safe_spawn_candidates_for_both_teams():
             for _ in range(30):
                 x, y, z = wm.get_spawn_point(team)
                 assert 0.0 <= x < MAP_X and 0.0 <= y < MAP_Y
-                surface = wm._get_surface_z(int(x), int(y))
-                assert surface <= 238
-                assert abs((z + OFF + 0.5) - surface) < 0.001
-                authored = wm._zone_at(
-                    wm.map_metadata.spawn_zones.get(team, []), int(x), int(y)
-                )
-                assert wm._safe_spawn_column(
-                    int(x), int(y), authored_zone=authored,
-                    reject_roofs=authored is None,
+                # Retail spawn boxes may put a life on a storey under a roof
+                # (or a deck) inside the authored box, so the supporting floor
+                # is not always the column top; unauthored maps still are.
+                floor = int(round(z + OFF + 0.5))
+                assert floor <= 238
+                assert wm.get_solid(int(x), int(y), floor)
+                zones = wm.map_metadata.spawn_zones.get(team, [])
+                if not zones:
+                    assert floor == wm._get_surface_z(int(x), int(y))
+                assert any(
+                    wm.spawn_candidate_position(candidate, zones) == (x, y, z)
+                    for candidate in ((int(x), int(y)), (int(x), int(y), floor))
                 )
                 assert wm.spawn_position_is_safe((x, y, z))
 

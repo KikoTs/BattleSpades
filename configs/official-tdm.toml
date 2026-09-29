@@ -44,3 +44,6 @@ query_port = 27016
 level = "INFO"
 file = "official-tdm.log"
 console = false
+
+[game_rules]
+RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

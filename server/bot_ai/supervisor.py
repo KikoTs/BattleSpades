@@ -65,6 +65,15 @@ class WorkerStatus:
     last_heartbeat_batch_id: int
     last_heartbeat_frame_id: int
     awaiting_snapshot_transfer_id: int | None
+    # Map snapshots the worker could not parse (kept out of the restart
+    # count: a poisoned snapshot is skipped once, not retried forever).
+    snapshot_rejections: int = 0
+    # ``restarts`` stays the total for backward compatibility; these split it
+    # into scheduled clean-slate recycles and unexpected exits/crashes (which
+    # include watchdog-terminated stalls), so alerts need not misread
+    # ``clean_slate_games`` recycles as crashes.
+    planned_recycles: int = 0
+    crash_restarts: int = 0
 
 
 class AIWorkerSupervisor:
@@ -113,6 +122,8 @@ class AIWorkerSupervisor:
         self._running = False
         self._process_id: int | None = None
         self._restarts = 0
+        self._planned_recycles = 0
+        self._crash_restarts = 0
         self._stalled_restarts = 0
         self._dropped_frames = 0
         self._dropped_intents = 0
@@ -264,6 +275,8 @@ class AIWorkerSupervisor:
             process_id = self._process_id
             restarts = self._restarts
             stalled_restarts = self._stalled_restarts
+            planned_recycles = self._planned_recycles
+            crash_restarts = self._crash_restarts
             dropped_frames = self._dropped_frames
             dropped_intents = self._dropped_intents
             last_intent_at = self._last_intent_at
@@ -292,6 +305,8 @@ class AIWorkerSupervisor:
             process_id=process_id,
             restarts=restarts,
             stalled_restarts=stalled_restarts,
+            planned_recycles=planned_recycles,
+            crash_restarts=crash_restarts,
             intent_silence_seconds=intent_silence_seconds,
             queued_frames=self._queued_frame_count(),
             queued_intents=self._intents.qsize(),
@@ -345,6 +360,7 @@ class AIWorkerSupervisor:
                         self._running = False
                         self._process_id = None
                         self._restarts += 1
+                        self._planned_recycles += 1
                         self._awaiting_intent_since = None
                         self._awaiting_frame_id = None
                         self._awaiting_snapshot_transfer_id = None
@@ -371,6 +387,7 @@ class AIWorkerSupervisor:
                             self._running = False
                             self._process_id = None
                             self._restarts += 1
+                            self._crash_restarts += 1
                             self._awaiting_intent_since = None
                             self._awaiting_frame_id = None
                             self._awaiting_snapshot_transfer_id = None

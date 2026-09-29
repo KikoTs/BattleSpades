@@ -45,7 +45,12 @@ class ClassicCTFMode(CTFMode):
     death_representation = CLASSIC_CORPSE_REPRESENTATION
     intel_auto_return_default = False
     shoot_with_intel_default = True
+    # Retail Classic CTF: the intel keeps the Classic-only
+    # ``CLASSIC_CTF_INTEL_MIN_RADIUS_FROM_BASE`` (3) from the base point, which
+    # the retail capture radius (``CLASSIC_CTF_BASE_CAPTURE_DISTANCE`` 5) still
+    # covers. Its direction is not recoverable; we use toward the enemy base.
     intel_offset_from_base = float(CG.CLASSIC_CTF_INTEL_MIN_RADIUS_FROM_BASE)
+    intel_fallback_offset_from_base = intel_offset_from_base
     stock_maps = (
         "Crossroads",
         "Hiesville",

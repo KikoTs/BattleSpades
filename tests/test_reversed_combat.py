@@ -130,6 +130,7 @@ class DummyServer:
         self.connections = {}
         self.broadcast_packets = []
         self.broadcast_excludes = []
+        self.broadcast_reliable = []
         self.world_manager = WorldManager(self.config)
         if TEST_MAP_BYTES is not None:
             self.world_manager.map = VXL(-1, TEST_MAP_BYTES, len(TEST_MAP_BYTES), 2)
@@ -139,9 +140,10 @@ class DummyServer:
             self.world_manager.generate_flat_map()
         flatten_patch(self.world_manager, 100, 100)
 
-    def broadcast(self, data, exclude=None):
+    def broadcast(self, data, exclude=None, reliable=True):
         self.broadcast_packets.append(data)
         self.broadcast_excludes.append(exclude)
+        self.broadcast_reliable.append(reliable)
 
 
 def make_player(server, player_id, name, team, weapon, position):
@@ -178,6 +180,11 @@ def aim_at(player, point):
         point[2] - player.eye_z,
     )
     player.set_orientation_vector(*normalize(direction))
+
+
+def torso_point(player):
+    """A point inside the stock torso box (the eye itself is the head)."""
+    return (player.x, player.y, player.z + 0.6)
 
 
 def make_shoot_packet(player, origin=None, orientation=None, seed=1):
@@ -559,7 +566,7 @@ def test_rifle_body_hit_sends_hp_and_broadcasts_shot():
     target, target_connection = make_player(server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0))
 
     attacker.set_tool(C.RIFLE_TOOL)
-    aim_at(attacker, target.position)
+    aim_at(attacker, torso_point(target))
 
     asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker).generate())))
 
@@ -587,7 +594,7 @@ def test_snub_and_semiautomatic_rifle_use_the_normal_hitscan_pipeline():
             server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0)
         )
         attacker.set_tool(tool)
-        aim_at(attacker, target.position)
+        aim_at(attacker, torso_point(target))
 
         assert tool in WEAPON_TOOL_IDS
         assert tool in RIFLE_LIKE_TOOLS
@@ -611,15 +618,16 @@ def test_original_knife_baton_and_machete_player_damage_was_not_block_damage():
     assert WEAPON_CATALOG[int(C.MACHETE_TOOL)].block_damage == 2
 
 
-def test_scout_knife_head_hit_is_lethal():
+def test_knife_hit_on_a_scout_is_lethal():
+    """Knife 80 x the VICTIM's Scout CLASS_DAMAGE_MULTIPLIER 1.43 = 114."""
     server = DummyServer()
     attacker, _ = make_player(
-        server, 0, "Scout", TEAM1, C.KNIFE_TOOL, (100.5, 100.5, 60.0)
+        server, 0, "Knifer", TEAM1, C.KNIFE_TOOL, (100.5, 100.5, 60.0)
     )
     target, _ = make_player(
-        server, 1, "Target", TEAM2, C.RIFLE_TOOL, (102.5, 100.5, 60.0)
+        server, 1, "Scout", TEAM2, C.RIFLE_TOOL, (102.5, 100.5, 60.0)
     )
-    attacker.class_id = int(C.CLASS_SCOUT)
+    target.class_id = int(C.CLASS_SCOUT)
     attacker.set_tool(C.KNIFE_TOOL)
     aim_at(attacker, target.eye)
 
@@ -651,7 +659,7 @@ def test_peerless_bot_takes_normal_hitscan_damage_and_dies() -> None:
     server.players[bot.id] = bot
 
     attacker.set_tool(C.RIFLE_TOOL)
-    aim_at(attacker, bot.position)
+    aim_at(attacker, torso_point(bot))
     combat = get_combat_system(server)
     assert combat.handle_shot(attacker, make_shoot_packet(attacker)) is True
     assert bot.health == 30
@@ -714,7 +722,7 @@ def test_held_riot_shield_absorbs_half_of_frontal_direct_damage():
     target.set_tool(C.RIOTSHIELD_TOOL, raw=True)
     target.input.can_display_weapon = True
     target.set_orientation_vector(-1.0, 0.0, 0.0)
-    aim_at(attacker, target.position)
+    aim_at(attacker, torso_point(target))
 
     get_combat_system(server)._resolve_hitscan(
         attacker, attacker.orientation, attacker.eye
@@ -739,7 +747,7 @@ def test_riot_shield_does_not_absorb_rear_or_hidden_weapon_hit():
         target.set_tool(C.RIOTSHIELD_TOOL, raw=True)
         target.input.can_display_weapon = displayed
         target.set_orientation_vector(*facing)
-        aim_at(attacker, target.position)
+        aim_at(attacker, torso_point(target))
 
         get_combat_system(server)._resolve_hitscan(
             attacker, attacker.orientation, attacker.eye
@@ -829,12 +837,18 @@ def test_stock_hitboxes_rotate_with_player_yaw():
     assert hit[2] is False
 
 
-def test_crouch_uses_two_lowered_leg_models_not_one_center_box():
+def test_crouch_uses_two_lowered_leg_models_not_one_center_box(monkeypatch):
     server = DummyServer()
     target, _ = make_player(
         server, 1, "Target", TEAM2, C.RIFLE_TOOL, (106.5, 100.5, 60.0))
     target.set_orientation_vector(0.0, 1.0, 0.0)
     target.input.crouch = True
+    # Hit resolution uses the SIMULATED crouch (Player.hitbox_crouched), not
+    # the raw input bit; this unit test has no movement tick to apply it.
+    monkeypatch.setattr(
+        type(target), "hitbox_crouched", property(lambda self: True),
+        raising=False,
+    )
     combat = get_combat_system(server)
 
     leg_height = target.z + 1.2
@@ -892,7 +906,7 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
 
     wall = (104, 100, 60)
     server.world_manager.set_block(*wall, solid=True, color=TEST_COLOR)
-    aim_at(attacker, target.position)
+    aim_at(attacker, torso_point(target))
 
     for shot_index in range(3):
         asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker, seed=shot_index + 1).generate())))
@@ -980,6 +994,9 @@ def test_build_damage_flag_disables_weapon_block_damage():
 
 def test_direct_block_destroy_refunds_one_block():
     server = DummyServer()
+    # Stock clients never send BlockLiberate(35); only the UGC editor
+    # keeps the validated legacy path (non-UGC is a protocol violation).
+    server.config.ugc_runtime = True
     builder, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
     builder.set_tool(C.BLOCK_TOOL)
     builder.blocks = 10
@@ -1008,6 +1025,9 @@ def test_direct_block_destroy_refunds_one_block():
 
 def test_spade_destroy_breaks_vertical_three_block_column():
     server = DummyServer()
+    # Stock clients never send BlockLiberate(35); only the UGC editor
+    # keeps the validated legacy path (non-UGC is a protocol violation).
+    server.config.ugc_runtime = True
     player, _ = make_player(server, 0, "Digger", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
     player.set_tool(C.SPADE_TOOL)
 
@@ -1031,9 +1051,44 @@ def test_spade_destroy_breaks_vertical_three_block_column():
     damage_packets = [raw for raw in server.broadcast_packets if raw[0] == 37]
     assert damage_packets
     assert any(raw[0] == 23 for raw in server.broadcast_packets)
-    for packet_bytes in damage_packets:
-        destroy_packet = Damage(ByteReader(packet_bytes[1:]))
-        assert destroy_packet.damage >= 31.0
+    # One native type-2 column packet with the RETAIL amount: each client
+    # applies 5 to each of the three cells, the same as the server.
+    assert len(damage_packets) == 1
+    column = Damage(ByteReader(damage_packets[0][1:]))
+    assert column.type == int(C.SPADE_DAMAGE)
+    assert column.damage == float(C.SPADE_DAMAGE_AMOUNT)
+
+
+def test_spade_needs_two_swings_on_player_built_blocks():
+    """Retail: spade 5/cell vs a 9-health built block -> 4.0 left, then gone."""
+
+    server = DummyServer()
+    player, _ = make_player(server, 0, "Digger", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.SPADE_TOOL)
+    center = (103, 100, 60)
+    for z in (59, 60, 61):
+        server.world_manager.set_block(
+            center[0], center[1], z, True, TEST_COLOR,
+            health=combat_runtime.USER_BLOCK_HEALTH,
+        )
+    server.world_manager.raycast = lambda *_args: center
+    server.world_manager.find_unsupported_chunks = lambda _frontier: []
+    combat = get_combat_system(server)
+
+    assert combat._resolve_spade_dig(player, player.eye, player.orientation, SimpleNamespace())
+    assert all(server.world_manager.get_solid(center[0], center[1], z) for z in (59, 60, 61))
+    assert server.world_manager.block_manager_rows()[1] == [
+        (center[0], center[1], z, 4.0, _rgb(TEST_COLOR)) for z in (59, 60, 61)
+    ]
+    assert combat._resolve_spade_dig(player, player.eye, player.orientation, SimpleNamespace())
+    assert not any(server.world_manager.get_solid(center[0], center[1], z) for z in (59, 60, 61))
+    packets = [Damage(ByteReader(d[1:])) for d in server.broadcast_packets if d[0] == 37]
+    assert [(p.type, p.damage) for p in packets] == [(int(C.SPADE_DAMAGE), 5.0)] * 2
+
+
+def _rgb(color):
+    color = int(color) & 0xFFFFFF
+    return ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
 
 
 def test_retail_melee_footprints_keep_column_cube_and_single_cell_distinct():
@@ -1088,9 +1143,11 @@ def test_zombie_hand_hits_players_through_shared_combat_authority() -> None:
     )
 
     assert accepted is True
+    # The class multiplier belongs to the class TAKING the hit (the
+    # survivor is a Soldier, 1.0), not to the attacking zombie.
     stock_damage = round(
         float(C.ZOMBIEHAND_HITPLAYER_DAMAGE_AMOUNT)
-        * float(C.ZOMBIE_DAMAGE_MULTIPLIER)
+        * float(C.CLASS_DAMAGE_MULTIPLIER[int(survivor.class_id)])
     )
     assert survivor.health == 100 - stock_damage
     hp = SetHP(ByteReader(survivor_connection.sent_packets[-1][1:]))
@@ -1127,13 +1184,23 @@ def test_zombie_hand_removes_one_centered_cube_and_replicates_one_area_packet():
     )
 
     assert accepted is True
-    assert all(not server.world_manager.get_solid(*pos) for pos in footprint)
-    assert zombie.blocks == len(footprint)
     damage_packets = [data for data in server.broadcast_packets if data[0] == Damage.id]
     assert len(damage_packets) == 1
     damage = Damage(ByteReader(damage_packets[0][1:]))
     assert damage.type == int(C.ZOMBIE_DAMAGE)
+    assert damage.damage == float(C.ZOMBIEHAND_DAMAGE_AMOUNT)
     assert tuple(int(value) for value in damage.position) == center
+    # Retail 2 + 8*random per cell (seeded by the packet): the server's map
+    # must equal what every client derives from this one packet.
+    from server.block_damage_model import footprint as native_footprint
+
+    expected_gone = {
+        cell for cell, amount in native_footprint(
+            damage.type, damage.position, damage.damage, damage.seed
+        ) if amount >= 5.0
+    }
+    assert {pos for pos in footprint if not server.world_manager.get_solid(*pos)} == expected_gone
+    assert zombie.blocks == len(expected_gone)
 
 
 def test_miner_superspade_shoot_removes_centered_3x3x3_atomically():
@@ -1161,6 +1228,7 @@ def test_miner_superspade_shoot_removes_centered_3x3x3_atomically():
     )
 
     assert resolved is True
+    # 7.5 + 5*random >= 5 on every cell: map voxels all break in one swing.
     assert all(not server.world_manager.get_solid(*pos) for pos in footprint)
     assert server.world_manager.get_solid(*outside) is True
     assert player.blocks == 27
@@ -1171,7 +1239,7 @@ def test_miner_superspade_shoot_removes_centered_3x3x3_atomically():
     assert len(damage_packets) == 1
     damage = Damage(ByteReader(damage_packets[0][1:]))
     assert damage.type == C.SUPERSPADE_DAMAGE
-    assert damage.damage >= 31.0
+    assert damage.damage == float(C.SUPERSPADE_DAMAGE_AMOUNT)
     assert tuple(int(value) for value in damage.position) == center
 
 
@@ -1267,6 +1335,9 @@ def test_spade_mining_never_emits_crash_unsafe_shoot_feedback():
 
 def test_legacy_superspade_liberate_uses_same_cube_and_one_native_damage():
     server = DummyServer()
+    # Stock clients never send BlockLiberate(35); only the UGC editor
+    # keeps the validated legacy path (non-UGC is a protocol violation).
+    server.config.ugc_runtime = True
     player, _ = make_player(
         server, 0, "Miner", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0)
     )
@@ -1276,7 +1347,10 @@ def test_legacy_superspade_liberate_uses_same_cube_and_one_native_damage():
     footprint = set(combat_runtime._melee_dig_positions(
         center, combat_runtime.DIG_CUBE
     ))
-    for position in footprint:
+    # The targeted cell must be visible to the digger (the client picks it
+    # by eye raycast): open the one cell between the eye and the centre.
+    sight_hole = (102, 100, 60)
+    for position in footprint - {sight_hole}:
         server.world_manager.set_block(*position, True, TEST_COLOR)
     server.world_manager.find_unsupported_chunks = lambda _frontier: []
     packet = BlockLiberate()
@@ -1289,7 +1363,7 @@ def test_legacy_superspade_liberate_uses_same_cube_and_one_native_damage():
     ))
 
     assert all(not server.world_manager.get_solid(*pos) for pos in footprint)
-    assert player.blocks == 27
+    assert player.blocks == 26
     from shared.packet import Damage
     damage_packets = [raw for raw in server.broadcast_packets if raw[0] == 37]
     assert len(damage_packets) == 1
@@ -1323,13 +1397,30 @@ def test_block_build_consumes_inventory_and_clears_old_damage():
     assert player.blocks == 4
     assert server.world_manager.get_solid(*block) is True
     assert block not in server.world_manager.block_damage
-    build_packets = [
+    # The builder keeps its native id-32 echo; observers get explicit RGB so
+    # they never depend on a (throttled) SetColor relay.
+    own_builds = [
+        data for data in connection.sent_packets if data[0] == BlockBuild.id
+    ]
+    assert len(own_builds) == 1
+    own_packet = BlockBuild(ByteReader(own_builds[0][1:]))
+    assert own_packet.block_type == 0
+    assert (own_packet.x, own_packet.y, own_packet.z) == block
+    assert not [
         data for data in server.broadcast_packets if data[0] == BlockBuild.id
     ]
-    assert build_packets
-    broadcast_packet = BlockBuild(ByteReader(build_packets[-1][1:]))
-    assert broadcast_packet.block_type == BLOCK_ACTION_BUILD
-    assert (broadcast_packet.x, broadcast_packet.y, broadcast_packet.z) == block
+    colored = [
+        (data, exclude)
+        for data, exclude in zip(
+            server.broadcast_packets, server.broadcast_excludes
+        )
+        if data[0] == BlockBuildColored.id
+    ]
+    assert len(colored) == 1
+    observer_packet = BlockBuildColored(ByteReader(colored[0][0][1:]))
+    assert colored[0][1] is player
+    assert (observer_packet.x, observer_packet.y, observer_packet.z) == block
+    assert observer_packet.color == player.block_color
     sounds = [
         PlaySound(ByteReader(data[1:]))
         for data in server.broadcast_packets
@@ -1351,9 +1442,9 @@ def test_rejected_predicted_build_is_queued_for_canonical_repair():
     )
     player.set_tool(C.BLOCK_TOOL)
     player.blocks = 5
-    # Valid coordinates but no face-connected support, so canonical VXL
-    # rejects the client's attempted/predicted placement.
-    position = (100, 100, 10)
+    # Valid in-reach coordinates but no face-connected support, so canonical
+    # VXL rejects the client's attempted/predicted placement.
+    position = (100, 100, 52)
     packet = BlockBuild()
     packet.loop_count = 1
     packet.player_id = player.id
@@ -1425,11 +1516,18 @@ def test_block_build_waits_for_its_originating_movement_loop():
     assert server.world_mutations.commit_ready() == 1
     assert server.world_manager.get_solid(*block) is True
     build_packets = [
-        data for data in server.broadcast_packets if data[0] == BlockBuild.id
+        data for data in player.connection.sent_packets
+        if data[0] == BlockBuild.id
     ]
     assert build_packets
     echoed = BlockBuild(ByteReader(build_packets[-1][1:]))
     assert echoed.loop_count == 103
+    observed = [
+        BlockBuildColored(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data[0] == BlockBuildColored.id
+    ]
+    assert [packet.loop_count for packet in observed] == [103]
 
 
 def test_pending_block_build_repairs_only_after_resolution():
@@ -1477,6 +1575,9 @@ def test_block_tool_destroy_waits_for_its_originating_movement_loop():
     from server.world_mutations import WorldMutationService
 
     server = DummyServer()
+    # Stock clients never send BlockLiberate(35); only the UGC editor
+    # keeps the validated legacy path (non-UGC is a protocol violation).
+    server.config.ugc_runtime = True
     server.loop_count = 500
     server.metrics = RuntimeMetrics()
     server.world_mutations = WorldMutationService(server)
@@ -1560,11 +1661,31 @@ def test_block_line_replicates_as_explicit_colored_cells():
     assert sounds[0].sound_id == 46
     assert sounds[0].positioned
     assert server.broadcast_excludes[-1] is None
-    assert len(connection.sent_packets) == 1
+    # Own echo first, then one PaintBlock(7) colour pin per committed cell.
+    assert [data[0] for data in connection.sent_packets] == [
+        BlockLine.id,
+        PaintBlockPacket.id,
+        PaintBlockPacket.id,
+        PaintBlockPacket.id,
+    ]
     own_echo = BlockLine(ByteReader(connection.sent_packets[0][1:]))
     assert own_echo.loop_count == packet.loop_count
     assert (own_echo.x1, own_echo.y1, own_echo.z1) == (101, 100, 60)
     assert (own_echo.x2, own_echo.y2, own_echo.z2) == (103, 100, 60)
+    pins = [
+        PaintBlockPacket(ByteReader(data[1:]))
+        for data in connection.sent_packets[1:]
+    ]
+    assert [(p.x, p.y, p.z) for p in pins] == [
+        (101, 100, 60),
+        (102, 100, 60),
+        (103, 100, 60),
+    ]
+    color = player.block_color
+    assert all(
+        tuple(p.color) == ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+        for p in pins
+    )
 
 
 def test_block_line_rejects_visually_identical_flare_tool():
@@ -1650,8 +1771,15 @@ def test_block_line_waits_for_originating_movement_loop_before_collision_commit(
     assert echoed.loop_count == 103
 
 
-def test_delayed_block_line_keeps_color_selected_when_action_was_sent():
-    """A later palette click cannot recolour an already queued placement."""
+def test_delayed_block_line_uses_palette_the_builder_renders_its_echo_with():
+    """A palette change before commit is the colour the builder will show.
+
+    Live-measured on the stock client (2026-09-26): the builder's own
+    BlockLine echo is painted with ``Character.block_color`` at the moment
+    the echo ARRIVES, so a SetColor sent after packet 40 already recolours
+    the builder's cell. Storing the action-time colour left the builder
+    alone with a different colour than the VXL, observers and late joiners.
+    """
 
     from server.metrics import RuntimeMetrics
     from server.world_mutations import WorldMutationService
@@ -1687,20 +1815,23 @@ def test_delayed_block_line_keeps_color_selected_when_action_was_sent():
     packet.x2, packet.y2, packet.z2 = block
     asyncio.run(PacketHandler(server).handle(player, bytes(packet.generate())))
 
-    # SetColor can arrive before the post-physics commit. The placed voxel and
-    # observer packet still belong to the colour selected for packet 40.
-    player.set_color(0xABCDEF)
+    # SetColor can arrive before the post-physics commit. The builder paints
+    # its echo with that newer palette, so VXL/observers must use it too.
+    later_color = 0xABCDEF
+    player.set_color(later_color)
     player.last_applied_input_loop = 103
     assert server.world_mutations.commit_ready() == 1
 
     replicated = BlockBuildColored(ByteReader(server.broadcast_packets[0][1:]))
-    assert replicated.color == action_color
+    assert replicated.color == later_color != action_color
     assert server.world_manager.map.get_color_tuple(*block) == (
-        0x12,
-        0x34,
-        0x56,
+        0xAB,
+        0xCD,
+        0xEF,
         0xFF,
     )
+    pin = PaintBlockPacket(ByteReader(_connection.sent_packets[-1][1:]))
+    assert tuple(pin.color) == (0xAB, 0xCD, 0xEF)
 
 
 
@@ -1846,8 +1977,10 @@ def test_block_line_is_atomic_when_inventory_cannot_cover_it():
 
 def test_reload_is_server_validated_and_completes_in_update():
     server = DummyServer()
-    player, _ = make_player(server, 0, "Reloader", TEAM1, C.SHOTGUN_TOOL, (100.5, 100.5, 60.0))
-    player.set_tool(C.SHOTGUN_TOOL)
+    # A magazine gun: the whole clip loads in one cycle. Shotguns load one
+    # round per cycle (tests/test_retail_ammo.py).
+    player, _ = make_player(server, 0, "Reloader", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
+    player.set_tool(C.RIFLE_TOOL)
     player.ammo_clip = 1
     player.ammo_reserve = 10
 
@@ -1886,6 +2019,9 @@ def test_raw_reversed_minigun_tool_id_is_treated_as_weapon():
 
 def test_raw_reversed_block_tool_id_can_destroy_blocks():
     server = DummyServer()
+    # Stock clients never send BlockLiberate(35); only the UGC editor
+    # keeps the validated legacy path (non-UGC is a protocol violation).
+    server.config.ugc_runtime = True
     builder, _ = make_player(server, 0, "Builder", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
     builder.set_tool(C.BLOCK_TOOL)
     builder.blocks = 10

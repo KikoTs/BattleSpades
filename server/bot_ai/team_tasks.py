@@ -72,6 +72,19 @@ class TeamTasks:
 
     def reserve(self, project: TeamProject) -> bool:
         same_team = [p for p in self.projects.values() if p.team == project.team]
+        if project.kind == "rampart":
+            # A squad walls one refuge together: several short runs at once,
+            # never the same cells, one run per builder.
+            ramparts = [p for p in same_team if p.kind == "rampart"]
+            cells = frozenset(project.cells)
+            if (len(ramparts) >= 8 or len(self.projects) >= 24
+                    or any(p.owner == project.owner for p in same_team)
+                    or any(not cells.isdisjoint(p.cells) for p in ramparts)):
+                return False
+            self.projects[project.project_id] = project
+            self.metrics["projects_started"] += 1
+            return True
+        same_team = [p for p in same_team if p.kind != "rampart"]
         if (len(same_team) >= 3 or len(self.projects) >= 12
                 or any(p.owner == project.owner for p in same_team)
                 or any(math.dist(p.position, project.position) < 7 for p in same_team)):

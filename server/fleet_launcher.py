@@ -12,6 +12,11 @@ from typing import Sequence
 import toml
 
 
+# ServerConfig.port's default (the shipped config.toml value). Kept literal so
+# the fleet parent does not import the whole server configuration module.
+_DEFAULT_GAME_PORT = 27015
+
+
 @dataclass(frozen=True, slots=True)
 class FleetInstance:
     """One enabled server process described by a fleet manifest."""
@@ -36,7 +41,9 @@ def _configured_port(document: dict, override: object) -> int:
     value = override
     if value is None:
         server = document.get("server", {})
-        value = server.get("port", 32887) if isinstance(server, dict) else 32887
+        # Same fallback as ServerConfig.port / the shipped config.toml.
+        default = _DEFAULT_GAME_PORT
+        value = server.get("port", default) if isinstance(server, dict) else default
     try:
         port = int(value)
     except (TypeError, ValueError) as exc:

@@ -44,6 +44,7 @@ from shared.bytes import ByteReader
 from shared.packet import (
     BuildPrefabAction,
     ErasePrefabAction,
+    FogColor,
     ForceTeamJoin,
     InitialUGCBatch,
     MapDataChunk,
@@ -235,7 +236,9 @@ def test_txt_atmosphere_and_ugc_placements_layer_for_published_game(
 
     assert metadata.source == vxl.with_suffix(".ugc")
     assert metadata.skybox_name == "User_Desert.txt"
-    assert metadata.fog_color == (12, 34, 56)
+    # The editor's skydome choice owns the fog (retail set_skybox_name sends
+    # FogColor(FOG_COLORS[name])); the baseplate .txt pin sits beneath it.
+    assert metadata.fog_color == (195, 116, 77)
     assert len(metadata.spawn_zones[TEAM1]) == 1
     assert len(metadata.spawn_zones[TEAM2]) == 1
     assert [entity.kind for entity in metadata.entities] == ["ammo"]
@@ -606,8 +609,15 @@ def test_host_skybox_and_water_settings_replicate_and_persist(
     assert project.skybox_name == "User_Desert.txt"
     assert server.world_manager.map_metadata.skybox_name == "User_Desert.txt"
     skybox = SkyboxData()
-    skybox.read(ByteReader(server.broadcasts[-1][1:]))
+    skybox.read(ByteReader(server.broadcasts[-2][1:]))
     assert skybox.value == "User_Desert.txt"
+    # FogColor(74) follows to every editor with FOG_COLORS[User_Desert.txt].
+    assert server.broadcasts[-1][0] == 74
+    fog = FogColor()
+    fog.read(ByteReader(server.broadcasts[-1][1:]))
+    assert fog.color == (195 << 16) | (116 << 8) | 77
+    assert server.broadcasts[-1][1:] == bytes((0, 77, 116, 195))
+    assert server.world_manager.map_metadata.fog_color == (195, 116, 77)
     assert mode.set_skybox(player, "../../bad.dll") is False
 
     colors = [(1, 2, 3, 32), (4, 5, 6, 239)]

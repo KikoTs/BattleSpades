@@ -54,30 +54,19 @@ def _allowed_for(code: str) -> tuple[int, ...]:
         return tuple(int(x) for x in C.CLASSIC_TEAM_CLASSES)
     if mafia:
         return tuple(int(x) for x in C.MAFIA_TEAM_CLASSES)
-    if code == 'tdm':
-        # Ordinary TDM uses the seven Battle Builder combat classes. Event,
-        # Classic, Gangster, Zombie and UGC classes have mode-owned state and
-        # exposing them here produces invalid loadouts and class UI.
-        return (
-            int(C.CLASS_SOLDIER),
-            int(C.CLASS_SCOUT),
-            int(C.CLASS_ROCKETEER),
-            int(C.CLASS_MINER),
-            int(C.CLASS_ENGINEER),
-            int(C.CLASS_SPECIALIST),
-            int(C.CLASS_MEDIC),
-        )
+    # TDM has no list of its own in retail: it uses DEFAULT_TEAM_CLASSES
+    # (alias A93 = Soldier, Scout, Engineer, Miner, Specialist, Medic, in that
+    # card order), which has no Rocketeer; the retail lobby lists the same six
+    # (gameRulesPanel.py:181-188).  So TDM falls through to the default.
     if code == 'zom':
         # Zombie mode has asymmetric class menus.  This union is used by
         # InitialInfo.disabled_classes; ZombieMode.configure_state_data splits
-        # it into survivor and infected lists for the two teams.  Fast/Jump
+        # it into survivor and infected lists for the two teams.  Survivors
+        # use the stock DEFAULT_TEAM_CLASSES (no Rocketeer).  Fast/Jump
         # Zombie have no ordinary class-picker icons in this retail build, so
         # exposing them here crashes selectClass.py instead of adding choices.
         survivors = tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
-        legacy_rocketeer = (int(C.CLASS_ROCKETEER),)
-        return tuple(dict.fromkeys(survivors + legacy_rocketeer + (
-            int(C.CLASS_ZOMBIE),
-        )))
+        return tuple(dict.fromkeys(survivors + (int(C.CLASS_ZOMBIE),)))
     if code == 'ugc':
         return tuple(int(x) for x in C.UGC_TEAM_CLASSES)
     return tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
@@ -96,12 +85,17 @@ def _mode_data(code: str) -> ModeData:
         infographic1='{}_INFOGRAPHIC_TEXT1'.format(code_upper),
         infographic2='{}_INFOGRAPHIC_TEXT2'.format(code_upper),
         infographic3='{}_INFOGRAPHIC_TEXT3'.format(code_upper),
-        # Score/win limits. TDM plays to 200 team kills (user spec). CTF to
-        # the intel-capture count. Sourced here so wire HUD + rules agree.
+        # Score/win limits: the retail Match Lobby defaults (GAME_RULES_LIST,
+        # docs/RETAIL_VALUES.md). Modes read their live rule; this table is
+        # the StateData fallback before a mode exists and the Multi-Hill
+        # target (retail has no MH score rule; 100 is a server choice).
+        # Demolition is won by one base kill; TC by owning every base.
         default_score_limit={
-            'ctf': 10, 'cctf': 5, 'tdm': 200, 'dem': 5, 'mh': 100,
-            'oc': 100, 'dia': 10, 'tc': 100,
-            'vip': int(MG.VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP), 'zom': 1,
+            'ctf': 5, 'cctf': 5, 'tdm': 200, 'dem': 1, 'mh': 100,
+            'oc': 30, 'dia': int(MG.DIA_DIAMONDS_TO_GET_FOR_MAP_ROTATION),
+            'tc': int(MG.TC_DEFAULT_BASE_COUNT_TO_USE),
+            'vip': int(MG.VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP),
+            'zom': int(MG.ZOM_NOOF_ROUNDS_BEFORE_NEXT_MAP),
             'ugc': 0,
         }.get(code, 10),
         # Round clock (seconds). Original game lengths from

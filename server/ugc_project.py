@@ -31,6 +31,8 @@ WORLD_XY = 512
 WORLD_Z = 256
 MAX_UGC_ENTITIES = 8192
 COMMON_MODE = "nor"
+UNTITLED_TITLE = "Untitled UGC"
+UNDESCRIBED_DESCRIPTION = "Undescribed UGC"
 TARGET_MODES = ("tdm", "ctf", "dem", "mh", "oc", "tc", "vip", "zom", "dia")
 
 
@@ -135,9 +137,21 @@ def item_id(value: str | int) -> int:
 
 
 def authored_mode_for_item(item: int, target_mode: str) -> str:
-    """Apply the retail rule that shared crate points belong to ``nor``."""
+    """Apply retail ``UGCEntity.get_ugc_mode`` (gameScene.pyd 0x100a7970).
 
-    return COMMON_MODE if int(item) in _COMMON_ITEMS else normalize_target_mode(target_mode)
+    Zone items (``UGC_ZONE_SIZES``) belong to the mode they were placed in,
+    the Occupation bomb point is always ``MODE_OCCUPATION`` and everything
+    else (the three crate drop points) is ``MODE_NORMAL`` (shared by every
+    mode).  The editor draws only rows whose mode is the edited one or
+    ``nor`` (gameScene.pyd 0x10151a20).
+    """
+
+    item = int(item)
+    if item == int(C.UGC_ITEM_OCC_BOMB_POINT):
+        return "oc"
+    if item in C.UGC_ZONE_SIZES:
+        return normalize_target_mode(target_mode)
+    return COMMON_MODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,14 +264,16 @@ class UGCProject:
             raise ValueError("prefab_set must be a retail palette index from 0 to 5")
         self.target_mode = normalize_target_mode(self.target_mode)
         self.baseplate = terrain_spec(self.baseplate).stem
-        self.title = _clean_text(self.title, "Untitled Map", 80)
-        self.description = _clean_text(self.description, self.title, 512)
+        # Retail placeholders: save_ugc_file (gameScene 0x10174e80) defaults
+        # the title to 'Untitled UGC'; ugc_data.pyd holds 'Undescribed UGC'.
+        self.title = _clean_text(self.title, UNTITLED_TITLE, 80)
+        self.description = _clean_text(self.description, UNDESCRIBED_DESCRIPTION, 512)
         self.author = _clean_text(self.author, "Unknown", 80)
         if len(self.placements) > MAX_UGC_ENTITIES:
             raise ValueError(f"UGC project exceeds {MAX_UGC_ENTITIES} entities")
         self.placements = list(dict.fromkeys(self.placements))
         self.ground_colors = [_rgba(value) for value in self.ground_colors[:32]]
-        self.tags = _normalized_tags(self.tags, self.target_mode)
+        self.tags = _normalized_tags(self.tags)
 
     @property
     def terrain(self) -> TerrainSpec:
@@ -271,8 +287,15 @@ class UGCProject:
     def place(self, x: int, y: int, z: int, item: int, *, mode: str | None = None) -> bool:
         """Insert one object, returning false for an exact duplicate or full project."""
 
+        return self.place_placement(x, y, z, item, mode=mode) is not None
+
+    def place_placement(
+        self, x: int, y: int, z: int, item: int, *, mode: str | None = None
+    ) -> UGCPlacement | None:
+        """Insert one object and return it (``None`` if duplicate or full)."""
+
         if len(self.placements) >= MAX_UGC_ENTITIES:
-            return False
+            return None
         placement = UGCPlacement(
             x,
             y,
@@ -281,37 +304,73 @@ class UGCProject:
             mode or authored_mode_for_item(item, self.target_mode),
         )
         if placement in self.placements:
-            return False
+            return None
         self.placements.append(placement)
         self.modified_since_publish = True
-        return True
+        return placement
 
     def remove(self, x: int, y: int, z: int, item: int | None = None) -> UGCPlacement | None:
-        """Remove the newest matching object at a coordinate.
+        """Remove the newest object at (or next to) a coordinate.
 
-        Retail secondary-click replaces an object by sending remove then add.
-        Prefer the supplied item id but fall back to the coordinate so a host
-        whose palette changed between the two clicks can still erase safely.
+        Retail ``UGCTool`` removes/replaces with ``send_place_ugc(entity
+        .ugc_item_id, self.ghost_position, ...)`` where the ghost may sit up
+        to 1.0 from the entity (``is_object_on_entity_of_class`` radius 1.0,
+        weapons/ugcTool.py:171-221).  Match the newest placement within
+        distance^2 <= 1, preferring an exact position, then the supplied item
+        id, so a host whose palette changed between clicks can still erase.
+        The caller must echo the RETURNED placement's stored position/item.
         """
 
         position = (int(x), int(y), int(z))
         candidate_item = None if item is None else item_id(item)
+        best_index = -1
+        best_rank: tuple[int, int, int, int] | None = None
         for index in range(len(self.placements) - 1, -1, -1):
             placement = self.placements[index]
-            if placement.position == position and (
-                candidate_item is None or placement.item_id == candidate_item
-            ):
-                self.modified_since_publish = True
-                return self.placements.pop(index)
-        if candidate_item is not None:
-            return self.remove(*position, item=None)
-        return None
+            dx = placement.x - position[0]
+            dy = placement.y - position[1]
+            dz = placement.z - position[2]
+            distance = dx * dx + dy * dy + dz * dz
+            if distance > 1:
+                continue
+            # Retail clients only draw/point at rows of the edited mode or
+            # ``nor`` (gameScene 0x10151a20), so a hidden other-mode zone at
+            # the same cell is never the target while a visible one exists.
+            rank = (
+                0 if placement.mode in (COMMON_MODE, self.target_mode) else 1,
+                0 if candidate_item is None or placement.item_id == candidate_item else 1,
+                distance,
+                -index,
+            )
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_index = index
+        if best_index < 0:
+            return None
+        self.modified_since_publish = True
+        return self.placements.pop(best_index)
+
+    def publishable_modes(self) -> tuple[str, ...]:
+        """Every target mode whose recovered objective limits are all met."""
+
+        return tuple(
+            mode for mode in TARGET_MODES if self.validation(mode).complete
+        )
+
+    def refresh_tags(self) -> list[str]:
+        """Retail ``set_tags_from_supported_gamemodes`` (ugc_data 0x1000e230).
+
+        ``save_ugc`` rewrites ``tags`` on every save as ``['map']`` plus the
+        mode code (``MODE_IDS_MODE[id]``) of every publishable game mode.
+        """
+
+        self.tags = ["map", *self.publishable_modes()]
+        return self.tags
 
     def set_target_mode(self, value: str) -> None:
         """Change validation context while preserving multi-mode authored objects."""
 
         self.target_mode = normalize_target_mode(value)
-        self.tags = _normalized_tags(self.tags, self.target_mode)
         self.modified_since_publish = True
 
     def validation(self, target_mode: str | None = None) -> UGCValidation:
@@ -343,8 +402,12 @@ class UGCProject:
         return UGCValidation(mode, tuple(rows))
 
     def to_sidecar(self) -> dict[str, object]:
-        """Produce the field-compatible JSON object read by the retail menus."""
+        """Produce the field-compatible JSON object read by the retail menus.
 
+        Tags are recomputed first, exactly like retail ``save_ugc``.
+        """
+
+        self.refresh_tags()
         return {
             "use_overhead_image": bool(self.use_overhead_image),
             "description": self.description,
@@ -357,6 +420,9 @@ class UGCProject:
             "baseplate": self.baseplate,
             "modified_since_publish": bool(self.modified_since_publish),
             "tags": list(self.tags),
+            # Not a retail key: tags list every publishable mode, so the
+            # last edited target mode is persisted explicitly for reopen.
+            "ugc_target_mode": self.target_mode,
             "prefab_set": self.prefab_set,
         }
 
@@ -383,13 +449,16 @@ class UGCProject:
         if not isinstance(raw_entities, Sequence) or isinstance(raw_entities, (str, bytes)):
             raise ValueError("ugc_entities must be an array")
         tags = [str(tag) for tag in data.get("tags", ())]
-        inferred_mode = target_mode or next(
+        stored_mode = str(data.get("ugc_target_mode", "")).strip().lower()
+        inferred_mode = target_mode or (
+            stored_mode if stored_mode in TARGET_MODES else None
+        ) or next(
             (tag.lower() for tag in tags if tag.lower() in TARGET_MODES),
             "tdm",
         )
         return cls(
             title=str(data.get("title", source.stem)),
-            description=str(data.get("description", data.get("title", source.stem))),
+            description=str(data.get("description", UNDESCRIBED_DESCRIPTION)),
             author=str(data.get("author", "Unknown")),
             baseplate=str(data.get("baseplate", "GrasslandBaseplate")),
             target_mode=inferred_mode,
@@ -559,13 +628,11 @@ def _rgba(value: Sequence[int]) -> tuple[int, int, int, int]:
     return tuple(int(component) & 0xFF for component in value)  # type: ignore[return-value]
 
 
-def _normalized_tags(values: Iterable[str], target_mode: str) -> list[str]:
+def _normalized_tags(values: Iterable[str]) -> list[str]:
     tags = [str(value).strip().lower() for value in values if str(value).strip()]
     tags = list(dict.fromkeys(tags))
     if "map" not in tags:
         tags.insert(0, "map")
-    if target_mode not in tags:
-        tags.append(target_mode)
     return tags
 
 
@@ -579,6 +646,8 @@ def _casefold_child(directory: Path, filename: str) -> Path | None:
 
 __all__ = [
     "COMMON_MODE",
+    "UNDESCRIBED_DESCRIPTION",
+    "UNTITLED_TITLE",
     "MAX_UGC_ENTITIES",
     "TARGET_MODES",
     "TERRAINS",

@@ -18,5 +18,10 @@ async def handle_shoot(server, player, packet) -> None:
 @register_handler(76)  # WeaponReload
 async def handle_weapon_reload(server, player, packet) -> None:
     """Start or finish the authoritative reload state machine."""
+    # The stock client also sends is_done=1 after finishing a reload
+    # (Character.end_reload); the server's own timer owns completion, so only
+    # a start request (is_done=0) drives the state machine.
+    if int(getattr(packet, "is_done", 0)):
+        return
     if player.alive:
         get_combat_system(server).handle_weapon_reload(player)
