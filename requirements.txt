@@ -21,3 +21,5 @@ py_trees>=2.5,<2.6
 # --- development / testing (optional for just running the server) ---
 pytest>=7.0.0
 pytest-asyncio>=0.20.0
+# Process metrics used by the soak harness and its canonical regression tests.
+psutil==7.2.2
