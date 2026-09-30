@@ -2,13 +2,13 @@
 
 The default private join greeting identifies **BattleSpades Beta 0.1** and the
 build's UTC day. Its three MOTD lines identify the server and BattleSpades
-client as an open AoS Revival project, link `https://aosplay.net`, and link:
+client as an open AoS Revival project, link `https://aosplay.net`, and say:
 
-- `https://github.com/KikoTs/BattleSpades`
-- `https://github.com/KikoTs/BattleSpadesClient`
+- `Join our Discord: https://discord.gg/aosbb`
+- `Server source code is available in our Discord.`
 
-Both GitHub URLs were verified from the corresponding local Git remotes. No
-remote request or publication is needed to display these links.
+The user-provided Discord invite replaces the former server/client GitHub
+chat links. Custom operator MOTDs continue to override these defaults.
 
 The four lines use private system chat after the first successful world
 reveal/ClientData. They are not sent during the loading handshake, broadcast

@@ -7,9 +7,11 @@ import asyncio
 import inspect
 import logging
 import time
+import weakref
 import zlib
 from typing import Optional, TYPE_CHECKING, Dict, Type
 
+import shared.constants as shared_constants
 import shared.packet as shared_packet
 from protocol.runtime_packets import decode_runtime_packet
 from shared.bytes import ByteReader
@@ -25,6 +27,9 @@ from shared.packet import (
     MapSyncEnd,
     MapSyncStart,
     NewPlayerConnection,
+    Password,
+    PasswordNeeded,
+    PasswordProvided,
     SetClassLoadout,
     SetColor,
     SetHP,
@@ -122,6 +127,55 @@ SPAWN_HP_DAMAGE_TYPE = 2
 # draw_progress_bar with 7 args (it takes 5) -> TypeError kills the client.
 _BLOCKED_OUTBOUND_PACKET_IDS = frozenset({3, 65})
 
+# ENet sends a packet as one command only while it fits
+# ``mtu - sizeof(ENetProtocolHeader) - sizeof(ENetProtocolSendFragment)``
+# (4 + 24). Measured on this build with the default MTU: 1372 bytes is one
+# SEND_UNRELIABLE, 1373 bytes becomes reliable SEND_FRAGMENT commands.
+ENET_DEFAULT_MTU = 1400
+ENET_FRAGMENT_OVERHEAD = 28
+# CreatePlayer(28) builds the character a WorldUpdate row is applied to.
+SNAPSHOT_LIFECYCLE_PACKET_ID = int(CreatePlayer.id)
+# CreateEntity(21) builds what a WorldUpdate entity or turret row moves. Its
+# hold key is ``("entity", id)`` with the id as the signed short on the wire.
+SNAPSHOT_ENTITY_PACKET_ID = 21
+# Safety bound for a row hold whose acknowledgement never reports (2 s).
+SNAPSHOT_HOLD_TIMEOUT_TICKS = 120
+# Same for the numbering of unacknowledged reliable packets (10 s), which is
+# also bounded in count (a full map transfer is about 1500 packets in flight).
+RELIABLE_TRACK_TIMEOUT_TICKS = 600
+RELIABLE_TRACK_LIMIT = 8192
+
+
+def framed_wire_size(payload_length: int) -> int:
+    """Wire bytes of a packet body: prefix, body, one LZF byte per 32."""
+    payload_length = max(0, int(payload_length))
+    return 1 + payload_length + (payload_length + 31) // 32
+
+
+def max_unframed_payload(wire_limit: int) -> int:
+    """Largest packet body whose framed form is at most ``wire_limit``."""
+    wire_limit = int(wire_limit)
+    length = max(0, (wire_limit - 1) * 32 // 33)
+    while framed_wire_size(length + 1) <= wire_limit:
+        length += 1
+    while length > 0 and framed_wire_size(length) > wire_limit:
+        length -= 1
+    return length
+
+# Client packets that carry the join password. Their bytes and fields never
+# reach a log, at any level.
+_SECRET_INBOUND_PACKET_IDS = frozenset({Password.id, PasswordProvided.id})
+
+# Disconnect reasons that mean "the server removed this player".
+_KICK_REASONS = frozenset(
+    int(getattr(shared_constants.DISCONNECT, name))
+    for name in (
+        "ERROR_BANNED", "ERROR_KICKED", "ERROR_AFK_TIMEOUT", "ERROR_TEMP_BANNED",
+        "ERROR_KICK_GRIEFING", "ERROR_KICK_HACKING", "ERROR_KICK_ABUSE",
+    )
+)
+_KICKED_SCORE_REASON = shared_constants.KICKED_SCORE_REASON
+
 
 def outbound_packet_is_safe(data: bytes, *, cosmetic_capable: bool = False) -> bool:
     """Return whether one complete payload may enter retail transport."""
@@ -170,6 +224,11 @@ class Connection:
 
         # Connection state
         self.authenticated = False
+        # Private servers: nothing about the match is sent before this
+        # session is cleared (server/join_password.py).
+        from server.join_password import JoinPasswordSession
+        self.join_password = JoinPasswordSession()
+        self._join_password_timer = None
         self.map_sent = False
         self._map_sync_generation = 0
         self.state_sent = False
@@ -242,6 +301,7 @@ class Connection:
         prefix: int = 0x30,
         *,
         unsequenced: bool = False,
+        snapshot: bool = False,
     ):
         """Send packet to this connection.
 
@@ -249,6 +309,9 @@ class Connection:
         ``reliable``): the packet bypasses channel 0's sequence gate, so it
         is never held behind a lost reliable packet.  Retail uses it for the
         ClockSync request (``send_packet(packet, unreliable=True)``).
+
+        ``snapshot`` marks an observer WorldUpdate part (``send_snapshot``):
+        the only traffic that must never be promoted to reliable fragments.
         """
         # ENetPeer storage belongs to the server's ENet Host.  This check must
         # precede logging (``peer.address`` also enters the native wrapper),
@@ -301,15 +364,168 @@ class Connection:
             flags = enet.PACKET_FLAG_UNSEQUENCED
         else:
             flags = enet.PACKET_FLAG_RELIABLE if reliable else 0
+        if (
+            snapshot
+            and flags != enet.PACKET_FLAG_RELIABLE
+            and len(prefixed_data) > self.unfragmented_wire_limit()
+        ):
+            # ENet fragments an oversize packet RELIABLY unless told not to,
+            # whatever flags it carries (measured: 1373 bytes of flag 0 or
+            # UNSEQUENCED leave as SEND_FRAGMENT). Unreliable fragments are
+            # sequenced, so an oversize snapshot part cannot be unsequenced;
+            # replication packs parts below the limit and this is the
+            # fallback for a tail that does not fit alone.
+            flags = int(getattr(enet, "PACKET_FLAG_UNRELIABLE_FRAGMENT", 8))
+            self.oversize_snapshot_sends = int(
+                getattr(self, "oversize_snapshot_sends", 0)
+            ) + 1
         packet = enet.Packet(prefixed_data, flags)
+        if flags == enet.PACKET_FLAG_RELIABLE:
+            self._hold_snapshot_rows_for(data, packet)
         self.peer.send(0, packet)
-        
+
+    def unfragmented_wire_limit(self) -> int:
+        """Largest wire payload ENet sends as one command to this peer."""
+        mtu = getattr(self.peer, "mtu", None)
+        if not isinstance(mtu, int) or isinstance(mtu, bool) or mtu <= 0:
+            mtu = ENET_DEFAULT_MTU
+        return max(64, int(mtu) - ENET_FRAGMENT_OVERHEAD)
+
+    def snapshot_payload_limit(self) -> int:
+        """Largest packet body whose framed form still fits one command."""
+        return max_unframed_payload(self.unfragmented_wire_limit())
+
+    def send_snapshot(self, data: bytes, *, unsequenced: bool = True) -> None:
+        """Queue one observer WorldUpdate part (never reliable)."""
+        self.send(
+            data, reliable=False, unsequenced=unsequenced, snapshot=True
+        )
+
+    def _hold_snapshot_rows_for(self, data: bytes, packet) -> None:
+        """Withhold a player's snapshot rows until its CreatePlayer is acked.
+
+        Unsequenced snapshots are not ordered against reliable packets. A row
+        of a new life must not reach the client before the CreatePlayer that
+        builds that life's character (class, loadout, jetpack), so the row is
+        left out of this peer's snapshots until ENet reports the packet
+        acknowledged. Owner rows travel on the ordered stream instead.
+
+        An entity's or turret's row is held the same way behind its
+        CreateEntity; the client keeps simulating the entity meanwhile.
+
+        Every reliable packet is also numbered until it is acknowledged
+        (``reliable_unacked_through``): an ordered snapshot can only be held
+        at the receiver behind a reliable packet sent before it.
+        """
+        register = getattr(packet, "set_free_callback", None)
+        if not callable(register):
+            return
+        loop_count = int(getattr(self.server, "loop_count", 0) or 0)
+        index = int(self.__dict__.get("reliable_send_index", 0)) + 1
+        self.reliable_send_index = index
+        unacked = self.__dict__.setdefault("_reliable_unacked", {})
+        unacked[index] = loop_count + RELIABLE_TRACK_TIMEOUT_TICKS
+        while len(unacked) > RELIABLE_TRACK_LIMIT:
+            # Bounded even if the binding never reports an acknowledgement.
+            del unacked[next(iter(unacked))]
+
+        player_id = None
+        if len(data) >= 2 and data[0] == SNAPSHOT_LIFECYCLE_PACKET_ID:
+            player_id = int(data[1])
+        elif len(data) >= 3 and data[0] == SNAPSHOT_ENTITY_PACKET_ID:
+            player_id = (
+                "entity", int.from_bytes(data[1:3], "little", signed=True)
+            )
+        token = object()
+        if player_id is not None:
+            # row key -> {token of one unacknowledged packet: expiry tick}
+            holds = self.__dict__.setdefault("snapshot_row_holds", {})
+            holds.setdefault(player_id, {})[token] = (
+                loop_count + SNAPSHOT_HOLD_TIMEOUT_TICKS
+            )
+        reference = weakref.ref(self)
+
+        def released(*_args) -> None:
+            connection = reference()
+            if connection is None:
+                return
+            pending_reliable = connection.__dict__.get("_reliable_unacked")
+            if pending_reliable:
+                pending_reliable.pop(index, None)
+            current = connection.__dict__.get("snapshot_row_holds")
+            pending = current.get(player_id) if current else None
+            if not pending:
+                return
+            pending.pop(token, None)
+            if not pending:
+                current.pop(player_id, None)
+
+        try:
+            register(released)
+        except Exception:
+            # No acknowledgement signal: never hold what cannot be released.
+            released()
+
+    def reliable_unacked_through(self, index: int) -> bool:
+        """Whether a reliable packet numbered ``index`` or lower is unacked."""
+        unacked = self.__dict__.get("_reliable_unacked")
+        if not unacked:
+            return False
+        loop_count = int(getattr(self.server, "loop_count", 0) or 0)
+        for key in tuple(unacked):
+            if key > int(index):
+                break
+            if loop_count > unacked[key]:
+                del unacked[key]  # safety bound: no acknowledgement report
+                continue
+            return True
+        return False
+
+    def held_snapshot_rows(self) -> frozenset:
+        """Rows this peer must not receive unsequenced yet.
+
+        Player ids, and ``("entity", id)`` for entity and turret rows.
+        """
+        holds = self.__dict__.get("snapshot_row_holds")
+        if not holds:
+            return frozenset()
+        loop_count = int(getattr(self.server, "loop_count", 0) or 0)
+        for player_id in tuple(holds):
+            pending = holds[player_id]
+            for token in tuple(pending):
+                if loop_count > pending[token]:
+                    del pending[token]
+            if not pending:
+                del holds[player_id]
+        return frozenset(holds)
+
 
     
+    def _record_kick(self, reason: int) -> None:
+        """Count KICKED_SCORE_REASON (224) once for a player the server removed.
+
+        Retail lists it among the profile statistics (Steam stat name
+        'KICKED_SCORE_REASON'); no client code reads it, so the retail server
+        wrote it. Every kick path ends here: vote kick, /kick, /ban, the AFK
+        timer, grief and anticheat kicks.
+        """
+        player = getattr(self, "player", None)
+        if (
+            player is None
+            or int(reason) not in _KICK_REASONS
+            or getattr(self, "_kick_recorded", False)
+        ):
+            return
+        self._kick_recorded = True
+        from server import profile_stats
+
+        profile_stats.add(player, int(_KICKED_SCORE_REASON))
+
     def disconnect(self, reason: int = 0):
         """Disconnect this peer."""
         self._map_sync_generation += 1
         self.disconnect_reason = int(reason)
+        self._record_kick(reason)
         if getattr(self.server, "_stopping", False):
             return
         self.peer.disconnect(reason)
@@ -552,7 +768,105 @@ class Connection:
     def on_disconnect(self):
         """Called when connection is closed."""
         self._map_sync_generation += 1
+        self._cancel_join_password_timer()
         logger.debug(f"Connection closed from {self.peer.address}")
+
+    # -- join password (packets 111/112/113) -----------------------------
+
+    def _join_password_cleared(self) -> bool:
+        from server.join_password import JoinPasswordSession, gate_for
+
+        session = getattr(self, "join_password", None)
+        if session is None:  # a connection built without __init__
+            session = self.join_password = JoinPasswordSession()
+        if session.cleared:
+            return True
+        if not gate_for(self.server).enabled:
+            # An open server clears every peer, so setting a password later
+            # never locks out the players already inside.
+            session.cleared = True
+            return True
+        return False
+
+    def _cancel_join_password_timer(self) -> None:
+        timer = getattr(self, "_join_password_timer", None)
+        self._join_password_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _join_password_timed_out(self) -> None:
+        self._join_password_timer = None
+        if not self.join_password.pending:
+            return
+        from shared.constants import DISCONNECT
+
+        logger.info("No join password from %s in time", self.peer.address)
+        self.disconnect(reason=int(DISCONNECT.ERROR_TIMEOUT))
+
+    def _ask_join_password(self) -> None:
+        """Send PasswordNeeded once; a repeated ticket sends nothing more."""
+        from server.join_password import gate_for, peer_host
+        from shared.constants import DISCONNECT
+
+        session = self.join_password
+        if session.asked_at is not None:
+            return
+        gate = gate_for(self.server)
+        if gate.locked_out(peer_host(self)):
+            logger.info(
+                "Refused %s: locked out after wrong join passwords",
+                self.peer.address,
+            )
+            self.disconnect(reason=int(DISCONNECT.ERROR_KICKED))
+            return
+        session.asked_at = time.monotonic()
+        self._join_password_timer = asyncio.get_running_loop().call_later(
+            gate.timeout, self._join_password_timed_out
+        )
+        self.send(bytes(PasswordNeeded().generate()))
+        logger.info("Asked %s for the join password", self.peer.address)
+
+    async def _on_join_password(self, reader) -> None:
+        """Judge one PasswordProvided/Password answer."""
+        from server.join_password import (
+            ACCEPTED, RETRY, gate_for, peer_host,
+        )
+        from shared.constants import DISCONNECT
+
+        session = self.join_password
+        gate = gate_for(self.server)
+        if not session.pending or session.attempts >= gate.max_attempts:
+            return
+        try:
+            candidate = reader.read_string()
+        except Exception:
+            candidate = None
+        outcome = session.answer(gate, candidate)
+        if outcome == ACCEPTED:
+            self._cancel_join_password_timer()
+            logger.info("Join password accepted from %s", self.peer.address)
+            await self.send_connection_data()
+        elif outcome == RETRY:
+            logger.info(
+                "Wrong join password from %s (%d of %d)",
+                self.peer.address, session.attempts, gate.max_attempts,
+            )
+            self.send(bytes(PasswordNeeded().generate()))
+        else:
+            self._cancel_join_password_timer()
+            gate.lock(peer_host(self))
+            logger.warning(
+                "Kicked %s after %d wrong join passwords",
+                self.peer.address, session.attempts,
+            )
+            self.disconnect(reason=int(DISCONNECT.ERROR_KICKED))
+
+    async def _continue_join(self) -> bool:
+        """Run the loader handshake, behind the join password if one is set."""
+        if not self._join_password_cleared():
+            self._ask_join_password()
+            return False
+        return await self.send_connection_data()
     
     async def on_receive(self, data: bytes):
         """Handle incoming packet - dispatches to appropriate handler."""
@@ -589,7 +903,10 @@ class Connection:
         packet_id = data[0]
         #packet_name = get_packet_name(packet_id) # Using this here might spam console if on_receive is called a lot. Use sparingly? No user asked for it.
         # Check suppression for receive too? Assuming yes.
-        suppressed = packet_id in self.server.config.log_suppress_packets
+        suppressed = (
+            packet_id in self.server.config.log_suppress_packets
+            or packet_id in _SECRET_INBOUND_PACKET_IDS
+        )
         trace_packet = (
             not suppressed
             and bool(getattr(self.server.config, "packet_trace", False))
@@ -638,6 +955,9 @@ class Connection:
                 logger.exception("reveal_world_to failed")
                 return
 
+        if packet_id in _SECRET_INBOUND_PACKET_IDS and self.player:
+            return  # a password after the join has no meaning; never log it
+
         # Route to handler
         if self.player:
             # Forward to packet handler for joined players
@@ -667,7 +987,7 @@ class Connection:
                 del self._waiters[packet_id]
 
     def arm_scene_transition(self) -> None:
-        """Require a fresh loader acknowledgement for the next scene epoch."""
+        """Retire the old join epoch and record optional patched-client state."""
 
         # A NewPlayerConnection still awaiting the Revival bridge belongs to
         # the retiring scene; the epoch bump makes it abandon the join.
@@ -676,7 +996,7 @@ class Connection:
         self._scene_transition_ready = asyncio.Event()
 
     def note_scene_transition_menu(self, in_menu: bool) -> None:
-        """Accept packet 110 as ready only while a transition is armed."""
+        """Record a patched client's packet 110 during an armed transition."""
 
         if bool(in_menu) and self._scene_transition_ready is not None:
             self._scene_transition_ready.set()
@@ -701,6 +1021,13 @@ class Connection:
         """
         from server.builders import build_state_data
         state = build_state_data(self.server, player_id=player_id)
+        if bool(getattr(self, "flight_profile_capable", False)) and not state.prefabs:
+            # The map's own constructs (StateData.prefabs is the client's
+            # map_prefabs). BattleSpades clients only: the stock client keeps
+            # the empty list it was verified with.
+            from server.map_prefabs import map_prefabs
+
+            state.prefabs = list(map_prefabs(self.server.config))
         self.send(bytes(state.generate()), prefix=0x31)
         # Modes with a native pre-spawn menu contract may append small state
         # packets here.  Map Creator uses ForceTeamJoin(115) so the stock
@@ -806,10 +1133,18 @@ class Connection:
         
         packet_id = data[0]
         packet_name = get_packet_name(packet_id)
-        logger.debug(f"PRE-JOIN packet_id={packet_id} ({packet_name}) len={len(data)} hex={data[:32].hex()}")
-        
+        if packet_id in _SECRET_INBOUND_PACKET_IDS:
+            # Not even the length: it is the length of the password.
+            logger.debug(f"PRE-JOIN packet_id={packet_id} ({packet_name})")
+        else:
+            logger.debug(f"PRE-JOIN packet_id={packet_id} ({packet_name}) len={len(data)} hex={data[:32].hex()}")
+
         reader = ByteReader(data[1:])
-        
+
+        if packet_id in _SECRET_INBOUND_PACKET_IDS:
+            await self._on_join_password(reader)
+            return
+
         # SteamSessionTicket (105) - client sends this first after connect
         if packet_id == 105:
             logger.info(f"Received SteamSessionTicket from {self.peer.address}")
@@ -825,11 +1160,11 @@ class Connection:
                 else:
                     logger.debug(f"No steam key (offline mode)")
                 # Now send all connection data
-                await self.send_connection_data()
+                await self._continue_join()
             except Exception as e:
                 logger.error(f"Error parsing SteamSessionTicket: {e}")
                 # Still proceed even if parsing fails
-                await self.send_connection_data()
+                await self._continue_join()
         
         # NewPlayerConnection (15)
         elif packet_id == 15:
@@ -952,10 +1287,10 @@ class Connection:
     async def reload_scene(self) -> bool:
         """Stream the active map/mode into the existing authenticated peer.
 
-        The transition service has already received ClientInMenu from the
-        replacement loader before calling this method. The client must also
-        answer the new ``InitialInfo`` with ``MapDataValidation``; ``False``
-        lets the lifecycle retire only that timed-out peer.
+        InitialInfo enters LoadingMenu through the stock GameClient network
+        handler. The client must answer it with ``MapDataValidation``; ``False``
+        lets the lifecycle retire only that timed-out peer. Packet 110 is not
+        required: stock retail sends no loader-ready reply to MapEnded.
         """
         self.reset_for_scene_reload()
         return await self.send_connection_data(require_map_validation=True)
@@ -989,6 +1324,14 @@ class Connection:
         require_map_validation: bool = False,
     ) -> bool:
         """Send the loader handshake and report whether map sync completed."""
+        if not self._join_password_cleared():
+            # Every caller is gated; this keeps a future one from leaking
+            # the map or the roster to a peer that never answered.
+            logger.warning(
+                "Withheld connection data from %s: join password not given",
+                self.peer.address,
+            )
+            return False
         logger.info(f"Sending connection data to {self.peer.address}")
         if not await self._claim_player_slot():
             return False
@@ -1061,15 +1404,18 @@ class Connection:
     async def send_map_data(self, *, require_validation: bool = False) -> bool:
         """Send map data to client.
 
-        Validation contract (measured against the original client + maps):
-        - InitialInfo.checksum and our MapDataValidation reply both carry
-          the CRC32 of the RAW .vxl file bytes; the client compares them
-          against the crc32 of its local copy of `filename`.
-        - On a match the client loads its pristine local file as the world
-          base, so the MapSync stream only needs the columns changed since
-          map load (empty on a fresh map).
-        - On a mismatch we stream the full world state as sync chunks (the
-          client applies (x, y, column) records onto whatever base it has).
+        Validation contract (retail network.pyd GameClient, vxl.pyd loader):
+        - On InitialInfo the client opens its local `<filename>.vxl` and
+          sends MapDataValidation with zlib.crc32 of the raw file bytes, 0
+          when it has no such file. It never compares CRCs itself.
+        - Our MapDataValidation reply makes it load that local file as the
+          world base (THREAD_STATE_FULL_LOCAL); it carries OUR file CRC.
+        - MapSync records (x, y, column) are then applied on top
+          (THREAD_STATE_PART_REMOTE) and the world is finalized. The sync
+          stage must always run, even with no record at all.
+        - `map_sync_mode = "auto"`: on a CRC match only the columns changed
+          since map load are streamed (none on a fresh map). Otherwise, and
+          always with "full", the complete world state is streamed.
         """
         logger.debug(f"Sending map data to {self.peer.address}")
         self._map_sync_generation += 1
@@ -1113,12 +1459,24 @@ class Connection:
         if not still_current():
             return False
 
+        # The retail client answers crc32 of its local <filename>.vxl, or 0
+        # when it has no such file (GameClient.send_map_validation). A zero
+        # therefore never matches, not even a server map without a file CRC:
+        # that peer has no base to apply a delta to.
         crc_match = (
             client_crc is not None
+            and server_crc != 0
             and (int(client_crc) & 0xFFFFFFFF) == server_crc
         )
         sync_mode = str(getattr(self.server.config, "map_sync_mode", "auto")).lower()
-        use_delta = crc_match and sync_mode != "full"
+        # A mode that ships its own source map before validation (the Map
+        # Creator) keeps the full stream it was verified with.
+        ships_source_map = callable(getattr(
+            getattr(self.server, "mode", None),
+            "send_pre_validation_map_data",
+            None,
+        ))
+        use_delta = crc_match and sync_mode == "auto" and not ships_source_map
 
         snapshot_prepared = False
         if callable(getattr(wm, "capture_map_sync", None)):

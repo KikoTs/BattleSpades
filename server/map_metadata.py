@@ -306,17 +306,6 @@ _STOCK_FALLBACK_SPAWN_REGIONS = {
     },
 }
 
-# The stock editor's shipped GrasslandBaseplate metadata defines the two
-# chroma-marker families even when a finished map does not retain its sidecar:
-# green markers use slot 0 and blue markers use slot 1.  Individual stock-map
-# metadata (for example MayanJungle's amber slot 0) overrides these defaults.
-# Do not apply them to arbitrary UGC maps: custom authors own their palette and
-# silently guessing it would turn accidental chroma terrain into light sources.
-STOCK_STATIC_LIGHT_COLORS = {
-    0: (255, 255, 82),
-    1: (250, 250, 200),
-}
-
 _MAP_AMBIENT_OVERRIDES = {
     "20thcenturytown": "amb_city",
     "alcatraz": "amb_alcatraz",
@@ -1096,12 +1085,11 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         # baseplate .txt ``fog_color`` pin beneath it.
         fog_color = normalize_rgb(C.FOG_COLORS.get(skybox_name)) or fog_color
 
-    # Many retail VXL files preserve their hidden chroma markers but not the
-    # companion map-description file.  Recognized stock maps inherit the
-    # editor's two shipped defaults; any recovered per-map values below win.
-    static_light_colors: dict[int, tuple[int, int, int]] = (
-        dict(STOCK_STATIC_LIGHT_COLORS) if official_map else {}
-    )
+    # A VXL chroma marker identifies a palette slot, not the light's RGB.
+    # GrasslandBaseplate's editor palette is not evidence for other stock
+    # maps: guessing it creates pale glowing blocks and extra point lights.
+    # Keep missing families absent until that map supplies their colors.
+    static_light_colors: dict[int, tuple[int, int, int]] = {}
     for index in (0, 1):
         color = normalize_rgb(payload.get(f"static_light_color{index}"))
         if color is not None:

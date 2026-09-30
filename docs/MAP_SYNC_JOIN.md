@@ -1,6 +1,32 @@
 # Map sync on join: what a late joiner receives
 
-Verified live 2026-09-24 on ArcticBase with the tracer dev client.
+Collision verified live 2026-09-24 on ArcticBase with the tracer dev client.
+Surface-color serialization corrected 2026-09-30 after a stock retail late
+join exposed a gap in that collision-only check.
+
+## Exposed faces on a late join
+
+The retail VXL loader stores solidity separately from explicit surface
+colors. Implicit span interiors become solid without color-table entries.
+After live digging the retail mutation function (`vxl.pyd` `0x10029DA0`)
+creates entries for the six face neighbors. MapSync finalization only
+shades existing entries (apart from floor, outer boundary and marker
+cleanup); it does not create all newly exposed underground surfaces.
+
+The server previously removed a voxel without materializing these neighbor
+colors. Full sync sent pristine spans for neighboring columns; delta sync
+omitted them. The resulting walls had correct collision but missing visible
+faces. `WorldManager` now materializes each newly exposed solid neighbor
+using its existing canonical interior RGB and marks that column dirty.
+Authored and painted colors remain intact. Batch excavation finishes before
+the mutation is published, and snapshot capture remains immutable.
+
+`tests/test_map_sync_exposed_surfaces.py` independently decodes both solidity
+and explicit colors from full and delta payloads. It covers single cuts,
+lines, blast cavities, XY boundaries, painted colors, concurrent join
+catch-up, and fresh `Connection.send_map_data` joins after excavation on
+MayanJungle and vertically shifted 20thCenturyTown. The original failing
+assertion was a solid side wall with no explicit color entry.
 
 ## Before
 
@@ -31,8 +57,10 @@ dug cells plus face neighbours.
 
 The `MapSync` stream already substitutes every edited column's current spans
 (`MapSyncSnapshot.build_chunks` overlays `serialize_columns(dirty_columns)`),
-so the client's world is complete when the loading screen ends, exactly like
-the original server's full-state sync.
+so the client's collision was complete when the loading screen ended.
+That measurement did not inspect surface-color entries and therefore did
+not rule out the late-join rendering defect corrected above. It also did
+not establish the original server's implementation.
 
 ## Now
 

@@ -1,22 +1,22 @@
-"""Retail (stock Steam client) weapon damage rules.
+"""Stock weapon data and explosion geometry with server damage policies.
 
-Everything here was recovered from the stock ``aos.pkg`` of the Steam build
+The data was recovered from the stock ``aos.pkg`` of the Steam build
 (PYZ byte-identical to the embedded archive) -- see docs/WEAPONS_RETAIL.md:
 
 * ``RETAIL_EXPLOSIONS`` are the literal arguments every
   ``shared.explosionDamageManager.ExplosionDamageManager.handle_*_damage``
   wrapper passes to ``handle_explosion_damage`` (captured by running the stock
   32-bit module against the stock constants).
-* :func:`explosion_player_damage` / :func:`explosion_los_fraction` reproduce
-  ``handle_explosion_damage`` for a player damageable, fitted exactly against
-  the same stock module (distance falloff, crouch body offset, three
+* :func:`explosion_player_damage` / :func:`explosion_los_fraction` use the
+  stock ``handle_explosion_damage`` geometry (distance falloff, crouch body offset, three
   line-of-sight rays weighted by ``LINE_OF_SIGHT_EXPLOSION_MODIFIERS``,
-  ``SELF_EXPLOSION_DAMAGE_REDUCTION`` and ``TEAM_EXPLOSION_DAMAGE_REDUCTION``).
+  ``SELF_EXPLOSION_DAMAGE_REDUCTION``). The neutral-team reduction remains a
+  server policy: the stock client instead compares the victim's team ID to
+  the attacking PLAYER ID, an apparent stock bug exposed by varying that ID.
 * The per-class multipliers are the stock ``CLASS_DAMAGE_MULTIPLIER`` /
-  ``CLASS_HEADSHOT_DAMAGE_MULTIPLIER`` tables. The client never reads them (the
-  original server did); the class descriptions ("your health and ammo are
-  limited" for the 1.43 Scout, 0 for the invulnerable UGC builder) place them
-  on the damage a class TAKES.
+  ``CLASS_HEADSHOT_DAMAGE_MULTIPLIER`` tables. The stock HUD divides normalized
+  health by the class damage multiplier; class descriptions also support
+  applying these multipliers to the damage a class TAKES.
 
 The module is pure: no server objects are imported, so it is unit-testable in
 isolation and shared by combat_runtime and main._apply_blast.
@@ -39,8 +39,8 @@ SELF_EXPLOSION_DAMAGE_REDUCTION = float(
     getattr(C, "SELF_EXPLOSION_DAMAGE_REDUCTION", 0.5))
 TEAM_EXPLOSION_DAMAGE_REDUCTION = float(
     getattr(C, "TEAM_EXPLOSION_DAMAGE_REDUCTION", 0.5))
-# TEAM_NEUTRAL (1): the stock manager halves damage to a damageable whose
-# get_team_id() is the neutral team (non-classic explosions, not self).
+# Existing server policy, not the stock client's apparent ID/team mix-up.
+# See the 2026-09-30 correction in docs/WEAPONS_RETAIL.md.
 TEAM_NEUTRAL = int(getattr(C, "TEAM_NEUTRAL", 1))
 
 # LINE_OF_SIGHT_HEAD/TORSO/LEGS weights (stock A252 = {0: .5, 1: .3, 2: .2}).
@@ -245,7 +245,7 @@ def explosion_player_damage(
     target_team: Optional[int] = None,
     classic: bool = False,
 ) -> float:
-    """Stock player damage for one explosion (before class multipliers)."""
+    """Stock blast geometry plus server reductions, before class multipliers."""
     falloff = explosion_falloff(
         explosion, position, radius,
         BODY_OFFSET_CROUCHING if crouched else BODY_OFFSET_STANDING,

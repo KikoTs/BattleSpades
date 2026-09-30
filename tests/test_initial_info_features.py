@@ -29,11 +29,15 @@ def test_same_team_collision_wire_flag_matches_authoritative_config():
     assert packet.same_team_collision == 1
 
 
-def test_flare_block_is_hidden_from_the_retail_prefab_selection_page():
-    """Retail injects tool 22 as the first prefab tile unless it is disabled."""
+def test_flare_block_tile_follows_the_flare_rule():
+    """Retail shows tool 22 as the first Constructs tile unless it is disabled."""
 
     packet = build_initial_info(BattleSpadesServer(ServerConfig()))
+    assert C.FLAREBLOCK_TOOL not in packet.disabled_tools
 
+    config = ServerConfig()
+    config.game_rules.apply({"RULE_ENABLE_FLARE_BLOCKS": False})
+    packet = build_initial_info(BattleSpadesServer(config))
     assert C.FLAREBLOCK_TOOL in packet.disabled_tools
 
 

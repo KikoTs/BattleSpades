@@ -92,12 +92,22 @@ def test_normalizer_rejects_cross_class_tools_and_fills_required_items():
 )
 def test_normalized_default_loadout_preserves_stock_tool_carousel_order(class_id):
     """Visually similar normal/flare blocks must keep their retail slots."""
+    disabled = list(DEFAULT_DISABLED_TOOLS)
+    if C.FLAREBLOCK_TOOL not in C.CLASS_ITEMS[class_id][C.CLASS_COMMON]:
+        # No Flare Block tile for this class (Classic Soldier).
+        disabled.append(int(C.FLAREBLOCK_TOOL))
     expected = list(dict.fromkeys(default_client_loadout(
         class_id,
-        disabled_tools=DEFAULT_DISABLED_TOOLS,
+        disabled_tools=disabled,
     )))
 
-    assert list(normalize_class_selection(class_id).loadout) == expected
+    loadout = list(normalize_class_selection(class_id).loadout)
+    assert loadout == expected
+    if C.FLAREBLOCK_TOOL in loadout:
+        # Block first, flare last (PROTOCOL.md "Normal block versus flare
+        # block"): the retail combined HUD index puts it before the prefabs.
+        assert loadout[0] == C.BLOCK_TOOL
+        assert loadout[-1] == C.FLAREBLOCK_TOOL
 
 
 def test_prefab_selection_preserves_three_slots_and_wire_order():
@@ -135,11 +145,53 @@ def test_engineer_constructs_match_the_stock_alias_seven():
     assert selection.prefabs == ("prefab_caltrop",)
 
 
-def test_stray_flare_block_is_not_part_of_spawn_loadout():
+def test_flare_block_is_part_of_the_default_spawn_loadout():
+    """GameClass.build_class_loadout appends tool 22 unless it is disabled."""
     selection = normalize_class_selection(C.CLASS_ENGINEER)
 
-    assert C.FLAREBLOCK_TOOL in DEFAULT_DISABLED_TOOLS
-    assert C.FLAREBLOCK_TOOL not in selection.loadout
+    assert C.FLAREBLOCK_TOOL not in DEFAULT_DISABLED_TOOLS
+    assert C.FLAREBLOCK_TOOL in selection.loadout
+    # Block first, flare after the class tools: the stock carousel order.
+    assert selection.loadout[0] == C.BLOCK_TOOL
+    assert selection.loadout.index(C.FLAREBLOCK_TOOL) > selection.loadout.index(
+        C.BLOCK_TOOL
+    )
+
+
+def test_flare_block_follows_the_constructs_tile_the_menu_sent():
+    """create_loadout_list sends tool 22 only while its tile is selected."""
+    primary = int(C.CLASS_ITEMS[C.CLASS_ENGINEER][C.CLASS_PRIMARY_WEAPONS][0])
+
+    without = normalize_class_selection(C.CLASS_ENGINEER, [primary])
+    chosen = normalize_class_selection(
+        C.CLASS_ENGINEER, [primary, C.FLAREBLOCK_TOOL]
+    )
+    disabled = normalize_class_selection(
+        C.CLASS_ENGINEER,
+        [primary, C.FLAREBLOCK_TOOL],
+        disabled_tools=(int(C.FLAREBLOCK_TOOL),),
+    )
+
+    assert C.FLAREBLOCK_TOOL not in without.loadout
+    assert C.FLAREBLOCK_TOOL in chosen.loadout
+    assert C.FLAREBLOCK_TOOL not in disabled.loadout
+
+
+@pytest.mark.parametrize(
+    "class_id",
+    [
+        C.CLASS_ZOMBIE,
+        C.CLASS_FAST_ZOMBIE,
+        C.CLASS_JUMP_ZOMBIE,
+        C.CLASS_CLASSIC_SOLDIER,
+    ],
+)
+def test_flare_block_is_never_given_to_a_class_without_the_tile(class_id):
+    """selectClass.get_class_images: no tile for Zombie or Classic Soldier."""
+    requested = normalize_class_selection(class_id, [C.FLAREBLOCK_TOOL])
+
+    assert C.FLAREBLOCK_TOOL not in normalize_class_selection(class_id).loadout
+    assert C.FLAREBLOCK_TOOL not in requested.loadout
 
 
 def test_normalizer_keeps_requested_jetpack_without_adding_class_default():

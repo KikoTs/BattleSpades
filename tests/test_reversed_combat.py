@@ -639,9 +639,11 @@ def test_knife_hit_on_a_scout_is_lethal():
     assert not target.alive
 
 
-def test_peerless_bot_takes_normal_hitscan_damage_and_dies() -> None:
+def test_peerless_bot_takes_normal_hitscan_damage_and_dies(monkeypatch) -> None:
     """Bots are authoritative Player targets even without an ENet peer."""
 
+    clock = [1000.0]
+    monkeypatch.setattr(combat_runtime.time, "monotonic", lambda: clock[0])
     server = DummyServer()
     attacker, _ = make_player(
         server,
@@ -677,7 +679,7 @@ def test_peerless_bot_takes_normal_hitscan_damage_and_dies() -> None:
     assert attacker.x < responses[0].position_x <= bot.x
     assert math.isclose(responses[0].position_y, bot.y, abs_tol=1 / 32)
 
-    attacker.next_shot_time = 0.0
+    clock[0] += attacker.get_weapon_profile().fire_interval
     assert combat.handle_shot(attacker, make_shoot_packet(attacker, seed=2)) is True
     assert bot.health == 0
     assert bot.alive is False
@@ -898,7 +900,9 @@ def test_invalid_shot_origin_is_rejected():
     assert server.broadcast_packets == []
 
 
-def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player():
+def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(combat_runtime.time, "monotonic", lambda: clock[0])
     server = DummyServer()
     attacker, _ = make_player(server, 0, "Attacker", TEAM1, C.RIFLE_TOOL, (100.5, 100.5, 60.0))
     target, target_connection = make_player(server, 1, "Target", TEAM2, C.RIFLE_TOOL, (108.5, 100.5, 60.0))
@@ -910,8 +914,7 @@ def test_weapon_block_damage_accumulates_and_breaks_wall_before_hitting_player()
 
     for shot_index in range(3):
         asyncio.run(PacketHandler(server).handle(attacker, bytes(make_shoot_packet(attacker, seed=shot_index + 1).generate())))
-        attacker.last_shot_time -= attacker.get_weapon_profile().fire_interval
-        attacker.next_shot_time -= attacker.get_weapon_profile().fire_interval
+        clock[0] += attacker.get_weapon_profile().fire_interval
 
     assert target.health == 100
     assert target_connection.sent_packets == []

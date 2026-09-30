@@ -1,7 +1,118 @@
 # Retail jump rollback: the launch-frame position restore
 
+## Current package compatibility (September 30, 2026)
+
+The stationary launch compensation described in the historical section below
+has been removed. It discarded the first native movement step and therefore
+conflicted with `AoS-Retail-Fixes.zip`, whose jump patch preserves that step.
+Server authority now keeps the original mover's result for every client.
+The absence of BSCF flight capability does not distinguish patched retail.
+Stock clients still perform their local stale-anchor reset; supporting their
+reset by changing authoritative launch physics breaks the fixed client.
+
+The original-native 45-frame fixture in `retail_native_jump_arc.json` covers
+ascent, apex, descent and landing. Three focused cases failed with the server
+compensation and pass after its removal. Windows and Linux each pass 1,953
+movement/network/flight checks. Native BattleSpades remains unchanged. The
+retail-only nominal 30 Hz delivery and guarded idle backlog catch-up remain.
+Pack-equipped ordinary jumps use replay spacing only outside active flight
+and pending handoff, and flight retires an earlier ordinary-jump marker.
+These checks do not establish zero corrections on every live route.
+
+The local Steam installation was restored byte-for-byte from the six runtime
+files in the user's ZIP after removing the temporary diagnostic loader.
+Earlier full-suite and memory-soak reports predate these later changes.
+
+
+## Server compatibility fix with stock corrections enabled (2026-09-30)
+
+The restored stock retail client now has actual standing and moving jump
+captures, replacing the earlier idle-only evidence. Its Character binary is
+unchanged (`52ec520d83fe9e0ed8338a1038b176c272752e81d65e9f923fe90036aaa107f7`);
+neither its launch restore nor its correction routine is suppressed.
+
+Three server changes address distinct errors:
+
+- `Player._stationary_retail_jump_origin` matches the stock launch's discarded
+  first displacement only for settled, stationary retail infantry. It requires
+  recent, equal, zero-velocity owner anchors spanning the estimated round trip.
+  It retains the native launch velocity and collision result. Moving, coasting,
+  crouching, newly landed, unlabelled and native/BSCF actors keep ordinary native
+  movement. No guessed old snapshot becomes an authoritative position.
+- Stock Character records normal movement history before movement, but rebuilds
+  correction history after movement under the old labels. Another nearby owner
+  row can therefore trigger the same correction again. After sending the first
+  post-jump anchor, `ReplicationService` briefly waits for the consumed input
+  label to pass the estimated replay window (newest received input + RTT frames
+  + three service phases), then resumes retail's two-tick/30 Hz cadence. The wait
+  has a server-tick deadline; all sent rows still describe real consumed input.
+  Observer rows and urgent flight transitions are not delayed. Native BSCF
+  players retain their six-tick airborne cadence and native physics.
+- A bounded idle-only catch-up consumes a second already-received input frame
+  while a retail player is settled and fully idle. Otherwise a startup/render
+  stall can leave a permanent FIFO delay even after the network recovers.
+  Contiguous idle labels, matching inactive actions, unchanged terrain, no
+  pending mutation/impulse/flight, and no player within four blocks are required.
+  Nothing is dropped or acknowledged without simulation. Active movement and
+  native clients keep their existing backlog policy.
+
+On the same flat ArcticBase route, the old server produced 642 above-threshold
+history comparisons and 48 actual correction displacements across 18 requested
+taps. The changed server produced zero standing corrections and one correction
+for each of 12 moving taps (12 comparisons/displacements total), both locally
+and with 40 ms per-direction latency plus 8 ms jitter. The stock launch still
+pulls a moving player toward its cached owner position before the server hears
+about the jump: maximum matched error was 0.692 blocks locally and 1.720 blocks
+with latency. These captures show the repeated correction loop is resolved on
+this route, **not zero corrections or complete physics parity**. The stock
+ClientData packet has no received-owner ACK, position or velocity from which
+the server could recover the exact cached position at arbitrary latency.
+
+Evidence: `_wave8/codex-recovery/jump-parity-live-12` (baseline), `-17` (final
+server, local) and `-18` (final server, impaired link), plus the 45-frame stock
+jump fixture in `tests/fixtures/retail_stock_jump_arc.json`. Captures 17/18 predate
+the later idle-only catch-up; final validation identifies its separate captures.
+Original functions
+ran under passive observation; input was driven through the game's ordinary
+scene keyboard state. No client suppression patch was installed. A general
+launch-position rewind was investigated and rejected.
+
+## Earlier stock Steam playtest recovery (2026-09-30)
+
+The earlier zero-ADJUST result below belongs to the patched client. The installed
+Steam `aoslib.character.pyd` is still the stock SHA-256
+`52ec520d83fe9e0ed8338a1038b176c272752e81d65e9f923fe90036aaa107f7`.
+It must not be represented as having the client-side launch fix.
+
+Repeated jump taps on a local server exposed disruptive corrections with the
+shipped airborne self-row interval of six ticks (10 Hz). Changing only that
+server setting to two ticks (30 Hz) produced a user-confirmed reduction to a
+small nudge. This workaround is now **retail-only**:
+`worldupdate_retail_airborne_self_row_interval` defaults to two ticks, while
+`worldupdate_airborne_self_row_interval` retains six for native BattleSpades
+peers advertising their existing BSCF capability. Grounded and observer
+delivery, native prediction, physics and urgent flight transitions are unchanged.
+Regression coverage decodes mixed-client owner/observer packets through
+flight and landing, for split/sequenced transport and both configuration
+sources. The server still stamps only actual consumed input; authoritative
+physics never rewinds to an estimated received row.
+
+This is a server-side freshness improvement, not removal of the stock client's
+launch-frame restore. The residual local reset happens after client physics,
+before the server can receive that jump input. Neither a guessed owner anchor
+nor a false future pong establishes what the client has received. No client
+binary or runtime hook was changed in this recovery.
+
+The user-supplied `continuous_jump.py`, if imported into retail, intercepts the
+launch-frame `set_position(network_position)` call while preserving other
+position updates. Its whitelist contains only `207.148.19.167:32887`, so it
+does not apply to the local `127.0.0.1:28630` playtest. Reading that file does not
+establish that it is installed; the inspected Steam loader was mouse-only.
+
+## Earlier client-patch investigation
+
 Measured and fixed 2026-09-24 against the stock `aoslib/character.pyd`
-(SHA-256 `52ec520d83fe9e0e…`, byte-identical in the Revival release client,
+(SHA-256 `52ec520d83fe9e0eâ€¦`, byte-identical in the Revival release client,
 the tracer-instrumented dev client and the Steam build).
 
 ## Symptom
@@ -70,7 +181,7 @@ The patcher also rewrites that `.reloc` entry to type ABSOLUTE (ignored by the
 loader); without it Windows rebases the DLL and adds the load delta to the
 jump's rel32, which crashed the client on the first jump.
 
-Patched SHA-256: `2db2a0dbad619fa0…`. `--check` reports original / patched /
+Patched SHA-256: `2db2a0dbad619fa0â€¦`. `--check` reports original / patched /
 partial; `--revert` restores the stock bytes. Both Python wrappers now detect
 the patched binary (`native_restore_removed()`) and stand down, because their
 "large restore" rule would otherwise discard a legitimate sprint-jump step.
@@ -158,3 +269,25 @@ lengthens the client's delay, which keeps the same sign. Removing the nudge
 needs the server to learn the client's actual thrust frame from the velocity
 kick in its ClientData and re-simulate the one to three frames in between; that
 server-side rewind is noted in the backlog.
+
+### Re-read of the same captures (2026-09-29)
+
+The paragraph above cannot be done: ClientData carries buttons and aim only
+(its unnamed byte is the aim anti-cheat countdown), and neither client sends
+a position, so nothing reveals the owner's thrust frame afterwards.
+
+What the eight captures do show, with S the label being simulated when the
+row is queued and N the newest label already received: the owner's thrust
+changed on `N + 2` (10 boundaries) or `N + 3` (6), never earlier. It does not
+follow S. With two labels buffered the owner was on `S + 4` all three times
+while the fixed constant said `S + 3`, and the constants ignore the round
+trip entirely, so at 100 ms the server ignited about five frames early.
+
+`[debug] jetpack_handoff_latency_aware = true` (default) applies the bound:
+ignition on `max(S + 3, N + 2)`, exhaustion on `max(S + 4, N + 3)`, both
+moved by the round trip in frames (ENet's estimate minus 8 ms, rounded down
+for ignition and up for exhaustion). Either way a mismatch is a forward
+nudge. Against the recorded ignitions that is 4 of 8 exact instead of 2,
+still no rollback. One frame of uncertainty remains and is not removable
+with the stock protocol. The round-trip term has not been run against the
+stock client at real ping yet.

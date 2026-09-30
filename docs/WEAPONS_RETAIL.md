@@ -24,8 +24,9 @@ in the live `aos.pkg`. Tests: `tests/test_weapons_retail.py`, plus the updated
    - Every `handle_*_damage` wrapper was intercepted to record its arguments.
    - `handle_explosion_damage` was swept over distance, crouch, line of sight
      (LOS), team, self and classic mode.
-   - 60 randomised cases match `server/weapons_retail.py` exactly; 22 of them
-     are pinned in the tests.
+   - The original 60 randomised cases used attacker ID 1; 22 are pinned in
+     tests. The 2026-09-30 independent sweep exposed a mistaken neutral-team
+     interpretation in that fixed-ID oracle (see below).
    - `Player.get_line_of_sight_positions` was called from the stock
      `aoslib.scenes.main.player.pyd`.
    - The stock `aoslib.world.pyd` raycast (`sub_10005C20`) was checked with
@@ -53,9 +54,11 @@ in the live `aos.pkg`. Tests: `tests/test_weapons_retail.py`, plus the updated
 | Headshot rule | the head slot of the tuple, times the **victim's** `CLASS_HEADSHOT_DAMAGE_MULTIPLIER` | same | **fixed**: before, a rifle headshot did 70 × the *attacker's* multiplier |
 | Class multiplier | `CLASS_DAMAGE_MULTIPLIER` of the class **taking** damage | victim-side (`weapons_retail.victim_damage_multiplier`) | **fixed**: before, it was attacker-side |
 
-The client never reads `CLASS_DAMAGE_MULTIPLIER` or
-`CLASS_HEADSHOT_DAMAGE_MULTIPLIER` (only the fall-on-water one), so the side
-they apply to comes from the design data:
+The stock client does read `CLASS_DAMAGE_MULTIPLIER`: Character's
+`modify_damage_by_class` uses it, and the HUD divides normalized HP by the
+class's damage multiplier. Engineer's 100 server HP therefore displays as
+85 (`100 / 1.1765`, rounded for display). This supports victim-side damage
+scaling; the descriptions supply further evidence:
 
 - Scout is 1.43, and its description says "your health and ammo are limited".
 - Soldier is 1.0: "take a beating".
@@ -131,7 +134,7 @@ Melee has a single player figure (no part tuple), so no headshot multiplier.
 ## Explosives (stock `ExplosionDamageManager`)
 
 `handle_explosion_damage(world, damageable, by_player_id, pos, type, radius,
-kb_min, kb_max, damage, classic=False)`. The `type` argument is the **kill
+kb_min, kb_max, damage, classic=False, weapon_id=None)`. The `type` argument is the **kill
 type**.
 
 For a player damageable:
@@ -144,8 +147,13 @@ For a player damageable:
   weights of the visible points.
 - `damage = D · f · L`.
 - When not classic: × `SELF_EXPLOSION_DAMAGE_REDUCTION` (0.5) for your own
-  blast, otherwise × `TEAM_EXPLOSION_DAMAGE_REDUCTION` (0.5) if the victim is
-  on `TEAM_NEUTRAL` (1).
+  blast. **Correction (2026-09-30):** the stock client's next branch compares
+  `damageable.get_team_id()` to `by_player_id`, then applies
+  `TEAM_EXPLOSION_DAMAGE_REDUCTION` (0.5). This is an apparent stock ID/team
+  bug, not a neutral-team rule. The prior oracle fixed `by_player_id=1`,
+  concealing the distinction. A new 40-case attacker/team/classic matrix
+  confirms it. The server deliberately retains its existing neutral/team
+  policy rather than making damage depend on the attacker's connection slot.
 - The impulse is `(kb_min + f·(kb_max − kb_min)) · L`, directed from the blast
   to the network position.
 
@@ -267,7 +275,7 @@ startup.
 | Jetpack | `JETPACK_PROPERTIES[pack][7]` (`JETPACK_DAMAGE_MULTIPLIER` index): 2.0 for 66/67, 1.0 for 68/69 | damage taken ×field 7 while `jetpack_active` | **added** (server-only field, no client reader; inference from its name) |
 | Riot shield | 50% frontal absorption when displayed (`A1883`), 0.5 knockback on bash (`A1884`) | unchanged | ok |
 | VIP | `VIP_DAMAGE_MULTIPLIER` 0.5 | `modes/vip.py` `modify_incoming_damage` | ok (not changed) |
-| Self / neutral explosion | 0.5 / 0.5, skipped when classic | implemented | **fixed** |
+| Self / neutral explosion | Self 0.5 is stock; neutral 0.5 is existing server policy (stock client has an apparent ID/team bug, above) | skipped when classic | policy preserved |
 | Friendly fire | the manager applies the knockback and the server's `add_damage` decides the HP | FF off: push kept, no HP loss (policy kept) | ok |
 
 ## Not recoverable / not implemented (no invented numbers)

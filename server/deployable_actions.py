@@ -460,7 +460,13 @@ class DeployableActionService:
     def place_machine_gun(
         self, player: "Player", position: Vector3, *, yaw: float
     ) -> bool:
-        """Place the one-per-owner durable mounted machine gun."""
+        """Place or relocate the owner's unoccupied mounted machine gun.
+
+        The native client sends PlaceMG + UseCommand at every deployment.
+        Keep one live gun per owner, retaining its health/ammo on relocation;
+        an occupied gun cannot be withdrawn out from under another player.
+        This is BattleSpades policy: retail never sends PlaceMG in gameplay.
+        """
 
         if not deployable_authorized(player, C.MG_TOOL) or not math.isfinite(float(yaw)):
             return False
@@ -479,13 +485,21 @@ class DeployableActionService:
             return False
         if not self.placement_visible(player, pos, support_cell):
             return False
-        if any(
+        previous = [
+            entity for entity in self.server.entity_registry.all()
+            if (
             entity.alive
             and isinstance(entity.behavior, MachineGunBehavior)
             and entity.behavior.owner_id == player.id
-            for entity in self.server.entity_registry.all()
-        ):
+            )
+        ]
+        if any(entity.behavior.carrier_id is not None for entity in previous):
             return False
+        behavior = MachineGunBehavior(player.id, player.team)
+        if previous:
+            # Redeploying moves equipment; it does not repair or refill it.
+            behavior.health = min(entity.behavior.health for entity in previous)
+            behavior.ammo = min(entity.behavior.ammo for entity in previous)
         entity = self.server.entity_registry.place(
             int(C.MACHINE_GUN),
             *pos,
@@ -493,10 +507,13 @@ class DeployableActionService:
             state=internal_team_to_wire(player.team),
             kind="machine_gun",
             player_id=0xFF,
-            behavior=MachineGunBehavior(player.id, player.team),
+            behavior=behavior,
             support_cell=support_cell,
         )
         commit_deployable_use(player, int(C.MG_TOOL), now)
+        for old in previous:
+            self.server.entity_registry.remove(old.entity_id)
+            self.server.broadcast_destroy_entity(old.entity_id)
         self.server.broadcast_create_entity(entity)
         logger.info(
             "MACHINE GUN id=%d placed by %s at %s yaw=%.2f",
@@ -552,7 +569,7 @@ class DeployableActionService:
         self._placement_sound(SND_TURRET_PLACE, pos)
         return True
 
-    def set_disguise(self, player: "Player", *, active: bool) -> bool:
+    def set_disguise(self, player: "Player", *, active: bool, loop_count=None) -> bool:
         """Activate/deactivate the stock two-use Engineer disguise."""
 
         if not active:
@@ -576,6 +593,16 @@ class DeployableActionService:
         player.disguised = True
         player._disguise_anchor = tuple(
             float(value) for value in getattr(player, "position", (0.0, 0.0, 0.0))
+        )
+        # Reliable actions are drained before buffered movement. Keep older
+        # input from undoing a new activation, but never trust an arbitrary
+        # future label or wait indefinitely for a stopped input stream.
+        from server import action_clock
+
+        player._disguise_pending_input = (
+            (int(loop_count), now + action_clock.MAX_STALL_SECONDS)
+            if action_clock.label_plausible(player, loop_count)
+            else None
         )
         logger.info("DISGUISE %s activated (%d remaining)", player.name, player.disguise_stock)
         return True

@@ -25,6 +25,9 @@ from .ctf import CTFMode
 
 _CLASSIC_DISABLED_TOOLS = (
     *DEFAULT_DISABLED_TOOLS,
+    # Classic has no Flare Block: selectClass shows no tile for the Classic
+    # Soldier and CLASS_CLASSIC_COMMON_TOOLS does not carry tool 22.
+    int(C.FLAREBLOCK_TOOL),
     int(C.CLASSIC_SMG_TOOL),
     int(C.CLASSIC_SHOTGUN_TOOL),
 )

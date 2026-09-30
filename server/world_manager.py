@@ -501,6 +501,7 @@ class WorldManager:
         else:
             self.map.remove_point(x, y, z)
             self._set_air_override(x, y, z, True)
+            self._materialize_exposed_surfaces(((x, y, z),))
         self._surface_cache.pop((x, y), None)
         self.dirty_columns.add((x, y))
         if not recolour:
@@ -508,6 +509,35 @@ class WorldManager:
         published_color = self._canonical_vxl_color(color) & 0xFFFFFF
         self._publish_mutations(((x, y, z, bool(solid), published_color),))
         return True
+
+    def _materialize_exposed_surfaces(self, removed_positions) -> None:
+        """Keep newly visible solid faces in the retail MapSync color table.
+
+        The retail remote loader fills implicit span interiors with solidity
+        only. Its finalizer shades existing color entries, rather than
+        discovering newly exposed interiors. Live destruction creates those
+        entries on the client; a late join needs them explicitly in its VXL
+        spans, including in columns adjacent to the excavated column.
+        """
+        world_map = self.map
+        has_color = getattr(world_map, "has_explicit_color", None)
+        if has_color is None:
+            return  # Lightweight/alternate map implementations have no sparse colors.
+        for x, y, z in removed_positions:
+            for dx, dy, dz in (
+                (-1, 0, 0), (1, 0, 0), (0, -1, 0),
+                (0, 1, 0), (0, 0, -1), (0, 0, 1),
+            ):
+                nx, ny, nz = x + dx, y + dy, z + dz
+                if not (0 <= nx < MAP_X and 0 <= ny < MAP_Y and 0 <= nz < MAP_Z):
+                    continue
+                if not world_map.get_solid(nx, ny, nz) or has_color(nx, ny, nz):
+                    continue
+                # Preserve the canonical interior fill color; authored,
+                # painted, and player-built entries above were left intact.
+                color = self._canonical_vxl_color(world_map.get_color(nx, ny, nz))
+                world_map.color_block(nx, ny, nz, color)
+                self.dirty_columns.add((nx, ny))
 
     def restore_static_light_block(
         self,
@@ -1757,6 +1787,7 @@ class WorldManager:
             self.clear_block_damage(x, y, z)
             self.block_health.pop(pos, None)
             destroyed.append(pos)
+        self._materialize_exposed_surfaces(destroyed)
         self._publish_mutations(
             tuple((x, y, z, False, 0) for x, y, z in destroyed)
         )

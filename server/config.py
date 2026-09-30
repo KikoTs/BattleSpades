@@ -336,6 +336,12 @@ class ServerConfig:
     # Private, once-per-connection chat after the GameScene is ready.
     join_greeting: str = DEFAULT_JOIN_GREETING
     motd: list[str] = field(default_factory=lambda: list(DEFAULT_MOTD))
+    # [server] password. Empty = open server. Only the native BattleSpades
+    # client can answer the challenge (server/join_password.py).
+    join_password: str = ""
+    password_max_attempts: int = 3
+    password_timeout_seconds: float = 60.0
+    password_lockout_seconds: float = 60.0
 
     # Network settings
     # ``timeout_ms`` and ``bandwidth_limit`` are accepted for old configs but
@@ -419,6 +425,18 @@ class ServerConfig:
     lag_compensation_max_ms: float = 250.0
     lag_compensation_extra_ms: float = 50.0
     lag_compensation_view_delay_ms: float = 0.0
+    # WorldUpdate transport (server/replication.py). "split" sends the rows
+    # of other players, entities and turrets UNSEQUENCED, so a lost reliable
+    # packet can no longer hold them at the receiver, and keeps each
+    # recipient's own row on the ordered stream. "sequenced" is the previous
+    # single ordered packet, which ENet holds behind every lost reliable
+    # packet (docs/RETAIL_INPUT_LOSS.md).
+    worldupdate_delivery: str = "split"
+    # Neither client orders WorldUpdates itself. When a player's ClientData
+    # shows that the link swaps datagrams a snapshot interval apart, that
+    # player's unsequenced snapshots are spaced wider than the measured
+    # displacement (sequenced beyond 100 ms), so none can overtake another.
+    worldupdate_reorder_guard: bool = True
     # Reliable mutation packets are primary. This delayed, bounded canonical
     # replay repairs rare native BlockManager rejection/prediction divergence.
     terrain_repair_enabled: bool = True
@@ -433,9 +451,8 @@ class ServerConfig:
     # Confirm its exact air cells sooner, still in a bounded per-tick lane.
     terrain_collapse_repair_batch_limit: int = 8
     terrain_collapse_repair_delay_ticks: int = 18
-    # Packet 52 gives the retail GameScene time to enter its terminal map
-    # state before ENet reason 18 closes the old session. Zero is useful only
-    # for deterministic tests; production should retain a visible grace.
+    # Dwell after MapEnded(52) before InitialInfo(114) opens the stock loader
+    # on the retained ENet peer. Zero skips this optional presentation delay.
     transition_grace_seconds: float = 1.25
 
     # Game settings
@@ -459,11 +476,14 @@ class ServerConfig:
     # "client": echo the client-reported position back (interim mode while
     # the physics engine is being brought to parity with the original game).
     movement_authority: str = "server"
-    # "full": always stream the complete world state (REQUIRED: measured
-    # 2026-06-12 — the client uses its local map file only to answer the
-    # CRC validation; world content comes exclusively from the MapSync
-    # stream, so an empty delta leaves the client world hollow).
-    # "auto": changed-columns delta for matching CRCs — experimental.
+    # "full": always stream the complete world state. The default: it is
+    # the one path verified live on every client.
+    # "auto": the retail design. A client whose crc32 of its local .vxl
+    # equals ours loads that file as the world base (network.pyd
+    # start_processing_map) and gets only the columns changed since map
+    # load; any other client gets the full stream. A live retail join on
+    # 2026-06-12 ended with a hollow world on the delta path and has not
+    # been repeated since, so "auto" stays opt-in until it is.
     map_sync_mode: str = "full"
 
     # Match Lobby settings recovered from matchSettingsPanel.pyc. ``None``
@@ -504,6 +524,9 @@ class ServerConfig:
     map_vote_recent_exclude: int = 2
     map_vote_bot_weight: float = 1.0
     map_size_overrides: dict = field(default_factory=dict)
+    # Constructs a map adds to every class (server/map_prefabs.py). None =
+    # the six map-themed constructs the game ships, on London and LunarBase.
+    map_prefabs: Optional[dict] = None
     # Kick-vote cooldowns per starter (retail MIN_TIME_BETWEEN_KICK_VOTES =
     # 300 s and MIN_TIME_BETWEEN_CANCELLED_KICK_VOTES = 45 s, shared
     # constants C:5269-5273). A denial sends KICK_DENIED_REASON_VOTE_TOO_SOON.
@@ -672,10 +695,12 @@ class ServerConfig:
     worldupdate_loop_offset: int = 0
     # Refresh grounded owner anchors at ordinary observer cadence.
     worldupdate_self_row_interval: int = 2
-    # Airborne vertical phase differs slightly across independent client/server
-    # frame clocks. Six ticks was the highest measured cadence that reduced
-    # correction chatter without approaching the 60-entry retail history cap.
+    # Preserve BattleSpades' existing airborne owner cadence (10 Hz).
     worldupdate_airborne_self_row_interval: int = 6
+    # Retail Character restores its received owner position on jump launch.
+    # Keep that cache fresher (30 Hz) without changing native prediction,
+    # physics, observer snapshots or flight-transition handling.
+    worldupdate_retail_airborne_self_row_interval: int = 2
     # WorldUpdate is the retail owner's only jetpack-active signal.  Because
     # ClientData has no application acknowledgement, ordinary position rows
     # are withheld after the reliable transition row while GameScene crosses
@@ -697,6 +722,12 @@ class ServerConfig:
     # docs/RETAIL_JUMP_RESTORE.md.
     jetpack_activation_defer_frames: int = 2
     jetpack_exhaustion_tail_frames: int = 3
+    # The two values above are the retail owner's handoff on a link with no
+    # delay and one buffered input. When true they are extended by the input
+    # labels already received and by the connection's round trip, which the
+    # owner's clock has advanced by when the row arrives (measured bounds in
+    # server/player.py). Native owners predict locally and are unaffected.
+    jetpack_handoff_latency_aware: bool = True
     # When true, append every self-row's (stamp, position) to
     # logs/selfrow_samples.ndjson for offline reconciliation calibration
     # (join with the client capture via tmp/reconcile_sim.py). Debug only.
@@ -847,6 +878,23 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         if not isinstance(motd, list) or not all(isinstance(line, str) for line in motd):
             raise ValueError("server.motd must be a string or an array of strings")
         config.motd = list(motd)
+        join_password = s.get("password", config.join_password)
+        if not isinstance(join_password, str):
+            raise ValueError("server.password must be a string")
+        if len(join_password.encode("utf-8")) > 64:
+            raise ValueError("server.password must be at most 64 bytes")
+        if "\0" in join_password:
+            raise ValueError("server.password must not contain a NUL byte")
+        config.join_password = join_password
+        config.password_max_attempts = min(10, max(1, int(
+            s.get("password_max_attempts", config.password_max_attempts)
+        )))
+        config.password_timeout_seconds = min(600.0, max(5.0, float(
+            s.get("password_timeout_seconds", config.password_timeout_seconds)
+        )))
+        config.password_lockout_seconds = min(86400.0, max(0.0, float(
+            s.get("password_lockout_seconds", config.password_lockout_seconds)
+        )))
 
     if "lobby" in data:
         lobby = data["lobby"]
@@ -944,6 +992,12 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             else:
                 normalized_overrides[str(map_name)] = min(262144, max(1, int(size)))
         config.map_size_overrides = normalized_overrides
+        if "map_prefabs" in lobby:
+            from server.map_prefabs import normalize_table
+
+            if not isinstance(lobby["map_prefabs"], dict):
+                raise ValueError("lobby.map_prefabs must be a TOML table")
+            config.map_prefabs = normalize_table(lobby["map_prefabs"])
 
     game_rule_data = data.get("game_rules", {})
     if game_rule_data:
@@ -1020,6 +1074,15 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.lag_compensation_view_delay_ms = min(250.0, max(0.0, float(n.get(
             "lag_compensation_view_delay_ms",
             config.lag_compensation_view_delay_ms))))
+        delivery = str(n.get(
+            "worldupdate_delivery", config.worldupdate_delivery)).lower()
+        if delivery not in ("split", "sequenced"):
+            raise ValueError(
+                "network.worldupdate_delivery must be 'split' or 'sequenced'"
+            )
+        config.worldupdate_delivery = delivery
+        config.worldupdate_reorder_guard = bool(n.get(
+            "worldupdate_reorder_guard", config.worldupdate_reorder_guard))
         config.terrain_repair_enabled = bool(n.get(
             "terrain_repair_enabled", config.terrain_repair_enabled))
         config.terrain_repair_queue_limit = max(64, int(n.get(
@@ -1629,6 +1692,10 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             "worldupdate_airborne_self_row_interval",
             config.worldupdate_airborne_self_row_interval,
         )))
+        config.worldupdate_retail_airborne_self_row_interval = max(1, int(dbg.get(
+            "worldupdate_retail_airborne_self_row_interval",
+            config.worldupdate_retail_airborne_self_row_interval,
+        )))
         config.jetpack_owner_handoff_input_frames = max(0, min(120, int(
             dbg.get(
                 "jetpack_owner_handoff_input_frames",
@@ -1649,6 +1716,10 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             dbg.get("jetpack_exhaustion_tail_frames",
                     config.jetpack_exhaustion_tail_frames)
         )))
+        config.jetpack_handoff_latency_aware = bool(dbg.get(
+            "jetpack_handoff_latency_aware",
+            config.jetpack_handoff_latency_aware,
+        ))
         config.debug_selfrow = bool(dbg.get("debug_selfrow", config.debug_selfrow))
         config.movement_debug_capture = bool(dbg.get(
             "movement_debug_capture", config.movement_debug_capture))

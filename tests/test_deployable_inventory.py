@@ -284,17 +284,24 @@ def test_inventory_snapshot_is_read_only_and_includes_equipped_empty_items(clock
     assert not hasattr(unknown, "deployable_stock")
 
 
-def test_machine_gun_snapshot_preserves_existing_one_owned_entity_limit(clock):
+def test_machine_gun_snapshot_allows_relocation_but_protects_occupied_gun(clock):
     server, player, _ = _server_player(C.MG_TOOL, [C.MG_TOOL])
     place = lambda: server.deployable_actions.place_machine_gun(player, POSITION, yaw=0.0)
     assert deployable_inventory_snapshot(player) == ((int(C.MG_TOOL), 1),)
     assert place()
-    assert deployable_inventory_snapshot(player) == ((int(C.MG_TOOL), 0),)
+    assert deployable_inventory_snapshot(player) == ((int(C.MG_TOOL), 1),)
+    assert not place()  # placement cadence still prevents immediate duplicates
     clock[0] += 60.0
     player.restock_ammo(int(C.AMMO_CRATE))
-    assert not place()
+    assert place()
+    assert len(server.entity_registry.all()) == 1
     entity = server.entity_registry.all()[0]
-    server.entity_registry.remove(entity.entity_id)
+    entity.behavior.mount(entity, player, server)
+    assert deployable_inventory_snapshot(player) == ((int(C.MG_TOOL), 0),)
+    clock[0] += 60.0
+    assert not place()
+    entity.behavior.unmount(entity, server)
+    player.set_tool(C.MG_TOOL, raw=True)
     assert deployable_inventory_snapshot(player) == ((int(C.MG_TOOL), 1),)
     assert place()
 

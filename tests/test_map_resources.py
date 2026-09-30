@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 
 import shared.constants as C
 
 from server.entities.registry import EntityRegistry
 from server.game_constants import MAX_HEALTH, TEAM_NEUTRAL
-from server.map_metadata import MapEntitySpec, MapMetadata
+from server.map_metadata import MapEntitySpec, MapMetadata, load_map_metadata
 from server.map_resources import MapResourceService
 
 
@@ -180,6 +181,31 @@ def test_both_chroma_marker_families_keep_their_distinct_palette_colors():
         (40, 50, 60): 0x80FFFF52,
         (41, 51, 61): 0x80FAFAC8,
     }
+
+
+def test_stock_map_missing_palette_does_not_create_glowing_blocks(caplog):
+    # Arctic's shipped sidecar has no static-light palette. Chroma markers
+    # alone do not establish the color of a finished map's light entities.
+    server = _Server(load_map_metadata(Path("maps/ArcticBase.vxl"), "tdm"))
+    server.world_manager.map_name = "ArcticBase"
+
+    MapResourceService(server).rebuild()
+
+    assert not any(entity.kind == "map_flare" for entity in server.created)
+    assert server.world_manager.map.points == {}
+    assert "palette is missing" in caplog.text
+
+
+def test_recovered_map_palette_does_not_fill_unauthored_marker_family():
+    server = _Server(load_map_metadata(Path("maps/MayanJungle.vxl"), "tdm"))
+
+    MapResourceService(server).rebuild()
+
+    flares = [entity for entity in server.created if entity.kind == "map_flare"]
+    assert [(entity.x, entity.y, entity.z, entity.color) for entity in flares] == [
+        (40.0, 50.0, 60.0, (224, 172, 29)),
+    ]
+    assert not server.world_manager.map.get_solid(41, 51, 61)
 
 
 def test_rebuild_replaces_only_map_owned_entities():

@@ -579,7 +579,9 @@ class CombatSystem:
             if not self._accept_assault_burst_packet(player, packet, now):
                 return False
         elif int(player.tool) == int(getattr(C, "MINIGUN_TOOL", 8)):
-            if not self._accept_minigun_packet(player, now):
+            if not self._accept_minigun_packet(
+                player, now, loop=getattr(packet, "loop_count", None)
+            ):
                 return False
         elif int(player.tool) == int(getattr(C, "MG_TOOL", 15)):
             # MG_TOOL is only ever fired from a server-owned mounted gun
@@ -594,11 +596,16 @@ class CombatSystem:
             if not player.consume_shot(
                 now,
                 fire_interval=float(getattr(C, "MG_DEPLOYED_SHOOT_INTERVAL", 0.1)),
+                loop=getattr(packet, "loop_count", None),
             ):
                 return False
-        elif not player.consume_shot(now):
+        elif not player.consume_shot(now, loop=getattr(packet, "loop_count", None)):
             return False
 
+        # Only an admitted attack ends disguise. A stale, dry, or invalid
+        # request must not clear a later activation. The return value below
+        # describes a hit, so an accepted miss must clear it here as well.
+        player.disguised = False
         from server.profile_stats import shot
         shot(player)
         from server.combat_scores import record_shot
@@ -783,13 +790,23 @@ class CombatSystem:
 
     def _accept_assault_burst_packet(self, player, packet, now: float) -> bool:
         """Accept the stock three-round burst at 0.1s internal spacing."""
+        from server import action_clock
+
         loop_count = int(getattr(packet, "loop_count", 0))
         burst = self._assault_bursts.get(player.id)
+        labelled_continuation = bool(
+            burst is not None
+            and action_clock.label_plausible(player, loop_count)
+            and burst.get("first_loop") is not None
+            and 0 < loop_count - burst["first_loop"]
+            <= ASSAULT_BURST_LOOP_INTERVAL * (ASSAULT_BURST_SIZE - 1)
+        )
         if (
             burst is not None
             and burst["count"] < ASSAULT_BURST_SIZE
             and loop_count - burst["last_loop"] >= ASSAULT_BURST_LOOP_INTERVAL
-            and now - burst["started_at"] <= ASSAULT_BURST_WINDOW
+            and (now - burst["started_at"] <= ASSAULT_BURST_WINDOW
+                 or labelled_continuation)
         ):
             if player.ammo_clip <= 0 or player.reloading:
                 return False
@@ -798,16 +815,17 @@ class CombatSystem:
             burst["last_loop"] = loop_count
             return True
 
-        if not player.consume_shot(now):
+        if not player.consume_shot(now, loop=loop_count):
             return False
         self._assault_bursts[player.id] = {
             "count": 1,
             "last_loop": loop_count,
+            "first_loop": loop_count,
             "started_at": now,
         }
         return True
 
-    def _accept_minigun_packet(self, player, now: float) -> bool:
+    def _accept_minigun_packet(self, player, now: float, *, loop=None) -> bool:
         """Mirror the stock MinigunWeapon.update spin model.
 
         Stock: while primary OR secondary is held (and not reloading) the
@@ -829,6 +847,12 @@ class CombatSystem:
             interval = MINIGUN_INTERVAL_MIN if pre_spun else MINIGUN_FIRST_SHOT_INTERVAL
         else:
             gap = max(0.0, now - run["last_packet_at"])
+            from server import action_clock
+
+            if action_clock.label_plausible(player, loop) and run.get("loop") is not None:
+                label_gap = (int(loop) - int(run["loop"])) / action_clock.TICK_RATE
+                if 0.0 <= label_gap <= action_clock.link_stall_seconds(player) + gap:
+                    gap = label_gap
             interval = float(run["interval"])
             # Packet stalls bunch shot arrivals; while the trigger is still
             # down a gap is treated as held so no legitimate round is refused.
@@ -852,11 +876,12 @@ class CombatSystem:
             MINIGUN_INTERVAL_MIN,
             interval / (1.0 + MINIGUN_INTERVAL_RAMP_PER_SECOND),
         )
-        if not player.consume_shot(now, fire_interval=next_gap):
+        if not player.consume_shot(now, fire_interval=next_gap, loop=loop):
             return False
         self._minigun_runs[player.id] = {
             "last_packet_at": now,
             "interval": interval,
+            "loop": loop,
         }
         return True
 
@@ -1007,7 +1032,14 @@ class CombatSystem:
         if not self._block_supported(x, y, z):
             self._queue_canonical_terrain_repair((position,))
             return False
-        if not self._block_interval_ok(player, (position,)):
+        # Retail BlockTool requires a positive wallet even when the team
+        # has infinite blocks; that flag waives cost, not this eligibility.
+        if int(player.blocks) <= 0:
+            self._queue_canonical_terrain_repair((position,))
+            return False
+        if not self._block_interval_ok(
+            player, (position,), loop=getattr(packet, "loop_count", None)
+        ):
             return False
         if not player.remove_block():
             self._queue_canonical_terrain_repair((position,))
@@ -1042,24 +1074,31 @@ class CombatSystem:
             return CLASSIC_BUILD_REACH
         return BUILD_REACH
 
-    def _block_interval_ok(self, player, cells) -> bool:
+    def _block_interval_ok(self, player, cells, *, loop=None) -> bool:
         """Stock MIN_BLOCK_INTERVAL between one player's accepted builds.
 
         ``[anticheat] enforce_block_interval`` (default off) rejects a too-early
         build with a canonical repair; log-only otherwise. Bots always pace
         themselves (BotActionGateway) so they never trip it.
         """
-        from server import anticheat
+        from server import action_clock, anticheat
 
         now = time.monotonic()
         last = getattr(player, "_last_block_build_at", None)
-        if last is not None and now - float(last) < (
-            MIN_BLOCK_INTERVAL - MIN_BLOCK_INTERVAL_GRACE
-        ):
+        if not getattr(player, "is_bot", False):
+            permitted = action_clock.admit(
+                player, "build", label=loop, interval=MIN_BLOCK_INTERVAL,
+                now=now, grace=MIN_BLOCK_INTERVAL_GRACE,
+            )
+        else:
+            permitted = last is None or now - float(last) >= (
+                MIN_BLOCK_INTERVAL - MIN_BLOCK_INTERVAL_GRACE
+            )
+        if not permitted:
             enforce = anticheat.enforcing(self.server, "enforce_block_interval")
             anticheat.report(
                 self.server, player, "block_interval", enforced=enforce,
-                gap=round(now - float(last), 3),
+                gap=round(now - float(last), 3) if last is not None else 0.0,
             )
             if enforce:
                 self._queue_canonical_terrain_repair(list(cells))
@@ -1183,12 +1222,13 @@ class CombatSystem:
         # rejecting the whole line loses valid player placements whenever a
         # drag crosses terrain or another just-built voxel.
         build_cells = [cell for cell in cells if not self.server.world_manager.get_solid(*cell)]
-        # TeamInfiniteBlocks(82): the client skips its block-count checks for
-        # that team, so the server must neither refuse nor charge.
+        # TeamInfiniteBlocks(82) waives cost, but retail BlockTool still
+        # requires at least one block in the wallet.
         from server.hud_packets import team_infinite_blocks
 
         infinite = team_infinite_blocks(self.server, getattr(player, "team", -1))
-        if not build_cells or (not infinite and player.blocks < len(build_cells)):
+        if (not build_cells or int(player.blocks) <= 0
+                or (not infinite and player.blocks < len(build_cells))):
             if build_cells:
                 self._queue_canonical_terrain_repair(build_cells)
             return False
@@ -1201,7 +1241,9 @@ class CombatSystem:
                 self._queue_canonical_terrain_repair(build_cells)
                 return False
             pending.add(cell)
-        if not self._block_interval_ok(player, build_cells):
+        if not self._block_interval_ok(
+            player, build_cells, loop=getattr(packet, "loop_count", None)
+        ):
             return False
 
         # Reserve inventory now, but do not mutate collision geometry during
@@ -2114,7 +2156,9 @@ class CombatSystem:
             headshot=False,
             target=target,
         )
-        damage = self._apply_riot_shield_mitigation(target, attacker, damage)
+        damage = self._apply_riot_shield_mitigation(
+            target, attacker, damage, impact=position, melee=True
+        )
         if int(getattr(attacker, "tool", -1)) == int(C.RIOTSHIELD_TOOL):
             self._apply_riot_shield_knockback(attacker, target)
         health_before = target.health
@@ -2155,7 +2199,9 @@ class CombatSystem:
                 attacker, attacker.get_weapon_profile(), headshot=headshot,
                 target=target, part=part,
             )
-            damage = self._apply_riot_shield_mitigation(target, attacker, damage)
+            damage = self._apply_riot_shield_mitigation(
+                target, attacker, damage, impact=position
+            )
             kill_type = KILL_HEADSHOT if headshot else attacker.get_weapon_profile().kill_type
             health_before = target.health
             target.damage(damage, source=attacker, kill_type=kill_type)
@@ -3054,7 +3100,9 @@ class CombatSystem:
             return entity_damage
         return float(profile.base_damage)
 
-    def _apply_riot_shield_mitigation(self, target, attacker, damage: float) -> float:
+    def _apply_riot_shield_mitigation(
+        self, target, attacker, damage: float, *, impact=None, melee: bool = False
+    ) -> float:
         """Apply the retail shield's 50% absorption to frontal direct hits.
 
         The shield has no activation packet: it is held whenever tool 52 is
@@ -3062,6 +3110,9 @@ class CombatSystem:
         facing dot means the source lies in the shield bearer's front
         hemisphere. Explosions and status damage do not route through this
         helper because their impact origin is not the attacking character.
+
+        ``impact`` is where the hit landed. When the shield takes it, the
+        retail RiotShieldEntity plays its bullet or melee impact there.
         """
         if (
             int(getattr(target, "tool", -1)) != int(C.RIOTSHIELD_TOOL)
@@ -3091,6 +3142,10 @@ class CombatSystem:
                 / 100.0,
             ),
         )
+        if impact is not None and absorption > 0.0 and float(damage) > 0.0:
+            from server.entities.attachments import riot_shield_hit
+
+            riot_shield_hit(self.server, target, impact, melee=melee)
         return max(0.0, float(damage) * (1.0 - absorption))
 
     @staticmethod

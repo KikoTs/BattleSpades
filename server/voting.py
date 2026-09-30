@@ -168,7 +168,7 @@ def _retail_localised_text(
         raise ValueError("invalid retail localization identifier")
     if not isinstance(arguments, tuple):
         raise TypeError("retail localization arguments must be a tuple")
-    return repr((identifier, arguments))
+    return _py2_literal((identifier, arguments))
 
 
 def _py2_literal(value: object) -> str:
@@ -263,7 +263,7 @@ def _retail_dynamic_text(value: object) -> str:
         raise ValueError("invalid retail dynamic vote text")
     if len(text) > 128:
         raise ValueError("retail dynamic vote text is too long")
-    return repr((text.replace("{", "{{").replace("}", "}}"), ()))
+    return _py2_literal((text.replace("{", "{{").replace("}", "}}"), ()))
 
 
 class VoteManager:
@@ -293,7 +293,7 @@ class VoteManager:
         self.opened_at = 0.0
         self._deadline = 0.0
         self._map_result_event = asyncio.Event()
-        self._last_start: dict[int, float] = {}
+        self._last_start: dict[int | str, float] = {}
         # Cooldown key -> earliest time that starter may open another kick.
         self._cooldown_until: dict = {}
         self._starter_cooldown_key = None
@@ -679,6 +679,12 @@ class VoteManager:
                 or self.server.players.get(int(starter.id)) is not starter
                 or int(starter.id) not in self._eligible_ids()):
             return False
+        # Address cooldowns intentionally survive player-slot reuse, but
+        # expired addresses must not accumulate for the server's lifetime.
+        for key, until in tuple(self._cooldown_until.items()):
+            if float(now) >= float(until):
+                self._cooldown_until.pop(key, None)
+                self._last_start.pop(key, None)
         denial = self._kick_denial(starter, target, now)
         if denial is not None:
             self._deny_kick(starter, *denial)

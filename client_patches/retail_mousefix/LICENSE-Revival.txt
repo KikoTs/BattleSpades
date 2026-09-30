@@ -1,0 +1,51 @@
+AoS Revival Repository License
+
+This repository contains a mix of:
+
+- original AoS Revival project code and tooling
+- original Ace of Spades game assets and runtime files
+- third-party libraries and binaries
+- source files that may be derived from proprietary upstream client builds for compatibility, maintenance, and preservation work
+
+Because of that mix, this license applies by scope:
+
+1. AoS Revival-original code
+
+Unless a file says otherwise, original source code written for the AoS Revival project and not copied or derived from proprietary upstream game files is licensed under the MIT License below.
+
+2. Excluded materials
+
+The following are not relicensed by this file:
+
+- original Ace of Spades assets, binaries, data files, audio, textures, maps, fonts, trademarks, and branding
+- proprietary upstream game code and files
+- decompiled or derived upstream files, except to the limited extent AoS Revival contributors hold rights in their own original additions
+- third-party dependencies that are shipped under their own licenses
+
+No permission is granted by this file to use excluded materials beyond whatever rights you separately have from the original rights holders.
+
+3. Third-party software
+
+Third-party components included in this repository remain under their respective licenses and terms.
+
+MIT License
+
+Copyright (c) 2026 AoS Revival contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

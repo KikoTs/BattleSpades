@@ -1,0 +1,999 @@
+{
+  "source": "jump-parity-live-08/capture/client.ndjson; first standing jump; stock Character and World methods intact; no correction suppression",
+  "character_sha256": "52ec520d83fe9e0ed8338a1038b176c272752e81d65e9f923fe90036aaa107f7",
+  "world_sha256": "ae45ec007e312c8d650620bc2779169f7b7461c74192b7a7480342c21237c1a0",
+  "ground_z": 234,
+  "class_id": 0,
+  "frames": [
+    {
+      "loop": 39731,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.74281311035156,
+      "z": 231.74281311035156,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.40852463245391846
+      ],
+      "airborne": true,
+      "jump_this_frame": true
+    },
+    {
+      "loop": 39732,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.74281311035156,
+      "z": 231.53724670410156,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.3854340612888336
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39733,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.53724670410156,
+      "z": 231.3437957763672,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.3627220094203949
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39734,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.3437957763672,
+      "z": 231.16226196289062,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.34038230776786804
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39735,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.16226196289062,
+      "z": 230.99244689941406,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.3184088170528412
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39736,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.99244689941406,
+      "z": 230.8341522216797,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.2967955470085144
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39737,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.8341522216797,
+      "z": 230.68719482421875,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.27553659677505493
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39738,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.68719482421875,
+      "z": 230.5513916015625,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.25462615489959717
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39739,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.5513916015625,
+      "z": 230.4265594482422,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.23405851423740387
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39740,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.4265594482422,
+      "z": 230.31251525878906,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.21382805705070496
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39741,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.31251525878906,
+      "z": 230.20909118652344,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.19392924010753632
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39742,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.20909118652344,
+      "z": 230.11610412597656,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.1743566393852234
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39743,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.11610412597656,
+      "z": 230.03338623046875,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.1551048904657364
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39744,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.03338623046875,
+      "z": 229.9607696533203,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.13616874814033508
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39745,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.9607696533203,
+      "z": 229.89808654785156,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.11754303425550461
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39746,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.89808654785156,
+      "z": 229.8451690673828,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.09922266006469727
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39747,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.8451690673828,
+      "z": 229.80186462402344,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.08120261877775192
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39748,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.80186462402344,
+      "z": 229.76800537109375,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.06347798556089401
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39749,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.76800537109375,
+      "z": 229.7434539794922,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.04604392126202583
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39750,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.7434539794922,
+      "z": 229.72804260253906,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.028895659372210503
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39751,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.72804260253906,
+      "z": 229.7216339111328,
+      "velocity": [
+        0.0,
+        0.0,
+        -0.012028517201542854
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39752,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.7216339111328,
+      "z": 229.72406005859375,
+      "velocity": [
+        0.0,
+        0.0,
+        0.0045621152967214584
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39753,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.72406005859375,
+      "z": 229.73519897460938,
+      "velocity": [
+        0.0,
+        0.0,
+        0.020880769938230515
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39754,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.73519897460938,
+      "z": 229.75489807128906,
+      "velocity": [
+        0.0,
+        0.0,
+        0.03693190962076187
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39755,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.75489807128906,
+      "z": 229.78302001953125,
+      "velocity": [
+        0.0,
+        0.0,
+        0.05271990969777107
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39756,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.78302001953125,
+      "z": 229.8194122314453,
+      "velocity": [
+        0.0,
+        0.0,
+        0.06824909895658493
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39757,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.8194122314453,
+      "z": 229.86395263671875,
+      "velocity": [
+        0.0,
+        0.0,
+        0.0835237056016922
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39758,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.86395263671875,
+      "z": 229.91650390625,
+      "velocity": [
+        0.0,
+        0.0,
+        0.09854790568351746
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39759,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.91650390625,
+      "z": 229.97694396972656,
+      "velocity": [
+        0.0,
+        0.0,
+        0.1133258119225502
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39760,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 229.97694396972656,
+      "z": 230.04513549804688,
+      "velocity": [
+        0.0,
+        0.0,
+        0.12786146998405457
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39761,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.04513549804688,
+      "z": 230.12095642089844,
+      "velocity": [
+        0.0,
+        0.0,
+        0.14215882122516632
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39762,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.12095642089844,
+      "z": 230.2042694091797,
+      "velocity": [
+        0.0,
+        0.0,
+        0.15622179210186005
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39763,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.2042694091797,
+      "z": 230.2949676513672,
+      "velocity": [
+        0.0,
+        0.0,
+        0.17005422711372375
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39764,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.2949676513672,
+      "z": 230.39291381835938,
+      "velocity": [
+        0.0,
+        0.0,
+        0.1836598962545395
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39765,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.39291381835938,
+      "z": 230.4980010986328,
+      "velocity": [
+        0.0,
+        0.0,
+        0.1970425248146057
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39766,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.4980010986328,
+      "z": 230.610107421875,
+      "velocity": [
+        0.0,
+        0.0,
+        0.21020576357841492
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39767,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.610107421875,
+      "z": 230.7291259765625,
+      "velocity": [
+        0.0,
+        0.0,
+        0.223153218626976
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39768,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.7291259765625,
+      "z": 230.8549346923828,
+      "velocity": [
+        0.0,
+        0.0,
+        0.23588842153549194
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39769,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.8549346923828,
+      "z": 230.9874267578125,
+      "velocity": [
+        0.0,
+        0.0,
+        0.24841485917568207
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39770,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 230.9874267578125,
+      "z": 231.12648010253906,
+      "velocity": [
+        0.0,
+        0.0,
+        0.2607359290122986
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39771,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.12648010253906,
+      "z": 231.27200317382812,
+      "velocity": [
+        0.0,
+        0.0,
+        0.2728550434112549
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39772,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.27200317382812,
+      "z": 231.42388916015625,
+      "velocity": [
+        0.0,
+        0.0,
+        0.2847754657268524
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39773,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.42388916015625,
+      "z": 231.58201599121094,
+      "velocity": [
+        0.0,
+        0.0,
+        0.29650047421455383
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39774,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.58201599121094,
+      "z": 231.74630737304688,
+      "velocity": [
+        0.0,
+        0.0,
+        0.3080332577228546
+      ],
+      "airborne": true,
+      "jump_this_frame": false
+    },
+    {
+      "loop": 39775,
+      "buttons": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ],
+      "before_z": 231.74630737304688,
+      "z": 231.74630737304688,
+      "velocity": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "airborne": false,
+      "jump_this_frame": false
+    }
+  ]
+}

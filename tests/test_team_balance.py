@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 import shared.constants as C
 from shared.bytes import ByteReader
 from shared.packet import ChatMessage, LocalisedMessage
@@ -299,6 +301,45 @@ def test_bot_roster_in_transition_is_untouched():
     _add(server, _Player(100, TEAM2, alive=True))
     assert not _tick(TeamBalancer(server), 10.0)
     assert bot.team == TEAM1
+
+
+@pytest.mark.parametrize("alive", [False, True])
+def test_bot_replacement_cannot_bypass_mode_team_change_veto(alive):
+    mode = SimpleNamespace(started=True, ended=False, allows_team_change=lambda *_: False)
+    server = _server(mode=mode, balance_bot_wait_seconds=0.0)
+    director = server.bots = _Director(server)
+    for index in range(4):
+        bot = _add(server, _Player(index, TEAM1, alive=alive, bot=True))
+        director.bots.append(bot)
+    _add(server, _Player(100, TEAM2, alive=True))
+    balancer = TeamBalancer(server)
+    assert not _tick(balancer, 10.0)
+    assert asyncio.run(balancer.force_balance()) == 0
+    assert director.removed == director.added == []
+    assert team_counts(server) == {TEAM1: 4, TEAM2: 1}
+
+
+@pytest.mark.parametrize("state", ["not_started", "ended", "retiring", "transition"])
+def test_admin_balance_preserves_round_and_transition_boundaries(state):
+    server = _server()
+    _populate(server, big=4, small=1)
+    if state == "not_started":
+        server.mode.started = False
+    elif state == "transition":
+        server.match_transition = SimpleNamespace(_transition_busy=lambda: True)
+    else:
+        setattr(server.mode, state, True)
+    assert asyncio.run(TeamBalancer(server).force_balance()) == 0
+    assert team_counts(server) == {TEAM1: 4, TEAM2: 1}
+
+
+def test_admin_balance_still_works_when_automatic_balance_is_disabled():
+    server = _server()
+    server.config.auto_balance = False
+    server.config.balance_mid_match = False
+    _populate(server, big=4, small=1)
+    assert asyncio.run(TeamBalancer(server).force_balance()) == 1
+    assert team_counts(server) == {TEAM1: 3, TEAM2: 2}
 
 
 def test_periodic_services_run_once_per_second_and_isolate_failures():

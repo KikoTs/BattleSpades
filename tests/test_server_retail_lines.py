@@ -136,19 +136,14 @@ def test_official_fleet_names_fit_the_retail_limit():
         assert len(name) <= 31, (path, name)
 
 
-def test_fallback_lighting_is_the_retail_editor_template():
-    """MayanJungle and Trenches share one lighting row: the evidenced default."""
+def test_recovered_maps_share_lighting_without_proving_other_map_defaults():
+    """Their shared row is evidence for these maps, not missing sidecars."""
     import json
     from pathlib import Path
 
-    from server.builders import state_data
-
     rows = [json.loads(Path(f"maps/{name}.json").read_text(encoding="utf-8"))
             for name in ("MayanJungle", "Trenches")]
-    for row in rows:
-        assert tuple(row["light_color"]) == state_data._DEFAULT_LIGHT_COLOR
-        assert tuple(row["light_direction"]) == state_data._DEFAULT_LIGHT_DIR
-        assert tuple(row["back_light_color"]) == state_data._DEFAULT_BACK_LIGHT_COLOR
-        assert tuple(row["back_light_direction"]) == state_data._DEFAULT_BACK_LIGHT_DIR
-        assert tuple(row["ambient_light_color"]) == state_data._DEFAULT_AMBIENT_COLOR
-        assert row["ambient_light_intensity"] == state_data._DEFAULT_AMBIENT_INTENSITY
+    for field in ("light_color", "light_direction", "back_light_color",
+                  "back_light_direction", "ambient_light_color",
+                  "ambient_light_intensity"):
+        assert rows[0][field] == rows[1][field]

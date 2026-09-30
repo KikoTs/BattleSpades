@@ -94,9 +94,9 @@ class TeamBalancer:
             return False
         return bool(getattr(config, "balance_mid_match", True))
 
-    def _applicable(self) -> bool:
+    def _applicable(self, *, manual: bool = False) -> bool:
         server = self.server
-        if not self.enabled():
+        if not manual and not self.enabled():
             return False
         mode = getattr(server, "mode", None)
         if mode is None:
@@ -309,7 +309,7 @@ class TeamBalancer:
             ),
         )
         for bot in candidates:
-            if not self._objective_safe(bot):
+            if not self._objective_safe(bot) or not self._mode_allows(bot, small):
                 continue
             if callable(safe_to_retire) and not safe_to_retire(bot):
                 continue
@@ -334,10 +334,7 @@ class TeamBalancer:
         human gets the retail TEAM_FULL notice.  Modes that assign teams
         themselves are never balanced.  Returns how many players moved.
         """
-        mode = getattr(self.server, "mode", None)
-        if mode is None or callable(getattr(mode, "prepare_join_team", None)):
-            return 0
-        if not bool(getattr(mode, "auto_balance_enabled", True)):
+        if not self._applicable(manual=True):
             return 0
         moved = 0
         for _attempt in range(64):

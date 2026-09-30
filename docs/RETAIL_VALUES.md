@@ -60,7 +60,7 @@ were already at 60 s because only the sample config overrode it.
 | One-hit kill, teabag points | OFF, OFF | OFF | OFF | retail |
 | Gravestones, corpse explosion, sniper beam, death cam, minimap, spectators, colour picker | ON | ON | ON | retail |
 | Blocks, prefabs | ON | ON | ON | retail |
-| Flare blocks `RULE_ENABLE_FLARE_BLOCKS` | ON | hidden from the loadout unless a config sets it | OFF | deliberate: this client build injects flare tool 22 as a fake first prefab tile (`config.toml` comment) |
+| Flare blocks `RULE_ENABLE_FLARE_BLOCKS` | ON | ON | ON | retail since 2026-09-29. The Flare Block (tool 22, 10 blocks, radius-5 light) is the first tile of the Constructs page for every class except Zombie and Classic Soldier (`selectClass.py`, `flareBlockTool.py`); it had been hidden on the mistaken belief that the tile was fake |
 | Vote-kick share `RULE_VOTES_REQUIRED_FOR_KICK` | 50% (25/50/75) | 50% | 50% | retail |
 | Classes (7 `RULE_ENABLE_CLASS_*`) | all ON | ON | ON | retail |
 | Equipment (20 `RULE_ENABLE_EQUIPMENT_*`, plus hidden parachute) | all ON | ON | ON | retail |

@@ -12,6 +12,13 @@ steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting
 # Custom MOTD replaces the default lines; empty greeting and [] disable both.
 # join_greeting = "Welcome, {player}! {release} | Build (UTC): {build_date}"
 # motd = ["Build big. Play fair. Have fun!"]
+# Private server: players must type this before anything is sent to them.
+# Empty = open server. At most 64 bytes. Works with the BattleSpades client
+# only; the original retail client has no working password prompt.
+password = ""
+password_max_attempts = 3       # wrong answers before the kick
+password_timeout_seconds = 60.0 # time to answer the prompt
+password_lockout_seconds = 60.0 # that address is refused this long after the kick
 
 # Used only by run_map_creator.py / BattleSpadesMapCreator.exe.
 # `project` reopens an existing .ugc/.vxl/.txt triplet or names a new one.
@@ -125,6 +132,14 @@ lag_compensation_enabled = true
 lag_compensation_max_ms = 250
 lag_compensation_extra_ms = 50
 lag_compensation_view_delay_ms = 0
+# WorldUpdate transport. "split" sends other players, entities and turrets
+# unsequenced, so one lost reliable packet no longer freezes every remote
+# player until it is retransmitted; each player's own row stays ordered.
+# "sequenced" is the previous single ordered packet.
+worldupdate_delivery = "split"
+# Space a player's unsequenced snapshots wider than the reordering measured on
+# that player's link, so a stale snapshot is never applied over a newer one.
+worldupdate_reorder_guard = true
 # Delayed canonical reassertion of rejected or cancelled client predictions.
 # Successful ordinary builds/prefabs/digs are not replayed because that would
 # run native placement/damage particles twice. Unsupported collapses are the
@@ -156,11 +171,14 @@ default_map = "MayanJungle"
 # is in progress); "server" = authoritative server simulation (the server's
 # physics engine is oracle-calibrated to match the client's compiled engine).
 movement_authority = "server"
-# MEASURED 2026-06-12: the client uses its local map file ONLY for CRC
-# validation ??? world CONTENT comes exclusively from the MapSync stream
-# (with an empty delta sync the client world stays hollow forever).
-# Keep "full". ("auto" sends only changed columns on CRC match ??? broken
-# until the client-side world-base question is solved.)
+# How a joining client gets the map.
+#   "full" - always send the complete map. Verified live on every client.
+#   "auto" - the retail fast join: a client whose own copy of the map has the
+#            same CRC loads that copy and receives only the columns changed
+#            since the map started; every other client gets the complete map.
+# Keep "full" for now. The retail client code supports "auto", but the one
+# live retail join on it (2026-06-12) ended in a hollow world and has not
+# been repeated; "auto" is tested at protocol level only.
 map_sync_mode = "full"
 friendly_fire = false
 fall_damage = true
@@ -210,6 +228,11 @@ map_vote_min_area = 24000
 map_vote_recent_exclude = 2
 map_vote_bot_weight = 1.0
 map_size_overrides = {}   # e.g. { WW1 = "large", DragonIsland = 27000 }
+# Constructs a map adds to every class (all but the zombies and the Classic
+# Soldier), after the class's own constructs. The game ships six map-themed
+# constructs; these are the defaults. `map_prefabs = {}` offers none, which
+# is what the original game's data lists. Shown by BattleSpades clients.
+map_prefabs = { London = ["prefab_london_taxi", "prefab_london_postbox", "prefab_london_duck"], LunarBase = ["prefab_lunarcargo", "prefab_lunarshield", "prefab_lunarsteps"] }
 # Kick votes (K). Retail MIN_TIME_BETWEEN_KICK_VOTES 300 s and
 # MIN_TIME_BETWEEN_CANCELLED_KICK_VOTES 45 s, per starter address; a starter
 # needs votekick_min_team_players on their team (retail 3; 0 disables).
@@ -224,9 +247,11 @@ votekick_min_team_players = 3
 [game_rules]
 # General world/UI rules.
 RULE_ENABLE_BLOCKS = true
-# BattleSpades defaults this OFF because this retail build injects tool 22 as a
-# fake first prefab tile when enabled. Turn it on only when flare tools are wanted.
-RULE_ENABLE_FLARE_BLOCKS = false
+# The Flare Block (the glowing block, tool 22): retail default ON. It is the
+# first tile on the Constructs page of the class menu for every class except
+# Zombie and Classic Soldier, costs 10 blocks and lights a 5-block radius in
+# the player's block colour (selectClass.py, flareBlockTool.py).
+RULE_ENABLE_FLARE_BLOCKS = true
 RULE_ENABLE_PREFABS = true
 RULE_ONE_HIT_KILL = false
 RULE_ENABLE_GRAVESTONES = true
@@ -419,6 +444,14 @@ time_limit = 1500
 
 [modes.dia]
 time_limit = 900
+# A diamond that is dropped or thrown (primary fire) into an open drop-off
+# scores for the team that carried it: "Diamond cashed in for your team!".
+loose_cash_in = true
+# Diamonds are never placed on the map: digging uncovers them, by chance
+# (retail: 1 in 100 mined blocks at best). While no diamond is in play, the
+# block that brings the count since the last find to this number always
+# uncovers one. 0 = chance only, as in retail.
+discovery_guarantee_blocks = 300
 
 [modes.dem]
 time_limit = 900
@@ -513,6 +546,9 @@ starvation_airborne_ticks = 24
 starvation_timeout_seconds = 8.0
 enforce_input_backlog = false
 backlog_max_frames = 6
+# Client frame cadence plus a bounded server-time budget tolerates bunched
+# reliable packets. Missing this key in older configs retains log-only mode.
+enforce_block_interval = true
 kick_on_protocol_violation = true   # NaN/forged packets the stock client never sends
 admin_login_attempts = 3
 summary_interval_seconds = 60.0
@@ -651,9 +687,12 @@ worldupdate_loop_offset = 0
 # intervals reduced soft correction chatter but intermittently let jump reuse a
 # stale anchor and visibly roll back.
 worldupdate_self_row_interval = 2
-# Airborne anchors stay within the retail 60-entry history while avoiding the
-# correction replay that a 30 Hz vertical phase mismatch causes.
+# Preserve BattleSpades' existing airborne owner cadence (10 Hz).
 worldupdate_airborne_self_row_interval = 6
+# Retail-only freshness workaround (30 Hz). Stock Character restores its
+# cached owner position on jump launch; the native client has no such reset.
+# This changes owner delivery, not physics, observers or flight transitions.
+worldupdate_retail_airborne_self_row_interval = 2
 # Retail never acknowledges applying the jetpack-active WorldUpdate. Give the
 # owner this many accepted input frames of quiet transition time, then publish
 # one causal active-flight checkpoint and repeat. This bounds long Glide
@@ -670,6 +709,11 @@ jetpack_owner_release_handoff_input_frames = 600
 # the Rocketeer jump-pack gate; see docs/RETAIL_JUMP_RESTORE.md).
 jetpack_activation_defer_frames = 2
 jetpack_exhaustion_tail_frames = 3
+# Those two values are the handoff on a link with no delay. When true they are
+# extended by the input labels already received and by the owner's round trip,
+# which a real link adds before the row lands (retail owners only; the native
+# client predicts the boundary itself). false = the fixed values above.
+jetpack_handoff_latency_aware = true
 # Log every self-row's (stamp, position) to logs/selfrow_samples.ndjson so the
 # offline simulator (tmp/reconcile_sim.py) can replicate the client's exact
 # reconciliation and report the snap/adjust/no-op distribution. Turn ON for one

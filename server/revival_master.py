@@ -404,6 +404,9 @@ class RevivalMasterService:
         ]
         if listen_port != game_port:
             tags.extend(("public_port_mapped", "listen_port=%d" % listen_port))
+        join_password = getattr(self.server.config, "join_password", "")
+        if isinstance(join_password, str) and join_password:
+            tags.append("password")
         return {
             "identifier": self.server_id,
             "name": str(self.server.config.server_name),

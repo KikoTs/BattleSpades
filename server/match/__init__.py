@@ -2,8 +2,8 @@
 
 The client only consumes map/mode identity while ``LoadingMenu`` constructs a
 new ``GameScene``.  Full transitions therefore pause the old scene with packet
-52, retain the authenticated ENet peer, and run a fresh loader handshake after
-the client enters that menu.  Same-map round restarts continue in-place.
+52, retain the authenticated ENet peer, and send InitialInfo(114), which makes
+the stock GameClient enter that menu. Same-map round restarts continue in-place.
 """
 
 from __future__ import annotations
@@ -325,7 +325,7 @@ class MatchTransitionService:
             server = self.server
             all_connections = tuple(server.connections.values())
             # Two kinds of peer are carried into the new map over their
-            # retained ENet peer (MapEnded -> ClientInMenu ack -> InitialInfo
+            # retained ENet peer (MapEnded -> InitialInfo
             # -> MapSync -> StateData):
             #   * in-game peers (first ClientData seen), and
             #   * pre-game peers whose loader handshake already COMPLETED
@@ -365,14 +365,14 @@ class MatchTransitionService:
                 # replacement round.
                 self._reset_vote_state()
 
-                # Arm readiness before MapEnded so a fast client cannot race
-                # its acknowledgement ahead of the server-side waiter.
+                # Invalidate the old map epoch before MapEnded. This also
+                # prevents a late team selection from rejoining the old map.
                 for connection in connections:
                     connection.arm_scene_transition()
 
-                # MapEnded(52) freezes the compiled GameScene. BattleSpades'
-                # maintained client opens LoadingMenu on the same GameClient
-                # and acknowledges that state with ClientInMenu(110).
+                # MapEnded(52) freezes the compiled GameScene. InitialInfo(114)
+                # below enters LoadingMenu through GameClient.on_map_transfer;
+                # stock retail sends no loader-ready acknowledgement for 52.
                 map_ended = bytes(MapEnded().generate())
                 # The loader swaps the menu music and retires the in-game
                 # stream right after packet 52. With an OpenAL error pending
@@ -388,7 +388,7 @@ class MatchTransitionService:
                 server.broadcast(map_ended)
                 # broadcast() is gameplay-gated on in_game; a peer on team /
                 # class select has a live GameScene too and must see the
-                # same freeze to open its loader and acknowledge.
+                # same freeze before the replacement InitialInfo.
                 for connection in pregame_connections:
                     connection.send(flush)
                     connection.send(map_ended)
@@ -428,10 +428,10 @@ class MatchTransitionService:
                 # may carry a ballot or a staged next map into the new one.
                 self._reset_vote_state()
                 self._discard_old_timeline_work()
-                ready_timeout = min(
+                grace_seconds = min(
                     5.0,
                     max(
-                        0.25,
+                        0.0,
                         float(
                             getattr(
                                 server.config,
@@ -441,32 +441,9 @@ class MatchTransitionService:
                         ),
                     ),
                 )
-                readiness = await asyncio.gather(
-                    *(
-                        connection.wait_for_scene_transition(ready_timeout)
-                        for connection in connections
-                    ),
-                    return_exceptions=True,
-                )
-                ready_connections = []
+                if grace_seconds:
+                    await asyncio.sleep(grace_seconds)
                 failed_connections = list(loading_connections)
-                for connection, outcome in zip(connections, readiness):
-                    if outcome is True:
-                        ready_connections.append(connection)
-                        continue
-                    failed_connections.append(connection)
-                    logger.warning(
-                        "client did not acknowledge transition loader at %s; "
-                        "withholding InitialInfo",
-                        getattr(
-                            getattr(connection, "peer", None),
-                            "address",
-                            "unknown",
-                        ),
-                    )
-                    connection.disconnect(
-                        reason=int(DISCONNECT.ERROR_MATCH_ENDED)
-                    )
 
                 server.reset_round_runtime()
                 repair = getattr(server, "terrain_repair", None)
@@ -517,18 +494,18 @@ class MatchTransitionService:
                     if result is not None:
                         await result
 
-                # Each acknowledged peer now receives the normal initial-join
-                # loader ordering. MapDataValidation is the second-phase proof
-                # that InitialInfo was parsed and the advertised VXL can be
-                # synchronized; unacknowledged clients never reach this line.
+                # InitialInfo itself switches the stock client into its loader.
+                # MapDataValidation then proves that the advertised VXL can be
+                # synchronized. Requiring custom ClientInMenu(110) beforehand
+                # deadlocks unpatched retail clients before that trigger.
                 reloads = await asyncio.gather(
                     *(
                         connection.reload_scene()
-                        for connection in ready_connections
+                        for connection in connections
                     ),
                     return_exceptions=True,
                 )
-                for connection, outcome in zip(ready_connections, reloads):
+                for connection, outcome in zip(connections, reloads):
                     if outcome is True:
                         continue
                     failed_connections.append(connection)

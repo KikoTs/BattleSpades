@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
 _NEUTRAL_COLOR = (255, 255, 255)
 _FALLBACK_RADIUS = 12.0
+# Three times the blocks the best retail chance needs on average.
+DEFAULT_DISCOVERY_GUARANTEE_BLOCKS = 300
 
 
 def _configured_rule(server, key: str, rule: str, fallback):
@@ -67,6 +69,9 @@ class GroundDiamond:
     spawned_at: float
     expires_at: float
     pickup_after: float
+    # Team of the player who last carried it; None for a diamond that was
+    # only ever mined. A loose diamond is cashed in for this team.
+    last_team: int | None = None
 
 
 class DiamondMineMode(BaseMode):
@@ -100,6 +105,22 @@ class DiamondMineMode(BaseMode):
         self.diamond_lifetime = max(1.0, float(_configured_rule(
             server, "diamond_lifetime", "RULE_DIAMOND_LIFETIME", 60.0
         )))
+        # [modes.dia] loose_cash_in: a dropped or thrown diamond that rests
+        # in a drop-off scores for the team that carried it.
+        self.loose_cash_in = bool(getattr(
+            getattr(server, "config", None), "mode_settings", {}
+        ).get("dia", {}).get("loose_cash_in", True))
+        # [modes.dia] discovery_guarantee_blocks: retail is pure chance (one
+        # diamond per 100 mined blocks at best), so a round can stay empty
+        # for a long time. While no diamond is in play, the block that
+        # brings the count since the last find to this number uncovers one.
+        # 0 = retail chance only.
+        self.discovery_guarantee_blocks = max(0, int(getattr(
+            getattr(server, "config", None), "mode_settings", {}
+        ).get("dia", {}).get(
+            "discovery_guarantee_blocks", DEFAULT_DISCOVERY_GUARANTEE_BLOCKS
+        )))
+        self._mined_since_discovery = 0
         self.dropoffs: list[DiamondDropoff] = []
         self.active_dropoffs: list[DiamondDropoff] = []
         self.ground_diamonds: dict[int, GroundDiamond] = {}
@@ -117,6 +138,24 @@ class DiamondMineMode(BaseMode):
         # serial -> (uncovering player or None, teams that have carried it):
         # feeds DIA_STEAL_TOTAL / DIA_FINDANDCASHIN_TOTAL (COM_DIA_STEAL).
         self._diamond_history: dict[int, tuple[object, set[int]]] = {}
+        # Blocks removed since the last report, for the once-a-minute log
+        # line: "no diamonds" is nearly always "nobody is digging".
+        self._dig_report = {"mined": 0, "other": 0, "found": 0}
+        self._next_dig_report_at = 0.0
+
+    def _report_digging(self, now: float) -> None:
+        if now < self._next_dig_report_at:
+            return
+        if self._next_dig_report_at:
+            report = self._dig_report
+            logger.info(
+                "Diamond Mine, last minute: %d blocks mined, %d removed by "
+                "other means, %d diamonds uncovered; %d on the ground, %d carried",
+                report["mined"], report["other"], report["found"],
+                len(self.ground_diamonds), len(self.carriers),
+            )
+        self._dig_report = {"mined": 0, "other": 0, "found": 0}
+        self._next_dig_report_at = float(now) + 60.0
 
     async def on_mode_start(self) -> None:
         # Clear before the base class rebuilds map resources: on a round
@@ -138,6 +177,7 @@ class DiamondMineMode(BaseMode):
         self._escorts.reset()
         self._diamond_history.clear()
         self._rotation_cursor = 0
+        self._mined_since_discovery = 0
         self._activate_next_dropoffs()
         self.broadcast_start_cue()
         now = time.time()
@@ -161,6 +201,7 @@ class DiamondMineMode(BaseMode):
         if self.ended:
             return
         now = time.time()
+        self._report_digging(now)
         registry = getattr(self.server, "entity_registry", None)
         for diamond in tuple(self.ground_diamonds.values()):
             if now < diamond.expires_at:
@@ -171,6 +212,9 @@ class DiamondMineMode(BaseMode):
                     entity.fuse = max(0.0, float(diamond.expires_at - now))
             if now >= diamond.expires_at:
                 self._remove_ground_diamond(diamond.entity_id)
+                # An expired serial can never cash in. Do not retain its
+                # uncovering Player (and connection/world graph) for the match.
+                self._diamond_history.pop(diamond.serial, None)
                 # A diamond left on the ground too long vanishes with its
                 # own cue where it lay (DIAMOND_DISAPPEAR, server-only id).
                 from server.audio import SND_DIAMOND_DISAPPEAR, play_sound
@@ -178,6 +222,11 @@ class DiamondMineMode(BaseMode):
                 play_sound(
                     self.server, SND_DIAMOND_DISAPPEAR, position=diamond.position
                 )
+            elif diamond.last_team is not None:
+                # Also reached when a drop-off opens around a resting diamond.
+                await self._cash_in_loose(diamond)
+                if self.ended:
+                    return
 
         for player in tuple(getattr(self.server, "players", {}).values()):
             if not self._active_player(player):
@@ -209,17 +258,25 @@ class DiamondMineMode(BaseMode):
     ) -> None:
         """Roll once per mined voxel batch after the server commits terrain."""
 
+        self._dig_report["mined" if mined else "other"] += len(positions)
         if (
             self.ended
             or not mined
             or not self._active_player(player)
             or not positions
-            or self._active_diamond_count() >= self.max_active_diamonds
         ):
+            return
+        self._mined_since_discovery += len(positions)
+        if self._active_diamond_count() >= self.max_active_diamonds:
             return
         now = time.time()
         if now < self._next_discovery_at:
             return
+        overdue = (
+            self.discovery_guarantee_blocks > 0
+            and self._active_diamond_count() == 0
+            and self._mined_since_discovery >= self.discovery_guarantee_blocks
+        )
         active_ratio = self._active_diamond_count() / float(
             max(1, self.max_active_diamonds)
         )
@@ -232,9 +289,11 @@ class DiamondMineMode(BaseMode):
         # mined blocks.  This exact complement calculation preserves per-voxel
         # chance while spawning at most one diamond from one server event.
         event_chance = 1.0 - (1.0 - chance) ** len(positions)
-        if self._rng.random() > event_chance:
+        if not overdue and self._rng.random() > event_chance:
             return
         position = positions[self._rng.randrange(len(positions))]
+        self._dig_report["found"] += 1
+        self._mined_since_discovery = 0
         self._spawn_diamond((
             float(position[0]) + 0.5,
             float(position[1]) + 0.5,
@@ -322,7 +381,8 @@ class DiamondMineMode(BaseMode):
         await self._drop_carried_diamond(player)
 
     async def on_player_team_change(self, player, old_team: int, new_team: int) -> None:
-        await self._drop_carried_diamond(player)
+        # The diamond stays with the team that carried it, not the new one.
+        await self._drop_carried_diamond(player, team=old_team)
 
     async def handle_drop_pickup(self, player, position, velocity) -> bool:
         if int(getattr(player, "id", -1)) not in self.carriers:
@@ -461,6 +521,12 @@ class DiamondMineMode(BaseMode):
         )
         self._serial += 1
         self.ground_diamonds[diamond.entity_id] = diamond
+        logger.info(
+            "Diamond on the ground at (%.1f, %.1f, %.1f), entity %d, %s",
+            *diamond.position, diamond.entity_id,
+            "dropped" if uncovered_by is None
+            else f"uncovered by {getattr(uncovered_by, 'name', '?')}",
+        )
         if uncovered_by is not None:
             self._diamond_history[diamond.serial] = (uncovered_by, set())
             self._award_player(
@@ -587,7 +653,70 @@ class DiamondMineMode(BaseMode):
         if uncovered_by is player:
             record_profile_total(player, C.DIA_FINDANDCASHIN_TOTAL)
 
-    async def _drop_carried_diamond(self, player, position=None, velocity=None) -> None:
+    def _loose_dropoff(self, diamond: GroundDiamond) -> DiamondDropoff | None:
+        """The open drop-off a resting diamond lies in, for its last team."""
+        x, y, z = diamond.position
+        # Entities rest on the surface; a standing player is 2.25 above it.
+        points = ((x, y, z), (x, y, z - 2.25))
+        return next((
+            dropoff
+            for dropoff in self.active_dropoffs
+            if dropoff.remaining > 0
+            and dropoff.team in (TEAM_NEUTRAL, diamond.last_team)
+            and any(dropoff.zone.contains(point) for point in points)
+        ), None)
+
+    async def _cash_in_loose(self, diamond: GroundDiamond) -> bool:
+        """Cash in a diamond nobody carries: it was dropped or thrown in.
+
+        Retail has DIAMOND_CASHED_IN_LOOSE_YOURTEAM/_OPPOSITION ("Diamond
+        cashed in for your team!" / "for the enemy!"), sent by the server and
+        without a player name, and DiamondTool's primary fire throws the
+        diamond (DIAMOND_THROW_SPEED). The team point is the same; nobody
+        gets the carrier's individual score.
+        """
+        if (
+            not self.loose_cash_in
+            or self.ended
+            or diamond.last_team not in _PLAYABLE_TEAMS
+            or diamond.entity_id not in self.ground_diamonds
+        ):
+            return False
+        dropoff = self._loose_dropoff(diamond)
+        if dropoff is None:
+            return False
+        team_id = int(diamond.last_team)
+        self._remove_ground_diamond(diamond.entity_id)
+        self._diamond_history.pop(diamond.serial, None)
+        team = self.server.teams[team_id]
+        team.add_score(1)
+        try:
+            self.server.broadcast_set_score(
+                team, reason=int(C.SCORE_REASON.DIA_CAPTURE_SCORE_REASON)
+            )
+        except TypeError:
+            self.server.broadcast_set_score(team)
+        dropoff.remaining -= 1
+        self.announce_localised_to_team(team_id, "DIAMOND_CASHED_IN_LOOSE_YOURTEAM")
+        self.announce_localised_to_team(
+            TEAM2 if team_id == TEAM1 else TEAM1,
+            "DIAMOND_CASHED_IN_LOOSE_OPPOSITION",
+        )
+        from server.audio import SND_DIAMOND_DROPINBASE, play_team_relative
+
+        play_team_relative(self.server, team_id, good=SND_DIAMOND_DROPINBASE)
+        logger.info("Loose diamond cashed in for team %d", team_id)
+        if team.score >= self.score_limit:
+            await self._end_by_score(team_id)
+            return True
+        self._open_map_vote_if_due(int(team.score))
+        if dropoff.remaining <= 0:
+            self._rotate_dropoff(dropoff)
+        return True
+
+    async def _drop_carried_diamond(
+        self, player, position=None, velocity=None, team=None
+    ) -> None:
         serial = self.carriers.get(int(getattr(player, "id", -1)))
         if serial is None:
             return
@@ -607,6 +736,7 @@ class DiamondMineMode(BaseMode):
         if self.ended:
             # Clear the carried tool only: no new pickup entity is created
             # into the end screen (the restart would have to destroy it).
+            self._diamond_history.pop(serial, None)
             return
         settled = self._surface_anchor(dropped[2][0], dropped[2][1])
         # The client sounds the pickup itself but not the drop.
@@ -619,6 +749,8 @@ class DiamondMineMode(BaseMode):
             pickup_delay=float(C.NO_PICKUP_AFTER_DROP_TIME),
         )
         diamond.serial = serial
+        diamond.last_team = int(player.team if team is None else team)
+        await self._cash_in_loose(diamond)
 
     def _rotate_dropoff(self, exhausted: DiamondDropoff) -> None:
         """Replace one depleted drop-off without disrupting other live bases."""
@@ -682,6 +814,7 @@ class DiamondMineMode(BaseMode):
                 self._remove_ground_diamond(entity_id)
         self.ground_diamonds.clear()
         self.carriers.clear()
+        self._diamond_history.clear()
 
     def _nearest_ground_diamond(self, player) -> GroundDiamond | None:
         radius_sq = float(C.PICKUP_DISTANCE) ** 2

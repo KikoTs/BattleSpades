@@ -15,10 +15,10 @@ from typing import Iterable, Protocol
 import shared.constants as C
 
 
-# The native SelectClass menu injects FLAREBLOCK_TOOL as a fake first entry on
-# the prefab page unless InitialInfo disables it.  Keep this shared with the
-# spawn normalizer so the hidden tile cannot reappear in CreatePlayer.loadout.
-DEFAULT_DISABLED_TOOLS: tuple[int, ...] = (int(C.FLAREBLOCK_TOOL),)
+# Tools hidden when no rule catalog is supplied. Empty, as in retail: the
+# Flare Block (tool 22) used to be listed here, which removed the glowing
+# block from every class menu and every spawn loadout.
+DEFAULT_DISABLED_TOOLS: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,7 +158,13 @@ def normalize_class_selection(
     # Retail adds these two non-mafia tools after the class/common pass. The
     # final ordered de-duplication keeps PREFAB in its earlier common slot when
     # present while still restoring both tools for Classic Soldier.
-    if flare_tool not in disabled:
+    #
+    # The Flare Block is the first tile of the Constructs page, offered to
+    # every class whose CLASS_COMMON carries it (selectClass.get_class_images:
+    # not Zombie, not Classic Soldier). The menu sends tool 22 only while that
+    # tile is selected (create_loadout_list add_flareblock); a player who never
+    # opened the menu, and a bot, get it from build_class_loadout.
+    if flare_tool in common and (not requested or flare_tool in requested_set):
         chosen.append(flare_tool)
     if prefab_tool not in disabled:
         chosen.append(prefab_tool)
@@ -200,6 +206,10 @@ def normalize_server_selection(
 
     from server.game_rules import get_rules
 
+    # Both the stock class table and map/UGC extensions inspect this input.
+    # Materialize once so callers may supply a generator without losing its
+    # map constructs after the first validation pass.
+    prefabs = tuple(prefabs)
     disabled = set(get_rules(config).selection_disabled_tools())
     disabled.update(int(tool) for tool in additionally_disabled)
     selection = normalize_class_selection(
@@ -210,6 +220,24 @@ def normalize_server_selection(
         fallback_class_id=fallback_class_id,
         disabled_tools=disabled,
     )
+    # Constructs the current map adds to the class (retail MAP_PREFABS list,
+    # server/map_prefabs.py), kept in the order the player chose them.
+    from server.map_prefabs import selected_map_prefabs
+
+    from_map = selected_map_prefabs(config, selection.class_id, prefabs)
+    if from_map:
+        kept = {name.lower() for name in (*selection.prefabs, *from_map)}
+        by_key = {name.lower(): name for name in (*selection.prefabs, *from_map)}
+        selection = ClassSelection(
+            class_id=selection.class_id,
+            loadout=selection.loadout,
+            prefabs=tuple(
+                by_key[key]
+                for key in dict.fromkeys(str(value).lower() for value in prefabs)
+                if key in kept
+            ),
+            ugc_tools=selection.ugc_tools,
+        )
     # The retail UGC Builder's prefab table is populated by the Map Creator
     # menu at runtime and is intentionally empty in shared.constants.  Only
     # the isolated launcher sets this allow-list; ordinary servers therefore

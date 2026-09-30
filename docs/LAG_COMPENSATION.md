@@ -124,3 +124,51 @@ Measured on the dev machine with 24 real Players:
   can still be hit where the shooter saw them, for up to RTT + 50 ms. This is
   the standard lag-compensation trade-off; `lag_compensation_max_ms` bounds it.
 - **Explosions, grenades and projectiles are not rewound.**
+
+## Measured under simulated ping (2026-09-29)
+
+`scripts/lag_compensation_link.py` replays the stock client's picture of a
+moving target over a link with delay, jitter and loss, in virtual time, and
+runs the real `rewind_targets` and hitbox test. The client model is the
+contract above (newest snapshot received, simulated forward), not the client
+binary. `tests/test_lag_compensation_link.py` keeps it in the suite.
+
+Seed 11, 20 s, 140 shots per row, ±20 ms jitter per datagram and direction,
+1 % loss, targets at sprint speed (7.5 blocks/s):
+
+| Target | RTT | Registered | Without rewind | Position error p95 | Hit behind cover, max |
+|---|---|---|---|---|---|
+| strafe | 50 / 100 / 200 ms | 100 / 100 / 100 % | 76 / 14 / 14 % | 0.25 / 0.24 / 0.26 | 0.47 / 0.85 / 1.61 blocks |
+| jump | 50 / 100 / 200 ms | 100 / 99.3 / 99.3 % | 74 / 6 / 5 % | 0.34 / 0.32 / 0.35 | 0.77 / 1.32 / 2.25 |
+| jetpack | 50 / 100 / 200 ms | 99.3 / 100 / 100 % | 89 / 13 / 0 % | 0.60 / 0.52 / 0.63 | 1.81 / 3.32 / 6.31 |
+| parachute | 50 / 100 / 200 ms | 100 / 100 / 100 % | 100 / 81 / 30 % | 0.33 / 0.31 / 0.27 | 0.91 / 1.69 / 3.07 |
+
+Over 10,000 shots per setting (four seeds, all four targets, 1 % loss) the
+first-attempt registration is 99.7 % at ±20 ms jitter and 99.9 % at ±5 ms.
+
+- **Rewind limits.** The largest rewind was 62 / 113 / 214 ms at 50 / 100 /
+  200 ms: the smoothed round trip, never above `RTT + extra` or the 250 ms
+  cap. A claim of a snapshot one second old changed nothing (largest rewind
+  113 ms, as for the honest client); a claim of a fresh one only shortens
+  the rewind.
+- **The round trip overstates the view age by about 12 ms**, at every ping
+  and without any jitter: a shot waits up to a tick before it is handled
+  while the newest state label is a tick old (half a tick on average), and
+  ENet times the round trip to an acknowledgement the client sends from its
+  10 ms socket poll. Subtracting it was tried and rejected: the mean
+  position error halved (0.113 to 0.063 blocks) but fewer shots registered
+  (99.93 to 99.78 %; 99.08 to 97.90 % against a 12 blocks/s target at ±20 ms
+  jitter). The misses are direction changes, where the client's
+  extrapolation overshoots the turning point, and a slightly older body is
+  the nearer one.
+- **A lost shot packet** arrives one retransmission time-out later, which is
+  beyond the allowance at any ping above about 50 ms. It is rewound as far
+  as allowed and usually misses a moving target; that is the whole cost of
+  loss (at most the share of shots that needed a retransmission). Honest
+  clients trip `lag_comp_stale_snapshot` this way, so it stays log-only.
+- **Paced snapshots.** When the WorldUpdate reorder guard spaces a player's
+  snapshots four or six ticks apart, registration was 98.5 % and 97.9 %.
+- **`shot_on_world_update` and split delivery.** The client stores the header
+  loop of every WorldUpdate, the own-row packet included. That packet
+  therefore repeats the loop of the newest observer snapshot sent to the
+  recipient, so the claim keeps dating the bodies on screen.

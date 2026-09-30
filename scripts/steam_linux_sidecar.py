@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import socket
 import struct
@@ -26,6 +27,49 @@ if __package__:
     from .check_steam_registration import ProbeError, query_a2s
 else:
     from check_steam_registration import ProbeError, query_a2s
+
+
+# This helper is installed with check_steam_registration.py alone, without the
+# server package. Tests pin its public-mode contract to server.mode_data.
+PUBLIC_MODES = ("tdm", "ctf", "cctf", "zom", "vip", "tc", "dia", "dem", "mh", "oc")
+_MODE_ALIASES = {
+    "zombie": "zom", "classic_ctf": "cctf", "classic-ctf": "cctf",
+    "multihill": "mh", "multi-hill": "mh", "territory_control": "tc",
+    "territory-control": "tc", "diamond": "dia", "diamond_mine": "dia",
+    "demolition": "dem", "occupation": "oc",
+}
+_REGION_ALIASES = {
+    "us_west": "us_west", "uswest": "us_west", "usw": "us_west", "west": "us_west",
+    "us_east": "us_east", "useast": "us_east", "use": "us_east", "east": "us_east",
+    "america": "us_east", "americas": "us_east", "north_america": "us_east",
+    "northamerica": "us_east", "na": "us_east", "us": "us_east", "usa": "us_east",
+    "canada": "us_east", "ca": "us_east",
+    "europe": "europe", "eu": "europe", "eu_west": "europe", "eu_central": "europe",
+    "asia": "asia", "as": "asia",
+    "australia": "australia", "au": "australia", "oceania": "australia", "oce": "australia",
+    "": "",
+}
+
+
+def canonical_mode(value: str) -> str:
+    """Resolve the public gameplay codes and aliases used by the server."""
+    code = value.strip().lower()
+    code = _MODE_ALIASES.get(code, code)
+    if code not in PUBLIC_MODES:
+        raise ValueError("mode must be one of " + ", ".join(PUBLIC_MODES))
+    return code
+
+
+def canonical_region(value: str) -> str:
+    """Match website region aliases while emitting a canonical browser tag.
+
+    Unqualified North America means US East, matching the official Canadian
+    fleet and the master listing. Keep Asia and the empty/unfiltered option.
+    """
+    key = re.sub(r"[-\s]+", "_", value.strip().lower())
+    if key not in _REGION_ALIASES:
+        raise ValueError("region must be us_west, us_east, europe, asia, australia, or empty")
+    return _REGION_ALIASES[key]
 
 
 class Callback(c.Structure):
@@ -45,6 +89,8 @@ def vcall(obj: int, index: int, result: Any, types: list[Any], *args: Any) -> An
 
 def advertisement(info: dict[str, Any], mode: str, region: str) -> dict[str, Any]:
     """Convert live A2S metadata into the retail browser's fields."""
+    mode = canonical_mode(mode)
+    region = canonical_region(region)
     if info["folder"].casefold() != "aceofspades":
         raise ProbeError("upstream is not an Ace of Spades server")
     if not 0 <= info["bots"] <= info["players"] <= info["max_players"] <= 255:
@@ -55,9 +101,13 @@ def advertisement(info: dict[str, Any], mode: str, region: str) -> dict[str, Any
     if region:
         tags.append(f"region={region}")
     tags.append("mode=0001")
+    if mode == "cctf":
+        tags.append("classic")
     for tag in str(info.get("tags", "")).split(";"):
-        if tag == "classic" or tag.startswith("skin="):
+        if (tag == "classic" or tag.startswith("skin=")) and tag not in tags:
             tags.append(tag)
+    if mode in {"tc", "vip"} and not any(tag.startswith("skin=") for tag in tags):
+        tags.append("skin=mafia")
     encoded_tags = ";".join(tags)
     if len(encoded_tags.encode()) >= 128:
         raise ProbeError("retail tags exceed the Steam limit")
@@ -208,8 +258,8 @@ def port(value: str) -> int:
     return result
 
 
-def main() -> int:
-    """Keep a live advertisement, withdrawing it when its upstream fails."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the standalone CLI without contacting an upstream or Steam."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--bind-ip", type=ipaddress.IPv4Address, default="0.0.0.0",
@@ -218,9 +268,17 @@ def main() -> int:
     parser.add_argument("--source-port", type=port, required=True)
     parser.add_argument("--game-port", type=port, default=32887)
     parser.add_argument("--query-port", type=port, default=32888)
-    parser.add_argument("--mode", choices=["tdm", "ctf", "zom", "vip", "tc", "dia"], required=True)
-    parser.add_argument("--region", default="europe", choices=["europe", "america", "asia", "oceania", ""])
-    args = parser.parse_args()
+    parser.add_argument("--mode", type=canonical_mode, choices=PUBLIC_MODES, required=True)
+    parser.add_argument("--region", type=canonical_region, default="europe",
+                        help="us_west, us_east, europe, asia, australia, or empty; "
+                             "legacy america and oceania aliases are accepted")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Keep a live advertisement, withdrawing it when its upstream fails."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.game_port == args.query_port:
         parser.error("game and query ports must differ")
     running = True

@@ -199,7 +199,7 @@ def test_projectile_specs_use_the_stock_blast_arguments():
 
 
 # Executed against the stock 32-bit explosionDamageManager with the stock
-# constants (explosion at the origin): (target position, radius, damage,
+# constants (explosion at the origin, attacker ID fixed at 1): (target position, radius, damage,
 # crouched, (head, torso, legs) blocked, classic, self, target team,
 # (kmin, kmax), stock damage, stock added velocity).
 STOCK_GOLDEN = [
@@ -250,7 +250,7 @@ def test_explosion_damage_and_impulse_match_stock_manager(case):
     assert (impulse or (0.0, 0.0, 0.0)) == pytest.approx(stock_velocity, abs=2e-4)
 
 
-def test_stock_reductions_and_non_player_damage():
+def test_server_reduction_policy_and_stock_non_player_damage():
     # Enemy on team 2 at 3 blocks (body 0.75 lower), grenade-like 100/r4.
     full = R.explosion_player_damage((0, 0, 0), (3, 0, 0), 4.0, 100.0,
                                      target_team=2)
@@ -393,7 +393,9 @@ class _Player:
         return (self.x, self.y, self.z)
 
     def damage(self, amount, source=None, kill_type=0):
-        self.damage_calls.append((amount, source, kill_type))
+        # Model Player.damage's final HP conversion. The blast itself must
+        # leave fractions available to the mode/rule modifiers first.
+        self.damage_calls.append((round(amount), source, kill_type))
 
 
 class _Registry:

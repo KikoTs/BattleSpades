@@ -12,10 +12,8 @@ import pytest
 
 from server.build_info import (
     BUILD_INFO_FILENAME,
-    CLIENT_REPOSITORY,
     DISPLAY_RELEASE,
     PROJECT_WEBSITE,
-    SERVER_REPOSITORY,
     BuildInfo,
     load_build_info,
     write_build_info,
@@ -33,16 +31,17 @@ from shared.packet import ChatMessage, NewPlayerConnection
 from tests.test_reversed_spawn_handshake import DummyServer, make_connection
 
 
-def test_default_greeting_contains_requested_release_and_verified_project_links():
+def test_default_greeting_contains_release_discord_and_server_source_notice():
     config = ServerConfig()
     lines = join_message_lines(config, "Builder", BuildInfo(DISPLAY_RELEASE, "2026-09-21"))
     assert len(lines) == 4
-    assert lines[0] == "Welcome, Builder! BattleSpades Beta 0.1 | Build (UTC): 2026-09-21"
+    assert lines[0] == "Welcome, Builder! BattleSpades Beta 0.2 | Build (UTC): 2026-09-21"
     assert "open AoS Revival project" in lines[1]
     assert "Server + client" in lines[1]
     assert PROJECT_WEBSITE in lines[1]
-    assert lines[2] == f"Server: {SERVER_REPOSITORY}"
-    assert lines[3] == f"Client: {CLIENT_REPOSITORY}"
+    assert lines[2] == "Join our Discord: https://discord.gg/aosbb"
+    assert lines[3] == "Server source code is available in our Discord."
+    assert all("github.com" not in line for line in lines)
     assert all(len(line.encode("utf-8")) <= MAX_MESSAGE_BYTES for line in lines)
     assert config.steam.game_version == "1.0.0.0"
     assert config.steam.protocol_version == 168
@@ -126,7 +125,7 @@ def test_join_dispatch_waits_for_world_reveal_and_never_repeats(monkeypatch):
     assert len(chats) == 4
     assert all(packet.player_id == 255 and packet.chat_type == CHAT_SYSTEM
                and flags["reliable"] for packet, flags in chats)
-    assert chats[0][0].value.startswith("Welcome, Builder! BattleSpades Beta 0.1")
+    assert chats[0][0].value.startswith("Welcome, Builder! BattleSpades Beta 0.2")
     assert not any(data[0] == ChatMessage.id for data in server.broadcast_packets)
     assert len(handled) == 3
 
@@ -167,4 +166,4 @@ def test_freezer_includes_stable_stamp_without_changing_internal_version():
     spec = (root / "BattleSpades.spec").read_text(encoding="utf-8")
     assert "from server.build_info import write_build_info" in spec
     assert 'datas.append((str(build_info_path), "."))' in spec
-    assert (root / "VERSION").read_text().strip() == "0.1.0-beta.1"
+    assert (root / "VERSION").read_text().strip() == "0.2.0-beta.1"

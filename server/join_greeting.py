@@ -6,9 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from server.build_info import (
-    CLIENT_REPOSITORY,
     PROJECT_WEBSITE,
-    SERVER_REPOSITORY,
     BuildInfo,
     runtime_build_info,
 )
@@ -21,8 +19,8 @@ if TYPE_CHECKING:
 DEFAULT_JOIN_GREETING = "Welcome, {player}! {release} | Build (UTC): {build_date}"
 DEFAULT_MOTD = (
     f"Dig in. Build big. Server + client: an open AoS Revival project | {PROJECT_WEBSITE}",
-    f"Server: {SERVER_REPOSITORY}",
-    f"Client: {CLIENT_REPOSITORY}",
+    "Join our Discord: https://discord.gg/aosbb",
+    "Server source code is available in our Discord.",
 )
 # Use the more conservative original chat-field limit, in UTF-8 bytes.
 MAX_MESSAGE_BYTES = 90

@@ -209,7 +209,9 @@ class TutorialMode(BaseMode):
         super().__init__(server)
         self._sessions: dict[int, TutorialSession] = {}
         self._lane_occupants: dict[int, int] = {}
-        self._mutation_queue: deque[tuple[int, int, int, bool]] = deque()
+        self._mutation_queue: deque[
+            tuple[int, int, int, bool, TutorialSession | None]
+        ] = deque()
         self._mutation_listener_token: int | None = None
         self._target_voxels: list[
             list[dict[tuple[int, int, int], int]]
@@ -772,22 +774,31 @@ class TutorialMode(BaseMode):
                 touched.add((int(x), int(y), int(z)))
         if len(self._mutation_queue) >= self.MUTATION_QUEUE_LIMIT:
             return
-        self._mutation_queue.append((int(x), int(y), int(z), bool(solid)))
+        # A lane can be restored/reassigned before this bounded queue drains.
+        # Bind progress to its occupant at publication, not its next learner.
+        token = self._lane_occupants.get(lane_index)
+        session = self._sessions.get(token)
+        self._mutation_queue.append((int(x), int(y), int(z), bool(solid), session))
 
     def _drain_world_mutations(self, now: float) -> None:
         """Interpret a bounded edit batch as target hits or construction."""
 
         for _ in range(min(len(self._mutation_queue), self.MUTATION_DRAIN_BUDGET)):
-            x, y, z, solid = self._mutation_queue.popleft()
+            x, y, z, solid, session = self._mutation_queue.popleft()
             coordinate = (x, y, z)
+            lane_index = self._lane_for_coordinate(x, y)
+            if (
+                session is None
+                or self._sessions.get(id(session.player)) is not session
+                or self._lane_occupants.get(lane_index) != id(session.player)
+            ):
+                continue
             if not solid:
                 target = self._target_lookup.get(coordinate)
                 if target is None:
                     continue
                 lane_index, target_index = target
-                token = self._lane_occupants.get(lane_index)
-                session = self._sessions.get(token) if token is not None else None
-                if session is None or target_index in session.destroyed_targets:
+                if target_index in session.destroyed_targets:
                     continue
                 self._drop_target(session, target_index, now)
                 continue
@@ -795,9 +806,7 @@ class TutorialMode(BaseMode):
             lane_index = self._lane_for_coordinate(x, y)
             if lane_index is None or coordinate in self._target_lookup:
                 continue
-            token = self._lane_occupants.get(lane_index)
-            session = self._sessions.get(token) if token is not None else None
-            if session is not None and session.stage is TutorialStage.CLIMB:
+            if session.stage is TutorialStage.CLIMB:
                 session.built_cells.add(coordinate)
 
     def _lane_for_coordinate(self, x: int, y: int) -> int | None:

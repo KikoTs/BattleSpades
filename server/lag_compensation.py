@@ -356,6 +356,13 @@ def rewind_targets(server, shooter, packet) -> Optional[RewindContext]:
     view_delay_ms = max(0.0, float(_setting(
         server, "lag_compensation_view_delay_ms", DEFAULT_VIEW_DELAY_MS)))
     allowed_ms = min(rtt_ms + extra_ms, max_ms)
+    # The round trip overstates the view age by about 12 ms (half a tick of
+    # wait before the shot is handled plus the client's socket poll inside
+    # every acknowledgement). That is deliberate: measured over 10,000 shots
+    # per setting (scripts/lag_compensation_link.py), removing it halves the
+    # mean position error but registers fewer shots, because the misses are
+    # direction changes, where the client's extrapolation overshoots and a
+    # slightly older body is the nearer one.
     desired_ms = rtt_ms + view_delay_ms
 
     snapshot = None

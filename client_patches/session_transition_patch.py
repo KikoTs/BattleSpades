@@ -4,8 +4,9 @@
 The retail ``MapEnded`` handler only freezes the compiled ``GameScene``; it
 does not open ``LoadingMenu`` and ENet disconnect reason 18 does not reconnect.
 BattleSpades sends a fresh loader handshake over the existing authenticated
-peer, so this compatibility hook moves the client to ``LoadingMenu`` after the
-three native MapEnded pause flags become true.
+peer. InitialInfo itself opens the stock loader through GameClient; this
+optional hook enters ``LoadingMenu`` earlier, after the three native MapEnded
+pause flags become true. The server does not require its packet-110 reply.
 
 The hook wraps the GameManager's already-scheduled update callback.  It does no
 polling thread, network I/O, or filesystem I/O and remains compatible with the

@@ -490,8 +490,13 @@ def test_double_dragon_water_recovery_moves_real_player_physics_to_land() -> Non
     asyncio.run(scenario())
 
 
-def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
+def test_double_dragon_production_brain_drives_real_spawned_players(monkeypatch) -> None:
     """Run actual TDM policy, motor, mutations, and native bodies together."""
+
+    # Motor decisions and authority cooldowns must share the accelerated
+    # clock. Real wall time made build/dig acceptance depend on runner speed.
+    simulated_clock = [1_000_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: simulated_clock[0])
 
     async def scenario() -> None:
         random_state = random.getstate()
@@ -562,6 +567,7 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
             try:
                 for tick in range(60 * 30):
                     now = base + tick / 60.0
+                    simulated_clock[0] = now
                     if tick % 8 == 0:
                         snapshots = director._snapshot_players()
                         entities = director._snapshot_entities()
@@ -731,6 +737,8 @@ def test_double_dragon_production_brain_drives_real_spawned_players() -> None:
                 or max(max_idle_stall_ticks.values()) >= 120
             ):
                 for player in players:
+                    if player.id not in longest_stall:
+                        continue
                     runtime = director._runtime[player.id]
                     state = brain._states[(player.id, runtime.generation)]
                     position = tuple(
