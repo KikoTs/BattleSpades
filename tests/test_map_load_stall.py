@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -101,6 +102,27 @@ async def _worst_main_gap_during(name: str) -> tuple[float, float]:
     return worst, await task
 
 
+async def _sample_main_gaps(name: str) -> list[tuple[float, float]]:
+    """Use a fixed sample set so shared-runner scheduling cannot pick a pass."""
+    return [await _worst_main_gap_during(name) for _ in range(5)]
+
+
+def test_responsiveness_probe_detects_gil_held_work(monkeypatch):
+    import ctypes
+
+    def blocking_load(name):
+        # PyDLL, unlike CDLL, retains the GIL throughout the native call.
+        if sys.platform == "win32":
+            ctypes.PyDLL("kernel32.dll").Sleep(100)
+        else:
+            ctypes.PyDLL(None).usleep(100_000)
+        return 0.1
+
+    monkeypatch.setattr(sys.modules[__name__], "_load_world", blocking_load)
+    samples = asyncio.run(_sample_main_gaps("negative control"))
+    assert statistics.median(gap for gap, _ in samples) >= 0.030
+
+
 @pytest.mark.parametrize("name", ["MayanJungle", "Classic"])
 def test_background_map_load_keeps_main_thread_responsive(name):
     if not (MAPS / f"{name}.vxl").is_file():
@@ -115,13 +137,16 @@ def test_background_map_load_keeps_main_thread_responsive(name):
         winmm.timeBeginPeriod(1)
     try:
         _load_world(name)  # warm imports/metadata caches off the clock
-        worst, load_s = asyncio.run(_worst_main_gap_during(name))
+        samples = asyncio.run(_sample_main_gaps(name))
     finally:
         if winmm is not None:
             winmm.timeEndPeriod(1)
-    print(f"{name}: worst main-thread gap {worst * 1000:.1f} ms, load {load_s:.2f} s")
-    # Target < 30 ms (measured ~8 ms; the GIL-held parse used to give ~0.4 s).
-    assert worst < 0.030
+    gaps_ms = [round(gap * 1000, 1) for gap, _ in samples]
+    print(f"{name}: five worst main-thread gaps {gaps_ms} ms")
+    # Keep the 30 ms budget. A fixed five-sample median rejects repeatable
+    # GIL stalls while tolerating occasional descheduling by shared CI hosts.
+    # The native GIL-held negative control above guards the measurement.
+    assert statistics.median(gap for gap, _ in samples) < 0.030
 
 
 def _variants(data: bytes, rng: random.Random):
