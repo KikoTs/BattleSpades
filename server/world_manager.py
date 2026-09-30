@@ -8,8 +8,11 @@ import math
 import os
 import random
 import struct
+import threading
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass
+from time import perf_counter as _scan_clock, sleep as _scan_yield
 from typing import Callable, Optional, Tuple
 
 import shared.constants as C
@@ -31,6 +34,27 @@ logger = logging.getLogger(__name__)
 MAP_X = int(C.MAP_X)
 MAP_Y = int(C.MAP_Y)
 MAP_Z = int(C.MAP_Z)
+
+
+def _spawn_scan_columns(
+    x_start: int, x_stop: int, y_start: int, y_stop: int, step: int = 1,
+) -> Iterator[tuple[int, int]]:
+    """Keep background spawn discovery from starving the live event loop.
+
+    Repeated short Python/native probes can reacquire the GIL for tens of
+    milliseconds on macOS despite the parser releasing it. Yield explicitly
+    every two milliseconds on a worker, preserving coordinate order. Startup
+    and any live main-thread caller retain the ordinary synchronous scan.
+    """
+    background = threading.current_thread() is not threading.main_thread()
+    deadline = _scan_clock() + 0.002 if background else 0.0
+    for x in range(x_start, x_stop, step):
+        for y in range(y_start, y_stop, step):
+            yield x, y
+            if background and _scan_clock() >= deadline:
+                _scan_yield(0.001)
+                deadline = _scan_clock() + 0.002
+
 
 # Authored spawn areas whose retail spawns stood in the sea. Retail dropped
 # SpookyMansion's zombies into the z=239 water ring around the island; every
@@ -1149,24 +1173,26 @@ class WorldManager:
     def _zone_candidates(self, zone: MapZone) -> list[tuple[int, ...]]:
         candidates: list[tuple[int, ...]] = []
         x0, x1, y0, y1 = zone.xy_bounds()
-        for x in range(max(1, x0), min(MAP_X - 2, x1) + 1):
-            for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1):
-                surface_ok = self._safe_spawn_column(
-                    x, y, authored_zone=zone, reject_roofs=False
-                )
-                if surface_ok:
-                    candidates.append((x, y))
-                surface_z = self._get_surface_z(x, y)
-                for floor_z in self._zone_floor_levels(x, y, zone):
-                    if floor_z == surface_z and surface_ok:
-                        # Already a top-surface candidate. A top surface that
-                        # failed the terrain-only rules (a jetty or bridge
-                        # deck with air beneath it, open water) is still
-                        # where a retail drop into this box landed, so it is
-                        # judged by the floor rules below instead.
-                        continue
-                    if self._safe_spawn_floor(x, y, floor_z, zone):
-                        candidates.append((x, y, floor_z))
+        for x, y in _spawn_scan_columns(
+            max(1, x0), min(MAP_X - 2, x1) + 1,
+            max(1, y0), min(MAP_Y - 2, y1) + 1,
+        ):
+            surface_ok = self._safe_spawn_column(
+                x, y, authored_zone=zone, reject_roofs=False
+            )
+            if surface_ok:
+                candidates.append((x, y))
+            surface_z = self._get_surface_z(x, y)
+            for floor_z in self._zone_floor_levels(x, y, zone):
+                if floor_z == surface_z and surface_ok:
+                    # Already a top-surface candidate. A top surface that
+                    # failed the terrain-only rules (a jetty or bridge
+                    # deck with air beneath it, open water) is still
+                    # where a retail drop into this box landed, so it is
+                    # judged by the floor rules below instead.
+                    continue
+                if self._safe_spawn_floor(x, y, floor_z, zone):
+                    candidates.append((x, y, floor_z))
         return candidates
 
     def _zone_spawn_candidates(self, team: int) -> list[tuple[int, ...]]:
@@ -1232,8 +1258,7 @@ class WorldManager:
         x0, y0, x1, y1 = self._spawn_region(team)
         strict = [
             (x, y)
-            for x in range(x0, x1 + 1, 4)
-            for y in range(y0, y1 + 1, 4)
+            for x, y in _spawn_scan_columns(x0, x1 + 1, y0, y1 + 1, 4)
             if self._safe_spawn_column(x, y)
         ]
         if strict:
@@ -1242,8 +1267,7 @@ class WorldManager:
         # is still safer than the native random surface (which selects roofs).
         return [
             (x, y)
-            for x in range(x0, x1 + 1, 4)
-            for y in range(y0, y1 + 1, 4)
+            for x, y in _spawn_scan_columns(x0, x1 + 1, y0, y1 + 1, 4)
             if self._get_surface_z(x, y) <= int(C.Z_ABOVE_WATERPLANE)
         ]
 
@@ -1316,8 +1340,10 @@ class WorldManager:
             x0, x1, y0, y1 = zone.xy_bounds()
             candidates = [
                 (x, y)
-                for x in range(max(1, x0), min(MAP_X - 2, x1) + 1)
-                for y in range(max(1, y0), min(MAP_Y - 2, y1) + 1)
+                for x, y in _spawn_scan_columns(
+                    max(1, x0), min(MAP_X - 2, x1) + 1,
+                    max(1, y0), min(MAP_Y - 2, y1) + 1,
+                )
                 if self._safe_spawn_column(
                     x, y, authored_zone=zone, reject_roofs=False
                 )
