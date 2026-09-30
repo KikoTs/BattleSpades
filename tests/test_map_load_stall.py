@@ -15,6 +15,7 @@ import asyncio
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,9 +28,54 @@ from server.runtime_vxl import (
     _raw_vxl_size,
 )
 from server.world_manager import WorldManager
+import server.world_manager as world_manager
 
 
 MAPS = Path(__file__).resolve().parents[1] / "maps"
+
+
+def test_main_thread_spawn_scan_never_sleeps_or_reads_clock(monkeypatch):
+    def unexpected_call(*args):
+        pytest.fail("main-thread spawn selection must remain synchronous")
+
+    monkeypatch.setattr(world_manager, "_scan_clock", unexpected_call)
+    monkeypatch.setattr(world_manager, "_scan_yield", unexpected_call)
+    assert list(world_manager._spawn_scan_columns(1, 6, 2, 7, 2)) == [
+        (1, 2), (1, 4), (1, 6), (3, 2), (3, 4), (3, 6),
+        (5, 2), (5, 4), (5, 6),
+    ]
+
+
+def test_background_spawn_scan_yields_within_budget_and_preserves_order(monkeypatch):
+    now = 0.0
+    pauses = []
+
+    def read_clock():
+        return now
+
+    def pause(delay):
+        pauses.append((now, delay))
+
+    def scan():
+        nonlocal now
+        columns = []
+        for column in world_manager._spawn_scan_columns(1, 6, 2, 7, 2):
+            columns.append(column)
+            now += 0.001  # Each terrain probe consumes one millisecond.
+        return columns
+
+    monkeypatch.setattr(world_manager, "_scan_clock", read_clock)
+    monkeypatch.setattr(world_manager, "_scan_yield", pause)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        columns = executor.submit(scan).result()
+    assert columns == [(x, y) for x in range(1, 6, 2) for y in range(2, 7, 2)]
+    assert len(pauses) >= 3
+    previous = 0.0
+    for at, delay in pauses:
+        assert 0.002 <= at - previous < 0.0031
+        assert delay == 0.001
+        previous = at
+    assert now - previous < 0.0031
 
 
 def _load_world(name: str) -> float:
