@@ -189,7 +189,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="$(python -c 'from server.build_info import DISPLAY_RELEASE; print(DISPLAY_RELEASE)')"
+          title="$(python -c 'import runpy; print(runpy.run_path("server/build_info.py")["DISPLAY_RELEASE"])')"
           gh release create "$GITHUB_REF_NAME" \
             release-assets/*.zip release-assets/SHA256SUMS.txt \
             --verify-tag \

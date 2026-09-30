@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +46,27 @@ def test_release_job_requires_complete_build_matrix() -> None:
     assert "release:\n    name: Publish prerelease\n    needs: build" in text
     assert "startsWith(github.ref, 'refs/tags/v')" in text
     assert "scripts/verify_release_assets.py" in text
+
+
+def test_release_title_does_not_import_server_runtime(tmp_path: Path) -> None:
+    """The publish-only runner has neither game dependencies nor extensions."""
+    command = re.search(r"python -c '([^']+)'", _workflow_text())
+    assert command is not None
+    package = tmp_path / "server"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        'raise AssertionError("Publishing must not initialize the server runtime")\n',
+        encoding="utf-8",
+    )
+    (package / "build_info.py").write_bytes(
+        (PROJECT_ROOT / "server" / "build_info.py").read_bytes()
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", command.group(1)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "BattleSpades Beta 0.2"
 
 
 def test_tag_is_validated_against_version_file() -> None:
