@@ -37,6 +37,11 @@ A key missing from the file falls back to the value in the shipped
 unshipped map `classicgen`. Port 32887 is an explicit choice for the
 unmodified Steam browser (see `[steam]`), not a default.
 - `tick_rate`: bounded to 10–240; production must remain 60 for retail physics.
+- `password`: optional join password, at most 64 UTF-8 bytes; blank is public.
+  Requires the native BattleSpades client. `password_max_attempts` (3),
+  `password_timeout_seconds` (60), and `password_lockout_seconds` (60) bound
+  failed joins. A password server advertises A2S visibility 1 and the master
+  `password` tag. Password packets and their lengths are excluded from logs.
 
 ### `[steam]`
 
@@ -163,6 +168,20 @@ The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
   rewound; terrain and damage use the live world. The retail client
   extrapolates remote players, so the view delay stays 0
   (docs/LAG_COMPENSATION.md).
+- `worldupdate_delivery` (default `"split"`; or `"sequenced"`): how the 30 Hz
+  WorldUpdate is sent. The stock client opens one ENet channel, and on it an
+  ordered unreliable packet waits behind any lost reliable packet sent before
+  it, which froze every remote player until the retransmission arrived.
+  `split` sends the rows of other players, entities and turrets unsequenced
+  (nothing can hold them) in packets that fit one datagram, and keeps each
+  player's own row on the ordered stream. `sequenced` restores the single
+  ordered packet.
+- `worldupdate_reorder_guard` (default `true`): neither client orders
+  WorldUpdates itself. When a player's own input stream shows that the link
+  swaps datagrams two frames apart, that player's unsequenced snapshots are
+  spaced wider than the measured displacement (down to 10 Hz, ordered
+  delivery beyond that), so a stale snapshot is never applied over a newer
+  one. `tick stats:` is unchanged; the measurement is per player.
 - `terrain_repair_enabled`, `terrain_repair_queue_limit`,
   `terrain_repair_batch_limit`, `terrain_repair_interval_ticks`,
   `terrain_repair_delay_ticks`: delayed canonical repair of rejected client
@@ -171,9 +190,10 @@ The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
   `terrain_collapse_repair_delay_ticks`: faster exact-air confirmation for
   server-derived unsupported collapses. The stock checked Damage animation is
   still sent first; these values only bound the stale-geometry safety net.
-- `transition_grace_seconds`: maximum wait for the maintained client's
-  post-`MapEnded(52)` loader-ready acknowledgement. A peer that does not enter
-  `LoadingMenu` in time is disconnected with reason 18 before `InitialInfo`.
+- `transition_grace_seconds`: optional dwell after `MapEnded(52)` before
+  `InitialInfo(114)` opens the stock loader on the retained peer (0–5 seconds).
+  The subsequent `MapDataValidation` response gates terrain transfer; no
+  custom-client loader acknowledgement is required.
 
 ### `[game]` and `[lobby]`
 
@@ -185,6 +205,8 @@ The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
 - `default_map`: `.vxl` basename without a path. Default `MayanJungle`.
 - `movement_authority`: `server` (production) or diagnostic `client` echo.
 - `map_sync_mode`: production `full`; `auto` remains experimental.
+  See [PROTOCOL.md](PROTOCOL.md#map-validation-and-the-fast-join-2026-09-29)
+  for the tested CRC/delta behavior and outstanding retail visual check.
 - `same_team_collision`, `friendly_fire`, `fall_damage`, `build_damage`:
   authoritative simulation switches.
 - `bot_count`: legacy fixed bot count, used only when `[bots]` is absent.
@@ -201,6 +223,12 @@ The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
   warning.
 - `[lobby]` `map_rotation_shuffle` (default `true`): shuffle the map list once at
   startup, like retail's `random.shuffle(map_list)` at lobby creation.
+- `lobby.map_prefabs`: a table of map names to extra construct names for
+  capable native clients, e.g. `{ MayanJungle = ["prefab_ladder"] }`.
+  It replaces the defaults: London's taxi/postbox/duck and LunarBase's
+  cargo/shield/steps. `{}` disables extras. Each map allows up to eight names;
+  missing models are omitted. Classes without MAP_PREFABS cannot carry them.
+  These defaults are a server choice, not recovered retail map catalogs.
 - `[lobby]` `map_vote_retail_max_players` (default `true`): a map whose retail
   `mapinfo` `max_players` (DragonIsland 16, London/LunarBase 20,
   BlockNess/SpookyMansion 24) is below the connected human count is offered
@@ -293,6 +321,18 @@ Mode rules and accepted choices:
 | Diamond Mine | bases 1–5, score 5–60 step 5, diamonds 1–5, lifetime 10–60 step 10 |
 | Demolition | build state OFF or 10–120 seconds step 10 |
 | Occupation | score OFF, 3/6/9/15/30/45/60/75/90/150; bombs 1–3; fuse 5/10/15/20 |
+
+Diamond Mine spawns diamonds when blocks are mined; none is placed at round
+start. `[modes.dia] discovery_guarantee_blocks` defaults to `300`: when no
+diamond is active, that many mined blocks since the last find guarantee the
+next discovery after the spawn cooldown. Set `0` for retail chance only.
+Bots now hold their mining target until the block breaks and seek a new site
+when no block is within reach. Once-a-minute logs report mined blocks and
+discoveries. `loose_cash_in = true` scores a dropped diamond resting in an
+open drop-off for its last carrier's team; set it to `false` to disable this
+inferred trigger. Throw velocity is currently accepted but ground diamonds
+are anchored to the surface immediately; authoritative pickup flight has not
+been recovered.
 
 The exact keys are visible in `config.toml` and defined in
 `server/game_rules.py`; tests require that catalog to contain all 102 recovered
@@ -391,13 +431,25 @@ Enforcement switches: `enforce_shot_origin` with `shot_origin_tolerance`,
 `enforce_aim_direction` with `aim_direction_tolerance_deg`,
 `enforce_input_starvation` with `starvation_airborne_ticks` and
 `starvation_timeout_seconds`, `enforce_input_backlog` with
-`backlog_max_frames`, `enforce_block_interval` (default false: the stock
-server-only `MIN_BLOCK_INTERVAL`, 0.1 s between one player's accepted block
-builds/lines; a too-early build is refused with a canonical repair when true,
-counted as `block_interval:observed` otherwise; bots always pace themselves
-to it), plus `kick_on_protocol_violation`,
+`backlog_max_frames`, `enforce_block_interval` (enabled in the sample config;
+omitting the key retains the older log-only default), plus `kick_on_protocol_violation`,
 `admin_login_attempts` and `summary_interval_seconds`. Checks that could
 reject legitimate play under packet loss ship log-only.
+
+Block cadence uses the stock server-only `MIN_BLOCK_INTERVAL` (0.1 seconds)
+for builds, lines and flares. Plausible client frame labels preserve spacing
+when reliable packets arrive together; a bounded budget replenished by server
+time still limits the sustained rate. Packets with absent or invalid labels
+share that budget and must satisfy arrival-time spacing. Refused builds get a
+canonical repair when enforcement is enabled and otherwise increment
+`block_interval:observed`. Bots retain their arrival-time pacing.
+
+Shots use the same frame-label and server-time budget approach, with a shared
+fire lane across tools and mouse buttons. Changing tools cannot shorten the
+previous shot's cooldown or turn fast-tool credit into extra slow-tool shots.
+Reloads still complete on server time: reload packet 76 has no action label.
+See `tests/test_action_clock.py` and `tests/test_action_clock_recovery_review.py`
+for packet bunching, mixed-label, forged-rate and delayed-burst regressions.
 
 **Suspicion report** (`server/anticheat_report.py`). Every
 `summary_interval_seconds` the server scores each human against statistical

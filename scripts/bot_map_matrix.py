@@ -381,6 +381,11 @@ async def simulate_map(
         if mode_type is None:
             raise ValueError(f"unknown mode {mode_name}")
         server.mode = mode_type(server)
+        # Diamond Mine owns a separate discovery stream. Seeding the module
+        # RNG alone leaves identical matrix seeds at the mercy of OS entropy.
+        mode_rng = getattr(server.mode, "_rng", None)
+        if isinstance(mode_rng, random.Random):
+            mode_rng.seed(seed)
         await server.mode.on_mode_start()
         if respawns:
             # Keep a single continuous round alive for accelerated endurance.

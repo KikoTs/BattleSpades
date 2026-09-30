@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from shared.bytes import ByteReader
 from shared.packet import StateData
 from server.builders.state_data import build_state_data
 from server.config import ServerConfig
 from server.game_constants import TEAM1, TEAM2
-from server.map_metadata import MapMetadata
+from server.map_metadata import MapMetadata, load_map_metadata
 from server.team import Team
 
 
@@ -71,3 +74,41 @@ def test_state_data_uses_authored_map_lighting():
     assert packet.back_light_direction == (0.0, 0.7, 0.3)
     assert packet.ambient_light_color == (15, 30, 10)
     assert abs(packet.ambient_light_intensity - 0.3) < 1e-6
+
+
+@pytest.mark.parametrize("name", ["ArcticBase", "London"])
+def test_missing_map_lighting_preserves_pre_parity_wire_appearance(name):
+    """A missing map palette must not borrow MayanJungle's warm lighting."""
+    server = _server(None)
+    metadata = load_map_metadata(Path("maps") / f"{name}.vxl", "tdm")
+    assert metadata.light_color is None
+    server.world_manager.map_metadata = metadata
+    wire = bytes(build_state_data(server, player_id=7).generate())
+    received = StateData(ByteReader(wire[1:]))
+
+    # Compatibility baseline: the actual StateData values before 68c36ca.
+    # This does not assert that an unrecovered retail map used these values.
+    assert received.light_color == (180, 192, 220)
+    assert received.light_direction == (13 / 64, 51 / 64, 0.0)
+    assert received.back_light_color == (64, 64, 64)
+    # Stock fixed encoding adds 0.5 before truncation even for negatives.
+    assert received.back_light_direction == (-4 / 64, -36 / 64, 19 / 64)
+    assert received.ambient_light_color == (52, 56, 64)
+    assert received.ambient_light_intensity == 13 / 64
+
+
+@pytest.mark.parametrize("name", ["MayanJungle", "Trenches"])
+def test_recovered_map_lighting_survives_fallback_rollback(name):
+    """Restoring the fallback must preserve maps with recovered lighting."""
+    server = _server(None)
+    server.world_manager.map_metadata = load_map_metadata(
+        Path("maps") / f"{name}.vxl", "tdm"
+    )
+    wire = bytes(build_state_data(server, player_id=7).generate())
+    received = StateData(ByteReader(wire[1:]))
+    assert received.light_color == (236, 244, 203)
+    assert received.light_direction == (-44 / 64, 19 / 64, 0.0)
+    assert received.back_light_color == (15, 20, 10)
+    assert received.back_light_direction == (0.0, 45 / 64, 19 / 64)
+    assert received.ambient_light_color == (15, 30, 10)
+    assert received.ambient_light_intensity == 19 / 64

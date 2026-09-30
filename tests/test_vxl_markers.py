@@ -129,6 +129,9 @@ def test_restored_flare_cells_reach_the_bot_worker_map():
 
     server = BattleSpadesServer(ServerConfig())
     assert server.world_manager.load_map("Training")
+    # This regression exercises an explicitly authored palette. Training's
+    # missing shipped sidecar must not inherit another map's editor colors.
+    server.world_manager.map_metadata.static_light_colors = {0: (224, 172, 29)}
     published = []
     supervisor = SimpleNamespace(
         publish_world_change=lambda change, **_kw: published.append(change),

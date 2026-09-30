@@ -1,5 +1,10 @@
 """Wire metadata and real occupancy contracts for the Linux Steam sidecar."""
+import os
 import struct
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -56,6 +61,126 @@ def test_native_map_prefix_and_classic_skin_are_preserved():
     result = sidecar.advertisement(upstream(map="TDM_Atlantis", tags="v168;mode=0006;classic;skin=mafia"), "tdm", "")
     assert result["map"] == "TDM_Atlantis"
     assert result["tags"] == "v168;playlist=8;mode=0001;classic;skin=mafia"
+
+
+@pytest.mark.parametrize("region, canonical", [
+    ("america", "us_east"), ("NA", "us_east"), ("us-west", "us_west"),
+    (" US East ", "us_east"), ("EU", "europe"), ("oceania", "australia"),
+])
+def test_region_aliases_advertise_browser_filter_values(region, canonical):
+    result = sidecar.advertisement(upstream(), "tdm", region)
+    assert f"region={canonical}" in result["tags"].split(";")
+
+
+@pytest.mark.parametrize("mode", ["dem", "mh", "oc", "cctf"])
+def test_sidecar_cli_accepts_new_public_modes_and_canonical_region(mode):
+    parser = sidecar.build_parser()
+    arguments = parser.parse_args([
+        "--runtime", ".", "--source-port", "32887", "--mode", mode,
+        "--region", "us_east",
+    ])
+    result = sidecar.advertisement(upstream(), arguments.mode, arguments.region)
+    assert result["map"] == f"{mode.upper()}_CityOfChicago"
+    assert "mode=0001" in result["tags"].split(";")
+    assert "region=us_east" in result["tags"].split(";")
+    if mode == "cctf":
+        assert "classic" in result["tags"].split(";")
+
+
+def test_public_mode_and_alias_contract_matches_server():
+    from server import mode_data
+
+    public = set(mode_data.MODES) - {"nor", "tut", "ugc"}
+    assert set(sidecar.PUBLIC_MODES) == public
+    for name in public | set(sidecar._MODE_ALIASES):
+        arguments = sidecar.build_parser().parse_args([
+            "--runtime", ".", "--source-port", "32887", "--mode", name,
+        ])
+        assert arguments.mode == mode_data.get(name).code
+
+
+@pytest.mark.parametrize("region", ["us_west", "us_east", "europe", "asia", "australia", ""])
+def test_canonical_regions_survive_cli_and_advertisement(region):
+    arguments = sidecar.build_parser().parse_args([
+        "--runtime", ".", "--source-port", "32887", "--mode", "tdm",
+        "--region", region,
+    ])
+    tags = sidecar.advertisement(upstream(), arguments.mode, arguments.region)["tags"].split(";")
+    assert ([tag for tag in tags if tag.startswith("region=")]
+            == ([f"region={region}"] if region else []))
+
+
+@pytest.mark.parametrize("mode", ["tc", "vip", "cctf", "dem", "mh", "oc"])
+def test_mode_flags_match_main_server_advertisement(mode):
+    from server.config import ServerConfig
+    from server.steam_master import build_game_tags
+
+    config = ServerConfig()
+    config.steam.region = "us_east"
+    expected = build_game_tags(config, mode)
+    assert sidecar.advertisement(upstream(tags=""), mode, "us_east")["tags"] == expected
+
+
+@pytest.mark.parametrize("option, value", [
+    ("--mode", "typo"), ("--mode", "ugc"), ("--mode", "tutorial"),
+    ("--region", "somewhere"), ("--region", "europe;mode=0006"),
+])
+def test_bad_advertisement_options_fail_before_query(monkeypatch, option, value):
+    query = Mock(side_effect=AssertionError("must not query on invalid CLI"))
+    monkeypatch.setattr(sidecar, "query_a2s", query)
+    with pytest.raises(SystemExit) as result:
+        sidecar.main(["--runtime", ".", "--source-port", "32887", "--mode", "tdm", option, value])
+    assert result.value.code == 2
+    query.assert_not_called()
+
+
+def test_legacy_region_is_canonical_for_both_tags_and_steam(monkeypatch):
+    calls = {}
+    handlers = {}
+
+    class FakeSteam:
+        def __init__(self, *args):
+            pass
+
+        def update(self, data, rows):
+            calls["tags"] = data["tags"]
+
+        def start(self, region):
+            calls["region"] = region
+
+        def poll(self):
+            handlers[sidecar.signal.SIGTERM](None, None)
+            return True, 1, 0
+
+        def close(self):
+            calls["closed"] = True
+
+    monkeypatch.setattr(sidecar, "SteamServer", FakeSteam)
+    monkeypatch.setattr(sidecar, "query_a2s", lambda *args: upstream())
+    monkeypatch.setattr(sidecar, "query_players", lambda *args: [])
+    monkeypatch.setattr(sidecar.signal, "signal", lambda sig, fn: handlers.setdefault(sig, fn))
+    monkeypatch.setattr(sidecar.time, "sleep", lambda seconds: None)
+    assert sidecar.main([
+        "--runtime", ".", "--source-port", "32887", "--mode", "demolition",
+        "--region", "america",
+    ]) == 0
+    assert calls["region"] == "us_east"
+    assert "region=us_east" in calls["tags"].split(";")
+    assert calls["closed"]
+
+
+def test_standalone_install_does_not_require_server_package(tmp_path):
+    source = Path(sidecar.__file__).parent
+    for name in ("steam_linux_sidecar.py", "check_steam_registration.py"):
+        shutil.copyfile(source / name, tmp_path / name)
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in {"PYTHONPATH", "PYTHONSAFEPATH"}}
+    result = subprocess.run(
+        [sys.executable, str(tmp_path / "steam_linux_sidecar.py"), "--help"],
+        cwd=tmp_path, env=environment, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "cctf" in result.stdout and "us_east" in result.stdout
 
 
 @pytest.mark.parametrize("changes", [{"bots": 13}, {"players": 25}, {"folder": "other"}])

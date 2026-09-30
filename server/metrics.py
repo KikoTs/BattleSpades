@@ -58,6 +58,12 @@ class RuntimeMetrics:
         self.world_sends += int(recipients)
         self.world_bytes += int(size) * int(recipients)
 
+    def record_world_delivery(self, sends: int, total_bytes: int) -> None:
+        """One snapshot serialization delivered as ``sends`` packets."""
+        self.world_serializations += 1
+        self.world_sends += int(sends)
+        self.world_bytes += int(total_bytes)
+
     def snapshot(self) -> dict[str, float | int]:
         values = sorted(self.tick_samples_ms)
         snapshot = {

@@ -131,3 +131,40 @@ def test_next_excavation_face_preserves_owned_melee_cooldown():
     next_face = replace(plan, target_cell=(297, 228, 235))
     assert act(next_face, 100.125) is BotActionKind.NONE
     assert act(next_face, 100.75) is BotActionKind.MELEE
+
+
+@pytest.mark.parametrize("reenter_water", [False, True])
+def test_brief_bank_contact_retains_swim_recovery_until_sustained_dry_exit(
+    monkeypatch, reenter_water
+):
+    from server.bot_ai.messages import MovementAffordance
+    from server.bot_ai.simple_navigation import RouteStep
+    from server.bot_ai.simple_worker import _BotState
+    from tests.test_simple_bot_tactics import _TacticalWorld, _player
+
+    dry = _player(1, 2, (8.5, 10.5, 235.75), is_bot=True)
+    wet = replace(dry, position=(10.5, 10.5, 236.75), wade=True, grounded=False)
+    world = _TacticalWorld(water_step=RouteStep(
+        (10.5, 11.5, 236.75), MovementAffordance.SWIM
+    ))
+    brain = SimpleBotBrain(world)
+    brain.reset_for_map(1)
+    monkeypatch.setattr(brain, "_select_goal", lambda *_args, **_kwargs: None)
+    state = _BotState(1, 1, dry.life_id, water_committed=True,
+                      water_recovery=True, water_escape_position=wet.position,
+                      water_escape_at=99.5)
+    brain._states[(dry.player_id, dry.generation)] = state
+
+    brain.decide(_frame(dry, created_at=100.))
+    assert not state.water_committed  # Ordinary walking resumes immediately.
+    assert state.water_recovery
+    brain.decide(_frame(wet if reenter_water else dry, created_at=100.5))
+    assert state.water_recovery
+    assert state.water_committed is reenter_water
+    if reenter_water:
+        assert world.water_step_calls
+        brain.decide(_frame(dry, created_at=101.))
+    brain.decide(_frame(dry, created_at=103.))
+    assert not state.water_recovery
+    assert state.water_escape_position is None
+    assert state.water_dry_since is None

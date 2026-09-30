@@ -64,6 +64,8 @@ FLAT_KEYS = [
     ("network", "lag_compensation_max_ms", "lag_compensation_max_ms", 250.0),
     ("network", "lag_compensation_extra_ms", "lag_compensation_extra_ms", 50.0),
     ("network", "lag_compensation_view_delay_ms", "lag_compensation_view_delay_ms", 0.0),
+    ("network", "worldupdate_delivery", "worldupdate_delivery", "split"),
+    ("network", "worldupdate_reorder_guard", "worldupdate_reorder_guard", True),
     ("bots", "skill_balance", "bots.skill_balance", True),
     ("bots", "skill_balance_max_shift", "bots.skill_balance_max_shift", 0.35),
     ("bots", "skill_balance_rate", "bots.skill_balance_rate", 0.03),

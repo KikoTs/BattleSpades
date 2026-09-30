@@ -381,13 +381,27 @@ class SimulationRuntime:
                 peer = getattr(getattr(player, "connection", None), "peer", None)
                 throttle = getattr(peer, "packetThrottle", None)
                 rtt = getattr(peer, "roundTripTime", None)
+                # Out-of-order input: labels that arrived after a newer one,
+                # refilled labels whose original still arrived, and taps
+                # honoured from them (shown only on a link that reorders).
+                reordered = getattr(player, "input_frames_reordered", 0)
+                salvaged = getattr(player, "input_frames_salvaged", 0)
+                latched = getattr(player, "input_presses_latched", 0)
                 inputs.append(
                     f"{player.name}:appl={applied} stale={stale} "
                     f"overflow={overflow} starve={starved} synth={synthesized} "
                     f"pos={position_reports}"
+                    + (
+                        f" reord={reordered} salv={salvaged} latch={latched}"
+                        if reordered or salvaged or latched else ""
+                    )
                     + (f" thr={throttle}/32" if throttle is not None else "")
                     + (f" rtt={rtt}ms" if rtt is not None else "")
                 )
+                if reordered or salvaged or latched:
+                    player.input_frames_reordered = 0
+                    player.input_frames_salvaged = 0
+                    player.input_presses_latched = 0
                 player.input_frames_synthesized = 0
                 player.input_frames_applied = 0
                 player.input_frames_dropped = 0

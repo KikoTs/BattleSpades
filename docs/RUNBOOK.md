@@ -713,8 +713,8 @@ each scene boundary:
 1. `/restart`: the client stays responsive in `GameScene` with a live player.
 2. `/map DefinitelyMissingMap_7391`: the current scene/world stays intact and
    the admin receives `Map not found`; no disconnect is allowed.
-3. `/map ArcticBase`: the client processes native `MapEnded(52)`, enters
-   `LoadingMenu`, receives `InitialInfo` and the validated VXL transfer on the
+3. `/map ArcticBase`: the client processes native `MapEnded(52)`, receives
+   `InitialInfo(114)` to enter `LoadingMenu`, and the validated VXL transfer on the
    same authenticated peer, then returns to `GameScene` on ArcticBase. The
    client must never report `disconnected=True` and the server log must not
    contain an ENet disconnect for that peer.
@@ -724,14 +724,13 @@ each scene boundary:
 5. Run `/restart` once in CTF, then `/mode tdm`, and finally `/kick` the test
    player. Only the explicit kick may disconnect the peer.
 
-Before this test, install `client_patches/session_transition_patch.py` as
-documented in `client_patches/INSTALL.txt` and restart the client once. The stock
-packet-52 handler only freezes `GameScene`; disconnect reason 18 is terminal
-and is not a reconnect mechanism. The hook sends ClientInMenu(110) only after
-installing `LoadingMenu`; the server requires that acknowledgement before
-sending `InitialInfo`, then requires `MapDataValidation` before VXL bytes. An
-unpatched client is retired individually without receiving loader packets in
-an old scene.
+Run this test with the unpatched stock client as well as maintained clients.
+The stock packet-52 handler only freezes `GameScene`; `InitialInfo(114)` enters
+`LoadingMenu` through the network handler on the existing peer. The server
+requires `MapDataValidation` before VXL bytes, but never requires the optional
+compatibility hook's `ClientInMenu(110)` acknowledgement. Disconnect reason 18
+is terminal and is not a reconnect mechanism. The compatibility patch also
+contains an optional audio-stream guard; see `client_patches/INSTALL.txt`.
 
 Reject a lifecycle patch if a new `aos_crash_*.dmp` appears, the client log
 contains a traceback/invalid entity warning, or a transition tick exceeds the
@@ -746,7 +745,8 @@ three correctly named candidates on F1/F2/F3—never `Kick Player`. Cast from
 two clients, confirm the chosen map is
 announced on the HUD, and let the end sequence finish. On an official map the
 client must receive final `GameStats(67)`, show the packet-53 scores/credits
-screen for `lobby.end_screen_seconds`, and only then enter the packet-52 loader.
+screen for `lobby.end_screen_seconds`, and only then freeze with packet 52 and
+enter the loader on packet 114.
 The winner must be consumed only at that boundary and use the same retained-peer
 loader transition.
 An unadvertised candidate packet must not affect the tally.

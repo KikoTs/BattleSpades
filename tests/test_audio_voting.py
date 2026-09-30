@@ -290,6 +290,26 @@ def test_disconnect_clears_vote_identity_before_player_id_reuse():
     assert 0 not in vm._last_start
 
 
+def test_expired_address_cooldowns_do_not_accumulate_across_reconnecting_voters():
+    srv = _vote_server(4)
+    vm = voting.VoteManager(srv)
+    for index in range(12):
+        starter = FakePlayer(0, "P0")
+        starter.connection.peer = SimpleNamespace(address=f"10.0.0.{index + 1}:51000")
+        srv.players[0] = starter
+        srv.connections[0] = starter.connection
+        now = 100.0 + index * (voting.VOTE_COOLDOWN + 1.0)
+        assert vm.start_kick(starter, srv.players[1], voting.KICK_ABUSE, now=now)
+        vm.cancel()
+        vm.forget_player(0)
+        # Disconnect must preserve this address's live cooldown, but no older
+        # expired address belongs to the next connection's vote history.
+        key = vm._cooldown_key(starter)
+        assert vm._cooldown_until == {key: now + voting.VOTE_COOLDOWN}
+        assert vm._last_start == {key: now}
+        assert not vm.start_kick(starter, srv.players[1], voting.KICK_ABUSE, now=now + 1.0)
+
+
 def test_map_vote_uses_retail_three_candidate_overlay_and_selects_winner():
     srv = _vote_server(4)
     vm = voting.VoteManager(srv)
@@ -341,6 +361,27 @@ def test_closed_map_vote_keeps_winning_map_as_literal_format_argument():
     assert identifier == "MAP_VOTED_MESSAGE"
     assert "Next map will be {0}".format(*arguments) == "Next map will be Map {1}'s Hill"
     assert vm.consume_next_map() == "Map {1}'s Hill"
+
+
+def test_unicode_map_ballot_and_result_are_python2_safe():
+    """Stock HUD formats the winner into a Unicode localized template."""
+    name = "Château {1}'s Hill"
+    srv = _vote_server(1)
+    vm = voting.VoteManager(srv)
+    vm._available_maps = (name, "London")
+    assert vm.start_map_vote(vm._available_maps, now=100.0)
+    start = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    vm.cast_wire_candidate(srv.players[0], start.candidates[0]["name"])
+    closed = GenericVoteMessage(ByteReader(srv.sent[-1][1:]))
+    for text in (start.candidates[0]["name"], closed.title):
+        assert text.isascii(), "Python 2 byte literals must not contain UTF-8 text"
+        for node in ast.walk(ast.parse(text, mode="eval")):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and not node.value.isascii():
+                assert node.kind == "u", "non-ASCII literals need Python 2 Unicode semantics"
+    identifier, arguments = ast.literal_eval(closed.title)
+    assert identifier == "MAP_VOTED_MESSAGE"
+    assert "Next map will be {0}".format(*arguments) == f"Next map will be {name}"
+    assert vm.consume_next_map() == name
 
 
 def test_every_outbound_vote_packet_uses_crash_safe_retail_text():

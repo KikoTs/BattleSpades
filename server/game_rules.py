@@ -385,19 +385,16 @@ class GameRules:
         }))
 
     def selection_disabled_tools(self) -> tuple[int, ...]:
-        """Return menu/loadout disables including the legacy flare safeguard.
+        """Return the tools hidden from the class menu and every loadout.
 
-        A programmatic ``ServerConfig()`` predates the exhaustive TOML and
-        historically hid flare tool 22 from the buggy prefab page while still
-        allowing tests/plugins to place it explicitly. An explicit TOML flare
-        rule removes that compatibility ambiguity: false disables it fully;
-        true exposes and authorizes it.
+        Retail RULE_ENABLE_FLARE_BLOCKS defaults ON: the Flare Block (tool
+        22) is the first tile of the Constructs page (selectClass.py
+        get_class_images) and part of the default loadout
+        (GameClass.build_class_loadout). It used to be hidden here unless a
+        config named the rule; it now follows the rule like every other tool.
         """
 
-        disabled = set(self.disabled_tools())
-        if "RULE_ENABLE_FLARE_BLOCKS" not in self.explicit:
-            disabled.add(22)
-        return tuple(sorted(disabled))
+        return self.disabled_tools()
 
     def disabled_classes(self) -> tuple[int, ...]:
         return tuple(sorted({

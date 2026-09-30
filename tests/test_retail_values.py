@@ -27,11 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Rule -> the value BattleSpades deliberately uses instead of retail.
 # RULE_RESPAWN_TIMES: historic 5 s pace (GameRules.server_defaults docstring).
-# RULE_ENABLE_FLARE_BLOCKS: off because this client build injects flare tool
-# 22 as a fake first prefab tile (config.toml comment).
 DOCUMENTED_DEVIATIONS = {
     "RULE_RESPAWN_TIMES": 5,
-    "RULE_ENABLE_FLARE_BLOCKS": False,
 }
 # Code-only default for bare ServerConfig() test servers; every shipped
 # config turns the retail 3-second window back on.
@@ -96,12 +93,13 @@ def test_server_defaults_deviate_only_where_documented():
         if not _same(server.get(key), retail.get(key))
     }
     allowed = {**DOCUMENTED_DEVIATIONS, **CODE_ONLY_DEVIATIONS}
-    allowed.pop("RULE_ENABLE_FLARE_BLOCKS")  # handled as a selection safeguard
     assert set(differing) == set(allowed)
     for key, value in differing.items():
         assert _same(value, allowed[key]), key
-    # The flare safeguard hides tool 22 unless a config names the rule.
-    assert 22 in server.selection_disabled_tools()
+    # Retail default ON: the Flare Block (tool 22) is offered unless a config
+    # turns RULE_ENABLE_FLARE_BLOCKS off.
+    assert server.enabled("RULE_ENABLE_FLARE_BLOCKS")
+    assert 22 not in server.selection_disabled_tools()
 
 
 def test_retail_values_used_by_fixed_rules():

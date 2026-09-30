@@ -4,10 +4,10 @@ Retail compatibility patches
 The stock retail MapEnded(52) handler freezes GameScene, but it does not open
 the map loader and disconnect reason 18 does not reconnect this client build.
 BattleSpades reloads maps and modes over the existing authenticated connection.
-The included session_transition_patch.py moves the frozen scene into
-LoadingMenu and sends ClientInMenu(110) as a loader-ready acknowledgement.
-The server withholds InitialInfo until this acknowledgement arrives, so a
-missing or late hook cannot receive a new-scene packet inside GameScene.
+InitialInfo(114) itself opens the stock LoadingMenu through GameClient's
+network handler; no client patch is required for this transition trigger.
+The optional session_transition_patch.py enters LoadingMenu earlier and
+sends ClientInMenu(110), which the server accepts but does not require.
 The same patch clears any pending OpenAL error before each ALURE stream call.
 Without it the stock client can orphan a music stream when a map changes and
 then freeze (Not Responding) on the first menu sound after START; music and

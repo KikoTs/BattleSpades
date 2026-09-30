@@ -16,6 +16,7 @@ import pytest
 import shared.constants as C
 import server.handlers.deployables as deployable_handlers
 from protocol.packet_handler import PacketHandler
+from server import action_clock
 from server.combat_runtime import (
     anticheat_stats,
     cell_visible,
@@ -127,6 +128,8 @@ def _handle(server, player, packet):
 
 
 def _fire(server, shooter, packet):
+    # These tests isolate geometry/statistics from cadence (covered separately).
+    action_clock.reset(shooter, "fire")
     shooter.next_shot_time = 0.0
     shooter.last_shot_time = 0.0
     return server.combat.handle_shot(shooter, packet)
@@ -487,7 +490,9 @@ def _build_packet(cell, loop=1):
     return packet
 
 
-def test_building_against_the_wall_you_look_at_works():
+def test_building_against_the_wall_you_look_at_works(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("server.combat_runtime.time.monotonic", lambda: clock[0])
     server = _server()
     _wall(server)
     builder = _player(server, C.BLOCK_TOOL, loadout=[C.BLOCK_TOOL])
@@ -495,8 +500,8 @@ def test_building_against_the_wall_you_look_at_works():
     cells = [(WALL_X - 1, 100, 60), (WALL_X - 1, 97, 57), (WALL_X - 1, 103, 55)]
     for cell in cells:
         # The stock BlockTool fires every 0.5 s, beyond MIN_BLOCK_INTERVAL.
-        builder._last_block_build_at = None
         assert server.combat.handle_block_build(builder, _build_packet(cell))
+        clock[0] += 0.5
     assert builder.blocks == 10 - len(cells)  # reserved for commit
     assert not _counts(builder)
 

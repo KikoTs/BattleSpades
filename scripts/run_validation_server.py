@@ -50,7 +50,16 @@ def parse_args(argv=None):
     )
     parser.add_argument("--worldupdate-loop-offset", type=int)
     parser.add_argument("--worldupdate-self-row-interval", type=int)
-    parser.add_argument("--worldupdate-airborne-self-row-interval", type=int)
+    parser.add_argument(
+        "--worldupdate-airborne-self-row-interval",
+        type=int,
+        help="native BattleSpades airborne owner-row interval in server ticks",
+    )
+    parser.add_argument(
+        "--worldupdate-retail-airborne-self-row-interval",
+        type=int,
+        help="retail airborne owner-row interval in server ticks",
+    )
     parser.add_argument("--jetpack-owner-handoff-input-frames", type=int)
     parser.add_argument("--jetpack-owner-release-handoff-input-frames", type=int)
     parser.add_argument("--movement-authority", choices=("server", "client"))
@@ -93,6 +102,13 @@ async def run_validation_server(args) -> None:
         config.worldupdate_airborne_self_row_interval = max(
             1,
             int(args.worldupdate_airborne_self_row_interval),
+        )
+    retail_airborne_interval = getattr(
+        args, "worldupdate_retail_airborne_self_row_interval", None,
+    )
+    if retail_airborne_interval is not None:
+        config.worldupdate_retail_airborne_self_row_interval = max(
+            1, int(retail_airborne_interval),
         )
     if args.jetpack_owner_handoff_input_frames is not None:
         config.jetpack_owner_handoff_input_frames = max(

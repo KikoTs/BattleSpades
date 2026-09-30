@@ -1,13 +1,15 @@
-BattleSpades Portable Beta 0.1
+BattleSpades Portable Beta 0.2
 =============================
 
 Part of the open AoS Revival project: https://aosplay.net
 Server source: https://github.com/KikoTs/BattleSpades
 Client source: https://github.com/KikoTs/BattleSpadesClient
 
-Beta 0.1 adds cooperative class tactics, bots that fight and move like
-players, and a private welcome with the actual UTC build day. Behavior,
-configuration and verification details are in the server repository's docs.
+Beta 0.2 adds retail compatibility, terrain and map-transition fixes,
+movement delivery improvements, recovered game modes and weapons, and
+stability improvements. Behavior, configuration and verification details
+are in the server repository's docs and release/NOTES.md. Join the community
+at https://discord.gg/aosbb.
 
 1. Extract the complete zip into a writable directory.
 2. Run `BattleSpades.exe --check` on Windows or `./BattleSpades --check` on

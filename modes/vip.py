@@ -75,8 +75,9 @@ class VIPMode(BaseMode):
     Both teams respawn until their own VIP dies. That team then enters sudden
     death and its remaining lives become permanent. The opposing team keeps
     respawning while its VIP remains alive. Eliminating every survivor on a
-    VIP-less team awards one round; the first team to the configured number of
-    rounds wins the match.
+    VIP-less team awards one round. The configured number of sub-rounds is
+    played, then the team with more round wins takes the match (a tie draws).
+    This round-count policy is inferred; the retail server is not recovered.
     """
 
     name = "VIP"
@@ -371,6 +372,10 @@ class VIPMode(BaseMode):
             await self._check_team_elimination()
         if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING):
             await self._arm_selection_if_ready(time.monotonic())
+        connection = getattr(player, "connection", None)
+        if new_team != old_team and getattr(connection, "in_game", False):
+            # A spectator (or the other team) stepping onto the VIP-less team.
+            self._tell_locked_out(connection, player)
 
     def prepare_join_selection(
         self,
@@ -534,6 +539,39 @@ class VIPMode(BaseMode):
                 and self._is_connected(vip)
             ):
                 self._set_vip_marker(vip, True, connection=connection)
+        self._tell_locked_out(connection)
+
+    def _locked_out(self, player) -> bool:
+        """Whether ``player`` waits out this sub-round: its team's VIP died."""
+        team = int(getattr(player, "team", -1))
+        return bool(
+            player is not None
+            and not self.ended
+            and self.phase is VIPPhase.ACTIVE
+            and team in _PLAYABLE_TEAMS
+            and not self.vip_alive.get(team, True)
+            and not self.respawn_enabled.get(team, True)
+            and not bool(getattr(player, "alive", False))
+        )
+
+    def _tell_locked_out(self, connection, player=None) -> bool:
+        """Tell a player who arrives on a VIP-less team why it stays dead.
+
+        Retail VIP_ALREADY_DEAD, "your team's V.I.P. is already dead". No
+        client binary references the id, so the retail server sent it; when
+        is not recorded. This is the one moment the sentence describes: the
+        player joins a team, and that team's VIP is already dead.
+        """
+        if player is None:
+            player = getattr(connection, "player", None)
+        if connection is None or not self._locked_out(player):
+            return False
+        try:
+            self.send_localised_message_to(connection, "VIP_ALREADY_DEAD")
+        except Exception:  # noqa: BLE001 - the line is informational
+            logger.debug("VIP_ALREADY_DEAD skipped", exc_info=True)
+            return False
+        return True
 
     async def _begin_round(self, *, reset_players: bool) -> None:
         """Clear prior bosses, restore respawns, and arm the next selection."""

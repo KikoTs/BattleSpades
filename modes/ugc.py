@@ -59,9 +59,9 @@ class UGCMode(BaseMode):
     """Own editor roles, object state, validation packets, and checkpoints.
 
     Tick/thread contract: all project mutations occur on the gameplay thread.
-    Small JSON snapshots are serialized there and written atomically by one
-    background task.  VXL serialization occurs only during explicit shutdown,
-    never in the 60 Hz path.
+    Project snapshots are serialized there and disk writes are serialized by
+    one async lock. VXL serialization occurs only for an explicit save or
+    shutdown, never in the periodic 60 Hz path.
     """
 
     # No combat score economy: no generic kill/suicide SetScore.
@@ -104,6 +104,7 @@ class UGCMode(BaseMode):
         self._preview_task: asyncio.Task | None = None
         self._save_task: asyncio.Task | None = None
         self._save_waiters: list[object] = []
+        self._project_write_lock = asyncio.Lock()
         # Stock clients only see markers as CreateEntity(21) type
         # UGC_ENTITY(29); packets 97/98 have no gameScene receive handler.
         self._marker_entities: dict[UGCPlacement, int] = {}
@@ -184,15 +185,25 @@ class UGCMode(BaseMode):
             return
         if self._checkpoint_task is not None and not self._checkpoint_task.done():
             return
-        self._metadata_dirty = False
         self._last_checkpoint = now
-        payload = json.dumps(
-            self.project.to_sidecar(), indent=4, ensure_ascii=False
-        ) + "\n"
-        destination = Path(self.server.config.ugc_sidecar_path)
         self._checkpoint_task = asyncio.create_task(
-            asyncio.to_thread(_atomic_write_text, destination, payload)
+            self._checkpoint_metadata()
         )
+
+    async def _checkpoint_metadata(self) -> None:
+        """Snapshot after older writes finish, so metadata cannot regress."""
+
+        async with self._project_write_lock:
+            payload = json.dumps(
+                self.project.to_sidecar(), indent=4, ensure_ascii=False
+            ) + "\n"
+            self._metadata_dirty = False
+            destination = Path(self.server.config.ugc_sidecar_path)
+            try:
+                await asyncio.to_thread(_atomic_write_text, destination, payload)
+            except Exception:
+                self._metadata_dirty = True
+                logger.exception("UGC metadata checkpoint failed")
 
     def prepare_join_team(self, requested_team: int) -> int:
         """All editors inhabit the one non-competitive builder team."""
@@ -847,19 +858,23 @@ class UGCMode(BaseMode):
             waiters, self._save_waiters = self._save_waiters, []
             ok = True
             try:
-                # Serialization is a consistent snapshot taken on the
-                # gameplay thread; only the disk writes run off-thread.
-                raw = bytes(self.server.world_manager.map.generate_vxl(False))
-                sidecar_text = json.dumps(
-                    self.project.to_sidecar(), indent=4, ensure_ascii=False
-                ) + "\n"
-                self._metadata_dirty = False
-                self._world_dirty = False
-                await asyncio.to_thread(
-                    self._write_project_files, raw, sidecar_text
-                )
+                # Periodic metadata checkpoints share the same destination
+                # and temporary filename. Snapshot and write in lock order:
+                # an older checkpoint must not replace an acknowledged save.
+                async with self._project_write_lock:
+                    raw = bytes(self.server.world_manager.map.generate_vxl(False))
+                    sidecar_text = json.dumps(
+                        self.project.to_sidecar(), indent=4, ensure_ascii=False
+                    ) + "\n"
+                    self._metadata_dirty = False
+                    self._world_dirty = False
+                    await asyncio.to_thread(
+                        self._write_project_files, raw, sidecar_text
+                    )
             except Exception:
                 logger.exception("UGC save request failed")
+                self._metadata_dirty = True
+                self._world_dirty = True
                 ok = False
             data = build_localised_overlay(
                 self.SAVE_SUCCESS_STRING if ok else self.SAVE_ERROR_STRING,

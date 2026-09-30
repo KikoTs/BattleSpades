@@ -111,7 +111,7 @@ def commit_deployable_use(player: Player, tool: int, now: float) -> None:
 def deployable_stock(player: Player, tool: int) -> int:
     """Read remaining placements for an equipped tool, excluding cooldown.
 
-    C4/radar/MG additionally honor their live-entity caps. No inventory state is
+    C4 and occupied MGs additionally honor their live-entity caps. No inventory state is
     initialized or pruned here, making this safe for immutable bot snapshots.
     """
 
@@ -140,6 +140,7 @@ def deployable_stock(player: Player, tool: int) -> int:
             entity.alive
             and isinstance(entity.behavior, MachineGunBehavior)
             and entity.behavior.owner_id == int(player.id)
+            and entity.behavior.carrier_id is not None
             for entity in registry.all()
         ))
     return stock

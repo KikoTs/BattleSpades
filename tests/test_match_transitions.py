@@ -192,7 +192,7 @@ def test_map_change_prepares_world_before_gating_clients(monkeypatch) -> None:
     assert all(conn.disconnect_reasons == [] for conn in server.connections.values())
 
 
-def test_scene_transition_requires_loader_ack_before_reload(
+def test_scene_transition_grace_preserves_order_without_requiring_loader_ack(
     monkeypatch,
 ) -> None:
     server = _Server()
@@ -201,17 +201,26 @@ def test_scene_transition_requires_loader_ack_before_reload(
     candidate = SimpleNamespace(map_name="HallwayPin", config=None)
     monkeypatch.setattr(service, "_load_world_candidate", lambda *_args: candidate)
     monkeypatch.setattr(service, "_resolve_mode_class", lambda _name: _NewMode)
+    sleeps = []
+
+    async def observe_grace(seconds):
+        assert 52 in [packet[0] for packet in server.broadcast_packets]
+        assert all(connection.reload_calls == 0 for connection in server.connections.values())
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", observe_grace)
 
     result = asyncio.run(service.change_map("HallwayPin"))
 
     assert result.ok is True
     assert all(connection.transition_arms == 1 for connection in server.connections.values())
-    assert all(connection.transition_waits == [0.75] for connection in server.connections.values())
+    assert sleeps == [0.75]
+    assert all(connection.transition_waits == [] for connection in server.connections.values())
     assert all(connection.reload_calls == 1 for connection in server.connections.values())
     assert all(connection.disconnect_reasons == [] for connection in server.connections.values())
 
 
-def test_unacknowledged_client_never_receives_scene_handshake(monkeypatch) -> None:
+def test_stock_client_without_custom_loader_ack_receives_scene_handshake(monkeypatch) -> None:
     server = _Server()
     connections = list(server.connections.values())
     connections[0].transition_ready = False
@@ -223,9 +232,9 @@ def test_unacknowledged_client_never_receives_scene_handshake(monkeypatch) -> No
     result = asyncio.run(service.change_map("HallwayPin"))
 
     assert result.ok is True
-    assert result.reconnect_required is True
-    assert connections[0].reload_calls == 0
-    assert connections[0].disconnect_reasons == [18]
+    assert result.reconnect_required is False
+    assert connections[0].reload_calls == 1
+    assert connections[0].disconnect_reasons == []
     assert connections[1].reload_calls == 1
 
 

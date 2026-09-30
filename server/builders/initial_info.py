@@ -228,12 +228,10 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     )
 
     # ---- Class / movement / loadouts ------------------------------------
-    # Retail otherwise inserts FLAREBLOCK_TOOL as a fake first prefab tile.
-    # The same tuple is the default for class normalization, keeping the menu
-    # declaration and every CreatePlayer loadout in lockstep.
     # Disabled tool IDs are both a menu declaration and an authorization
-    # invariant. Config's server defaults retain the flare-tool compatibility
-    # suppression that DEFAULT_DISABLED_TOOLS historically provided.
+    # invariant; the same set feeds class normalization, keeping the menu and
+    # every CreatePlayer loadout in lockstep. The Flare Block tile (tool 22)
+    # is shown unless RULE_ENABLE_FLARE_BLOCKS is off.
     pkt.disabled_tools = list(rules.selection_disabled_tools())
     pkt.disabled_classes = _classes_disabled(server)
     pkt.movement_speed_multipliers = _movement_speed_multipliers(server)

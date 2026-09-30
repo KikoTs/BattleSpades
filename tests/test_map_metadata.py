@@ -8,7 +8,6 @@ sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 import shared.constants as C  # noqa: E402
 from server.game_constants import TEAM1, TEAM2  # noqa: E402
 from server.map_metadata import (  # noqa: E402
-    STOCK_STATIC_LIGHT_COLORS,
     MapMetadata,
     MapZone,
     canonical_gravity,
@@ -278,11 +277,11 @@ def test_official_alias_catalog_selects_client_assets_but_not_map_sync():
     assert metadata.ambient_sounds[0].points == ()
 
 
-def test_stock_maps_inherit_the_shipped_editor_static_light_palette():
+def test_stock_maps_without_a_palette_do_not_inherit_unrelated_editor_lights():
     metadata = load_map_metadata(Path("maps") / "ArcticBase.vxl", "tdm")
 
     assert metadata.official_map is True
-    assert metadata.static_light_colors == STOCK_STATIC_LIGHT_COLORS
+    assert metadata.static_light_colors == {}
 
 
 def test_stock_sidecar_static_light_color_overrides_only_its_family(
@@ -299,7 +298,6 @@ def test_stock_sidecar_static_light_color_overrides_only_its_family(
 
     assert metadata.static_light_colors == {
         0: (224, 172, 29),
-        1: STOCK_STATIC_LIGHT_COLORS[1],
     }
 
 

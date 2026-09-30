@@ -684,6 +684,10 @@ class BattleSpadesServer:
         events = self.projectile_engine.update(
             dt, self.world_manager, players=tuple(self.players.values())
         )
+        # Sticky 34 -> 35 swaps first, so a blast below names the live id.
+        from server.entities import attachments
+        attachments.publish_sticky_events(self)
+        attachments.sweep_riot_shields(self)
         from server.projectiles import DrillContact, ProjectileDeployment
         for event in events:
             if isinstance(event, DrillContact):
@@ -1242,9 +1246,10 @@ class BattleSpadesServer:
                 target_team=getattr(target, "team", None),
                 classic=classic,
             ) * retail.victim_damage_multiplier(target)
-            dmg = int(round(amount))
-            if dmg > 0:
-                target.damage(dmg, source=thrower, kill_type=int(kill_type))
+            # Player.damage applies mode/rule multipliers before the single
+            # HP rounding step. Preserve blast fractions through that policy.
+            if amount > 0.0:
+                target.damage(amount, source=thrower, kill_type=int(kill_type))
 
         # Damageable placed entities share the same LOS/radius/falloff as
         # players. Iterate a snapshot because a one-hit C4/medpack may remove

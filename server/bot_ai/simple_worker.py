@@ -20,7 +20,12 @@ import time
 from typing import Iterable
 
 import shared.constants as C
-from server.dig_profiles import DigProfile, best_navigation_dig_profile
+from server.dig_profiles import (
+    DigProfile,
+    PRIMARY_DIG_PROFILES,
+    best_navigation_dig_profile,
+    melee_dig_positions,
+)
 from server.game_constants import (
     CAT_SNIPER,
     SPADE_TOOL_IDS,
@@ -264,6 +269,10 @@ class _BotState:
     block_work_since: float = 0.0
     block_work_skip: dict[tuple[int, int, int], float] = field(default_factory=dict)
     next_block_work_at: float = 0.0
+    # Diamond Mine: the spot being walked to for fresh blocks.
+    mine_site: Vector3 | None = None
+    mine_site_until: float = 0.0
+    mine_site_index: int = 0
     yielded_breach_edge: EdgeKey | None = None
     yielded_breach_started_at: float = 0.0
     next_water_build_at: float = 0.0
@@ -274,6 +283,7 @@ class _BotState:
     water_progress_at: float = 0.0
     water_recovery: bool = False
     water_committed: bool = False
+    water_dry_since: float | None = None
     water_goal_reached: bool = False
     water_escape_position: Vector3 | None = None
     water_escape_at: float = 0.0
@@ -471,8 +481,10 @@ class SimpleBotBrain:
         water_contact = self._water_contact(observer)
         if water_contact:
             state.water_committed = True
+            state.water_dry_since = None
         elif state.water_committed and self._landed_on_dry_surface(observer):
             state.water_committed = False
+            state.water_dry_since = now
             state.dry_detour_goal = None
             state.dry_detour_until = 0.0
             state.dry_route_failures = 0
@@ -603,18 +615,23 @@ class SimpleBotBrain:
                 force_block_edge=force_water_edge,
             )
 
-        state.water_step_key = None
-        state.water_landing_step = None
-        state.water_breach_target = None
-        state.water_best_distance = math.inf
-        state.water_progress_at = now
-        state.water_recovery = False
-        state.water_goal_reached = False
-        state.water_escape_position = None
-        state.water_escape_at = now
-        state.water_search_heading = None
-        state.water_search_until = 0.0
-        state.water_search_origin = None
+        # A single dry contact on a lip is enough to resume walking, but not
+        # enough to forget a failed swim. Retain recovery across brief bank
+        # bobs; otherwise strategic A* immediately re-enters the same basin.
+        if state.water_dry_since is None or now - state.water_dry_since >= 2.0:
+            state.water_step_key = None
+            state.water_landing_step = None
+            state.water_breach_target = None
+            state.water_best_distance = math.inf
+            state.water_progress_at = now
+            state.water_recovery = False
+            state.water_goal_reached = False
+            state.water_escape_position = None
+            state.water_escape_at = now
+            state.water_search_heading = None
+            state.water_search_until = 0.0
+            state.water_search_origin = None
+            state.water_dry_since = None
         # A one-block foothold can briefly clear wade before the body falls
         # back in. Keep shoreline failure memory through that landing; its
         # ordinary TTL and the next life/map reset still bound it.
@@ -721,6 +738,12 @@ class SimpleBotBrain:
             )
             if mining is not None:
                 return mining
+            # Nothing to dig from here (or still at the spawn): walk on.
+            mode_decision = replace(
+                mode_decision,
+                position=self._mine_site(frame, observer, state, now),
+                arrival_radius=1.25,
+            )
 
         if (
             mode_decision is not None
@@ -2221,57 +2244,185 @@ class SimpleBotBrain:
         state: _BotState,
         now: float,
     ) -> BotIntent | None:
-        """Mine a safe nearby surface ring for Diamond Mine discovery rolls."""
+        """Dig the blocks in reach for Diamond Mine's discovery rolls.
 
-        if now + 1e-9 < state.next_breach_at:
-            return None
+        One block is worked until it breaks: the aim stays on it between
+        swings, because a swing goes where the body looks, not where the
+        plan points. (The target used to move on every half second, the aim
+        never arrived, and 669 swings in two minutes removed nothing.)
+        ``None`` means nothing is left in reach here; the caller walks on.
+        """
+
         melee = _melee_tool(observer)
-        if melee is None:
+        if melee is None or not observer.grounded:
             return None
-        base_x = int(math.floor(observer.position[0]))
-        base_y = int(math.floor(observer.position[1]))
-        surface_z = int(round(observer.position[2] + 2.25))
-        phase = (int(observer.player_id) + int(now * 2.0)) & 7
-        offsets = (
-            (2, 0),
-            (2, 1),
-            (0, 2),
-            (-1, 2),
-            (-2, 0),
-            (-2, -1),
-            (0, -2),
-            (1, -2),
-        )
-        cell = next(
-            (
-                (base_x + dx, base_y + dy, surface_z)
-                for index in range(len(offsets))
-                for dx, dy in (offsets[(phase + index) % len(offsets)],)
-                if self.world.solid(base_x + dx, base_y + dy, surface_z)
-            ),
-            None,
-        )
+        if self._near_own_spawn(frame, observer):
+            return None  # the spawn is not a quarry
+        skip = state.block_work_skip
+        for cell, until in tuple(skip.items()):
+            if until <= now:
+                skip.pop(cell, None)
+        eye = tuple(float(value) for value in observer.eye)
+        cell = state.block_work_cell
+        if (cell is not None and cell not in skip and self.world.solid(*cell)
+                and self._mine_cell_is_safe(observer, cell)):
+            if now - state.block_work_since > self._BLOCK_WORK_PATIENCE:
+                # The swing never lands from here: leave it for a while.
+                skip[cell] = now + self._BLOCK_WORK_SKIP_SECONDS
+                cell = None
+        else:
+            cell = None
         if cell is None:
-            return None
-        state.next_breach_at = float(now) + _melee_swing_interval(melee)
-        target = tuple(float(value) + 0.5 for value in cell)
+            cell = self._mine_cell(observer, eye, skip)
+            state.block_work_cell = cell
+            state.block_work_since = now
+            if cell is None:
+                return None
+        center = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+        self._set_goal(state, None, observer.position, now)
+        swing = now + 1e-9 >= state.next_breach_at
+        if swing:
+            state.next_breach_at = float(now) + _melee_swing_interval(melee)
         return self._intent(
             frame,
             movement=MovementIntent(
                 crouch=True,
                 affordance=MovementAffordance.BREACH,
             ),
-            look=LookIntent(target, visible=False),
+            look=LookIntent(center, visible=False),
             tool_id=int(melee),
-            action=BotAction(
-                BotActionKind.MELEE,
-                tool_id=int(melee),
-                position=target,
+            action=(
+                BotAction(BotActionKind.MELEE, tool_id=int(melee), position=center)
+                if swing else BotAction()
             ),
             priority=BotIntentPriority.ROUTINE,
-            debug_goal=target,
+            debug_goal=center,
             debug_role="diamond_mine_blocks",
         )
+
+    # The terrain swing reaches MELEE_WORLD_RANGE from the eye to the face
+    # it meets; stay inside it.
+    _MINE_REACH = float(getattr(C, "MELEE_WORLD_RANGE", 4)) - 0.4
+    _MINE_SPAWN_CLEARANCE = 12.0
+    _MINE_SITE_STEP = 6.0
+    _MINE_SITE_SECONDS = 12.0
+    _MINE_RING = tuple(
+        (dx, dy)
+        for radius in (1, 2)
+        for dx in range(-radius, radius + 1)
+        for dy in range(-radius, radius + 1)
+        if max(abs(dx), abs(dy)) == radius
+    )
+
+    def _near_own_spawn(self, frame: PerceptionFrame, observer: PlayerSnapshot) -> bool:
+        return any(
+            item.kind == "team_anchor" and int(item.team) == int(observer.team)
+            and math.dist(observer.position[:2], item.position[:2])
+            < self._MINE_SPAWN_CLEARANCE
+            for item in frame.objectives
+        )
+
+    def _first_solid_hit(
+        self, origin: Vector3, target: Vector3, limit: float,
+    ) -> tuple[tuple[int, int, int], float] | None:
+        """The first solid voxel on the ray and the distance to its face."""
+
+        dx, dy, dz = (float(target[i]) - float(origin[i]) for i in range(3))
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 1e-6:
+            return None
+        steps = max(1, int(math.ceil(limit / 0.05)))
+        last = None
+        for index in range(1, steps + 1):
+            travelled = limit * index / steps
+            cell = (
+                int(math.floor(origin[0] + dx / length * travelled)),
+                int(math.floor(origin[1] + dy / length * travelled)),
+                int(math.floor(origin[2] + dz / length * travelled)),
+            )
+            if cell == last:
+                continue
+            last = cell
+            if self.world.solid(*cell):
+                return cell, travelled
+        return None
+
+    def _mine_cell(
+        self, observer: PlayerSnapshot, eye: Vector3, skip,
+    ) -> tuple[int, int, int] | None:
+        """The block a swing from here would break, nearest columns first.
+
+        Never the column the bot stands on, and nothing at the water line.
+        """
+
+        base_x = int(math.floor(observer.position[0]))
+        base_y = int(math.floor(observer.position[1]))
+        surface_z = int(round(observer.position[2] + 2.25))
+        ring = self._MINE_RING
+        start = (int(observer.player_id) * 3) % len(ring)
+        for index in range(len(ring)):
+            dx, dy = ring[(start + index) % len(ring)]
+            target = (base_x + dx + 0.5, base_y + dy + 0.5, surface_z + 0.5)
+            hit = self._first_solid_hit(eye, target, self._MINE_REACH)
+            if hit is None:
+                continue
+            cell = hit[0]
+            if cell in skip or not self._mine_cell_is_safe(observer, cell):
+                continue
+            return cell
+        return None
+
+    @staticmethod
+    def _mine_cell_is_safe(observer: PlayerSnapshot, cell: tuple[int, int, int]) -> bool:
+        """Keep the entire primary swing clear of footing and the waterline."""
+        tool = _melee_tool(observer)
+        profile = PRIMARY_DIG_PROFILES.get(tool)
+        if profile is None:
+            return False
+        footing = tuple(int(math.floor(value)) for value in observer.position[:2])
+        waterline = int(C.Z_ABOVE_WATERPLANE)
+        # A center above water is insufficient: columns/machetes also remove
+        # the block below, and the super spade reaches adjacent columns. The
+        # old center-only guard let miners excavate their own flooded pit.
+        return all(
+            voxel[:2] != footing and voxel[2] < waterline
+            for voxel in melee_dig_positions(cell, profile.pattern)
+        )
+
+    def _mine_site(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot,
+        state: _BotState, now: float,
+    ) -> Vector3:
+        """Where to walk once nothing here is left to dig.
+
+        A short step toward the nearest open drop-off (the map centre when
+        none is known), fanned out per bot so a team does not dig one trench.
+        """
+
+        site = state.mine_site
+        if (site is not None and now < state.mine_site_until
+                and math.dist(observer.position[:2], site[:2]) > 1.5):
+            return site
+        state.mine_site_index += 1
+        position = observer.position
+        dropoffs = [
+            item.position for item in frame.objectives
+            if item.kind == "dia_dropoff" and int(item.state) > 0
+        ]
+        toward = min(
+            dropoffs, key=lambda point: math.dist(position[:2], point[:2]),
+            default=(256.0, 256.0, position[2]),
+        )
+        heading = math.atan2(toward[1] - position[1], toward[0] - position[0])
+        fan = (int(observer.player_id) * 0.618 + state.mine_site_index * 0.37) % 1.0
+        heading += (fan - 0.5) * 1.8
+        state.mine_site = (
+            min(503.0, max(8.0, position[0] + math.cos(heading) * self._MINE_SITE_STEP)),
+            min(503.0, max(8.0, position[1] + math.sin(heading) * self._MINE_SITE_STEP)),
+            float(position[2]),
+        )
+        state.mine_site_until = float(now) + self._MINE_SITE_SECONDS
+        return state.mine_site
 
     # Demolition block work. The melee ray is MELEE_RANGE long; stay inside
     # it. A repair placement is an ordinary BlockLine-length reach.

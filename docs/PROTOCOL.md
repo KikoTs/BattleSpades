@@ -41,7 +41,7 @@ Sources of truth:
   3/10 protocol mismatch (above), 4 `ERROR_FULL`
   (no free player slot after trying to swap a bot out; the client shows
   SERVERFULL_ERROR), 13 `ERROR_DATA`, 16 AFK, 18 match ended (map rollover
-  without a `ClientInMenu(110)` ack), 19 `ERROR_TEMP_BANNED` (a timed `/ban`
+  with an unfinished or failed loader handshake), 19 `ERROR_TEMP_BANNED` (a timed `/ban`
   and a reconnect during it), 23-25 vote-kick reasons. Reason 3 is
   `ERROR_SERVER_OUT_OF_DATE` ("The server is out of date"); it is sent only to
   a client whose connect data is newer than 168. Beta.1 builds before f3518e2
@@ -70,7 +70,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 |----|--------|-----------|--------|-------|
 | 0 | ClockSync | both | Handled+Sent | Round-trip clock/loop_count sync; client 1 tick ahead. The client sends it unsequenced every 60 loops; the reply is sent ENet UNSEQUENCED too, so it is never held behind a lost reliable packet (a lost reply is replaced by the next one). |
 | 1 | PlaceDynamite | C→S | Handled | Tool/loadout-gated Miner charge; server creates entity type 10 and owns its fuse/blast. |
-| 2 | WorldUpdate | S→C | Sent | 30 Hz unreliable position/state feed. Header loop is the global snapshot clock; each human row pong is that player's consumed ClientData loop. Peerless bots have no client clock and use the authoritative server loop as a monotonic remote-row stamp; leaving bot pong at zero makes retail deduplicate every later bot position. Rocket-turret rows carry the turret entity id as the same signed short CreateEntity wrote (uint16 registry ids above 32767 become negative, e.g. 40000 -> -25536). |
+| 2 | WorldUpdate | S→C | Sent | 30 Hz unreliable position/state feed. Default delivery (`[network] worldupdate_delivery = "split"`): rows of other players, entities and turrets are ENet UNSEQUENCED in parts of at most `mtu - 28` wire bytes (never held behind a lost reliable packet, never fragmented), and the recipient's own row is a one-row packet on the ordered stream (sequenced, reliable on a flight transition). The stock handler looks rows up per known player and skips absent ones, and neither client orders WorldUpdates, so the server spaces unsequenced snapshots by the reordering it measures on that player's ClientData and withholds a player row until that life's CreatePlayer, and an entity or turret row until its CreateEntity, is acknowledged by that peer. The own-row packet repeats the header loop of the newest observer snapshot sent, so `shot_on_world_update` keeps dating the remote bodies. Header loop is the global snapshot clock; each human row pong is that player's consumed ClientData loop. Peerless bots have no client clock and use the authoritative server loop as a monotonic remote-row stamp; leaving bot pong at zero makes retail deduplicate every later bot position. Rocket-turret rows carry the turret entity id as the same signed short CreateEntity wrote (uint16 registry ids above 32767 become negative, e.g. 40000 -> -25536). |
 | 3 | EntityUpdates | — | Planned | IDA (stock gameScene.pyd): `self.process_entity_updates(packet.updated_entities)`, a moving-entity delta stream. BattleSpades moves entities with ChangeEntityPosition(21); no mode needs the batch form yet. |
 | 4 | ClientData | C→S | Handled | Buffered client input, applied at matching tick. The player byte uses bits 0–6 for `player_id`; bit 7 is `palette_enabled`. |
 | 5 | SetHP | S→C | Sent | Sets a player's HP (spawn/heal/damage feedback). |
@@ -120,7 +120,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 49 | ChatMessage | both | Handled+Sent | Player chat is relayed only as ALL(0) or TEAM(1): a client-supplied SYSTEM(2)/BIG(3) is coerced to ALL, TEAM lines reach only the sender's team, text is cut to the client's `MAX_CHAT_MESSAGE_LENGTH` (200), each player has a token-bucket limit (burst 5, then 1/s; excess dropped silently), and recipients must know the sender's id (`known_player_lives`), so a dead joiner's chat never names an unknown id. Slash commands and the private `/__local_ugc_title` bridge are never relayed. Private system replies use type 2; global server/mode announcements use `CHAT_BIG` type 3 and render at the top of every retail HUD. |
 | 50 | LocalisedMessage | S→C | Sent | Top-screen string-table announcement. Resolves `string_id`, optionally resolves every positional parameter as another localization ID (for example `TEAM1_COLOR`), formats `{0}`/`{1}`/`{2}`, and supports replace-previous behavior. See Broadcast templates below. Server-sent retail ids added 2026-09-28: `PLAYER_LEFT` {name} (before PlayerLeft 64), `COUNTDOWN_FROM_TEN` 9..1 after the 10 s cue, private `TEAM_SWITCH_WAIT` / `TEAM_SWITCH_NOT_ALLOWED` / `TEAM_LOCKED` / `TEAM_FULL` team-change refusals (menu packet 77 and `/team`) and `TEAM_FULL` to a joiner the join balance moved. `PLAYER_JOINED` keeps `localise_parameters` for the team id, so an identifier-shaped player name gets one trailing space (never a string-table key) and is not translated. |
 | 51 | SkyboxData | both | Handled+Sent | Null-terminated retail mesh-environment filename (sent at join, prefix 0x30). It comes from the active VXL's validated sidecar `skybox_texture`/`skybox_name`; `[world].default_skybox` is the missing-metadata fallback. C→S only in the Map Creator: the host's UGC Settings choice is validated to a safe skydome basename and relayed to the other editors; ignored elsewhere. |
-| 52 | MapEnded | S→C | Sent | Native full-scene rollover trigger. It freezes the compiled `GameScene`; the compatibility hook opens `LoadingMenu` and acknowledges readiness with `ClientInMenu(110)`. Only then may the server send a fresh loader handshake over the same authenticated peer. Same-map score presentation deliberately omits it. |
+| 52 | MapEnded | S→C | Sent | Freezes the compiled `GameScene` before full-scene rollover. A subsequent `InitialInfo(114)` opens the stock loader on the same authenticated peer; no custom `ClientInMenu(110)` acknowledgement is required. Same-map score presentation deliberately omits it. |
 | 53 | ShowGameStats | S→C | Sent | Opens `GameScene.show_game_statistics(False)`. Used only after voted-map preflight and only for maps with a bundled retail level screenshot; custom maps and same-map restarts omit it. |
 | 54 | MapDataStart | S→C | Sent | Opens the native UGC source-map transfer before MapDataValidation. |
 | 55 | MapSyncStart | S→C | Sent | Bare-id map sync start (prefix 0x32). |
@@ -179,9 +179,9 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 108 | LockToZone | S→C | Sent | Six-short native movement clamp used for Demolition's build phase. Retail Python 2 wire vector verified. |
 | 109 | HelpMessage | S→C | Sent | Localized tutorial HelpPanel rows with the packet's exceptional big-endian float delay. Retail Python 2 wire vector verified. |
 | 110 | ClientInMenu | C→S | Handled | Client reports it's in a menu (handshake/idle gating). |
-| 111 | Password | — | Planned | Password packet (auth). |
-| 112 | PasswordNeeded | — | Planned | Server requests a password (auth). |
-| 113 | PasswordProvided | — | Planned | Client submits a password (auth). |
+| 111 | Password | C→S | Handled | Legacy alias for PasswordProvided; gated join only, never logged. |
+| 112 | PasswordNeeded | S→C | Sent | Requests a password before InitialInfo; native client support required. |
+| 113 | PasswordProvided | C→S | Handled | Password response; accepted before join only, with pacing, timeout and address lockout. |
 | 114 | InitialInfo | S→C | Sent | First join packet: map filename, checksum, direct per-class movement scales, and a null-terminated `texture_skin` string. Each movement value is the complete 1/64-rounded authority scale; clients must not divide it by the class baseline. VIP sends `mafia`; the empty string selects the normal skin. |
 | 115 | ForceTeamJoin | S→C | Sent | Map Creator sends team 2/instant 0 after loading so Start opens the native prefab/Game Data selector. |
 | 116 | PositionData | C→S | Handled | Records the client-reported position and its drift from the authoritative body (diagnostics / tick stats `pos=`); only the non-default `movement_authority = "client"` mode lets fresh reports pin the body. |
@@ -342,11 +342,12 @@ and team spawn/base volumes without executing map code.
 The native VXL loader removes exposed chroma markers before gameplay. Green
 markers select static-light colour slot 0 and blue markers select slot 1. The
 server mirrors that collision removal and creates neutral type-13 entities at
-the removed marker positions. The shipped editor baseplate defines stock slot
-0 as `(255,255,82)` and slot 1 as `(250,250,200)`; recovered per-map sidecars
-override those defaults. The fallback is restricted to recognized stock maps,
-so a community VXL with missing palette metadata cannot turn accidental chroma
-terrain into guessed lights.
+the removed marker positions only when the map supplies that palette slot.
+The shipped GrasslandBaseplate editor values `(255,255,82)` and `(250,250,200)`
+are not evidence for other finished maps. Missing slots are skipped and
+logged for both stock and community maps, avoiding guessed glowing blocks
+and point lights. Recovered per-map palettes, such as MayanJungle's amber
+slot 0, and explicitly authored flare entities remain supported.
 
 Native `FlareBlockEntity.post_initialize` calls both
 `BlockManager.add_user_block(x,y,z,RGB,5,0)` and
@@ -449,28 +450,30 @@ IDA confirms that the retail receiver dispatches packet 52 through
 `GameScene.process_packet_map_ended` and then `GameScene.on_map_ended`.
 `on_map_ended` only sets the three scene pause flags and stops movement; it does
 not select `LoadingMenu`, disconnect, or reconnect. Disconnect reason 18 is
-terminal in the tested retail build.
+terminal in the tested retail build. The actual loader trigger is
+`InitialInfo(114)`: `GameClient.packet_received` (`network.pyd` 0x1000D900)
+destroys the old map and invokes `GameManager.on_map_transfer`
+(`GameManager.pyd` 0x1001C160), which sets `LoadingMenu` when leaving a game
+scene. This network handling runs before forwarding the packet to the scene.
 
 For a voted official map, the end sequence is `GameStats(67)`, resolved vote,
 `ShowGameStats(53)`, the configured `lobby.end_screen_seconds` dwell, then
 `MapEnded(52)`. IDA shows packet 53 calls the live
-`GameScene.show_game_statistics(False)` overlay; packet 52 remains the actual
-loader boundary. A custom map may have no `png/ui/level_screenshots` asset, so
+`GameScene.show_game_statistics(False)` overlay; packet 52 freezes the retiring
+scene. A custom map may have no `png/ui/level_screenshots` asset, so
 the server omits packet 53 rather than triggering the client's native
 `ResourceNotFoundException`.
 
 Replacing the VXL or mode then sends and flushes `MapEnded(52)`, detaches the
 old server-side `Player`, commits the new runtime, and retains each settled
-authenticated ENet peer. The client compatibility
-hook selects `LoadingMenu(identifier=None)`, which deliberately reuses the
-current `GameClient`, and sends `ClientInMenu(110)` as the explicit scene-ready
-acknowledgement. The server arms that acknowledgement before packet 52 and
-does not infer readiness from a fixed delay. Only acknowledged peers receive
-`InitialInfo`; non-acknowledging peers are retired with reason 18 before any
-crash-sensitive loader packet. Only after receiving
+authenticated ENet peer. After the optional `transition_grace_seconds` dwell,
+`InitialInfo` starts the stock loader on that peer. The optional compatibility
+hook can enter `LoadingMenu(identifier=None)` earlier and send
+`ClientInMenu(110)`, but the server never requires that custom acknowledgement.
+Only after receiving
 the matching `MapDataValidation` response does it stream the VXL and finish the
-normal `MapSync`/`StateData`/roster sequence. A peer that does not enter the
-loader is retired with reason 18 without affecting compatible peers. Invalid
+normal `MapSync`/`StateData`/roster sequence. A peer that does not answer map
+validation is retired with reason 18 without affecting compatible peers. Invalid
 targets fail before packets 53/52 and fall back to a same-map restart. A peer
 still inside its original InitialInfo/MapSync when rollover begins never
 receives gameplay-gated packet 52; it is retired with reason 18 instead of
@@ -493,6 +496,14 @@ VIP uses existing retail wire state rather than introducing a custom packet:
   `locked_class` bits.
 - `CreatePlayer(28)` carries ordinary gangster or team-specific boss class.
 - `ChangePlayer(17)` action 8 toggles the boss crown/through-wall marker.
+
+The retail `Player.set_high_minimap_visibility` handler also switches
+`current_class` and body parts to `MAFIA_VIPS[team]` when the marker is enabled
+in Mafia mode (`player.pyd` 0x10014490). This proves a client-side model
+transition, not the retail server's promotion sequence. BattleSpades retains
+its tested class-change KillAction followed by boss CreatePlayer and the
+marker; that respawn sequence is a compatibility policy, not recovered retail
+server behavior.
 
 The server owns selection, respawn lockout, disconnect-as-death, sub-round
 score, intermission, and late-join marker replay. Do not use `TeamLockClass(80)`
@@ -795,7 +806,15 @@ before the same numeric player id receives its next `CreatePlayer`. Roster
 catch-up records death separately from life creation: a joining GameScene sees
 `CreatePlayer -> SetColor -> KillAction` exactly once, and if the corpse
 exploded while gameplay was gated it receives only a silent packet-36 repair.
-DisguisePacket (95) is handled and replicated through WorldUpdate.
+DisguisePacket (95) consumes one of the Engineer's two spawn charges and
+replicates active state through WorldUpdate bit 0x02. The server's stationary
+policy retains the disguise while idle; an admitted attack or subsequent
+walk/jump/displacement ends it. Rejected shooting requests do not change the
+state. Buffered locomotion whose source label precedes the activation cannot
+cancel it: the anchor follows those earlier frames until activation catches
+up, with plausible-label validation and a 1.5-second maximum ordering guard.
+This guard is a server scheduling correction; the exact retail server's
+movement tolerance remains inferred, not recovered from the client binary.
 
 Drill contact uses one reliable Damage (37) with type 10, damage 20,
 `chunk_check=1`, and the still-live Drill entity id as `causer_id`. The retail
@@ -841,13 +860,14 @@ turn a roster repair into an owner reconciliation event and can cause a visible
 join-time rollback. Ordinary 30 Hz WorldUpdates remain unreliable. ChangePlayer
 (17) remains planned.
 
-### Auth (not usable with the stock client)
-Password (111), PasswordNeeded (112), PasswordProvided (113). The stock
-client's `LoadingMenu.packet_received` has the PasswordNeeded branch
-commented out and `send_password_callback` sends `False` rather than a
-packet, so these can never complete a join. Retail server passwords went
-through the Steam lobby (`network.pyd` `SteamSendPassword`). Resource packs
-(61-63) have no client handler in any module either.
+### Auth (native client required)
+Password (111), PasswordNeeded (112), and PasswordProvided (113) are handled
+by the server. The stock client's `LoadingMenu.packet_received` disables the
+PasswordNeeded prompt, so it cannot complete this challenge. Retail server
+passwords went through the Steam lobby (`network.pyd` `SteamSendPassword`).
+The native client supports the challenge documented under
+"Password-protected servers" below. Resource packs (61-63) have no client
+handler in any module.
 
 ### Steam Internet server discovery
 
@@ -1113,3 +1133,175 @@ the last verified data; publication failures are logged and retried.
 Tests: `tests/test_cosmetics.py`, `tests/test_revival_master.py`, and
 `tests/test_connection_skybox.py`. Master/client deployment policy is owned by
 those projects; this repository defines only the server wire/service contract.
+
+## Attached entities (2026-09-29)
+
+Recovered from the retail `gameScene.pyd`. Only existing packets are used:
+CreateEntity (21), ChangeEntity (16), DestroyEntity (19), HitEntity (20).
+
+| type | retail class | role |
+|---|---|---|
+| 34 | `StickyGrenadeEntity` | The flying sticky. Collides with terrain only. No sound, no fuse, no `on_delete`: destroying it is silent. |
+| 35 | `AttachedStickyGrenadeEntity` | The stuck sticky. `set_packet` stores `packet.fuse`; its first `update` plays the attach cue and starts the countdown loop; `set_target` makes it follow a player; `on_delete` is the explosion effect and sound. |
+| 39 | `RiotShieldEntity` | Draws nothing. `hit(x, y, z, type)` plays the shield's melee impact when `type == MELEE_KILL` (2), else the bullet impact, at the bearer. |
+
+Sticky grenade, in order:
+
+1. Throw: CreateEntity type 34 with the throw position and velocity (as
+   before).
+2. Stick (terrain, or any living player but the thrower), same tick:
+   DestroyEntity of the type-34 id; CreateEntity type 35 with a new id, the
+   thrower's team and id, the stuck position, zero velocity and `fuse` = 5.0;
+   and, only for a player, ChangeEntity action 5 (`SET_TARGET`) with that
+   player's id. The client derives its follow offsets from the entity position
+   and the target's position when it handles `SET_TARGET`.
+3. The carrier dies or leaves: ChangeEntity `SET_TARGET` -1, then ChangeEntity
+   action 1 (`SET_POSITION`) with the position the grenade keeps. On a leave
+   both precede PlayerLeft.
+4. Blast (fuse, or the supporting voxel is removed): DestroyEntity of the
+   type-35 id, then the usual Damage (37) type 39.
+
+A peer that never received CreatePlayer for the carrier gets no `SET_TARGET`.
+Stuck stickies are not part of a join snapshot.
+
+Riot shield: the first hit a bearer's shield absorbs creates one type-39
+entity for that bearer. Each peer receives CreateEntity + ChangeEntity
+`SET_TARGET` (the bearer's id) once, right before its first HitEntity for it.
+Every absorbed hit sends HitEntity with the impact point and `type` 2 for
+melee, 0 for bullets. DestroyEntity follows the bearer's death, team change
+or leave, and a round restart.
+
+Not evidenced, because the retail server is not available: whether retail
+sent ChangeEntity action 6 (`SET_FUSE`, which switches on the 3D countdown
+digits of types 10, 35 and 36), what it did with a sticky whose carrier died,
+and when it created and destroyed the type-39 entity. `SET_FUSE` is not sent.
+
+Code: `server/entities/attachments.py`, `server/projectiles.py`. Tests:
+`tests/test_attached_entities.py`.
+
+## Password-protected servers (2026-09-29)
+
+Layouts are retail: 112 is the
+bare id; 111 and 113 carry one NUL-terminated UTF-8 string. The retail
+LoadingMenu answered 112 with 113 from a masked edit box, but that branch is
+disabled in the shipped client, so the stock client cannot join a password
+server. The native BattleSpades client can.
+
+```text
+C -> S  SteamSessionTicket (105)
+S -> C  PasswordNeeded (112)          only when [server] password is set
+        nothing else is sent: no InitialInfo, map, state or roster
+C -> S  PasswordProvided (113)
+  wrong -> S -> C  PasswordNeeded (112) again
+  right -> S -> C  InitialInfo (114) and the normal join
+```
+
+| rule | value |
+|---|---|
+| wrong answers before the kick | `password_max_attempts` (3), then disconnect reason 2 (`ERROR_KICKED`) |
+| time to answer | `password_timeout_seconds` (60), then disconnect reason 11 (`ERROR_TIMEOUT`) |
+| pacing | an answer less than 0.5 s after the previous one counts as wrong |
+| lockout | the kicked address is refused for `password_lockout_seconds` (60): disconnect reason 2, no 112 |
+| length | more than 64 bytes is wrong without comparison; the comparison is constant-time |
+| Password (111) | accepted from the client exactly like 113 |
+| while waiting | ClockSync is answered; NewPlayerConnection and everything else are ignored |
+| map change | a peer still at the prompt is retired like any loading peer; joined peers are not asked again |
+| listings | A2S_INFO `visibility` = 1; the AoSPlay heartbeat carries the tag `password` |
+| logs | the bytes, fields and length of 111/113 are never logged |
+
+Code: `server/join_password.py`, `server/connection.py`. Tests:
+`tests/test_join_password.py`.
+
+## Map construct catalogs and mounted-gun relocation
+
+`StateData.prefabs` becomes the client's `prefab_manager.map_prefabs`; the
+class menu adds those constructs for classes whose lists include
+`MAP_PREFABS`. BattleSpades sends the validated `[lobby] map_prefabs` catalog
+to native clients declaring the existing capability ticket; stock clients
+retain the empty catalog. Map Creator supplies its separate catalog. Unknown
+models are filtered out, and class selection accepts only offered constructs
+for an eligible class. London and LunarBase defaults use their six shipped
+map-themed models. These defaults are a server choice: the retail map lists
+have not been recovered.
+
+Custom-mode mounted MG deployment uses `PlaceMG(87)` followed by
+`UseCommand(86)`. A later valid placement relocates the owner's unoccupied
+gun: DestroyEntity for the old ID, CreateEntity at the new position, then the
+normal UseCommand mount within 3 blocks. Health and ammunition are preserved;
+invalid placement, placement cadence, allocation failure, or an occupied old
+gun leaves the existing gun intact. Relocation emits no server explosion.
+This is BattleSpades policy; no stock class carries MG_TOOL and the recovered
+retail client does not send PlaceMG during gameplay.
+
+## Retail HUD evidence boundaries
+
+Territory Control's client stores the last packet-106 capture value and draws
+it as a percentage (`TerritoryBaseInfo.draw`, `hud.pyd` 0x10045760); it does
+not interpolate capture progress between packets. The server sends each
+authoritative capture update. The stock capture-rate table is recovered, but
+the server's interpretation as percentage per tick, interpolation between
+table entries, and contested-base freeze remain inferred gameplay rules.
+
+HeadCount type 0 draws `Team.count()`, including alive and dead roster entries;
+types other than inactive 3 draw team scores. Type 2 has a dedicated wider
+frame. The default 6 takes the same fallback score layout as type 1.
+Per-mode retail selections are unavailable; BattleSpades keeps its
+default 6 and Zombie's explicit 0. Packet 73 only changes the headline of an
+already open ViewGameStats screen; it does not open that screen. KillAction's
+respawn timer controls the HUD countdown (retail default 10, never-respawn
+sentinel 255).
+
+## Map validation and the fast join (2026-09-29)
+
+Recovered from the retail `aoslib.network.pyd` (`GameClient`) and
+`aoslib.vxl.pyd` (loader thread).
+
+Client side, in order:
+
+| packet | what the retail client does |
+|---|---|
+| InitialInfo (114) | Opens its local `<map directory>/<filename>.vxl` and sends MapDataValidation (60) with `zlib.crc32` of the raw file bytes; 0 when it has no such file. It never compares CRCs itself. |
+| MapDataValidation (60) from the server | `start_processing_map`: builds the world from that local file (`THREAD_STATE_FULL_LOCAL` = 1) and stops reading the network until the loader is done. Columns are read in file order (y outer, x inner), z is moved down by `max(0, 239 - highest z named in the file)`, and the solid under the last span is filled up to that highest z. |
+| MapDataStart / Chunk / End (54/56/58) | A zlib stream of a whole `.vxl`. The client **writes it to its map directory** and validates again. |
+| MapSyncStart / Chunk / End (55/57/59) | A zlib stream of `(u32 x, u32 y, column)` records. At the end `start_processing_map_sync` applies them on top of the loaded world (`THREAD_STATE_PART_REMOTE` = 2): each record replaces its whole column, no z move, filled to 239. Then the world is finalized (borders, mesh). This stage must run even with no record at all; it is what finalizes the world. |
+| StateData (45) | `manager.on_connect()`. |
+
+The other thread states are `THREAD_IDLE` 0, `THREAD_DONE_PROCESSING` 3 and
+`THREAD_CLOSE` 4.
+
+The first byte of every datagram is a priority, read by the client's network
+thread: `0x30` goes to the normal queue, anything else to the high-priority
+queue, and `0x32` also empties the normal queue first. Between MapSyncStart
+and StateData the client reads the high-priority queue only. That is why the
+validation reply, the map stream and StateData use `0x31` and MapSyncStart
+uses `0x32`.
+
+Server side, `[game] map_sync_mode`:
+
+| mode | matching CRC | any other CRC, or 0 |
+|---|---|---|
+| `full` (default) | the whole world as sync records | the same |
+| `auto` | only the columns changed since the map was loaded; none on a fresh map | the whole world as sync records |
+
+A CRC of 0 never matches. The Map Creator always gets the whole world. The
+server never sends 54/56/58 outside the Map Creator, because the retail
+client would overwrite the player's installed map with it.
+
+An excavated column's neighbors can also become dirty without changing
+their solidity: newly exposed implicit interior voxels must gain explicit
+surface-color words. The retail remote loader stores implicit solidity
+without color entries and its finalizer shades existing entries only.
+`WorldManager` materializes the six solid face neighbors before publishing
+a removal, preserving their canonical RGB, and includes their columns in
+full/delta overlays. Otherwise a late join can collide with a wall the
+retail mesher cannot draw. See `tests/test_map_sync_exposed_surfaces.py` and
+`docs/MAP_SYNC_JOIN.md` for independent explicit-color coverage.
+
+`auto` is verified at protocol level: `tests/test_map_sync_auto.py` rebuilds
+the retail client's world from "local file + delta" with the loader above and
+compares it with the server's world, on a full-height map and on a z-moved
+one. Not verified live: the one retail join on the delta path (2026-06-12)
+ended with a hollow world and has not been repeated, so `full` stays the
+default. The z 239 plane differs between the two client loaders (the file
+loader leaves it to the span list, the sync loader fills it); both physics
+treat z 239 as z 238.

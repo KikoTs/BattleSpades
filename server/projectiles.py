@@ -419,12 +419,60 @@ class DrillContact:
         self.block = tuple(int(value) for value in block)
 
 
+class StickyAttachment:
+    """A sticky grenade anchored this tick, on terrain or on ``target_id``.
+
+    The retail client draws the flying grenade (entity 34) and the stuck one
+    (entity 35, AttachedStickyGrenadeEntity) as two different entities, so
+    the server has to swap them at this moment.
+    """
+    __slots__ = ("projectile", "target_id")
+
+    def __init__(self, projectile: Projectile):
+        self.projectile = projectile
+        self.target_id = projectile.attached_player_id
+
+
+class StickyDetachment:
+    """The player a sticky was stuck to stopped being a live carrier."""
+    __slots__ = ("projectile",)
+
+    def __init__(self, projectile: Projectile):
+        self.projectile = projectile
+
+
 class ProjectileEngine:
     """Owns in-flight projectiles; update() advances them one tick and returns
     the explosions the caller must apply (blast + crater + broadcast)."""
 
     def __init__(self):
         self.projectiles: list[Projectile] = []
+        # Sticky attach/detach transitions since the last drain. They are
+        # kept apart from update()'s result, which stays "what exploded".
+        self.attachment_events: list = []
+
+    def drain_attachment_events(self) -> list:
+        """Return and forget the sticky transitions of the ticks so far."""
+        events = self.attachment_events
+        if events:
+            self.attachment_events = []
+        return events
+
+    def detach_from_player(self, player_id: int) -> list[Projectile]:
+        """Freeze every sticky stuck to one player where it currently is.
+
+        Used before a player id leaves the roster: the id is reused at once,
+        and a grenade must never jump to the newcomer who inherits it.
+        """
+        player_id = int(player_id)
+        detached = [
+            projectile
+            for projectile in self.projectiles
+            if projectile.attached_player_id == player_id
+        ]
+        for projectile in detached:
+            projectile.attached_player_id = None
+        return detached
 
     def spawn(self, tool: int, pos, vel, fuse: float, thrower_id: int,
               now: Optional[float] = None) -> Optional[Projectile]:
@@ -512,6 +560,12 @@ class ProjectileEngine:
                         p.x = float(target.x)
                         p.y = float(target.y)
                         p.z = float(target.z) + 1.0
+                    else:
+                        # The carrier died or left. Stay where it was; without
+                        # this a respawn inside the fuse pulled the grenade
+                        # across the map to the new life.
+                        p.attached_player_id = None
+                        self.attachment_events.append(StickyDetachment(p))
                 elif (
                     p.contact_block is not None
                     and not world.get_solid(*p.contact_block)
@@ -548,6 +602,7 @@ class ProjectileEngine:
                     if p.explode_at is None:
                         # Fuse arms on impact (client sends no throw fuse).
                         p.explode_at = now + STICK_ARM_SECONDS
+                    self.attachment_events.append(StickyAttachment(p))
             # Failsafe: nothing fuse-less may outlive MAX_FLIGHT_SECONDS.
             if p.explode_at is None and p.lifespan_at == 0.0 \
                     and (now - p.spawned_at) > MAX_FLIGHT_SECONDS:

@@ -118,6 +118,71 @@ lost packet could hold the WorldUpdate stream behind. Event packets (kills,
 scores, sounds, entity moves) remain reliable by necessity, so the stall can
 still occur behind a lost event packet during busy play.
 
+## Head-of-line stall removed (2026-09-29)
+
+"Nothing server-side can change that without a second ENet channel" above was
+wrong: `ENET_PACKET_FLAG_UNSEQUENCED` is dispatched on arrival whatever the
+channel's reliable sequence says. Measured on this build with one datagram
+carrying a reliable command dropped: flag 0 held three snapshots for 172 ms,
+unsequenced held none.
+
+`[network] worldupdate_delivery = "split"` (default) sends the rows of other
+players, entities and turrets unsequenced, in parts of at most `mtu - 28`
+wire bytes, and keeps each recipient's own row on the ordered stream. The
+second half matters: a snapshot of 24 rows is 1397 wire bytes, and above 1372
+ENet fragments it **reliably** whatever its flags, so a full server was
+sending every WorldUpdate as reliable fragments.
+
+Neither client orders WorldUpdates, so the server does:
+
+- it measures each link from the arrival order of that player's own
+  ClientData and spaces the unsequenced snapshots wider than the measured
+  displacement (`worldupdate_reorder_guard`);
+- a player's row is withheld from a peer until ENet reports that life's
+  CreatePlayer acknowledged, and an entity's or turret's row until its
+  CreateEntity is (the client keeps simulating both meanwhile).
+
+`scripts/worldupdate_stall_probe.py`, 100 ms round trip, 2 % loss, about 18
+reliable packets per second to the observer, gaps of 150 ms or more between
+snapshots carrying remote rows:
+
+| Link | Delivery | Gaps | Frozen | Longest | Stale |
+|---|---|---|---|---|---|
+| ±5 ms, 40 s | sequenced | 7 | 1498 ms | 437 ms | 0 |
+| ±5 ms, 40 s | split | 0 | 0 | 110 ms | 0 |
+| ±20 ms, 40 s | sequenced | 8 | 1687 ms | 266 ms | 0 |
+| ±20 ms, 40 s | split, guard off | 0 | 0 | 110 ms | 16 |
+| ±20 ms, 60 s | split, guard on | 1 and 9 | 157 and 1422 ms | 157 and 171 ms | 0 |
+
+On the last row (two seeds) the guard paces the stream to about 15 Hz, so
+one lost snapshot is already 133 ms and two are over the 150 ms mark; those
+gaps are lost datagrams, not holds, and none is longer than 171 ms. A link
+that reorders datagrams 33 ms apart is unusual; the ±5 ms rows are the
+ordinary case and keep 30 Hz.
+
+When a link stops reordering beyond 100 ms and its stream returns from
+ordered to unsequenced delivery, the observer stream pauses until every
+reliable packet sent before the last ordered snapshot is acknowledged (about
+one round trip, once): an ordered snapshot still held at the receiver would
+otherwise be released after a newer one.
+
+## Late and out-of-order ClientData (2026-09-29)
+
+A label that was refilled as lost often arrives a moment later (any link
+with jitter). It used to be dropped as stale. `Player._salvage_late_frame`
+now uses it once: if nothing newer has been simulated, the next step latches
+its buttons and aim exactly as the client's did; otherwise a jump or gadget
+tap that lived only in that packet is honoured on the next consumed frame. A
+button still held in a newer frame is left to that frame, so nothing fires
+twice. `handle_client_data` no longer lets an older label replace the aim,
+buttons and tool of a newer one, and the crouch edge that scores a teabag is
+taken on the arrival timeline only (the buffered replay repeated it once per
+tick of queue depth: one held crouch counted as three).
+
+A packet that never arrives still leaves its frame a guess, and when it
+carried an edge the guess is wrong half the time. Only redundancy from the
+client can remove that.
+
 ## Not done
 
 Making the Revival client send ClientData reliably (a two-address patch in

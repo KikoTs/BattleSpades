@@ -10,7 +10,7 @@ from server.game_constants import TEAM1
 from server.main import BattleSpadesServer
 from server.player import Player
 from shared.bytes import ByteReader
-from shared.packet import ChangeEntity, CreateEntity, PlaceMG, UseCommand
+from shared.packet import ChangeEntity, CreateEntity, DestroyEntity, PlaceMG, UseCommand
 
 
 class _Connection:
@@ -139,6 +139,87 @@ def test_use_command_mounts_and_unmounts_nearest_machine_gun():
     assert unmounted.player_id == 0xFF
 
 
+def test_redeployment_after_withdrawal_moves_the_gun_and_mounts_again(monkeypatch):
+    from server.deployable_inventory import deployable_stock
+
+    now = [1000.0]
+    monkeypatch.setattr("server.deployable_actions.time.monotonic", lambda: now[0])
+    server, player, connection = _server_player()
+    _place(server, player)
+    old = server.entity_registry.all()[0]
+    old.behavior.health = 47.0
+    old.behavior.ammo = 21
+    use = bytes(UseCommand().generate())
+    asyncio.run(PacketHandler(server).handle(player, use))
+    assert deployable_stock(player, C.MG_TOOL) == 0
+    asyncio.run(PacketHandler(server).handle(player, use))
+    assert deployable_stock(player, C.MG_TOOL) == 1
+    player.set_position(110.5, 100.5, 59.75)
+    player.set_tool(C.MG_TOOL, raw=True)
+    now[0] += 4.0
+    connection.sent.clear()
+
+    _place(server, player, x=111.0)
+    asyncio.run(PacketHandler(server).handle(player, use))
+
+    guns = server.entity_registry.all()
+    assert len(guns) == 1
+    new = guns[0]
+    assert new.entity_id != old.entity_id
+    assert new.x == 111.0
+    assert new.behavior.health == 47.0
+    assert new.behavior.ammo == 21
+    assert player.mounted_entity_id == new.entity_id
+    assert [data[0] for data in connection.sent] == [
+        DestroyEntity.id, CreateEntity.id, ChangeEntity.id,
+    ]
+
+
+def test_rejected_redeployment_preserves_old_gun_and_cadence(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr("server.deployable_actions.time.monotonic", lambda: now[0])
+    server, player, connection = _server_player()
+    _place(server, player)
+    old = server.entity_registry.all()[0]
+    deadline = player._deployable_next_use[C.MG_TOOL]
+    now[0] += 4.0
+    connection.sent.clear()
+
+    _place(server, player, x=200.0)
+    assert server.entity_registry.get(old.entity_id) is old
+    assert player._deployable_next_use[C.MG_TOOL] == deadline
+    assert connection.sent == []
+
+    old.behavior.carrier_id = 7  # another player is using it
+    _place(server, player, x=102.0)
+    assert server.entity_registry.all() == [old]
+    assert player._deployable_next_use[C.MG_TOOL] == deadline
+    assert connection.sent == []
+
+
+def test_redeployment_creation_failure_preserves_old_gun(monkeypatch):
+    import pytest
+
+    now = [1000.0]
+    monkeypatch.setattr("server.deployable_actions.time.monotonic", lambda: now[0])
+    server, player, connection = _server_player()
+    _place(server, player)
+    old = server.entity_registry.all()[0]
+    deadline = player._deployable_next_use[C.MG_TOOL]
+    now[0] += 4.0
+    connection.sent.clear()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("entity id space exhausted")
+
+    monkeypatch.setattr(server.entity_registry, "place", fail)
+    with pytest.raises(RuntimeError, match="entity id"):
+        server.deployable_actions.place_machine_gun(player, (102.0, 100.0, 62.0), yaw=0.0)
+    assert server.entity_registry.all() == [old]
+    assert player._deployable_next_use[C.MG_TOOL] == deadline
+    assert connection.sent == []
+
+
 def _mounted_shot_packet(player):
     return type("Shot", (), {
         "loop_count": 1,
@@ -157,8 +238,8 @@ def test_deployed_mg_uses_recovered_tenth_second_fire_interval(monkeypatch):
     player.set_tool(C.MG_TOOL, raw=True)
     observed = []
 
-    def consume(_now=None, fire_interval=None):
-        observed.append(fire_interval)
+    def consume(_now=None, fire_interval=None, *, loop=None):
+        observed.append((fire_interval, loop))
         return False
 
     monkeypatch.setattr(player, "consume_shot", consume)
@@ -173,7 +254,7 @@ def test_deployed_mg_uses_recovered_tenth_second_fire_interval(monkeypatch):
     from server.combat_runtime import get_combat_system
     get_combat_system(server).handle_shot(player, packet)
 
-    assert observed == [float(C.MG_DEPLOYED_SHOOT_INTERVAL)]
+    assert observed == [(float(C.MG_DEPLOYED_SHOOT_INTERVAL), 1)]
 
 
 def test_unmounted_mg_fire_is_rejected_even_when_client_claims_deployed(monkeypatch):

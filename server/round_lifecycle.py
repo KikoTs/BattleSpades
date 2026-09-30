@@ -176,6 +176,12 @@ class RoundLifecycle:
         if callable(cancel_prefabs):
             cancel_prefabs(player_id)
 
+        # Stickies stuck to this player and its riot-shield anchor name the
+        # id on every client; release them before PlayerLeft frees it.
+        from server.entities import attachments
+
+        attachments.forget_player(server, player)
+
         projectile_engine = getattr(server, "projectile_engine", None)
         remove_projectiles = getattr(projectile_engine, "remove_by_thrower", None)
         if callable(remove_projectiles):

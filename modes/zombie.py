@@ -367,7 +367,7 @@ class ZombieMode(BaseMode):
         Character replacements (loadout edit, team change, round reset) are
         not deaths in the infection sense and never convert or score.
         """
-        if int(kill_type) in _TRANSITION_KILLS:
+        if self.ended or int(kill_type) in _TRANSITION_KILLS:
             return
         if self.phase is not ZombiePhase.ACTIVE or int(player.team) != SURVIVOR_TEAM:
             return
@@ -397,7 +397,8 @@ class ZombieMode(BaseMode):
         on top.
         """
         if (
-            self.phase is ZombiePhase.ACTIVE
+            not self.ended
+            and self.phase is ZombiePhase.ACTIVE
             and int(killer.team) == SURVIVOR_TEAM
             and int(victim.team) == ZOMBIE_TEAM
             and self.last_survivor_id == int(killer.id)

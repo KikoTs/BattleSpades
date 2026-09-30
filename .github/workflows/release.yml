@@ -188,10 +188,11 @@ jobs:
       - name: Publish unsigned beta prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          release-assets/*.zip release-assets/SHA256SUMS.txt
-          --verify-tag
-          --prerelease
-          --title "BattleSpades ${GITHUB_REF_NAME#v}"
-          --notes "Unsigned beta server builds for Windows, Linux, and macOS on x86_64 and arm64. macOS archives are not notarized. Verify downloads with SHA256SUMS.txt."
+        run: |
+          title="$(python -c 'from server.build_info import DISPLAY_RELEASE; print(DISPLAY_RELEASE)')"
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/*.zip release-assets/SHA256SUMS.txt \
+            --verify-tag \
+            --prerelease \
+            --title "$title (${GITHUB_REF_NAME#v})" \
+            --notes-file release/NOTES.md

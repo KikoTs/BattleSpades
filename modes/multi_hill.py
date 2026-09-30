@@ -157,11 +157,16 @@ class MultiHillMode(BaseMode):
                 self._activate_next(now)
             return
 
-        self._update_control(now)
-        await self._award_team_ticks(now)
+        # A delayed tick must not let a newly arrived player claim an expired
+        # hill, or score the stalled time after its configured active window.
+        # Settle the last ownership sample only through the expiry boundary.
+        if now < self._next_rotation_at:
+            self._update_control(now)
+        score_until = min(now, self._next_rotation_at)
+        await self._award_team_ticks(score_until)
         if self.ended:
             return
-        self._award_presence_scores(now)
+        self._award_presence_scores(score_until)
         if now >= self._next_rotation_at:
             expired = tuple(self.active_zones)
             if expired:

@@ -32,4 +32,9 @@ def build_validation_config(
     # disable both sources or a production backfill target silently injects
     # combat traffic into supposedly isolated movement captures.
     config.bots.enabled = False
+    # Validation may inherit an operator config and environment credentials.
+    # Private tests must never advertise themselves to either public master.
+    config.revival.enabled = False
+    config.steam.enabled = False
+    config.steam.query_port = 0
     return config

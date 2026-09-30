@@ -281,6 +281,13 @@ Not sent (evidence too weak for a trigger): `BASE_ACTIVATED`
 lines already cover claims), `TAKE_BOMB_TO_ENEMY_BASE_FAIL`,
 `DIAMOND_SUPPORT`.
 
+Implemented in the 2026-09-29 feature recovery: `VIP_ALREADY_DEAD` is private
+to a joining/team-switching player locked out because their team's VIP died.
+`DIAMOND_CASHED_IN_LOOSE_YOURTEAM` / `_OPPOSITION` announce a loose diamond
+cashed in for its last carrier's team. The retail strings are recovered;
+these server-side triggers are inferred, with dedicated regression coverage
+in `test_vip_already_dead.py` and `test_diamond_loose_cash_in.py`.
+
 Tests: `tests/test_parity_late_additions.py`,
 `tests/test_votekick_retail_format.py`, `tests/test_retail_announcements.py`,
 `tests/test_occupation_fixes.py`.

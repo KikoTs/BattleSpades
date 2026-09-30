@@ -17,6 +17,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
 from .game_constants import TEAM1, TEAM2
+from .mode_data import get as get_mode_data
 from .steam_master import (
     build_game_tags,
     server_population,
@@ -351,7 +352,8 @@ class A2SHandler:
         packet.append(ord(os_code))
         
         # Password protected
-        packet.append(0)
+        join_password = getattr(config, "join_password", "")
+        packet.append(1 if isinstance(join_password, str) and join_password else 0)
         
         # VAC is truthful: anonymous public listing defaults to insecure mode.
         steam_master = getattr(self.server, "steam_master", None)
@@ -372,8 +374,14 @@ class A2SHandler:
         steam_id = int(getattr(steam_master, "steam_id", 0) or config.steam_id)
         packet.extend(struct.pack("<Q", steam_id & 0xFFFFFFFFFFFFFFFF))
         
-        # Keywords (EDF_KEYWORDS)
+        # Keywords (EDF_KEYWORDS). ``mode=`` in the retail tags is the
+        # SERVERMODE browser category, so the AoSPlay master reads the
+        # gameplay mode from the trailing ``gamemode=`` keyword. Retail
+        # scans tags by prefix and ignores it; the Steam tags stay retail.
         keywords = build_game_tags(config)
+        gameplay = f"{keywords};gamemode={get_mode_data(config.game_mode).code}"
+        if len(gameplay.encode('utf-8')) < 128:
+            keywords = gameplay
         packet.extend(keywords.encode('utf-8', 'replace') + b'\0')
         
         # Game ID (EDF_GAME_ID) - 64-bit

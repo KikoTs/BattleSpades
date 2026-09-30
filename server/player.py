@@ -13,9 +13,10 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import shared.constants as C
-from server import anticheat, conduct
+from server import action_clock, anticheat, conduct
 from server.flight_profile import profile_for
 from server.lag_compensation import record_player as _record_lag_history
+from server.lag_compensation import shooter_rtt_ms as _shooter_rtt_ms
 from server.deployable_inventory import (
     commit_deployable_use,
     deployable_ready,
@@ -59,6 +60,20 @@ JETPACK_ACTIVATION_DEFER_FRAMES = 2
 # owner stops thrust 2-3 frames after the inactive row is sent; three frames
 # keeps any residual a forward nudge. Config overrides these fallbacks.
 JETPACK_EXHAUSTION_TAIL_FRAMES = 3
+# Where the retail owner really applies a flight transition row. Eight live
+# 60 Hz captures (16 boundaries, loopback), S = label being simulated when the
+# row is queued, N = newest label already received: the owner's thrust changed
+# on N + 2 (10 times) or N + 3 (6 times), never earlier. The fixed constants
+# above equal that lower bound only while one label is buffered, and ignore
+# the round trip a real link adds. ``_jetpack_handoff_frames`` applies the
+# bound: ignition starts on the earliest possible label (a late owner is a
+# forward nudge), exhaustion ends on the latest (never a rollback).
+JETPACK_HANDOFF_EARLIEST_AFTER_NEWEST = 2
+JETPACK_HANDOFF_LATEST_AFTER_NEWEST = 3
+# ENet's round trip on a link with no delay: the stock client services its
+# socket every 10 ms, the loopback captures above already contain it.
+JETPACK_HANDOFF_LOCAL_RTT_MS = 8.0
+JETPACK_HANDOFF_MAX_FRAMES = 30
 # Parachute (equipment 72) policy; docs/PARACHUTE.md has the evidence and the
 # measurements. The canopy arithmetic itself (0.05 gravity, per-frame fall
 # reset) is the stock native mover and is not touched here. Every value below
@@ -111,6 +126,20 @@ INPUT_LABEL_AHEAD_OF_APPLIED = 64
 INPUT_LABEL_AHEAD_OF_SERVER = 256
 # Samples retained for per-player ClientData queue-delay statistics.
 INPUT_QUEUE_DELAY_SAMPLES = 600
+# ClientData arrival order. A label this far behind the newest one is a
+# ClockSync relabel (MAX_CLOCK_SYNC_DIFFERENCE = 10), not link reordering.
+INPUT_REORDER_MAX_FRAMES = 10
+# How long one observed reordering keeps the replication guard engaged, and
+# the resolution the sliding maximum is kept at.
+INPUT_REORDER_WINDOW_TICKS = 1200
+INPUT_REORDER_BUCKET_TICKS = 60
+# Refilled labels remembered for a late real packet (``_salvage_late_frame``).
+SYNTHESIZED_LABEL_LIMIT = 16
+# Trigger-like inputs honoured once when they were down only in a frame the
+# server never simulated: movement index 4 = jump, action index 7 = hover.
+# Held states (directions, crouch, sneak, sprint, fire, zoom) are not latched.
+PRESS_LATCH_MOVEMENT_INDICES = (4,)
+PRESS_LATCH_ACTION_INDICES = (7,)
 # Launcher reload gate. Live retail RPG: 4 rockets take ~6.6 s, i.e. each
 # emptied clip waits shoot_interval + reload_time (0.7 + 1.5 s) before the
 # next round. The grace absorbs packet jitter between two shots.
@@ -579,6 +608,35 @@ class Player:
         # packet carried (crouch geometry alone is a 0.9-block difference).
         self.last_applied_input_synthesized: bool = False
         self._orientation_after_synth: bool = False
+        # Arrival order of the unsequenced ClientData stream. A label that
+        # arrives after a newer one measures how far this link reorders
+        # datagrams; replication paces its unsequenced snapshots by it
+        # (ReplicationService reorder guard). Never reset per life: the
+        # client keeps one loop clock across respawns.
+        self._input_newest_label: Optional[int] = None
+        self._input_reorder_events: deque[tuple[int, int]] = deque(
+            maxlen=INPUT_REORDER_WINDOW_TICKS // INPUT_REORDER_BUCKET_TICKS + 2
+        )
+        self.input_frames_reordered: int = 0
+        # Labels refilled as lost, kept briefly so a late real packet can
+        # still supply what the guess could not know (see
+        # ``_salvage_late_frame``). label -> buttons the refill assumed.
+        self._synthesized_labels: dict[int, tuple] = {}
+        self.input_frames_salvaged: int = 0
+        # Buttons and actions that were down only in a frame the server
+        # never simulated; honoured once on the next consumed frame.
+        self._press_latch_flags: tuple = ()
+        self._press_latch_actions: tuple = ()
+        self.input_presses_latched: int = 0
+        # Action flags of the newest frame the simulation consumed.
+        self._applied_action_flags: Optional[tuple] = None
+        # False while a ClientData older than the newest seen label is being
+        # handled: its immediate state must not overwrite newer input.
+        self.last_input_arrival_fresh: bool = True
+        # Score-bearing crouch edges are detected on the arrival timeline
+        # only; the buffered replay trails it and would repeat each edge.
+        self._crouch_edge_held: bool = False
+        self._applying_buffered_frame: bool = False
         self.rejected_tool_updates: int = 0
         # Anti-cheat input accounting (docs: server/anticheat.py).
         # label -> (eye xyz, aim xyz) right after that frame was simulated.
@@ -623,6 +681,7 @@ class Player:
         self.last_landed: bool = False
         self.last_step_delta: float = 0.0
         self.last_trigger_jump: bool = False
+        self.last_retail_jump_loop: Optional[int] = None
         self.last_buffered_jump_active: bool = False
         self.last_collision_count: int = 0
         self.last_collision_preview: list[tuple[float, float, float, float]] = []
@@ -986,6 +1045,41 @@ class Player:
         except (TypeError, ValueError):
             return int(default)
 
+    def _jetpack_handoff_frames(
+        self, name: str, default: int, *, latest: bool
+    ) -> int:
+        """Accepted-input frames until the retail owner applies a transition.
+
+        ``latest`` selects the last label the owner can still be on (used for
+        exhaustion, where the server must not stop thrust before the owner
+        does); otherwise the first one (ignition). With one buffered label
+        and no network delay both equal the configured constants.
+        """
+        frames = self._jetpack_boundary_frames(name, default)
+        if bool(getattr(self.connection, "flight_profile_capable", False)):
+            # Native owners predict the boundary from their own input.
+            return frames
+        config = getattr(getattr(self.connection, "server", None), "config", None)
+        if not bool(getattr(config, "jetpack_handoff_latency_aware", True)):
+            return frames
+        applied = self.last_applied_input_loop
+        ahead = 0
+        if applied is not None and self.input_history:
+            try:
+                ahead = max(0, min(10, int(max(self.input_history)) - int(applied)))
+            except (TypeError, ValueError):
+                ahead = 0
+        after_newest = (
+            JETPACK_HANDOFF_LATEST_AFTER_NEWEST if latest
+            else JETPACK_HANDOFF_EARLIEST_AFTER_NEWEST
+        )
+        # The boundary label is S + 1 + frames and must reach N + after_newest.
+        frames = max(frames, ahead + after_newest - 1)
+        network_ms = max(0.0, _shooter_rtt_ms(self) - JETPACK_HANDOFF_LOCAL_RTT_MS)
+        network_frames = network_ms * 60.0 / 1000.0
+        frames += int(math.ceil(network_frames) if latest else math.floor(network_frames))
+        return max(0, min(JETPACK_HANDOFF_MAX_FRAMES, int(frames)))
+
     def _note_jetpack_physics_started(self) -> None:
         """Persist the exact consumed frame that first applied active thrust.
 
@@ -1319,6 +1413,10 @@ class Player:
         # compatibility facade for legacy mode spawn paths, so reset the
         # replication service here until every mode delegates to RoundLifecycle.
         server = self.connection.server if self.connection else None
+        if server is not None:
+            from server.entities.attachments import forget_player as forget_attachments
+
+            forget_attachments(server, self)
         self.reset_block_color_for_spawn()
         corpse_lifecycle = getattr(server, "corpse_lifecycle", None)
         before_player_spawn = getattr(
@@ -1374,6 +1472,13 @@ class Player:
         self._last_simulated_at = None
         self._backlog_over_ticks = 0
         self._backlog_catchup = False
+        # A press or refill of the previous body never reaches the new one.
+        self._synthesized_labels = {}
+        self._press_latch_flags = ()
+        self._press_latch_actions = ()
+        self._applied_action_flags = None
+        self._crouch_edge_held = False
+        self._applying_buffered_frame = False
         self._tool_before_mg = None
         self.blocks = self._block_wallet_start()
         self.grenades = MAX_GRENADES
@@ -1430,6 +1535,7 @@ class Player:
         self.last_landed = False
         self.last_step_delta = 0.0
         self.last_trigger_jump = False
+        self.last_retail_jump_loop = None
         self.last_buffered_jump_active = False
         self.last_collision_count = 0
         self.last_collision_preview = []
@@ -1439,6 +1545,7 @@ class Player:
         self.last_native_post_update = {}
         self.last_shot_time = 0.0
         self.next_shot_time = 0.0
+        action_clock.reset(self)
         self.reload_end_time = 0.0
         self.reloading = False
 
@@ -1631,11 +1738,28 @@ class Player:
             return False
         return True
 
+    def _fire_lane(self) -> str:
+        """Share a cooldown across mouse buttons and tool changes."""
+        return "fire"
+
+    def _fire_interval(self, fire_interval: Optional[float]) -> float:
+        if fire_interval is not None:
+            return float(fire_interval)
+        return float(self.get_weapon_profile().fire_interval)
+
     def can_fire(
         self,
         now: Optional[float] = None,
         fire_interval: Optional[float] = None,
+        *,
+        loop=None,
     ) -> bool:
+        """Whether a shot/swing may happen now.
+
+        ``loop`` is the client frame label of the ShootPacket. With it the
+        cadence is measured on the client's clock (server/action_clock.py);
+        without it (bots, server-side callers) on arrival time as before.
+        """
         if not self.alive or not self.spawned:
             return False
 
@@ -1643,10 +1767,17 @@ class Player:
         self._advance_reload(current_time)
         if self._reload_blocks_shot(current_time, commit=False):
             return False
+        if not self.is_bot:
+            if not action_clock.peek(
+                self, self._fire_lane(), label=loop,
+                interval=self._fire_interval(fire_interval), now=current_time,
+                grace=FIRE_RATE_GRACE,
+            ):
+                return False
         # Admit up to one tick of arrival jitter against a stable cadence
         # schedule. The grace is never subtracted from every accepted interval,
         # which would permanently raise the weapon's sustained fire rate.
-        if current_time + FIRE_RATE_GRACE < self.next_shot_time:
+        elif current_time + FIRE_RATE_GRACE < self.next_shot_time:
             return False
 
         if self.is_spade_tool():
@@ -1658,7 +1789,8 @@ class Player:
         # An empty clip whose reload cycle ends within the jitter grace.
         return bool(
             self.reloading
-            and float(self.reload_end_time) - float(current_time)
+            and float(self.reload_end_time)
+            - current_time
             <= self._reload_fire_grace(self._reload_profile())
             and self.ammo_reserve > 0
         )
@@ -1667,8 +1799,10 @@ class Player:
         self,
         now: Optional[float] = None,
         fire_interval: Optional[float] = None,
+        *,
+        loop=None,
     ) -> bool:
-        if not self.can_fire(now, fire_interval=fire_interval):
+        if not self.can_fire(now, fire_interval=fire_interval, loop=loop):
             return False
 
         current_time = time.monotonic() if now is None else now
@@ -1678,6 +1812,12 @@ class Player:
                 return False
         profile = self.get_weapon_profile()
         interval = profile.fire_interval if fire_interval is None else float(fire_interval)
+        if not self.is_bot:
+            if not action_clock.admit(
+                self, self._fire_lane(), label=loop, interval=interval,
+                now=current_time, grace=FIRE_RATE_GRACE,
+            ):
+                return False
         previous_due = self.next_shot_time
         self.last_shot_time = current_time
         if previous_due <= 0.0:
@@ -2729,9 +2869,8 @@ class Player:
         self.last_update = time.time()
         self.movement_time += dt
         was_airborne = self.airborne
-        # The native mover decides whether held jump can launch. Authority
-        # advances from its simulated position; owner snapshots are outputs,
-        # never a position rewind input to the next jump.
+        # The native mover decides whether held jump can launch. Owner
+        # snapshots remain outputs, never guessed position rewind inputs.
         trigger_jump = bool(self.input.jump) and not bool(world_object.airborne)
         self.last_trigger_jump = bool(trigger_jump)
         positions = self._build_player_collision_positions()
@@ -2761,12 +2900,44 @@ class Player:
             )
         self._update_jetpack(dt)
         self._update_parachute(dt)
+        if (
+            self.jetpack_active
+            or self._jetpack_physics_active
+            or self._jetpack_activation_defer_remaining
+            or self._jetpack_exhaustion_tail_remaining
+            or self.parachute_active
+            or self._parachute_physics_active
+            or self._parachute_deploy_pending
+        ):
+            # A later flight release must not reopen an ordinary jump's old
+            # replay window. Flight owns its separate urgent handoff rows.
+            self.last_retail_jump_loop = None
         self._apply_input_state_to_world(
             trigger_jump=trigger_jump, collisions=positions
         )
         chute_pre_vz = float(world_object.velocity.z)
         chute_physics = bool(self._parachute_physics_active)
+        # Keep the original mover's displacement for every client. The retail
+        # jump fix already removes Character's extra cache reset; reproducing
+        # that reset here fights patched clients and creates a new correction.
+        # An absent BSCF flight capability cannot identify an unpatched client.
         result = world_object.update(dt, positions)
+        if (
+            world_object.jump_this_frame
+            and not self.is_bot
+            and getattr(self.connection, "flight_profile_capable", None) is False
+            and not self.jetpack_active
+            and not self._jetpack_physics_active
+            and not self._jetpack_activation_defer_remaining
+            and not self._jetpack_exhaustion_tail_remaining
+            and not self.parachute_active
+            and not self._parachute_physics_active
+            and not self._parachute_deploy_pending
+        ):
+            # The first post-launch owner row can trigger stock correction
+            # replay. Replication spaces the following row past that replay's
+            # differently-labelled history, without changing physics/pongs.
+            self.last_retail_jump_loop = self.last_applied_input_loop
         self.last_fall_result = int(result or 0)
         self._sync_cached_vectors()
         # The landing row must close the advertised canopy immediately, and
@@ -2839,6 +3010,20 @@ class Player:
         """
         if not bool(getattr(self, "disguised", False)):
             return
+        pending = getattr(self, "_disguise_pending_input", None)
+        if pending is not None:
+            activation_loop, deadline = pending
+            # Locomotion in a retail history row is latched from the previous
+            # ClientData. Compare that source label, not the row being ACKed.
+            source_loop = getattr(self, "_applied_input_source_loop", None)
+            if (
+                time.monotonic() < deadline
+                and action_clock.label_plausible(self, activation_loop)
+                and (source_loop is None or source_loop < activation_loop)
+            ):
+                self._disguise_anchor = (float(self.x), float(self.y), float(self.z))
+                return
+            self._disguise_pending_input = None
         state = getattr(self, "input", None)
         if state is not None and any(
             bool(getattr(state, name, False))
@@ -2974,9 +3159,10 @@ class Player:
                     # the unobservable GameScene boundary settles.
                     self._jetpack_physics_active = False
                     self._jetpack_activation_defer_remaining = (
-                        self._jetpack_boundary_frames(
+                        self._jetpack_handoff_frames(
                             "jetpack_activation_defer_frames",
                             JETPACK_ACTIVATION_DEFER_FRAMES,
+                            latest=False,
                         )
                     )
                     self._jetpack_exhaustion_tail_remaining = 0
@@ -3012,9 +3198,10 @@ class Player:
                 self._jetpack_requires_release = True
                 self._jetpack_activation_defer_remaining = 0
                 self._jetpack_exhaustion_tail_remaining = (
-                    self._jetpack_boundary_frames(
+                    self._jetpack_handoff_frames(
                         "jetpack_exhaustion_tail_frames",
                         JETPACK_EXHAUSTION_TAIL_FRAMES,
+                        latest=True,
                     )
                     if self._jetpack_physics_active else 0
                 )
@@ -3395,7 +3582,16 @@ class Player:
         sneak: bool,
         sprint: bool,
     ):
-        crouch_pressed = bool(crouch and not self.input.crouch)
+        if getattr(self, "_applying_buffered_frame", False):
+            # The buffered replay trails the arrival timeline by the queue
+            # depth; ``self.input`` alternates between the two, so an edge
+            # taken here would repeat once per tick of that depth.
+            crouch_pressed = False
+        else:
+            crouch_pressed = bool(
+                crouch and not getattr(self, "_crouch_edge_held", False)
+            )
+            self._crouch_edge_held = bool(crouch)
         self.input.up = up
         self.input.down = down
         self.input.left = left
@@ -3577,6 +3773,9 @@ class Player:
         # AFK: idle clients keep streaming identical rows, so only a change
         # of keys/aim counts as activity (server.conduct).
         conduct.observe_input(self, flags, orientation, action_flags)
+        self.last_input_arrival_fresh = self._observe_input_arrival_order(
+            loop_count, received_server_tick
+        )
         if not self.alive or not self.spawned:
             # The retail client keeps sending ClientData during the class-change
             # death screen. Those frames describe the old body and spawn()
@@ -3592,7 +3791,11 @@ class Player:
             and loop_count <= self.last_applied_input_loop
         ):
             # Never let a delayed duplicate move the authoritative player a
-            # second time.
+            # second time. A late original of a refilled label still tells
+            # what the refill had to guess.
+            self._salvage_late_frame(
+                loop_count, flags, orientation, action_flags
+            )
             self.input_frames_stale += 1
             self.input_frames_dropped += 1
             return
@@ -3645,6 +3848,160 @@ class Player:
             self.input_frames_dropped += len(overflow)
             for key in overflow:
                 del self.input_history[key]
+
+    def _observe_input_arrival_order(
+        self,
+        loop_count,
+        received_server_tick: Optional[int],
+    ) -> bool:
+        """Record where ``loop_count`` arrived; True when it is the newest.
+
+        ClientData is ENet unsequenced, so the link may deliver labels out of
+        order. The distance a label trails the newest one is a direct
+        measurement of how far this link reorders datagrams sent one frame
+        apart; ``input_reorder_spread_frames`` reports the recent maximum.
+        """
+        try:
+            label = int(loop_count)
+        except (TypeError, ValueError):
+            return True
+        newest = self._input_newest_label
+        if newest is None or label > newest:
+            self._input_newest_label = label
+            return True
+        late = newest - label
+        if late > INPUT_REORDER_MAX_FRAMES:
+            # The client rewrote its loop clock backwards (ClockSync).
+            self._input_newest_label = label
+            return True
+        if late == 0:
+            return False
+        self.input_frames_reordered += 1
+        tick = 0 if received_server_tick is None else int(received_server_tick)
+        # One entry per second of server time, holding that second's largest
+        # displacement: a sliding maximum over the window in ~20 entries.
+        events = self._input_reorder_events
+        if events and 0 <= tick - events[-1][0] < INPUT_REORDER_BUCKET_TICKS:
+            if late > events[-1][1]:
+                events[-1] = (events[-1][0], late)
+        else:
+            events.append((tick, late))
+        return False
+
+    def input_reorder_spread_frames(self, now_tick: int) -> int:
+        """Largest recent arrival displacement of this player's ClientData."""
+        events = self._input_reorder_events
+        now_tick = int(now_tick)
+        while events and now_tick - events[0][0] > INPUT_REORDER_WINDOW_TICKS:
+            events.popleft()
+        return max((late for _tick, late in events), default=0)
+
+    def _salvage_late_frame(
+        self,
+        loop_count: int,
+        flags: tuple,
+        orientation: tuple,
+        action_flags: tuple | None,
+    ) -> bool:
+        """Use the late original of a label that was refilled as lost.
+
+        The refill simulated the label with the held input, which is exact
+        for its locomotion and aim (both latched from the previous packet).
+        What it could not know is what this packet carried for later frames:
+
+        * the step after this label latches this packet's locomotion buttons
+          and aim. If nothing newer has been simulated yet they are installed
+          now, so that step matches the client's exactly;
+        * a trigger-like button that was down only in this packet (a short
+          jump or gadget tap) would otherwise never be seen. It is honoured
+          once, on the next consumed frame.
+
+        Each refilled label is salvaged at most once, and a button still held
+        in a newer frame is left to that frame, so nothing fires twice.
+        """
+        assumed = self._synthesized_labels.pop(int(loop_count), None)
+        if assumed is None:
+            return False
+        assumed_flags, assumed_actions = assumed
+        try:
+            flags = tuple(bool(value) for value in flags)
+        except TypeError:
+            return False
+        if len(flags) != len(IDLE_INPUT_FLAGS):
+            return False
+        actions = None
+        if action_flags is not None:
+            try:
+                actions = tuple(bool(value) for value in action_flags)
+            except TypeError:
+                actions = None
+        self.input_frames_salvaged += 1
+        server = self.connection.server if self.connection else None
+        latch_frames = int(getattr(
+            getattr(server, "config", None), "movement_input_latch_frames", 1
+        ))
+        queued = [self.input_history[key] for key in sorted(self.input_history)]
+        in_time = bool(
+            latch_frames
+            and int(loop_count) == self.last_applied_input_loop
+        )
+        if in_time:
+            try:
+                aim = tuple(float(value) for value in orientation)
+            except (TypeError, ValueError):
+                aim = ()
+            if len(aim) == 3 and all(math.isfinite(value) for value in aim):
+                self._applied_orientation = aim
+                self._orientation_after_synth = False
+            self._pending_packet_flags = flags
+            self._pending_packet_loop = int(loop_count)
+        else:
+            held = tuple(self._pending_packet_flags)
+            latch = list(self._press_latch_flags or IDLE_INPUT_FLAGS)
+            for index in PRESS_LATCH_MOVEMENT_INDICES:
+                if (
+                    flags[index]
+                    and not bool(assumed_flags[index])
+                    and not bool(held[index])
+                    and not any(
+                        bool(frame.movement_flags[index]) for frame in queued
+                    )
+                ):
+                    latch[index] = True
+                    self.input_presses_latched += 1
+            if any(latch):
+                self._press_latch_flags = tuple(latch)
+        if actions is not None:
+            held_actions = self._applied_action_flags or ()
+            latch = list(
+                self._press_latch_actions or (False,) * len(actions)
+            )
+            for index in PRESS_LATCH_ACTION_INDICES:
+                if index >= len(actions) or index >= len(latch):
+                    continue
+                if (
+                    actions[index]
+                    and not (
+                        assumed_actions is not None
+                        and index < len(assumed_actions)
+                        and bool(assumed_actions[index])
+                    )
+                    and not (
+                        index < len(held_actions)
+                        and bool(held_actions[index])
+                    )
+                    and not any(
+                        frame.action_flags is not None
+                        and index < len(frame.action_flags)
+                        and bool(frame.action_flags[index])
+                        for frame in queued
+                    )
+                ):
+                    latch[index] = True
+                    self.input_presses_latched += 1
+            if any(latch):
+                self._press_latch_actions = tuple(latch)
+        return True
 
     async def simulate_tick(self, dt: float) -> None:
         """Advance at most one observed client frame per server tick.
@@ -3810,10 +4167,32 @@ class Player:
         self._orientation_after_synth = False
         self.last_applied_input_loop = loop
         self.last_applied_input_synthesized = False
+        action_flags = frame.action_flags
+        if self._press_latch_flags:
+            # A tap that lived only in a frame never simulated: once, now.
+            flags = tuple(
+                bool(value) or bool(latched)
+                for value, latched in zip(flags, self._press_latch_flags)
+            )
+            self._press_latch_flags = ()
+        if self._press_latch_actions and action_flags is not None:
+            action_flags = tuple(
+                bool(value) or (
+                    index < len(self._press_latch_actions)
+                    and bool(self._press_latch_actions[index])
+                )
+                for index, value in enumerate(action_flags)
+            )
+            self._press_latch_actions = ()
         self.set_orientation_vector(*applied_orientation)
-        self.update_input(*flags)
-        if frame.action_flags is not None:
-            self.update_action_input(*frame.action_flags)
+        self._applying_buffered_frame = True
+        try:
+            self.update_input(*flags)
+        finally:
+            self._applying_buffered_frame = False
+        if action_flags is not None:
+            self.update_action_input(*action_flags)
+        self._applied_action_flags = frame.action_flags
         self._applied_input_flags = flags
         self._applied_orientation = orientation
         self._applied_input_source_loop = applied_input_source_loop
@@ -3950,10 +4329,14 @@ class Player:
         # Neutral locomotion (crouch kept: flipping it moves the eye 0.9),
         # no thrust, no hover. The acknowledged label does not advance, so
         # the owner's next self row corrects it onto the falling body.
-        self.update_input(
-            False, False, False, False, False,
-            bool(self.input.crouch), False, False,
-        )
+        self._applying_buffered_frame = True
+        try:
+            self.update_input(
+                False, False, False, False, False,
+                bool(self.input.crouch), False, False,
+            )
+        finally:
+            self._applying_buffered_frame = False
         self.input.hover = False
         self.input_frames_starvation_steps += 1
         await self.update(dt)
@@ -3968,6 +4351,11 @@ class Player:
         """
         if not self.input_history or server is None:
             return False
+        if self._retail_idle_backlog_pair_safe(server):
+            # A render/network stall otherwise leaves a permanent FIFO delay
+            # in observation mode. Consume one extra *received* idle frame;
+            # walking, actions and native clients retain their normal policy.
+            return True
         head = self.input_history[min(self.input_history)]
         if head.received_server_tick is None:
             return False
@@ -4005,6 +4393,42 @@ class Player:
         if excess > 0:
             self._drop_backlog_frames(excess)
         return False
+
+    def _retail_idle_backlog_pair_safe(self, server) -> bool:
+        """Drain only settled retail idle input, with no nearby moving actor."""
+        if (
+            self.is_bot
+            or getattr(self.connection, "flight_profile_capable", None) is not False
+            or len(self.input_history) <= 2
+            or not self.grounded
+            or self.wade
+            or max(abs(self.vx), abs(self.vy), abs(self.vz)) > 1e-7
+            or self.jetpack_id
+            or any(self._pending_packet_flags)
+            or any(self._press_latch_flags)
+            or any(self._press_latch_actions)
+            or any((self.input.up, self.input.down, self.input.left,
+                    self.input.right, self.input.jump, self.input.crouch,
+                    self.input.sprint, self.input.hover))
+            or not self._backlog_pair_safe(server)
+        ):
+            return False
+        first = self.input_history[self.last_applied_input_loop + 1]
+        second = self.input_history[self.last_applied_input_loop + 2]
+        if any(first.movement_flags) or any(second.movement_flags):
+            return False
+        actions = first.action_flags
+        # Pickup, weapon-display and palette bits are stable capabilities,
+        # not held actions; stock idle packets normally keep them enabled.
+        if (actions != second.action_flags
+                or actions != self._applied_action_flags
+                or any(enabled for index, enabled in enumerate(actions or ())
+                       if index not in (3, 4, 8))):
+            return False
+        return not any(
+            (x - self.x) ** 2 + (y - self.y) ** 2 + (z - self.z) ** 2 < 16.0
+            for x, y, z, _height in self._build_player_collision_positions()
+        )
 
     def _backlog_pair_safe(self, server) -> bool:
         """Two frames may share a tick only across no state transition.
@@ -4120,8 +4544,18 @@ class Player:
         self.last_applied_input_loop = int(loop)
         self.last_applied_input_synthesized = True
         self._orientation_after_synth = True
+        # Remember what was assumed: the original may still arrive late.
+        self._synthesized_labels[int(loop)] = (
+            flags, self._applied_action_flags
+        )
+        while len(self._synthesized_labels) > SYNTHESIZED_LABEL_LIMIT:
+            del self._synthesized_labels[min(self._synthesized_labels)]
         self.set_orientation_vector(*orientation)
-        self.update_input(*flags)
+        self._applying_buffered_frame = True
+        try:
+            self.update_input(*flags)
+        finally:
+            self._applying_buffered_frame = False
         self._applied_input_flags = flags
         self.input_frames_synthesized += 1
         self._apply_velocity_impulses_through(int(loop))

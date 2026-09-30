@@ -121,6 +121,12 @@ async def handle_place_flare_block(server, player, packet):
     infinite = bool(getattr(server.teams.get(player.team), "infinite_blocks", False))
     if not infinite and int(getattr(player, "blocks", 0)) < cost:
         return
+    # The retail tool paces at 0.5 s. The server's shared minimum placement
+    # interval also covers flares and tolerates reliable packets bunched by lag.
+    if not get_combat_system(server)._block_interval_ok(
+        player, (cell,), loop=getattr(packet, "loop_count", None)
+    ):
+        return
 
     packed_color = int(getattr(player, "block_color", 0)) & 0xFFFFFF
     color = (
@@ -251,7 +257,8 @@ async def handle_disguise(server, player, packet):
     disguises or consuming two charges for an already-active player.
     """
     return server.deployable_actions.set_disguise(
-        player, active=bool(getattr(packet, "active", 0))
+        player, active=bool(getattr(packet, "active", 0)),
+        loop_count=getattr(packet, "loop_count", None),
     )
 
 

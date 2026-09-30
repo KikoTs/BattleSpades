@@ -532,6 +532,7 @@ class SoakHarness:
         fields = {}
         for name in (
             "running", "process_id", "restarts", "stalled_restarts",
+            "planned_recycles", "crash_restarts",
             "intent_silence_seconds", "queued_frames", "queued_intents",
             "pending_terrain_cells", "dropped_frames", "dropped_intents",
             "snapshot_required", "snapshot_rejections",
@@ -978,6 +979,10 @@ class SoakHarness:
                 exc = server_task.exception()
                 self.stop_reason = f"server task ended: {exc!r}"
                 self.event("server_task_ended", error=repr(exc))
+                raise RuntimeError(self.stop_reason) from exc
+            # Propagate driver failures after writing the shutdown summary;
+            # silently gathering them used to turn a broken soak into exit 0.
+            await driver_task
         finally:
             self.stop_requested = True
             try:

@@ -139,6 +139,11 @@ async def handle_client_data(server, player, packet) -> None:
         received_server_tick=int(getattr(server, "loop_count", 0)),
         wire_unknown_byte=int(packet.ooo),
     )
+    if getattr(player, "last_input_arrival_fresh", True) is False:
+        # ClientData is unsequenced, so an older label can arrive after a
+        # newer one. It was buffered (or salvaged) above; its aim, buttons
+        # and tool must not replace the newer state already in effect.
+        return
     player.set_orientation_vector(packet.o_x, packet.o_y, packet.o_z)
     player.update_input(*flags)
     player.update_action_input(

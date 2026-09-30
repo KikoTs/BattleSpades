@@ -116,15 +116,16 @@ def test_shootpacket_dig_queues_mined_blocks_destroyed_once(tool):
     assert all(not server.world_manager.get_solid(*cell) for cell in cells)
 
 
-def test_machete_dig_queues_event_only_when_a_cell_breaks():
+def test_machete_dig_queues_event_only_when_a_cell_breaks(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("server.combat_runtime.time.monotonic", lambda: clock[0])
     server, player, _ = _server_player(C.MACHETE_TOOL)
     player.orientation = (0.0, 0.0, 1.0)
     server._mode_events.clear()
     swings = 0
     while server.world_manager.get_solid(100, 100, 62) and swings < 10:
-        player.next_shot_time = 0.0
-        player.last_shot_time = 0.0
         server.combat.handle_shot(player, _dig_packet(player))
+        clock[0] += player.get_weapon_profile().fire_interval
         swings += 1
     events = _events(server, "on_blocks_destroyed")
     assert not server.world_manager.get_solid(100, 100, 62)

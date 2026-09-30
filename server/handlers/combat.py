@@ -11,7 +11,6 @@ async def handle_shoot(server, player, packet) -> None:
     """Validate and resolve one server-authoritative weapon shot."""
     if not player.alive:
         return
-    player.disguised = False
     get_combat_system(server).handle_shot(player, packet)
 
 

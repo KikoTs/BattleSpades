@@ -1,6 +1,10 @@
+import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
+from scripts import run_validation_server as validation_launcher
 from scripts.parity_artifact import ParityArtifact
 from scripts.parity_clients import DEFAULT_CLIENT_DIR, build_client_specs
 from scripts.run_validation_server import parse_args
@@ -17,6 +21,9 @@ def test_validation_config_overrides_runtime_values_without_mutating_source():
         bot_count=4,
         bots=BotConfig(configured=True, enabled=True, max_bots=12),
     )
+    source.revival.enabled = True
+    source.steam.enabled = True
+    source.steam.query_port = 27016
 
     result = build_validation_config(
         source,
@@ -31,10 +38,16 @@ def test_validation_config_overrides_runtime_values_without_mutating_source():
     assert result.name.endswith("[VALIDATION]")
     assert result.bot_count == 0
     assert result.bots.enabled is False
+    assert result.revival.enabled is False
+    assert result.steam.enabled is False
+    assert result.steam.query_port == 0
     assert source.port == 27015
     assert source.default_map == "CityOfChicago"
     assert source.bot_count == 4
     assert source.bots.enabled is True
+    assert source.revival.enabled is True
+    assert source.steam.enabled is True
+    assert source.steam.query_port == 27016
 
 
 def test_validation_config_refuses_public_port():
@@ -53,6 +66,7 @@ def test_validation_launcher_defaults_are_isolated():
     assert args.config == Path("config.toml")
     assert args.worldupdate_loop_offset is None
     assert args.worldupdate_airborne_self_row_interval is None
+    assert args.worldupdate_retail_airborne_self_row_interval is None
     assert args.jetpack_owner_handoff_input_frames is None
     assert args.jetpack_owner_release_handoff_input_frames is None
     assert args.movement_authority is None
@@ -68,6 +82,7 @@ def test_validation_launcher_accepts_reconciliation_calibration_overrides():
     args = parse_args([
         "--worldupdate-loop-offset", "-2",
         "--worldupdate-airborne-self-row-interval", "6",
+        "--worldupdate-retail-airborne-self-row-interval", "3",
         "--jetpack-owner-handoff-input-frames", "18",
         "--jetpack-owner-release-handoff-input-frames", "600",
         "--debug-selfrow",
@@ -75,9 +90,69 @@ def test_validation_launcher_accepts_reconciliation_calibration_overrides():
 
     assert args.worldupdate_loop_offset == -2
     assert args.worldupdate_airborne_self_row_interval == 6
+    assert args.worldupdate_retail_airborne_self_row_interval == 3
     assert args.jetpack_owner_handoff_input_frames == 18
     assert args.jetpack_owner_release_handoff_input_frames == 600
     assert args.debug_selfrow
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ([], (9, 5)),
+        (["--worldupdate-retail-airborne-self-row-interval", "3"], (9, 3)),
+        (["--worldupdate-airborne-self-row-interval", "4"], (4, 5)),
+        (["--worldupdate-retail-airborne-self-row-interval", "0"], (9, 1)),
+        (["--worldupdate-retail-airborne-self-row-interval", "-8"], (9, 1)),
+        (["--worldupdate-airborne-self-row-interval", "0",
+          "--worldupdate-retail-airborne-self-row-interval", "7"], (1, 7)),
+    ],
+)
+def test_validation_launcher_applies_independent_airborne_overrides(
+    monkeypatch, overrides, expected,
+):
+    source = ServerConfig(
+        worldupdate_airborne_self_row_interval=9,
+        worldupdate_retail_airborne_self_row_interval=5,
+    )
+    observed = []
+
+    class ConfigCaptured(Exception):
+        pass
+
+    def capture_config(config):
+        # Stop before creating a real host, installing signals or log sinks.
+        observed.append(config)
+        raise ConfigCaptured
+
+    monkeypatch.setattr(validation_launcher, "load_config", lambda _path: source)
+    monkeypatch.setattr(validation_launcher, "BattleSpadesServer", capture_config)
+    with pytest.raises(ConfigCaptured):
+        asyncio.run(validation_launcher.run_validation_server(parse_args(overrides)))
+
+    config, = observed
+    assert (config.worldupdate_airborne_self_row_interval,
+            config.worldupdate_retail_airborne_self_row_interval) == expected
+    assert source.worldupdate_airborne_self_row_interval == 9
+    assert source.worldupdate_retail_airborne_self_row_interval == 5
+
+
+def test_validation_launcher_accepts_older_namespace_without_retail_override(monkeypatch):
+    args = parse_args([])
+    del args.worldupdate_retail_airborne_self_row_interval
+    source = ServerConfig(worldupdate_retail_airborne_self_row_interval=7)
+
+    class ConfigCaptured(Exception):
+        pass
+
+    def capture_config(config):
+        assert config.worldupdate_retail_airborne_self_row_interval == 7
+        raise ConfigCaptured
+
+    monkeypatch.setattr(validation_launcher, "load_config", lambda _path: source)
+    monkeypatch.setattr(validation_launcher, "BattleSpadesServer", capture_config)
+    with pytest.raises(ConfigCaptured):
+        asyncio.run(validation_launcher.run_validation_server(args))
 
 
 def test_validation_launcher_accepts_authority_and_self_row_ab_overrides():

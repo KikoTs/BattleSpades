@@ -83,7 +83,7 @@ def test_mode_change_also_carries_team_select_peer(monkeypatch) -> None:
     assert pregame.reload_calls == 1
 
 
-def test_team_select_peer_without_loader_ack_is_retired(monkeypatch) -> None:
+def test_stock_team_select_peer_without_custom_loader_ack_is_reloaded(monkeypatch) -> None:
     server = _Server()
     pregame = _PregameConnection()
     pregame.transition_ready = False
@@ -93,9 +93,9 @@ def test_team_select_peer_without_loader_ack_is_retired(monkeypatch) -> None:
     result = asyncio.run(service.change_map("HallwayPin"))
 
     assert result.ok is True
-    assert result.reconnect_required is True
-    assert pregame.reload_calls == 0
-    assert pregame.disconnect_reasons == [18]
+    assert result.reconnect_required is False
+    assert pregame.reload_calls == 1
+    assert pregame.disconnect_reasons == []
 
 
 def test_mid_mapsync_peer_still_retired_and_gets_no_mapended(monkeypatch) -> None:
