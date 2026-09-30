@@ -18,3 +18,4 @@ jobs:
       - run: python setup.py build_ext --inplace
       - run: python scripts/beta02_map_load_diagnostic.py
       - run: python -m pytest tests/test_map_load_stall.py -q -s
+      - run: python scripts/beta02_map_load_control.py
