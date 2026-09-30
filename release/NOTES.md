@@ -32,6 +32,8 @@ follow-up gameplay and stability fixes into one server release.
 
 - Reduce voxel-memory overhead, improve map loading and worker lifecycle, and
   add repeatable regression, network-impairment and capped-memory soak tools.
+- Yield periodically during background spawn discovery so map rotation keeps
+  the live server responsive on macOS as well as Windows and Linux.
 - Add private-server password support for the maintained BattleSpades client,
   configurable map constructs and Diamond Mine discovery/cash-in options.
 - Update the in-game welcome to [Discord](https://discord.gg/aosbb), where
@@ -49,7 +51,8 @@ targeted tests on both Windows and Linux, including an independent original
 native jump fixture. A six-hour earlier-runtime soak completed under a
 536,870,912-byte cap with zero swap, OOMs, failures or unexpected restarts;
 peak cgroup memory was 373.10 MiB. That soak predates the final movement edits
-and does not establish indefinite leak freedom or high-player-count coverage.
+and the final background spawn-scan change, and does not establish indefinite
+leak freedom or high-player-count coverage.
 
 Native client source is published separately for local building and testing;
 this release contains **server downloads only**. Optional retail fix sources
