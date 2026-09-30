@@ -1,198 +1,20 @@
-name: Build portable beta release
-
+name: Diagnose macOS map loading
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*-beta.*"
-      - "v*-alpha.*"
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
-
 jobs:
-  build:
-    name: Build ${{ matrix.platform }} ${{ matrix.architecture }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows
-            architecture: x86_64
-            python_architecture: x64
-            runner: windows-2025
-          - platform: windows
-            architecture: arm64
-            python_architecture: arm64
-            runner: windows-11-arm
-          - platform: linux
-            architecture: x86_64
-            python_architecture: x64
-            runner: ubuntu-24.04
-          - platform: linux
-            architecture: arm64
-            python_architecture: arm64
-            runner: ubuntu-24.04-arm
-          - platform: macos
-            architecture: x86_64
-            python_architecture: x64
-            runner: macos-15-intel
-          - platform: macos
-            architecture: arm64
-            python_architecture: arm64
-            runner: macos-15
-    runs-on: ${{ matrix.runner }}
-    # The Intel macOS runner needs about 85 minutes for the full suite alone.
-    timeout-minutes: 150
-
+  diagnose:
+    runs-on: macos-15
+    timeout-minutes: 30
     steps:
-      - name: Check out release source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
         with:
-          persist-credentials: false
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
-        with:
-          python-version: "3.12"
-          architecture: ${{ matrix.python_architecture }}
+          python-version: '3.12'
           cache: pip
           cache-dependency-path: requirements-release.txt
-
-      - name: Validate release tag
-        if: startsWith(github.ref, 'refs/tags/')
-        run: >-
-          python -c "from pathlib import Path; import os, sys;
-          version = Path('VERSION').read_text(encoding='utf-8').strip();
-          expected_tag = f'v{version}'; actual_tag = os.environ['GITHUB_REF_NAME'];
-          sys.exit(0 if actual_tag == expected_tag else
-          f'tag {actual_tag!r} does not match {expected_tag!r}')"
-
-      - name: Record native build environment
-        run: >-
-          python -c "import platform, struct, sys;
-          print('python=' + sys.version.replace(chr(10), ' '));
-          print('platform=' + platform.platform());
-          print('machine=' + platform.machine());
-          print('pointer_bits=' + str(struct.calcsize('P') * 8))"
-
-      - name: Install pinned release dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-release.txt
-
-      - name: Compile native extensions
-        run: python setup.py build_ext --inplace
-
-      - name: Build isolated x86 Steam bridge
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          cmake -S tools/steam_bridge -B build/steam-bridge -A Win32
-          if ($LASTEXITCODE -ne 0) { throw "Steam bridge configure failed" }
-          cmake --build build/steam-bridge --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { throw "Steam bridge build failed" }
-
-      - name: Run complete source test suite
-        run: python -m pytest tests -q
-
-      - name: Freeze one-directory server
-        # Invoke the module through setup-python's interpreter. A global
-        # `pyinstaller` executable may belong to another Python installation.
-        run: python -m PyInstaller --noconfirm --clean BattleSpades.spec
-
-      - name: Stage and archive native release
-        run: >-
-          python scripts/package_release.py
-          --frozen-dir dist/BattleSpades
-          --output-root release-dist
-          --platform ${{ matrix.platform }}
-          --architecture ${{ matrix.architecture }}
-
-      - name: Smoke packaged Windows launcher outside archive
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          $bundle = Get-ChildItem -LiteralPath "$env:GITHUB_WORKSPACE\release-dist" -Directory | Select-Object -First 1
-          if ($null -eq $bundle) { throw "staged release directory is missing" }
-          Push-Location -LiteralPath $env:RUNNER_TEMP
-          try {
-            $sessionConfig = Join-Path $env:RUNNER_TEMP "battlespades-session.toml"
-            Copy-Item -LiteralPath "$($bundle.FullName)\config.toml" -Destination $sessionConfig
-            & "$($bundle.FullName)\BattleSpades.exe" --version
-            if ($LASTEXITCODE -ne 0) { throw "packaged --version failed" }
-            & "$($bundle.FullName)\BattleSpades.exe" --check --config $sessionConfig
-            if ($LASTEXITCODE -ne 0) { throw "packaged external-config check failed" }
-            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --version
-            if ($LASTEXITCODE -ne 0) { throw "tutorial --version failed" }
-            & "$($bundle.FullName)\BattleSpadesTutorial.exe" --check --config $sessionConfig
-            if ($LASTEXITCODE -ne 0) { throw "tutorial external-config check failed" }
-            & "$($bundle.FullName)\BattleSpadesMapCreator.exe" --version
-            if ($LASTEXITCODE -ne 0) { throw "map creator --version failed" }
-          } finally {
-            Pop-Location
-          }
-
-      - name: Smoke packaged POSIX launcher outside archive
-        if: matrix.platform != 'windows'
-        shell: bash
-        run: |
-          bundle="$(find "$GITHUB_WORKSPACE/release-dist" -mindepth 1 -maxdepth 1 -type d -name 'BattleSpades-*' -print -quit)"
-          test -n "$bundle"
-          cd "$RUNNER_TEMP"
-          cp "$bundle/config.toml" "$RUNNER_TEMP/battlespades-session.toml"
-          "$bundle/BattleSpades" --version
-          "$bundle/BattleSpades" --check --config "$RUNNER_TEMP/battlespades-session.toml"
-          "$bundle/BattleSpadesTutorial" --version
-          "$bundle/BattleSpadesTutorial" --check --config "$RUNNER_TEMP/battlespades-session.toml"
-          "$bundle/BattleSpadesMapCreator" --version
-
-      - name: Upload native zip
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: release-${{ matrix.platform }}-${{ matrix.architecture }}
-          path: release-dist/*.zip
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-
-  release:
-    name: Publish prerelease
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-
-    steps:
-      - name: Check out checksum tooling
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-
-      - name: Download all native archives
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          pattern: release-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Require complete matrix and write checksums
-        run: python scripts/verify_release_assets.py --asset-dir release-assets --project-root .
-
-      - name: Publish unsigned beta prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          title="$(python -c 'from server.build_info import DISPLAY_RELEASE; print(DISPLAY_RELEASE)')"
-          gh release create "$GITHUB_REF_NAME" \
-            release-assets/*.zip release-assets/SHA256SUMS.txt \
-            --verify-tag \
-            --prerelease \
-            --title "$title (${GITHUB_REF_NAME#v})" \
-            --notes-file release/NOTES.md
+      - run: python -m pip install -r requirements-release.txt
+      - run: python setup.py build_ext --inplace
+      - run: python scripts/beta02_map_load_diagnostic.py
+      - run: python -m pytest tests/test_map_load_stall.py -q -s
