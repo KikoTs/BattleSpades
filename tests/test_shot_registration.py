@@ -279,6 +279,135 @@ def test_manual_reload_with_rounds_left_keeps_arrival_timing(monkeypatch):
     assert shooter.reloading and shooter.ammo_clip == 24
 
 
+def test_sniper_stock_cycle_earliest_shot_is_interval_plus_reload(monkeypatch):
+    """Single-shot sniper (clip 1), retail cycle (weapon.py use_primary,
+    character.pyd update_alive/end_reload): the round at L schedules the
+    reload, which starts when weapon_shoot ends (L + shoot_interval) and
+    lasts reload_time. With the WeaponReload on time, a shot halfway through
+    the reload is refused and the stock post-reload shot is accepted."""
+
+    clock = _clock(monkeypatch)
+    server, shooter, target, damage = _sniper_duel(distance=20.0)
+    direction = _aim(shooter.eye, (target.x, target.y, target.z + 0.75))
+    _stream(shooter, 1000, 1010)
+    server.combat.handle_shot(shooter, _shot(shooter, direction, label=1010))
+    assert len(damage) == 1 and shooter.ammo_clip == 0
+    clock["now"] += 1.0  # weapon_shoot (shoot_interval 1.0 s) ends
+    assert shooter.start_reload()
+    clock["now"] += 1.0  # halfway through the 2.0 s reload
+    _stream(shooter, 1011, 1130)
+    server.combat.handle_shot(shooter, _shot(shooter, direction, label=1130))
+    assert len(damage) == 1 and shooter.reloading
+    clock["now"] += 1.0
+    _stream(shooter, 1131, 1190)
+    server.combat.handle_shot(shooter, _shot(shooter, direction, label=1190))
+    assert len(damage) == 2, "the stock post-reload sniper shot was dropped"
+    assert shooter.ammo_clip == 0 and shooter.ammo_reserve == 6
+
+
+@pytest.mark.parametrize("label, accepted", [(1188, False), (1189, True)])
+def test_sniper_label_floor_is_interval_plus_reload(monkeypatch, label, accepted):
+    """With the reload packet late, only the frame labels can prove the
+    reload finished: the earliest provable frame is shot + shoot_interval +
+    reload_time (60 + 120 frames, one frame of timer slack)."""
+
+    clock = _clock(monkeypatch)
+    server, shooter, target, damage = _sniper_duel(distance=20.0)
+    direction = _aim(shooter.eye, (target.x, target.y, target.z + 0.75))
+    _stream(shooter, 1000, 1010)
+    server.combat.handle_shot(shooter, _shot(shooter, direction, label=1010))
+    clock["now"] += 1.0 + 0.9  # the WeaponReload arrived 0.9 s late
+    assert shooter.start_reload()
+    clock["now"] += 1.1
+    _stream(shooter, 1011, label)
+    server.combat.handle_shot(shooter, _shot(shooter, direction, label=label))
+    assert (len(damage) == 2) is accepted
+
+
+def test_launcher_reload_packet_never_starts_the_gun_reload(monkeypatch):
+    """RPGWeapon is a stock Weapon, so its auto reload sends WeaponReload.
+    The server must not start the reload of the last-held gun for it."""
+
+    clock = _clock(monkeypatch)
+    server = _server()
+    player = _player(
+        server, player_id=0, team=TEAM1, position=(60.5, 100.5, EYE_Z),
+        class_id=C.CLASS_ROCKETEER, loadout=[C.RPG_TOOL, C.SMG_TOOL],
+        tool=C.SMG_TOOL,
+    )
+    player.ammo_clip = 3  # the SMG has room to reload
+    gun_ammo = (player.ammo_clip, player.ammo_reserve)
+    player.set_tool(C.RPG_TOOL, raw=True)
+    # Full rocket clip: the stock client cannot reload (is_reloadable).
+    assert not player.start_reload()
+    assert player.consume_oriented_item(C.RPG_TOOL, now=clock["now"])
+    clock["now"] += 0.7  # weapon_shoot ends, Character.reload runs
+    assert player.start_reload()  # relayed: the rocket reload is stock
+    assert not player.reloading
+    assert (player.ammo_clip, player.ammo_reserve) == gun_ammo
+    # The rocket cycle itself stays on the time-inferred launcher model.
+    assert not player.can_use_oriented_item(C.RPG_TOOL, now=clock["now"] + 1.0,
+                                            report_violation=False)
+    assert player.can_use_oriented_item(C.RPG_TOOL, now=clock["now"] + 1.5,
+                                        report_violation=False)
+
+
+@pytest.mark.parametrize(
+    "tool, class_id",
+    [
+        (C.RIFLE_TOOL, C.CLASS_SOLDIER),
+        (C.PISTOL_TOOL, C.CLASS_SOLDIER),
+        (C.SHOTGUN_TOOL, C.CLASS_SOLDIER),
+        (C.SNIPER2_TOOL, C.CLASS_SCOUT),
+        (C.SNUB_PISTOL_TOOL, C.CLASS_SOLDIER),
+    ],
+)
+def test_held_trigger_cadence_is_accepted_at_the_shoot_interval(monkeypatch, tool, class_id):
+    """Retail has no semi-automatic weapons: Character.update_weapon fires
+    every update while shoot_primary is set, limited by shoot_delay alone.
+    A held trigger's rounds land exactly one shoot_interval apart on the
+    client clock and must all register; two frames sooner must not (one
+    frame is the action clock's FIRE_RATE_GRACE for dt accumulation)."""
+
+    from server import action_clock
+    from server.game_constants import WEAPON_PROFILES
+
+    clock = _clock(monkeypatch)
+    server = _server()
+    shooter = _player(
+        server, player_id=0, team=TEAM1, position=(60.5, 100.5, EYE_Z),
+        class_id=class_id, loadout=[tool], tool=tool,
+    )
+    profile = WEAPON_PROFILES[int(tool)]
+    frames = action_clock.interval_frames(float(profile.fire_interval))
+    label = 1000
+    _stream(shooter, label - 10, label)
+    rounds = int(profile.clip_size)
+    for shot in range(rounds):
+        if shot:
+            label += frames
+            clock["now"] += frames / 60.0
+            _stream(shooter, label - frames + 1, label)
+        before = shooter.ammo_clip
+        server.combat.handle_shot(shooter, _shot(shooter, (1.0, 0.0, 0.0), label=label))
+        assert shooter.ammo_clip == before - 1, f"held round {shot} was dropped"
+    assert shooter.ammo_clip == 0
+
+    # Two frames early is refused.
+    server2 = _server()
+    early = _player(
+        server2, player_id=0, team=TEAM1, position=(60.5, 100.5, EYE_Z),
+        class_id=class_id, loadout=[tool], tool=tool,
+    )
+    _stream(early, 2000, 2010)
+    server2.combat.handle_shot(early, _shot(early, (1.0, 0.0, 0.0), label=2010))
+    clock["now"] += (frames - 2) / 60.0
+    _stream(early, 2011, 2010 + frames - 2)
+    before = early.ammo_clip
+    server2.combat.handle_shot(early, _shot(early, (1.0, 0.0, 0.0), label=2010 + frames - 2))
+    assert early.ammo_clip == before
+
+
 # --- diagnostics ---------------------------------------------------------
 
 def test_dropped_shot_is_logged_with_reason(caplog, monkeypatch):

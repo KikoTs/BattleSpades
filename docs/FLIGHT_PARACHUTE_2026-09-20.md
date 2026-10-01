@@ -256,3 +256,33 @@ The final abuse audit found no live combat class/equipment refill shortcut:
 unchanged selections are ignored, changed selections end the old life and
 commit on respawn, and ordinary ammo restock does not refill fuel. Full fuel
 on respawn and an authoritative Jetpack Crate pickup remain intentional.
+
+## Engineer flight speed and canopy tuning (BSFP v2, 2026-10-01)
+
+Request: "flight speed is too slow for the Engineer". Nothing regressed: the
+v1 balanced profile only changes fuel, and the active Engineer air
+acceleration has been the stock `world.pyd` 0.1 (0x10012DC8, jump table
+0x10013240 sends packs 3 and 4 there; packs 1 and 2 use 0.5) on both server
+and native client since July. With the InitialInfo class scale (1.25) a
+thrusting Engineer cruises at 0.0875 native = 2.8 blocks/s walking (5 with
+sprint), 40% of its 7 blocks/s ground walk, while a Rocketeer jump pack gets
+0.5.
+
+| Value (Engineer, pack 68) | Stock / v1 | BSFP v2 |
+| --- | ---: | ---: |
+| Active air accel factor | 0.1 | 0.25 |
+| Horizontal cruise (W held) | 2.8 blocks/s | 7.0 blocks/s (= ground walk) |
+| Vertical thrust | 0.020 | 0.020 (unchanged) |
+| Fuel drain / refill | 18 / 3 (v1: 7.5 / 20) | 7.5 / 20 |
+
+Version 2 of the negotiated profile (client trailer `BSCF`, InitialInfo
+`BSFP`) appends two exact 1/1024 values to the v1 layout: the Engineer
+factor (256) and the canopy gravity scale (160), and flag bit 2 for the canopy
+free-fall floor (PARACHUTE.md). The server sends v1 to v1 natives and nothing
+to stock clients, so neither changes; the UGC Builder pack keeps 0.1. A v2
+client on an older server falls back to the stock resource contract.
+Tests: `tests/test_flight_balance.py` (wire golden, negotiation, Engineer
+cruise through real ClientData for stock/v1/v2) and the native
+`test_protocol168_session`, `test_player_movement`, `test_tutorial_session`
+(timeline regenerated from the v2 FlightFlow trace: pack 68 x at frames 60/360
+= 103.913543701 / 136.957565308, fuel and z unchanged).

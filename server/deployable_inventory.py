@@ -41,6 +41,11 @@ _INTERVALS = {
     int(C.MG_TOOL): float(C.MG_SHOOT_INTERVAL),
 }
 _SNAPSHOT_TOOLS = frozenset(_INTERVALS) | {int(C.DISGUISE_TOOL)}
+# Retail places deployables continuously while LMB is held over a valid ghost
+# (Character.update_weapon -> use_weapon_primary each update), so consecutive
+# packets arrive one shoot_interval apart on the client clock; admit arrival
+# jitter against that schedule.
+DEPLOYABLE_CADENCE_GRACE = 0.05
 
 
 def reset_deployable_inventory(player: Player) -> None:
@@ -87,7 +92,8 @@ def deployable_ready(player: Player, tool: int, now: float) -> bool:
     return (
         tool in _INTERVALS
         and math.isfinite(now)
-        and now >= getattr(player, "_deployable_next_use", {}).get(tool, 0.0)
+        and now + DEPLOYABLE_CADENCE_GRACE
+        >= getattr(player, "_deployable_next_use", {}).get(tool, 0.0)
         and _carried_stock(player, tool) > 0
     )
 
@@ -105,7 +111,10 @@ def commit_deployable_use(player: Player, tool: int, now: float) -> None:
         # Custom-mode MG/turret owners can use their existing entity/controller
         # stock without a Player wallet; recording cadence grants no items.
         player._deployable_next_use = {}
-    player._deployable_next_use[tool] = now + _INTERVALS[tool]
+    # Scheduled from the earlier due time: a held trigger's packet admitted
+    # inside the jitter grace never raises the sustained placement rate.
+    previous_due = float(player._deployable_next_use.get(tool, 0.0))
+    player._deployable_next_use[tool] = max(now, previous_due) + _INTERVALS[tool]
 
 
 def deployable_stock(player: Player, tool: int) -> int:

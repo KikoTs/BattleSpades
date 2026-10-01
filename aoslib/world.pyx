@@ -1045,6 +1045,13 @@ cdef class Player(Object):
     cdef float _fall_on_water_multiplier
     cdef float _climb_slowdown
     cdef bint _can_sprint_uphill
+    # Negotiated BattleSpades flight tuning (server/flight_profile.py). The
+    # defaults are the stock world.pyd literals: Engineer active-flight air
+    # acceleration 0.1 (0x10012DC8) and canopy gravity 0.05 (0x10012EFD),
+    # with no free-fall floor. Stock owners and bots always keep them.
+    cdef float _engineer_flight_accel
+    cdef float _parachute_gravity_scale
+    cdef bint _parachute_free_fall_floor
 
     def initialize(self):
         self._name = "player"
@@ -1069,6 +1076,9 @@ cdef class Player(Object):
         self._left = False
         self._parachute = False
         self._parachute_active = False
+        self._engineer_flight_accel = <float>0.1
+        self._parachute_gravity_scale = <float>0.05
+        self._parachute_free_fall_floor = False
         self._right = False
         self._sneak = False
         self._sprint = False
@@ -1182,6 +1192,33 @@ cdef class Player(Object):
             return bool(self._parachute_active)
         def __set__(self, value):
             self._parachute_active = bool(value)
+
+    property engineer_flight_accel:
+        """Air-acceleration factor of an active Engineer pack (stock 0.1)."""
+        def __get__(self):
+            return float(self._engineer_flight_accel)
+        def __set__(self, value):
+            value = float(value)
+            if not (0.0 < value <= 1.0):
+                raise ValueError("engineer_flight_accel must be in (0, 1]")
+            self._engineer_flight_accel = <float>value
+
+    property parachute_gravity_scale:
+        """Gravity factor under an open canopy (stock 0.05)."""
+        def __get__(self):
+            return float(self._parachute_gravity_scale)
+        def __set__(self, value):
+            value = float(value)
+            if not (0.0 < value <= 1.0):
+                raise ValueError("parachute_gravity_scale must be in (0, 1]")
+            self._parachute_gravity_scale = <float>value
+
+    property parachute_free_fall_floor:
+        """Below canopy terminal speed, fall with ordinary gravity (stock off)."""
+        def __get__(self):
+            return bool(self._parachute_free_fall_floor)
+        def __set__(self, value):
+            self._parachute_free_fall_floor = bool(value)
 
     property right:
         def __get__(self):
@@ -1432,7 +1469,10 @@ cdef class Player(Object):
             # Engineer/UGC packs trade horizontal control for climb.  Retail
             # applies 0.1 while they are actively firing; normal/Rocketeer
             # packs and ordinary airborne movement retain the 0.5 factor.
-            if self._jetpack_active and not self._hover and self._jetpack in (3, 4):
+            if self._jetpack_active and not self._hover and self._jetpack == 3:
+                # Stock 0.1; a negotiated BattleSpades profile may raise it.
+                accel = <double>accel * <double>self._engineer_flight_accel
+            elif self._jetpack_active and not self._hover and self._jetpack == 4:
                 accel = <double>accel * 0.1000000014901161
             elif not self._jetpack_active or self._hover or self._jetpack in (1, 2):
                 accel *= 0.5
@@ -1469,13 +1509,17 @@ cdef class Player(Object):
 
         divisor = dt + 1.0
         gravity_step = dt * gravity
+        pre_gravity_vz = self._velocity.z
+        canopy_gravity = False
         if self._jetpack_passive:
             # Atomic retail oracle: Engineer active+passive yields
             # (-0.020 + dt*0.75)/(1+dt). Passive is a distinct 0.75-gravity
             # state; normal active thrust leaves it false.
             gravity_step *= 0.75
         elif self._parachute_active:
-            gravity_step *= 0.05000000074505806
+            # Stock 0.05 (double of float 0.05, as world.pyd loads it).
+            gravity_step *= <double>self._parachute_gravity_scale
+            canopy_gravity = True
         # Retail world.pyd applies gravity after assigning the jump impulse in
         # the same frame.  This ordering is collision-sensitive near voxel
         # edges: omitting the gravity step changes the first-frame vz enough
@@ -1489,6 +1533,16 @@ cdef class Player(Object):
             if not self._jetpack_passive or 1 <= self._jetpack <= 4:
                 self._velocity.z = <float>(<float>self._velocity.z + gravity_step)
         self._velocity.z = <float>(<float>self._velocity.z / <double>divisor)
+        if canopy_gravity and self._parachute_free_fall_floor and not self._hover:
+            # BattleSpades canopy: a chute only brakes. Below its terminal
+            # descent (scale * gravity, the fixed point of the canopy step)
+            # the body falls with ordinary gravity, capped at that terminal;
+            # at or above it the stock canopy step above is unchanged.
+            free_fall_vz = <float>(<float>(<float>pre_gravity_vz + dt * gravity) / <double>divisor)
+            canopy_terminal = <float>(<double>self._parachute_gravity_scale * gravity)
+            floor_vz = free_fall_vz if free_fall_vz < canopy_terminal else canopy_terminal
+            if floor_vz > self._velocity.z:
+                self._velocity.z = floor_vz
 
         # A deployed parachute cancels accumulated falling distance every
         # native update (world.pyd 0x10012CD0). It does not apply the adjacent

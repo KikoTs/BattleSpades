@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import shared.constants as C
 from shared.packet import PlayerLeft
 
+from server.class_data import BATTLESPADES_TEAM_CLASSES
 from server.class_selection import normalize_class_selection
 from server.game_constants import (
     DEFAULT_WEAPON_TOOL,
@@ -135,12 +136,12 @@ _WALK_STEER_ANGLES = tuple(
 _WATER_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0, 80.0)
 )
-# The stock DEFAULT_TEAM_CLASSES (alias A93): the six classes a human can pick
-# in every ordinary retail mode.  Rocketeer is not among them, so bots never
-# field a class the human class picker does not offer.
+# The BattleSpades combat roster (stock six plus Rocketeer). _choose_class
+# filters it through is_class_selectable, so bots never field a class the
+# human class picker does not offer in the current mode.
 _DEFAULT_CLASSES = tuple(
     int(value)
-    for value in getattr(C, "DEFAULT_TEAM_CLASSES", ())
+    for value in BATTLESPADES_TEAM_CLASSES
     if int(value) in C.CLASS_ITEMS
 )
 _BOT_TRAVERSAL_PREFAB_TOKENS = (

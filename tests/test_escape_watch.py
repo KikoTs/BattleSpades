@@ -114,6 +114,68 @@ def test_body_inside_blocks_is_embedded(ctx):
     assert escape_watch.classify(world, stuck, objective=False) == "embedded"
 
 
+def _wading_player(crouch_ticks):
+    """A real mover settled on the waterbed, then crouched for some ticks."""
+
+    from server.player import Player
+    from tests.test_reversed_world_update import DummyConnection, make_world_manager
+
+    world_manager = make_world_manager()  # empty map: only the z=239 waterbed
+    server = SimpleNamespace(world_manager=world_manager, players={})
+    connection = DummyConnection(server)
+    player = Player(0, "wader", TEAM1, C.RIFLE_TOOL, connection)
+    player.loadout = [int(C.RIFLE_TOOL), int(C.BLOCK_TOOL)]
+    connection.player = player
+    server.players[player.id] = player
+    player.spawn(100.5, 100.5, 239.0 - float(C.PLAYER_STANDING_POS_ABOVE_GROUND))
+    idle = (False,) * 8
+    crouch = (False,) * 5 + (True, False, False)
+    for _ in range(120):
+        player.update_input(*idle)
+        asyncio.run(player.update(1.0 / 60.0))
+    for _ in range(crouch_ticks):
+        player.update_input(*crouch)
+        asyncio.run(player.update(1.0 / 60.0))
+    return world_manager, player
+
+
+@pytest.mark.parametrize("crouch_ticks", [0, 1, 120])
+def test_standing_or_crouching_in_water_is_not_below_floor(crouch_ticks):
+    """Kiril's report: crouching in water in TDM showed "You are a V.I.P!".
+
+    Character.set_crouch drops the anchor 0.9 while the mover keeps the
+    standing contact offset in water, so the crouched wader's anchor reaches
+    ~238.65; the old standing-offset test read that as feet at 240.9, under
+    the floor, and broadcast the high-minimap (VIP) marker immediately.
+    """
+
+    world_manager, player = _wading_player(crouch_ticks)
+    assert player.wade
+    assert bool(player.input.crouch) == (crouch_ticks > 0)
+    assert escape_watch.classify(world_manager, player, objective=False) is None
+    assert escape_watch.classify(world_manager, player, objective=True) is None
+
+
+def test_crouched_wader_never_gets_the_vip_marker_in_tdm(ctx):
+    server = ctx.server
+    # The anchor the real mover produces for a crouched wader (see above).
+    wader = _player(server, 9, (100.5, 100.5, 238.6491))
+    wader.input = SimpleNamespace(crouch=True)
+    wader.wade = True
+    for now in (0.0, 1.0, 2.0, 10.0):
+        escape_watch.tick(server, now=now, force=True)
+    assert ctx.sent == []
+    assert escape_watch.is_flagged(server, wader) is None
+
+
+def test_really_falling_out_under_the_floor_is_still_flagged(ctx):
+    for crouch in (False, True):
+        player = SimpleNamespace(
+            position=(100.5, 100.5, 240.5), input=SimpleNamespace(crouch=crouch)
+        )
+        assert escape_watch.classify(ctx.world, player, objective=False) == "below_floor"
+
+
 # ---------------------------------------------------------------------------
 # marker lifecycle
 # ---------------------------------------------------------------------------

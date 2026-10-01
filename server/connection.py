@@ -48,7 +48,11 @@ from server.game_constants import (
 )
 from server.map_metadata import DEFAULT_SKYBOX_NAME, normalize_skybox_name
 from server.cosmetics import PACKET_ID as COSMETIC_PACKET_ID, MAGIC as COSMETIC_MAGIC, MAX_PACKET_BYTES, capable
-from server.flight_profile import RETAIL_FLIGHT, BALANCED_FLIGHT, ticket_has_flight_capability
+from server.flight_profile import (
+    RETAIL_FLIGHT,
+    profile_for_capability,
+    ticket_flight_capability,
+)
 
 # Build packet name mapping
 PACKET_NAMES = {}
@@ -1150,8 +1154,11 @@ class Connection:
             logger.info(f"Received SteamSessionTicket from {self.peer.address}")
             try:
                 packet = SteamSessionTicket(reader)
-                self.flight_profile_capable = ticket_has_flight_capability(data)
-                self.flight_profile = BALANCED_FLIGHT if self.flight_profile_capable else RETAIL_FLIGHT
+                # BSCF v1 natives get the fuel balance; v2 natives also get
+                # the Engineer speed / canopy tuning (server/flight_profile.py).
+                capability = ticket_flight_capability(data)
+                self.flight_profile_capable = capability > 0
+                self.flight_profile = profile_for_capability(capability)
                 # Set steam key immediately - subsequent packets will be decrypted
                 self.steam_key = getattr(packet, 'ticket', None)
                 self.authenticated = True

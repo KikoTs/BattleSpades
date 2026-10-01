@@ -693,3 +693,63 @@ def test_non_finite_position_report_is_ignored():
     asyncio.run(movement.handle_position_data(server, player, packet))
     assert player.position_reports_received == 0
     assert anticheat.counters(player)["position_nonfinite"] == 1
+
+
+# -- held-trigger cadence (retail fires continuously while LMB is held) -------
+
+
+def test_held_rpg2_clip_lands_at_its_interval_with_arrival_jitter():
+    """Character.update_weapon fires every update while shoot_primary is set,
+    so a held RPG2 sends its three rockets one shoot_interval apart. Packets
+    arriving a little early (jitter) still count, but the schedule never lets
+    the sustained rate exceed one rocket per interval."""
+    player = _launcher_player()
+    interval = 0.75
+    assert Player.consume_oriented_item(player, C.RPG2_TOOL, now=10.0)
+    # Second packet 30 ms early (jitter), third on schedule.
+    assert Player.consume_oriented_item(player, C.RPG2_TOOL, now=10.0 + interval - 0.03)
+    assert Player.consume_oriented_item(player, C.RPG2_TOOL, now=10.0 + 2 * interval)
+    assert "launcher_reload_skip" not in anticheat.counters(player)
+    # The grace never compounds into a faster cadence.
+    player = _launcher_player()
+    assert Player.consume_oriented_item(player, C.RPG2_TOOL, now=20.0)
+    assert Player.consume_oriented_item(player, C.RPG2_TOOL, now=20.0 + interval - 0.04)
+    assert not Player.can_use_oriented_item(
+        player, C.RPG2_TOOL, now=20.0 + 2 * interval - 0.08, report_violation=False
+    )
+
+
+def test_held_deployable_placement_admits_jitter_without_raising_the_rate():
+    from server.deployable_inventory import (
+        commit_deployable_use,
+        deployable_ready,
+        reset_deployable_inventory,
+    )
+
+    player = SimpleNamespace()
+    reset_deployable_inventory(player)
+    tool = int(C.LANDMINE_TOOL)
+    interval = float(C.LANDMINE_SHOOT_INTERVAL)
+    assert deployable_ready(player, tool, 5.0)
+    commit_deployable_use(player, tool, 5.0)
+    early = 5.0 + interval - 0.03
+    assert deployable_ready(player, tool, early)
+    commit_deployable_use(player, tool, early)
+    # Scheduled from the due time (6.0), not from the early arrival.
+    assert not deployable_ready(player, tool, 5.0 + 2 * interval - 0.06)
+    assert deployable_ready(player, tool, 5.0 + 2 * interval)
+
+
+def test_ugc_rpg2_never_spends_and_ugc_drill_reloads_with_an_endless_reserve():
+    player = _launcher_player()
+    ugc_rpg2 = int(C.UGC_RPG2_TOOL)
+    for shot in range(20):
+        assert Player.consume_oriented_item(player, ugc_rpg2, now=100.0 + 0.5 * shot)
+    ugc_drill = int(C.UGC_DRILLGUN_TOOL)
+    cycle = 0.2 + 4.0
+    for shot in range(8):  # more than the 1 + 3 a stock drill could fire
+        assert Player.consume_oriented_item(player, ugc_drill, now=200.0 + cycle * shot)
+    # UGCDrillgunWeapon still reloads between rounds (DrillgunWeapon timing).
+    assert not Player.can_use_oriented_item(
+        player, ugc_drill, now=200.0 + cycle * 7 + 1.0, report_violation=False
+    )

@@ -18,6 +18,8 @@ from scripts.verify_release_assets import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# The packager refuses a target that differs from VERSION, so follow it.
+CURRENT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 TRACKED_MAPS = sorted(path.name for path in (PROJECT_ROOT / "maps").glob("*.vxl"))
 TRACKED_NAVIGATION = sorted(
     path.name for path in (PROJECT_ROOT / "maps").glob("*.botnav")
@@ -66,7 +68,7 @@ def test_invalid_release_target_is_rejected() -> None:
 def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> None:
     """Maps/prefabs ship, while unrelated root executables never enter output."""
 
-    target = ReleaseTarget("windows", "x86_64", "0.2.0-beta.2")
+    target = ReleaseTarget("windows", "x86_64", CURRENT_VERSION)
 
     staged = stage_release(
         PROJECT_ROOT,
@@ -213,7 +215,7 @@ def test_checksum_cli_runs_without_installed_project_dependencies(
 ) -> None:
     """The publish job can verify assets without installing server packages."""
 
-    for name in expected_archive_names("0.2.0-beta.2"):
+    for name in expected_archive_names(CURRENT_VERSION):
         (tmp_path / name).write_bytes(name.encode("utf-8"))
 
     completed = subprocess.run(
