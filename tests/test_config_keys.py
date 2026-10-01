@@ -59,6 +59,9 @@ FLAT_KEYS = [
      "votekick_cancelled_cooldown_seconds", 45.0),
     ("lobby", "votekick_min_team_players", "votekick_min_team_players", 3),
     ("audio", "mode_start_music", "mode_start_music", True),
+    ("updates", "update_check_enabled", "update_check_enabled", True),
+    ("updates", "update_manifest_url", "update_manifest_url",
+     "https://www.aosplay.net/updates/stable.json"),
     ("network", "prefab_health_state_batch", "prefab_health_state_batch", 128),
     ("network", "lag_compensation_enabled", "lag_compensation_enabled", True),
     ("network", "lag_compensation_max_ms", "lag_compensation_max_ms", 250.0),
@@ -71,6 +74,10 @@ FLAT_KEYS = [
     ("bots", "skill_balance_rate", "bots.skill_balance_rate", 0.03),
     ("bots", "skill_balance_deadband", "bots.skill_balance_deadband", 0.15),
     ("bots", "skill_balance_min_events", "bots.skill_balance_min_events", 6),
+    ("bots", "chatter", "bots.chatter", False),
+    ("bots", "name_prefix", "bots.name_prefix", "[BOT]"),
+    ("admin", "creator_token", "admin_creator_token", ""),
+    ("admin", "auto_admin", "admin_auto_ids", []),
 ]
 
 
@@ -217,6 +224,12 @@ _CUSTOM_TOML = textwrap.dedent("""
     skill_balance_rate = 0.05
     skill_balance_deadband = 0.25
     skill_balance_min_events = 9
+    chatter = true
+    name_prefix = "BOT_"
+
+    [admin]
+    creator_token = "abcdefghijklmnopqrstuvwxyz012345"
+    auto_admin = ["76561198000000001", "aosplay:PLY_Example", "Kiko"]
 
     [anticheat]
     report_enabled = false
@@ -296,6 +309,21 @@ def test_bot_keys_reach_skill_balancer(custom_server):
     assert balancer._setting("skill_balance_rate", 0.03) == 0.05
     assert balancer._setting("skill_balance_deadband", 0.15) == 0.25
     assert balancer._setting("skill_balance_min_events", 6) == 9
+
+
+def test_bot_label_and_chat_keys_reach_bot_config(custom_server):
+    bots = custom_server.config.bots
+    assert bots.chatter is True
+    assert bots.name_prefix == "BOT_"
+
+
+def test_admin_keys_reach_admin_commands(custom_server):
+    config = custom_server.config
+    assert config.admin_creator_token == "abcdefghijklmnopqrstuvwxyz012345"
+    # Names are never trusted; bare SteamIDs are canonicalised.
+    assert config.admin_auto_ids == [
+        "steam:76561198000000001", "aosplay:ply_example",
+    ]
 
 
 def test_anticheat_keys_reach_report(custom_server):
@@ -405,6 +433,7 @@ _SCANS = {
     "server/prefab_actions.py": (r'"config",\s*None\s*\),\s*"(\w+)"', "config"),
     "server/lag_compensation.py": (r'_setting\(\s*server,\s*"(\w+)"', "config"),
     "modes/ctf.py": (r'getattr\(self\.server\.config,\s*"(\w+)"', "config"),
+    "server/update_check.py": (r'_setting\(\s*config,\s*"(\w+)"', "config"),
 }
 
 

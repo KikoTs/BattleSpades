@@ -23,6 +23,88 @@ Precedence is narrowest first:
 Older `[game]` keys remain compatible. `respawn_time` and `fall_damage` are
 mirrored into the new rule service when their `RULE_*` equivalents are absent.
 
+## Desktop host: `BattleSpadesServer`
+
+Every release bundle also contains `BattleSpadesServer` (`.exe` on Windows),
+a window for hosting without a terminal. From source:
+`py -3.12 run_server_gui.py` (needs `customtkinter` and `tomlkit` from
+`requirements.txt`). It uses the same folder, `config.toml`, maps and logs
+as the console server, and runs that server as a child process with
+`--control-stdin --status-file state/server-gui-status.json` (plus
+`--steam-p2p` when enabled). Stopping sends `shutdown` on the pipe. If the
+window crashes, the server sees the pipe close and shuts down cleanly as well.
+Only one window can be open per server folder.
+
+| Window | What it changes |
+| --- | --- |
+| Host: name, mode, start map, players | `[server] name`, `[game] default_mode`, `[game] default_map`, `[server] max_players` |
+| Host: next maps | `[lobby] map_rotation`: `[]` is the retail playlist, `[map]` is one map, or a custom list |
+| Host: bots | `[bots] enabled`; "Fill empty slots" sets `population_mode = "backfill"` and `fill_target` (raising `max_bots` if needed); "Fixed number" sets `"fixed"` and `max_bots`; `difficulty` |
+| Host: join / admin password | `[server] password`, `[admin] password` (an empty admin field leaves the file alone). When the file still has the shipped `"changeme"` the first time the window opens, it fills in a random 16-character password (shown with "Show"; saved with the other first-run changes), and the field warns in orange while the default is in place. "Generate" makes a new one |
+| Host: auto-admin | `[admin] auto_admin`: comma-separated `steam:<SteamID64>` or `aosplay:<account id>` entries that become admin on join (see [Room creator and auto-admin](#room-creator-and-auto-admin)) |
+| Host: Steam P2P (on by default) | launch option `--steam-p2p`. It is offered only where the server can start it: a Windows host with the bundled `relay/aos-retail-relay.exe` and `[revival] require_identity = false` |
+| Network: game port | `[server] port`. The window uses 32887, the port the stock browser connects to, when the file still has the sample 27015 the first time it opens |
+| Network: Steam server browser | `[steam] enabled` and `public = true` (also needs `steam_api.dll` and forwarded ports; see `[steam]`) |
+| Host: Import from Steam Workshop | copies subscribed Ace of Spades Workshop maps into `[world] maps_path` (see below) |
+| Advanced | every key in `config.toml`, grouped by table, with that key's comments as help |
+
+Settings are checked by `server.config.load_config`, the loader the server
+runs at startup, before they are written. Invalid files are never saved.
+Edits keep the file's comments and layout; only changed values differ.
+Everything applies at the next start, and the window offers a restart when the
+server is running. "Restore section defaults" uses a pristine copy of the
+shipped file (`_internal/server_gui/config.defaults.toml` in a release).
+
+"Import from Steam Workshop…" (`server_gui/workshop_import.py`) reads the
+Workshop's legacy items straight from disk, so Steam does not need to be
+running. It looks in `steamapps/workshop/content/224540/<id>/*_legacy.bin` in
+every Steam library listed in `steamapps/libraryfolders.vdf`, or in a folder
+you pick, which can also be a client's `ugc/maps` with `Subscribed_<id>.*`
+files. Each `.aos` container (`VXL\0`/`UGC\0` chunks) is bounds-checked. The
+VXL must load in the server's own parser as a full 512x512 map, and the sidecar
+must load in `server.map_metadata`. The map is then written atomically as
+`<Title>.vxl`, `.txt` and `.ugc`, the layout Map Creator projects use. Names
+are ASCII; Cyrillic is transliterated, and a title with nothing usable becomes
+`Workshop_<id>`. An existing map is never overwritten: a clash gets a `_2`
+suffix. Re-importing the same item updates it in place, tracked in
+`maps/.workshop_imports.json`. The sidecar's `tags` decide which modes list
+the map in the window. The server's retail-playlist vote only offers stock
+maps, so use an imported map as the start map or put it in a custom rotation.
+
+The Console tab shows the live log and sends operator commands as
+`command <text>` lines on the control pipe (see
+`server/control_channel.py`). They run through the normal chat-command
+handlers as an admin named `Console`, and replies go to the log as
+`BattleSpades.console`. Allowed: `help`, `players`, `score`, `kick`, `ban`,
+`mute`, `unmute`, `god <player>`, `map`, `mode`, `restart`, `endround`,
+`say`, `fog`, `time`, `balance`, `bots ...`, `acreport`, `acstats`,
+`lockscore`, `infiniteblocks`, `netcode`. The console also has `status`,
+`banlist`, `unban <address|name>` and `commands`. Commands that need an
+in-game body (`tp`, `kill`, `team`, ...) are refused.
+
+Networking helpers, and their limits:
+
+- Automatic port forwarding is opt-in. It uses UPnP IGD, with NAT-PMP as a
+  fallback, written in the standard library. It maps the game port (plus the
+  Steam query and updater ports when Steam listing is on) while the server
+  runs, and removes those mappings when the server stops.
+- "Check connection" reports what it can actually measure: the LAN and public
+  addresses, whether the server answers A2S locally, the router's outside
+  address (it reports carrier-grade NAT when that differs from the public
+  address), and whether the server answers through the public address.
+  Many routers cannot loop back to their own address, so a missing loopback
+  answer proves nothing. No free service reliably tests a UDP game port
+  from outside, so the final test is a friend joining.
+- The Windows firewall button runs one elevated
+  `netsh advfirewall firewall add rule ... protocol=UDP` for the server
+  executable through the normal UAC prompt. On Linux and macOS the window
+  shows the `ufw`, `firewalld` or `socketfilterfw` command to run instead.
+
+`BattleSpadesServer --self-check` checks the bundled Tk, fonts and server
+executable without opening a window. Window state is stored in
+`state/server-gui.json`, or in the per-user data folder when the server
+folder is read-only.
+
 ## Configuration tables
 
 ### `[server]`
@@ -345,7 +427,17 @@ visible and hidden entries.
   `normal`, `hard`, `mixed`); `worker` (`thread` by default, or `process`);
   worker rates/budgets; `seed`;
   `clean_slate_games` (defaults to `3`, `0` disables only the periodic worker
-  recycle); and bounded `debug_visualization`. Per-round path, coordination,
+  recycle); and bounded `debug_visualization`.
+  `chatter` (default `false`) turns the bots' short, rate-limited kill and
+  round chat lines back on. `name_prefix` (default `"[BOT]"`, printable
+  ASCII, at most 6 characters, `""` disables) is put in front of every bot's
+  name, so the scoreboard, kill feed and chat of every client, retail
+  included, show `[BOT]Pancake`. Bot names are drawn short enough that the
+  label never pushes them past the 15-byte retail limit, and they stay unique
+  against every player. A human cannot wear the label: a joiner named
+  `[BOT]x`, `(b0t)x` or similar is renamed `Player` (for a plain prefix such
+  as `BOT_` only names starting with it are refused, so "Bottle" stays
+  available). Per-round path, coordination,
   stuck, motor, and queued-intent state is always discarded.
   Per-team bot skill balance: with `skill_balance` on (default `true`), when
   one team's humans clearly out-kill the other side, that team's bots are
@@ -388,8 +480,10 @@ visible and hidden entries.
   retail water plane is fixed at z 238/239 and retail has no water damage.
   Map metadata overrides atmosphere and authored entities.
 - `[plugins]`: `enabled`, `path`, `allowlist`, `denylist`.
-- `[admin]`: password, command logging and `bans_path`; see
-  [Admin login and password](#admin-login-and-password).
+- `[admin]`: password, command logging, `bans_path`, the room-creator
+  `creator_token` and the `auto_admin` identity list; see
+  [Admin login and password](#admin-login-and-password) and
+  [Room creator and auto-admin](#room-creator-and-auto-admin).
 - `[logging]`: level, file, console, packet-trace opt-in, queue capacity,
   rotating-file `max_bytes`/`backup_count`, and
   suppressed packet IDs.
@@ -494,6 +588,31 @@ their thresholds (defaults in `config.toml`):
   to `false` for the retail silence; round starts then only stop the
   previous round's track. The final-minute, victory, Zombie last-man and
   Tutorial tracks are unaffected.
+
+### `[updates]`: update notices and `--update`
+
+The server reads the same update manifest as the client launcher
+(`stable.json`, schema 2; see the client's `docs/INSTALLER_AND_UPDATER.md`).
+
+- `update_check_enabled` (default `true`): at startup a background thread
+  fetches the manifest (6 s timeout) and logs
+  `New BattleSpades server version X available (current Y)`. It is silent
+  when offline and never delays the listener. Servers the game client starts
+  for Create Match (`--control-stdin`) skip it; the launcher updates those.
+  `false` disables the check.
+- `update_manifest_url` (default
+  `https://www.aosplay.net/updates/stable.json`): the manifest to read.
+  Must be `https://` (or `http://127.0.0.1` / `http://localhost` for a test
+  mirror).
+
+`BattleSpades --update` (optionally with `--config`) downloads the `server`
+component, trying each mirror in order until one passes the size and SHA-256
+check, and extracts it to `update/staging/server-<version>/` beside the
+server. **It never replaces any file**, and nothing updates a running server.
+To install the staged version: stop the server, copy the staged folder over
+the installation, and keep the files the manifest lists under `preserve`
+(normally `config.toml`, `bans.json`, `fleet.toml`). Exit code 0 means staged
+or already up to date, 1 means it failed.
 
 ### `[conduct]`: team griefing, AFK and names
 
@@ -604,6 +723,47 @@ entrypoint refuses to start with the default and requires 12+ characters).
   remove it early by deleting the entry). Each failure is also counted in the
   anticheat log as `admin_login_failed`.
 - An admin session lasts until the player disconnects.
+- Loopback (`127.0.0.1`) is kicked but never banned: the hosting client and
+  both relays reach a player-hosted room from loopback, so banning it would
+  lock the room's creator out.
+
+### Room creator and auto-admin
+
+Rooms started from the BattleSpades client (Create Match, Map Creator, and
+the same rooms when published through Steam or the AoSPlay relay) make their
+creator admin without typing anything:
+
+- For every room the client writes a fresh random `[admin] password`
+  (16 characters) and a one-time `[admin] creator_token` (32 characters)
+  into that room's private session `config.toml`. Neither is ever the
+  shared default, and both die with the room.
+- Right after the creator's client joins it sends `/claimhost <token>`. The
+  server compares it in constant time and grants admin exactly once; a second
+  use of the same token (a replay) or a wrong token is refused and counts as a
+  failed admin login (`[anticheat] admin_login_attempts`). The command is
+  hidden from `/help` and its argument is never logged. When a map change
+  reconnects the creator, the client logs back in with `/admin` and the room
+  password it generated.
+- On a successful claim the creator sees the room's admin password in chat.
+  `/roompassword` (admin only) repeats it; share it deliberately with people
+  who should get admin. Dedicated servers (empty `creator_token`) never echo
+  their password.
+- Retail clients cannot send the claim, but they never create these rooms;
+  the room's creator always uses the BattleSpades client.
+
+Dedicated operators already have the console. To make a person admin on join
+without a password, list a verified identity in `[admin] auto_admin`:
+
+```toml
+[admin]
+auto_admin = ["steam:76561198000000000", "aosplay:ply_example"]
+```
+
+`steam:` matches the SteamID that Steam authenticated for a Steam P2P relay
+connection, or the SteamID an AoSPlay join ticket carries; `aosplay:` matches
+an AoSPlay account's public or legacy id from a verified ticket. Bare
+17-digit numbers are read as SteamIDs. Player names are never accepted:
+anyone can type any name.
 
 Admin commands are:
 
@@ -619,6 +779,7 @@ Admin commands are:
 - `/fog <r> <g> <b>`, `/time [seconds]`, `/balance`
 - `/netcode [selfrow on|off] [offset n] [interval n]` (diagnostics only)
 - `/bots status|fill n|add n [team]|remove n|name|all|difficulty ...|debug ...`
+- `/roompassword` (player-hosted rooms only; see above)
 
 Unknown commands, missing arguments, invalid RGB/coordinates, unavailable
 maps, and unregistered modes fail without mutating live match state.

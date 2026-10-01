@@ -132,6 +132,9 @@ lag_compensation_enabled = true
 lag_compensation_max_ms = 250
 lag_compensation_extra_ms = 50
 lag_compensation_view_delay_ms = 0
+# A shot whose datagram was lost arrives one retransmission late; its own
+# (unsequenced) ClientData dates it and adds up to this much rewind (0..1000).
+lag_compensation_late_shot_ms = 400
 # WorldUpdate transport. "split" sends other players, entities and turrets
 # unsequenced, so one lost reliable packet no longer freezes every remote
 # player until it is retransmitted; each player's own row stays ordered.
@@ -384,7 +387,12 @@ path_requests_per_second = 24
 behavior_version = "cooperative"
 friendly_mischief = true
 # Occasional short bot chat lines after kills/deaths (hard rate limited).
-chatter = true
+# Off by default; set true to bring the banter back.
+chatter = false
+# Label shown before every bot's name ("[BOT]Pancake") so stock and native
+# clients can tell bots from people. Humans cannot use it. Printable ASCII,
+# at most 6 characters; "" turns the label off.
+name_prefix = "[BOT]"
 main_thread_budget_ms = 0.75
 seed = 0
 debug_visualization = false
@@ -595,6 +603,13 @@ sustained_per_minute = 3.0
 # last_man_standing played only for the Zombie last survivor. false = retail.
 mode_start_music = true
 
+[updates]
+# Read the shared update manifest at startup and log "new server version X
+# available". Nothing is ever installed automatically; run
+# `BattleSpades --update` to download, verify and stage a new server.
+update_check_enabled = true
+update_manifest_url = "https://www.aosplay.net/updates/stable.json"
+
 [conduct]
 # Team griefing: grief points per 100 HP removed from teammates plus a bonus
 # per team kill -- including a teammate's death from a deployable YOU set off
@@ -633,6 +648,15 @@ reserved_names = []
 password = "changeme"
 log_commands = true
 bans_path = "bans.json"
+# One-time room-creator secret. Rooms started by the BattleSpades client
+# (Create Match, Map Creator, Steam/relay hosting) get a fresh random token
+# and admin password in their private session config; the client redeems the
+# token with /claimhost right after joining. Leave empty on dedicated servers.
+creator_token = ""
+# Verified identities that become admin on join, no password needed:
+# "steam:<SteamID64>" (Steam P2P relay or an AoSPlay ticket) or
+# "aosplay:<account id>". Player names are never trusted.
+auto_admin = []
 
 [logging]
 level = "INFO"

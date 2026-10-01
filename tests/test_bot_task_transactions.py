@@ -65,9 +65,13 @@ def test_non_death_respawn_has_a_distinct_action_life():
 
 def test_director_rejects_delayed_previous_spawn_intent_but_accepts_current_life():
     director = object.__new__(BotDirector)
-    actor = SimpleNamespace(id=1, replication_generation=2, deaths=0)
+    actor = SimpleNamespace(
+        id=1, replication_generation=2, deaths=0, is_bot=True, bot_generation=1
+    )
     state = _RuntimeBot(actor, 1, _profile(), _AimMotor(0.0), random.Random(1))
     director._runtime = {1: state}
+    # Intents only ever steer the registered occupant of the bot's id.
+    director.server = SimpleNamespace(players={1: actor})
     director._map_epoch, director._mode_epoch, director._topology_version = 1, 1, 0
     delayed = BotIntent(1, 1, 10, 1, 1, 0, 100, 101, MovementIntent(), life_id=1)
     director.supervisor = SimpleNamespace(drain_intents=lambda **_: [delayed])

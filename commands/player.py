@@ -42,7 +42,7 @@ async def cmd_help(ctx: CommandContext):
             await send_message(ctx.server, ctx.player, f"Unknown command: {ctx.args[0]}")
     else:
         # Show all commands
-        commands = get_all_commands()
+        commands = [c for c in get_all_commands() if not getattr(c, "hidden", False)]
         player_cmds = [c for c in commands if not c.admin_only]
         admin_cmds = [c for c in commands if c.admin_only]
         

@@ -68,8 +68,12 @@ other than those Valve components, and you must follow Valve's own terms for
 the Valve components. If you modify BattleSpades, you may extend this
 permission to your version, but you are not obliged to.
 
-BattleSpades does not ship any Valve files; optional master-server
-registration only loads copies that the operator supplies.
+The ordinary server's legacy master-registration helper loads Valve runtime
+files supplied by the operator. The optional retail Steam relay package also
+includes the Steamworks SDK's `steam_api64.dll` redistributable beside its
+separate helper. That Valve binary is not covered by the AGPL; it retains
+Valve's Steamworks SDK terms. No original retail game binary is distributed
+in the retail patch package.
 
 ## Names and trademarks
 

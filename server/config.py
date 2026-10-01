@@ -47,6 +47,71 @@ def admin_password_problem(password: object) -> Optional[str]:
     return None
 
 
+# [bots] name_prefix leaves at least 9 of the 15 retail name bytes for the bot.
+MAX_BOT_NAME_PREFIX = 6
+
+# [admin] creator_token: a client-generated, single-use room-creator secret.
+MIN_CREATOR_TOKEN_LENGTH = 24
+MAX_CREATOR_TOKEN_LENGTH = 128
+_CREATOR_TOKEN_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def valid_creator_token(token: object) -> bool:
+    """Whether ``token`` is long and plain enough to act as a host secret."""
+
+    text = "" if token is None else str(token)
+    return (
+        MIN_CREATOR_TOKEN_LENGTH <= len(text) <= MAX_CREATOR_TOKEN_LENGTH
+        and all(character in _CREATOR_TOKEN_CHARACTERS for character in text)
+    )
+
+
+def normalize_admin_identity(value: object) -> Optional[str]:
+    """Canonical ``steam:<id>`` / ``aosplay:<id>`` key, or None if unusable.
+
+    A bare 17-digit number is a SteamID64. Player names are deliberately not
+    accepted: anybody can type any name.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return f"steam:{int(text)}" if len(text) >= 15 else None
+    kind, separator, ident = text.partition(":")
+    kind, ident = kind.strip().lower(), ident.strip()
+    if not separator or not ident or len(ident) > 128:
+        return None
+    if kind == "steam":
+        return f"steam:{int(ident)}" if ident.isdigit() else None
+    if kind == "aosplay" and all(
+        character.isalnum() or character in "-_" for character in ident
+    ):
+        return f"aosplay:{ident.lower()}"
+    return None
+
+
+def normalize_admin_identities(values) -> List[str]:
+    """Normalize ``[admin] auto_admin`` entries, dropping unusable ones."""
+
+    result: List[str] = []
+    for value in values or ():
+        key = normalize_admin_identity(value)
+        if key is None:
+            import logging
+
+            logging.getLogger("BattleSpades.config").warning(
+                "Ignoring [admin] auto_admin entry %r: use steam:<SteamID64> "
+                "or aosplay:<account id>.",
+                str(value)[:64],
+            )
+        elif key not in result:
+            result.append(key)
+    return result
+
+
 def _steam_token(name: str, value: object, limit: int) -> str:
     """Validate one legacy ASCII tag/version token from untrusted TOML."""
 
@@ -103,7 +168,12 @@ class BotConfig:
     behavior_version: str = "cooperative"
     friendly_mischief: bool = True
     # Sparse, rate-limited bot chat reacting to kills and round boundaries.
-    chatter: bool = True
+    # Off by default: players found it noisy. ``[bots] chatter = true``.
+    chatter: bool = False
+    # Shown before every bot's name on the scoreboard and kill feed, so stock
+    # and native clients alike can tell bots from people. Humans may not
+    # use it. Empty disables the label. Printable ASCII, at most 6 bytes.
+    name_prefix: str = "[BOT]"
     # Per-team bot skill balancing (server/bot_ai/skill_balance.py): when the
     # humans on one team clearly out-kill the other side, that team's bots are
     # eased and the other team's sharpened, by at most ``skill_balance_max_shift``
@@ -425,6 +495,9 @@ class ServerConfig:
     lag_compensation_max_ms: float = 250.0
     lag_compensation_extra_ms: float = 50.0
     lag_compensation_view_delay_ms: float = 0.0
+    # Extra rewind for a shot whose reliable datagram was retransmitted: its
+    # unsequenced ClientData dates the frame that fired it.
+    lag_compensation_late_shot_ms: float = 400.0
     # WorldUpdate transport (server/replication.py). "split" sends the rows
     # of other players, entities and turrets UNSEQUENCED, so a lost reliable
     # packet can no longer hold them at the receiver, and keeps each
@@ -542,6 +615,11 @@ class ServerConfig:
     # last_man_standing played only for the Zombie last survivor. false =
     # retail silence.
     mode_start_music: bool = True
+    # [updates]: read the shared update manifest at startup and log when a
+    # newer server release exists (server/update_check.py). Never installs
+    # anything; `BattleSpades --update` downloads and stages on request.
+    update_check_enabled: bool = True
+    update_manifest_url: str = "https://www.aosplay.net/updates/stable.json"
     game_rules: GameRules = field(default_factory=GameRules.server_defaults)
 
     # Team settings
@@ -642,6 +720,14 @@ class ServerConfig:
     # Admin settings
     admin_password: str = "changeme"
     log_commands: bool = True
+    # One-time room-creator secret ([admin] creator_token). The BattleSpades
+    # client writes a fresh one into each room it hosts and redeems it with
+    # /claimhost right after joining; empty (dedicated servers) disables it.
+    admin_creator_token: str = ""
+    # Verified identities granted admin on join ([admin] auto_admin):
+    # "steam:<SteamID64>" (Steam P2P or an AoSPlay ticket) or
+    # "aosplay:<account id>". Typed names are never trusted.
+    admin_auto_ids: List[str] = field(default_factory=list)
 
     # Per-mode setting overlays from config.toml [modes.<code>] tables.
     # e.g. mode_settings["tdm"] = {"score_limit": 200, "time_limit": 900,
@@ -1074,6 +1160,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.lag_compensation_view_delay_ms = min(250.0, max(0.0, float(n.get(
             "lag_compensation_view_delay_ms",
             config.lag_compensation_view_delay_ms))))
+        config.lag_compensation_late_shot_ms = min(1000.0, max(0.0, float(n.get(
+            "lag_compensation_late_shot_ms",
+            config.lag_compensation_late_shot_ms))))
         delivery = str(n.get(
             "worldupdate_delivery", config.worldupdate_delivery)).lower()
         if delivery not in ("split", "sequenced"):
@@ -1188,6 +1277,18 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             au.get("mode_start_music", config.mode_start_music)
         )
 
+    if "updates" in data:
+        upd = data["updates"]
+        if not isinstance(upd, dict):
+            raise ValueError("updates must be a TOML table")
+        config.update_check_enabled = bool(
+            upd.get("update_check_enabled", config.update_check_enabled)
+        )
+        url = str(upd.get("update_manifest_url", config.update_manifest_url)).strip()
+        if not url.lower().startswith(("https://", "http://127.0.0.1", "http://localhost")):
+            raise ValueError("updates.update_manifest_url must be an https URL")
+        config.update_manifest_url = url
+
     if "objectives" in data:
         ob = data["objectives"]
         if not isinstance(ob, dict):
@@ -1292,6 +1393,16 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
             b.get("friendly_mischief", config.bots.friendly_mischief)
         )
         config.bots.chatter = bool(b.get("chatter", config.bots.chatter))
+        prefix = b.get("name_prefix", config.bots.name_prefix)
+        prefix = "" if prefix is None else str(prefix)
+        if len(prefix) > MAX_BOT_NAME_PREFIX or not all(
+            " " <= character <= "~" for character in prefix
+        ):
+            raise ValueError(
+                f"bots.name_prefix must be printable ASCII of at most "
+                f"{MAX_BOT_NAME_PREFIX} characters"
+            )
+        config.bots.name_prefix = prefix
         config.bots.debug_visualization = bool(
             b.get("debug_visualization", config.bots.debug_visualization)
         )
@@ -1631,6 +1742,25 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.admin_password = "" if password is None else str(password)
         config.log_commands = a.get("log_commands", config.log_commands)
         config.bans_path = str(a.get("bans_path", config.bans_path))
+        token = a.get("creator_token", config.admin_creator_token)
+        token = "" if token is None or isinstance(token, (dict, list)) else str(token)
+        if token and not valid_creator_token(token):
+            import logging
+
+            # Never echo the value: it is a credential.
+            logging.getLogger("BattleSpades.config").warning(
+                "Ignoring [admin] creator_token: it must be %d-%d letters, "
+                "digits, '-' or '_'.",
+                MIN_CREATOR_TOKEN_LENGTH, MAX_CREATOR_TOKEN_LENGTH,
+            )
+            token = ""
+        config.admin_creator_token = token
+        auto_admin = a.get("auto_admin", config.admin_auto_ids)
+        if isinstance(auto_admin, str):
+            auto_admin = [auto_admin]
+        if not isinstance(auto_admin, (list, tuple)):
+            raise ValueError("admin.auto_admin must be a list of strings")
+        config.admin_auto_ids = normalize_admin_identities(auto_admin)
     problem = admin_password_problem(config.admin_password)
     if problem is not None:
         import logging

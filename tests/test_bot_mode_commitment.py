@@ -141,13 +141,42 @@ def test_policy_hysteresis_cannot_survive_authoritative_boundaries(edge):
 
 def test_vip_role_is_retained_across_brief_roster_churn_then_rebalanced():
     memory = ModePolicyMemory()
-    observation, _, attacker, _ = vip_frame()
+    observation, guard, attacker, _ = vip_frame()
     assert memory.decide(observation, attacker).role == "vip_flank_attack"
-    # Add four bot teammates: roster balancing would now make id3 a guard.
-    additions = tuple(_player(i, 3, (25., 40., 10.)) for i in (7, 8, 9, 10))
-    changed = replace(observation, created_at=101., players=observation.players + additions)
+    # The designated bodyguard (lowest id) drops out: id3 becomes the
+    # designated guard but keeps attacking through the commitment window.
+    changed = replace(observation, created_at=101.,
+                      players=tuple(p for p in observation.players
+                                    if p.player_id != guard.player_id)
+                      + (_player(7, 3, (25., 40., 10.)),))
     assert memory.decide(changed, attacker).role == "vip_flank_attack"
     assert memory.decide(replace(changed, created_at=109.), attacker).role == "vip_guard_formation"
+
+
+def test_vip_team_never_has_more_than_one_bodyguard():
+    observation, guard, attacker, vip = vip_frame()
+    bots = (guard, attacker) + tuple(_player(i, 3, (25. + i, 40., 10.)) for i in (7, 8, 9, 10))
+    observation = replace(observation, players=bots + (vip,))
+    roles = [objective_decision_for(observation, bot).role for bot in bots]
+    assert roles.count("vip_guard_formation") == 1
+    assert roles.count("vip_flank_attack") == len(bots) - 1
+    # A retained guard whose designation moved leaves at once; with the
+    # commitment memory the team still never shows two bodyguards.
+    memory = ModePolicyMemory()
+    for bot in bots:
+        memory.decide(observation, bot)
+    lower = _player(0, 3, (26., 40., 10.))
+    churn = replace(observation, created_at=101., players=(lower,) + bots + (vip,))
+    roles = [memory.decide(churn, bot).role for bot in (lower,) + bots]
+    assert roles.count("vip_guard_formation") <= 1
+
+
+def test_vip_holds_behind_and_requests_a_shelter():
+    observation, guard, _, vip = vip_frame()
+    decision = objective_decision_for(observation, vip)
+    assert decision.role == "vip_rally"
+    assert decision.directive == "vip_shelter"
+    assert not decision.sprint
 
 
 def test_urgent_self_healing_borrows_only_bounded_time_from_capture_route():

@@ -36,6 +36,7 @@ class Command:
         admin_only: bool = False,
         usage: str = "",
         description: str = "",
+        hidden: bool = False,
     ):
         self.name = name
         self.handler = handler
@@ -43,10 +44,15 @@ class Command:
         self.admin_only = admin_only
         self.usage = usage
         self.description = description
+        # Hidden commands (client-driven plumbing) are left out of /help.
+        self.hidden = hidden
 
 
 # Registered commands
 _commands: Dict[str, Command] = {}
+
+# Commands whose arguments are secrets and must never reach a log.
+CREDENTIAL_COMMANDS = frozenset({"admin", "claimhost"})
 
 
 def register_command(
@@ -55,6 +61,7 @@ def register_command(
     admin_only: bool = False,
     usage: str = "",
     description: str = "",
+    hidden: bool = False,
 ):
     """Decorator to register a command."""
     def decorator(func: Callable[[CommandContext], Awaitable[None]]):
@@ -65,6 +72,7 @@ def register_command(
             admin_only=admin_only,
             usage=usage,
             description=description,
+            hidden=hidden,
         )
         
         # Register by name
@@ -117,7 +125,9 @@ async def handle_command(server: 'BattleSpadesServer', player: 'Player', message
         if server.config.log_commands:
             # Never write credentials to the operational log. Use the
             # canonical command name so the /login alias is redacted too.
-            logged_args = "<redacted>" if command.name == "admin" else raw_args
+            logged_args = (
+                "<redacted>" if command.name in CREDENTIAL_COMMANDS else raw_args
+            )
             logger.info(
                 "Command: %s used /%s %s",
                 player.name,

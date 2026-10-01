@@ -18,6 +18,30 @@ at https://discord.gg/aosbb.
    exposing the server publicly.
 4. Run the same launcher without arguments.
 
+Hosting with the window (easiest)
+---------------------------------
+
+Run `BattleSpadesServer.exe` on Windows or `./BattleSpadesServer` on
+Linux/macOS (Linux: `BattleSpadesServer.desktop` starts it from a file manager).
+Pick a name, mode and map, then press START. The window runs the normal
+server from this folder with the same `config.toml`, and saves only settings
+the server accepts.
+
+- Host: name, mode, map rotation, players, bots, passwords, and "Import from
+  Steam Workshop…", which copies your subscribed Workshop maps into `maps/`
+  (Steam does not need to be running). Steam P2P is on by default on Windows: friends using the retail client with the Steam relay
+  drop-in can join through Steam without port forwarding.
+- Network: the game port (32887, the original game's port, is used if the
+  file still has the 27015 sample), Steam server browser listing, optional
+  automatic port forwarding (UPnP/NAT-PMP), a connection check that reports
+  only what it can measure, a firewall helper, and router guides.
+- Console: the live log, plus admin commands such as `say`, `kick`, `ban`,
+  `map`, `restart` and `bots add 4`.
+- Advanced: every config.toml setting, with the file's own comments as help.
+
+Closing the window stops the server gracefully, and asks first if players
+are online.
+
 Per-session local hosting
 -------------------------
 
@@ -61,8 +85,9 @@ Supported terrains are desert, lunar, mountain, grassland, temple, urban,
 marsh, snowy, and water. The retail baseplates and KV6 catalog are proprietary
 client assets and are deliberately not included in this archive.
 
-The default game listener uses UDP port 27015. Allow that UDP port through the
-host firewall and router when accepting players from outside the local network.
+The default game listener uses UDP port 27015 (the server window switches a
+fresh install to 32887). Allow the configured UDP port through the host
+firewall and router when accepting players from outside the local network.
 Optional Steam registry/A2S advertisement also needs the configured Steam
 updater and query UDP ports (defaults 8766 and game port + 1). Valve retired
 the legacy list endpoint used by the unmodified 2015 All/Community screen.
@@ -71,6 +96,8 @@ Runtime files
 -------------
 
 - `config.toml`: server, game, mode, bot, logging, and admin configuration.
+- `BattleSpadesServer`: the desktop window for hosting (see above).
+- `state/`: server-window settings and match results kept between restarts.
 - `maps/`: VXL maps available to `/map` and startup configuration.
 - `prefabs/`: KV6 models required by classes and game modes.
 - `plugins/`: optional trusted Python plugins.

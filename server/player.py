@@ -117,6 +117,10 @@ IDLE_INPUT_FLAGS = (False, False, False, False, False, False, False, False)
 FIRE_RATE_GRACE = 1.0 / 60.0
 # Per-label eye/aim history for shot-origin validation (combat_runtime).
 EYE_HISTORY_LIMIT = 128
+# Zoom bit per received ClientData label (see Player.zoom_for_action).
+ZOOM_LABEL_HISTORY_LIMIT = 256
+ZOOM_ACTION_LOOKBACK = 3
+ZOOM_ACTION_SEARCH = 12
 # A stock client's label is its ClockSync estimate of the server loop plus
 # one-way latency (gameScene process_packet_clock_sync), so it never runs
 # seconds ahead of the tick on which the server received it. A label beyond
@@ -1262,6 +1266,92 @@ class Player:
             return None
         return None if entry is None else entry[1]
 
+    def _record_zoom_label(self, loop_count, action_flags) -> None:
+        """Remember the zoom bit of every received ClientData by its label.
+
+        ClientData is unsequenced while ShootPacket is reliable: a shot whose
+        datagram was lost is retransmitted after ClientData frames that
+        already carry the post-shot state (``Character.reload`` and the last
+        round un-zoom a sniper). The shot's pellet spread must use the zoom
+        of its own frame, not whatever ClientData arrived last.
+        """
+        if action_flags is None or len(action_flags) < 3:
+            return
+        try:
+            label = int(loop_count)
+        except (TypeError, ValueError, OverflowError):
+            return
+        history = getattr(self, "_zoom_by_label", None)
+        if not isinstance(history, dict):
+            history = {}
+            self._zoom_by_label = history
+        history[label] = bool(action_flags[2])
+        while len(history) > ZOOM_LABEL_HISTORY_LIMIT:
+            del history[next(iter(history))]
+        # When did this label's ClientData arrive? The unsequenced stream is
+        # never held behind a lost reliable packet, so it dates the client
+        # frame that also produced a (possibly retransmitted) action packet.
+        arrivals = getattr(self, "_label_arrival_tick", None)
+        if not isinstance(arrivals, dict):
+            arrivals = {}
+            self._label_arrival_tick = arrivals
+        if label not in arrivals:
+            server = getattr(getattr(self, "connection", None), "server", None)
+            tick = getattr(server, "loop_count", None)
+            if tick is not None:
+                arrivals[label] = int(tick)
+                while len(arrivals) > ZOOM_LABEL_HISTORY_LIMIT:
+                    del arrivals[next(iter(arrivals))]
+
+    def label_arrival_tick(self, loop_count) -> Optional[int]:
+        """Server tick at which ClientData ``loop_count`` arrived (or None)."""
+        arrivals = getattr(self, "_label_arrival_tick", None)
+        if not isinstance(arrivals, dict) or loop_count is None:
+            return None
+        try:
+            return arrivals.get(int(loop_count))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def zoom_for_action(self, loop_count) -> bool:
+        """Zoom state of the client frame an action packet describes.
+
+        True when any ClientData labelled within ``ZOOM_ACTION_LOOKBACK``
+        frames up to ``loop_count`` had the zoom bit (covers a frame whose
+        ClientData was sampled after the shot dropped the zoom, and the
+        native client labelling actions one frame late). Frame ``loop_count``
+        itself may already show the post-shot state, so it alone never
+        proves "not zoomed": the newest frame BEFORE it (searched up to
+        ``ZOOM_ACTION_SEARCH`` back, since jittered or lost ClientData may
+        not have arrived yet) decides. When neither the shot's frame nor the
+        one before it arrived the state is unknowable and the shot counts as
+        zoomed; with no history at all, the newest zoom state.
+        Zoom only narrows the stock spread and any client may legitimately
+        hold it, so leniency here grants nothing a stock client cannot do.
+        """
+        history = getattr(self, "_zoom_by_label", None)
+        current = bool(getattr(getattr(self, "input", None), "zoom", False))
+        if loop_count is None or not isinstance(history, dict) or not history:
+            return current
+        try:
+            label = int(loop_count)
+        except (TypeError, ValueError, OverflowError):
+            return current
+        window = [history.get(label - back) for back in range(ZOOM_ACTION_LOOKBACK + 1)]
+        if any(window):
+            return True
+        if window[0] is None and window[1] is None:
+            # The shot's frame and the one before it were lost with it (the
+            # shot itself was retransmitted): the scope state is unknowable,
+            # so favour the shooter -- zoom is client-chosen anyway.
+            return True
+        for back in range(1, ZOOM_ACTION_SEARCH + 1):
+            state = history.get(label - back)
+            if state is not None:
+                return bool(state)
+        own = history.get(label)
+        return current if own is None else bool(own)
+
     def _record_eye_history(self, loop: int, aim) -> None:
         history = getattr(self, "_eye_history", None)
         if not isinstance(history, dict):
@@ -1672,6 +1762,8 @@ class Player:
     def _stop_reload(self) -> None:
         self.reloading = False
         self.reload_end_time = 0.0
+        # The auto-reload bound belongs to the reload that just ended.
+        self._auto_reload_floor = None
 
     def _advance_reload(self, now: Optional[float] = None) -> bool:
         """Apply every reload cycle due by ``now``; True when reloading ends.
@@ -1712,7 +1804,61 @@ class Player:
             self._reload_done_pending = False
             self._broadcast_reload_state(True)
 
-    def _reload_blocks_shot(self, current_time: float, *, commit: bool) -> bool:
+    def _reload_done_by_label(self, profile, loop) -> bool:
+        """Whether the client's own frame labels prove its reload finished.
+
+        The reload timer starts when WeaponReload(76) ARRIVES. That packet is
+        reliable and carries no frame label: when its datagram is lost it
+        arrives one retransmission time-out (often 0.3-1 s) late, the server
+        reload ends that much after the client's, and the first shots after
+        the client's reload were dropped silently ("bullets don't register").
+
+        For the automatic reload that follows the round that emptied the
+        magazine, the stock client cannot start reloading before that
+        round's weapon_shoot animation ends (``shoot_interval`` after the
+        shot, ``Character.update_alive``), so ``shot label + interval`` is a
+        hard lower bound of the reload's start frame. A shot labelled at
+        least ``reload_time`` after that bound is one the stock client could
+        fire; forging labels gains nothing over the stock minimum cycle, and
+        ``action_clock`` still caps the sustained rate.
+        """
+        floor = getattr(self, "_auto_reload_floor", None)
+        if floor is None or loop is None:
+            return False
+        tool, floor_label = floor
+        if int(tool) != int(getattr(self, "tool", -1)):
+            return False
+        if bool(getattr(profile, "clip_reload", False)) and self.ammo_clip > 0:
+            # A shell-by-shell gun with rounds loaded already fires mid-chain;
+            # with none, the label gap proves the first shell went in.
+            return False
+        if self.ammo_reserve <= 0:
+            return False
+        if not action_clock.label_plausible(self, loop):
+            return False
+        try:
+            gap = int(loop) - int(floor_label)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        # One frame of slack for the client's dt-accumulating timers.
+        return gap >= action_clock.interval_frames(float(profile.reload_time)) - 1
+
+    def _note_auto_reload_floor(self, loop, interval: float) -> None:
+        """Remember the earliest frame the auto reload of this gun can start."""
+        if self.ammo_clip > 0 or loop is None or self.is_bot:
+            self._auto_reload_floor = None
+            return
+        if not action_clock.label_plausible(self, loop):
+            self._auto_reload_floor = None
+            return
+        self._auto_reload_floor = (
+            int(getattr(self, "tool", -1)),
+            int(loop) + action_clock.interval_frames(float(interval)),
+        )
+
+    def _reload_blocks_shot(
+        self, current_time: float, *, commit: bool, loop=None
+    ) -> bool:
         """Whether a running reload rejects a shot at ``current_time``.
 
         Retail ``Weapon.use_primary`` refuses while ``character.reloading``,
@@ -1727,10 +1873,14 @@ class Player:
             return False
         profile = self._reload_profile()
         remaining = float(self.reload_end_time) - float(current_time)
-        if remaining <= self._reload_fire_grace(profile):
+        if (
+            remaining <= self._reload_fire_grace(profile)
+            or self._reload_done_by_label(profile, loop)
+        ):
             if commit:
                 self._load_reload_cycle(profile)
                 self._stop_reload()
+                self._auto_reload_floor = None
             return False
         if bool(getattr(profile, "clip_reload", False)) and self.ammo_clip > 0:
             if commit:
@@ -1765,7 +1915,7 @@ class Player:
 
         current_time = time.monotonic() if now is None else now
         self._advance_reload(current_time)
-        if self._reload_blocks_shot(current_time, commit=False):
+        if self._reload_blocks_shot(current_time, commit=False, loop=loop):
             return False
         if not self.is_bot:
             if not action_clock.peek(
@@ -1786,13 +1936,16 @@ class Player:
             return False
         if self.ammo_clip > 0:
             return True
-        # An empty clip whose reload cycle ends within the jitter grace.
+        # An empty clip whose reload cycle ends within the jitter grace, or
+        # whose end the client's frame labels prove (_reload_done_by_label).
         return bool(
             self.reloading
-            and float(self.reload_end_time)
-            - current_time
-            <= self._reload_fire_grace(self._reload_profile())
             and self.ammo_reserve > 0
+            and (
+                float(self.reload_end_time) - current_time
+                <= self._reload_fire_grace(self._reload_profile())
+                or self._reload_done_by_label(self._reload_profile(), loop)
+            )
         )
 
     def consume_shot(
@@ -1807,7 +1960,7 @@ class Player:
 
         current_time = time.monotonic() if now is None else now
         if self.is_weapon_tool():
-            self._reload_blocks_shot(current_time, commit=True)
+            self._reload_blocks_shot(current_time, commit=True, loop=loop)
             if self.ammo_clip <= 0:
                 return False
         profile = self.get_weapon_profile()
@@ -1828,6 +1981,7 @@ class Player:
             self.next_shot_time = current_time + interval
         if self.is_weapon_tool():
             self.ammo_clip = max(0, self.ammo_clip - 1)
+            self._note_auto_reload_floor(loop, interval)
         return True
 
     def start_reload(self, now: Optional[float] = None) -> bool:
@@ -3773,6 +3927,7 @@ class Player:
         # AFK: idle clients keep streaming identical rows, so only a change
         # of keys/aim counts as activity (server.conduct).
         conduct.observe_input(self, flags, orientation, action_flags)
+        self._record_zoom_label(loop_count, action_flags)
         self.last_input_arrival_fresh = self._observe_input_arrival_order(
             loop_count, received_server_tick
         )

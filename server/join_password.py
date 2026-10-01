@@ -105,6 +105,11 @@ def gate_for(server) -> JoinPasswordGate:
 
 def peer_host(connection) -> str:
     """The address without its port: a lockout is per machine."""
+    relay = getattr(getattr(connection, 'server', None), 'steam_p2p', None)
+    if relay is not None:
+        identity = relay.identity_for(connection.peer)
+        if identity is not None:
+            return identity
     address = getattr(getattr(connection, "peer", None), "address", None)
     host = getattr(address, "host", None)
     if host is None and isinstance(address, tuple) and address:

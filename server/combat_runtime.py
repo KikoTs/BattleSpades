@@ -46,6 +46,19 @@ from server.colors import pack_rgb, unpack_rgb
 from server import block_damage_model as _damage_model
 
 logger = logging.getLogger(__name__)
+# One INFO line per dropped (never resolved) shot and per near miss of a
+# slow single-pellet gun, so a player's "my shot did not register" clip can
+# be matched to the server's reason. Rate-limited per player.
+shot_logger = logging.getLogger("combat.shots")
+SHOT_LOG_BURST = 20
+SHOT_LOG_WINDOW_SECONDS = 10.0
+# Near misses are logged for guns firing at most this often (sniper, rifle,
+# pistol, snub pistol...) and when the ray passed this close to an enemy.
+NEAR_MISS_MIN_INTERVAL = 0.4
+NEAR_MISS_DISTANCE = 1.0
+# The log window keeps its own clock: tests and the lab drive
+# ``time.monotonic`` as the simulation clock.
+_shot_log_clock = time.perf_counter
 
 SHOT_ORIGIN_TOLERANCE = 8.0
 # Initial health of every player-built voxel.  Live-measured on the stock
@@ -447,6 +460,7 @@ class CombatSystem:
         self._liberate_next_use = {}
         self._paint_budget = {}
         self._shot_tally = None
+        self._shot_drop_reason = None
 
     def forget_player(self, player_id: int) -> None:
         """Discard cadence/group state before a wire player id is reused."""
@@ -556,20 +570,28 @@ class CombatSystem:
 
     def handle_shot(self, player, packet) -> bool:
         if not player.alive or not player.spawned:
+            self._log_shot_drop(player, packet, "not_spawned")
             return False
         from server.game_rules import get_rules
         if not get_rules(self.server.config).is_tool_enabled(
             int(getattr(player, "tool", -1))
         ):
+            self._log_shot_drop(player, packet, "tool_disabled_by_rules")
             return False
         if bool(getattr(player, "pickup_burdensome", False)) and not bool(
             getattr(getattr(self.server, "mode", None), "shoot_with_intel", False)
         ):
+            self._log_shot_drop(player, packet, "carrying_objective")
             return False
         if not (player.is_weapon_tool() or player.is_spade_tool()):
+            self._log_shot_drop(player, packet, "held_tool_not_a_weapon")
             return False
+        self._shot_drop_reason = None
         validated = self._validate_shot_packet(player, packet)
         if validated is None:
+            self._log_shot_drop(
+                player, packet, self._shot_drop_reason or "invalid_shot_packet"
+            )
             return False
         reach_eyes, reach_slack = validated
 
@@ -577,11 +599,13 @@ class CombatSystem:
         now = time.monotonic()
         if int(player.tool) == int(getattr(C, "ASSAULT_RIFLE_TOOL", 60)):
             if not self._accept_assault_burst_packet(player, packet, now):
+                self._log_cadence_drop(player, packet, now)
                 return False
         elif int(player.tool) == int(getattr(C, "MINIGUN_TOOL", 8)):
             if not self._accept_minigun_packet(
                 player, now, loop=getattr(packet, "loop_count", None)
             ):
+                self._log_cadence_drop(player, packet, now)
                 return False
         elif int(player.tool) == int(getattr(C, "MG_TOOL", 15)):
             # MG_TOOL is only ever fired from a server-owned mounted gun
@@ -592,14 +616,17 @@ class CombatSystem:
 
             if not _mounted_machine_gun_authorized(player, self.server):
                 self._reject(player, "mg_fire_unmounted")
+                self._log_shot_drop(player, packet, "mg_fire_unmounted")
                 return False
             if not player.consume_shot(
                 now,
                 fire_interval=float(getattr(C, "MG_DEPLOYED_SHOOT_INTERVAL", 0.1)),
                 loop=getattr(packet, "loop_count", None),
             ):
+                self._log_cadence_drop(player, packet, now)
                 return False
         elif not player.consume_shot(now, loop=getattr(packet, "loop_count", None)):
+            self._log_cadence_drop(player, packet, now)
             return False
 
         # Only an admitted attack ends disguise. A stale, dry, or invalid
@@ -703,6 +730,9 @@ class CombatSystem:
                 ):
                     if self._resolve_hitscan(player, pellet_direction, origin):
                         hit_any = True
+                tally = self._shot_tally
+                if tally is not None and not tally.get("hit"):
+                    self._log_near_miss(player, packet, origin, direction, profile)
                 return hit_any
             finally:
                 self._end_shot_tally(player)
@@ -719,6 +749,173 @@ class CombatSystem:
         anticheat.report(self.server, player, kind, enforced=True, **detail)
         if not getattr(player, "is_bot", False):
             anticheat_stats(player)["rejected"][kind] += 1
+
+    # ------------------------------------------------------------------
+    # Shot diagnostics (INFO, rate-limited)
+    # ------------------------------------------------------------------
+
+    def _shot_log_allowed(self, player) -> tuple[bool, int]:
+        """Per-player log window; returns (allowed, lines suppressed before)."""
+
+        if getattr(player, "is_bot", False):
+            return False, 0
+        now = _shot_log_clock()
+        state = getattr(player, "_shot_log_window", None)
+        suppressed = 0
+        if not isinstance(state, list) or now - state[0] > SHOT_LOG_WINDOW_SECONDS:
+            suppressed = int(state[2]) if isinstance(state, list) else 0
+            state = [now, 0, 0]
+            try:
+                player._shot_log_window = state
+            except AttributeError:
+                return False, 0
+        if state[1] >= SHOT_LOG_BURST:
+            state[2] += 1
+            return False, 0
+        state[1] += 1
+        return True, suppressed
+
+    def _intended_target(self, player, origin, direction):
+        """(enemy, distance along the ray, miss distance) nearest the ray.
+
+        Uses the lag-compensated body when a rewind is installed, else the
+        live body; the reference point is the torso centre (0.75 below the
+        eye). Purely diagnostic.
+        """
+
+        try:
+            origin = tuple(float(v) for v in origin)
+            direction = tuple(float(v) for v in direction)
+        except (TypeError, ValueError):
+            return None
+        from server import lag_compensation
+
+        best = None
+        for target in tuple(self.server.players.values()):
+            if target is player or not target.alive or not target.spawned:
+                continue
+            if (
+                not getattr(self.server.config, "friendly_fire", False)
+                and target.team == player.team
+            ):
+                continue
+            body = lag_compensation.body_for(self, target)
+            centre = (float(body.x), float(body.y), float(body.z) + 0.75)
+            rel = tuple(centre[i] - origin[i] for i in range(3))
+            along = sum(rel[i] * direction[i] for i in range(3))
+            if along <= 0.0:
+                continue
+            miss = math.sqrt(max(0.0, sum(c * c for c in rel) - along * along))
+            if best is None or miss < best[2]:
+                best = (target, along, miss)
+        return best
+
+    def _shot_context(self, player, packet) -> dict:
+        context = {
+            "tool": int(getattr(player, "tool", -1)),
+            "loop": int(getattr(packet, "loop_count", 0) or 0),
+        }
+        try:
+            origin = (float(packet.x), float(packet.y), float(packet.z))
+            direction = self._normalize((packet.ori_x, packet.ori_y, packet.ori_z))
+        except (AttributeError, TypeError, ValueError):
+            return context
+        if direction is None or not self._finite(*origin):
+            return context
+        aimed = self._intended_target(player, origin, direction)
+        if aimed is not None:
+            target, along, miss = aimed
+            context["target"] = repr(getattr(target, "name", "?"))
+            context["distance"] = round(along, 1)
+            context["miss_by"] = round(miss, 2)
+        peer = getattr(getattr(player, "connection", None), "peer", None)
+        rtt = getattr(peer, "roundTripTime", None)
+        if rtt is not None:
+            context["rtt_ms"] = rtt
+        return context
+
+    def _log_shot_drop(self, player, packet, reason: str, **detail) -> None:
+        """INFO line for a shot that was never resolved, with its reason."""
+
+        try:
+            allowed, suppressed = self._shot_log_allowed(player)
+            if not allowed:
+                return
+            context = self._shot_context(player, packet)
+            context.update(detail)
+            if suppressed:
+                context["suppressed_before"] = suppressed
+            shot_logger.info(
+                "shot dropped player=%s name=%r reason=%s %s",
+                getattr(player, "id", "?"), getattr(player, "name", ""), reason,
+                " ".join(f"{key}={value}" for key, value in context.items()),
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not break combat
+            logger.debug("shot drop logging failed", exc_info=True)
+
+    def _log_cadence_drop(self, player, packet, now: float) -> None:
+        """Classify a consume_shot refusal: reload, empty magazine, or rate."""
+
+        detail = {
+            "clip": int(getattr(player, "ammo_clip", 0)),
+            "reserve": int(getattr(player, "ammo_reserve", 0)),
+        }
+        if bool(getattr(player, "reloading", False)):
+            reason = "reloading"
+            detail["reload_left"] = round(
+                float(getattr(player, "reload_end_time", 0.0)) - float(now), 3
+            )
+        elif int(getattr(player, "ammo_clip", 0)) <= 0:
+            reason = "empty_clip"
+        else:
+            reason = "fire_rate"
+            lanes = getattr(player, "_action_lanes", None)
+            lane = lanes.get("fire") if isinstance(lanes, dict) else None
+            if lane is not None:
+                if lane.label is not None:
+                    detail["label_gap"] = (
+                        int(getattr(packet, "loop_count", 0) or 0) - int(lane.label)
+                    )
+                detail["due_in"] = round(float(lane.due) - float(now), 3)
+                detail["tokens"] = round(float(lane.tokens), 2)
+        self._log_shot_drop(player, packet, reason, **detail)
+
+    def _log_near_miss(self, player, packet, origin, direction, profile) -> None:
+        """INFO line when a slow single-pellet gun narrowly missed an enemy."""
+
+        try:
+            if getattr(player, "is_bot", False) or player.is_spade_tool():
+                return
+            if float(profile.fire_interval) < NEAR_MISS_MIN_INTERVAL:
+                return
+            if int(getattr(profile, "pellet_count", 1)) != 1:
+                return
+            aimed = self._intended_target(player, origin, direction)
+            if aimed is None or aimed[2] > NEAR_MISS_DISTANCE:
+                return
+            allowed, suppressed = self._shot_log_allowed(player)
+            if not allowed:
+                return
+            target, along, miss = aimed
+            rewind = getattr(self, "_lag_rewind", None)
+            zoom_for = getattr(player, "zoom_for_action", None)
+            zoom = (
+                bool(zoom_for(getattr(packet, "loop_count", None)))
+                if callable(zoom_for) else None
+            )
+            peer = getattr(getattr(player, "connection", None), "peer", None)
+            shot_logger.info(
+                "shot missed player=%s name=%r tool=%s target=%r distance=%.1f "
+                "miss_by=%.2f rewind_ms=%s zoom=%s rtt_ms=%s%s",
+                getattr(player, "id", "?"), getattr(player, "name", ""),
+                int(getattr(player, "tool", -1)), getattr(target, "name", "?"),
+                along, miss,
+                None if rewind is None else round(float(rewind.rewind_ms), 1),
+                zoom, getattr(peer, "roundTripTime", None),
+                f" suppressed_before={suppressed}" if suppressed else "",
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not break combat
+            logger.debug("near-miss logging failed", exc_info=True)
 
     def _begin_shot_tally(self, player) -> None:
         self._shot_tally = {
@@ -813,6 +1010,11 @@ class CombatSystem:
             player.ammo_clip -= 1
             burst["count"] += 1
             burst["last_loop"] = loop_count
+            note_floor = getattr(player, "_note_auto_reload_floor", None)
+            if callable(note_floor):
+                note_floor(
+                    loop_count, float(player.get_weapon_profile().fire_interval)
+                )
             return True
 
         if not player.consume_shot(now, loop=loop_count):
@@ -914,6 +1116,13 @@ class CombatSystem:
                 spread = spread_min
             else:
                 elapsed = max(0.0, now - float(state["last_at"]))
+                # The client's bloom decays on its own frame clock: measure
+                # the gap by labels when both shots carry plausible ones, so
+                # jitter or a retransmission burst does not bloom the
+                # server's cone wider than the one the client drew.
+                label_gap = self._shot_label_gap(player, state.get("label"), packet)
+                if label_gap is not None:
+                    elapsed = label_gap
                 spread = max(spread_min, float(state["spread"]) - elapsed * reduction)
             ratio = 0.0
             if spread_max > spread_min:
@@ -926,9 +1135,21 @@ class CombatSystem:
             "tool": tool,
             "spread": spread,
             "last_at": now,
+            "label": getattr(packet, "loop_count", None),
         }
 
-        zoomed = bool(getattr(getattr(player, "input", None), "zoom", False))
+        # The zoom of the shot's OWN client frame (Character.shoot reads
+        # ``self.zoom`` before the shot can drop it). The newest ClientData
+        # may already carry the post-shot state: Character.reload cancels a
+        # sniper's zoom one frame later, and an unsequenced ClientData
+        # overtakes a retransmitted reliable ShootPacket. Using it turned
+        # zoomed sniper shots (accuracy_zoom 0) into hip shots with up to
+        # +/-0.05 rad of spread per axis: clean misses at range.
+        zoom_for_action = getattr(player, "zoom_for_action", None)
+        if callable(zoom_for_action):
+            zoomed = bool(zoom_for_action(getattr(packet, "loop_count", None)))
+        else:
+            zoomed = bool(getattr(getattr(player, "input", None), "zoom", False))
         if zoomed and tool in RETAIL_ACCURACY_ZOOM:
             accuracy = RETAIL_ACCURACY_ZOOM[tool]
         scale = 2.0 if zoomed else 4.0
@@ -944,6 +1165,25 @@ class CombatSystem:
             if pellet is not None:
                 pellets.append(pellet)
         return pellets
+
+    @staticmethod
+    def _shot_label_gap(player, previous_label, packet):
+        """Seconds between two shots by client frame labels, or None."""
+
+        if previous_label is None or getattr(player, "is_bot", False):
+            return None
+        from server import action_clock
+
+        label = getattr(packet, "loop_count", None)
+        if not action_clock.label_plausible(player, label):
+            return None
+        try:
+            gap = int(label) - int(previous_label)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if gap < 0 or gap > 10 * int(action_clock.TICK_RATE):
+            return None
+        return gap / float(action_clock.TICK_RATE)
 
     def handle_weapon_reload(self, player) -> bool:
         if not player.start_reload():
@@ -2678,19 +2918,23 @@ class CombatSystem:
                 packet.ori_x, packet.ori_y, packet.ori_z,
             )
         except AttributeError:
+            self._shot_drop_reason = "malformed_packet"
             return None
         if not self._finite(*raw):
             logger.debug("Rejecting shoot packet from %s with non-finite values", player.name)
+            self._shot_drop_reason = "non_finite_values"
             return None
         packet_origin = (float(packet.x), float(packet.y), float(packet.z))
         packet_direction = self._normalize((packet.ori_x, packet.ori_y, packet.ori_z))
         if packet_direction is None:
             logger.debug("Rejecting shoot packet from %s with zero orientation", player.name)
+            self._shot_drop_reason = "zero_orientation"
             return None
 
         loop = getattr(packet, "loop_count", None)
         at_loop, eyes = reference_eyes(player, loop)
         if not eyes:
+            self._shot_drop_reason = "no_server_eye"
             return None
         current_eye = _finite_point(player.eye)
         is_bot = bool(getattr(player, "is_bot", False))
@@ -2698,6 +2942,7 @@ class CombatSystem:
         nearest = min(self._distance(packet_origin, eye) for eye in eyes)
         if not nearest <= SHOT_ORIGIN_TOLERANCE:
             self._reject(player, "shot_origin_far", distance=round(nearest, 2))
+            self._shot_drop_reason = f"shot_origin_far({nearest:.2f})"
             return None
         if not any(
             segment_clear(self.server.world_manager, eye, packet_origin)
@@ -2706,6 +2951,7 @@ class CombatSystem:
             self._reject(
                 player, "shot_origin_occluded", distance=round(nearest, 2)
             )
+            self._shot_drop_reason = "shot_origin_occluded"
             return None
 
         from server import anticheat
@@ -2735,6 +2981,7 @@ class CombatSystem:
                 )
                 if enforce:
                     stats["rejected"]["shot_origin_drift"] += 1
+                    self._shot_drop_reason = f"shot_origin_drift({origin_error:.2f})"
                     return None
 
         # Coarse direction gate (kept from before): the shot must point
@@ -2751,6 +2998,7 @@ class CombatSystem:
         server_direction = self._normalize(player.orientation)
         aims = [aim for aim in (at_loop_aim, server_direction) if aim is not None]
         if not aims:
+            self._shot_drop_reason = "no_server_orientation"
             return None
         dots = [
             sum(packet_direction[i] * aim[i] for i in range(3)) for aim in aims
@@ -2759,6 +3007,7 @@ class CombatSystem:
             self._reject(
                 player, "shot_direction_mismatch", dot=round(max(dots), 3)
             )
+            self._shot_drop_reason = f"shot_direction_mismatch({max(dots):.2f})"
             return None
 
         # Soft aim check against the shot's own frame (fallback: latest).
@@ -2782,6 +3031,7 @@ class CombatSystem:
                 )
                 if enforce:
                     stats["rejected"]["aim_direction_mismatch"] += 1
+                    self._shot_drop_reason = f"aim_direction_mismatch({angle:.1f}deg)"
                     return None
         return eyes, slack
 

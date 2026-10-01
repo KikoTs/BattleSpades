@@ -51,6 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="launch all enabled [[instances]] from a fleet TOML manifest",
     )
+    action.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "download, verify and stage the newest server from the update "
+            "manifest; never replaces files of this installation"
+        ),
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -71,6 +79,19 @@ def build_parser() -> argparse.ArgumentParser:
             "intended for an embedding launcher"
         ),
     )
+    parser.add_argument(
+        "--status-file",
+        type=Path,
+        default=None,
+        help=(
+            "write a small JSON status snapshot (state, players, map, mode) "
+            "about once per second; intended for a supervising launcher"
+        ),
+    )
+    parser.add_argument('--steam-p2p', action='store_true', help='publish this server for patched retail clients over Steam relays')
+    parser.add_argument('--steam-p2p-bridge', type=Path, help='path to the portable aos-retail-relay.exe helper')
+    parser.add_argument('--steam-p2p-port', type=int, choices=range(1000), default=168, metavar='0..999', help='Steam virtual port (default 168; unique per hosting account)')
+    parser.add_argument('--steam-p2p-private', action='store_true', help='validation only: keep the advertisement out of the public retail browser')
     return parser
 
 
@@ -113,6 +134,16 @@ def _apply_port_override(config: object, port: int | None) -> object:
     return config
 
 
+def _apply_network_options(config: object, arguments) -> object:
+    """CLI-only hosting settings; never rewrite the operator's configuration."""
+    _apply_port_override(config, arguments.port)
+    config.steam_p2p_enabled = arguments.steam_p2p
+    config.steam_p2p_bridge = str(arguments.steam_p2p_bridge.resolve()) if arguments.steam_p2p_bridge else None
+    config.steam_p2p_port = arguments.steam_p2p_port
+    config.steam_p2p_private = arguments.steam_p2p_private
+    return config
+
+
 def _emit_check_report(report: CheckReport) -> int:
     """Print one complete health report to stdout on success or stderr on failure."""
 
@@ -143,10 +174,16 @@ _WINDOWS_PIPE_EOF_ERRORS = frozenset({109, 232, 233})
 
 @dataclass(slots=True)
 class _ControlLineDecoder:
-    """Recognize only an exact ASCII ``shutdown`` line from bounded chunks."""
+    """Recognize an exact ASCII ``shutdown`` line from bounded chunks.
+
+    Complete ``command <text>`` lines are collected in ``commands`` for the
+    trusted operator console (server/control_channel.py); every other line
+    is ignored, as before.
+    """
 
     pending: bytearray = field(default_factory=bytearray)
     discarding_line: bool = False
+    commands: list = field(default_factory=list)
 
     def feed(self, data: bytes) -> bool:
         """Return true once one complete exact shutdown line is received."""
@@ -168,8 +205,10 @@ class _ControlLineDecoder:
             remaining = remaining[newline + 1 :]
             if not self.discarding_line:
                 self.pending.extend(segment)
-                if bytes(self.pending) in (b"shutdown\n", b"shutdown\r\n"):
+                line = bytes(self.pending)
+                if line in (b"shutdown\n", b"shutdown\r\n"):
                     return True
+                self._collect_command(line.rstrip(b"\r\n"))
             self.pending.clear()
             self.discarding_line = False
         return False
@@ -178,6 +217,21 @@ class _ControlLineDecoder:
         """Recognize the sole legal unterminated line when the pipe closes."""
 
         return not self.discarding_line and bytes(self.pending) == b"shutdown"
+
+    def _collect_command(self, line: bytes) -> None:
+        if not line.startswith(b"command "):
+            return
+        from server.control_channel import MAX_PENDING_COMMANDS, parse_command_line
+
+        text = parse_command_line(line)
+        if text is not None and len(self.commands) < MAX_PENDING_COMMANDS:
+            self.commands.append(text)
+
+    def take_commands(self) -> list:
+        """Return and clear the command lines received so far."""
+
+        commands, self.commands = self.commands, []
+        return commands
 
 
 def _control_stream_fd(stream) -> int:
@@ -269,6 +323,7 @@ def _poll_posix_control_pipe(descriptor: int) -> tuple[bytes | None, bool]:
 async def _control_stdin_monitor(
     stream,
     request_shutdown: Callable[[str], None],
+    on_command: Callable[[str], None] | None = None,
 ) -> None:
     """Poll the parent pipe without leaving a thread alive during AI spawns.
 
@@ -314,7 +369,13 @@ async def _control_stdin_monitor(
             )
             request_shutdown(reason)
             return
-        if data and decoder.feed(data):
+        stop = bool(data) and decoder.feed(data)
+        # Commands that arrived before a shutdown line still run, in order.
+        commands = decoder.take_commands()
+        if on_command is not None:
+            for text in commands:
+                on_command(text)
+        if stop:
             request_shutdown("parent requested shutdown on stdin")
             return
         await asyncio.sleep(_CONTROL_STDIN_POLL_SECONDS)
@@ -325,6 +386,7 @@ def _start_control_stdin_monitor(
     request_shutdown: Callable[[str], None],
     *,
     stream=None,
+    on_command: Callable[[str], None] | None = None,
 ) -> asyncio.Task:
     """Schedule the opt-in, thread-free stdin control monitor."""
 
@@ -332,6 +394,7 @@ def _start_control_stdin_monitor(
         _control_stdin_monitor(
             sys.stdin if stream is None else stream,
             request_shutdown,
+            on_command,
         ),
         name="BattleSpades-stdin-control",
     )
@@ -363,7 +426,13 @@ def _freeze_import_graph_for_gc() -> bool:
     return True
 
 
-async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> None:
+async def _serve(
+    config,
+    logging_runtime,
+    *,
+    control_stdin: bool = False,
+    status_file: Path | None = None,
+) -> None:
     """Own one asynchronous server instance until signal-driven shutdown."""
 
     from server.main import BattleSpadesServer
@@ -393,6 +462,16 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
     shutdown_task: asyncio.Task | None = None
     control_task: asyncio.Task | None = None
     ready_task: asyncio.Task | None = None
+    status_task: asyncio.Task | None = None
+    status_state = {"state": "starting"}
+    dispatcher = None
+    if status_file is not None:
+        from server.control_channel import publish_status_loop
+
+        status_task = asyncio.create_task(
+            publish_status_loop(server, Path(status_file), status_state),
+            name="BattleSpades-status-file",
+        )
 
     async def report_ready() -> None:
         while not server.running and not server_task.done():
@@ -416,6 +495,7 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
         if shutdown_task is not None:
             return
         logger.info("%s...", reason.capitalize())
+        status_state["state"] = "stopping"
         if native_status is not None:
             native_status.publish("stopping")
         shutdown_task = asyncio.create_task(
@@ -435,7 +515,12 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
             )
 
     if control_stdin:
-        control_task = _start_control_stdin_monitor(loop, request_shutdown)
+        from server.control_channel import CommandDispatcher
+
+        dispatcher = CommandDispatcher(server, loop)
+        control_task = _start_control_stdin_monitor(
+            loop, request_shutdown, on_command=dispatcher.submit,
+        )
 
     failed = False
     try:
@@ -462,8 +547,52 @@ async def _serve(config, logging_runtime, *, control_stdin: bool = False) -> Non
                 control_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await control_task
+        if dispatcher is not None:
+            await dispatcher.close()
+        if status_task is not None:
+            status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await status_task
+            from server.control_channel import build_status, write_status
+
+            with contextlib.suppress(Exception):
+                write_status(
+                    Path(status_file),
+                    build_status(server, state="failed" if failed else "stopped"),
+                )
         if native_status is not None and not failed:
             native_status.publish("stopped")
+
+
+def _start_update_notice(config, paths: RuntimePaths, logger: logging.Logger) -> None:
+    """Log "new server version available" from a daemon thread (never blocks)."""
+
+    from server.update_check import start_background_check
+
+    try:
+        current = read_version(paths.root)
+    except (OSError, ValueError):
+        return
+    start_background_check(config, current, log=logger)
+
+
+def _run_update_command(paths: RuntimePaths) -> int:
+    """``--update``: stage the newest server component; replace nothing."""
+
+    from server.config import load_config
+    from server.update_check import run_update
+
+    try:
+        config = load_config(paths.config)
+        current = read_version(paths.root)
+    except (OSError, ValueError) as exc:
+        print(f"Update failed: {exc}", file=sys.stderr)
+        return 1
+    return run_update(
+        paths.root,
+        current,
+        url=getattr(config, "update_manifest_url", ""),
+    )
 
 
 def _run_server(
@@ -472,6 +601,7 @@ def _run_server(
     config_transform: Callable[[object], object | None] | None = None,
     banner: str = "BattleSpades Server - Protocol 1.0 Battle Builders",
     control_stdin: bool = False,
+    status_file: Path | None = None,
 ) -> int:
     """Configure process resources, run one server variant, and close sinks.
 
@@ -499,7 +629,13 @@ def _run_server(
     # load_config warned before file logging existed; repeat it into server.log.
     password_problem = admin_password_problem(getattr(config, "admin_password", ""))
     if password_problem is not None:
-        logger.warning("In-game /admin login is DISABLED: %s.", password_problem)
+        rule = "!" * 72
+        logger.warning(
+            "%s\nIn-game /admin login is DISABLED: %s.\nSet [admin] password "
+            "in config.toml to a unique secret of 12+ characters (the desktop "
+            "host's Generate button makes one).\n%s",
+            rule, password_problem, rule,
+        )
     log_stem = Path(str(getattr(config, "log_file", "server.log"))).stem
     fault_file = paths.logs / f"{log_stem or 'server'}.fault.log"
 
@@ -511,12 +647,16 @@ def _run_server(
             logger.info("=" * 50)
             logger.info("Application root: %s", paths.root)
             logger.info("Log level set to: %s", config.log_level.upper())
+            if not control_stdin:
+                # Embedded (client-owned) servers are updated by the launcher.
+                _start_update_notice(config, paths, logger)
             try:
                 asyncio.run(
                     _serve(
                         config,
                         logging_runtime,
                         control_stdin=control_stdin,
+                        status_file=status_file,
                     )
                 )
             except KeyboardInterrupt:
@@ -559,10 +699,14 @@ def run(
             arguments.config is not None
             or arguments.port is not None
             or arguments.control_stdin
+            or arguments.status_file is not None
+            or arguments.steam_p2p
+            or arguments.steam_p2p_bridge is not None
+            or arguments.steam_p2p_private
         ):
             print(
                 "Server startup failed: --fleet cannot be combined with "
-                "--config, --port, or --control-stdin",
+                "--config, --port, --control-stdin, or Steam relay hosting options",
                 file=sys.stderr,
             )
             return 2
@@ -585,11 +729,15 @@ def run(
         return 1
     if arguments.check:
         return _emit_check_report(run_release_check(runtime_paths))
+    if arguments.update:
+        return _run_update_command(runtime_paths)
     return _run_server(
         runtime_paths,
-        config_transform=lambda config: _apply_port_override(
-            config,
-            arguments.port,
-        ),
+        config_transform=lambda config: _apply_network_options(config, arguments),
         control_stdin=arguments.control_stdin,
+        status_file=(
+            arguments.status_file.resolve()
+            if arguments.status_file is not None
+            else None
+        ),
     )

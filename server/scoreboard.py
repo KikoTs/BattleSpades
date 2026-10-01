@@ -29,6 +29,16 @@ SCORE_TEAM = int(C.SCORE.TEAM)
 SCORE_PLAYER = int(C.SCORE.PLAYER)
 REASON_KILL = int(getattr(C.SCORE_REASON, "KILL_SCORE_REASON", 1))
 REASON_SUICIDE = int(getattr(C.SCORE_REASON, "SUICIDE_SCORE_REASON", 2))
+# Retail HUD.draw_timer (hud.pyd, hud.pyx:777-786) prints
+# ``'%02d:%02d' % gmtime(countdown)[tm_min, tm_sec]``: there is no hour field.
+# A clock above one hour -- Classic CTF's retail 5400 s, the Match Lobby's
+# 90-minute option -- starts at 30:00, reaches 00:00 a full hour before the
+# round ends, then wraps to 59:59 ("the timer hits zero and resets to 59
+# minutes"). The round length stays retail; only the displayed value is held
+# at the largest MM:SS the HUD can draw until the last hour, so 00:00 on the
+# HUD always means the round is over. Just under 3600 so gmtime never rolls
+# the minute over to 00 between the 1 Hz refreshes.
+HUD_CLOCK_MAX_SECONDS = 3599.999
 
 
 def player_score_packet(player, *, reason: int = 0) -> bytes:
@@ -104,8 +114,22 @@ def send_round_timer(server, seconds_remaining: float, *, reliable: bool = True)
     and keep ``reliable=True`` for round starts and mode transitions.
     """
     pkt = DisplayCountdown()
-    pkt.timer = float(max(0.0, seconds_remaining))
+    pkt.timer = hud_clock_seconds(seconds_remaining)
     server.broadcast(bytes(pkt.generate()), reliable=reliable)
+
+
+def hud_clock_seconds(seconds_remaining: float) -> float:
+    """The DisplayCountdown value: non-negative and never past the HUD's hour.
+
+    See ``HUD_CLOCK_MAX_SECONDS``. Non-finite input shows 0 rather than NaN.
+    """
+    try:
+        value = float(seconds_remaining)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value:  # NaN
+        return 0.0
+    return min(HUD_CLOCK_MAX_SECONDS, max(0.0, value))
 
 
 def reveal_to(server, connection) -> None:

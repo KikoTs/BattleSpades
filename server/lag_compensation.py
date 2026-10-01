@@ -51,6 +51,8 @@ Config keys (read with getattr, defaults in brackets):
 * ``lag_compensation_extra_ms`` [50] allowance above the measured RTT
 * ``lag_compensation_view_delay_ms`` [0] extra client render delay; the
   retail client extrapolates remotes, so 0 is the measured-contract value
+* ``lag_compensation_late_shot_ms`` [400] most extra rewind for a shot that
+  arrived late because its datagram was retransmitted (``late_shot_ms``)
 
 See docs/LAG_COMPENSATION.md.
 """
@@ -61,10 +63,10 @@ import contextlib
 import math
 from typing import Optional
 
-# Ring capacity in ticks (power of two, ~1.07 s at 60 Hz). The rewind cap is
-# far below this; the slack covers tick-rate overrides up to 240 Hz at the
-# default 250 ms cap.
-HISTORY_TICKS = 64
+# Ring capacity in ticks (power of two, ~2.1 s at 60 Hz). The default rewind
+# (250 ms cap + 400 ms late-shot allowance) is far below this; the slack
+# covers tick-rate overrides up to 120 Hz at those defaults.
+HISTORY_TICKS = 128
 _MASK = HISTORY_TICKS - 1
 
 # Legit bodies never move this far in one tick (sprint ~0.2, terminal fall
@@ -75,6 +77,10 @@ TELEPORT_BLOCKS_PER_TICK = 5.0
 DEFAULT_MAX_MS = 250.0
 DEFAULT_EXTRA_MS = 50.0
 DEFAULT_VIEW_DELAY_MS = 0.0
+# Extra rewind for a shot whose reliable datagram was retransmitted (see
+# late_shot_ms): about one ENet retransmission time-out at 300 ms ping.
+DEFAULT_LATE_SHOT_MS = 400.0
+LATE_SEARCH_FRAMES = 8
 
 # Below half a tick there is nothing to rewind.
 _MIN_REWIND_TICKS = 0.5
@@ -356,6 +362,12 @@ def rewind_targets(server, shooter, packet) -> Optional[RewindContext]:
     view_delay_ms = max(0.0, float(_setting(
         server, "lag_compensation_view_delay_ms", DEFAULT_VIEW_DELAY_MS)))
     allowed_ms = min(rtt_ms + extra_ms, max_ms)
+    # A shot whose reliable datagram was lost arrives one ENet retransmission
+    # later than the frame that produced it; the unsequenced ClientData of
+    # that frame dates it (late_shot_ms). That delay is added to the view
+    # age and to the allowance, bounded by lag_compensation_late_shot_ms.
+    late_ms = late_shot_ms(server, shooter, packet, tick_ms)
+    allowed_ms += late_ms
     # The round trip overstates the view age by about 12 ms (half a tick of
     # wait before the shot is handled plus the client's socket poll inside
     # every acknowledgement). That is deliberate: measured over 10,000 shots
@@ -363,7 +375,7 @@ def rewind_targets(server, shooter, packet) -> Optional[RewindContext]:
     # mean position error but registers fewer shots, because the misses are
     # direction changes, where the client's extrapolation overshoots and a
     # slightly older body is the nearer one.
-    desired_ms = rtt_ms + view_delay_ms
+    desired_ms = rtt_ms + view_delay_ms + late_ms
 
     snapshot = None
     try:
@@ -388,6 +400,11 @@ def rewind_targets(server, shooter, packet) -> Optional[RewindContext]:
                         claimed_ms=round(snapshot_age_ms, 1),
                         allowed_ms=round(allowed_ms, 1),
                         rtt_ms=round(rtt_ms, 1))
+    if late_ms > 0.0:
+        # Log-only: an honest link shows this at about its loss rate; a
+        # client that holds every shot back ("backtrack") shows it always.
+        _report(server, shooter, "lag_comp_late_shot",
+                late_ms=round(late_ms, 1), rtt_ms=round(rtt_ms, 1))
 
     rewind_ms = max(0.0, min(desired_ms, allowed_ms))
     if rewind_ms < _MIN_REWIND_TICKS * tick_ms:
@@ -399,6 +416,49 @@ def rewind_targets(server, shooter, packet) -> Optional[RewindContext]:
         pass
     return RewindContext(now, view_tick, rewind_ms, allowed_ms, rtt_ms,
                          snapshot)
+
+
+def late_shot_ms(server, shooter, packet, tick_ms: float) -> float:
+    """How much later than its own client frame an action packet arrived.
+
+    ``Player.label_arrival_tick`` dates every ClientData label by the server
+    tick it arrived on. ClientData is unsequenced, so it is never held behind
+    a lost reliable packet, while the ShootPacket of the same frame is: when
+    that datagram is lost the shot arrives one retransmission time-out late
+    (hundreds of ms) and, rewound by the round trip alone, misses the moving
+    body the shooter saw. When the shot's own ClientData was lost with it,
+    the nearest label that arrived (within ``LATE_SEARCH_FRAMES``) dates it.
+    One tick of ordinary drain/phase skew is ignored. Bounded by
+    ``lag_compensation_late_shot_ms``; 0 when nothing dates the label.
+    """
+
+    cap = max(0.0, float(_setting(
+        server, "lag_compensation_late_shot_ms", DEFAULT_LATE_SHOT_MS)))
+    if cap <= 0.0:
+        return 0.0
+    arrival_of = getattr(shooter, "label_arrival_tick", None)
+    if not callable(arrival_of):
+        return 0.0
+    try:
+        label = int(getattr(packet, "loop_count", None))
+        loop_now = int(getattr(server, "loop_count", 0))
+    except (TypeError, ValueError):
+        return 0.0
+    estimate = None
+    for offset in range(LATE_SEARCH_FRAMES + 1):
+        for candidate in ((label,) if offset == 0 else (label - offset, label + offset)):
+            arrived = arrival_of(candidate)
+            if arrived is not None:
+                estimate = int(arrived) - (candidate - label)
+                break
+        if estimate is not None:
+            break
+    if estimate is None:
+        return 0.0
+    late_ticks = loop_now - estimate - 1
+    if late_ticks <= 0:
+        return 0.0
+    return min(cap, late_ticks * float(tick_ms))
 
 
 def _report(server, shooter, kind: str, **detail) -> None:

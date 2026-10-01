@@ -217,6 +217,8 @@ class MouseTests(Fixture):
                           _get_modifiers=lambda: 7,
                           dispatch_event=lambda *args: self.events.append(args))
         self.controller = mouse.MouseController(self.api, self.logs.append)
+        self.now = [0.0]
+        self.controller.clock = lambda: self.now[0]
         self.controller.sync(self.window)
 
     def send(self, message=mouse.WM_INPUT):
@@ -237,14 +239,68 @@ class MouseTests(Fixture):
         self.assertFalse(self.api.forwarded)
 
     def test_legacy_only_provider_cannot_freeze_the_camera(self):
-        now = [0.0]
-        self.controller.clock = lambda: now[0]
         for index in range(4):
-            now[0] = index * 0.11
+            self.now[0] = 1.0 + index * 0.11
             result = self.send(mouse.WM_MOUSEMOVE)
         self.assertEqual(result, 77)
-        self.assertTrue(self.controller.states[self.window].disabled)
-        self.assertFalse(self.api.registered)
+        state = self.controller.states[self.window]
+        self.assertTrue(state.legacy_fallback)
+        self.assertFalse(state.disabled)
+        self.assertEqual(self.api.registered, [(10, 0)])
+
+    def test_raw_motion_recovers_after_watchdog_without_double_delivery(self):
+        self.test_legacy_only_provider_cannot_freeze_the_camera()
+        self.send(mouse.WM_INPUT)
+        self.assertFalse(self.events)  # Its legacy half may already be delivered.
+        self.assertFalse(self.controller.states[self.window].legacy_fallback)
+        self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 0)
+        self.send(mouse.WM_INPUT)
+        self.assertEqual(self.events, [('on_mouse_motion', 50, 60, 9, 3)])
+        self.assertEqual(self.api.registration_calls, [10])
+
+    def test_button_only_raw_packets_do_not_end_legacy_fallback(self):
+        self.test_legacy_only_provider_cannot_freeze_the_camera()
+        self.api.packet = (0, 0, 0, 1)
+        self.send(mouse.WM_INPUT)
+        self.assertTrue(self.controller.states[self.window].legacy_fallback)
+        self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 77)
+
+    def test_restore_warps_do_not_trigger_fallback(self):
+        for index in range(5):
+            self.now[0] = index * 0.1
+            self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 0)
+        self.assertFalse(self.controller.states[self.window].legacy_fallback)
+
+    def test_repeated_focus_cycles_clear_transient_state(self):
+        state = self.controller.states[self.window]
+        for index in range(100):
+            state.legacy_fallback = True
+            state.failures = 2
+            state.absolute[7] = (999, 999, False)
+            self.window._has_focus = False
+            self.controller.sync(self.window)
+            self.assertFalse(self.api.registered)
+            self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 77)
+            self.now[0] += 1.0
+            self.window._has_focus = True
+            self.controller.sync(self.window)
+            self.assertFalse(state.legacy_fallback)
+            self.assertEqual(state.failures, 0)
+            self.assertEqual(state.absolute, {})
+            self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 0)
+            self.send(mouse.WM_INPUT)
+        self.assertEqual(len(self.events), 100)
+        self.assertFalse(state.disabled)
+        self.assertEqual(len(self.controller.views), 1)
+
+    def test_foreign_registration_during_fallback_is_respected(self):
+        self.test_legacy_only_provider_cannot_freeze_the_camera()
+        self.api.registered = [(999, 0)]
+        self.controller.sync(self.window)
+        self.assertEqual(self.send(mouse.WM_MOUSEMOVE), 77)
+        self.controller.close(self.window)
+        self.assertEqual(self.api.registered, [(999, 0)])
+        self.assertEqual(self.api.registration_calls, [10])
 
     def test_raw_input_after_idle_does_not_trigger_watchdog(self):
         now = [100.0]
@@ -374,7 +430,7 @@ class MousePacketTests(unittest.TestCase):
 
 
 class MouseInstallTests(Fixture):
-    def test_existing_window_future_capture_and_raw_input_wake_mask(self):
+    def install_window(self):
         api = InputAPI()
         self.set(mouse, 'WindowsInput', lambda: api)
         self.set(ctypes, 'sizeof', lambda unused: 4)
@@ -395,6 +451,10 @@ class MouseInstallTests(Fixture):
         self.module('pyglet.libs.win32', __path__=[], constants=constants)
         self.module('pyglet.window.win32', Win32Window=Window)
         mouse.install(self.runtime)
+        return window, api, constants, scheduled
+
+    def test_existing_window_future_capture_and_raw_input_wake_mask(self):
+        window, api, constants, scheduled = self.install_window()
         self.assertEqual(self.runtime.status['mouse.raw'], 'active')
         self.assertEqual(constants.QS_ALLINPUT, 0x04ff)
         self.assertEqual(api.registered, [(10, 0)])
@@ -406,6 +466,28 @@ class MouseInstallTests(Fixture):
         window.close()
         self.assertTrue(window.closed)
         self.assertFalse(api.registered)
+
+    @unittest.skipUnless(os.environ.get('AOS_RETAIL_BUNDLE') and sys.version_info[0] == 2,
+                         'Use Python 2.7 and AOS_RETAIL_BUNDLE for bytecode integration')
+    def test_retail_focus_handlers_reenter_capture_hook_without_polling(self):
+        window, api, unused_constants, unused_scheduled = self.install_window()
+        lose = retail_method('pyglet/window/win32.py', 'Win32Window', '_event_killfocus')
+        gain = retail_method('pyglet/window/win32.py', 'Win32Window', '_event_setfocus')
+        window.dispatch_event = lambda *args: None
+        window._exclusive_keyboard = False
+        window.set_exclusive_keyboard = lambda unused: None
+        controller = self.runtime.mouse
+        state = controller.states[window]
+        for unused in range(100):
+            state.legacy_fallback = True
+            self.assertEqual(lose(window, 0, 0, 0), 0)
+            self.assertFalse(state.active)
+            self.assertFalse(api.registered)
+            self.assertEqual(gain(window, 0, 0, 0), 0)
+            self.assertTrue(state.active)
+            self.assertFalse(state.legacy_fallback)
+            self.assertEqual(api.registered, [(10, 0)])
+        self.assertEqual(len(controller.views), 1)
 
 
 class ScrollTests(Fixture):

@@ -80,6 +80,13 @@ jobs:
           print('machine=' + platform.machine());
           print('pointer_bits=' + str(struct.calcsize('P') * 8))"
 
+      - name: Ensure Tk for the desktop host
+        # BattleSpadesServer uses the Tk that setup-python's CPython links
+        # against; PyInstaller then bundles it, so players install nothing.
+        # This only installs the runtime library on a runner image lacking it.
+        if: matrix.platform == 'linux'
+        run: python -c "import tkinter" || (sudo apt-get update && sudo apt-get install -y libtk8.6)
+
       - name: Install pinned release dependencies
         run: |
           python -m pip install --upgrade pip
@@ -133,6 +140,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "tutorial external-config check failed" }
             & "$($bundle.FullName)\BattleSpadesMapCreator.exe" --version
             if ($LASTEXITCODE -ne 0) { throw "map creator --version failed" }
+            # Windowed executable: wait for it explicitly and read its exit code.
+            $gui = Start-Process -FilePath "$($bundle.FullName)\BattleSpadesServer.exe" -ArgumentList "--self-check" -Wait -PassThru
+            if ($gui.ExitCode -ne 0) { throw "server window --self-check failed" }
           } finally {
             Pop-Location
           }
@@ -150,6 +160,7 @@ jobs:
           "$bundle/BattleSpadesTutorial" --version
           "$bundle/BattleSpadesTutorial" --check --config "$RUNNER_TEMP/battlespades-session.toml"
           "$bundle/BattleSpadesMapCreator" --version
+          "$bundle/BattleSpadesServer" --self-check
 
       - name: Upload native zip
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

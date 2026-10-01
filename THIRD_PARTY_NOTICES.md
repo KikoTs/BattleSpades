@@ -23,6 +23,11 @@ which carries the full notices for everything the frozen server contains.
 | [toml](https://github.com/uiri/toml) | 0.10.2 | runtime dependency | Config parsing; shipped in releases | MIT | Yes |
 | [py_trees](https://github.com/splintered-reality/py_trees) | 2.5.0 | runtime dependency | Bot behaviour trees; shipped in releases | BSD-3-Clause | Yes |
 | [pydot](https://github.com/pydot/pydot) / [pyparsing](https://github.com/pyparsing/pyparsing) | per lock | dependencies of py_trees | Shipped in releases when collected | MIT | Yes |
+| [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) | 5.2.2 | runtime dependency of `BattleSpadesServer` | Desktop window widgets; shipped in releases | MIT | Yes |
+| [darkdetect](https://github.com/albertosottile/darkdetect) / [packaging](https://github.com/pypa/packaging) | 0.8.0 / 25.0 | dependencies of CustomTkinter | Shipped in releases | BSD-3-Clause / Apache-2.0 or BSD-2-Clause | Yes |
+| [tomlkit](https://github.com/python-poetry/tomlkit) | 0.13.2 | runtime dependency of `BattleSpadesServer` | Comment-preserving `config.toml` edits; shipped in releases | MIT | Yes |
+| [Tcl/Tk](https://www.tcl.tk/) | 8.6 (from CPython) | release archives only | Toolkit under the desktop window | Tcl/Tk license (BSD-style) | Yes |
+| [Barlow Condensed](https://github.com/jpt/barlow) | 1.4 | `server_gui/fonts/` | Heading font of the desktop window; shipped in releases | SIL OFL 1.1 — [`server_gui/fonts/OFL.txt`](server_gui/fonts/OFL.txt) | Yes |
 | [setuptools](https://github.com/pypa/setuptools) | 80.9.0 | build dependency | Extension build | MIT | Yes (build tool only) |
 | [PyInstaller](https://pyinstaller.org/) | 6.11.1 | release build tool | Produces the portable launchers; its bootloader is embedded in each executable | GPL-2.0-or-later **with the PyInstaller bootloader exception**, which permits distributing the resulting executables under any terms | Yes (build tool; bootloader exception) |
 | [pytest](https://pytest.org/) / pytest-asyncio | per `requirements*.txt` | development only | Test suite; not shipped | MIT | n/a (not shipped) |

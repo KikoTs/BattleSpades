@@ -348,3 +348,46 @@ initial, crate restock)`:
 - The Snowblower honours `TeamInfiniteBlocks(82)`.
 - Burn and goo ticks keep the raw 2.5 (no class multiplier): no evidence
   that the stock server scaled them; left as is.
+
+## Hit registration under lag (2026-10-01)
+
+Beta 0.1 clip: a zoomed sniper shot on target did no damage. Reproduced end
+to end with `scripts/shot_registration_lab.py` (real server tick, real
+`handle_shot`, a headless client aiming at the body it displays, impaired
+link); pinned by `tests/test_shot_registration.py`.
+
+- **Zoom of the shot's own frame.** `Character.shoot` (character.pyd
+  `0x10049DB0`, source lines 1714-1727) expands the pellets with
+  `(random()*2-1)*accuracy_zoom` when `self.zoom`, else
+  `(random()*4-2)*accuracy`; the ShootPacket carries the central
+  orientation (line 1707, `weapon.shoot(orientation, seed)`). The sniper
+  is un-zoomed soon after its shot: `Character.shoot` ends with a
+  conditional `set_zoom` (xref `0x1004C681`, source line 1763; the native
+  client models it as "last round un-zooms") and `Character.reload`
+  cancels zoom. The server read the NEWEST ClientData zoom bit;
+  ClientData is unsequenced and the shot reliable, so jitter or a lost
+  datagram made a zoomed sniper shot (`accuracy_zoom` 0) a hip shot
+  (`accuracy` 0.025, up to +/-0.05 rad per axis): 10-20 % of sniper shots
+  missed at 100-300 ms ping, 30-50 % when the frame's ClientData is sampled
+  after the shot. `Player.zoom_for_action(label)` now uses the zoom of the
+  shot's frame (labels L-3..L). Zoom is client-chosen anyway, so this
+  grants nothing.
+- **Reload proven by labels.** The reload timer starts on WeaponReload(76)
+  arrival; a lost reload datagram made the first shots after the client's
+  reload `dropped:reloading`. After a round that empties the magazine the
+  stock reload cannot start before that round's `shoot_interval`; a shot
+  labelled `reload_time` after that bound completes the reload
+  (`Player._reload_done_by_label`; for an empty shell-by-shell gun it
+  proves the first shell). Manual reloads with rounds left keep arrival
+  timing.
+- **Bloom** (`RETAIL_ACCURACY_SPREAD`) now decays over the gap between the
+  two shots' frame labels, not their arrival times, so a retransmission
+  burst no longer widens the server's cone beyond the client's.
+- **Late shots** are rewound to their own frame (docs/LAG_COMPENSATION.md).
+- **Diagnostics.** Logger `combat.shots` writes one INFO line per dropped
+  shot (`reason=reloading|empty_clip|fire_rate|shot_origin_far(...)|...`,
+  tool, label, nearest enemy, distance, miss distance, RTT) and per near
+  miss (< 1 block) of guns with `shoot_interval >= 0.4` (rewind, zoom),
+  at most 20 lines per player per 10 s.
+- Retail damage is unchanged: a sniper body shot is 50 (two to kill a
+  100 HP soldier), a head shot 175.

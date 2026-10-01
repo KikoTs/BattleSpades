@@ -22,7 +22,7 @@ exit /b %errorlevel%
 [IO.File]::WriteAllText($buildCmd, $content, [Text.ASCIIEncoding]::new())
 & $buildCmd
 if ($LASTEXITCODE -ne 0) { throw 'Loader compilation failed.' }
-foreach ($scriptName in @('aosfix_runtime.py', 'aos_mousefix.py', 'aos_equipmentfix.py', 'aos_uifix.py', 'aos_movementfix.py')) {
+foreach ($scriptName in @('aosfix_runtime.py', 'aos_mousefix.py', 'aos_equipmentfix.py', 'aos_uifix.py', 'aos_movementfix.py', 'aos_networkfix.py', 'aos_steam_bridge.py')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $scriptName) -Destination $OutputDirectory
 }
-Write-Output "Built $OutputDirectory\winmm.dll and five Python runtime files"
+Write-Output "Built $OutputDirectory\winmm.dll and Python runtime files"

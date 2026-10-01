@@ -53,7 +53,7 @@ and [type-cache invalidation](https://docs.python.org/3/c-api/type.html#c.PyType
 
 ## Validation and limits
 
-- 53 existing loader/UI/mouse checks and 18 movement-boundary checks pass on
+- 59 loader/UI/mouse checks and 18 movement-boundary checks pass on
   Python 2.7 x86. The bootstrap tests include the movement feature switch.
 - 1,711 current BattleSpades checks pass across `test_retail_binary_movement`,
   `test_reversed_movement_engine`, `test_movement_jitter` and
@@ -67,10 +67,10 @@ and [type-cache invalidation](https://docs.python.org/3/c-api/type.html#c.PyType
   The test uses a small Character shell to isolate the identified statement;
   it is not a substitute for full-game reconciliation measurements.
 - The actual retail client loads the hook and logs the first local Character
-  update after spawning. Automated Space taps did not produce the first-jump
-  suppression marker; a physical-keyboard jump is still unverified in game.
-  The log distinguishes installation, the first local update and the first
-  suppressed stale restore so these stages can be checked independently.
+  update after spawning. Subsequent installed-client logs from the user's
+  sessions contain the first stale-restore suppression marker as well. The
+  log distinguishes these stages; it does not measure full-game movement
+  accuracy or correction frequency.
 
 The walking predictor was not replaced because the inspected tests and code
 already agree with the current server. This patch removes one confirmed local

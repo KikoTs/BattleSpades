@@ -87,7 +87,7 @@ def test_launcher_reports_ready_only_after_initialization(
             self.running = False
             self.stopped.set()
 
-    def monitor(_loop, shutdown):
+    def monitor(_loop, shutdown, **_kwargs):
         async def wait_until_ready():
             while "ready" not in states:
                 await asyncio.sleep(0.005)

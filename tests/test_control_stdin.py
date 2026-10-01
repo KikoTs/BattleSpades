@@ -113,7 +113,7 @@ def test_serve_awaits_parent_requested_stop_to_completion(monkeypatch) -> None:
     monkeypatch.setattr(launcher.signal, "signal", lambda *_args: None)
     monitor_tasks = []
 
-    def start_monitor(loop, callback):
+    def start_monitor(loop, callback, **_kwargs):
         async def deliver_shutdown() -> None:
             await asyncio.sleep(0)
             callback("parent requested shutdown on stdin")

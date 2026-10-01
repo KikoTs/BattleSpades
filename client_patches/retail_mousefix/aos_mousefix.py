@@ -131,6 +131,8 @@ class WindowState(object):
         self.active = False
         self.owned = False
         self.disabled = False
+        self.legacy_fallback = False
+        self.capture_started = None
         self.failures = 0
         self.absolute = {}
         self.reported_motion = False
@@ -157,13 +159,23 @@ class MouseController(object):
 
     def release(self, state):
         state.active = False
-        state.absolute.clear()
-        state.legacy_started = state.last_legacy = None
-        state.legacy_count = 0
+        self.reset_capture(state)
         owned = state.owned
         state.owned = False
         if owned and state.hwnd and self.api.registrations() == [(state.hwnd, 0)]:
             self.api.register(None)
+
+    def reset_capture(self, state):
+        # Focus/capture transitions start a new input session. In particular,
+        # cursor warps and read errors from before minimize are not evidence
+        # that the restored window's device has stopped producing raw input.
+        state.absolute.clear()
+        state.failures = 0
+        state.last_motion = None
+        state.legacy_started = state.last_legacy = None
+        state.legacy_count = 0
+        state.legacy_fallback = False
+        state.capture_started = None
 
     def fail(self, state, reason):
         state.disabled = True
@@ -202,13 +214,14 @@ class MouseController(object):
                 # Another component owns raw input. Do not steal its target.
                 state.active = False
                 state.owned = False
-                state.absolute.clear()
+                self.reset_capture(state)
                 return
             if not registrations:
                 self.api.register(hwnd)
                 state.owned = True
             if not state.active:
-                state.absolute.clear()
+                self.reset_capture(state)
+                state.capture_started = self.clock()
                 self.log('mouse: raw input active on view %s.' % hwnd)
             state.active = True
         except Exception as error:
@@ -245,13 +258,22 @@ class MouseController(object):
         # those users with a frozen camera. Require sustained movement, so the
         # legacy message preceding the first raw packet after idle is safe.
         now = self.clock()
+        if state.legacy_fallback:
+            return True
+        # Pyglet recenters the cursor while restoring exclusive capture. Let
+        # its focus messages settle before evaluating a silent raw stream.
+        if state.capture_started is not None and now - state.capture_started < 0.5:
+            return False
         if state.last_legacy is None or now - state.last_legacy > 0.2:
             state.legacy_started, state.legacy_count = now, 0
         state.last_legacy = now
         state.legacy_count += 1
         silent = state.last_motion is None or now - state.last_motion > 0.3
         if silent and state.legacy_count >= 4 and now - state.legacy_started >= 0.3:
-            self.fail(state, 'cursor movement without raw motion (remote/synthetic input)')
+            # Keep the registration so real motion can restore raw input.
+            # This is a transient provider condition, not a broken adapter.
+            state.legacy_fallback = True
+            self.log('mouse: temporarily using stock input; waiting for raw motion.')
             return True
         return False
 
@@ -282,6 +304,15 @@ class MouseController(object):
         if not dx and not dy:
             return
         state.last_motion = self.clock()
+        if state.legacy_fallback:
+            state.legacy_fallback = False
+            state.legacy_started = state.last_legacy = None
+            state.legacy_count = 0
+            state.capture_started = state.last_motion
+            self.log('mouse: raw motion resumed; stock movement suppressed again.')
+            # The legacy half of this first packet may already have moved the
+            # camera. Discard it once at the handoff to avoid double movement.
+            return
         if not state.reported_motion:
             state.reported_motion = True
             self.log('mouse: first %s raw motion delivered.' %

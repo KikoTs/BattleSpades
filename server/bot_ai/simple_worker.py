@@ -87,6 +87,13 @@ from .policies import (
     mode_objective_committed,
 )
 from .simple_navigation import RoutePlan, RouteStep, SimpleVoxelWorld
+from .recovery_skills import SkillCommand
+from .skill_driver import (
+    SKILL_DIRECTIVES,
+    LocomotionSkillDriver,
+    SkillRequest,
+    swim_seconds_to_shore,
+)
 from .surface_corridor import SurfaceCorridorSearch
 from .prefab_policy import bot_prefab_block_count, bot_prefab_is_suitable
 from .snapshot_transport import MapSnapshotAssembler, SnapshotTransportError
@@ -385,6 +392,8 @@ class SimpleBotBrain:
         self._map_epoch = -1
         self.cooperative = CooperativeBehavior(world)
         self.mode_policy = ModePolicyMemory()
+        # Climb out of water/pits, pillar, fast-bridge (recovery_skills).
+        self.skills = LocomotionSkillDriver(world)
 
     def reset_for_map(self, map_epoch: int) -> None:
         """Discard every controller and route from the previous map."""
@@ -397,6 +406,7 @@ class SimpleBotBrain:
         self._team_oriented_ready_at.clear()
         self.cooperative.reset()
         self.mode_policy.reset()
+        self.skills.reset()
 
     def reset_bot(self, player_id: int, generation: int) -> None:
         """Discard a failed controller without interrupting healthy teammates."""
@@ -404,6 +414,73 @@ class SimpleBotBrain:
         self._states.pop((int(player_id), int(generation)), None)
         self.cooperative.forget(int(player_id), int(generation))
         self.mode_policy.forget(int(player_id), int(generation))
+        self.skills.forget(int(player_id), int(generation))
+
+    def request_locomotion_skill(self, frame: PerceptionFrame,
+                                 request: SkillRequest) -> BotIntent | None:
+        """Run an explicit primitive for ``frame``'s observer right now.
+
+        Strategy code normally sets ``ModeBotDecision.directive`` instead
+        (``climb``, ``pillar_up``, ``dig_staircase_up``, ``bridge``); this is
+        the direct form for tests and tools. Returns ``None`` when the
+        primitive cannot be planned from the body's position.
+        """
+
+        observer = next((player for player in frame.players
+                         if int(player.player_id) == int(frame.observer_id)
+                         and int(player.generation) == int(frame.observer_generation)), None)
+        if observer is None or not observer.alive:
+            return None
+        command = self.skills.request(observer, frame.profile, request, float(frame.created_at))
+        if command is None or command.status != "running":
+            return None
+        return self._skill_intent(frame, observer, command, request.target)
+
+    def _skill_intent(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                      command: SkillCommand, goal: Vector3 | None) -> BotIntent:
+        """Wrap one locomotion-skill input frame into an ordinary intent."""
+
+        water = command.role.startswith("water_")
+        return self._intent(
+            frame,
+            movement=MovementIntent(
+                direction=command.direction,
+                jump=command.jump,
+                crouch=command.crouch,
+                sneak=command.sneak,
+                sprint=command.sprint,
+                affordance=command.affordance,
+            ),
+            look=LookIntent(command.look, visible=False) if command.look is not None else None,
+            tool_id=command.tool_id if command.tool_id >= 0 else _weapon_tool(observer),
+            action=command.action,
+            priority=BotIntentPriority.SURVIVAL if water else BotIntentPriority.TRAVERSAL,
+            secondary_fire=command.secondary,
+            debug_goal=goal,
+            debug_path=(observer.position,),
+            debug_role=command.role,
+            crowd_adjust=False,
+        )
+
+    def _continue_skill(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                        state: _BotState, now: float) -> BotIntent | None:
+        """Keep an active locomotion skill in charge; replan the route after."""
+
+        command = self.skills.step(observer, frame.profile, now)
+        return self._skill_result(frame, observer, state, command, now)
+
+    def _skill_result(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                      state: _BotState, command: SkillCommand | None,
+                      now: float) -> BotIntent | None:
+        if command is None:
+            return None
+        if command.status != "running":
+            # Finished (or abandoned): the old route is from another place.
+            self._clear_route(state, now)
+            state.escape_goal = None
+            return None
+        goal = state.goal.position if state.goal is not None else None
+        return self._skill_intent(frame, observer, command, goal)
 
     def decide(self, frame: PerceptionFrame) -> BotIntent | None:
         """Return the newest bounded intention for one observer."""
@@ -534,6 +611,12 @@ class SimpleBotBrain:
                 state.water_recovery = True
                 self._clear_route(state, now)
                 force_water_edge = True
+            if self.skills.active(observer):
+                # A climb out (staircase/pillar from the water) owns the body
+                # until it stands on main ground or gives up.
+                climbing = self._continue_skill(frame, observer, state, now)
+                if climbing is not None:
+                    return climbing
             landing = state.water_landing_step
             if (landing is not None and not force_water_edge and not observer.grounded
                     and now - state.water_progress_at < 1.2
@@ -565,6 +648,18 @@ class SimpleBotBrain:
                 state.water_recovery = True
             elif water_edge_blocked:
                 state.water_recovery = True
+            # Under a cliff, a player digs a staircase or pillars up rather
+            # than swimming half way round the island to a beach.
+            climb = self._skill_result(frame, observer, state, self.skills.consider_water(
+                observer, frame.profile, now,
+                goal=state.goal.position if state.goal is not None else None,
+                swim_seconds=swim_seconds_to_shore(
+                    self.world, observer,
+                    state.goal.position if state.goal is not None else None),
+                recovering=state.water_recovery,
+            ), now)
+            if climb is not None:
+                return climb
             # Keep following a strategic cross-water route when one already
             # owns locomotion. The former code erased this goal on contact with
             # water and sent the bot back to the nearest shore, making river
@@ -635,6 +730,7 @@ class SimpleBotBrain:
         # A one-block foothold can briefly clear wade before the body falls
         # back in. Keep shoreline failure memory through that landing; its
         # ordinary TTL and the next life/map reset still bound it.
+        self.skills.left_water(observer, now)
 
         if observer.grounded:
             escape = hazard_escape(self.world, frame, observer, profile,
@@ -710,6 +806,12 @@ class SimpleBotBrain:
                 debug_goal=contact,
                 debug_role="cover_reload",
             )
+        if visible_target is None and self.skills.active(observer):
+            # Half way up a staircase or a pillar: finish the climb before
+            # optional work. A visible enemy still interrupts (combat below).
+            climbing = self._continue_skill(frame, observer, state, now)
+            if climbing is not None:
+                return climbing
         if frame.behavior_version == "cooperative":
             order = self.cooperative.decide(frame, observer, visible_target, mode_decision)
             if order is not None:
@@ -747,7 +849,7 @@ class SimpleBotBrain:
 
         if (
             mode_decision is not None
-            and mode_decision.directive in ("demolish", "repair")
+            and mode_decision.directive in ("demolish", "repair", "siege")
         ):
             work = self._objective_block_work_intent(
                 frame, observer, state, now, mode_decision,
@@ -786,6 +888,21 @@ class SimpleBotBrain:
         )
         if deployable is not None:
             return deployable
+
+        if mode_decision is not None and mode_decision.directive in SKILL_DIRECTIVES:
+            # Strategy asked for a locomotion primitive (reach an elevated
+            # player, pillar up, dig a staircase, bridge). Far away, walk
+            # there first; when it cannot be planned, ordinary navigation
+            # toward the same position remains the fallback.
+            target = mode_decision.position
+            if math.hypot(target[0] - observer.position[0],
+                          target[1] - observer.position[1]) <= 14.0:
+                primitive = self._skill_result(frame, observer, state, self.skills.request(
+                    observer, frame.profile,
+                    SkillRequest.from_directive(mode_decision.directive, target, observer),
+                    now), now)
+                if primitive is not None:
+                    return primitive
 
         goal = self._select_goal(
             frame,
@@ -977,7 +1094,8 @@ class SimpleBotBrain:
             decision = self.mode_policy.decide(frame, observer)
         if decision is not None and (mode_objective_committed(decision)
                                      or decision.objective_priority >= 0.7):
-            if decision.role in {"team_assault_enemy_side", "arena_elimination_push"}:
+            if decision.role in {"team_assault_enemy_side", "arena_elimination_push",
+                                 "vip_mop_up"}:
                 return (self._flank_approach_goal(frame, observer, state, now)
                         or self._assault_search_goal(observer, state, decision, now))
             if decision.role in {"ctf_attack_intel", "classic_ctf_attack_intel"}:
@@ -1004,7 +1122,8 @@ class SimpleBotBrain:
         if decision is None:
             return None
         decision = self._optional_support_decision(frame, observer, state, decision, now)
-        if decision.role in {"team_assault_enemy_side", "arena_elimination_push"}:
+        if decision.role in {"team_assault_enemy_side", "arena_elimination_push",
+                             "vip_mop_up"}:
             return (self._flank_approach_goal(frame, observer, state, now)
                     or self._assault_search_goal(observer, state, decision, now))
         return self._goal_from_mode_decision(decision)
@@ -2449,15 +2568,28 @@ class SimpleBotBrain:
         decision's cell until one is in reach.
         """
 
-        demolish = decision.directive == "demolish"
-        base = next(
-            (
-                item for item in frame.objectives
-                if item.kind == "dem_base"
-                and ((item.team != observer.team) if demolish else (item.team == observer.team))
-            ),
-            None,
-        )
+        siege = decision.directive == "siege"
+        demolish = siege or decision.directive == "demolish"
+        if siege:
+            # Zombie horde order (zombie_siege / horde_strategy): claw the
+            # assigned collapse-cut or tunnel voxels, same swing machinery.
+            base = next(
+                (
+                    item for item in frame.objectives
+                    if item.kind == "zombie_order"
+                    and item.carrier_id == observer.player_id and item.cells
+                ),
+                None,
+            )
+        else:
+            base = next(
+                (
+                    item for item in frame.objectives
+                    if item.kind == "dem_base"
+                    and ((item.team != observer.team) if demolish else (item.team == observer.team))
+                ),
+                None,
+            )
         if base is None or not observer.grounded:
             return None
         skip = state.block_work_skip
@@ -2487,7 +2619,10 @@ class SimpleBotBrain:
             skip[cell] = now + self._BLOCK_WORK_SKIP_SECONDS
             state.block_work_cell = None
             return None
-        role = "demolition_dig_base" if demolish else "demolition_repair_block"
+        role = (
+            decision.role if siege
+            else "demolition_dig_base" if demolish else "demolition_repair_block"
+        )
         center = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
         self._set_goal(state, None, observer.position, now)
         if now + 1e-9 < state.next_block_work_at:
@@ -2771,6 +2906,14 @@ class SimpleBotBrain:
                 debug_goal=active_goal.position,
                 debug_role=f"{active_goal.role}:arrived",
             )
+
+        if not effective_wading:
+            # Stuck in a pit / on a cut-off beach below the goal: climb out
+            # (staircase or pillar) instead of cycling escape segments.
+            climb = self._skill_result(frame, observer, state, self.skills.consider_stuck(
+                observer, frame.profile, now, active_goal.position), now)
+            if climb is not None:
+                return climb
 
         repeated_coverage = self._navigation_revisits(state, observer.position, active_goal, now)
         current_step = (state.route[state.route_index]
@@ -3072,6 +3215,19 @@ class SimpleBotBrain:
                     ):
                         state.dry_route_failures = 0
                 else:
+                    # No walking route: a chasm straight ahead that the wallet
+                    # can span is crossed now, backing over the edge laying
+                    # short block lines, instead of wandering along its lip.
+                    # A short gap is bridged at once; a long one by builders,
+                    # or by others after one lateral detour along the lip.
+                    long_ok = (personality.style is _TraversalStyle.BRIDGE
+                               or state.dry_route_failures >= 1)
+                    gap = (self._skill_result(frame, observer, state, self.skills.consider_gap(
+                        observer, frame.profile, now, active_goal.position,
+                        max_cells=16 if long_ok else 8), now)
+                        if not crowd_detour_active else None)
+                    if gap is not None:
+                        return gap
                     bridge = (
                         self._water_bridge_intent(
                             frame,
@@ -3130,6 +3286,11 @@ class SimpleBotBrain:
                         state.dry_detour_until = 0.0
             if plan.deferred:
                 return wait_for_plan()
+            if not effective_wading and not _plan_can_advance(plan, observer.position):
+                gap = self._skill_result(frame, observer, state, self.skills.consider_gap(
+                    observer, frame.profile, now, active_goal.position), now)
+                if gap is not None:
+                    return gap
             state.planning_context = None
             state.planning_results.clear()
             self._reset_breach(state, now)

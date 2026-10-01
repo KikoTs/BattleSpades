@@ -34,6 +34,16 @@ for unused in range(40):
         assert controller.states[window].active
         assert api.registrations() == [(window._view_hwnd, 0)]
         assert user.SendMessageW(window._view_hwnd, 0x8001, 0, 0) == 0
+        for cycle in range(3):
+            state = controller.states[window]
+            state.legacy_fallback = True
+            window._has_focus = False
+            controller.sync(window)
+            assert not api.registrations()
+            window._has_focus = True
+            controller.sync(window)
+            assert state.active and not state.legacy_fallback
+            assert api.registrations() == [(window._view_hwnd, 0)]
         controller.close(window)
         assert not api.registrations()
     finally:
@@ -47,4 +57,4 @@ except RuntimeError:
     pass
 else:
     raise AssertionError('Invalid raw-input handle was accepted')
-print('x86 Win32 raw-input registration, callback chaining and 40 teardown cycles passed.')
+print('x86 Win32 registration, callback chaining, 120 capture resets and 40 teardown cycles passed.')

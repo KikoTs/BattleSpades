@@ -242,8 +242,39 @@ def test_vip_damage_is_halved_and_only_dead_vip_team_loses_respawns():
     assert _visibility_packets(server.packets)[-1].high_minimap_visibility == 0
 
 
-def test_vip_disconnect_counts_as_vip_death_and_late_join_gets_survivor_marker():
+def test_vip_disconnect_hands_crown_to_teammate_and_late_join_sees_both_markers():
     server, mode = _new_mode()
+    blue_a = _player(server, 1, TEAM1)
+    blue_b = _player(server, 3, TEAM1)
+    _player(server, 2, TEAM2)
+    asyncio.run(mode.on_tick(1))
+    blue_vip = mode.vips[TEAM1]
+    successor = blue_b if blue_vip is blue_a else blue_a
+    green_vip = mode.vips[TEAM2]
+
+    server.players.pop(blue_vip.id)
+    server.teams[TEAM1].remove_player(blue_vip)
+    asyncio.run(mode.on_player_leave(blue_vip))
+    joining = _Connection()
+    mode.reveal_to(joining)
+
+    assert mode.phase is VIPPhase.ACTIVE
+    assert mode.vips[TEAM1] is successor
+    assert mode.vip_alive[TEAM1] is True
+    assert mode.respawn_enabled[TEAM1] is True
+    assert successor.class_id == int(C.MAFIA_VIPS[TEAM1])
+    visible = _visibility_packets(joining.sent)
+    assert sorted((packet.player_id, packet.high_minimap_visibility) for packet in visible) == sorted([
+        (successor.id, 1), (green_vip.id, 1)
+    ])
+
+
+def test_vip_disconnect_counts_as_vip_death_under_death_leave_policy():
+    server = _Server()
+    server.config.mode_settings["vip"]["leave_policy"] = "death"
+    mode = VIPMode(server)
+    server.mode = mode
+    asyncio.run(mode.on_mode_start())
     _player(server, 1, TEAM1)
     _player(server, 3, TEAM1)
     _player(server, 2, TEAM2)

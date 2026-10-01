@@ -15,6 +15,7 @@ The implementation uses the user's confirmed repository at
 | Equipment and characters | Retail `selectClass` and `GameClass` call sites | Fresh scoped wrappers for DLC-listed tool/character IDs. No unconditional replacement of shared selection functions or Steam DLC APIs. |
 | Jump launch | Revival `tools/patch_character_jump_restore.py` and BattleSpades `docs/RETAIL_JUMP_RESTORE.md`; AGEX `continuous_jump.py` reviewed for comparison | New scoped runtime implementation of the exact launch-restore omission. Keeps the post-physics position, rather than the old Revival wrapper's pre-frame position. Applies to the local character on every server. Uses GC dictionary discovery and CPython cache invalidation, without executable byte edits, guessed object-memory offsets, or a GameManager factory replacement. |
 | Loader/coordinator | Original code written for this task | Existing WinMM forwarder, rewritten bootstrap, shared Python module observers and transactional attribute replacement. |
+| Optional retail Steam relay | Installed retail bytecode and Valve Steamworks interfaces; BattleSpadesClient's transport inspected read-only as a design reference | New standalone native helper and Python 2 controller/browser adapter. No C++ client files or AGEX networking/lobby modules are copied or modified. Separate helper runtime; stock retail DLLs remain intact. |
 
 Windows structure layouts, API signatures, message constants and export names
 describe the platform ABI. Their presence is not evidence of copied custom
@@ -33,6 +34,10 @@ Disassembly of the installed, SHA256-verified `aos.pkg` showed `continue`
 branches absent from the local decompilation. The original compiled list
 methods skip hidden rows and preserve header positions correctly. A trial
 offset wrapper visibly displaced rows, so all four layout wrappers were
-removed before packaging. Six integration checks now use actual bundled
+removed before packaging. Seven integration checks now use actual bundled
 methods, including regression checks that the four stock layouts remain
 correct. `retail_bytecode.py` is test tooling, not part of the game runtime.
+
+The minimize/restore repair uses the existing capture wrapper and a new
+recoverable watchdog state. Retail focus-handler bytecode is exercised by
+tests; no copied replacement focus handler is shipped in the runtime.
