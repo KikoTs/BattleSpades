@@ -20,6 +20,7 @@ import shared.constants as C
 import shared.constants_gamemode as CG
 
 from server import mode_data
+from server.class_data import BATTLESPADES_TEAM_CLASSES
 from server.class_selection import ClassSelection, normalize_class_selection
 from server.game_constants import (
     KILL_CLASS_CHANGE,
@@ -49,8 +50,8 @@ _ZOMBIE_PREFABS = tuple(
     for name in C.PREFAB_LISTS.get(int(C.CLASS_PREFABS_ZOMBIE), ())
 )
 # Retail survivors pick from DEFAULT_TEAM_CLASSES (alias A93), which has no
-# Rocketeer.  Keep the stock card order for the StateData list.
-_SURVIVOR_CLASS_ORDER = tuple(int(value) for value in C.DEFAULT_TEAM_CLASSES)
+# Rocketeer; BattleSpades survivors keep the Rocketeer (restored 2026-10-01).
+_SURVIVOR_CLASS_ORDER = BATTLESPADES_TEAM_CLASSES
 _SURVIVOR_CLASSES = frozenset(_SURVIVOR_CLASS_ORDER)
 _PLAYABLE_TEAMS = (ZOMBIE_TEAM, SURVIVOR_TEAM)
 # Deaths that only replace a Character (loadout edit, team/role change) are

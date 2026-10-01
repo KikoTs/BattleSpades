@@ -124,3 +124,27 @@ at under 6 blocks clearance never opened and the landing took full damage.
   use SPACE.
 - Bots do not decide to open a canopy yet (they would do so through
   `action_hover`).
+
+## BattleSpades canopy (BSFP v2, 2026-10-01)
+
+Request: "falling with the parachute is way too slow when deployed at slow
+fall speed". The stock mover (re-checked in `world.pyd`: `fmul 0.05` at
+0x10012EFD, then the ordinary `/(1+dt)` drag) has no deploy blend, clamp or
+minimum: a canopy opened at the top of a fall (SPACE again after the jump, or
+the queued Z press, opens at vz ~ 0) creeps from rest toward the 0.05 native
+= 1.6 blocks/s terminal, ~25 s for 40 blocks. A fast body brakes with a
+one-second time constant toward the same terminal.
+
+Native BattleSpades clients that advertise `BSCF` now receive
+`BALANCED_FLIGHT_V2` (`server/flight_profile.py`), whose canopy uses gravity
+scale 0.15625 (5 blocks/s terminal) plus a **free-fall floor**: while the body
+is slower than that terminal it falls with ordinary gravity, capped at the
+terminal; at or above it the stock canopy step runs unchanged. So a slow
+deploy reaches 5 blocks/s in ~10 frames (40 blocks in ~8 s), and a fast one
+still brakes with the stock drag. Both sides implement it identically
+(`aoslib/world.pyx` `parachute_gravity_scale`/`parachute_free_fall_floor`,
+native `step_player`), and the free-fall-equivalent landing damage uses the
+same canopy step. Landing at 5 blocks/s equals a ~0.5-block free fall: no
+damage. Stock clients, bots and BSCF v1 natives keep 0.05 with no floor.
+Tests: `tests/test_flight_balance.py` (`..._canopy_...`), native
+`test_player_movement` and `test_tutorial_session`.

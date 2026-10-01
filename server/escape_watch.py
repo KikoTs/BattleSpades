@@ -51,6 +51,13 @@ DEFAULT_ENTOMB_SECONDS = 5.0
 CLEAR_AFTER_CHECKS = 2
 # Flood-fill budget for the sealed-pocket test (air cells visited).
 ENTOMB_FILL_BUDGET = 256
+# ``below_floor`` margin, in blocks, past the z=240 map bottom.  Players stand
+# legitimately with their nominal feet up to ~1 block under it: a wader's feet
+# rest at ~239.99, and crouching (Character.set_crouch) drops the anchor a
+# further 0.9 while the mover keeps the standing contact offset in water, so
+# a crouched wader's anchor sits at ~238.65.  Only a body a full block past
+# the indestructible floor has really fallen out of the map.
+BELOW_FLOOR_TOLERANCE = 1.0
 
 PLAYABLE_REASONS = ("out_of_bounds", "below_floor", "sky", "embedded", "entombed")
 
@@ -248,8 +255,14 @@ def classify(world, player, *, objective: bool) -> str | None:
     map_x, map_y, map_z = _dims()
     if not (0.0 <= x < map_x and 0.0 <= y < map_y):
         return "out_of_bounds"
-    feet = z + float(C.PLAYER_STANDING_POS_ABOVE_GROUND)
-    if feet > float(map_z):
+    # A crouched anchor is 0.9 lower in the world than a standing one, so the
+    # standing offset would put a crouched wader's "feet" under the floor and
+    # broadcast the VIP/high-minimap marker the instant they crouched in water.
+    crouched = bool(getattr(getattr(player, "input", None), "crouch", False))
+    contact = (C.PLAYER_CROUCHING_POS_ABOVE_GROUND if crouched
+               else C.PLAYER_STANDING_POS_ABOVE_GROUND)
+    feet = z + float(contact)
+    if feet > float(map_z) + BELOW_FLOOR_TOLERANCE:
         return "below_floor"
     if z < 0.0:
         return "sky"

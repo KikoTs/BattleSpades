@@ -54,18 +54,21 @@ def _allowed_for(code: str) -> tuple[int, ...]:
         return tuple(int(x) for x in C.CLASSIC_TEAM_CLASSES)
     if mafia:
         return tuple(int(x) for x in C.MAFIA_TEAM_CLASSES)
-    # TDM has no list of its own in retail: it uses DEFAULT_TEAM_CLASSES
-    # (alias A93 = Soldier, Scout, Engineer, Miner, Specialist, Medic, in that
-    # card order), which has no Rocketeer; the retail lobby lists the same six
-    # (gameRulesPanel.py:181-188).  So TDM falls through to the default.
+    if code == 'tdm':
+        # Retail TDM uses DEFAULT_TEAM_CLASSES (alias A93, no Rocketeer);
+        # BattleSpades TDM keeps offering the Rocketeer and its Glider pack
+        # (restored 2026-10-01 after 68c36ca dropped it).
+        from server.class_data import BATTLESPADES_TEAM_CLASSES
+        return BATTLESPADES_TEAM_CLASSES
     if code == 'zom':
         # Zombie mode has asymmetric class menus.  This union is used by
         # InitialInfo.disabled_classes; ZombieMode.configure_state_data splits
         # it into survivor and infected lists for the two teams.  Survivors
-        # use the stock DEFAULT_TEAM_CLASSES (no Rocketeer).  Fast/Jump
+        # use the BattleSpades roster (stock six plus Rocketeer).  Fast/Jump
         # Zombie have no ordinary class-picker icons in this retail build, so
         # exposing them here crashes selectClass.py instead of adding choices.
-        survivors = tuple(int(x) for x in C.DEFAULT_TEAM_CLASSES)
+        from server.class_data import BATTLESPADES_TEAM_CLASSES
+        survivors = BATTLESPADES_TEAM_CLASSES
         return tuple(dict.fromkeys(survivors + (int(C.CLASS_ZOMBIE),)))
     if code == 'ugc':
         return tuple(int(x) for x in C.UGC_TEAM_CLASSES)

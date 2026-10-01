@@ -141,6 +141,18 @@ block the stock client executes), the renamed decompile and our
 | Zombie survivor classes | `DEFAULT_TEAM_CLASSES` | + Rocketeer, sorted by id | the stock six in stock order (`modes/zombie.py`); the zombie team stays `[4]` (Fast/Jump Zombie have no picker icon) |
 | Bot classes | - | drew from the seven incl. Rocketeer in every mode | `DEFAULT_TEAM_CLASSES`, filtered by `is_class_selectable` (operator class rules + the mode list) like a human pick |
 
+**Rocketeer restored (2026-10-01, by request).** The three class-list rows
+above (68c36ca) removed the Rocketeer, the class with the Glide (67) and Jump
+(66) packs, from BattleSpades TDM, the Zombie survivors and bot picks. Players
+asked for it back, so those three now use `BATTLESPADES_TEAM_CLASSES`
+(`server/class_data.py`): the stock six in stock card order plus the
+Rocketeer in card 5 (the order of the named `CLASS.DEFAULT_TEAM_CLASSES`).
+Other ordinary modes (CTF, Demolition, ...) keep the stock six, exactly as
+before 68c36ca. `RULE_ENABLE_CLASS_ROCKETEER` still switches it off; its
+default loadout is SMG + Glider, with the Jump pack as the equipment
+alternative. Tests: `tests/test_rocketeer_restore.py`, `test_mode_data.py`,
+`test_zombie.py`.
+
 Every other class matched on every slot (Soldier, Scout, Rocketeer, Miner,
 Zombie x3, Classic Soldier, Gangsters/VIPs, UGC Builder, Specialist, Medic).
 Rocketeer itself is unchanged and still selectable where a mode or operator

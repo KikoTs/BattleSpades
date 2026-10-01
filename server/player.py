@@ -14,7 +14,7 @@ from typing import Optional, Tuple, TYPE_CHECKING
 
 import shared.constants as C
 from server import action_clock, anticheat, conduct
-from server.flight_profile import profile_for
+from server.flight_profile import apply_mover_tuning, canopy_vz_step, profile_for
 from server.lag_compensation import record_player as _record_lag_history
 from server.lag_compensation import shooter_rtt_ms as _shooter_rtt_ms
 from server.deployable_inventory import (
@@ -206,6 +206,10 @@ ORIENTED_STOCK_AMMO: dict[int, tuple[int, int, int, int, int]] = {
 # Gun reload vs. a shot that arrives just before the server's own reload
 # timer (retail Character.end_reload runs on the client's clock). A shot this
 # close to the end of the current cycle completes that cycle first.
+# Arrival jitter admitted against an oriented tool's shoot_interval. Retail
+# fires launchers continuously while LMB is held (Character.update_weapon), so
+# back-to-back packets arrive exactly one interval apart on the client clock.
+ORIENTED_CADENCE_GRACE = 0.05
 RELOAD_FIRE_GRACE_SECONDS = 0.1
 RELOAD_FIRE_GRACE_FRACTION = 0.1
 # Input consumption (see Player.simulate_tick): at most one physics step per
@@ -907,6 +911,9 @@ class Player:
             world_object.parachute_active = bool(
                 self._parachute_physics_active
             )
+            # Negotiated (BSFP v2) Engineer flight speed and canopy descent;
+            # stock owners, v1 natives and bots keep the world.pyd literals.
+            apply_mover_tuning(world_object, profile_for(self))
         except Exception:
             pass
         if collisions is None:
@@ -1996,6 +2003,15 @@ class Player:
             return False
 
         current_time = time.monotonic() if now is None else now
+        if self.tool_is_raw and int(self.tool) not in WEAPON_PROFILES:
+            # A launcher (RPGWeapon & co.) is a stock Weapon, so its
+            # Character.reload sends WeaponReload like any gun. WEAPON_TOOL_IDS
+            # lists it, but its rounds live in oriented_stock and its clip is
+            # inferred from time (_launcher_clip_left). get_weapon_profile()
+            # would fall back to the last-held GUN and start THAT reload,
+            # moving gun reserve into the server's gun clip behind the
+            # client's back. Only acknowledge the request for relay.
+            return self.launcher_reload_relayable(current_time)
         profile = self.get_weapon_profile()
         if self.reloading:
             self._advance_reload(current_time)
@@ -2630,7 +2646,10 @@ class Player:
         self.grenades = stock.get(int(C.GRENADE_TOOL), self.grenades)
 
     # Retail launchers with a clip: an emptied clip auto-reloads before the
-    # next round. UGC editor launchers are deliberately excluded.
+    # next round. UGCDrillgunWeapon reloads like the drill (its
+    # get_ammo_after_reload returns (1, 1), so only its reserve is endless);
+    # UGCRPG2Weapon never spends a round (use_an_ammo is `pass`) and is
+    # limited by its shoot_interval alone.
     _RELOADING_LAUNCHERS = frozenset(
         int(getattr(C, name))
         for name in (
@@ -2639,6 +2658,7 @@ class Player:
             "DRILLGUN_TOOL",
             "GRENADE_LAUNCHER_WEAPON_TOOL",
             "MINE_LAUNCHER_TOOL",
+            "UGC_DRILLGUN_TOOL",
         )
         if hasattr(C, name)
     )
@@ -2667,8 +2687,9 @@ class Player:
     def _launcher_clip_left(self, tool: int, current_time: float) -> Optional[int]:
         """Rounds the retail clip holds at ``current_time`` (None: no clip).
 
-        The server never sees WeaponReload for launchers, so a reload is
-        inferred from time: any gap long enough to reload refills the clip.
+        Launcher WeaponReload packets are only relayed (start_reload), so a
+        reload is inferred from time: any gap long enough to reload refills
+        the clip.
         This also covers a manual reload of a partly used RPG2 clip.
         """
         if tool not in self._RELOADING_LAUNCHERS or bool(
@@ -2698,6 +2719,31 @@ class Player:
             return min(clip, int(left) + cycles)
         return clip
 
+    def launcher_reload_relayable(self, now: Optional[float] = None) -> bool:
+        """Whether a WeaponReload for the held launcher is a stock reload.
+
+        Stock ``Character.reload`` only runs while ``Weapon.is_reloadable``:
+        room in the clip and a round left in the reserve. The server's clip
+        model is time-inferred, so this only gates the relay of the reload
+        sound to other clients; no server state changes.
+        """
+        tool = int(getattr(self, "tool", -1))
+        if tool not in self._RELOADING_LAUNCHERS or not self.tool_is_raw:
+            return False
+        current_time = time.monotonic() if now is None else float(now)
+        timing = self._launcher_timing(tool)
+        clip_left = self._launcher_clip_left(tool, current_time)
+        if timing is None or clip_left is None:
+            return False
+        clip = int(timing[0])
+        stock = getattr(self, "oriented_stock", None)
+        if not isinstance(stock, dict):
+            return False
+        if tool not in stock:
+            # UGC drill: an endless reserve (get_ammo_after_reload (1, 1)).
+            return int(clip_left) < clip
+        return int(clip_left) < clip and int(stock[tool]) > int(clip_left)
+
     def can_use_oriented_item(
         self,
         tool: int,
@@ -2715,7 +2761,7 @@ class Player:
         current_time = time.monotonic() if now is None else float(now)
         if tool in (int(C.DYNAMITE_TOOL), int(C.LANDMINE_TOOL)):
             return deployable_ready(self, tool, current_time)
-        if current_time + FIRE_RATE_GRACE < self._oriented_next_use.get(tool, 0.0):
+        if current_time + ORIENTED_CADENCE_GRACE < self._oriented_next_use.get(tool, 0.0):
             return False
         if self._launcher_clip_left(tool, current_time) == 0:
             # The clip is empty and no reload fits since the emptying shot:
@@ -2791,7 +2837,11 @@ class Player:
         from server.game_constants import WEAPON_CATALOG
         profile = WEAPON_CATALOG.get(tool)
         interval = float(profile.fire_interval) if profile is not None else 0.0
-        self._oriented_next_use[tool] = current_time + max(0.0, interval)
+        # Schedule from the earlier due time when a held trigger's packet
+        # arrives inside the jitter grace, so the grace never raises the
+        # sustained rate above one round per shoot_interval.
+        previous_due = float(self._oriented_next_use.get(tool, 0.0))
+        self._oriented_next_use[tool] = max(current_time, previous_due) + max(0.0, interval)
         return True
 
     def set_tool(self, tool: int, raw: Optional[bool] = None):
@@ -3696,8 +3746,10 @@ class Player:
         dt = float(dt) if dt and dt > 0.0 else 1.0 / 60.0
         if gravity <= 0.0:
             return 0
-        factor = 0.05000000074505806 if physics_active else 1.0
-        landing_speed = (float(pre_vz) + dt * gravity * factor) / (1.0 + dt)
+        if physics_active:
+            landing_speed = canopy_vz_step(float(pre_vz), dt, gravity, profile_for(self))
+        else:
+            landing_speed = (float(pre_vz) + dt * gravity) / (1.0 + dt)
         if landing_speed <= 0.0:
             return 0
         # Same recurrence as the native mover's free fall from rest; the

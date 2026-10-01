@@ -17,6 +17,7 @@ from modes.zombie import (  # noqa: E402
 )
 from server.builders.initial_info import build_initial_info  # noqa: E402
 from server.builders.state_data import build_state_data  # noqa: E402
+from server.class_data import BATTLESPADES_TEAM_CLASSES  # noqa: E402
 from server.class_selection import normalize_class_selection  # noqa: E402
 from server.config import ServerConfig  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
@@ -136,14 +137,14 @@ def test_zombie_mode_is_registered_with_asymmetric_native_snapshot():
     assert state.team1_name == "ZOMBIE_TEAM"
     assert state.team2_name == "SURVIVOR_TEAM"
     assert state.team1_classes == [int(C.CLASS_ZOMBIE)]
-    assert state.team2_classes == [int(x) for x in C.DEFAULT_TEAM_CLASSES]
-    assert int(C.CLASS_ROCKETEER) not in state.team2_classes
+    assert state.team2_classes == list(BATTLESPADES_TEAM_CLASSES)
+    assert int(C.CLASS_ROCKETEER) in state.team2_classes
     assert state.team1_locked is True
     assert state.team1_locked_class is True
     assert state.lock_team_swap is True
     assert info.friendly_fire == 0
     assert info.exposed_teams_always_on_minimap == 1
-    assert int(C.CLASS_ROCKETEER) in info.disabled_classes
+    assert int(C.CLASS_ROCKETEER) not in info.disabled_classes
     assert int(C.CLASS_ZOMBIE) not in info.disabled_classes
     assert int(C.CLASS_FAST_ZOMBIE) in info.disabled_classes
     assert int(C.CLASS_JUMP_ZOMBIE) in info.disabled_classes

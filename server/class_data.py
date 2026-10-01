@@ -46,6 +46,24 @@ CLASS_IDS: tuple[int, ...] = (
 )
 
 
+# BattleSpades ordinary combat roster: the stock DEFAULT_TEAM_CLASSES (alias
+# A93: Soldier, Scout, Engineer, Miner, Specialist, Medic) plus the Rocketeer
+# with its Glide (67) / Jump (66) packs, in the card order of the named
+# ``CLASS.DEFAULT_TEAM_CLASSES`` list (shared/constants.py). Retail hid the
+# Rocketeer; BattleSpades TDM and Zombie survivors offered it until 68c36ca
+# removed it, and it is back by request (2026-10-01). RULE_ENABLE_CLASS_ROCKETEER
+# still switches it off.
+BATTLESPADES_TEAM_CLASSES: tuple[int, ...] = (
+    int(C.CLASS_SOLDIER),
+    int(C.CLASS_SCOUT),
+    int(C.CLASS_ENGINEER),
+    int(C.CLASS_MINER),
+    int(C.CLASS_ROCKETEER),
+    int(C.CLASS_SPECIALIST),
+    int(C.CLASS_MEDIC),
+)
+
+
 # Wire order for the InitialInfo.movement_speed_multipliers list. Verified
 # empirically from the original server's hardcoded array: SOLDIER, SCOUT,
 # ROCKETEER, ENGINEER, MINER, ZOMBIE, CLASSIC_SOLDIER, GANGSTER_1..4,
