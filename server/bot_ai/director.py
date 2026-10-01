@@ -388,7 +388,11 @@ class BotDirector:
                 ),
             )
         self.gateway = BotActionGateway(server)
-        self.profile_factory = ProfileFactory(seed=seed)
+        self.profile_factory = ProfileFactory(
+            seed=seed,
+            # Leave room for the [bots] name_prefix label inside 15 bytes.
+            max_name_length=15 - len(str(getattr(config, "name_prefix", "") or "")),
+        )
         self.banter = BotBanter(seed=seed)
         self._rng = random.Random(seed)
         self.bots: list[Player] = []
@@ -730,9 +734,16 @@ class BotDirector:
             )
 
         connection = _BotConnection(self.server)
+        from server.player_names import allocate_bot_display_name
+
         player = Player(
             player_id,
-            profile.name,
+            # "[BOT]Name": the label every client, retail included, shows.
+            allocate_bot_display_name(
+                profile.name,
+                str(getattr(self._config, "name_prefix", "") or ""),
+                self.server.players.values(),
+            ),
             selected_team,
             DEFAULT_WEAPON_TOOL,
             connection,
@@ -823,33 +834,112 @@ class BotDirector:
             return False
         if not force and not self._safe_to_retire(bot):
             return False
-        runtime = self._runtime.pop(int(bot.id), None)
-        self._pending_gateway_actions.pop(int(bot.id), None)
+        player_id = int(bot.id)
+        runtime = self._runtime.pop(player_id, None)
+        self._pending_gateway_actions.pop(player_id, None)
         self.bots.remove(bot)
         self.server.round_lifecycle.forget_player(bot)
         if bot.team in self.server.teams:
             self.server.teams[bot.team].remove_player(bot)
-        self.server.players.pop(bot.id, None)
+        # The id stays unavailable until PlayerLeft is out. The mode hook
+        # below may yield; a bot backfilled (or a human slot claimed) on this
+        # id in that window would otherwise be created on every client and
+        # then deleted again by this bot's late PlayerLeft.
+        reserved_ids = getattr(self.server, "reserved_player_ids", None)
+        hold_id = isinstance(reserved_ids, set) and player_id not in reserved_ids
+        if hold_id:
+            reserved_ids.add(player_id)
+        if self.server.players.get(player_id) is bot:
+            self.server.players.pop(player_id, None)
         connection = getattr(bot, "connection", None)
         if connection is not None:
             connection.in_game = False
 
-        # The mode's leave hook (intel/bomb/diamond drops, VIP loss) sends
-        # packets naming this player, so it must run while every client still
-        # knows the id; PlayerLeft goes out last, as for departing humans.
-        if notify_mode and self.server.mode is not None:
-            try:
-                await self.server.mode.on_player_leave(bot)
-            except Exception:  # noqa: BLE001 - the slot must still be freed
-                logger.exception("Mode leave hook failed for bot %s", bot.name)
-        packet = PlayerLeft()
-        packet.player_id = int(bot.id)
-        self.server.broadcast(bytes(packet.generate()))
+        try:
+            # The mode's leave hook (intel/bomb/diamond drops, VIP loss) sends
+            # packets naming this player, so it must run while every client
+            # still knows the id; PlayerLeft goes out last, as for humans.
+            if notify_mode and self.server.mode is not None:
+                try:
+                    await self.server.mode.on_player_leave(bot)
+                except Exception:  # noqa: BLE001 - the slot must still be freed
+                    logger.exception("Mode leave hook failed for bot %s", bot.name)
+            self._announce_bot_left(player_id)
+        finally:
+            if hold_id:
+                reserved_ids.discard(player_id)
         if runtime is not None:
             self.profile_factory.release_name(runtime.profile.name)
         self.banter.forget(int(bot.id))
         logger.info("Bot retired: %s id=%s", bot.name, bot.id)
         return True
+
+    def _announce_bot_left(self, player_id: int) -> None:
+        """Send PlayerLeft exactly like a departing human's.
+
+        Only peers whose roster ledger holds the id get it: a bot that was
+        dead while a peer joined was never created there, and the retail
+        roster handler raises on PlayerLeft for an unknown id. The id is then
+        forgotten so a later occupant of the number starts from a clean
+        ledger; peers still loading keep the entry and catch-up retires it.
+        """
+
+        packet = PlayerLeft()
+        packet.player_id = int(player_id)
+        data = bytes(packet.generate())
+        if callable(getattr(self.server, "broadcast_known_player_packet", None)):
+            self.server.broadcast(data, known_player_id=int(player_id))
+        else:
+            self.server.broadcast(data)
+        forget = getattr(self.server, "_forget_departed_player_id", None)
+        if callable(forget):
+            forget(int(player_id))
+
+    def _runtime_is_live(self, runtime: _RuntimeBot) -> bool:
+        """Whether ``runtime`` still drives the registered occupant of its id.
+
+        Intents and actions are keyed by (id, generation). Requiring the very
+        Player object in ``server.players`` as well means a bot whose slot was
+        taken over by anyone else can never steer, shoot or build under that
+        id, even if some lifecycle path freed the slot without remove_bot.
+        """
+
+        player = runtime.player
+        try:
+            player_id = int(player.id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return (
+            self.server.players.get(player_id) is player
+            and bool(getattr(player, "is_bot", False))
+            and int(getattr(player, "bot_generation", -1)) == int(runtime.generation)
+        )
+
+    def _retire_orphaned_runtimes(self) -> None:
+        """Drop controllers whose bot no longer owns its slot.
+
+        No PlayerLeft is sent: the id now belongs to someone else (or to no
+        one, and whoever freed it already announced the departure).
+        """
+
+        orphaned = [
+            (player_id, runtime)
+            for player_id, runtime in self._runtime.items()
+            if not self._runtime_is_live(runtime)
+        ]
+        for player_id, runtime in orphaned:
+            self._runtime.pop(player_id, None)
+            self._pending_gateway_actions.pop(player_id, None)
+            if runtime.player in self.bots:
+                self.bots.remove(runtime.player)
+            self.profile_factory.release_name(runtime.profile.name)
+            self.banter.forget(int(player_id))
+            logger.warning(
+                "Bot controller for %s id=%s generation=%s lost its slot; retired",
+                getattr(runtime.player, "name", "?"),
+                player_id,
+                runtime.generation,
+            )
 
     async def update(self, dt: float) -> None:
         """Drain intentions, publish staggered frames, and run cheap motors."""
@@ -857,6 +947,7 @@ class BotDirector:
         if not self._started or self._reconnect_count is not None:
             return
         now = time.monotonic()
+        self._retire_orphaned_runtimes()
         self._refresh_epochs()
         # Population work is a one-Hz policy. Avoid creating/awaiting a
         # coroutine on the other 59 fixed ticks each second.
@@ -926,7 +1017,7 @@ class BotDirector:
     def on_player_killed(self, victim: "Player", killer: "Player | None", kill_type: int) -> None:
         """Let talkative bots react to a kill the whole server just saw."""
 
-        if not bool(getattr(self._config, "chatter", True)) or killer is None:
+        if not bool(getattr(self._config, "chatter", False)) or killer is None:
             return
         if int(getattr(victim, "team", -1)) == int(getattr(killer, "team", -2)) and victim is not killer:
             return  # team changes and friendly accidents are not banter
@@ -945,11 +1036,11 @@ class BotDirector:
     def on_match_phase(self, kind: str, *, delay: float = 0.0) -> None:
         """``start``/``end`` courtesy lines; queued lines die with a retired roster."""
 
-        if bool(getattr(self._config, "chatter", True)) and self._started:
+        if bool(getattr(self._config, "chatter", False)) and self._started:
             self.banter.on_phase(time.monotonic() + max(0.0, float(delay)), str(kind))
 
     def _release_banter(self, now: float) -> None:
-        if not bool(getattr(self._config, "chatter", True)):
+        if not bool(getattr(self._config, "chatter", False)):
             return
         busy = frozenset(player_id for player_id, runtime in self._runtime.items()
                          if runtime.player.alive and now - runtime.lock_confirmed_at < 3.0)
@@ -1693,6 +1784,7 @@ class BotDirector:
             ("ctf", self._objectives_ctf),
             ("team_anchor", self._objectives_team_anchors),
             ("zombie_refuge", self._objectives_zombie_refuge),
+            ("zombie_order", self._objectives_zombie_horde),
             ("vip", self._objectives_vip),
             ("last_survivor", self._objectives_last_survivor),
         ):
@@ -1941,6 +2033,20 @@ class BotDirector:
             ))
         return result
 
+    def _objectives_zombie_horde(self, mode) -> list[ObjectiveSnapshot]:
+        """Per-zombie horde orders (target spread, collapse sieges, unstick).
+
+        Lives in ``zombie_siege.ZombieSiegeService``; bounded and fail-safe.
+        """
+        if not hasattr(mode, "_living_survivors"):
+            return []
+        service = getattr(self, "_zombie_siege", None)
+        if service is None:
+            from .zombie_siege import ZombieSiegeService
+
+            service = self._zombie_siege = ZombieSiegeService()
+        return service.objectives(mode, self.server.world_manager)
+
     def _objectives_zombie_refuge(self, mode) -> list[ObjectiveSnapshot]:
         refuge = self._zombie_refuge_objective(mode)
         return [refuge] if refuge is not None else []
@@ -2006,7 +2112,7 @@ class BotDirector:
     def _drain_intents(self, now: float) -> None:
         for intent in self.supervisor.drain_intents(limit=12):
             runtime = self._runtime.get(int(intent.bot_id))
-            if runtime is None:
+            if runtime is None or not self._runtime_is_live(runtime):
                 continue
             if (
                 intent.bot_generation != runtime.generation
@@ -2920,6 +3026,7 @@ class BotDirector:
             if (
                 runtime is None
                 or int(runtime.generation) != int(generation)
+                or not self._runtime_is_live(runtime)
                 or runtime.pending_action is not action
                 or not runtime.player.alive
                 or not runtime.player.spawned

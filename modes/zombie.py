@@ -538,6 +538,17 @@ class ZombieMode(BaseMode):
         packet.team2_classes = list(_SURVIVOR_CLASS_ORDER)
         packet.team1_locked = self.phase is not ZombiePhase.ACTIVE
         packet.team2_locked = self.phase is ZombiePhase.ACTIVE
+        # The Zombie team sees every survivor on the minimap and big map.
+        # Retail Player.get_map_icon (player.pyd 0x10013140, player.pyx:486-489)
+        # returns no marker for an enemy unless viewer.team.can_see_other_team,
+        # and only then reaches the survivor-heart branch (:500-503). The only
+        # sources of that flag are this StateData bit (GameScene
+        # .process_packet_state_data, gameScene.pyd 0x1023E340) and
+        # TeamMapVisibility(83). ``exposed_teams_always_on_minimap`` alone
+        # only edge-pins markers that are already visible (:532-535), so
+        # without this bit a stock client drew no survivors for zombies.
+        packet.team1_can_see_team2 = True
+        packet.team2_can_see_team1 = False
         packet.lock_team_swap = True
         # One stable class bypasses the ordinary class picker.  Fast/Jump
         # Zombie lack picker icons in this client and are intentionally hidden.
@@ -560,12 +571,13 @@ class ZombieMode(BaseMode):
     def configure_initial_info(self, packet) -> None:
         """Force role-safe combat and expose the opposing infection roster.
 
-        Retail ``Player.display_map_icon_out_of_bounds`` reads
-        ``exposed_teams_always_on_minimap`` as its ordinary enemy-marker
-        fallback.  This is distinct from ``high_minimap_visibility``, whose
-        VIP icon is reserved below for the final survivor.  Enabling the
-        former restores the report's missing survivor highlight without
-        turning every survivor into a VIP on the Tab list.
+        Retail ``Player.display_map_icon_out_of_bounds`` (player.pyx:532-535)
+        edge-pins an enemy marker when ``exposed_teams_always_on_minimap`` is
+        on and the viewing team can see the other team.  It reveals nobody by
+        itself: visibility is the StateData ``team1_can_see_team2`` bit set
+        in ``configure_state_data``.  This is distinct from
+        ``high_minimap_visibility``, whose VIP icon is reserved for the final
+        survivor.
         """
         packet.friendly_fire = 0
         packet.exposed_teams_always_on_minimap = 1

@@ -109,7 +109,9 @@ def test_departed_vip_gets_no_marker_packets():
     asyncio.run(mode.on_player_leave(blue_vip))
     mode._clear_vip_markers()
 
-    assert mode.vip_alive[TEAM1] is False
+    # The crown moved to the remaining blue player; the departed id hears
+    # nothing.
+    assert mode.vips[TEAM1] is not blue_vip
     assert not [
         packet for packet in _visibility_packets(server.packets)
         if packet.player_id == blue_vip.id

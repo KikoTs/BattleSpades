@@ -112,8 +112,11 @@ _BANDS = {
 class ProfileFactory:
     """Create reproducible profiles while guaranteeing unique wire names."""
 
-    def __init__(self, seed: int = 0) -> None:
+    def __init__(self, seed: int = 0, max_name_length: int = 15) -> None:
         self._rng = random.Random(int(seed))
+        # Bytes left for the bare name once the [bots] name_prefix label is
+        # added; never below the retail minimum of 3.
+        self._max_name_length = max(3, min(15, int(max_name_length)))
         # Names come from their own stream so the nickname catalog can grow
         # without moving any seeded personality trait (replay fixtures).
         self._name_rng = random.Random(int(seed) * 7919 + 0x6E616D65)
@@ -177,16 +180,19 @@ class ProfileFactory:
         """Generate an ASCII name fitting the retail 3..15 byte field."""
 
         legacy = self._burn_legacy_name_draws()
+        limit = self._max_name_length
         for _ in range(512):
-            candidate = self._styled_name()[:15]
+            candidate = self._styled_name()
+            if len(candidate) > limit:
+                continue  # never show a truncated name next to the bot label
             key = candidate.casefold()
-            if 3 <= len(candidate) <= 15 and candidate.isascii() and key not in self._used_names:
+            if 3 <= len(candidate) <= limit and candidate.isascii() and key not in self._used_names:
                 self._used_names.add(key)
                 self._legacy_for[key] = legacy
                 return candidate
         # Deterministic bounded fallback if the catalog is somehow exhausted.
         index = len(self._used_names)
-        candidate = f"Player{index:04d}"[:15]
+        candidate = f"Bot{index:04d}"[: self._max_name_length]
         self._used_names.add(candidate.casefold())
         return candidate
 

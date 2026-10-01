@@ -76,6 +76,13 @@ fleet `match_length_minutes`: TDM, Demolition, Diamond Mine, Occupation and
 VIP 15 min; CTF 30 min; Classic CTF 90 min; Multi-Hill and TC 25 min; Zombie
 10 min.
 
+The retail HUD prints the countdown as `gmtime` minutes and seconds with no
+hour field, so a clock above one hour (Classic CTF, the lobby's 90-minute
+option) used to show 30:00, reach 00:00 an hour early and wrap to 59:59.
+`scoreboard.send_round_timer` holds DisplayCountdown(84) at 59:59 until the
+last hour; the round length is unchanged and 00:00 always means the round
+has ended.
+
 ### Team Deathmatch
 
 | Setting | Retail | Ours | Status |

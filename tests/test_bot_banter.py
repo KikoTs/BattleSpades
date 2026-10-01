@@ -72,13 +72,14 @@ def test_forgetting_a_bot_cancels_its_queued_line():
     assert banter.due(60.) == []
 
 
-def _director():
+def _director(chatter: bool = True):
     from types import SimpleNamespace
     import shared.constants as C
     from server.bot_ai.director import BotDirector
     from tests.test_equipment_handlers import _server_player
 
     server, killer, _ = _server_player(C.MINIGUN_TOOL, [C.MINIGUN_TOOL])
+    server.config.bots.chatter = chatter
     sent = []
     server.broadcast = lambda data, **_kwargs: sent.append(bytes(data))
     director = BotDirector(server, supervisor=SimpleNamespace())
@@ -124,3 +125,25 @@ def test_chatter_switch_and_team_kills_stay_silent():
     director.on_player_killed(victim, killer, int(C.WEAPON_KILL))
     director._release_banter(time.monotonic() + 6.)
     assert sent == []
+
+
+def test_bot_chat_is_off_by_default():
+    import time
+    import shared.constants as C
+    from server.config import BotConfig, ServerConfig
+
+    assert BotConfig().chatter is False
+    assert ServerConfig().bots.chatter is False
+    director, server, killer, victim, sent = _director(chatter=False)
+    director.on_player_killed(victim, killer, int(C.WEAPON_KILL))
+    director.on_match_phase("start")
+    director._release_banter(time.monotonic() + 60.)
+    assert sent == []
+
+
+def test_shipped_config_keeps_bots_quiet():
+    from pathlib import Path
+    from server.config import load_config
+
+    config = load_config(Path(__file__).resolve().parents[1] / "config.toml")
+    assert config.bots.chatter is False

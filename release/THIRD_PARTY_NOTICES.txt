@@ -13,6 +13,15 @@ py_trees 2.5.0 (BSD-3-Clause), pydot and pyparsing (MIT), pyenet 1.3.17
 (BSD-3-Clause), ENet 1.3.17 (MIT) and Recast/Detour 1.6.0 (Zlib). Full texts
 for the compiled-in components follow.
 
+The BattleSpadesServer window additionally ships Tcl/Tk 8.6 from CPython
+(Tcl/Tk license, BSD-style), CustomTkinter 5.2.2 (MIT, Copyright (c) 2023
+Tom Schimansky), darkdetect 0.8.0 (BSD-3-Clause, Copyright (c) 2019 Alberto
+Sottile), packaging 25.0 (Apache-2.0 or BSD-2-Clause) and tomlkit 0.13.2
+(MIT). Its heading font, Barlow Condensed (Copyright 2017 The Barlow Project
+Authors), is licensed under the SIL Open Font License 1.1; the full licence is
+in _internal/server_gui/fonts/OFL.txt. The window's icon and artwork are
+original to BattleSpades and contain no Ace of Spades game art.
+
 Valve Steam runtime files are not part of BattleSpades archives. Optional
 master-server registration loads only operator-supplied copies at runtime.
 

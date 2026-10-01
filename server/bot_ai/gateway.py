@@ -66,6 +66,8 @@ class BotActionGateway:
 
         if not bool(getattr(player, "is_bot", False)):
             return False
+        if not self.owns_live_slot(player):
+            return False
         if not bool(getattr(player, "alive", False)) or not bool(
             getattr(player, "spawned", False)
         ):
@@ -83,6 +85,24 @@ class BotActionGateway:
                 getattr(getattr(action, "kind", None), "value", "unknown"),
                 getattr(action, "tool_id", -1),
             )
+            return False
+
+    def owns_live_slot(self, player: "Player") -> bool:
+        """Whether ``player`` is still the registered occupant of its id.
+
+        Player ids are reused. An action naming a bot whose slot now belongs
+        to another Player (a human who joined after a retirement, or the next
+        bot generation) would replicate shots, tool changes and builds under
+        that other player's id on every client. Doubles without a roster keep
+        the historical contract.
+        """
+
+        players = getattr(self.server, "players", None)
+        if not isinstance(players, dict):
+            return True
+        try:
+            return players.get(int(player.id)) is player
+        except (AttributeError, TypeError, ValueError):
             return False
 
     def _execute_validated(self, player: "Player", action: BotAction) -> bool:
@@ -151,6 +171,7 @@ class BotActionGateway:
             x, y, z = (int(round(value)) for value in action.position)
         except (TypeError, ValueError):
             return False
+        self._apply_palette(player, action.argument)
         construction = getattr(self.server, "construction", None)
         reservation = None
         if construction is not None and not self._objective_repair(player, (x, y, z)):
@@ -170,6 +191,42 @@ class BotActionGateway:
         # Accepted block mutations can commit after physics; the short TTL
         # keeps the cell reserved until the normal mutation service catches up.
         return accepted
+
+    def _apply_palette(self, player: "Player", argument: str) -> None:
+        """Optional schematic colour ``rgb:RRGGBB``: a palette pick, like SetColor.
+
+        Commits the colour the next placement uses and relays it to peers
+        exactly as the stock SetColor(11) handler does. Ignored when the
+        colour picker rule is off or the colour is already selected.
+        """
+
+        text = str(argument or "")
+        if not text.startswith("rgb:"):
+            return
+        try:
+            value = int(text[4:], 16) & 0xFFFFFF
+        except ValueError:
+            return
+        from server.game_rules import get_rules
+        if not get_rules(getattr(self.server, "config", None)).enabled(
+            "RULE_ENABLE_COLOUR_PICKER"
+        ):
+            return
+        try:
+            if int(getattr(player, "block_color", -1)) & 0xFFFFFF == value:
+                return
+        except (TypeError, ValueError):
+            pass
+        setter = getattr(player, "set_color", None)
+        if callable(setter):
+            setter(value)
+        else:
+            player.block_color = value
+        try:
+            from server.handlers.team import _relay_color
+            _relay_color(self.server, player)
+        except Exception:  # relay is cosmetic; never fail the placement
+            logger.debug("bot palette relay failed", exc_info=True)
 
     def _objective_repair(self, player: "Player", cell: tuple[int, int, int]) -> bool:
         """Is ``cell`` a destroyed block of this player's own Demolition base?
@@ -206,6 +263,7 @@ class BotActionGateway:
             return False
         if len(start) != 3 or len(end) != 3:
             return False
+        self._apply_palette(player, action.argument)
         combat = getattr(self.server, "combat", None)
         cell_provider = getattr(combat, "block_line_cells", None)
         if combat is None or not callable(cell_provider):

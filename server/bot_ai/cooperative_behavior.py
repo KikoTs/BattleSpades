@@ -16,18 +16,39 @@ from server.game_constants import WEAPON_PROFILES
 from .behavior_memory import BehaviorMemory
 from .combat_profiles import envelope_for
 from .messages import BotAction, BotActionKind, PerceptionFrame, PlayerSnapshot, Vector3
-from .policies import ModeBotDecision, mode_objective_committed
+from .policies import ModeBotDecision, ModeBotPosture, canonical_mode_id, mode_objective_committed
 from .project_sites import (
     ProjectSite, find_bridge_project, find_decorative_site,
     find_mine_approach, find_prefab_cover, find_rampart_segment,
     find_sniper_outpost,
 )
+from .schematics import get as get_schematic
+from .schematics.model import PALETTE, Placement, Schematic
+from .schematics.planner import (
+    PLAN_REACH, cell_centre, node_for_position, node_position, ray_clear, step_remaining,
+    walk_path,
+)
+from .schematics.sites import SchematicSite, SchematicSites, find_schematic_site, interior_columns
 from .simple_navigation import SimpleVoxelWorld
 from .team_tasks import Identity, TacticalOrder, TaskStage, TeamProject, TeamTasks
+
+# Optional schematic choice per purpose; the first feasible one is built.
+_DEFENSIVE_SCHEMATICS = ("sandbag_wall", "cover_wall", "corner_cover", "pillbox", "bunker")
+_OBJECTIVE_SCHEMATICS = ("objective_ring", "sandbag_wall", "cover_wall")
+_SNIPER_SCHEMATICS = ("sniper_nest", "watchtower")
+_GENERIC_SCHEMATICS = ("cover_wall", "sandbag_wall", "small_hut", "corner_cover")
 
 
 def identity(player: PlayerSnapshot) -> Identity:
     return player.player_id, player.generation, player.life_id
+
+
+def _mix(*values: int) -> float:
+    """Stable [0, 1) jitter from identities/time buckets (no global RNG)."""
+    acc = 0x811C9DC5
+    for value in values:
+        acc = ((acc ^ (int(value) & 0xFFFFFFFF)) * 0x01000193) & 0xFFFFFFFF
+    return (acc % 997) / 997.0
 
 
 def _reached_landing(player: PlayerSnapshot, landing: Vector3) -> bool:
@@ -63,6 +84,14 @@ class _Task:
     built_cells: tuple[tuple[int, int, int], ...] = ()
     source_entity_id: int = -1
     starting_supplies: tuple[int, ...] = ()
+    # Schematic construction: the shared site, the claimed plan step, the
+    # claimed stand and the earliest time the next placement may go out
+    # (tool switch / human pause between drags).
+    schematic_id: int = -1
+    step_index: int = -1
+    stand: Vector3 | None = None
+    ready_at: float = 0.0
+    waiting_since: float = 0.0
 
 
 @dataclass(slots=True)
@@ -83,6 +112,7 @@ class _Life:
     partner_anchor: Vector3 | None = None
     partner_heading: tuple[float, float] = (1.0, 0.0)
     partner_holding: bool = False
+    climb_order: TacticalOrder | None = None
 
 
 class CooperativeBehavior:
@@ -94,14 +124,19 @@ class CooperativeBehavior:
         self.lives: dict[tuple[int, int], _Life] = {}
         self.teams = TeamTasks()
         self.patients: dict[Identity, tuple[Identity, float]] = {}
+        self.sites = SchematicSites()
 
     def reset(self) -> None:
         self.lives.clear()
         self.patients.clear()
         self.teams = TeamTasks()
+        if self.epoch != (-1, -1):
+            # Sites requested before the first frame belong to that frame's map.
+            self.sites = SchematicSites()
 
     def forget(self, player_id: int, generation: int) -> None:
         life = self.lives.pop((player_id, generation), None)
+        self.sites.forget((player_id, generation))
         if life and life.task:
             self.teams.projects.pop(life.task.task_id, None)
         if life:
@@ -114,7 +149,11 @@ class CooperativeBehavior:
         now = float(frame.created_at)
         epoch = (frame.map_epoch, frame.mode_epoch)
         if self.epoch != epoch:
+            # Sites requested before the first frame belong to this epoch.
+            requested = self.sites if self.epoch == (-1, -1) else None
             self.reset()
+            if requested is not None:
+                self.sites = requested
             self.epoch = epoch
         key = (player.player_id, player.generation)
         life = self.lives.get(key)
@@ -126,7 +165,15 @@ class CooperativeBehavior:
         life.memory.observe(frame, player, visible)
         self._expire(frame, now)
         if not player.grounded or player.wade:
+            # Mid-jump on a stair/step the builder climbs: keep the same
+            # movement owner instead of handing a half-finished hop back to
+            # unrelated navigation.
+            order = life.climb_order
+            if (order is not None and not player.wade and life.task is not None
+                    and life.task.kind == "schematic" and life.task.task_id == order.task_id):
+                return order
             return None
+        life.climb_order = None
         allies = tuple(p for p in frame.players if p.alive and p.spawned and p.team == player.team)
         # Role urgency is not permission for optional construction/formation
         # to replace the mode's actual winning job.
@@ -144,8 +191,23 @@ class CooperativeBehavior:
             and life.task.site and math.dist(player.position, life.task.site.approach) <= 1.5)
         combat_interrupt = (combat_visible is not None and life.task is not None
                             and life.task.kind != "heal" and not defending)
-        objective_support = bool(critical and life.task and strategic is not None
-            and self._supports_objective(life.task, player, strategic, now))
+        # Schematic construction that serves the mode (a VIP shelter, a
+        # requested zombie stair, a ring at an objective a defender already
+        # holds) may run under a committed role; see _schematic_allowed.
+        building_ok = self._schematic_allowed(frame, player, strategic, life.task)
+        objective_support = bool(critical and life.task and (
+            life.task.kind == "schematic" and (building_ok or life.task.pending is not None
+                                               or self._site_finished(life.task))
+            or strategic is not None and self._supports_objective(life.task, player, strategic, now)))
+        if (life.task and life.task.kind == "schematic" and life.task.pending is None
+                and player.last_damage_at > 0 and 0 <= now - player.last_damage_at <= 1.0):
+            # Taking hits while building: stop and fight; repeated hits on the
+            # same site abandon it for the whole team.
+            site = self.sites.sites.get(life.task.schematic_id)
+            if site is not None:
+                self.sites.under_fire(site, now)
+            self._finish(life, now, False, "under_fire")
+            life.next_project = now + 6.0
         if life.task and (critical and not objective_support or danger and life.task.kind != "heal"
                           or combat_interrupt or self._live_hazard(frame, player)):
             self._finish(life, now, False, "combat_contact" if combat_interrupt else "urgent_interrupt")
@@ -163,7 +225,23 @@ class CooperativeBehavior:
             life.partner_holding = False
             life.partner_until = 0.0
             if life.task is not None:
-                return self._advance(frame, player, combat_visible, life, allies)
+                order = self._advance(frame, player, combat_visible, life, allies)
+                if order is not None or life.task is not None:
+                    return order
+            if building_ok and combat_visible is None and not self._live_hazard(frame, player):
+                sheltered = self._vip_shelter_hold(frame, player, strategic)
+                if sheltered is not None:
+                    return sheltered
+                if now >= life.next_project:
+                    task = self._schematic_task(frame, player, life, strategic, allies,
+                                                critical=True, lane=None)
+                    if task is not None:
+                        life.task = task
+                        self.teams.event("tasks_started", task.task_id, task.kind, now)
+                        return self._advance(frame, player, combat_visible, life, allies)
+                    # Nothing feasible here: site searches plan geometry, so
+                    # back off instead of re-planning every decision.
+                    life.next_project = now + 4.0
             if (strategic is not None and self._can_stop_for_supplies(strategic)
                     and combat_visible is None and now >= life.next_evaluate
                     and not self._live_hazard(frame, player)
@@ -274,6 +352,13 @@ class CooperativeBehavior:
             if score > .2:
                 candidates.append(_Task(task_id, "investigate", contact.position, contact.position,
                     now, min(contact.expires_at, now + 6), score, progress_at=now))
+        if (visible is None and now >= life.next_project and player.health >= 45
+                and not fortifying):
+            # Join a teammate's schematic, or (rarely, budgeted) start one.
+            schematic = self._schematic_task(frame, player, life, strategic, allies,
+                                             critical=False, lane=lane)
+            if schematic is not None:
+                candidates.append(schematic)
         if candidates:
             # Near ties use an identity/decision-stable preference, not global RNG.
             task = max(candidates[:4], key=lambda t: t.score +
@@ -462,6 +547,9 @@ class CooperativeBehavior:
             rejected = (player.last_action_request_id == action.request_id
                         and not player.last_task_accepted)
             if rejected:
+                if task.kind == "schematic":
+                    return self._schematic_step_result(life, task, False,
+                        player.last_action_reason or "rejected", now)
                 self._finish(life, now, False, player.last_action_reason or "rejected")
                 return None
             if task.action_site and task.action_site.cells:
@@ -472,6 +560,17 @@ class CooperativeBehavior:
                     and math.dist(e.position, action.position) < 4 for e in frame.entities)
             confirmed = confirmed and player.last_action_request_id == action.request_id and player.last_task_accepted
             if not confirmed:
+                if task.kind == "schematic":
+                    if now - task.sent_at > 3.5:
+                        return self._schematic_step_result(life, task, False,
+                                                           "confirmation_timeout", now)
+                    # Keep the latched placement alive until the director has
+                    # executed it (it deduplicates by request id); afterwards
+                    # just hold the aim while the world delta arrives.
+                    executed = player.last_action_request_id == action.request_id
+                    return TacticalOrder(task.task_id, "schematic_confirm", player.position,
+                                         action.position, BotAction() if executed else action,
+                                         hold=True, tool_id=int(C.BLOCK_TOOL))
                 if now - task.sent_at > 8:
                     self._finish(life, now, False, "confirmation_timeout")
                     return None
@@ -484,6 +583,8 @@ class CooperativeBehavior:
                 task.built_cells += task.action_site.cells
             task.progress_at = now
             self.teams.event("actions_confirmed", task.task_id, task.kind, now)
+            if task.kind == "schematic":
+                return self._schematic_step_result(life, task, True, "placed", now)
             if task.kind == "rampart":
                 self._finish(life, now, True, "rampart_built")
                 life.next_project = now + 2.5
@@ -497,6 +598,8 @@ class CooperativeBehavior:
             else:
                 task.phase = "occupy"
             task.stage = TaskStage.USE
+        if task.kind == "schematic":
+            return self._advance_schematic(frame, player, life, allies)
         if task.kind == "heal":
             patient = next((p for p in allies if identity(p) == task.patient), None)
             if patient is None:
@@ -743,6 +846,12 @@ class CooperativeBehavior:
             return
         life.memory.record(task.kind, task.goal, now, success)
         self.teams.event("tasks_completed" if success else "tasks_failed", task.task_id, reason, now)
+        if task.kind == "schematic":
+            site = self.sites.sites.get(task.schematic_id)
+            if site is not None and task.step_index >= 0:
+                self.sites.release(site, task.step_index, life.key)
+            if site is not None:
+                site.builders.pop(life.key, None)
         project = self.teams.projects.get(task.task_id)
         if success and project and task.kind in {"bridge", "breach"}:
             # Leave a short route-uptake lease after the builder advances.
@@ -879,9 +988,463 @@ class CooperativeBehavior:
                              else "join_player_push", goal, partner.eye, arrival_radius=2,
                              hold=life.partner_holding)
 
+    # --- schematic construction -------------------------------------------------
+
+    def request_schematic(self, team: int, schematic: Schematic | Placement | str,
+                          anchor: Vector3, now: float, *,
+                          facing: tuple[float, float] = (1.0, 0.0),
+                          rotation: int | None = None, exact: bool = True,
+                          builders: tuple[int, ...] = (), priority: float = 0.95,
+                          ttl: float = 90.0, requester: str = "strategy",
+                          purpose: str = "") -> SchematicSite | None:
+        """Strategy API: have the team's bots build a schematic/structure.
+
+        Returns the registered site (``site.site_id`` for status/cancel) or
+        ``None`` when no feasible support-ordered, reachable plan exists.
+        """
+
+        return self.sites.request(self.world.solid, int(team), schematic, anchor, float(now),
+                                  facing=facing, rotation=rotation, exact=exact,
+                                  purpose=purpose, requester=requester or "strategy",
+                                  builders=builders, priority=priority, ttl=ttl)
+
+    def cancel_schematic(self, site_id: int) -> None:
+        self.sites.cancel(int(site_id))
+
+    def schematic_status(self, site_id: int) -> dict[str, object] | None:
+        site = self.sites.sites.get(int(site_id))
+        return site.status(self.world.solid) if site is not None else None
+
+    def _site_finished(self, task: _Task) -> bool:
+        site = self.sites.sites.get(task.schematic_id)
+        return site is not None and bool(site.completed_at)
+
+    @staticmethod
+    def _own_vip(frame: PerceptionFrame, player: PlayerSnapshot):
+        return next((o for o in frame.objectives if o.kind == "vip" and o.team == player.team), None)
+
+    def _schematic_allowed(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                           strategic: ModeBotDecision | None, task: _Task | None = None) -> bool:
+        """May this bot do schematic work despite a committed mode role?"""
+
+        if (player.carried_entity_id >= 0 or int(C.BLOCK_TOOL) not in player.loadout
+                or player.blocks < 2 or not player.grounded or player.wade):
+            return False
+        if self.sites.site_for(player.team, player.player_id, player.position,
+                               requested_only=True) is not None:
+            return True
+        if strategic is None:
+            return False
+        role = strategic.role
+        if canonical_mode_id(frame.mode_id) == "vip" and str(frame.mode_phase).lower() in {"active", ""}:
+            if role == "vip_rally":
+                return True  # the VIP itself, not recently hurt
+            if role == "vip_guard_formation":
+                vip = self._own_vip(frame, player)
+                return vip is not None and math.dist(vip.position, player.position) <= 24
+        if (strategic.posture is ModeBotPosture.DEFEND and strategic.directive != "fortify"
+                and frame.profile is not None and frame.profile.creativity >= .45):
+            # A defender that already holds its post may dig in there, and
+            # may walk around that post's site while building it.
+            if math.dist(player.position, strategic.position) <= strategic.arrival_radius + 3:
+                return True
+            site = (self.sites.sites.get(task.schematic_id)
+                    if task is not None and task.kind == "schematic" else None)
+            return (site is not None and site.active
+                    and math.dist(site.centre, strategic.position) <= strategic.arrival_radius + 8)
+        return False
+
+    def _vip_shelter_hold(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                          strategic: ModeBotDecision | None) -> TacticalOrder | None:
+        """A sheltered VIP stays in its finished box while it stands."""
+
+        if strategic is None or strategic.role != "vip_rally":
+            return None
+        for site in self.sites.sites.values():
+            if (site.team != player.team or site.purpose != "vip_shelter"
+                    or not site.completed_at or site.plan.placement.occupant is None):
+                continue
+            spot = site.plan.placement.occupant
+            if math.dist(spot, player.position) > 4:
+                continue
+            inside = (math.floor(player.position[0]), math.floor(player.position[1])) in interior_columns(
+                site.plan.placement)
+            cells = tuple(site.plan.placement.cells)
+            intact = sum(1 for cell in cells if self.world.solid(*cell))
+            if intact < .7 * len(cells):
+                return None
+            look = strategic.watch_position or next(
+                (o.position for o in frame.objectives if o.kind == "team_anchor" and o.team != player.team),
+                (spot[0] + site.plan.placement.forward[0] * 8, spot[1] + site.plan.placement.forward[1] * 8, spot[2]))
+            look = (look[0], look[1], player.eye[2])
+            holding = inside or math.dist(spot[:2], player.position[:2]) < .8
+            return TacticalOrder(0, "vip_sheltered", spot, look, arrival_radius=.6, hold=holding)
+        return None
+
+    def _keep_away(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                   ring_centre: Vector3 | None = None) -> tuple[tuple[Vector3, float], ...]:
+        points = []
+        for objective in frame.objectives[:16]:
+            if objective.kind in {"zombie_refuge", "zombie_order", "vip", "last_survivor"}:
+                continue
+            radius = 9.0 if objective.kind == "team_anchor" else 6.5
+            if ring_centre is not None and math.dist(objective.position, ring_centre) < 2:
+                radius = 3.0
+            points.append((objective.position, radius))
+        return tuple(points)
+
+    def _start_site(self, frame: PerceptionFrame, player: PlayerSnapshot, names: tuple[str, ...],
+                    centre: Vector3, facing: tuple[float, float], purpose: str, *,
+                    exact: bool = False, optional: bool = True, occupant: bool = False,
+                    requester: str = "", ring_centre: Vector3 | None = None) -> SchematicSite | None:
+        now = frame.created_at
+        if not self.sites.can_start(player.team, now, optional=optional, position=centre):
+            return None
+        bodies = tuple(p.position for p in frame.players[:48] if p.alive and p.spawned
+                       and math.dist(p.position, centre) < 20)
+        reserved = self._reserved_cells(player.team)
+        keep_away = self._keep_away(frame, player, ring_centre)
+        # At most two schematic searches per decision keep planning bounded.
+        start = (player.player_id + int(now / 7)) % max(1, len(names))
+        ordered = names[start:] + names[:start]
+        for name in ordered[:2]:
+            schematic = get_schematic(name)
+            if schematic is None or schematic.block_count > player.blocks * 2 + 40:
+                continue
+            choice = find_schematic_site(self.world.solid, schematic, centre, facing,
+                                         exact=exact, keep_away=keep_away, reserved=reserved,
+                                         bodies=bodies, occupant_body=player.position if occupant else None,
+                                         seed=player.player_id)
+            if choice is None:
+                continue
+            site = self.sites.create(player.team, choice.plan, purpose, identity(player), now,
+                                     optional=optional, requester=requester,
+                                     occupant=identity(player) if occupant else None)
+            if site is not None:
+                self.teams.event("schematic_sites_started", site.site_id, site.name, now)
+                return site
+        if optional:
+            # A failed search still spends the team's optional budget briefly.
+            self.sites.team_ready[player.team] = max(self.sites.team_ready.get(player.team, 0.0), now + 6.0)
+        return None
+
+    def _schematic_task(self, frame: PerceptionFrame, player: PlayerSnapshot, life: _Life,
+                        strategic: ModeBotDecision | None, allies: tuple[PlayerSnapshot, ...], *,
+                        critical: bool, lane: Vector3 | None) -> _Task | None:
+        """Join a team site, or start a mode-appropriate one (budgeted)."""
+
+        if int(C.BLOCK_TOOL) not in player.loadout or player.blocks < 2:
+            return None
+        now = frame.created_at
+        profile = frame.profile
+        teamwork = profile.teamwork if profile else .5
+        creativity = profile.creativity if profile else .5
+        role = strategic.role if strategic is not None else ""
+        site = self.sites.site_for(player.team, player.player_id, player.position, requested_only=True)
+        score = .92
+        vip_mode = canonical_mode_id(frame.mode_id) == "vip"
+        if site is None and vip_mode and role in {"vip_rally", "vip_guard_formation"}:
+            shelter = next((s for s in self.sites.active_sites(player.team) if s.purpose == "vip_shelter"), None)
+            if role == "vip_rally":
+                calm = player.last_damage_at <= 0 or now - player.last_damage_at > 6
+                if (shelter is None and calm and player.blocks >= 12
+                        and self._vip_can_shelter(frame, player)):
+                    facing = self._threat_facing(frame, player, strategic)
+                    shelter = self._start_site(frame, player, ("vip_shelter",), player.position,
+                                               facing, "vip_shelter", exact=True, optional=False,
+                                               occupant=True)
+                site = shelter if shelter is not None and math.dist(shelter.centre, player.position) <= 6 else None
+            else:
+                site = shelter
+                if site is None:
+                    done = next((s for s in self.sites.sites.values() if s.team == player.team
+                                 and s.purpose == "vip_shelter" and s.completed_at), None)
+                    barriers = sum(1 for s in self.sites.sites.values() if s.team == player.team
+                                   and s.purpose == "vip_barrier")
+                    if done is not None and barriers < 2 and math.dist(done.centre, player.position) <= 16:
+                        fx, fy = done.plan.placement.forward
+                        side = 1 if barriers == 0 else -1
+                        centre = (done.centre[0] + fx * 5 - fy * 3 * side,
+                                  done.centre[1] + fy * 5 + fx * 3 * side, done.centre[2])
+                        site = self._start_site(frame, player, ("sandbag_wall", "corner_cover"),
+                                                centre, (fx, fy), "vip_barrier", optional=False)
+            score = .95
+        if site is None and strategic is not None and critical and strategic.posture is ModeBotPosture.DEFEND:
+            site = self.sites.site_for(player.team, player.player_id, player.position)
+            if site is None and creativity >= .45 and player.blocks >= 20:
+                facing = self._threat_facing(frame, player, strategic)
+                objective = next((o for o in frame.objectives if o.team == player.team
+                                  and o.kind in {"ctf_intel", "mh_hill", "tc_territory", "oc"}
+                                  and math.dist(o.position, strategic.position) < 4), None)
+                if objective is not None and (player.player_id + int(now / 30)) % 2 == 0:
+                    site = self._start_site(frame, player, _OBJECTIVE_SCHEMATICS[:1], objective.position,
+                                            facing, "objective", exact=True,
+                                            ring_centre=objective.position)
+                if site is None:
+                    ahead = (player.position[0] + facing[0] * 3, player.position[1] + facing[1] * 3,
+                             player.position[2])
+                    site = self._start_site(frame, player, _DEFENSIVE_SCHEMATICS, ahead, facing, "defend")
+            score = .9
+        if site is None and not critical:
+            if teamwork >= .4:
+                site = self.sites.site_for(player.team, player.player_id, player.position)
+                score = .78 + teamwork * .1
+            holding = strategic is None or math.dist(player.position, strategic.position) <= strategic.arrival_radius + 4
+            threat = life.memory.contact(player.position, now) is not None or player.last_damage_at > 0 and now - player.last_damage_at < 30
+            if (site is None and lane is not None and creativity > .55 and player.blocks >= 30
+                    and holding and threat and self.sites.optional_started(player.team) < 6
+                    and frame.local_safety_complete and life.memory.pressure < .1
+                    and _mix(player.player_id, int(now / 20)) < .3):
+                facing = self._facing_to(player.position, lane)
+                has_sniper = any(tool in player.loadout for tool in (int(C.SNIPER_TOOL), int(C.SNIPER2_TOOL)))
+                names = _SNIPER_SCHEMATICS if has_sniper else _GENERIC_SCHEMATICS
+                ahead = (player.position[0] + facing[0] * 3, player.position[1] + facing[1] * 3,
+                         player.position[2])
+                if not self._near_objective(frame, ahead, 10):
+                    site = self._start_site(frame, player, names, ahead, facing,
+                                            "overwatch" if has_sniper else "cover")
+                score = .9
+        if site is None or not site.active:
+            return None
+        lane = lane or (site.centre[0] + site.plan.placement.forward[0] * 10,
+                        site.centre[1] + site.plan.placement.forward[1] * 10, player.eye[2])
+        task = _Task(frame.frame_id * 256 + player.player_id, "schematic", site.centre, lane, now,
+                     now + 30, score, progress_at=now, schematic_id=site.site_id)
+        site.builders[identity(player)] = now
+        return task
+
+    def _vip_can_shelter(self, frame: PerceptionFrame, player: PlayerSnapshot) -> bool:
+        """Box in only near help or home and away from spawn protection."""
+
+        if any(o.kind == "team_anchor" and math.dist(o.position, player.position) < 9
+               for o in frame.objectives):
+            return False
+        helpers = sum(1 for p in frame.players if p.team == player.team and p.alive and p.spawned
+                      and p.player_id != player.player_id and math.dist(p.position, player.position) <= 14)
+        return helpers >= 1
+
+    @staticmethod
+    def _facing_to(origin: Vector3, target: Vector3) -> tuple[float, float]:
+        dx, dy = target[0] - origin[0], target[1] - origin[1]
+        length = math.hypot(dx, dy)
+        return (dx / length, dy / length) if length > 1e-6 else (1.0, 0.0)
+
+    def _threat_facing(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                       strategic: ModeBotDecision | None) -> tuple[float, float]:
+        threat = strategic.watch_position if strategic is not None else None
+        if threat is None:
+            threat = next((o.position for o in frame.objectives
+                           if o.kind == "team_anchor" and o.team != player.team), None)
+        if threat is None and player.last_damage_source_position is not None:
+            threat = player.last_damage_source_position
+        if threat is None:
+            return (player.orientation[0], player.orientation[1]) if any(player.orientation[:2]) else (1.0, 0.0)
+        return self._facing_to(player.position, threat)
+
+    def _advance_schematic(self, frame: PerceptionFrame, player: PlayerSnapshot, life: _Life,
+                           allies: tuple[PlayerSnapshot, ...]) -> TacticalOrder | None:
+        task = life.task
+        assert task is not None
+        now = frame.created_at
+        site = self.sites.sites.get(task.schematic_id)
+        if site is None or site.abandoned:
+            self._finish(life, now, False, "site_" + (site.abandoned if site else "missing"))
+            return None
+        me = identity(player)
+        if site.completed_at:
+            spot = site.plan.placement.occupant
+            if (site.purpose == "overwatch" and spot is not None
+                    and site.occupant in (None, me) and now - site.completed_at < 25):
+                # Use what was built: climb the stair to the platform/step
+                # and watch the lane from it for a while.
+                if site.occupant is None:
+                    site.occupant = me
+                    task.best_distance, task.progress_at = math.inf, now
+                if math.dist(spot, player.position) > .9:
+                    # Lead the climb one tread at a time along the walkable
+                    # stand graph of what was built (stairs, steps); progress
+                    # is the remaining walk, not straight-line distance.
+                    goal = spot
+                    remaining = math.dist(spot, player.position) + 50
+                    start = node_for_position(self.world.solid, player.position)
+                    target = node_for_position(self.world.solid, spot)
+                    region = site.region
+                    if start is not None and target is not None and region is not None:
+                        path = walk_path(self.world.solid, region, start, target)
+                        if path:
+                            remaining = float(len(path))
+                            ground = site.plan.placement.ground_z
+                            first_up = next((i for i, node in enumerate(path) if node[2] < ground), None)
+                            if start[2] >= ground and first_up:
+                                # Ordinary navigation brings it to the foot of
+                                # the stair; then one tread per order.
+                                base = path[first_up - 1]
+                                ahead = base if base[:2] != start[:2] else path[first_up]
+                            else:
+                                ahead = path[0]
+                                if len(path) > 1 and path[1][2] == ahead[2] == start[2]:
+                                    ahead = path[1]
+                            goal = node_position(ahead)
+                    if remaining < task.best_distance - .5:
+                        task.best_distance, task.progress_at = remaining, now
+                    if now - task.progress_at > 14:
+                        self._finish(life, now, False, "occupy_stalled")
+                        return None
+                    order = TacticalOrder(task.task_id, "schematic_climb", goal, task.lane,
+                                          arrival_radius=.4)
+                    life.climb_order = order
+                    return order
+                task.progress_at = now
+                return TacticalOrder(task.task_id, "schematic_overwatch", spot, task.lane, hold=True)
+            self._finish(life, now, True, "schematic_complete")
+            life.next_project = now + 4.0
+            return None
+        site.builders[me] = now
+        solid = self.world.solid
+        step = site.plan.steps[task.step_index] if 0 <= task.step_index < len(site.plan.steps) else None
+        if step is not None and (task.step_index in site.done or not step_remaining(solid, step)):
+            self.sites.release(site, task.step_index, me)
+            task.step_index, step = -1, None
+        occupant = site.occupant == me
+        if step is None:
+            if now < task.ready_at:
+                return self._schematic_hold(task, player, site, None)
+            others = tuple(p.position for p in frame.players[:48] if p.alive and p.spawned
+                           and p.player_id != player.player_id
+                           and math.dist(p.position, site.centre) < 24)
+            claim = self.sites.claim(site, me, player.position, solid, now, others=others,
+                                     prefer_inside=occupant, seed=player.player_id * 31 + task.next_action)
+            if claim is None:
+                if not task.waiting_since:
+                    task.waiting_since = now
+                # Nothing ready for me: steps are claimed or wait on support
+                # from a teammate's line. Hold briefly, then leave the site.
+                if now - task.waiting_since > (12.0 if occupant else 6.0):
+                    self._finish(life, now, False, "no_open_step")
+                    life.next_project = now + 5.0
+                    return None
+                return self._schematic_hold(task, player, site, None)
+            task.waiting_since = 0.0
+            step, node = claim
+            task.step_index = step.index
+            task.stand = node_position(node)
+            task.best_distance = math.inf
+            task.progress_at = now
+            task.expires_at = max(task.expires_at, now + 20)
+        assert task.stand is not None
+        stand = task.stand
+        horizontal = math.hypot(player.position[0] - stand[0], player.position[1] - stand[1])
+        distance = math.hypot(horizontal, player.position[2] - stand[2])
+        if distance < task.best_distance - .3:
+            task.best_distance, task.progress_at = distance, now
+        remaining = step_remaining(solid, step)
+        near = horizontal <= .75 and abs(player.position[2] - stand[2]) <= .7
+        usable = (near and not self._body_in(player, remaining)
+                  and all(math.dist(player.eye, cell_centre(cell)) <= PLAN_REACH + .75
+                          for cell in (step.start, step.end))
+                  and ray_clear(solid, player.eye, step.start, frozenset(step.cells)))
+        if not usable:
+            if near and now - task.progress_at > 3:
+                # At the stand but straddling a planned cell or without a
+                # clear view: hand the step back and pick another.
+                return self._schematic_step_result(life, task, False, "stand_blocked", now)
+            if now - task.progress_at > 8:
+                return self._schematic_step_result(life, task, False, "approach_stalled", now)
+            radius = .3 if horizontal <= .6 else .35
+            order = TacticalOrder(task.task_id, "schematic_approach", stand,
+                                  (step.start[0] + .5, step.start[1] + .5, step.start[2] + .5),
+                                  arrival_radius=radius)
+            life.climb_order = order
+            return order
+        self.sites.extend_claim(site, task.step_index, me, now)
+        look = (step.start[0] + .5, step.start[1] + .5, step.start[2] + .5)
+        if player.tool != int(C.BLOCK_TOOL) and task.ready_at <= now - 3.0:
+            # Switch to the block tool like a player: a short, varied delay
+            # before the first drag (scaled by reaction time).
+            reaction = frame.profile.reaction_time if frame.profile else .3
+            task.ready_at = now + .22 + .3 * reaction + _mix(player.player_id, task.next_action, 7) * .25
+        if now < task.ready_at:
+            return TacticalOrder(task.task_id, "schematic_ready", player.position, look,
+                                 hold=True, tool_id=int(C.BLOCK_TOOL))
+        if not remaining:
+            task.step_index = -1
+            return None
+        if not self.teams.allow_mutation(player.team, now, len(remaining)):
+            return TacticalOrder(task.task_id, "schematic_budget_wait", player.position, look,
+                                 hold=True, tool_id=int(C.BLOCK_TOOL))
+        rgb = PALETTE.get(step.color)
+        argument = f"rgb:{rgb:06x}" if rgb is not None else ""
+        # Aim just inside the voxel centre; the gateway rounds to the cell.
+        aim = (step.start[0] + .49, step.start[1] + .49, step.start[2] + .49)
+        if step.is_line:
+            action = BotAction(BotActionKind.BUILD_LINE, int(C.BLOCK_TOOL), position=aim,
+                               end_position=(step.end[0] + .49, step.end[1] + .49, step.end[2] + .49),
+                               argument=argument)
+        else:
+            action = BotAction(BotActionKind.BUILD, int(C.BLOCK_TOOL), position=aim, argument=argument)
+        action_site = ProjectSite("schematic", aim, stand, (), cells=remaining,
+                                  required_blocks=len(remaining), tool_id=int(C.BLOCK_TOOL))
+        return self._action(frame, player, task, action, action_site)
+
+    @staticmethod
+    def _body_in(player: PlayerSnapshot, cells: tuple[tuple[int, int, int], ...]) -> bool:
+        """Mirror the authority's body test (0.45 footprint, three cells tall)."""
+
+        if not cells:
+            return False
+        px, py = player.position[0], player.position[1]
+        top = math.floor(player.position[2])
+        columns = {(x, y) for x in range(math.floor(px - .45), math.floor(px + .45) + 1)
+                   for y in range(math.floor(py - .45), math.floor(py + .45) + 1)}
+        return any((x, y) in columns and top <= z <= top + 2 for x, y, z in cells)
+
+    def _schematic_hold(self, task: _Task, player: PlayerSnapshot, site: SchematicSite,
+                        step) -> TacticalOrder:
+        centre = site.centre
+        look = (centre[0] + site.plan.placement.forward[0] * 6,
+                centre[1] + site.plan.placement.forward[1] * 6, player.eye[2])
+        if site.occupant == identity(player) and site.plan.placement.occupant is not None:
+            spot = site.plan.placement.occupant
+            inside = (math.floor(player.position[0]), math.floor(player.position[1])) in interior_columns(
+                site.plan.placement)
+            if not inside and math.dist(spot, player.position) > .8:
+                return TacticalOrder(task.task_id, "schematic_occupy", spot, look, arrival_radius=.5)
+        return TacticalOrder(task.task_id, "schematic_wait", player.position, look,
+                             hold=True, tool_id=int(C.BLOCK_TOOL))
+
+    def _schematic_step_result(self, life: _Life, task: _Task, success: bool, reason: str,
+                               now: float) -> TacticalOrder | None:
+        site = self.sites.sites.get(task.schematic_id)
+        index = task.step_index
+        placed = len(task.action_site.cells) if task.action_site and task.action_site.cells else 0
+        if site is not None and index >= 0:
+            if success:
+                self.sites.step_built(site, index, life.key, placed, now)
+            else:
+                self.sites.step_failed(site, index, life.key, reason, now)
+        self.teams.event("schematic_steps_" + ("built" if success else "failed"),
+                         task.task_id, reason, now)
+        task.pending = None
+        task.action_site = None
+        task.step_index = -1
+        task.stage = TaskStage.APPROACH
+        task.progress_at = now
+        task.expires_at = max(task.expires_at, now + 25)
+        # A human pauses between drags; skilled builders less.
+        jitter = _mix(life.key[0], task.next_action, int(now * 10))
+        task.ready_at = now + (.18 + .3 * jitter if success else .8 + .4 * jitter)
+        if not success:
+            task.remaining_cells = max(0, task.remaining_cells) + 1
+            if task.remaining_cells >= 3:
+                self._finish(life, now, False, "schematic_" + reason)
+                life.next_project = now + 6.0
+        return None
+
     def _expire(self, frame: PerceptionFrame, now: float) -> None:
         observed = {(p.player_id, p.generation): (p.alive and p.spawned, p.life_id) for p in frame.players}
         self.teams.expire(now, observed)
+        self.sites.refresh(self.world.solid, now, {key: life for key, (alive, life) in observed.items()
+                                                   if alive})
         for key, life in tuple(self.lives.items()):
             if now - life.last_seen > 15 or key in observed and observed[key] != (True, life.key[2]):
                 self.forget(*key)
@@ -890,8 +1453,10 @@ class CooperativeBehavior:
         self.patients = {key: value for key, value in self.patients.items() if value[1] > now}
 
     def _reserved_cells(self, team: int, *, exclude: int = -1) -> frozenset[tuple[int, int, int]]:
-        return frozenset(cell for p in self.teams.projects.values()
-                         if p.team == team and p.project_id != exclude for cell in p.cells)
+        cells = frozenset(cell for p in self.teams.projects.values()
+                          if p.team == team and p.project_id != exclude for cell in p.cells)
+        sites = self.sites.reserved_cells(team)
+        return cells | sites if sites else cells
 
     @staticmethod
     def _near_objective(frame: PerceptionFrame, position: Vector3, radius: float) -> bool:

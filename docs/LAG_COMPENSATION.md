@@ -91,6 +91,33 @@ rewind     = clamp(view_age, 0, allowed)  # < half a tick -> no rewind
 | `lag_compensation_max_ms` | `250` | absolute rewind cap |
 | `lag_compensation_extra_ms` | `50` | allowance above measured RTT |
 | `lag_compensation_view_delay_ms` | `0` | extra client render delay (retail extrapolates, so 0) |
+| `lag_compensation_late_shot_ms` | `400` | most extra rewind for a retransmitted (late) shot, see below |
+
+## Late (retransmitted) shots (2026-10-01)
+
+A ShootPacket is reliable; its frame's ClientData is unsequenced. When the
+datagram carrying both is lost, ENet resends the shot one retransmission
+time-out later (about 270 ms in the lab at 300 ms ping) while later
+ClientData keeps arriving. Rewound by the round trip alone, such a shot was
+tested against a body 1.3-2.6 blocks away from the one the shooter saw
+(`scripts/shot_registration_lab.py`, sniper and rifle misses at 300 ms).
+
+`Player.label_arrival_tick(label)` records the server tick on which every
+ClientData label arrived. `late_shot_ms` dates the shot's label by it (or by
+the nearest label within 8 frames when its own ClientData was lost with
+it), ignores one tick of phase skew, and adds the delay to both the view
+age and the allowance, capped by `lag_compensation_late_shot_ms`:
+
+```
+late     = min(cap, (loop_count - arrival_tick(label) - 1) * tick)
+view_age = min(RTT + view_delay + late, age of the claimed snapshot)
+allowed  = min(RTT + extra, max) + late
+```
+
+The snapshot floor still applies. Every late shot is reported log-only as
+`lag_comp_late_shot` with its delay: an honest link shows it at about its
+loss rate, a client holding every shot back ("backtrack") on every shot.
+The history ring is 128 ticks so the largest default rewind (650 ms) fits.
 
 ## Anti-abuse (log-only)
 

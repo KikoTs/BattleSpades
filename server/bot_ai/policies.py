@@ -582,6 +582,17 @@ class CTFBotPolicy:
                                 7.0 + 4.0 * ((beat + observer.player_id) % 3))
 
 
+# ``zombie_order.state`` role codes (server/bot_ai/horde_strategy.ROLE_CODES).
+_HORDE_ROLES = {
+    0: "hunt",
+    1: "flank",
+    2: "dig_root",
+    3: "climb",
+    4: "surround",
+    5: "tunnel",
+}
+
+
 class ZombieBotPolicy:
     """Separate preparation, survivor, infected, and last-man behavior.
 
@@ -633,6 +644,10 @@ class ZombieBotPolicy:
                 objective_priority=0.92,
                 engagement_radius=18.0,
             )
+        if infected and phase == "active":
+            ordered = self._horde_order_decision(frame, observer)
+            if ordered is not None:
+                return ordered
         if survivor is not None and survivor.team != observer.team:
             # This exact location is legal only because ZombieMode publishes
             # the native final-survivor marker to every infected client.
@@ -755,6 +770,98 @@ class ZombieBotPolicy:
         return None
 
     @staticmethod
+    def _horde_order_decision(
+        frame: PerceptionFrame, observer: PlayerSnapshot
+    ) -> ModeBotDecision | None:
+        """Follow the horde coordinator's order (``zombie_order`` objective).
+
+        The director's ``HordeCoordinator`` spreads infected bots over the
+        survivors and, under an elevated survivor, assigns collapse diggers,
+        climbers and a surrounding ring instead of a pile. Siege roles only
+        fight what is within claw reach (4.5 blocks): a survivor shooting
+        from a platform must not pull diggers off the cut.
+        """
+
+        order = next(
+            (
+                item for item in frame.objectives
+                if item.kind == "zombie_order"
+                and item.carrier_id == observer.player_id
+            ),
+            None,
+        )
+        if order is None:
+            return None
+        role = _HORDE_ROLES.get(int(order.state))
+        if role is None:
+            return None
+        target = next(
+            (
+                player for player in frame.players
+                if player.player_id == order.attacker and player.alive
+                and player.spawned
+            ),
+            None,
+        )
+        target_position = target.position if target is not None else order.position
+        if role == "hunt":
+            return ModeBotDecision(
+                target_position,
+                "zombie_hunt_survivor",
+                sprint=True,
+                arrival_radius=1.25,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.98,
+                engagement_radius=160.0,
+            )
+        if role == "flank":
+            return ModeBotDecision(
+                order.position,
+                "zombie_hunt_flank",
+                sprint=True,
+                arrival_radius=2.5,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.97,
+                # A flanker that sees its prey up close takes it.
+                engagement_radius=14.0,
+                watch_position=target_position,
+            )
+        if role in ("dig_root", "tunnel"):
+            return ModeBotDecision(
+                order.position,
+                "zombie_siege_dig" if role == "dig_root" else "zombie_hunt_tunnel",
+                sprint=True,
+                arrival_radius=1.5,
+                directive="siege",
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.99,
+                engagement_radius=4.5,
+                watch_position=target_position,
+            )
+        if role == "climb":
+            return ModeBotDecision(
+                target_position,
+                "zombie_siege_climb",
+                sprint=True,
+                arrival_radius=1.5,
+                directive="climb",
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.98,
+                engagement_radius=4.5,
+                watch_position=target_position,
+            )
+        return ModeBotDecision(
+            order.position,
+            "zombie_siege_surround",
+            sprint=math.dist(observer.position, order.position) > 12.0,
+            arrival_radius=2.0,
+            posture=ModeBotPosture.ASSAULT,
+            objective_priority=0.96,
+            engagement_radius=4.5,
+            watch_position=target_position,
+        )
+
+    @staticmethod
     def _nearest_enemy(
         frame: PerceptionFrame, observer: PlayerSnapshot
     ) -> PlayerSnapshot | None:
@@ -808,6 +915,16 @@ class ZombieBotPolicy:
         )
 
 
+# Strikes on the enemy VIP "arrive" only on top of it. With the old 2.5-block
+# radius two hunters separated by a single wall (a VIP shelter, a building
+# side) both counted as arrived, lost sight of each other and stood still;
+# the tight radius keeps the route (and its wall breach) going until combat
+# sees the boss.
+_VIP_STRIKE_ARRIVAL = 1.0
+_VIP_STRIKE_ROLES = frozenset({"vip_flank_attack", "vip_sudden_death_assault",
+                               "vip_lone_hunt"})
+
+
 class VIPBotPolicy:
     """Keep an escort while attackers eliminate the VIP, then survivors."""
 
@@ -851,6 +968,26 @@ class VIPBotPolicy:
             )
 
         if own_vip is not None and observer.player_id == own_vip.carrier_id:
+            alone = not any(p.team == observer.team and p.player_id != observer.player_id
+                            for p in frame.players)
+            if alone:
+                # Nobody else on this team can win the round. Holding behind
+                # an empty team deadlocked bots-only games (1v1: both bosses
+                # sheltered at home forever), so a lone VIP fights: it hunts
+                # the enemy boss through its public crown marker, or mops up
+                # once that boss is dead.
+                if enemy_vip is not None:
+                    return ModeBotDecision(
+                        enemy_vip.position,
+                        "vip_lone_hunt",
+                        sprint=True,
+                        arrival_radius=_VIP_STRIKE_ARRIVAL,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.95,
+                        engagement_radius=100.0,
+                    )
+                if enemy_anchor is not None:
+                    return _vip_mop_up(enemy_anchor)
             recently_hurt = (observer.last_damage_at > 0
                             and 0 <= frame.created_at - observer.last_damage_at <= 6)
             retreat = own_anchor.position if own_anchor is not None else own_vip.position
@@ -870,14 +1007,28 @@ class VIPBotPolicy:
                 if friends:
                     retreat = min(friends, key=lambda p: (
                         _distance_squared(observer.position, p.position), p.player_id)).position
+            if recently_hurt:
+                return ModeBotDecision(
+                    retreat,
+                    "vip_retreat",
+                    sprint=True,
+                    arrival_radius=6.0,
+                    posture=ModeBotPosture.EVASIVE,
+                    objective_priority=1.0,
+                    engagement_radius=8.0,
+                )
+            # The VIP stays behind its team and holds: it defends itself
+            # against anyone who closes in, and asks the construction layer
+            # for a shelter where it stands (``vip_shelter`` directive).
             return ModeBotDecision(
                 retreat,
-                "vip_retreat" if recently_hurt else "vip_rally",
-                sprint=recently_hurt,
+                "vip_rally",
+                sprint=False,
                 arrival_radius=6.0,
-                posture=ModeBotPosture.EVASIVE,
+                directive="vip_shelter",
+                posture=ModeBotPosture.DEFEND,
                 objective_priority=1.0,
-                engagement_radius=8.0,
+                engagement_radius=20.0,
             )
 
         # Assign from the actual friendly bot roster, not id%3: a small team
@@ -886,10 +1037,18 @@ class VIPBotPolicy:
         teammates = sorted({p.player_id for p in frame.players
                             if p.team == observer.team and p.is_bot and p.alive and p.spawned
                             and (own_vip is None or p.player_id != own_vip.carrier_id)})
-        guard_count = min(max(0, len(teammates) - 1), max(1, len(teammates) // 3))
+        # Exactly one bodyguard (when the team has a second bot to attack):
+        # every other bot goes for the enemy VIP. The lowest id is a stable
+        # designation, so the guard does not change as positions move.
+        guard_count = min(max(0, len(teammates) - 1), 1)
         guarding = observer.player_id in teammates[:guard_count]
-        if retained_role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}:
-            guarding = retained_role == "vip_guard_formation"
+        if retained_role in {"vip_flank_attack", "vip_mop_up"} and guarding:
+            # Hysteresis only toward attacking: a retained attacker that was
+            # just designated keeps attacking for the commitment window, a
+            # guard that lost the designation leaves at once. Brief roster
+            # churn can leave the VIP unguarded for a moment, never with two
+            # bodyguards.
+            guarding = False
         if own_vip is not None and guarding:
             return ModeBotDecision(
                 # A live character is a grounded route anchor; inventing a
@@ -909,22 +1068,30 @@ class VIPBotPolicy:
                 enemy_vip.position,
                 role,
                 sprint=own_vip is not None,
-                arrival_radius=2.5,
+                arrival_radius=_VIP_STRIKE_ARRIVAL,
                 posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.84,
+                # The enemy VIP is the win condition: nothing optional
+                # (supplies, construction, formations) outranks the push.
+                objective_priority=0.95,
                 engagement_radius=100.0,
             )
 
         if enemy_anchor is not None:
-            return ModeBotDecision(
-                enemy_anchor.position,
-                "vip_mop_up",
-                sprint=False,
-                arrival_radius=7.0,
-                posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.72,
-            )
+            return _vip_mop_up(enemy_anchor)
         return None
+
+
+def _vip_mop_up(enemy_anchor) -> ModeBotDecision:
+    """TDM-style hunt for a VIP-less enemy team (the worker searches the
+    enemy side after arriving instead of standing on the anchor)."""
+    return ModeBotDecision(
+        enemy_anchor.position,
+        "vip_mop_up",
+        sprint=False,
+        arrival_radius=7.0,
+        posture=ModeBotPosture.ASSAULT,
+        objective_priority=0.72,
+    )
 
 
 class ArenaBotPolicy:
@@ -1630,7 +1797,8 @@ def _watch_approach(frame: PerceptionFrame, observer: PlayerSnapshot,
 # (arena_regroup, tdm_regroup_wounded) deliberately stay anchored: the role
 # itself only lasts the 8 s after a hit, and re-routing after a teammate's
 # every step walked wounded London arena bots into the river (map matrix).
-_LIVE_TARGET_ROLE_WORDS = ("escort", "hunt", "escape", "evade", "intercept")
+# Horde siege roles follow the coordinator's live site/ring assignment.
+_LIVE_TARGET_ROLE_WORDS = ("escort", "hunt", "escape", "evade", "intercept", "siege")
 _LIVE_TARGET_ROLES = frozenset({
     "vip_guard_formation", "vip_flank_attack", "vip_sudden_death_assault",
     "vip_rally", "vip_retreat", "tdm_squad_support",
@@ -1682,7 +1850,10 @@ class ModePolicyMemory:
             observer.last_damage_source_id if decision.role == "vip_retreat" else -1,
             tuple((item.kind, item.team, item.carrier_id, item.state,
                    item.position if item.carrier_id < 0 and item.kind != "vip" else None)
-                  for item in frame.objectives),
+                  for item in frame.objectives
+                  # Another zombie's horde order is not this bot's business.
+                  if item.kind != "zombie_order"
+                  or item.carrier_id == observer.player_id),
         )
         previous = self._states.get(key)
         if previous is not None and (previous.signature != signature
@@ -1707,6 +1878,12 @@ class ModePolicyMemory:
                              math.dist(observer.position, previous.decision.position))
                 if decision.role == "vip_retreat" and now - previous.anchor_since < 4:
                     hold = True
+                if (hold and decision.role in _VIP_STRIKE_ROLES
+                        and math.dist(observer.position, previous.decision.position)
+                        <= decision.arrival_radius + 0.5):
+                    # Reached the held point but the boss is not there: chase
+                    # its current position instead of idling on a stale one.
+                    hold = False
                 if hold:
                     decision = replace(decision, position=previous.decision.position)
         role_since = (previous.role_since if previous is not None and

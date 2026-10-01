@@ -439,9 +439,13 @@ async def cmd_bots(ctx: CommandContext):
             try:
                 count = max(0, int(token))
             except ValueError:
+                # Admins may omit the [bots] name_prefix label.
+                label = str(getattr(config, "name_prefix", "") or "").lower()
+                wanted = token.lower()
                 candidates = [
                     bot for bot in director.bots
-                    if bot.name.lower().startswith(token.lower())
+                    if bot.name.lower().startswith(wanted)
+                    or (label and bot.name.lower().startswith(label + wanted))
                 ][:1]
             else:
                 candidates = list(director.bots)[:count]

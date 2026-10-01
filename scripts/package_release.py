@@ -22,6 +22,18 @@ from server.runtime_paths import read_version
 
 
 _PLATFORMS = frozenset({"windows", "linux", "macos"})
+
+# Linux menu entry for the desktop host. %k is the .desktop file's own path,
+# so the entry works from wherever the portable folder was extracted.
+LINUX_DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=BattleSpades Server
+Comment=Host an Ace of Spades: Battle Builders server
+Exec=sh -c 'cd "$(dirname "%k")" && exec ./BattleSpadesServer'
+Icon=battlespades-server
+Terminal=false
+Categories=Game;Network;
+"""
 _ARCHITECTURES = frozenset({"x86_64", "arm64"})
 
 
@@ -99,6 +111,7 @@ def stage_release(
         frozen / f"BattleSpades{executable_suffix}",
         frozen / f"BattleSpadesTutorial{executable_suffix}",
         frozen / f"BattleSpadesMapCreator{executable_suffix}",
+        frozen / f"BattleSpadesServer{executable_suffix}",
     )
     missing_launchers = [str(path) for path in launchers if not path.is_file()]
     if missing_launchers:
@@ -173,10 +186,30 @@ def stage_release(
             raise ValueError("release must contain at least one fleet config")
         if not (destination / "plugins" / "README.txt").is_file():
             raise FileNotFoundError("release plugin instructions are missing")
+        _stage_desktop_host(root, destination, target)
     except Exception:
         shutil.rmtree(destination, ignore_errors=True)
         raise
     return destination
+
+
+def _stage_desktop_host(root: Path, destination: Path, target: ReleaseTarget) -> None:
+    """Files the BattleSpadesServer window needs beside the frozen runtime.
+
+    A pristine copy of the shipped configuration backs the Advanced tab's
+    "Restore defaults"; Linux also gets a menu entry and its icon.
+    """
+
+    gui_data = destination / "_internal" / "server_gui"
+    gui_data.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / "config.toml", gui_data / "config.defaults.toml")
+    if target.platform == "linux":
+        desktop = destination / "BattleSpadesServer.desktop"
+        desktop.write_bytes(LINUX_DESKTOP_ENTRY.encode("utf-8"))
+        desktop.chmod(0o755)
+        icon = root / "server_gui" / "assets" / "battlespades-server.png"
+        if icon.is_file():
+            shutil.copy2(icon, destination / "battlespades-server.png")
 
 
 def archive_release(staged_dir: Path) -> tuple[Path, str]:

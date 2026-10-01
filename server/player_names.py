@@ -148,11 +148,83 @@ def is_reserved_name(name: object, extra_reserved: Iterable[str] = ()) -> bool:
     return False
 
 
+def _fold_keep_separators(text: object) -> str:
+    """Confusable-fold ``text`` like :func:`name_skeleton`, keeping punctuation."""
+
+    folded = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", str(text or "")).casefold())
+    result = []
+    for character in folded:
+        if _is_invisible(character) or unicodedata.category(character)[0] == "M":
+            continue
+        mapped = _CONFUSABLES.get(character, character)
+        result.append(_CONFUSABLES.get(mapped, mapped))
+    return re.sub(r"\s+", " ", "".join(result)).strip()
+
+
+def poses_as_bot(name: object, bot_label: str) -> bool:
+    """Whether a human ``name`` wears the server's bot label.
+
+    A bracketed label such as ``[BOT]`` is matched as a tag anywhere in the
+    name and in any bracket style or lookalike spelling (``(B0T)``,
+    ``<bot>``); a plain label such as ``BOT_`` only as a leading prefix, so
+    ordinary names like "Bottle" stay available.
+    """
+
+    label = str(bot_label or "").strip()
+    label_key = _alnum_skeleton(label)
+    if not label_key:
+        return False
+    text = unicodedata.normalize("NFKC", str(name or ""))
+    if _TAG_PATTERN.fullmatch(label):
+        return any(
+            _alnum_skeleton(match.group(1)) == label_key
+            for match in _TAG_PATTERN.finditer(text)
+        )
+    return _fold_keep_separators(text).startswith(_fold_keep_separators(label))
+
+
+def _unique_with_suffix(head: str, body: str, used: set[str]) -> str:
+    """``head + body``, or ``head + body~N`` trimmed to fit, unique in ``used``."""
+
+    candidate = head + _truncate_utf8(body, MAX_PLAYER_NAME_BYTES - len(head.encode("utf-8")))
+    if name_skeleton(candidate) not in used:
+        return candidate
+    for index in range(2, 10_000):
+        suffix = f"~{index}"
+        trimmed = _truncate_utf8(
+            body,
+            MAX_PLAYER_NAME_BYTES - len(head.encode("utf-8")) - len(suffix),
+        )
+        candidate = f"{head}{trimmed}{suffix}"
+        if name_skeleton(candidate) not in used:
+            return candidate
+    # The protocol supports far fewer simultaneous players than this branch;
+    # keep a deterministic safe fallback instead of returning a duplicate.
+    return f"P{len(used):013d}"[-MAX_PLAYER_NAME_BYTES:]
+
+
+def allocate_bot_display_name(
+    base: object,
+    prefix: str,
+    players: Iterable[object],
+) -> str:
+    """Return ``prefix + base`` within 15 bytes, unique among ``players``.
+
+    The label is never truncated or dropped: the bare name gives way first,
+    and a collision suffix (``~2``) shortens the name, not the prefix.
+    """
+
+    label = _truncate_utf8(str(prefix or ""), MAX_PLAYER_NAME_BYTES - 3)
+    used = {name_skeleton(getattr(player, "name", "")) for player in players}
+    return _unique_with_suffix(label, _safe_base_name(base), used)
+
+
 def allocate_unique_player_name(
     requested: object,
     players: Iterable[object],
     *,
     extra_reserved: Iterable[str] = (),
+    bot_label: str = "",
 ) -> str:
     """Allocate a confusable-unique retail wire name.
 
@@ -161,7 +233,8 @@ def allocate_unique_player_name(
     while live bot and human names share one collision domain (a human can
     never take a bot's name; bots are named elsewhere and never renamed here).
 
-    * reserved/staff names become ``Player`` (then made unique);
+    * reserved/staff names, and names wearing the ``[bots] name_prefix``
+      label (``bot_label``), become ``Player`` (then made unique);
     * a name whose skeleton matches a logged-in admin's also falls back to
       ``Player`` instead of receiving a lookalike ``~N`` suffix;
     * any other skeleton collision gets the ``~N`` suffix, within 15 bytes.
@@ -169,7 +242,7 @@ def allocate_unique_player_name(
 
     base = _safe_base_name(requested)
     players = tuple(players)
-    if is_reserved_name(base, extra_reserved):
+    if is_reserved_name(base, extra_reserved) or poses_as_bot(base, bot_label):
         base = FALLBACK_NAME
     else:
         base_skeleton = name_skeleton(base)
@@ -185,19 +258,4 @@ def allocate_unique_player_name(
         name_skeleton(getattr(player, "name", ""))
         for player in players
     }
-    if name_skeleton(base) not in used:
-        return base
-
-    for index in range(2, 10_000):
-        suffix = f"~{index}"
-        prefix = _truncate_utf8(
-            base,
-            MAX_PLAYER_NAME_BYTES - len(suffix.encode("ascii")),
-        )
-        candidate = f"{prefix}{suffix}"
-        if name_skeleton(candidate) not in used:
-            return candidate
-
-    # The protocol supports far fewer simultaneous players than this branch;
-    # keep a deterministic safe fallback instead of returning a duplicate.
-    return f"P{len(used):013d}"[-MAX_PLAYER_NAME_BYTES:]
+    return _unique_with_suffix("", base, used)

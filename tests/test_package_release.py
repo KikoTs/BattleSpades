@@ -27,12 +27,13 @@ TRACKED_PREFABS = sorted(
 )
 
 
-def _fake_frozen_tree(tmp_path: Path) -> Path:
+def _fake_frozen_tree(tmp_path: Path, suffix: str = ".exe") -> Path:
     frozen = tmp_path / "frozen"
     (frozen / "_internal").mkdir(parents=True)
-    (frozen / "BattleSpades.exe").write_bytes(b"launcher")
-    (frozen / "BattleSpadesTutorial.exe").write_bytes(b"tutorial launcher")
-    (frozen / "BattleSpadesMapCreator.exe").write_bytes(b"map creator launcher")
+    (frozen / f"BattleSpades{suffix}").write_bytes(b"launcher")
+    (frozen / f"BattleSpadesTutorial{suffix}").write_bytes(b"tutorial launcher")
+    (frozen / f"BattleSpadesMapCreator{suffix}").write_bytes(b"map creator launcher")
+    (frozen / f"BattleSpadesServer{suffix}").write_bytes(b"desktop host launcher")
     (frozen / "_internal" / "runtime.dll").write_bytes(b"runtime")
     return frozen
 
@@ -77,6 +78,11 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert (staged / "BattleSpades.exe").is_file()
     assert (staged / "BattleSpadesTutorial.exe").is_file()
     assert (staged / "BattleSpadesMapCreator.exe").is_file()
+    assert (staged / "BattleSpadesServer.exe").is_file()
+    assert (staged / "_internal" / "server_gui" / "config.defaults.toml").read_bytes() == (
+        PROJECT_ROOT / "config.toml"
+    ).read_bytes()
+    assert not (staged / "BattleSpadesServer.desktop").exists()
     assert (staged / "_internal" / "runtime.dll").is_file()
     assert (staged / "config.toml").is_file()
     assert (staged / "fleet.toml").is_file()
@@ -98,6 +104,29 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert not (staged / "client_patches" / "character_jump_smoothing.py").exists()
     assert not (staged / "codex-command-runner.exe").exists()
     assert not (staged / "tests").exists()
+
+
+def test_linux_release_gets_a_desktop_entry_for_the_server_window(tmp_path: Path) -> None:
+    """The Linux bundle has a menu entry that starts the window in place."""
+
+    target = ReleaseTarget("linux", "x86_64", (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip())
+    staged = stage_release(PROJECT_ROOT, _fake_frozen_tree(tmp_path, ""), tmp_path / "out", target)
+    entry = (staged / "BattleSpadesServer.desktop").read_text(encoding="utf-8")
+    assert entry.startswith("[Desktop Entry]")
+    assert "./BattleSpadesServer" in entry and "%k" in entry
+    assert (staged / "battlespades-server.png").is_file()
+
+
+def test_stage_release_requires_the_server_window(tmp_path: Path) -> None:
+    frozen = _fake_frozen_tree(tmp_path)
+    (frozen / "BattleSpadesServer.exe").unlink()
+    target = ReleaseTarget("windows", "x86_64", (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip())
+    try:
+        stage_release(PROJECT_ROOT, frozen, tmp_path / "out", target)
+    except FileNotFoundError as exc:
+        assert "BattleSpadesServer" in str(exc)
+    else:
+        raise AssertionError("a release without the server window was staged")
 
 
 def test_stage_release_refuses_existing_destination(tmp_path: Path) -> None:
@@ -141,6 +170,8 @@ def test_pyinstaller_spec_keeps_operator_content_external() -> None:
     assert 'name="BattleSpades"' in spec
     assert 'name="BattleSpadesTutorial"' in spec
     assert 'name="BattleSpadesMapCreator"' in spec
+    assert 'name="BattleSpadesServer"' in spec
+    assert 'project_root / "run_server_gui.py"' in spec
     assert 'project_root / "run_tutorial.py"' in spec
     assert 'project_root / "run_map_creator.py"' in spec
     assert '"server.bot_ai.recast"' in spec

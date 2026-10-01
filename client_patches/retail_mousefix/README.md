@@ -1,5 +1,11 @@
 # Retail bug fixes and menu QoL
 
+The optional **AoS-Retail-Steam-Relay.zip** also contains a Steam server-browser
+adapter and a portable native helper. Extract its entire contents beside
+`aos.exe`, including the `relay` subfolder. Read **NETWORK.txt** in that ZIP
+(`NETWORK.md` in source) for hosting, validation limits and removal. The
+ordinary **AoS-Retail-Fixes.zip** retains the six-file package below.
+
 Close the game, then drop these six files beside `aos.exe` and launch through
 Steam normally:
 
@@ -24,8 +30,10 @@ implemented. Updating our previous package requires replacing its loader too.
   decoding and stock-input fallback after repeated failures. No Windows pointer
   acceleration multiplier or movement batching. Absolute devices are handled
   separately and seeded on first use to avoid an initial camera jump.
-  Sustained legacy cursor movement without raw motion falls back to stock input
-  for that window, covering remote/automation providers that emit no raw motion.
+  Sustained legacy cursor movement without raw motion temporarily falls back
+  to stock input while monitoring for raw motion to resume. Minimize/restore
+  resets transient input state and gives cursor recentering a short grace
+  period, so a watchdog fallback cannot permanently change mouse behavior.
 - DLC weapon choices and Specialist/Medic selection in the equipment menu.
   Team class lists, disabled classes/tools, locked classes and server validation
   still apply. This changes the local selection UI, not Steam ownership or
@@ -41,7 +49,7 @@ implemented. Updating our previous package requires replacing its loader too.
   See `MOVEMENT.md` in the source directory for the BattleSpades comparison
   and test limits.
 
-No custom lobby/hosting implementation, relay, browser, login marker, artwork,
+The six-file bug-fix package contains no custom lobby/hosting implementation, relay, browser, login marker, artwork,
 first-launch display setup, map-transition protocol changes or
 server changes are included. Existing stock menu functions still do their
 normal work; the timer wrapper only controls their callback lifecycle.
@@ -56,8 +64,12 @@ Each feature can be disabled independently. Restart after making a change.
 | Equipment and characters | `+legacyequipment` | `aos_equipmentfix.disabled` |
 | Scrolling/timers | `+legacyui` | `aos_uifix.disabled` |
 | Jump prediction | `+legacymovement` | `aos_movementfix.disabled` |
+| Optional Steam networking | `+legacynetwork` | `aos_networkfix.disabled` |
 
 To uninstall, close the game and remove the six added files listed above.
+For the relay edition also remove `aos_networkfix.py`, `aos_steam_bridge.py`
+and its added `relay` folder. Server favourites/history are stored separately
+in `%LOCALAPPDATA%/AoSRetailFixes`.
 The diagnostic `aos_mousefix_loader.log` can also be removed. No original game
 file needs restoring because this package does not rewrite any of them.
 
@@ -115,7 +127,7 @@ python -B smoke_winmm.py path\to\winmm.dll
 ```
 
 `smoke_mouse.py` and `smoke_winmm.py` require a 32-bit Windows Python process.
-Set `AOS_RETAIL_BUNDLE` to the installed `aos.pkg` to enable the six additional
+Set `AOS_RETAIL_BUNDLE` to the installed `aos.pkg` to enable the seven additional
 Python 2.7 method-integration checks in `test_fixes.py`. They read the actual
 bundled bytecode without importing game modules. No proprietary source or
 bytecode is included in the package. See `VALIDATION.md` for observed results.

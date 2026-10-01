@@ -600,7 +600,7 @@ class VoteManager:
         try:
             from server.bans import address_host
 
-            host = address_host(starter.connection.peer)
+            host = address_host(starter.connection.peer, getattr(starter.connection, 'server', None))
         except Exception:
             host = None
         return f"ip:{host}" if host and host != "unknown" else int(starter.id)
@@ -1034,7 +1034,7 @@ class VoteManager:
             try:
                 from server.bans import address_host
 
-                host = address_host(target.connection.peer)
+                host = address_host(target.connection.peer, getattr(target.connection, 'server', None))
             except Exception:
                 host = None
             if host and host != "unknown":

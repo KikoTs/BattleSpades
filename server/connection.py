@@ -1708,6 +1708,10 @@ class Connection:
                 )
                 or ()
             ),
+            bot_label=str(
+                getattr(getattr(self.server.config, "bots", None), "name_prefix", "")
+                or ""
+            ),
         )
         if player_name != requested_name:
             logger.info(
@@ -1718,6 +1722,9 @@ class Connection:
         player = Player(player_id, player_name, internal_team, weapon, self)
         if revival_master is not None:
             revival_master.bind_player(player, identity)
+        from commands.admin import grant_auto_admin
+
+        grant_auto_admin(self.server, player, identity)
         player.local_language = int(packet.local_language)
         from server.class_selection import normalize_server_selection
 

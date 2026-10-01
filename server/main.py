@@ -51,6 +51,7 @@ from .connection import Connection
 from .a2s_query import A2SHandler
 from .steam_master import SteamMasterService
 from .revival_master import RevivalMasterService
+from .steam_p2p import SteamP2PService
 from .debug_parity import DebugParityManager
 from .replication import ReplicationService
 from .round_lifecycle import RoundLifecycle
@@ -358,6 +359,7 @@ class BattleSpadesServer:
         # callback cadence outside SimulationRuntime.
         self.steam_master = SteamMasterService(self)
         self.revival_master = RevivalMasterService(self)
+        self.steam_p2p = SteamP2PService(self)
         
         # Game mode
         self.mode = None
@@ -1824,6 +1826,7 @@ class BattleSpadesServer:
         # logon. Missing optional runtime files do not prevent local hosting.
         await self.steam_master.start()
         await self.revival_master.start()
+        await self.steam_p2p.start()
 
         # Auto-discover + load plugins from the plugins/ package.
         await self._load_plugins()
@@ -1890,9 +1893,12 @@ class BattleSpadesServer:
                         self.bots = None
 
                 for name, service in (
+                    ("Steam relay", getattr(self, "steam_p2p", None)),
                     ("Steam master", self.steam_master),
                     ("Revival master", self.revival_master),
                 ):
+                    if service is None:
+                        continue
                     try:
                         await service.close()
                     except Exception:
@@ -2192,7 +2198,7 @@ class BattleSpadesServer:
 
         # Reject banned IPs before we allocate any state for them.
         from server.bans import address_host
-        ban = self.ban_manager.is_banned(address_host(peer))
+        ban = self.ban_manager.is_banned(address_host(peer, self))
         if ban is not None:
             logger.info("Rejected banned client %s (%s)", peer.address, ban.get("reason"))
             try:
@@ -2205,7 +2211,7 @@ class BattleSpadesServer:
         # A vote-kick lasts "until the end of the current match" (client text).
         vote_manager = getattr(self, "vote_manager", None)
         kick_reason = getattr(vote_manager, "match_kick_reason", lambda _host: None)(
-            address_host(peer)
+            address_host(peer, self)
         )
         if kick_reason is not None:
             logger.info("Rejected vote-kicked client %s until the match ends", peer.address)
@@ -2246,6 +2252,9 @@ class BattleSpadesServer:
         """Handle disconnection (sync version for net_update)."""
         connection = self.connections.pop(peer, None)
         if not connection:
+            relay = getattr(self, "steam_p2p", None)
+            if relay is not None:
+                relay.forget_peer(peer)
             return
 
         # RECEIVE and DISCONNECT can be serviced in the same ENet pump.  A
@@ -2316,6 +2325,9 @@ class BattleSpadesServer:
             self._forget_departed_player_id(int(player.id))
         
         connection.on_disconnect()
+        relay = getattr(self, "steam_p2p", None)
+        if relay is not None:
+            relay.forget_peer(peer)
     
     def _announce_player_left(self, connection, player) -> None:
         """Retail PLAYER_LEFT "{0} has disconnected" (packet 50).

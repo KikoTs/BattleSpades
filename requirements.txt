@@ -18,6 +18,11 @@ toml>=0.10.2
 # Inspectable behavior-tree composition inside the isolated bot worker.
 py_trees>=2.5,<2.6
 
+# Desktop host window (python run_server_gui.py) and its comment-preserving
+# config.toml editor. Not needed for the console server.
+customtkinter>=5.2,<5.3
+tomlkit>=0.13,<0.14
+
 # --- development / testing (optional for just running the server) ---
 pytest>=7.0.0
 pytest-asyncio>=0.20.0

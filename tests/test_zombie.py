@@ -22,7 +22,7 @@ from server.config import ServerConfig  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer, DisplayCountdown, SetScore  # noqa: E402
+from shared.packet import ChangePlayer, DisplayCountdown, SetScore, StateData  # noqa: E402
 from server.game_constants import TEAM1, TEAM2  # noqa: E402
 
 
@@ -147,6 +147,21 @@ def test_zombie_mode_is_registered_with_asymmetric_native_snapshot():
     assert int(C.CLASS_ZOMBIE) not in info.disabled_classes
     assert int(C.CLASS_FAST_ZOMBIE) in info.disabled_classes
     assert int(C.CLASS_JUMP_ZOMBIE) in info.disabled_classes
+
+
+def test_zombie_team_sees_survivors_on_the_map_through_state_data():
+    """Retail Player.get_map_icon hides an enemy unless the viewer's team
+    can_see_other_team (player.pyx:486-489); the survivor heart (:500-503)
+    is unreachable without it. exposed_teams_always_on_minimap only
+    edge-pins already-visible markers (:532-535), so StateData must carry
+    the Zombie team's reveal bit, and only that direction."""
+    server, _mode = _new_mode()
+
+    state = build_state_data(server, player_id=3)
+    wire = StateData(ByteReader(bytes(state.generate())[1:]))
+
+    assert wire.team1_can_see_team2 is True
+    assert wire.team2_can_see_team1 is False
 
 
 def test_human_facing_zombie_alias_keeps_retail_mode_id_two():

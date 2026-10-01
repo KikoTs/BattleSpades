@@ -113,6 +113,19 @@ class VIPMode(BaseMode):
         self.vip_health_multiplier = float(server.config.mode_rule(
             "vip", "vip_health_multiplier", "RULE_VIP_HEALTH"
         ))
+        # What a live VIP's disconnect does. Retail's server rules are not
+        # recovered: the client strings only prove that a VIP *death* ends
+        # that team's respawns ("VIP is dead! No more respawns!"). "reassign"
+        # (default) crowns another member of the team so a team with anyone
+        # left always has a VIP; "death" resolves the quit as a VIP kill.
+        # Either way a team with nobody left loses its VIP.
+        self.leave_policy = str(overlay.get("leave_policy", "reassign")).lower()
+        if self.leave_policy not in {"reassign", "death"}:
+            logger.warning(
+                "Unknown [modes.vip] leave_policy %r; using 'reassign'",
+                self.leave_policy,
+            )
+            self.leave_policy = "reassign"
 
         self.phase = VIPPhase.WAITING
         self.vips: dict[int, Player | None] = {TEAM1: None, TEAM2: None}
@@ -209,7 +222,7 @@ class VIPMode(BaseMode):
             if self.ended or self.phase is not VIPPhase.ACTIVE:
                 return
             if audit_due:
-                await self._check_team_elimination()
+                await self._audit_vips()
 
     async def on_player_join(self, player: Player) -> None:
         """Start the selection countdown once both teams have a player."""
@@ -337,10 +350,12 @@ class VIPMode(BaseMode):
             )
 
     async def on_player_leave(self, player: Player) -> None:
-        """Treat a VIP disconnect as a death so quitting cannot save a team.
+        """Hand a departing VIP's crown to a teammate (``leave_policy``).
 
-        The hook may run while the departing player is still in the roster
-        (before PlayerLeft) or after removal; every count below excludes it.
+        With nobody left on the team (or ``leave_policy = "death"``) the quit
+        counts as the VIP's death, so the round still resolves. The hook may
+        run while the departing player is still in the roster (before
+        PlayerLeft) or after removal; every count below excludes it.
         """
         self._round_reset_queue = deque(
             queued for queued in self._round_reset_queue if queued is not player
@@ -354,7 +369,7 @@ class VIPMode(BaseMode):
             and self.vips.get(team) is player
             and self.vip_alive[team]
         ):
-            await self._kill_vip(team, player, killer=None)
+            await self._resolve_vip_departure(team, player)
         await self._check_team_elimination(exclude=player)
         if self.phase in (VIPPhase.WAITING, VIPPhase.SELECTING):
             await self._arm_selection_if_ready(time.monotonic(), exclude=player)
@@ -700,40 +715,117 @@ class VIPMode(BaseMode):
         self._next_escort_score = now + float(CG.VIP_SCORE_ESCORT_INTERVAL)
 
         for team in _PLAYABLE_TEAMS:
-            vip = selected[team]
-            vip_class = int(C.MAFIA_VIPS[team])
-            if bool(getattr(vip, "alive", False)):
-                self._promotion_deaths.add(int(vip.id))
-                vip.die(kill_type=KILL_CLASS_CHANGE)
-            vip.apply_class_selection(normalize_class_selection(vip_class))
-            self.server.respawn_player(vip)
-            from server.game_constants import MAX_HEALTH
-            from shared.packet import SetHP
-
-            # SetHP carries one unsigned byte. The boss's maximum is stored on
-            # the body so health crates / medpacks heal to it (not to 100).
-            vip.health = max(1, min(255, int(round(
-                MAX_HEALTH * self.vip_health_multiplier
-            ))))
-            vip.max_health = int(vip.health)
-            if vip.connection is not None:
-                packet = SetHP()
-                packet.hp = vip.health
-                packet.damage_type = 0
-                packet.source_x, packet.source_y, packet.source_z = getattr(
-                    vip, "position", (0.0, 0.0, 0.0)
-                )
-                vip.connection.send(bytes(packet.generate()))
-            self._set_vip_marker(vip, True)
-            # Teammates get the retail name line; the boss's own HUD shows
-            # VIP_YOU_ARE_VIP from the class change (hud.pyd), and retail
-            # has no string naming the enemy VIP.
-            self.announce_localised_to_team(
-                team, "VIP_NAME_IS_VIP", (str(vip.name),), exclude=vip
-            )
+            self._promote_vip(team, selected[team])
         self.vip_alive = {TEAM1: True, TEAM2: True}
         self.phase = VIPPhase.ACTIVE
         await self.broadcast_localised_message("VIP_START", override_previous=True)
+
+    def _promote_vip(self, team: int, vip: Player) -> None:
+        """Turn one team member into that team's boss and publish it.
+
+        The caller keeps ``vip_alive[team]`` False until this returns, so the
+        synthetic class-change death is not mistaken for a VIP kill.
+        """
+        vip_class = int(C.MAFIA_VIPS[team])
+        if bool(getattr(vip, "alive", False)):
+            self._promotion_deaths.add(int(vip.id))
+            vip.die(kill_type=KILL_CLASS_CHANGE)
+        vip.apply_class_selection(normalize_class_selection(vip_class))
+        self.server.respawn_player(vip)
+        from server.game_constants import MAX_HEALTH
+        from shared.packet import SetHP
+
+        # SetHP carries one unsigned byte. The boss's maximum is stored on
+        # the body so health crates / medpacks heal to it (not to 100).
+        vip.health = max(1, min(255, int(round(
+            MAX_HEALTH * self.vip_health_multiplier
+        ))))
+        vip.max_health = int(vip.health)
+        if vip.connection is not None:
+            packet = SetHP()
+            packet.hp = vip.health
+            packet.damage_type = 0
+            packet.source_x, packet.source_y, packet.source_z = getattr(
+                vip, "position", (0.0, 0.0, 0.0)
+            )
+            vip.connection.send(bytes(packet.generate()))
+        self._set_vip_marker(vip, True)
+        # Teammates get the retail name line; the boss's own HUD shows
+        # VIP_YOU_ARE_VIP from the class change (hud.pyd), and retail
+        # has no string naming the enemy VIP.
+        self.announce_localised_to_team(
+            team, "VIP_NAME_IS_VIP", (str(vip.name),), exclude=vip
+        )
+
+    def _reassign_vip(self, team: int, departed=None) -> bool:
+        """Hand a departed live VIP's crown to another member of its team.
+
+        Returns False (nothing changed) when the team has nobody left who can
+        hold it; the caller then resolves the departure as a VIP death.
+        Living members are preferred so the hand-over does not double as a
+        free respawn for a dead teammate.
+        """
+        candidates = self._team_candidates(team, exclude=departed)
+        if not candidates:
+            return False
+        living = [
+            player for player in candidates
+            if bool(getattr(player, "alive", False))
+            and bool(getattr(player, "spawned", False))
+        ]
+        successor = random.choice(living or candidates)
+        self.vip_alive[team] = False
+        self._vip_attackers[team] = {}
+        self.vips[team] = successor
+        try:
+            self._promote_vip(team, successor)
+        except Exception:
+            logger.exception(
+                "VIP hand-over failed for team %s (player %s)",
+                team, getattr(successor, "id", "?"),
+            )
+            self.vips[team] = departed
+            return False
+        self.vip_alive[team] = True
+        logger.info(
+            "VIP of team %s left; %s is the new VIP",
+            team, getattr(successor, "name", "?"),
+        )
+        return True
+
+    async def _resolve_vip_departure(self, team: int, vip) -> None:
+        """A live VIP left the round: hand the crown over, or lose the VIP."""
+        if self.leave_policy == "reassign" and self._reassign_vip(team, vip):
+            return
+        await self._kill_vip(team, vip, killer=None)
+
+    async def _audit_vips(self) -> None:
+        """Safety net: a live VIP that vanished without a leave hook.
+
+        Plugins and roster paths that drop a player without calling
+        ``on_player_leave`` would otherwise leave a ghost crown: the team
+        keeps respawning, nobody can kill its VIP and the sub-round never
+        ends.
+        """
+        for team in _PLAYABLE_TEAMS:
+            vip = self.vips.get(team)
+            if (
+                self.ended
+                or self.phase is not VIPPhase.ACTIVE
+                or vip is None
+                or not self.vip_alive.get(team, False)
+            ):
+                continue
+            connection = getattr(vip, "connection", None)
+            if (
+                self._is_connected(vip)
+                and int(getattr(vip, "team", -1)) == team
+                and connection is not None
+                and bool(getattr(connection, "in_game", True))
+            ):
+                continue
+            await self._resolve_vip_departure(team, vip)
+        await self._check_team_elimination()
 
     async def _kill_vip(
         self,

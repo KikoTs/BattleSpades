@@ -34,7 +34,8 @@ def _load_retail_fixes():
         for name, switch in [('aos_mousefix', 'legacymouse'),
                              ('aos_equipmentfix', 'legacyequipment'),
                              ('aos_uifix', 'legacyui'),
-                             ('aos_movementfix', 'legacymovement')]:
+                             ('aos_movementfix', 'legacymovement'),
+                             ('aos_networkfix', 'legacynetwork')]:
             if getattr(sys, '_' + name + '_loaded', False):
                 continue
             if switch in arguments or os.path.isfile(os.path.join(root, name + '.disabled')):
@@ -57,6 +58,8 @@ def _load_retail_fixes():
             sys._aos_retail_runtime = runtime
         for name in pending:
             try:
+                if name == 'aos_networkfix':
+                    load_source('aos_steam_bridge')
                 module = load_source(name)
                 module.install(runtime)
                 setattr(sys, '_' + name + '_loaded', True)

@@ -14,9 +14,14 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def address_host(peer) -> str:
+def address_host(peer, server=None) -> str:
     """A stable per-client key from an ENet peer address (IP without the
     ephemeral source port)."""
+    relay = getattr(server, 'steam_p2p', None)
+    if relay is not None:
+        identity = relay.identity_for(peer)
+        if identity is not None:
+            return identity
     try:
         addr = str(peer.address)
     except Exception:

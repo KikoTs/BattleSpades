@@ -9,15 +9,38 @@ and emits only missing transitions when that client enters the game scene.
 
 from __future__ import annotations
 
+import itertools
+
 from shared.packet import CreatePlayer, KillAction, PlayerLeft
+
+_ROSTER_IDENTITIES = itertools.count(1)
+
+
+def roster_identity(player) -> int:
+    """Return a process-unique number for one Player object.
+
+    ``id()`` is not enough: CPython hands a retired bot's memory straight to
+    the next Player, so a bot backfilled on the same wire id could alias the
+    one it replaced and never be announced to a peer that was loading.
+    """
+
+    identity = getattr(player, "_roster_identity", None)
+    if isinstance(identity, int):
+        return identity
+    identity = next(_ROSTER_IDENTITIES)
+    try:
+        player._roster_identity = identity
+    except AttributeError:
+        return id(player)
+    return identity
 
 
 def player_life_token(player) -> tuple[int, int]:
     """Return a process-local identity for one concrete spawned life."""
 
-    # Player ids are reused. Object identity prevents a new player whose first
-    # life is also generation one from aliasing the disconnected old player.
-    return (id(player), int(getattr(player, "replication_generation", 0)))
+    # Player ids are reused. A per-object identity prevents a new player whose
+    # first life is also generation one from aliasing the departed old player.
+    return (roster_identity(player), int(getattr(player, "replication_generation", 0)))
 
 
 def known_player_lives(connection) -> dict[int, tuple[int, int]]:
@@ -131,11 +154,25 @@ def catch_up_roster(server, connection) -> None:
     known_deaths = known_player_deaths(connection)
     local_player = getattr(connection, "player", None)
     local_id = getattr(local_player, "id", None)
-    current_ids = {int(player_id) for player_id in server.players}
+    occupants = {int(player_id): player for player_id, player in server.players.items()}
 
     for stale_id in tuple(known):
-        if stale_id == local_id or stale_id in current_ids:
+        if stale_id == local_id:
             continue
+        occupant = occupants.get(stale_id)
+        entry = known.get(stale_id)
+        if (
+            occupant is not None
+            and isinstance(entry, tuple)
+            and entry
+            and entry[0] == roster_identity(occupant)
+        ):
+            continue
+        # Departed while this peer loaded, or the id now belongs to a
+        # different Player (a bot retired and another backfilled on the same
+        # number). The second case must not reach the client as a respawn of
+        # the entry it already has: retire that entry first, exactly as the
+        # live PlayerLeft -> CreatePlayer pair does for in-game peers.
         packet = PlayerLeft()
         packet.player_id = stale_id
         connection.send(bytes(packet.generate()), reliable=True)

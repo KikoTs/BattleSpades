@@ -635,7 +635,7 @@ def _track_key(player) -> str:
         try:
             from server.bans import address_host
 
-            host = address_host(peer)
+            host = address_host(peer, getattr(connection, 'server', None))
             if host and host != "unknown":
                 return f"ip:{host}:{getattr(player, 'name', '')}"
         except Exception:  # noqa: BLE001
