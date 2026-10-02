@@ -166,4 +166,4 @@ def test_freezer_includes_stable_stamp_without_changing_internal_version():
     spec = (root / "BattleSpades.spec").read_text(encoding="utf-8")
     assert "from server.build_info import write_build_info" in spec
     assert 'datas.append((str(build_info_path), "."))' in spec
-    assert (root / "VERSION").read_text().strip() == "0.2.1-beta.3"
+    assert (root / "VERSION").read_text().strip() == "0.2.1-beta.4"
