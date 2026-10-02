@@ -123,7 +123,7 @@ def test_server_consumes_runtime_owned_bans_and_prefabs(
 def test_version_has_expected_prerelease_value() -> None:
     """All release metadata reads one canonical SemVer prerelease value."""
 
-    assert read_version(PROJECT_ROOT) == "0.2.1-beta.3"
+    assert read_version(PROJECT_ROOT) == "0.2.1-beta.4"
 
 
 @pytest.mark.parametrize("value", ["", "0.0.1 alpha", "0.0.1\nother"])
