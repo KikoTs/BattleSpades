@@ -192,7 +192,20 @@ async def simulate(scenario: str, *, seconds: float = 90.0) -> SchematicPhysicsR
         def strategic(frame, observer, *args, **kwargs):
             return _decision_for(scenario, observer, vip_id, posts)
 
+        # Bot planning stops after a slice of real CPU time (perf_counter
+        # budgets in navigation and recovery). Measured for real, a slow CI
+        # machine plans less per simulated second and the same scenario
+        # finished late on one platform or another. A counter that advances
+        # one microsecond per read makes every machine plan like the same
+        # fast one, so the gate is deterministic.
+        cpu_clock = [0.0]
+
+        def fake_perf_counter():
+            cpu_clock[0] += 1e-6
+            return cpu_clock[0]
+
         with patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(time, "perf_counter", side_effect=fake_perf_counter), \
                 patch.object(brain.mode_policy, "decide", side_effect=strategic):
             for tick in range(math.ceil(seconds * 60)):
                 clock[0] = now = base + tick / 60
