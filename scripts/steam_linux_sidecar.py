@@ -51,6 +51,20 @@ _REGION_ALIASES = {
 }
 
 
+def write_status(path: Path, state: tuple, game_port: int) -> None:
+    """Atomically publish login state and SteamID for the server heartbeat."""
+    temporary = path.with_name(path.name + ".tmp")
+    payload = {"logged_on": bool(state[0]), "steam_id": str(int(state[1] or 0)),
+               "game_port": int(game_port), "updated": time.time()}
+    try:
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        # The game server runs as another user; the SteamID is public.
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except OSError as error:
+        print(json.dumps({"status_file_error": str(error)}), flush=True)
+
+
 def canonical_mode(value: str) -> str:
     """Resolve the public gameplay codes and aliases used by the server."""
     code = value.strip().lower()
@@ -262,6 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the standalone CLI without contacting an upstream or Steam."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--status-file", type=Path, default=None,
+                        help="write login state and the server SteamID here for the game "
+                             "server's heartbeat ([revival] steam_sidecar_status)")
     parser.add_argument("--bind-ip", type=ipaddress.IPv4Address, default="0.0.0.0",
                         help="Locally assigned IPv4 for Steam traffic and queries; use one per listing")
     parser.add_argument("--source-host", default="127.0.0.1")
@@ -300,13 +317,18 @@ def main(argv: list[str] | None = None) -> int:
         last_logged_on = time.monotonic()
         state = None
         failures = 0
+        status_written = 0.0
         while running:
             current = steam.poll()
             if current != state:
                 print(json.dumps({"logged_on": current[0], "steam_id": current[1],
                                   "public_ip_integer": current[2]}), flush=True)
                 state = current
+                status_written = 0.0
             now = time.monotonic()
+            if args.status_file is not None and now - status_written >= 30.0:
+                write_status(args.status_file, current, args.game_port)
+                status_written = now
             if current[0]:
                 last_logged_on = now
             elif now - last_logged_on > 120:

@@ -434,7 +434,42 @@ class RevivalMasterService:
             "monitor": False,
             "beta": False,
             "tags": tags,
+            **self._steam_registration(),
         }
+
+    #: A sidecar status older than this is a sidecar that stopped.
+    STEAM_STATUS_MAX_AGE_SECONDS = 180.0
+
+    def _steam_registration(self) -> dict:
+        """The SteamID our Steam sidecar registered with Valve, if it is live.
+
+        Lets clients match Valve's server list (which they read through
+        Steam, even where aosplay.net is blocked) to this listing. Missing,
+        stale, logged-off or malformed status registers nothing.
+        """
+
+        import json
+        import os
+        import time
+
+        path = str(getattr(self.config, "steam_sidecar_status", "") or "").strip()
+        path = path or os.environ.get("AOS_STEAM_SIDECAR_STATUS", "").strip()
+        if not path:
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                status = json.load(handle)
+            age = time.time() - float(status.get("updated", 0.0))
+            steam_id = int(status.get("steam_id") or 0)
+            if not status.get("logged_on") or steam_id <= 0 or not 0.0 <= age <= self.STEAM_STATUS_MAX_AGE_SECONDS:
+                return {}
+            registration = {"steam_server_id": str(steam_id)}
+            game_port = int(status.get("game_port") or 0)
+            if 0 < game_port < 65536:
+                registration["steam_game_port"] = game_port
+            return registration
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {}
 
     async def publish_heartbeat(self) -> None:
         heartbeat = self.heartbeat_payload()

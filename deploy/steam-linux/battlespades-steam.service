@@ -12,11 +12,14 @@ User=battlespades-steam
 Group=battlespades-steam
 StateDirectory=battlespades-steam
 StateDirectoryMode=0700
+# Status for the game server's heartbeat (public SteamID only, world-readable).
+RuntimeDirectory=battlespades-steam
+RuntimeDirectoryMode=0755
 WorkingDirectory=/var/lib/battlespades-steam
 Environment=HOME=/var/lib/battlespades-steam
 Environment=LD_LIBRARY_PATH=/opt/battlespades-steam/runtime
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 -u /opt/battlespades-steam/steam_linux_sidecar.py --runtime /opt/battlespades-steam/runtime --source-port 27015 --mode tdm --region europe
+ExecStart=/usr/bin/python3 -u /opt/battlespades-steam/steam_linux_sidecar.py --runtime /opt/battlespades-steam/runtime --source-port 27015 --mode tdm --region europe --status-file /run/battlespades-steam/status.json
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=15

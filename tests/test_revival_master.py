@@ -425,3 +425,32 @@ def test_private_local_match_never_publishes_or_captures_account_results(tmp_pat
         await service.close()
 
     asyncio.run(scenario())
+
+
+def test_heartbeat_registers_a_live_steam_sidecar_id(monkeypatch, tmp_path):
+    import json
+    import time
+
+    monkeypatch.setenv("AOS_MASTER_WRITE_TOKEN", "x" * 48)
+    status = tmp_path / "steam-status.json"
+    monkeypatch.setenv("AOS_STEAM_SIDECAR_STATUS", str(status))
+    service = RevivalMasterService(make_server())
+
+    assert "steam_server_id" not in service.heartbeat_payload()  # no file yet
+
+    status.write_text(json.dumps({"logged_on": True, "steam_id": "90266228340001",
+                                  "game_port": 32887, "updated": time.time()}))
+    payload = service.heartbeat_payload()
+    assert payload["steam_server_id"] == "90266228340001"
+    assert payload["steam_game_port"] == 32887
+
+    status.write_text(json.dumps({"logged_on": False, "steam_id": "90266228340001",
+                                  "game_port": 32887, "updated": time.time()}))
+    assert "steam_server_id" not in service.heartbeat_payload()
+
+    status.write_text(json.dumps({"logged_on": True, "steam_id": "90266228340001",
+                                  "game_port": 32887, "updated": time.time() - 3600}))
+    assert "steam_server_id" not in service.heartbeat_payload()  # sidecar stopped
+
+    status.write_text("not json")
+    assert "steam_server_id" not in service.heartbeat_payload()

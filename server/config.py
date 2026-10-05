@@ -387,6 +387,10 @@ class RevivalMasterConfig:
     heartbeat_interval_seconds: float = 30.0
     request_timeout_seconds: float = 5.0
     results_path: str = "state/round-results.sqlite3"
+    #: Status file the Linux Steam sidecar writes (``--status-file``). When it
+    #: reports a logged-on SteamID, the heartbeat registers that id so clients
+    #: can match Valve's server list to ours. Also AOS_STEAM_SIDECAR_STATUS.
+    steam_sidecar_status: str = ""
 
 
 @dataclass
@@ -1588,6 +1592,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         config.revival.require_identity = bool(
             revival.get("require_identity", config.revival.require_identity)
         )
+        config.revival.steam_sidecar_status = str(
+            revival.get("steam_sidecar_status", config.revival.steam_sidecar_status)
+        ).strip()
         config.revival.heartbeat_interval_seconds = min(
             60.0,
             max(
