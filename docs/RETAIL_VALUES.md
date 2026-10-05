@@ -50,6 +50,7 @@ were already at 60 s because only the sample config overrode it.
 | Setting | Retail (source) | Code default | Shipped | Status |
 |---|---|---|---|---|
 | Respawn time `RULE_RESPAWN_TIMES` | 10 s (`C.DEFAULT_RESPAWN_TIME`; choices 0-60 step 5) | 5 | 5 | deliberate: historic BattleSpades pace, see `GameRules.server_defaults` |
+| Classic Deuce weapons `RULE_ENABLE_WEAPON_CLASSIC_SMG` / `RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN` | OFF (`classic.txt` playlist; `constants_matchmaking`) | OFF | ON in `official-cctf.toml` | deliberate: players asked for the Deuce rifle/SMG/shotgun choice on the official Classic CTF servers; other configs keep retail OFF |
 | Spawn protection `RULE_SPAWN_PROTECTION_TIME` | 3 s (OFF/1/2/3) | 0 (bare/test servers) | 3 | retail when shipped; ends early when the player attacks or picks up an objective |
 | Crate respawn `RULE_CRATES_SPAWN_TIME` | 25 s (`C.CRATE_SPAWN_DELAY`; 10-60 step 5) | 25 | 25 | fixed |
 | Block health `RULE_BLOCK_HEALTH` | 100% (50/100/200) | 100% | 100% | retail |
