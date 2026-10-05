@@ -1131,7 +1131,7 @@ class ZombieMode(BaseMode):
                 reason=int(C.ZOM_SURVIVE_SCORE_REASON),
             )
         if self.rounds_played >= self.score_limit:
-            await self.on_mode_end(winner)
+            await self.on_mode_end(self._match_winner())
             return
         logger.info(
             "Zombie round %d/%d won by team %s; next round in %.1fs",
@@ -1141,6 +1141,19 @@ class ZombieMode(BaseMode):
             self.round_intermission,
         )
         self._round_task = asyncio.ensure_future(self._round_intermission_task())
+
+    def _match_winner(self) -> int | None:
+        """The team that won more rounds; None on a tie.
+
+        The match used to go to whoever won the last round, so zombies
+        winning 2-1 could still end on "Survivors win".
+        """
+
+        zombies = self.server.teams[ZOMBIE_TEAM].score
+        survivors = self.server.teams[SURVIVOR_TEAM].score
+        if zombies == survivors:
+            return None
+        return ZOMBIE_TEAM if zombies > survivors else SURVIVOR_TEAM
 
     async def _round_intermission_task(self) -> None:
         try:

@@ -533,3 +533,38 @@ def test_demolition_block_credit_is_not_inherited_by_a_reused_id(monkeypatch):
     assert _decode(server.packets, SetScore) == [] or all(
         row.specifier != 1 or row.value == 0 for row in _decode(server.packets, SetScore)
     )
+
+
+def test_zombie_match_goes_to_the_team_with_more_rounds():
+    server, mode = _zombie_active(rounds=3)
+    ended = []
+
+    async def record_end(winner=None):
+        ended.append(winner)
+
+    mode.on_mode_end = record_end
+    server.teams[ZOMBIE_TEAM].score = 2
+    server.teams[SURVIVOR_TEAM].score = 0
+    mode.rounds_played = 2
+    # Survivors take the last round, but zombies won the match 2-1.
+    asyncio.run(mode._finish_round(SURVIVOR_TEAM, "SURVIVOR_WIN"))
+    task = mode._round_task
+    if task is not None:
+        task.cancel()
+    assert ended == [ZOMBIE_TEAM]
+
+
+def test_diamond_explains_itself_once_on_first_spawn():
+    from types import SimpleNamespace
+
+    from modes.diamond_mine import DiamondMineMode
+    from shared.packet import HelpMessage
+
+    sent = []
+    player = SimpleNamespace(send=lambda payload, reliable=False: sent.append(payload))
+    mode = DiamondMineMode.__new__(DiamondMineMode)
+    asyncio.run(mode.on_player_spawn(player))
+    asyncio.run(mode.on_player_spawn(player))
+    help_packets = _decode(sent, HelpMessage)
+    assert len(sent) == 1 and help_packets
+    assert list(help_packets[0].message_ids)[0] == "DIAMOND_TUTORIAL"

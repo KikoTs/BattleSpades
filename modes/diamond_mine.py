@@ -377,6 +377,28 @@ class DiamondMineMode(BaseMode):
                 self._KILL_EVENT_AMOUNTS, self._KILL_EVENT_REASONS, mode=self,
             )
 
+    #: Shown once per connection on its first spawn. Players asked what to do
+    #: in this mode: the loading-screen infographic is easy to skip and the
+    #: only in-game hint was the short "Dig for diamonds!" banner.
+    HELP_MESSAGE_IDS = (
+        "DIAMOND_TUTORIAL",
+        "DIA_INFOGRAPHIC_TEXT1",
+        "DIA_INFOGRAPHIC_TEXT2",
+        "DIA_INFOGRAPHIC_TEXT3",
+    )
+
+    async def on_player_spawn(self, player) -> None:
+        await super().on_player_spawn(player)
+        if getattr(player, "_diamond_help_shown", False):
+            return
+        player._diamond_help_shown = True
+        from shared.packet import HelpMessage
+
+        packet = HelpMessage()
+        packet.delay = 0.0
+        packet.message_ids = list(self.HELP_MESSAGE_IDS)
+        player.send(bytes(packet.generate()), reliable=True)
+
     async def on_player_leave(self, player) -> None:
         await self._drop_carried_diamond(player)
 
