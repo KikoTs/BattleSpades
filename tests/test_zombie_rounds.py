@@ -467,15 +467,28 @@ def test_death_of_departed_survivor_is_ignored():
     assert victim.team == SURVIVOR_TEAM
 
 
-def test_zombie_kill_does_not_add_generic_kill_score():
+def test_survivor_zombie_kill_earns_the_generic_kill_score():
+    import shared.constants_gamemode as CG
+
     server, mode = _active_mode(3)
     zombie = next(p for p in server.players.values() if p.team == ZOMBIE_TEAM)
     survivor = next(p for p in server.players.values() if p.team == SURVIVOR_TEAM)
     survivor.score = 0
     asyncio.run(mode.on_player_kill(survivor, zombie, int(C.KILL.WEAPON_KILL)))
-    # Not the last man: no ZOM award, and no generic per-kill score either.
-    assert survivor.score == 0
+    # Not the last man: no ZOM bonus, but the generic kill score the loading
+    # screen lists (it used to pay nothing at all).
+    assert survivor.score == int(CG.GENERIC_SCORE_KILL)
     assert "on_player_kill" in ZombieMode.__dict__
+
+
+def test_zombie_kill_of_a_survivor_does_not_stack_the_generic_score():
+    server, mode = _active_mode(3)
+    zombie = next(p for p in server.players.values() if p.team == ZOMBIE_TEAM)
+    survivor = next(p for p in server.players.values() if p.team == SURVIVOR_TEAM)
+    zombie.score = 0
+    asyncio.run(mode.on_player_kill(zombie, survivor, int(C.KILL.WEAPON_KILL)))
+    # Zombies score only through ZOM_SCORE_SURVIVORKILL (on_player_death).
+    assert zombie.score == 0
 
 
 def test_outbreak_retry_does_not_reannounce_every_tick():
