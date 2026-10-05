@@ -47,3 +47,20 @@ The optional binding's ABI call order and IPv4 encoding have unit coverage.
 Multiple simultaneous public-IP registrations still require a deployment
 check: verify each Steam endpoint, A2S response and retail join before
 migrating players or retiring an old host.
+
+## Registering the SteamID with the AoSPlay list
+
+The sidecar writes its login state and the SteamID Valve assigned to
+`/run/battlespades-steam/status.json` (`--status-file`). Point the game server
+at it so its heartbeat registers that id:
+
+```toml
+[revival]
+steam_sidecar_status = "/run/battlespades-steam/status.json"
+```
+
+or set `AOS_STEAM_SIDECAR_STATUS` in the server's environment. The heartbeat
+only sends `steam_server_id` / `steam_game_port` while the sidecar reports a
+logged-on id refreshed within the last three minutes. Clients use it to match
+Valve's server list (which they can read through Steam even where aosplay.net
+is blocked) to the AoSPlay listing.
