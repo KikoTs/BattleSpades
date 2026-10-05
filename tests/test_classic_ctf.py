@@ -43,8 +43,24 @@ def test_classic_ctf_registry_uses_ctf_scene_with_classic_switches() -> None:
     assert state.team2_locked_class is False
     assert state.score_limit == 5
     assert server.mode.score_limit == 5
+    # The Deuce weapon choice is on unless an operator turns it off.
+    assert int(C.CLASSIC_SMG_TOOL) not in info.disabled_tools
+    assert int(C.CLASSIC_SHOTGUN_TOOL) not in info.disabled_tools
+
+
+def test_classic_weapons_stay_off_when_an_operator_says_so() -> None:
+    from server.game_rules import GameRules
+
+    config = ServerConfig(default_mode="cctf")
+    rules = GameRules.server_defaults()
+    rules.values["RULE_ENABLE_WEAPON_CLASSIC_SMG"] = False
+    rules.explicit.add("RULE_ENABLE_WEAPON_CLASSIC_SMG")
+    config.game_rules = rules
+    server = BattleSpadesServer(config)
+    server.mode = ClassicCTFMode(server)
+    info = build_initial_info(server)
     assert int(C.CLASSIC_SMG_TOOL) in info.disabled_tools
-    assert int(C.CLASSIC_SHOTGUN_TOOL) in info.disabled_tools
+    assert int(C.CLASSIC_SHOTGUN_TOOL) not in info.disabled_tools
 
 
 def test_classic_selection_forces_deuce_rifle_grenade_and_spade() -> None:
@@ -60,8 +76,6 @@ def test_classic_selection_forces_deuce_rifle_grenade_and_spade() -> None:
     assert int(C.RIFLE_TOOL) in selected.loadout
     assert int(C.CLASSIC_GRENADE_TOOL) in selected.loadout
     assert int(C.CLASSIC_SPADE_TOOL) in selected.loadout
-    assert int(C.CLASSIC_SMG_TOOL) not in selected.loadout
-    assert int(C.CLASSIC_SHOTGUN_TOOL) not in selected.loadout
     assert mode.allows_class_selection(
         SimpleNamespace(team=TEAM1), selected
     )
@@ -239,3 +253,16 @@ def test_classic_weapon_rules_open_the_deuce_weapon_choice() -> None:
     selected = server.mode.prepare_join_selection(TEAM2, smg)
     assert int(C.CLASSIC_SMG_TOOL) in selected.loadout
     assert server.mode.allows_class_selection(SimpleNamespace(team=TEAM2), selected)
+
+
+def test_default_classic_server_keeps_a_chosen_smg_through_join_normalisation() -> None:
+    from server.class_selection import normalize_server_selection
+
+    server = _native_server()
+    selection = normalize_server_selection(
+        server.config,
+        int(C.CLASS_CLASSIC_SOLDIER),
+        (int(C.CLASSIC_SMG_TOOL), int(C.CLASSIC_GRENADE_TOOL)),
+    )
+    selected = server.mode.prepare_join_selection(TEAM1, selection)
+    assert int(C.CLASSIC_SMG_TOOL) in selected.loadout

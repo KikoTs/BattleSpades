@@ -390,13 +390,20 @@ class ZombieMode(BaseMode):
         victim: Player,
         kill_type: int,
     ) -> None:
-        """Award the recovered bonus for a last survivor killing a zombie.
+        """Pay survivors for zombie kills, plus the last-survivor bonus.
 
-        Deliberately does not call ``BaseMode.on_player_kill``: Zombie scores
-        only through its own ZOM_SCORE_* rules (the survivor-kill award lives
-        in ``on_player_death``), so the generic per-kill score must not stack
-        on top.
+        A survivor killing a zombie earns the generic kill/headshot/melee
+        score the loading screen lists for every mode; it used to earn
+        nothing at all. Zombies keep only their own ZOM_SCORE_SURVIVORKILL
+        (awarded in ``on_player_death``), so nothing stacks for them.
         """
+        if (
+            not self.ended
+            and self.phase is ZombiePhase.ACTIVE
+            and int(killer.team) == SURVIVOR_TEAM
+            and int(victim.team) == ZOMBIE_TEAM
+        ):
+            self.award_generic_kill_score(killer, victim, kill_type, mode_opted_in=True)
         if (
             not self.ended
             and self.phase is ZombiePhase.ACTIVE

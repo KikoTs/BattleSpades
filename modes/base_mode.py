@@ -273,11 +273,11 @@ class BaseMode(ABC):
 
     # Retail generic personal scores (shared/constants_gamemode.py).
 
-    def _generic_scoring_blocked(self, *players, kill_type: int) -> bool:
+    def _generic_scoring_blocked(self, *players, kill_type: int, mode_opted_in: bool = False) -> bool:
         import shared.constants as C
         from server.game_constants import TEAM1, TEAM2
 
-        if self.ended or not self.generic_scoring_enabled:
+        if self.ended or not (self.generic_scoring_enabled or mode_opted_in):
             return True
         config = getattr(self.server, "config", None)
         if bool(getattr(config, "ugc_runtime", False)) or str(
@@ -295,10 +295,12 @@ class BaseMode(ABC):
             for player in players
         )
 
-    def award_generic_kill_score(self, killer, victim, kill_type: int) -> int:
+    def award_generic_kill_score(self, killer, victim, kill_type: int, *, mode_opted_in: bool = False) -> int:
         """Give ``killer`` GENERIC_SCORE_KILL/HEADSHOT/MELEE for an enemy kill.
 
         Returns the points awarded (0 when the kill is not eligible).
+        ``mode_opted_in`` lets a mode with its own economy (Zombie) pay the
+        generic score for the kills it chooses.
         """
         import shared.constants as C
         import shared.constants_gamemode as CG
@@ -306,7 +308,7 @@ class BaseMode(ABC):
 
         if killer is None or victim is None or killer is victim:
             return 0
-        if self._generic_scoring_blocked(killer, victim, kill_type=kill_type):
+        if self._generic_scoring_blocked(killer, victim, kill_type=kill_type, mode_opted_in=mode_opted_in):
             return 0
         if int(killer.team) == int(victim.team):
             return 0
