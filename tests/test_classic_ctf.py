@@ -37,8 +37,10 @@ def test_classic_ctf_registry_uses_ctf_scene_with_classic_switches() -> None:
     assert info.allow_shooting_holding_intel == 1
     assert state.team1_classes == [int(C.CLASS_CLASSIC_SOLDIER)]
     assert state.team2_classes == [int(C.CLASS_CLASSIC_SOLDIER)]
-    assert state.team1_locked_class is True
-    assert state.team2_locked_class is True
+    # Not locked, so SelectClass can offer the weapon choice when the rules
+    # enable it; with the rifle alone the client spawns straight away.
+    assert state.team1_locked_class is False
+    assert state.team2_locked_class is False
     assert state.score_limit == 5
     assert server.mode.score_limit == 5
     assert int(C.CLASSIC_SMG_TOOL) in info.disabled_tools
@@ -212,3 +214,28 @@ def test_classic_one_hz_refresh_is_hud_safe_and_round_ends_at_limit(
     asyncio.run(mode.on_tick(2))
     assert ended == [float(mode.time_limit)]
     assert mode.ended
+
+
+def test_classic_weapon_rules_open_the_deuce_weapon_choice() -> None:
+    from server.game_rules import GameRules
+
+    config = ServerConfig(default_mode="cctf")
+    rules = GameRules.server_defaults()
+    rules.values["RULE_ENABLE_WEAPON_CLASSIC_SMG"] = True
+    rules.values["RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN"] = True
+    config.game_rules = rules
+    server = BattleSpadesServer(config)
+    server.mode = ClassicCTFMode(server)
+
+    info = build_initial_info(server)
+    assert int(C.CLASSIC_SMG_TOOL) not in info.disabled_tools
+    assert int(C.CLASSIC_SHOTGUN_TOOL) not in info.disabled_tools
+    assert int(C.FLAREBLOCK_TOOL) in info.disabled_tools
+
+    smg = normalize_class_selection(
+        int(C.CLASS_CLASSIC_SOLDIER),
+        (int(C.CLASSIC_SMG_TOOL), int(C.CLASSIC_GRENADE_TOOL)),
+    )
+    selected = server.mode.prepare_join_selection(TEAM2, smg)
+    assert int(C.CLASSIC_SMG_TOOL) in selected.loadout
+    assert server.mode.allows_class_selection(SimpleNamespace(team=TEAM2), selected)

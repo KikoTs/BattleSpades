@@ -44,4 +44,6 @@ file = "official-cctf.log"
 console = false
 
 [game_rules]
+RULE_ENABLE_WEAPON_CLASSIC_SMG = "ON"       # Deuce weapon choice: rifle, SMG or shotgun
+RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN = "ON"
 RULE_SPAWN_PROTECTION_TIME = "3"   # OFF, 1, 2, 3 s; ends early when the player attacks

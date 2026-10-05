@@ -30,6 +30,13 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTED_DEVIATIONS = {
     "RULE_RESPAWN_TIMES": 5,
 }
+# Deliberate deviations a shipped config may make while the server default
+# stays retail (docs/RETAIL_VALUES.md): official Classic CTF offers the Deuce
+# weapon choice.
+CONFIG_ONLY_DEVIATIONS = {
+    "RULE_ENABLE_WEAPON_CLASSIC_SMG": True,
+    "RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN": True,
+}
 # Code-only default for bare ServerConfig() test servers; every shipped
 # config turns the retail 3-second window back on.
 CODE_ONLY_DEVIATIONS = {"RULE_SPAWN_PROTECTION_TIME": 0.0}
@@ -152,10 +159,9 @@ def test_shipped_config_rules_are_retail_except_documented(path):
     retail = GameRules.retail_defaults()
     for key in RULE_DEFINITIONS:
         value = config.game_rules.get(key)
-        if key in DOCUMENTED_DEVIATIONS:
-            assert _same(value, DOCUMENTED_DEVIATIONS[key]) or _same(
-                value, retail.get(key)
-            ), key
+        documented = DOCUMENTED_DEVIATIONS.get(key, CONFIG_ONLY_DEVIATIONS.get(key))
+        if documented is not None:
+            assert _same(value, documented) or _same(value, retail.get(key)), key
             continue
         assert _same(value, retail.get(key)), (key, value, retail.get(key))
     assert config.respawn_time == float(config.game_rules.get("RULE_RESPAWN_TIMES"))

@@ -28,8 +28,6 @@ _CLASSIC_DISABLED_TOOLS = (
     # Classic has no Flare Block: selectClass shows no tile for the Classic
     # Soldier and CLASS_CLASSIC_COMMON_TOOLS does not carry tool 22.
     int(C.FLAREBLOCK_TOOL),
-    int(C.CLASSIC_SMG_TOOL),
-    int(C.CLASSIC_SHOTGUN_TOOL),
 )
 
 
@@ -37,8 +35,10 @@ class ClassicCTFMode(CTFMode):
     """Run the shipped ``classic.txt`` playlist on the CTF wire protocol.
 
     Both teams use the single Deuce class.  The playlist enables shooting
-    while carrying intel, disables Classic SMG/shotgun, and turns off the
-    ordinary 60-second dropped-intel return.  All hooks run on the gameplay
+    while carrying intel and turns off the ordinary 60-second dropped-intel
+    return. The Classic SMG and shotgun follow RULE_ENABLE_WEAPON_CLASSIC_SMG
+    and RULE_ENABLE_WEAPON_CLASSIC_SHOTGUN (OFF by default, as in the shipped
+    playlist); with either ON the Deuce gets the rifle/SMG/shotgun choice.  All hooks run on the gameplay
     tick and accept only normalized class selections.
     """
 
@@ -79,6 +79,15 @@ class ClassicCTFMode(CTFMode):
         ):
             self.score_limit = 5
 
+    def _disabled_tools(self) -> tuple[int, ...]:
+        """Classic's fixed exclusions plus every tool the game rules turn off."""
+
+        from server.game_rules import get_rules
+
+        disabled = set(_CLASSIC_DISABLED_TOOLS)
+        disabled.update(int(tool) for tool in get_rules(self.server.config).selection_disabled_tools())
+        return tuple(sorted(disabled))
+
     def prepare_join_selection(
         self,
         team: int,
@@ -93,7 +102,7 @@ class ClassicCTFMode(CTFMode):
             selection.loadout,
             selection.prefabs,
             selection.ugc_tools,
-            disabled_tools=_CLASSIC_DISABLED_TOOLS,
+            disabled_tools=self._disabled_tools(),
         )
 
     def allows_class_selection(
@@ -108,13 +117,19 @@ class ClassicCTFMode(CTFMode):
         return selection == self.prepare_join_selection(player.team, selection)
 
     def configure_state_data(self, packet) -> None:
-        """Expose one locked Deuce class to both native team menus."""
+        """Expose the single Deuce class to both native team menus.
+
+        The class is not locked: a locked team never opens SelectClass, which
+        hid the weapon choice when the rules enable the Classic SMG/shotgun.
+        With the rifle alone the client still spawns without a menu
+        (GameScene.class_selection_has_choices).
+        """
 
         classes = [int(C.CLASS_CLASSIC_SOLDIER)]
         packet.team1_classes = classes
         packet.team2_classes = list(classes)
-        packet.team1_locked_class = True
-        packet.team2_locked_class = True
+        packet.team1_locked_class = False
+        packet.team2_locked_class = False
 
     def configure_initial_info(self, packet) -> None:
         """Apply the shipped Classic playlist feature and weapon switches."""
@@ -125,7 +140,7 @@ class ClassicCTFMode(CTFMode):
         packet.enable_minimap = 0
         packet.allow_shooting_holding_intel = int(self.shoot_with_intel)
         disabled = list(packet.disabled_tools)
-        for tool in _CLASSIC_DISABLED_TOOLS:
+        for tool in self._disabled_tools():
             if int(tool) not in disabled:
                 disabled.append(int(tool))
         packet.disabled_tools = disabled
