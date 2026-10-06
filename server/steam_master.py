@@ -154,6 +154,13 @@ def build_game_tags(config: "ServerConfig", mode_code: Optional[str] = None) -> 
     encoded = ";".join(tags)
     if len(encoded.encode("utf-8")) >= 128:
         raise ValueError("Steam game tags exceed the legacy 127-byte limit")
+    # Relay host SteamIDs (server/steam_host.py), so a client that only sees
+    # Steam's server list can still join through Steam. Dropped, never fatal,
+    # when they would not fit.
+    for relay in getattr(config, "steam_relay_tags", ()) or ():
+        longer = encoded + ";" + str(relay)
+        if len(longer.encode("utf-8")) < 128:
+            encoded = longer
     return encoded
 
 

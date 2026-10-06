@@ -58,6 +58,13 @@ class SteamP2PService:
 
     def identity_for(self, peer) -> str | None:
         """Pin an identity to the ENet peer, even after its UDP port retires."""
+        # Dedicated-server relay hosts (server/steam_host.py) share this lookup,
+        # so bans, vote kicks and lockouts see ``steam:<id>`` for their players.
+        host = getattr(self.server, 'steam_host', None)
+        if host is not None:
+            identity = host.identity_for(peer)
+            if identity is not None:
+                return identity
         if not self.routes and not self.peers:
             return None
         cached = self.peers.get(peer)
@@ -74,6 +81,9 @@ class SteamP2PService:
 
     def forget_peer(self, peer) -> None:
         self.peers.pop(peer, None)
+        host = getattr(self.server, 'steam_host', None)
+        if host is not None:
+            host.forget_peer(peer)
 
     def metadata(self) -> list[str]:
         config = self.server.config

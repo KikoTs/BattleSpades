@@ -51,6 +51,7 @@ from .connection import Connection
 from .a2s_query import A2SHandler
 from .steam_master import SteamMasterService
 from .revival_master import RevivalMasterService
+from .steam_host import SteamHostService
 from .steam_p2p import SteamP2PService
 from .debug_parity import DebugParityManager
 from .replication import ReplicationService
@@ -360,6 +361,7 @@ class BattleSpadesServer:
         self.steam_master = SteamMasterService(self)
         self.revival_master = RevivalMasterService(self)
         self.steam_p2p = SteamP2PService(self)
+        self.steam_host = SteamHostService(self)
         
         # Game mode
         self.mode = None
@@ -1827,6 +1829,8 @@ class BattleSpadesServer:
         await self.steam_master.start()
         await self.revival_master.start()
         await self.steam_p2p.start()
+        # After the master: the relay hello carries this server's AoSPlay id.
+        await self.steam_host.start()
 
         # Auto-discover + load plugins from the plugins/ package.
         await self._load_plugins()
@@ -1894,6 +1898,7 @@ class BattleSpadesServer:
 
                 for name, service in (
                     ("Steam relay", getattr(self, "steam_p2p", None)),
+                    ("Steam relay host", getattr(self, "steam_host", None)),
                     ("Steam master", self.steam_master),
                     ("Revival master", self.revival_master),
                 ):

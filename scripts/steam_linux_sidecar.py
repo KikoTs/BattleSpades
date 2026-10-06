@@ -118,7 +118,7 @@ def advertisement(info: dict[str, Any], mode: str, region: str) -> dict[str, Any
     if mode == "cctf":
         tags.append("classic")
     for tag in str(info.get("tags", "")).split(";"):
-        if (tag == "classic" or tag.startswith("skin=")) and tag not in tags:
+        if (tag == "classic" or tag.startswith(("skin=", "sdr=", "sdr480="))) and tag not in tags:
             tags.append(tag)
     if mode in {"tc", "vip"} and not any(tag.startswith("skin=") for tag in tags):
         tags.append("skin=mafia")
