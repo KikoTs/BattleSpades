@@ -361,8 +361,39 @@ class PassiveIsolatedModePolicy:
         )
 
 
+# The minimap marks an intel carrier only after it has carried this long
+# (the mode's exposure timer); until then nobody on the robbed team knows
+# where the thief is.
+_CTF_MARKER_DELAY = float(getattr(C, "INTEL_MINIMAP_EXPOSURE_TIME", 30))
+# A carrier is burdened and cannot sprint: about this many blocks a second.
+_CTF_CARRIER_PACE = 6.0
+
+
 class CTFBotPolicy:
-    """Assign capture, escort, recovery, defence, and assault roles."""
+    """Split a team between carrying, escorting, intercepting, guarding and raiding.
+
+    Every teammate reads the same roster and runs the same allocation, so the
+    team agrees on who does what without talking: one job is filled nearest
+    first, then the next from whoever is left.
+
+    ===================  ==================================================
+    both intels at home  home guard (1; 2 from seven players), the rest raid
+    we carry theirs      home guard, two close escorts, the rest cover the walk
+    they carry ours      about half intercept (three at most), the rest raid
+    both carried         two escorts, everyone else intercepts
+    ours lies dropped    the two nearest hold it; nobody guards an empty base
+    ===================  ==================================================
+
+    Teams under three players keep no guard. Classic has no minimap and so
+    no carrier marker: nobody hunts a thief there, the raid on the enemy
+    base (where the thief has to score) goes on instead.
+    """
+
+    def __init__(self) -> None:
+        # Per intel: where it last lay (None when first met in a thief's
+        # hands), the carrier and when the carry began. The thief's own
+        # position is never stored: it is hidden until the marker appears.
+        self._tracks: dict[tuple[int, int, int], list] = {}
 
     def decide(
         self,
@@ -373,6 +404,9 @@ class CTFBotPolicy:
         prefix = "classic_" if classic else ""
         own_base = _objective(frame, "ctf_base", observer.team)
         own_intel = _objective(frame, "ctf_intel", observer.team)
+        enemy_base = next(
+            (item for item in frame.objectives
+             if item.kind == "ctf_base" and item.team != observer.team), None)
         enemy_intel = next(
             (
                 item for item in frame.objectives
@@ -380,6 +414,11 @@ class CTFBotPolicy:
             ),
             None,
         )
+        team = [player for player in frame.players
+                if player.team == observer.team and player.alive and player.spawned]
+        thief = own_intel is not None and own_intel.carrier_id >= 0 and not classic
+        track = (self._track(frame, own_intel)
+                 if own_intel is not None and not classic else None)
 
         if observer.carried_entity_id >= 0 and own_base is not None:
             return ModeBotDecision(
@@ -392,82 +431,130 @@ class CTFBotPolicy:
                 engagement_radius=8.0,
             )
 
-        # Normal CTF publishes the native high-visibility carrier marker.
-        # Classic disables its minimap, so do not turn an invisible marker
-        # into worker omniscience: Classic defenders hold the base instead.
-        if (
-            not classic
-            and own_intel is not None
-            and own_intel.carrier_id >= 0
-        ):
-            return ModeBotDecision(
-                own_intel.position,
-                "ctf_intercept_carrier",
-                sprint=True,
-                arrival_radius=2.5,
-                posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.94,
-                engagement_radius=160.0,
-            )
+        carrier = (
+            _friendly_player(frame, observer, enemy_intel.carrier_id)
+            if enemy_intel is not None and enemy_intel.carrier_id >= 0 else None
+        )
+        if carrier is not None and carrier.player_id == observer.player_id:
+            carrier = None
+        me = observer.player_id
+        free = [player for player in team
+                if carrier is None or player.player_id != carrier.player_id]
+        if all(player.player_id != me for player in free):
+            free.append(observer)
 
-        if enemy_intel is not None and enemy_intel.carrier_id >= 0:
-            carrier = _friendly_player(frame, observer, enemy_intel.carrier_id)
-            if carrier is not None and carrier.player_id != observer.player_id:
-                escort = _formation_point(carrier.position, observer.player_id, 4.5)
+        own_home = (own_intel is not None and own_intel.carrier_id < 0
+                    and int(own_intel.state) == 0)
+        if own_base is not None and own_home:
+            # An intel at home is the only thing worth guarding there; once
+            # it is gone the guard joins the hunt or the raid.
+            guards = self._nearest(free, own_base.position,
+                                   0 if len(team) < 3 else 1 if len(team) < 7 else 2,
+                                   within=90.0)
+            if me in guards:
                 return ModeBotDecision(
-                    escort,
-                    f"{prefix}ctf_escort",
-                    sprint=True,
-                    arrival_radius=2.5,
-                    posture=ModeBotPosture.ESCORT,
-                    objective_priority=0.88,
-                    engagement_radius=32.0,
+                    self._guard_point(frame, observer, own_base.position, enemy_intel),
+                    f"{prefix}ctf_defend",
+                    sprint=False,
+                    arrival_radius=3.0,
+                    posture=ModeBotPosture.DEFEND,
+                    objective_priority=0.74,
+                    engagement_radius=38.0,
                 )
+            free = [player for player in free if player.player_id not in guards]
 
         if (
             own_intel is not None
             and own_intel.carrier_id < 0
             and int(own_intel.state) == 1
             and self._visible_drop(classic, observer, own_intel.position)
-            and self._is_recoverer(frame, observer, own_intel.position)
         ):
             # A dropped friendly intel lies in the open: the nearest two
             # teammates guard it (touch-return where the server allows it)
             # instead of letting the enemy walk back and re-take it.
+            holders = self._nearest(free, own_intel.position, 2)
+            if me in holders:
+                return ModeBotDecision(
+                    own_intel.position,
+                    f"{prefix}ctf_recover_intel",
+                    sprint=True,
+                    arrival_radius=1.5,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.9,
+                    engagement_radius=60.0,
+                )
+            free = [player for player in free if player.player_id not in holders]
+
+        if carrier is not None:
+            close = self._nearest(free, carrier.position,
+                                  # With both intels on the move the hunt
+                                  # needs bodies too.
+                                  2 if thief or len(free) <= 5 else 3)
+            if me in close:
+                return ModeBotDecision(
+                    _formation_point(carrier.position, observer.player_id, 4.5),
+                    f"{prefix}ctf_escort",
+                    sprint=True,
+                    arrival_radius=2.5,
+                    posture=ModeBotPosture.ESCORT,
+                    objective_priority=0.9,
+                    # Whoever can hit the carrier is this escort's business,
+                    # and rifles reach well past the formation.
+                    engagement_radius=60.0,
+                )
+            free = [player for player in free if player.player_id not in close]
+
+        if thief:
+            point = self._thief_estimate(frame, own_intel, enemy_base, track)
+            if point is not None:
+                hunters = free if carrier is not None or enemy_intel is None else [
+                    # A raider already at the enemy intel stays on it: taking
+                    # it answers the theft, and the thief must come that way.
+                    player for player in free
+                    if math.dist(player.position, enemy_intel.position) > 60.0]
+                wanted = (len(hunters) if carrier is not None
+                          else min(3, max(1, (len(hunters) + 1) // 2)))
+                if me in self._nearest(hunters, point, wanted):
+                    return ModeBotDecision(
+                        point,
+                        "ctf_intercept_carrier",
+                        sprint=True,
+                        arrival_radius=2.5,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.94,
+                        engagement_radius=160.0,
+                    )
+
+        if carrier is not None:
+            # Everyone not needed elsewhere covers the walk home: a teammate
+            # coming from home clears the road ahead, the others hold off the
+            # pursuit from the side the intel was taken on.
+            ahead = (own_base is not None
+                     and math.dist(observer.position, own_base.position)
+                     < math.dist(carrier.position, own_base.position))
+            toward = own_base if ahead else enemy_base
             return ModeBotDecision(
-                own_intel.position,
-                f"{prefix}ctf_recover_intel",
+                (_toward(carrier.position, toward.position, 16.0 + 4.0 * (me % 3))
+                 if toward is not None else carrier.position),
+                f"{prefix}ctf_escort_cover",
                 sprint=True,
-                arrival_radius=1.5,
+                arrival_radius=4.0,
                 posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.9,
-                engagement_radius=60.0,
+                objective_priority=0.88,
+                engagement_radius=90.0,
             )
 
-        if own_base is not None and self._is_defender(frame, observer, own_base.position):
-            return ModeBotDecision(
-                self._guard_point(frame, observer, own_base.position, enemy_intel),
-                f"{prefix}ctf_defend",
-                sprint=False,
-                arrival_radius=3.0,
-                posture=ModeBotPosture.DEFEND,
-                objective_priority=0.74,
-                engagement_radius=38.0,
-            )
-
-        if (
-            enemy_intel is not None
-            and enemy_intel.carrier_id < 0
-            and (
-                int(enemy_intel.state) == 0
-                or not classic
-                # A dropped intel is an ordinary visible ground entity; only
-                # Classic's missing minimap limits it to what a bot can see.
-                or self._visible_drop(classic, observer, enemy_intel.position)
-            )
-        ):
-            if own_base is not None and self._should_rally(
-                    frame, observer, own_base.position, enemy_intel.position):
+        # The enemy intel only ever leaves its home in a teammate's hands, so
+        # where it lies is where that teammate fell: the whole team knows the
+        # spot without a minimap. Limiting Classic to drops within sight left
+        # every far bot with no order for the rest of the match (Classic
+        # never returns a dropped intel).
+        if enemy_intel is not None and enemy_intel.carrier_id < 0:
+            if own_base is not None and (
+                self._should_rally(frame, observer, own_base.position, enemy_intel.position)
+                or int(enemy_intel.state) == 0
+                and self._awaits_wave(frame, observer, free, enemy_intel.position)
+            ):
                 return ModeBotDecision(
                     observer.position,
                     f"{prefix}ctf_rally",
@@ -487,11 +574,23 @@ class CTFBotPolicy:
                 objective_priority=0.82,
                 engagement_radius=90.0,
             )
-        return None
+        if enemy_intel is not None and enemy_intel.carrier_id != observer.player_id:
+            # A carrier the roster did not describe: its marker is still the
+            # teammate to close up on.
+            return ModeBotDecision(
+                enemy_intel.position,
+                f"{prefix}ctf_escort",
+                sprint=True,
+                arrival_radius=4.5,
+                posture=ModeBotPosture.ESCORT,
+                objective_priority=0.88,
+                engagement_radius=60.0,
+            )
+        # No intel published (its snapshot failed): fight on like any team.
+        return _FALLBACK.decide(frame, observer)
 
-
-    # Perception range: a dropped Classic intel farther than this is off
-    # screen with no minimap marker to reveal it.
+    # Perception range: our own dropped Classic intel farther than this is
+    # off screen with no minimap marker to reveal it.
     _CLASSIC_DROP_SIGHT = 160.0
 
     @classmethod
@@ -500,20 +599,55 @@ class CTFBotPolicy:
         return not classic or math.dist(observer.position, position) <= cls._CLASSIC_DROP_SIGHT
 
     @staticmethod
-    def _is_recoverer(frame: PerceptionFrame, observer: PlayerSnapshot,
-                      intel: Vector3) -> bool:
-        """Only the two living teammates nearest a dropped intel go for it."""
+    def _nearest(pool, point: Vector3, count: int, *,
+                 within: float = math.inf) -> tuple[int, ...]:
+        """Ids of the ``count`` players of ``pool`` nearest ``point`` (id breaks ties)."""
 
-        own = math.dist(observer.position, intel)
-        closer = sum(
-            1 for player in frame.players
-            if player.team == observer.team and player.alive and player.spawned
-            and player.player_id != observer.player_id
-            and player.carried_entity_id < 0
-            and (math.dist(player.position, intel), player.player_id)
-            < (own, observer.player_id)
-        )
-        return closer < 2
+        if count <= 0 or not pool:
+            return ()
+        ranked = sorted((math.dist(player.position, point), player.player_id)
+                        for player in pool)
+        return tuple(player_id for distance, player_id in ranked[:count]
+                     if distance <= within)
+
+    def _track(self, frame: PerceptionFrame, intel) -> list:
+        """Remember where ``intel`` last lay and since when it is carried."""
+
+        key = (frame.map_epoch, frame.mode_epoch, intel.team)
+        now = float(frame.created_at)
+        track = self._tracks.get(key)
+        if track is None:
+            if len(self._tracks) >= 8:
+                self._tracks.clear()
+            track = self._tracks[key] = [None, -1, now]
+        if intel.carrier_id < 0:
+            # The minimap shows an intel on the ground wherever it lies.
+            track[0] = intel.position
+            track[1] = -1
+        elif track[1] != intel.carrier_id or now < track[2]:
+            track[1] = intel.carrier_id
+            track[2] = now
+        return track
+
+    @staticmethod
+    def _thief_estimate(frame: PerceptionFrame, intel, enemy_base, track) -> Vector3 | None:
+        """Where the team may look for the enemy carrying its intel.
+
+        Marked on the minimap: the marker. Before that a player only knows
+        where the intel was taken and that the thief is walking it to the
+        enemy base, so the hunt follows that line at a carrier's pace and
+        ends on the base it has to reach.
+        """
+
+        ground, _carrier_id, since = track
+        elapsed = max(0.0, float(frame.created_at) - float(since))
+        if elapsed >= _CTF_MARKER_DELAY:
+            return intel.position
+        if enemy_base is None:
+            return None
+        if ground is None:
+            return enemy_base.position
+        return _toward(ground, enemy_base.position, _CTF_CARRIER_PACE * elapsed)
 
     @staticmethod
     def _should_rally(frame: PerceptionFrame, observer: PlayerSnapshot,
@@ -548,28 +682,42 @@ class CTFBotPolicy:
                    and math.dist(player.position, observer.position) <= 70.0
                    for player in allies)
 
-    @staticmethod
-    def _is_defender(frame: PerceptionFrame, observer: PlayerSnapshot,
-                     base: Vector3) -> bool:
-        """Keep the teammates nearest home on guard; everyone else attacks.
+    # The last stop before a guarded intel: raiders arriving inside this band
+    # of distance from it go in together, at the latest every wave period.
+    _WAVE_BAND = (60.0, 85.0)
+    _WAVE_PERIOD = 20.0
+    _WAVE_WINDOW = 5.0
 
-        Fixed ``id % 3`` sentries froze four of ten bots for a whole match.
-        Proximity rotates the duty by itself: a fresh respawn beside the base
-        relieves the previous guard, who then joins the push.
+    @classmethod
+    def _awaits_wave(cls, frame: PerceptionFrame, observer: PlayerSnapshot,
+                     raiders, goal: Vector3) -> bool:
+        """Hold just outside the enemy base until the raid goes in as a group.
+
+        A carrier is unarmed and cannot sprint, and raiders arrived strung
+        out (the second teammate 77 blocks behind at the median pickup), so
+        the grab was a solo act that ended six seconds later. The wait cannot
+        last: three raiders go at once, anyone follows a push already inside,
+        and the team's shared clock sends whoever is there every period.
         """
-        team = [player for player in frame.players
-                if player.team == observer.team and player.alive and player.spawned]
-        wanted = 0 if len(team) < 3 else 1 if len(team) < 7 else 2
-        if wanted == 0:
+
+        near, far = cls._WAVE_BAND
+        own = math.dist(observer.position, goal)
+        if not near <= own <= far:
             return False
-        own = math.dist(observer.position, base)
-        closer = sorted(math.dist(player.position, base) for player in team
-                        if player.player_id != observer.player_id)
-        if len(closer) < wanted:
-            return True
-        # A relief must be clearly nearer before the duty changes hands, so
-        # two bots at similar range do not swap roles every decision.
-        return own <= closer[wanted - 1] + 6.0 and own <= 90.0
+        if (observer.last_damage_at > 0.0
+                and 0.0 <= frame.created_at - observer.last_damage_at <= 4.0):
+            return False
+        if (float(frame.created_at) + 7.0 * observer.team) % cls._WAVE_PERIOD < cls._WAVE_WINDOW:
+            return False
+        beside = 0
+        for player in raiders:
+            if player.player_id == observer.player_id:
+                continue
+            distance = math.dist(player.position, goal)
+            if distance < near:
+                return False  # the push already left
+            beside += distance <= far
+        return beside < 2
 
     @staticmethod
     def _guard_point(frame: PerceptionFrame, observer: PlayerSnapshot, base: Vector3,
@@ -960,7 +1108,7 @@ class VIPBotPolicy:
         if phase != "active":
             anchor = own_anchor or own_vip
             if anchor is None:
-                return None
+                return _FALLBACK.decide(frame, observer)
             return ModeBotDecision(
                 _formation_point(anchor.position, observer.player_id, 7.0),
                 "vip_form_up",
@@ -1110,7 +1258,15 @@ class ArenaBotPolicy:
             float(observer.last_damage_at) > 0.0
             and 0.0 <= frame.created_at - observer.last_damage_at <= 8.0
         )
-        if observer.health >= 55 or not recently_wounded:
+        teammates = [
+            player for player in frame.players
+            if player.team == observer.team
+            and player.player_id != observer.player_id
+            and player.alive
+        ]
+        # The last one standing has nobody to fall back on: it keeps hunting
+        # instead of waiting out the round where it was hit.
+        if observer.health >= 55 or not recently_wounded or not teammates:
             assault = _FALLBACK.decide(frame, observer)
             if assault is None:
                 return None
@@ -1123,14 +1279,6 @@ class ArenaBotPolicy:
                 objective_priority=0.62,
                 engagement_radius=120.0,
             )
-        teammates = [
-            player for player in frame.players
-            if player.team == observer.team
-            and player.player_id != observer.player_id
-            and player.alive
-        ]
-        if not teammates:
-            return None
         nearest = min(
             teammates,
             key=lambda player: _distance_squared(observer.position, player.position),
@@ -1270,7 +1418,7 @@ class DemolitionBotPolicy:
         phase = str(frame.mode_phase).lower()
         if phase in ("waiting", "building"):
             if own_base is None:
-                return None
+                return _FALLBACK.decide(frame, observer)
             return ModeBotDecision(
                 _formation_point(own_base.position, observer.player_id, 5.0),
                 "demolition_build_defences",
@@ -1348,7 +1496,8 @@ class DemolitionBotPolicy:
                 objective_priority=0.9,
                 engagement_radius=12.0 if at_base else 90.0,
             )
-        return None
+        # No enemy base published (its snapshot failed): fight on like any team.
+        return _FALLBACK.decide(frame, observer)
 
     @staticmethod
     def _is_repairer(frame: PerceptionFrame, observer: PlayerSnapshot, base) -> bool:
@@ -1534,7 +1683,13 @@ class DiamondMineBotPolicy:
 
 
 class OccupationBotPolicy:
-    """Attackers deliver/escort bombs; defenders intercept and dispose of them.
+    """Attackers bring bombs in as a group; defenders intercept and dispose of them.
+
+    A carrier is unarmed and cannot sprint, so the attack travels with it:
+    two close escorts and everyone else as a vanguard between the bomb and
+    the base, where the defenders come from. A bomb that falls is lit; its
+    fuse (a public rule) decides whether a teammate can still run it in or
+    everybody clears the blast.
 
     A defender carrying a bomb runs it to ONE disposal point, chosen when it
     picked the bomb up (away from the target), where the mode drops it. The
@@ -1548,9 +1703,25 @@ class OccupationBotPolicy:
     _INTERCEPT_RADIUS = 36.0
     # A loose, unarmed bomb is only worth denying with an attacker this close.
     _DENY_RADIUS = 24.0
+    _FUSE = float(getattr(C, "BOMB_EXPLOSION_FUSE", 10.0))
+    # Blast radius plus a few steps: nobody waits inside this of a lit bomb.
+    _BLAST_CLEARANCE = float(getattr(C, "BOMB_EXPLOSION_RADIUS", 7.0)) + 6.0
+    # A dropped bomb cannot be picked up again for this long.
+    _PICKUP_LOCK = float(getattr(C, "NO_PICKUP_AFTER_DROP_TIME", 2.5))
+    # Blocks a second: a free bot sprinting over ordinary ground, and a
+    # burdened carrier (no sprint).
+    _RUN_PACE = 9.0
+    _CARRY_PACE = 5.5
+    # The mode releases a defender's bomb this far outside the target.
+    _DISPOSAL_DISTANCE = 20.0
 
     def __init__(self) -> None:
         self._dispose: dict[tuple[int, int, int], Vector3] = {}
+        # Round-scoped memory of what every player can see or hear: when each
+        # live bomb was lit and where fresh bombs appear.
+        self._epoch: tuple[int, int] = (-1, -1)
+        self._lit: dict[tuple, float] = {}
+        self._spawn: Vector3 | None = None
 
     def decide(
         self,
@@ -1562,10 +1733,22 @@ class OccupationBotPolicy:
             None,
         )
         bombs = [item for item in frame.objectives if item.kind == "oc_bomb"]
+        self._observe(frame, bombs)
         attacker = observer.team == int(C.TEAM1)
         carry_key = (observer.player_id, observer.generation, observer.life_id)
         if observer.carried_entity_id == int(C.BOMB_PICKUP):
             if attacker and target is not None:
+                if self._lets_escort_lead(frame, observer, target):
+                    return ModeBotDecision(
+                        observer.position,
+                        "occupation_follow_escort",
+                        sprint=False,
+                        arrival_radius=2.0,
+                        posture=ModeBotPosture.EVASIVE,
+                        objective_priority=1.0,
+                        engagement_radius=7.0,
+                        watch_position=target.position,
+                    )
                 return ModeBotDecision(
                     target.position,
                     "occupation_deliver_bomb",
@@ -1604,25 +1787,83 @@ class OccupationBotPolicy:
                   if player.team == observer.team and player.alive and player.spawned]
         carried = [item for item in bombs if item.carrier_id >= 0]
         loose = [item for item in bombs if item.carrier_id < 0]
+        lit = [item for item in loose if int(item.state)]
 
         if attacker:
             friendly_carrier = next(
                 (item for item in carried if item.team == observer.team
                  and item.carrier_id != observer.player_id), None)
-            if friendly_carrier is not None and self._nearest_few(
-                    observer, allies, friendly_carrier.position, 2,
-                    exclude=friendly_carrier.carrier_id):
-                return ModeBotDecision(
-                    _formation_point(friendly_carrier.position, observer.player_id, 4.5),
-                    "occupation_escort_carrier",
-                    sprint=True,
-                    arrival_radius=2.5,
-                    posture=ModeBotPosture.ESCORT,
-                    objective_priority=0.92,
-                    engagement_radius=36.0,
-                )
-            if loose:
-                bomb = min(loose, key=lambda item: _distance_squared(
+            if friendly_carrier is not None:
+                rank = self._rank(observer, allies, friendly_carrier.position,
+                                  exclude=friendly_carrier.carrier_id)
+                if rank < 2:
+                    return ModeBotDecision(
+                        # A few steps ahead of the carrier on either side:
+                        # between it and the guns it is walking toward.
+                        self._beside_ahead(friendly_carrier.position, target.position,
+                                           -1.0 if rank == 0 else 1.0)
+                        if target is not None else
+                        _formation_point(friendly_carrier.position, observer.player_id, 4.5),
+                        "occupation_escort_carrier",
+                        sprint=True,
+                        arrival_radius=2.5,
+                        posture=ModeBotPosture.ESCORT,
+                        objective_priority=0.92,
+                        # Whoever can hit the carrier is this escort's
+                        # business, and rifles reach well past the formation.
+                        engagement_radius=60.0,
+                    )
+                if target is not None:
+                    # The defenders come out of the base at the carrier:
+                    # everyone else walks ahead of it and meets them first.
+                    return ModeBotDecision(
+                        _toward(friendly_carrier.position, target.position,
+                                22.0 + 4.0 * (observer.player_id % 3)),
+                        "occupation_escort_vanguard",
+                        sprint=True,
+                        arrival_radius=4.0,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.9,
+                        engagement_radius=90.0,
+                    )
+            for bomb in sorted(lit, key=lambda item: _distance_squared(
+                    observer.position, item.position)):
+                left = self._fuse_left(frame, bomb)
+                planted = target is not None and self._footprint_distance(
+                    target, bomb.position) <= 0.0
+                if (not planted and target is not None
+                        and self._nearest_few(observer, allies, bomb.position, 1)
+                        and self._can_carry(observer, bomb, left, self._footprint_distance(
+                            target, bomb.position) + 2.0)):
+                    # Close enough to finish the run before it goes off.
+                    return ModeBotDecision(
+                        bomb.position,
+                        "occupation_retrieve_bomb",
+                        sprint=True,
+                        arrival_radius=1.75,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.96,
+                        engagement_radius=56.0,
+                    )
+                gap = math.dist(observer.position, bomb.position)
+                if planted and gap <= 60.0:
+                    # Planted: keep the defenders off it from outside the blast.
+                    keep = self._BLAST_CLEARANCE + 2.0
+                    return ModeBotDecision(
+                        _toward(bomb.position, observer.position, keep) if gap >= keep
+                        else _away_from(observer.position, bomb.position, keep - gap),
+                        "occupation_cover_plant",
+                        sprint=True,
+                        arrival_radius=3.0,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.94,
+                        engagement_radius=60.0,
+                    )
+                if gap <= self._BLAST_CLEARANCE:
+                    return self._clear_blast(observer, bomb)
+            fresh = [item for item in loose if not int(item.state)]
+            if fresh:
+                bomb = min(fresh, key=lambda item: _distance_squared(
                     observer.position, item.position))
                 return ModeBotDecision(
                     bomb.position,
@@ -1647,21 +1888,42 @@ class OccupationBotPolicy:
                     objective_priority=0.92,
                     engagement_radius=100.0,
                 )
-        else:
-            live = [item for item in loose if int(item.state) and target is not None
-                    and math.dist(item.position, target.position) <= self._INTERCEPT_RADIUS]
-            if live:
-                bomb = min(live, key=lambda item: _distance_squared(
-                    observer.position, item.position))
+            if self._spawn is not None:
+                # No bomb to carry yet: gather where the last one appeared
+                # instead of running at the base without one.
                 return ModeBotDecision(
-                    bomb.position,
-                    "occupation_intercept_live_bomb",
+                    _formation_point(self._spawn, observer.player_id, 7.0),
+                    "occupation_await_bomb",
                     sprint=True,
-                    arrival_radius=1.75,
-                    posture=ModeBotPosture.SURVIVE,
-                    objective_priority=0.96,
-                    engagement_radius=10.0,
+                    arrival_radius=4.0,
+                    posture=ModeBotPosture.BALANCED,
+                    objective_priority=0.8,
+                    engagement_radius=90.0,
                 )
+        else:
+            live = [item for item in lit if target is not None
+                    and math.dist(item.position, target.position) <= self._INTERCEPT_RADIUS]
+            for bomb in sorted(live, key=lambda item: _distance_squared(
+                    observer.position, item.position)):
+                # One defender carries it off, and only with fuse to spare;
+                # the rest stay out of the blast.
+                if (self._nearest_few(observer, allies, bomb.position, 1)
+                        and self._can_carry(
+                            observer, bomb, self._fuse_left(frame, bomb),
+                            max(0.0, self._DISPOSAL_DISTANCE
+                                - self._footprint_distance(target, bomb.position)))):
+                    return ModeBotDecision(
+                        bomb.position,
+                        "occupation_intercept_live_bomb",
+                        sprint=True,
+                        arrival_radius=1.75,
+                        posture=ModeBotPosture.SURVIVE,
+                        objective_priority=0.96,
+                        engagement_radius=10.0,
+                    )
+            for bomb in lit:
+                if math.dist(observer.position, bomb.position) <= self._BLAST_CLEARANCE:
+                    return self._clear_blast(observer, bomb)
             hostile_carrier = next(
                 (item for item in carried if item.team != observer.team), None)
             if (hostile_carrier is not None
@@ -1718,15 +1980,146 @@ class OccupationBotPolicy:
             engagement_radius=120.0,
         )
 
+    def _observe(self, frame: PerceptionFrame, bombs) -> None:
+        """Note when each bomb was lit and where a fresh one lies."""
+
+        epoch = (frame.map_epoch, frame.mode_epoch)
+        if epoch != self._epoch:
+            self._epoch = epoch
+            self._lit = {}
+            self._spawn = None
+        now = float(frame.created_at)
+        seen = {}
+        for bomb in bombs:
+            if int(bomb.state):
+                seen[self._bomb_key(bomb)] = bomb
+            elif bomb.carrier_id < 0:
+                self._spawn = bomb.position
+        gone = sorted((since, key) for key, since in self._lit.items() if key not in seen)
+        for key in seen:
+            if key not in self._lit:
+                # A lit bomb changing hands keeps its fuse.
+                self._lit[key] = gone.pop(0)[0] if gone else now
+            elif self._lit[key] > now:
+                self._lit[key] = now
+        for key in [key for key in self._lit if key not in seen]:
+            del self._lit[key]
+
     @staticmethod
-    def _nearest_few(observer: PlayerSnapshot, allies, position: Vector3,
-                     count: int, *, exclude: int = -1) -> bool:
+    def _bomb_key(bomb) -> tuple:
+        if bomb.carrier_id >= 0:
+            return ("carried", int(bomb.carrier_id))
+        return ("ground", round(bomb.position[0]), round(bomb.position[1]))
+
+    def _fuse_left(self, frame: PerceptionFrame, bomb) -> float:
+        since = self._lit.get(self._bomb_key(bomb), float(frame.created_at))
+        return self._FUSE - (float(frame.created_at) - since)
+
+    def _can_carry(self, observer: PlayerSnapshot, bomb, left: float,
+                   distance: float) -> bool:
+        """Whether the observer can fetch a lit bomb and walk it ``distance``."""
+
+        reach = math.dist(observer.position, bomb.position) / self._RUN_PACE
+        lock = self._PICKUP_LOCK - (self._FUSE - left)
+        return max(reach, lock) + distance / self._CARRY_PACE + 1.0 <= left
+
+    @staticmethod
+    def _footprint_distance(target, position: Vector3) -> float:
+        """Horizontal blocks from ``position`` to the target footprint (0 inside)."""
+
+        if len(target.bounds) >= 4:
+            x0, x1, y0, y1 = target.bounds[:4]
+            dx = max(x0 - position[0], 0.0, position[0] - x1)
+            dy = max(y0 - position[1], 0.0, position[1] - y1)
+            return math.hypot(dx, dy)
+        return max(0.0, math.hypot(position[0] - target.position[0],
+                                   position[1] - target.position[1]) - 8.0)
+
+    def _clear_blast(self, observer: PlayerSnapshot, bomb) -> ModeBotDecision:
+        return ModeBotDecision(
+            _away_from(observer.position, bomb.position, self._BLAST_CLEARANCE + 4.0),
+            "occupation_clear_blast",
+            sprint=True,
+            arrival_radius=3.0,
+            posture=ModeBotPosture.SURVIVE,
+            objective_priority=1.0,
+            engagement_radius=6.0,
+        )
+
+    # The carrier follows: it walks while a teammate within this range is at
+    # least a couple of steps nearer the base than it is, and waits for
+    # teammates who are on their way from no farther than the support range.
+    _LEAD_RANGE = 45.0
+    _LEAD_STEPS = 2.5
+    _SUPPORT_RANGE = 120.0
+    # Inside this distance of the base it just goes for the plant.
+    _FINAL_RUN = 28.0
+
+    @classmethod
+    def _lets_escort_lead(cls, frame: PerceptionFrame, observer: PlayerSnapshot,
+                          target) -> bool:
+        """Whether the bomb carrier waits for a teammate to go in front.
+
+        Unarmed and unable to sprint, the carrier used to walk point: nine
+        in ten died with no teammate even five blocks ahead of them, about
+        75 blocks short of the base and with three defenders in range. It
+        now walks behind whoever is nearby and waits for teammates who are
+        on their way. The wait ends when someone is in front, when nobody
+        is close enough to come, under fire, on the final run, and in any
+        case for six seconds of every twenty, so a teammate that cannot get
+        ahead never parks the bomb.
+        """
+
+        own = cls._footprint_distance(target, observer.position)
+        if own <= cls._FINAL_RUN:
+            return False
+        now = float(frame.created_at)
+        if observer.last_damage_at > 0.0 and 0.0 <= now - observer.last_damage_at <= 3.0:
+            return False
+        if now % 20.0 < 6.0:
+            return False
+        coming = False
+        for player in frame.players:
+            if (player.team != observer.team or not player.alive or not player.spawned
+                    or player.player_id == observer.player_id):
+                continue
+            gap = math.dist(player.position, observer.position)
+            if gap > cls._SUPPORT_RANGE:
+                continue
+            if (gap <= cls._LEAD_RANGE and cls._footprint_distance(
+                    target, player.position) <= own - cls._LEAD_STEPS):
+                return False
+            coming = True
+        return coming
+
+    @staticmethod
+    def _beside_ahead(carrier: Vector3, target: Vector3, side: float) -> Vector3:
+        dx, dy = target[0] - carrier[0], target[1] - carrier[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return carrier
+        ux, uy = dx / length, dy / length
+        return (
+            min(510.0, max(1.0, carrier[0] + ux * 8.0 - uy * 4.0 * side)),
+            min(510.0, max(1.0, carrier[1] + uy * 8.0 + ux * 4.0 * side)),
+            carrier[2],
+        )
+
+    @staticmethod
+    def _rank(observer: PlayerSnapshot, allies, position: Vector3, *,
+              exclude: int = -1) -> int:
+        """How many free allies are nearer ``position`` than the observer."""
+
         own = (math.dist(observer.position, position), observer.player_id)
-        closer = sum(1 for player in allies
-                     if player.player_id not in (observer.player_id, exclude)
-                     and player.carried_entity_id < 0
-                     and (math.dist(player.position, position), player.player_id) < own)
-        return closer < count
+        return sum(1 for player in allies
+                   if player.player_id not in (observer.player_id, exclude)
+                   and player.carried_entity_id < 0
+                   and (math.dist(player.position, position), player.player_id) < own)
+
+    @classmethod
+    def _nearest_few(cls, observer: PlayerSnapshot, allies, position: Vector3,
+                     count: int, *, exclude: int = -1) -> bool:
+        return cls._rank(observer, allies, position, exclude=exclude) < count
 
 
 _FALLBACK = PatrolCombatPolicy()
@@ -1764,6 +2157,41 @@ def objective_decision_for(
         _canonical_mode(frame.mode_id), _FALLBACK
     ).decide(frame, observer)
     return _watch_approach(frame, observer, decision)
+
+
+def standing_order_for(frame: PerceptionFrame, observer: PlayerSnapshot) -> ModeBotDecision:
+    """The order of a bot whose mode policy had none: it never stands idle.
+
+    A policy with nothing to say (objectives not published yet, a state it
+    does not cover) used to leave the worker without a goal, and the bot
+    stood where it was until the state changed. Push on the enemy side when
+    the map names one, otherwise walk a beat around home. A frame that names
+    no place at all gives nowhere to walk to: the bot holds its ground with
+    a named order (wandering from the spot walked a bot that had just
+    climbed out of London's river back toward it).
+    """
+
+    push = _FALLBACK.decide(frame, observer)
+    if push is not None:
+        return push
+    home = _objective(frame, "team_anchor", observer.team)
+    if home is None:
+        return ModeBotDecision(
+            observer.position,
+            "hold_no_objective",
+            sprint=False,
+            arrival_radius=3.0,
+            posture=ModeBotPosture.BALANCED,
+            objective_priority=0.3,
+        )
+    return ModeBotDecision(
+        _guard_beat(frame, observer, home.position, 8.0),
+        "patrol_no_objective",
+        sprint=False,
+        arrival_radius=3.0,
+        posture=ModeBotPosture.BALANCED,
+        objective_priority=0.3,
+    )
 
 
 def mode_objective_committed(decision: ModeBotDecision | None) -> bool:
@@ -1813,6 +2241,30 @@ def _tracks_live_position(role: str) -> bool:
     return role in _LIVE_TARGET_ROLES or any(word in role for word in _LIVE_TARGET_ROLE_WORDS)
 
 
+# A raider that stops to wait finishes at least this much of the wait, and
+# one that has just set off does not stop again for a few seconds: the
+# conditions of a rally (who is alongside, who is ahead) flicker as teammates
+# move, and a third of all waits used to last half a second.
+_RALLY_MIN_HOLD = 1.5
+_RALLY_REARM = 3.0
+
+
+def _steady_rally(previous: "_ModeCommitment", decision: ModeBotDecision,
+                  observer: PlayerSnapshot, now: float) -> ModeBotDecision:
+    before = previous.decision
+    waited = before.role.endswith("ctf_rally")
+    if waited == decision.role.endswith("ctf_rally"):
+        return decision
+    age = now - previous.role_since
+    if waited:
+        under_fire = (observer.last_damage_at > 0.0
+                      and 0.0 <= now - observer.last_damage_at <= 4.0)
+        return before if age < _RALLY_MIN_HOLD and not under_fire else decision
+    if before.role.endswith("ctf_attack_intel") and age < _RALLY_REARM:
+        return before
+    return decision
+
+
 @dataclass(slots=True)
 class _ModeCommitment:
     signature: tuple[object, ...]
@@ -1837,14 +2289,16 @@ class ModePolicyMemory:
         self._states.pop((int(player_id), int(generation)), None)
 
     def decide(self, frame: PerceptionFrame,
-               observer: PlayerSnapshot) -> ModeBotDecision | None:
+               observer: PlayerSnapshot) -> ModeBotDecision:
         epoch = (frame.map_epoch, frame.mode_epoch)
         if self.epoch != epoch:
             self.reset()
             self.epoch = epoch
         key = (observer.player_id, observer.generation)
         decision = objective_decision_for(frame, observer)
-        if decision is None or not mode_objective_committed(decision):
+        if decision is None:
+            decision = standing_order_for(frame, observer)
+        if not mode_objective_committed(decision):
             self._states.pop(key, None)
             return decision
         now = float(frame.created_at)
@@ -1871,6 +2325,7 @@ class ModePolicyMemory:
                 decision = _watch_approach(frame, observer, VIPBotPolicy().decide(
                     frame, observer, retained_role=previous.decision.role))
                 assert decision is not None
+            decision = _steady_rally(previous, decision, observer, now)
             if decision.role == previous.decision.role:
                 separation = math.dist(decision.position, previous.decision.position)
                 moving_role = _tracks_live_position(decision.role)
@@ -2083,4 +2538,5 @@ __all__ = [
     "mode_strategy_for",
     "objective_decision_for",
     "objective_goal_for",
+    "standing_order_for",
 ]
