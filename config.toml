@@ -79,6 +79,29 @@ heartbeat_interval_seconds = 30.0
 request_timeout_seconds = 5.0
 # Preserve this database across upgrades; pending results retry with their original IDs.
 results_path = "state/round-results.sqlite3"
+# Status file written by the Linux Steam sidecar (--status-file); registers its
+# SteamID with the AoSPlay list. Blank = none. Also AOS_STEAM_SIDECAR_STATUS.
+steam_sidecar_status = ""
+
+# Steam relay hosting: players join through Steam's relay network instead of
+# the server's IP address, which helps where a provider blocks that address
+# (and costs nothing elsewhere: Steam connects directly when it can). Runs the
+# bundled steam-host/battlespades-steam-host beside the server. Windows needs
+# the Steam client installed; Linux needs Valve's steamclient.so from SteamCMD
+# (in ~/.steam/sdk64/ or runtime_dir). See deploy/steam-linux/README.md.
+[steam_host]
+enabled = false
+executable = ""             # blank = the bundled helper
+# One helper per Steam application: Ace of Spades owners (224540) and players
+# without the game, who attach as Spacewar (480).
+app_ids = [224540, 480]
+# Optional game server login token for 224540, from
+# https://steamcommunity.com/dev/managegameservers (one per running server).
+# It keeps the SteamID across restarts; blank logs on anonymously.
+# The file holds the token on one line. Also AOS_STEAM_GSLT_FILE.
+token_file = ""
+runtime_dir = ""            # Linux: directory holding steamclient.so
+max_clients = 64
 
 [network]
 max_connections = 64

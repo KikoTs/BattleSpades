@@ -64,3 +64,51 @@ only sends `steam_server_id` / `steam_game_port` while the sidecar reports a
 logged-on id refreshed within the last three minutes. Clients use it to match
 Valve's server list (which they can read through Steam even where aosplay.net
 is blocked) to the AoSPlay listing.
+
+## Steam relay hosting (joining through Steam instead of the IP)
+
+Some providers block a server's address and the AoSPlay web services while
+Steam itself stays reachable. With relay hosting enabled, the game server runs
+`steam-host/battlespades-steam-host` (shipped in the Linux and Windows x64
+bundles): it logs on to Steam as a game server and accepts players over
+Steam's relay network, forwarding them to the game port. The BattleSpades
+client tries this route first and falls back to the IP; Steam connects
+directly when it can, so players who are not blocked lose nothing.
+
+1. Give the server user Valve's Steam runtime. With SteamCMD installed as that
+   user, `steamclient.so` is at `~/.steam/sdk64/steamclient.so`, which is
+   where the helper looks. Otherwise set `runtime_dir` (or
+   `AOS_STEAM_RUNTIME_DIR`) to the directory that holds it.
+2. Enable it in the server's TOML (or set `AOS_STEAM_HOST=1`):
+
+   ```toml
+   [steam_host]
+   enabled = true
+   ```
+
+3. Optional but recommended: a game server login token keeps the server's
+   SteamID across restarts. Create one per running server at
+   <https://steamcommunity.com/dev/managegameservers> for App ID 224540, save it
+   alone on one line in a file only the server user can read, and point
+   `token_file` (or `AOS_STEAM_GSLT_FILE`) at it. Without a token the helper
+   logs on anonymously and gets a new SteamID on every start, which clients
+   pick up from the next heartbeat.
+
+On start the log shows `Steam relay host ready: app 224540, SteamID ...` and
+`Steam relay network: ready`, one pair per application (224540 for owners of
+Ace of Spades, 480 for everyone else). The ids reach players two ways: the
+heartbeat sends `steam_host_id` / `steam_host_id_480` to the AoSPlay list, and
+the server's A2S keywords carry `sdr=<id>` / `sdr480=<id>`, which the Steam
+sidecar copies into Valve's server list for players who cannot reach AoSPlay.
+
+A player who arrives this way is `steam:<SteamID64>` to bans, vote kicks and
+password lockouts, never `127.0.0.1`. The helper is optional at run time: if it
+is missing, crashes or Steam is down, the direct server keeps running and the
+helper is retried every 15 seconds.
+
+`battlespades-steam-host` also runs on its own, without the game server
+controlling it, for testing:
+
+```sh
+./battlespades-steam-host --game-port 27015 --app-id 224540 --token-file /path/to/token
+```

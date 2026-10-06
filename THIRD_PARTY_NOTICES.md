@@ -33,10 +33,14 @@ which carries the full notices for everything the frozen server contains.
 | [pytest](https://pytest.org/) / pytest-asyncio | per `requirements*.txt` | development only | Test suite; not shipped | MIT | n/a (not shipped) |
 
 Valve's Steamworks runtime (`steam_api.dll`, `steamclient.dll`, …) is **not**
-part of this repository or its release archives. Optional master-server
-registration loads operator-supplied copies at run time; those files are
-Valve's property and are governed by Valve's terms (see
-[`release/STEAM_RUNTIME.txt`](release/STEAM_RUNTIME.txt)). They are
+part of this repository. Optional master-server registration loads
+operator-supplied copies at run time; those files are Valve's property and
+are governed by Valve's terms (see
+[`release/STEAM_RUNTIME.txt`](release/STEAM_RUNTIME.txt)). Release archives
+that carry a Steam helper include one Valve file beside it, the Steamworks
+SDK's redistributable API library (`steam_api64.dll` / `libsteam_api.so`,
+unmodified, under Valve's Steamworks SDK terms); `steamclient` itself is
+never included. They are
 proprietary and **not** AGPL-compatible on their own; combining BattleSpades
 with them is allowed by the section 7 additional permission in
 [`LICENSING.md`](LICENSING.md#additional-permission-for-steamworks-agpl-section-7).
