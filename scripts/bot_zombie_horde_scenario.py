@@ -584,6 +584,89 @@ class _Clock:
         return False
 
 
+class _MotorProbe:
+    """What the motor pressed for one team and what it cost the bodies.
+
+    The sprint share of the ticks a movement key was held, the ground covered
+    in those ticks, and every fall that hurt or killed.
+    """
+
+    def __init__(self, team: int) -> None:
+        self.team = int(team)
+        self.move_ticks = 0
+        self.sprint_ticks = 0
+        self.blocks = 0.0
+        self.seconds = 0.0
+        self.fall_hits = 0
+        self.fall_damage = 0
+        self.fall_deaths = 0
+        self.ticks = 0
+        self.queue_ticks = 0
+        self._last: dict[int, tuple[float, float, float]] = {}
+        self._originals = None
+
+    def install(self) -> None:
+        set_state = BotDirector.__dict__["_set_movement_state"].__func__
+        damage, die = Player.damage, Player.die
+        self._originals = (BotDirector.__dict__["_set_movement_state"], damage, die)
+        fall = int(C.KILL.FALL_KILL)
+        probe = self
+
+        def pressed(runtime, values):
+            player = runtime.player
+            if int(getattr(player, "team", -1)) == probe.team:
+                here = (float(player.x), float(player.y), time.monotonic())
+                probe.ticks += 1
+                role = str(getattr(runtime.intent, "debug_role", ""))
+                probe.queue_ticks += int(role.endswith((":breach_assist_queue", ":breach_yield")))
+                before = probe._last.get(int(player.id))
+                probe._last[int(player.id)] = here
+                if any(values[:4]):
+                    probe.move_ticks += 1
+                    probe.sprint_ticks += int(bool(values[7]))
+                    # (A gap is a death or a respawn, not travel.)
+                    if before is not None and here[2] - before[2] <= 0.25:
+                        probe.blocks += math.hypot(here[0] - before[0], here[1] - before[1])
+                        probe.seconds += here[2] - before[2]
+            return set_state(runtime, values)
+
+        def hurt(player, amount, source=None, kill_type=0, **kwargs):
+            before = int(getattr(player, "health", 0))
+            result = damage(player, amount, source, kill_type, **kwargs)
+            if (int(kill_type) == fall and int(getattr(player, "team", -1)) == probe.team
+                    and getattr(player, "is_bot", False)):
+                lost = before - int(getattr(player, "health", 0))
+                if lost > 0:
+                    probe.fall_hits += 1
+                    probe.fall_damage += lost
+            return result
+
+        def died(player, killer=None, kill_type=0):
+            if (player.alive and int(kill_type) == fall
+                    and int(getattr(player, "team", -1)) == probe.team
+                    and getattr(player, "is_bot", False)):
+                probe.fall_deaths += 1
+            return die(player, killer, kill_type)
+
+        BotDirector._set_movement_state = staticmethod(pressed)
+        Player.damage, Player.die = hurt, died
+
+    def remove(self) -> None:
+        if self._originals is not None:
+            BotDirector._set_movement_state, Player.damage, Player.die = self._originals
+            self._originals = None
+
+    def report(self) -> dict:
+        return {
+            "motor_sprint_share": round(self.sprint_ticks / max(1, self.move_ticks), 3),
+            "travel_speed": round(self.blocks / max(1e-9, self.seconds), 2),
+            "breach_queue_share": round(self.queue_ticks / max(1, self.ticks), 4),
+            "fall_hits": self.fall_hits,
+            "fall_damage": self.fall_damage,
+            "fall_deaths": self.fall_deaths,
+        }
+
+
 class _StepClock:
     """A budget counter that charges a fixed cost for every reading."""
 
@@ -612,10 +695,13 @@ def scenario_args(**overrides) -> argparse.Namespace:
 async def run_scenario(args) -> dict:
     random_state = random.getstate()
     horde_objectives = BotDirector._objectives_zombie_horde
+    probe = args.probe = _MotorProbe(ZOMBIE_TEAM)
     try:
+        probe.install()
         with _Clock(real_budgets=args.real_budgets) as clock:
             return await _run_scenario(args, clock)
     finally:
+        probe.remove()
         BotDirector._objectives_zombie_horde = horde_objectives
         random.setstate(random_state)
 
@@ -828,6 +914,8 @@ async def _run_scenario(args, clock: _Clock) -> dict:
                            and len(infected) == len(survivors) else None),
     }
     result.update(metrics.report())
+    if getattr(args, "probe", None) is not None:
+        result.update(args.probe.report())
     tick_ms.sort()
     result["tick_p50_ms"] = round(tick_ms[len(tick_ms) // 2], 2)
     result["tick_p99_ms"] = round(tick_ms[int(0.99 * (len(tick_ms) - 1))], 2)

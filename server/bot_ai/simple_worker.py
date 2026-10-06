@@ -17,7 +17,7 @@ import logging
 import math
 import queue
 import time
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import shared.constants as C
 from server.dig_profiles import (
@@ -164,8 +164,25 @@ _CROWD_DETOUR_MIN_GOAL_DISTANCE = 40.0
 _CROWD_BLOCKED_EDGE_SECONDS = 20.0
 _CROWD_DETOUR_ROUTE_SECONDS = 20.0
 _BREACH_RESERVATION_RADIUS = 2.25
+# A class that may not sprint uphill lets go of sprint this far before a step
+# up (one decision at sprint speed and a stride), and takes it up again on it.
+_SPRINT_RELEASE_REACH = 2.5
+# The clear run a body needs ahead to hold sprint for one more decision and
+# still arrive at a walk. The native mover's velocity times ten is its
+# coasting distance (2.8 blocks from a Soldier's sprint, 3.3 from a
+# Zombie's). From rest one decision of sprint only reaches 4.4 to 5.2 blocks
+# a second, under a Soldier's walk: three blocks of run-up were asked for
+# when every class moved 40 % faster than retail.
+_SPRINT_ROOM_AT_REST = 1.75
+_SPRINT_ROOM_MAX = 9.0
 _BREACH_QUEUE_SPACING = 1.15
 _BREACH_YIELD_REPLAN_SECONDS = 1.25
+# A follower waits this long for a teammate to open the wall on its own way
+# (about one cell of it), then makes a hole of its own or goes round, and
+# does not queue again for the release time.
+_BREACH_QUEUE_PATIENCE = 2.0
+_BREACH_QUEUE_RELEASE_SECONDS = 6.0
+_BREACH_FACE_RADIUS = 2.25
 _TEAM_LANE_SPACING = 8.0
 _TEAM_LANE_MAX_OFFSET = 20.0
 _TEAM_LANE_MIN_GOAL_DISTANCE = 96.0
@@ -340,6 +357,11 @@ class _BotState:
     mine_site_index: int = 0
     yielded_breach_edge: EdgeKey | None = None
     yielded_breach_started_at: float = 0.0
+    # Queueing behind a teammate's excavation: whose, since when, and until
+    # when this bot has had enough of waiting for any.
+    breach_wait_digger: int | None = None
+    breach_wait_since: float = 0.0
+    breach_wait_released_until: float = 0.0
     next_water_build_at: float = 0.0
     water_step_key: tuple[int, int, int, str] | None = None
     water_landing_step: RouteStep | None = None
@@ -684,11 +706,18 @@ class SimpleBotBrain:
                 # every alternation, so blacklist the currently selected
                 # edge when the body fails the map-level four-block swim
                 # contract across the whole window.
+                spent = state.water_recovery
                 state.water_escape_position = observer.position
                 state.water_escape_at = now
                 state.water_recovery = True
                 self._clear_route(state, now)
                 force_water_edge = True
+                if spent and self._crosses_water(frame, observer, state, now):
+                    # Bank recovery has failed the same four blocks. Its turn
+                    # is over: this swimmer's way is across, and a failed
+                    # swim used to leave it to the nearest shore for good.
+                    state.water_recovery = False
+                    force_water_edge = False
             if self.skills.active(observer):
                 # A climb out (staircase/pillar from the water) owns the body
                 # until it stands on main ground or gives up.
@@ -784,13 +813,24 @@ class SimpleBotBrain:
                 ),
                 blocked_edges=self._water_exclusions(state, now),
             )
-            return self._water_intent(
+            shore = self._water_intent(
                 frame,
                 observer,
                 water_step,
                 now,
                 force_block_edge=force_water_edge,
             )
+            if (shore.debug_role in ("water_no_route", "water_search_shore")
+                    and state.water_recovery
+                    and self._crosses_water(frame, observer, state, now)):
+                # No bank for recovery to make for: it roams, or stands (a
+                # zombie stood in SpookyMansion's sea until the round ended).
+                # This swimmer knows where it is going: take the swim up again.
+                state.water_recovery = False
+                crossing = self._water_crossing_intent(frame, observer, state, profile, now)
+                if crossing is not None:
+                    return crossing
+            return shore
 
         # A single dry contact on a lip is enough to resume walking, but not
         # enough to forget a failed swim. Retain recovery across brief bank
@@ -3917,7 +3957,8 @@ class SimpleBotBrain:
             observer,
             now,
         )
-        if active_digger is not None:
+        if active_digger is not None and self._waits_for_breach(
+                frame, observer, state, active_goal, active_digger, now):
             return self._breach_assist_queue_intent(
                 frame,
                 observer,
@@ -4483,7 +4524,6 @@ class SimpleBotBrain:
         sprint_allowed = (
             motor_affordance is MovementAffordance.SWIM
             or (motor_affordance is MovementAffordance.WALK
-                and not step.waypoint[2] < observer.position[2] - 0.25
                 and self._route_allows_sprint(state, observer)))
         walk_drop = 1
         if (motor_affordance in {MovementAffordance.WALK, MovementAffordance.DROP}
@@ -4529,7 +4569,10 @@ class SimpleBotBrain:
                 to_run_end = math.hypot(
                     state.route[last].waypoint[0] - observer.position[0],
                     state.route[last].waypoint[1] - observer.position[1])
-                sprint_allowed = not exact_step_next or to_run_end >= 4.5
+                sprint_allowed = (
+                    (not exact_step_next or to_run_end >= _sprint_room(observer))
+                    and (_sprints_uphill(observer) or not self._rise_ahead(
+                        state.route, state.route_index, target_index, observer.position)))
             elif motor_affordance is MovementAffordance.DROP and runs_off(
                     self.world, step, observer.position):
                 # A lone ledge is walked off like any other; no shuffle first.
@@ -4665,21 +4708,45 @@ class SimpleBotBrain:
                 state.route_index = index
 
     @staticmethod
+    def _rise_ahead(route: Sequence[RouteStep], index: int, last: int,
+                    position: Vector3, reach: float = _SPRINT_RELEASE_REACH) -> bool:
+        """Is the next step up of this run within ``reach`` blocks of the body?"""
+
+        previous = position
+        distance = 0.0
+        for step in route[index:last + 1]:
+            distance += math.hypot(step.waypoint[0] - previous[0],
+                                   step.waypoint[1] - previous[1])
+            if distance > reach:
+                return False
+            if step.waypoint[2] < previous[2] - 0.25:  # z grows downward
+                return True
+            previous = step.waypoint
+        return False
+
+    @staticmethod
     def _route_allows_sprint(state: _BotState, observer: PlayerSnapshot) -> bool:
-        """Reserve native braking distance before turns, steps and landings."""
-        # The live motor uses this same velocity scale: 0.35 needs about four
-        # blocks to brake. A short approach needs walking even from rest, or
-        # sprint acceleration creates the AncientEgypt missed-waypoint orbit.
-        distance_needed = min(5.0, max(3.0, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
+        """Reserve native braking distance before turns, exact steps and landings."""
+        distance_needed = _sprint_room(observer)
+        uphill = _sprints_uphill(observer)
         previous = observer.position
         direction = None
         distance = 0.0
         for step in state.route[state.route_index:state.route_index + 8]:
-            if (step.affordance is not MovementAffordance.WALK
-                    or abs(step.waypoint[2] - previous[2]) > 0.25):
+            if step.affordance is not MovementAffordance.WALK:
                 return False
             dx, dy = step.waypoint[0] - previous[0], step.waypoint[1] - previous[1]
             length = math.hypot(dx, dy)
+            change = step.waypoint[2] - previous[2]  # z grows downward
+            if abs(change) > 0.25:
+                # A block up or down per stride is still a run: the native
+                # mover takes it at nine tenths of the flat speed, and used
+                # to be walked at a third of it (a Zombie walks at 4 blocks a
+                # second and sprints at 13). Only a class retail refuses to
+                # climb for while it sprints must walk into a rise.
+                if (abs(change) > max(1.0, length) * 1.05
+                        or (change < 0.0 and not uphill)):
+                    return False
             if length > 1e-6:
                 heading = (dx / length, dy / length)
                 if direction is None:
@@ -5321,6 +5388,61 @@ class SimpleBotBrain:
             )
         )
         return min(candidates, key=lambda player: int(player.player_id), default=None)
+
+    def _waits_for_breach(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        goal: _Goal, digger: PlayerSnapshot, now: float,
+    ) -> bool:
+        """Queue behind a teammate's excavation only while it opens this bot's way.
+
+        Everybody within five blocks of a landing spade or claw used to back
+        into the queue for as long as it kept landing: the other diggers of
+        the same siege (a keep's cut was dug one site at a time), the ring
+        round it and bots merely passing. Now a bot with voxels of its own to
+        claw goes to them, a bot whose way does not lead through that hole
+        carries on, and one that does wait gives the digger about a cell's
+        worth of swings before it opens a second hole or goes round.
+        """
+
+        target = digger.last_action_position
+        if target is None or now < state.breach_wait_released_until:
+            return False
+        if any(item.kind == "zombie_order" and item.carrier_id == observer.player_id
+               and item.cells for item in frame.objectives):
+            return False
+        ahead = state.route[state.route_index:state.route_index + 8]
+        shared = next((step for step in ahead if step.breach is not None and math.dist(
+            step.breach.target, target) <= _BREACH_FACE_RADIUS), None)
+        on_way = shared is not None or any(
+            math.hypot(step.waypoint[0] - target[0], step.waypoint[1] - target[1]) <= 1.25
+            and abs(step.waypoint[2] - target[2]) <= 3.0 for step in ahead)
+        if not ahead:
+            # No route yet: is the hole on the straight line to the goal?
+            dx = goal.position[0] - observer.position[0]
+            dy = goal.position[1] - observer.position[1]
+            length = math.hypot(dx, dy)
+            if length > 1e-6:
+                rx, ry = target[0] - observer.position[0], target[1] - observer.position[1]
+                along = (rx * dx + ry * dy) / length
+                across = abs(ry * dx - rx * dy) / length
+                on_way = 0.0 <= along <= min(length, 6.0) and across <= 1.5
+        if not on_way:
+            state.breach_wait_digger = None
+            return False
+        if state.breach_wait_digger != int(digger.player_id):
+            state.breach_wait_digger = int(digger.player_id)
+            state.breach_wait_since = float(now)
+        elif now - state.breach_wait_since >= _BREACH_QUEUE_PATIENCE:
+            state.breach_wait_digger = None
+            state.breach_wait_released_until = float(now) + _BREACH_QUEUE_RELEASE_SECONDS
+            if shared is not None:
+                # The planner offers the same cheapest cell again unless it
+                # is told that one is taken.
+                self._remember_blocked_edge(
+                    state, (shared.breach.source, shared.breach.destination), now)
+                self._clear_route(state, now)
+            return False
+        return True
 
     def _breach_assist_queue_intent(
         self,
@@ -7040,6 +7162,23 @@ def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     return best_navigation_dig_profile(
         int(tool) for tool in getattr(observer, "loadout", ())
     )
+
+
+def _sprint_room(observer: PlayerSnapshot) -> float:
+    """Blocks of clear run this body needs to sprint one more decision."""
+
+    return min(_SPRINT_ROOM_MAX, max(
+        _SPRINT_ROOM_AT_REST, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
+
+
+def _sprints_uphill(observer: PlayerSnapshot) -> bool:
+    """Retail's CLASS_CAN_SPRINT_UPHILL for this body's class.
+
+    The native mover does not lift a sprinting Classic Soldier or Jump Zombie
+    onto a step: it stands against it, keys held, until sprint is released.
+    """
+
+    return bool(C.CLASS_CAN_SPRINT_UPHILL.get(int(observer.class_id), True))
 
 
 def _movement_abilities(

@@ -262,3 +262,51 @@ def test_zombies_infect_survivors_standing_in_open_water():
 def test_zombies_swim_out_to_survivors_on_an_offshore_islet():
     result, detail = _run(scenario="offshore", zombies=8, survivors=2, seconds=120.0, seed=11)
     assert result["kills"] == 2, detail
+
+
+def _recovering_zombie(world, position=(30.5, 20.5, WADE_Z)):
+    """A wading zombie whose swim has been handed to bank recovery."""
+
+    brain = SimpleBotBrain(world)
+    observer = _zombie(1, position, wade=True, grounded=False)
+    survivor = _player(9, TEAM2, (80.5, 20.5, 234.75))
+    first = brain.decide(_zombie_frame(observer, survivor, created_at=100.0))
+    assert first is not None and first.movement.direction[0] > 0.5   # on its way east
+    state = brain._states[(observer.player_id, observer.generation)]
+    state.water_recovery = True
+    return brain, state, observer, survivor
+
+
+def test_bank_recovery_with_no_bank_to_make_for_gives_the_swim_back():
+    world = _strait()
+    brain, state, observer, survivor = _recovering_zombie(world)
+
+    class _NoShoreInReach(type(world)):
+        """The shared flow finds no bank, as in the middle of SpookyMansion's sea."""
+
+        __slots__ = ()
+
+        def water_step(self, position, preferred_goal=None, **kwargs):
+            if preferred_goal is None:
+                return None
+            return super().water_step(position, preferred_goal=preferred_goal, **kwargs)
+
+        def assisted_water_step(self, position, preferred_goal=None, **kwargs):
+            return None
+
+    world.__class__ = _NoShoreInReach
+    intent = brain.decide(_zombie_frame(observer, survivor, created_at=100.2))
+    assert intent is not None and intent.debug_role != "water_no_route"
+    assert intent.movement.direction[0] > 0.5
+    assert not state.water_recovery
+
+
+def test_bank_recovery_that_gets_nowhere_gives_the_swim_back():
+    brain, state, observer, survivor = _recovering_zombie(_strait())
+    # Recovery makes for the islet behind it; the body does not get there.
+    back = brain.decide(_zombie_frame(observer, survivor, created_at=100.2))
+    assert back is not None and back.movement.direction[0] < -0.5 and state.water_recovery
+    # Five seconds on the four-block window has failed for recovery as well.
+    again = brain.decide(_zombie_frame(observer, survivor, created_at=105.0))
+    assert again is not None and again.movement.direction[0] > 0.5
+    assert not state.water_recovery
