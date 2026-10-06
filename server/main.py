@@ -33,6 +33,7 @@ from shared.packet import (
 from .config import ServerConfig
 from .combat_runtime import CombatSystem, get_combat_system
 from .corpse_lifecycle import CorpseLifecycle
+from . import achievements
 from .deployable_actions import DeployableActionService
 from .oriented_actions import OrientedActionService
 from .construction import ConstructionSafetyService
@@ -353,6 +354,8 @@ class BattleSpadesServer:
         self.deployable_actions = DeployableActionService(self)
         self.oriented_actions = OrientedActionService(self)
         self.debug_parity = DebugParityManager(self)
+        # Inert until start(): hooks are no-ops and no file is opened.
+        self.achievements = achievements.AchievementEngine(self)
         
         # A2S Query handler for Steam browser and LAN discovery
         self.a2s_handler = A2SHandler(self)
@@ -747,7 +750,8 @@ class BattleSpadesServer:
                 combat.record_exact_block_destroy_catchup(
                     owner, destroyed, causer_id=int(owner.id)
                 )
-                combat._collapse_unsupported(owner, destroyed)
+                with achievements.block_cause(self, owner, int(C.DRILL_KILL)):
+                    combat._collapse_unsupported(owner, destroyed)
             return
 
         packet = Damage()
@@ -774,7 +778,9 @@ class BattleSpadesServer:
                 destroyed,
                 causer_id=int(owner.id),
             )
-            combat._collapse_unsupported(owner, destroyed)
+            # The bore is not a blast: name the drill for block achievements.
+            with achievements.block_cause(self, owner, int(C.DRILL_KILL)):
+                combat._collapse_unsupported(owner, destroyed)
 
     def _deploy_launched_mine(self, event) -> None:
         """Turn a Mine Launcher projectile's terrain contact into an armed,
@@ -913,6 +919,7 @@ class BattleSpadesServer:
         # Projectiles that don't self-destroy blocks (RPG2, block_damage 2)
         # ACCUMULATE damage; grenade-family + strong warheads destroy outright.
         force_destroy = ex.spec.behavior != "contact"
+        achievements.projectile_exploding(self, ex, thrower)
         self._apply_blast(gx, gy, gz, ex.damage, ex.block_damage,
                           ex.spec.kill_type, thrower, crater_radius=1,
                           force_destroy=force_destroy,
@@ -1051,6 +1058,7 @@ class BattleSpadesServer:
         )
         return True
 
+    @achievements.blast_scope
     def _apply_blast(self, gx, gy, gz, damage, block_damage, kill_type, thrower,
                      crater_radius: int = 1, force_destroy: bool = True,
                      blast_radius: float = 16.0, knockback_min: float = 0.0,
@@ -1818,6 +1826,8 @@ class BattleSpadesServer:
         
         # Load map
         self.world_manager.load_map(self.config.map_name)
+        # Before the mode starts: its first round already counts.
+        self.achievements.start()
         
         # Initialize game mode (validated at the top of start()).
         mode_class = get_mode_class(self.config.game_mode)
@@ -1919,6 +1929,11 @@ class BattleSpadesServer:
                     self.prefab_actions.close()
                 except Exception:
                     logger.exception("Prefab runtime shutdown failed")
+
+                try:
+                    self.achievements.close()
+                except Exception:
+                    logger.exception("Achievement store shutdown failed")
             finally:
                 # This block is synchronous on purpose: even cancellation of
                 # stop() itself must not leave a live Python Connection beside
@@ -2307,6 +2322,7 @@ class BattleSpadesServer:
             # another connection; RoundLifecycle preserves ordinary world
             # construction while removing deployables and stale credit.
             self.round_lifecycle.forget_player(player)
+            achievements.player_left(self, player)
             
             # Remove from team
             if player.team in self.teams:

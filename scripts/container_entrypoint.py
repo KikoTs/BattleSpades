@@ -271,6 +271,13 @@ def build_runtime_config(
         data_directory,
         "logs/anticheat.jsonl",
     )
+    achievements = _table(document, "achievements")
+    if str(achievements.get("path", "")).strip() != ":memory:":
+        achievements["path"] = _data_path(
+            achievements.get("path"),
+            data_directory,
+            "state/achievements.sqlite3",
+        )
 
     region = _optional_text(environment, "BATTLESPADES_REGION", maximum=32)
     if region is not None:

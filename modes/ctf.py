@@ -679,6 +679,9 @@ class CTFMode(BaseMode):
             burdensome=True, state=intel_team,
         ):
             return
+        from server import achievements
+
+        achievements.intel_picked_up(self.server, intel_team)
         # "First to Claim Flag" (reason 52, CTF_SCORE_CLAIM = 100): the first
         # grab of an intel resting at its home, once per home cycle (a
         # dropped intel re-taken in the field pays nothing).
@@ -790,6 +793,11 @@ class CTFMode(BaseMode):
         self._award_kill_events(player, killer, kill_type)
         for team_id in (TEAM1, TEAM2):
             if self.intel_holder[team_id] == player:
+                from server import achievements
+
+                achievements.intel_carrier_killed(
+                    self.server, killer, player, team_id, kill_type
+                )
                 await self._drop_intel(player, team_id)
                 break
 
@@ -864,6 +872,9 @@ class CTFMode(BaseMode):
         self.intel_drop_time[intel_team] = 0.0
         self.server.teams[intel_team].return_intel(home_pos)
         self._set_intel_entity(intel_team, True)
+        from server import achievements
+
+        achievements.intel_returned(self.server, intel_team)
         if returned_by is not None:
             # Retail has no "returned the flag" score reason; the +1
             # CTF_INDIVIDUAL_SCORE_FOR_RETURNING_INTEL is paid unlabelled

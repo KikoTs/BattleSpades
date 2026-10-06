@@ -720,6 +720,12 @@ class ZombieMode(BaseMode):
         self._publish_team_locks()
         for player in selected:
             await self._infect(player, patient_zero=True)
+        from server import achievements
+
+        # "Start the round as a zombie" is this draw, not a later replacement.
+        achievements.zombie_round_started(
+            self.server, selected, ZOMBIE_TEAM, SURVIVOR_TEAM
+        )
         # Survivors learn of the outbreak; each infected player already got
         # YOU_HAVE_BEEN_INFECTED from _infect. Retail never names Patient Zero.
         self.announce_localised_to_team(
@@ -1111,6 +1117,9 @@ class ZombieMode(BaseMode):
         from server.scoreboard import send_team_score
 
         bonus_players = self._survivors() if winner == SURVIVOR_TEAM else []
+        from server import achievements
+
+        achievements.zombie_round_finished(self.server, bonus_players)
         self.phase = ZombiePhase.INTERMISSION
         self.infection_deadline = None
         # In-scene clients still hold the outbreak locks (Zombie open,

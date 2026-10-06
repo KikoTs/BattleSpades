@@ -248,6 +248,10 @@ class OccupationMode(BaseMode):
                 int(C.SCORE_REASON.OCC_INTERCEPT_SCORE_REASON),
             )
             self._broadcast_team_score(team, C.SCORE_REASON.OCC_INTERCEPT_SCORE_REASON)
+            if carrier_team == TEAM1:
+                from server import achievements
+
+                achievements.bomb_carrier_killed(self.server, killer, player, serial)
             if self.score_limit > 0 and team.score >= self.score_limit:
                 await self._end_by_score(int(killer.team))
         await self._drop_bomb(player)
@@ -531,6 +535,14 @@ class OccupationMode(BaseMode):
             self.server.entity_registry.remove(bomb.entity_id)
             self.entity_to_bomb.pop(bomb.entity_id, None)
         bomb.entity_id = None
+        from server import achievements
+
+        achievements.bomb_picked_up(
+            self.server, player, bomb.serial,
+            # Never carried: it still lies where it spawned.
+            from_spawn=bomb.last_carrier_id is None,
+            attacker=int(player.team) == TEAM1,
+        )
         bomb.carrier_id = int(player.id)
         bomb.last_carrier_id = int(player.id)
         bomb.last_carrier = player
@@ -593,6 +605,12 @@ class OccupationMode(BaseMode):
         from server.audio import SND_BOMB_DROP, play_sound
 
         play_sound(self.server, SND_BOMB_DROP, position=bomb.position)
+        from server import achievements
+
+        achievements.bomb_dropped(
+            self.server, player, bomb.serial,
+            in_base=self._bomb_inside_target(bomb.position),
+        )
         if not bomb.armed:
             bomb.armed = True
             bomb.explode_at = now + self.bomb_fuse_time
@@ -708,6 +726,14 @@ class OccupationMode(BaseMode):
             causer_entity_id=entity_id,
         )
         self._award_blast_survivors(witnesses)
+        from server import achievements
+
+        # After the blast (did the planter live?) and before a winning bomb
+        # ends the round.
+        achievements.bomb_detonated(
+            self.server, bomb.serial, inside=inside,
+            planter=scorer if bomb.last_carrier_team == TEAM1 else None,
+        )
         # No client code plays BOMB_EXPLODE_SOUND; the detonation cue is ours.
         from server.audio import (
             SND_BOMB_EXPLODE,
