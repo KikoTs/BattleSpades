@@ -131,6 +131,10 @@ def apply_runtime_paths(config: ServerConfig, paths: RuntimePaths) -> ServerConf
     config.prefabs_path = str(paths.resolve_configured_path(config.prefabs_path))
     config.plugins_path = str(paths.resolve_configured_path(config.plugins_path))
     config.bans_path = str(paths.resolve_configured_path(config.bans_path))
+    if config.achievements.path != ":memory:":
+        config.achievements.path = str(
+            paths.resolve_configured_path(config.achievements.path)
+        )
     config.revival.results_path = str(
         paths.resolve_configured_path(config.revival.results_path)
     )

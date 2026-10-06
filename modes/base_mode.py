@@ -98,6 +98,8 @@ class BaseMode(ABC):
 
         from server.scoreboard import reset_round_scores
         reset_round_scores(self.server)
+        from server import achievements
+        achievements.match_started(self.server)
 
         # Kick off the in-game music bed so the round is never silent. This
         # is a deliberate deviation (retail rounds were silent until the
@@ -120,6 +122,9 @@ class BaseMode(ABC):
         if self.retiring:
             # A transition is replacing this mode: no vote, no end screen.
             return
+        from server import achievements
+        # Before the end sequence reports the round to the master.
+        achievements.match_ended(self.server, winner)
         import time
         vote_manager = getattr(self.server, "vote_manager", None)
         ensure_vote = getattr(

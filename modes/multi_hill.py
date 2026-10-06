@@ -9,7 +9,7 @@ import time
 import shared.constants as C
 import shared.constants_gamemode as CG
 
-from server import mode_data
+from server import achievements, mode_data
 from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL
 
 from .airstrike import trigger_airstrike
@@ -176,6 +176,9 @@ class MultiHillMode(BaseMode):
                 # the text).
                 self.announce_localised("BASE_DEPLETED", override_previous=True)
             for zone in expired:
+                achievements.hill_expired(
+                    self.server, zone, self.zone_occupants.get(zone.index)
+                )
                 trigger_airstrike(self.server, zone.center)
             self._clear_active_zones()
             self.zone_occupants = {}
@@ -209,6 +212,11 @@ class MultiHillMode(BaseMode):
         killer_zone = self._active_zone_at(killer)
         victim_zone = self._active_zone_at(victim)
         team = int(killer.team)
+        achievements.hill_kill(
+            self.server, killer, victim,
+            killer_in_hill=killer_zone is not None,
+            victim_in_hill=victim_zone is not None,
+        )
         if (
             killer_zone is not None
             and self.zone_owner.get(killer_zone.index) == team
@@ -217,6 +225,7 @@ class MultiHillMode(BaseMode):
                 killer,
                 int(CG.MH_SCORE_DEFEND),
                 int(C.SCORE_REASON.MH_DEFEND_SCORE_REASON),
+                killer_zone,
             )
         elif (
             victim_zone is not None
@@ -226,6 +235,7 @@ class MultiHillMode(BaseMode):
                 killer,
                 int(CG.MH_SCORE_ASSAULT),
                 int(C.SCORE_REASON.MH_ASSAULT_SCORE_REASON),
+                victim_zone,
             )
 
     def _active_zone_at(self, player) -> ObjectiveZone | None:
@@ -385,10 +395,19 @@ class MultiHillMode(BaseMode):
                     first,
                     int(CG.MH_SCORE_FIRST),
                     int(C.SCORE_REASON.MH_FIRST_SCORE_REASON),
+                    zone,
                 )
             was_contested = self.zone_contested.get(zone.index, False)
             contested = blue > 0 and green > 0
             self.zone_contested[zone.index] = contested
+            if was_contested and not contested and blue != green:
+                # The contest is over with one team left on the hill: it kept
+                # its hill or took the contested one.
+                left = TEAM1 if blue > green else TEAM2
+                achievements.hill_contest_won(
+                    self.server, occupants[left],
+                    retained=self.zone_owner.get(zone.index) == left,
+                )
             if contested and not was_contested:
                 last = self._contested_shout_at.get(zone.index)
                 if last is None or now - last >= _CONTESTED_SHOUT_COOLDOWN:
@@ -426,7 +445,7 @@ class MultiHillMode(BaseMode):
                 reason = int(C.SCORE_REASON.MH_CONTROL_SCORE_REASON)
                 points = int(CG.MH_SCORE_CONTROL)
             for claimer in claimers:
-                self._award_player_score(claimer, points, reason)
+                self._award_player_score(claimer, points, reason, zone)
             self._announce_claim(decisive, claimant, old_owner)
 
     async def _award_team_ticks(self, now: float) -> None:
@@ -515,15 +534,17 @@ class MultiHillMode(BaseMode):
                     # A reused id or a team switch since the last capture
                     # sample: that body did not hold this hill.
                     continue
-                self._award_player_score(player, periods * points, reason)
+                self._award_player_score(player, periods * points, reason, zone)
 
-    def _award_player_score(self, player, points: int, reason: int) -> None:
+    def _award_player_score(self, player, points: int, reason: int, zone=None) -> None:
         if not self._owns_slot(player):
             return
         from server.scoreboard import send_player_score
 
         player.score = int(getattr(player, "score", 0)) + int(points)
         send_player_score(self.server, player, reason=int(reason))
+        if zone is not None:
+            achievements.hill_scored(self.server, zone.index, player)
 
     def _announce_claim(self, claimant, team: int, old_owner) -> None:
         """Team-relative claim cue through the in-game-gated base helpers."""

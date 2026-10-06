@@ -421,6 +421,23 @@ class DemolitionMode(BaseMode):
             int(C.SCORE_REASON.DEM_DESTROY_SCORE_REASON),
         )
 
+    def enemy_objective_damage(self, player, cells) -> tuple[int, int] | None:
+        """``(enemy team, how many of ``cells`` belong to its objective)``.
+
+        Achievements ask this as the cells fall, so unlike the queued
+        ``on_blocks_destroyed`` it also sees drill bores and collapses.
+        """
+
+        if self.ended or self.phase != "active" or player is None:
+            return None
+        team = int(getattr(player, "team", -1))
+        if team not in _PLAYABLE_TEAMS:
+            return None
+        enemy = TEAM2 if team == TEAM1 else TEAM1
+        objective = self.objective_cells[enemy]
+        count = sum(1 for cell in cells if tuple(cell) in objective)
+        return (enemy, count) if count else None
+
     async def on_blocks_built(self, player, positions) -> None:
         """Personal DEM_SCORE_REPAIR award: every DEM_SCORE_REPAIR_INTERVAL
         blocks rebuilt into the player's own damaged objective earns
@@ -453,6 +470,9 @@ class DemolitionMode(BaseMode):
         from server.profile_stats import add
 
         add(player, C.DEM_REPAIR_TOTAL, count)
+        from server import achievements
+
+        achievements.add(self.server, player, "demolition_repair_count", count)
         self._credit_blocks(
             player,
             self._repair_progress,

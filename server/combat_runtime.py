@@ -956,6 +956,8 @@ class CombatSystem:
             stats["headshots"] += 1
             weapon["headshots"] += 1
         stats["pellet_hits"] += int(tally["pellet_hits"])
+        from server import achievements
+        achievements.shot_resolved(self.server, player, tool, bool(tally["hit"]))
 
     def _observe_pellet_seed(self, player, packet) -> None:
         """Track the client-chosen 8-bit pellet seed for skew detection.
@@ -2840,6 +2842,15 @@ class CombatSystem:
         from server.combat_scores import record_blocks_destroyed
         record_blocks_destroyed(
             self.server, player, len(removed_positions) + len(collapsed), chunks,
+        )
+        from server import achievements
+        # A bullet's removal belongs to the gun being fired right now; an
+        # explosion's is attributed by its own blast scope.
+        tally = getattr(self, "_shot_tally", None)
+        achievements.blocks_destroyed(
+            self.server, player, removed_positions, collapsed, chunks,
+            getattr(player, "tool", None)
+            if tally is not None and tally.get("player") is player else None,
         )
 
         # A client whose topology differs by even one voxel can derive a

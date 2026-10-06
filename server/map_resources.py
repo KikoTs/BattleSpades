@@ -48,6 +48,9 @@ def _counted(service, award, action):
     """Wrap a crate refill so the collector's round award counts it."""
 
     def refill(player):
+        from server import achievements
+
+        before = achievements.crate_baseline(player)
         result = action(player)
         server = getattr(service, "server", None) or getattr(
             getattr(player, "connection", None), "server", None
@@ -55,6 +58,7 @@ def _counted(service, award, action):
         from server.combat_scores import record_crate
 
         record_crate(server, player, int(award))
+        achievements.crate_collected(server, player, int(award), before)
         return result
 
     return refill

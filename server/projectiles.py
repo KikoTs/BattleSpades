@@ -332,7 +332,8 @@ class Projectile:
     __slots__ = ("spec", "tool", "x", "y", "z", "vx", "vy", "vz",
                  "explode_at", "thrower_id", "stuck", "spawned_at",
                  "lifespan_at", "entity_id", "contact_block",
-                 "attached_player_id", "block_color", "source_loop")
+                 "attached_player_id", "block_color", "source_loop",
+                 "contact_player_id", "turret", "turret_target_id")
 
     def __init__(self, spec, tool, pos, vel, fuse, thrower_id, now):
         self.spec = spec
@@ -357,6 +358,12 @@ class Projectile:
         # and the source loop is the only client timeline label for the shot.
         self.block_color = None
         self.source_loop = None
+        # Achievement evidence (server/achievements.py): the player a contact
+        # projectile struck directly, and for a turret rocket the turret that
+        # fired it and the player it was aimed at.
+        self.contact_player_id = None
+        self.turret = None
+        self.turret_target_id = None
 
 
 class Explosion:
@@ -364,7 +371,8 @@ class Explosion:
     __slots__ = ("x", "y", "z", "thrower_id", "spec", "damage", "block_damage",
                  "entity_id", "blast_radius", "knockback_min", "knockback_max",
                  "self_knockback_min", "self_knockback_max", "contact_block",
-                 "block_color", "source_loop")
+                 "block_color", "source_loop",
+                 "contact_player_id", "turret", "turret_target_id")
 
     def __init__(self, proj: Projectile, destroyed: bool = False):
         self.x, self.y, self.z = proj.x, proj.y, proj.z
@@ -374,6 +382,9 @@ class Explosion:
         self.contact_block = proj.contact_block
         self.block_color = proj.block_color
         self.source_loop = proj.source_loop
+        self.contact_player_id = getattr(proj, "contact_player_id", None)
+        self.turret = getattr(proj, "turret", None)
+        self.turret_target_id = getattr(proj, "turret_target_id", None)
         if destroyed and proj.spec.destroyed_damage > 0.0:
             self.damage = proj.spec.destroyed_damage
             self.block_damage = proj.spec.destroyed_block_damage
@@ -690,10 +701,12 @@ class ProjectileEngine:
                 # Explode AT the cell face we hit — keep the last free position
                 # so the crater centers on the wall surface, not inside it.
                 return "world"
-            hit_t = self._first_player_hit(
+            contact = self._first_player_contact(
                 (ox, oy, oz), (nx, ny, nz), players, p.thrower_id
             )
-            if hit_t is not None:
+            if contact is not None:
+                hit_t, struck = contact
+                p.contact_player_id = getattr(struck, "id", None)
                 # Place the explosion at the entry point of the character's
                 # swept volume, rather than behind the target.
                 p.x = ox + (nx - ox) * hit_t
@@ -706,13 +719,6 @@ class ProjectileEngine:
         if not (0.0 <= p.x < 512.0 and 0.0 <= p.y < 512.0 and -64.0 < p.z < 300.0):
             return "bounds"
         return None
-
-    @staticmethod
-    def _first_player_hit(start, end, players, thrower_id: int):
-        contact = ProjectileEngine._first_player_contact(
-            start, end, players, thrower_id
-        )
-        return None if contact is None else contact[0]
 
     @staticmethod
     def _first_player_contact(start, end, players, thrower_id: int):

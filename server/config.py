@@ -330,6 +330,21 @@ class ConductConfig:
 
 
 @dataclass
+class AchievementConfig:
+    """Retail Steam achievements (``[achievements]``, docs/ACHIEVEMENTS.md).
+
+    Evaluated on every server: there is deliberately no official, ranked or
+    write-token gate, so a local Create Match server unlocks them too.
+    """
+
+    enabled: bool = True
+    # Kills OF bots count towards kill achievements. Bots never earn any.
+    count_bot_kills: bool = True
+    # SQLite file holding each player's counters and unlocks.
+    path: str = "state/achievements.sqlite3"
+
+
+@dataclass
 class SteamMasterConfig:
     """Optional legacy Steam master-server registration.
 
@@ -697,6 +712,7 @@ class ServerConfig:
     # New isolated runtime. ``configured`` distinguishes an explicit [bots]
     # table from legacy game.bot_count fixed-population behavior.
     bots: BotConfig = field(default_factory=BotConfig)
+    achievements: AchievementConfig = field(default_factory=AchievementConfig)
     anticheat: AntiCheatConfig = field(default_factory=AntiCheatConfig)
     conduct: ConductConfig = field(default_factory=ConductConfig)
     steam: SteamMasterConfig = field(default_factory=SteamMasterConfig)
@@ -1364,6 +1380,22 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                     )
             else:
                 setattr(config.conduct, name, max(0.0, float(value)))
+
+    if "achievements" in data:
+        achievements = data["achievements"]
+        if not isinstance(achievements, dict):
+            raise ValueError("achievements must be a TOML table")
+        config.achievements.enabled = bool(
+            achievements.get("enabled", config.achievements.enabled)
+        )
+        config.achievements.count_bot_kills = bool(
+            achievements.get("count_bot_kills", config.achievements.count_bot_kills)
+        )
+        config.achievements.path = str(
+            achievements.get("path", config.achievements.path)
+        ).strip()
+        if not config.achievements.path:
+            raise ValueError("achievements.path cannot be empty")
 
     if "bots" in data and isinstance(data["bots"], dict):
         b = data["bots"]

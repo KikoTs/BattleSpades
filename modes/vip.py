@@ -718,6 +718,10 @@ class VIPMode(BaseMode):
             self._promote_vip(team, selected[team])
         self.vip_alive = {TEAM1: True, TEAM2: True}
         self.phase = VIPPhase.ACTIVE
+        from server import achievements
+
+        # "Start the round as VIP" is this draw, not a later successor.
+        achievements.vip_round_started(self.server, selected)
         await self.broadcast_localised_message("VIP_START", override_previous=True)
 
     def _promote_vip(self, team: int, vip: Player) -> None:
@@ -1153,6 +1157,9 @@ class VIPMode(BaseMode):
         """Score one sub-round, then either finish the match or restart it."""
         if self.phase is VIPPhase.INTERMISSION or self.ended:
             return
+        from server import achievements
+
+        achievements.vip_round_finished(self.server, self)
         self.phase = VIPPhase.INTERMISSION
         self._clear_sudden_death()
         self._clear_vip_markers()

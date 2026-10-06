@@ -672,6 +672,24 @@ and server names (`Server`, `Admin`, `Console`, `System`, `Moderator`,
 a human cannot take a live bot's name, and bots are never renamed. Names stay
 within the retail 15-byte limit.
 
+### `[achievements]`: retail Steam achievements
+
+`server/achievements.py` evaluates the 77 retail achievements on every match
+and announces each unlock to all players. [ACHIEVEMENTS.md](ACHIEVEMENTS.md)
+lists the rule applied to each one and the six that are not implemented.
+
+- `enabled` (default `true`): `false` counts, saves and announces nothing.
+- `count_bot_kills` (default `true`): whether kills of bots count. Bots never
+  earn achievements.
+- `path` (default `state/achievements.sqlite3`): the SQLite file with every
+  player's counters and unlocks, resolved through the runtime paths service.
+  Preserve it across bundle replacement. The Docker entrypoint moves a
+  relative path to the instance volume (`/data/state/achievements.sqlite3`).
+
+There is no official, ranked or write-token condition: an unranked or local
+server unlocks them too. Players are identified by their verified AoSPlay
+account, else by the Steam relay identity, else by name.
+
 ## Commands
 
 Anyone may use `/help [command]`, `/kill`, `/team <team1|team2|spectator>`,
