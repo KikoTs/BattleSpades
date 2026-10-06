@@ -21,6 +21,8 @@ HEARING_DISTANCE = float(getattr(C, "HEARING_DISTANCE", 50.0))
 FOOTSTEP_INTERVAL_WALK = 0.512
 FOOTSTEP_INTERVAL_SPRINT = 0.386
 _FOOTSTEP_SPEED = 1.5
+# Player velocity is in physics units: blocks per second is 32 times that.
+_PHYSICS_SCALE = 32.0
 _FOOTSTEP_LIFETIME = 0.45
 _SOUNDS = frozenset({
     StimulusKind.SHOT, StimulusKind.EXPLOSION, StimulusKind.BLOCK_DESTROYED,
@@ -114,7 +116,8 @@ class BotStimulusBus:
             controls = getattr(player, "input", None)
             if getattr(controls, "crouch", False) or getattr(controls, "sneak", False):
                 continue
-            speed = math.hypot(float(getattr(player, "vx", 0.0)), float(getattr(player, "vy", 0.0)))
+            speed = _PHYSICS_SCALE * math.hypot(float(getattr(player, "vx", 0.0)),
+                                                float(getattr(player, "vy", 0.0)))
             if speed < _FOOTSTEP_SPEED or now < self._next_step.get(player_id, 0.0):
                 continue
             self._next_step[player_id] = now + (

@@ -483,11 +483,13 @@ def test_worker_routes_a_fall_back_and_strides_away_while_no_route_exists():
 
 # -- sounds -----------------------------------------------------------------
 
-def _walker(player_id=7, team=TEAM2, position=(30.0, 10.0, 37.75), *, speed=5.0, alive=True,
+def _walker(player_id=7, team=TEAM2, position=(30.0, 10.0, 37.75), *, speed=5.6, alive=True,
             grounded=True, crouch=False, sneak=False, sprint=False):
+    """A roster entry moving at ``speed`` blocks a second (velocity is per 1/32 s)."""
+
     return SimpleNamespace(
         id=player_id, team=team, position=position, alive=alive, spawned=True,
-        grounded=grounded, vx=speed, vy=0.0,
+        grounded=grounded, vx=speed / 32.0, vy=0.0,
         input=SimpleNamespace(crouch=crouch, sneak=sneak, sprint=sprint))
 
 
@@ -686,7 +688,7 @@ def test_director_publishes_footsteps_and_filters_what_each_bot_hears():
     server.bot_stimuli = BotStimulusBus()
     enemy = _walker(77, TEAM2, (bot.x + 12.0, bot.y, bot.z))
     server.players[77] = enemy
-    bot.vx, bot.grounded = 5.0, True
+    bot.vx, bot.grounded = 5.6 / 32.0, True  # a walk, in the server's velocity units
     now = time.monotonic()
     try:
         director._perception_cache_until = 0.0
