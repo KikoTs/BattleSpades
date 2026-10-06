@@ -353,3 +353,27 @@ def test_repeated_budget_deferral_does_not_become_a_route_cycle(monkeypatch):
         assert intent.debug_role.endswith(":planning_wait")
     assert not state.blocked_edges
     assert not state.escape_attempts
+
+
+@pytest.mark.parametrize("step_age,blamed", ((3.0, True), (0.5, False)))
+def test_an_expired_progress_clock_blames_only_a_step_tried_for_that_long(step_age, blamed):
+    """The clock times the body through every replan; it is not about one edge.
+
+    A body stuck for 2.5 seconds still recovers, but the first step of a
+    route adopted half a second ago is not what held it: excluding that edge
+    for a minute closed the one way out of a pocket.
+    """
+    brain, state = SimpleBotBrain(_TacticalWorld()), _BotState(1, 1, 0)
+    observer = _player(1, 1, SQUARE[0], is_bot=True)
+    goal = _Goal(("far",), (100., 10., 20.), "route_test", 1., True)
+    brain._set_goal(state, goal, observer.position, 97.)
+    state.navigation_progress_position = state.navigation_window_position = observer.position
+    state.navigation_progress_at = state.navigation_window_at = 97.
+    state.route = (RouteStep(SQUARE[1], MovementAffordance.WALK),)
+    state.route_topology_version = 1
+    state.waypoint_progress_at = 100.
+    brain._note_step(state, state.route[0], 100. - step_age)
+    result = brain._navigation_intent(_frame(observer, created_at=100.),
+                                      observer, state, goal, 100.)
+    assert result.debug_role == "route_test:physical_edge_blocked"
+    assert bool(state.blocked_edges) is blamed

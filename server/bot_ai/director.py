@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import struct
 import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
@@ -130,6 +131,11 @@ _ENTITY_RANK_CACHE_SECONDS = 0.5
 # refuge election. A cold election scans ~13k map columns (~70 ms on
 # SpookyMansion); spread it across refreshes instead of one 53 ms tick.
 _REFUGE_ELECTION_BUDGET_SECONDS = 0.002
+# boxclipmove keeps the body's half width and every corner it probes as
+# float32 before truncating to a voxel. At a contact plane that decides which
+# column a corner is in, so the motor's own corners are rounded the same way.
+_BODY_RADIUS = 0.449999988079071
+_FLOAT32 = struct.Struct("f")
 _WALK_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0)
 )
@@ -3368,6 +3374,8 @@ class BotDirector:
                 and not world.clipbox(probe_x, probe_y, float(player.z) + 1.0)
                 for probe_x, probe_y in immediate[1:]
             )
+        if result and ordinary_walk and not wading:
+            result = not BotDirector._step_under_low_roof(world, player, *immediate[0])
         if result and ordinary_walk and not wading and probe_distance > 0.65:
             # The immediate full probe owns walls and step height. Farther
             # samples only own water/void braking: comparing their support
@@ -3425,6 +3433,36 @@ class BotDirector:
         runtime.waypoint_probe_key = probe_key
         runtime.waypoint_probe_result = result
         return result
+
+    @staticmethod
+    def _step_under_low_roof(world, player, centre_x: float, centre_y: float) -> bool:
+        """Would the native mover refuse to lift the body onto a step here?
+
+        boxclipmove climbs a one-block step only when the cell above the head
+        is clear at all four corners of the body's box, and stops that axis
+        dead otherwise. The probes above judge one column each: in a one-wide
+        tunnel a shoulder a hundredth of a block over a side ledge passed as
+        a climbable step while the roof over the lane held the body there,
+        keys down, until the route was given up.
+        """
+
+        solid = getattr(world, "get_solid", None)
+        if (not callable(solid) or not bool(getattr(player, "grounded", False))
+                or bool(getattr(getattr(player, "input", None), "crouch", False))):
+            return False
+        def voxel(coordinate: float) -> int:
+            return int(_FLOAT32.unpack(_FLOAT32.pack(coordinate))[0])
+
+        feet = int(round(float(player.z) + 2.25)) - 1
+        step = roof = False
+        for column in {(voxel(centre_x + offset_x), voxel(centre_y + offset_y))
+                       for offset_x in (-_BODY_RADIUS, _BODY_RADIUS)
+                       for offset_y in (-_BODY_RADIUS, _BODY_RADIUS)}:
+            if solid(*column, feet - 1) or solid(*column, feet - 2):
+                continue  # a wall, which the probes above own
+            step = step or bool(solid(*column, feet))
+            roof = roof or bool(solid(*column, feet - 3))
+        return step and roof
 
     @staticmethod
     def _has_travel_target(intent: BotIntent) -> bool:
@@ -3627,7 +3665,13 @@ class BotDirector:
                         centre_length = math.hypot(*centre)
                         candidate = (centre[0] / centre_length * length,
                                      centre[1] / centre_length * length, requested[2])
-                        if (math.dist(candidate, requested) > 1e-6
+                        # Only a heading that stays in this lane is re-centred
+                        # in it. One on its way into the next lane was pulled
+                        # back to the middle of the lane it was leaving.
+                        across, beside = ((player.y, dy) if abs(dx) >= abs(dy)
+                                          else (player.x, dx))
+                        if (math.floor(across + beside * 0.65) == math.floor(across)
+                                and math.dist(candidate, requested) > 1e-6
                                 and BotDirector._waypoint_is_live(runtime, candidate, affordance)):
                             result = candidate
                     # A narrow voxel corridor can admit an exact axis while
