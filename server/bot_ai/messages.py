@@ -252,6 +252,9 @@ class PlayerSnapshot:
     # Still shielded by spawn protection (the client shows the shield): bots
     # hold fire like a human would instead of wasting it on a fresh spawn.
     spawn_protected: bool = False
+    # Kill type of that last hit (bullet, blast, burn tick, ...). The client
+    # is told the same through the damage indicator it draws.
+    last_damage_kind: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +382,9 @@ class LookIntent:
     # Worker-chosen aim offset added to the live eye z (AoS z increases
     # downward: +1.15 torso, 0.0 head, +1.0 zombie center-mass).
     aim_offset_z: float = 0.0
+    # A look over the shoulder while the feet keep following their route:
+    # the motor turns the head to ``target`` instead of down the path.
+    glance: bool = False
 
 
 @dataclass(frozen=True, slots=True)
