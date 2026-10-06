@@ -956,9 +956,19 @@ class SimpleBotBrain:
             state.contact_until = now + _CONTACT_SECONDS
         if not reaction.role:
             return None
-        # A short run over checked ground; the old route is replanned from
-        # wherever it ends.
-        self._set_goal(state, None, observer.position, now)
+        if reaction.goal is not None:
+            routed = self._navigation_intent(frame, observer, state, _Goal(
+                ("awareness", reaction.role), reaction.goal, reaction.role, 3.0,
+                reaction.sprint), now)
+            if (routed.action.kind is not BotActionKind.NONE
+                    or math.hypot(*routed.movement.direction[:2]) > 1e-6
+                    or math.hypot(*reaction.heading[:2]) <= 1e-6):
+                return routed
+            # No route yet: the raw stride below beats standing in the open.
+        else:
+            # A short run over checked ground; the old route is replanned
+            # from wherever it ends.
+            self._set_goal(state, None, observer.position, now)
         return self._intent(
             frame,
             movement=MovementIntent(direction=reaction.heading, crouch=reaction.crouch,

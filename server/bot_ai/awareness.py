@@ -17,12 +17,14 @@ an expert is behind something solid within half a second.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 
 import shared.constants as C
 
-from .combat_tactics import find_shelter, firing_line, mix, walkable_heading
+from .combat_tactics import (
+    exposed, find_dead_ground, find_shelter, firing_line, mix, walkable_heading,
+)
 from .messages import (
     BotActionKind,
     BotIntent,
@@ -58,6 +60,25 @@ _SHELTER_ARRIVAL = 1.0
 _SHELTER_BRAKE = 3.0
 _SHELTER_STALL_SECONDS = 1.5
 _LOOK_BACK_SECONDS = 0.35
+# Counting the enemies in sight costs one ray each; twice a second is as
+# often as the answer changes.
+_ODDS_SECONDS = 0.45
+_ODDS_REACH = 70.0
+_MAX_FOES = 6
+_ALLY_REACH = 18.0
+# Inside this range turning away is death: the fight is settled where it is.
+_POINT_BLANK = 7.0
+_PRESSURE_SECONDS = 2.5
+# A lost fight shows over a couple of seconds, and a sight line that flickers
+# for a moment (a step behind a post) does not make it a new fight.
+_LOSS_WINDOW_SECONDS = 2.0
+_FIGHT_MEMORY_SECONDS = 1.5
+_FALL_BACK_SECONDS = 12.0
+_FALL_BACK_ARRIVAL = 8.0
+# A teammate this close is worth leaving cover for.
+_REGROUP_REACH = 60.0
+_DEAD_GROUND_SECONDS = 1.5
+_DEAD_GROUND_ARRIVAL = 2.5
 _MAX_LIVES = 128
 
 
@@ -72,11 +93,28 @@ class Reaction:
 
     role: str = ""
     heading: Vector3 = (0.0, 0.0, 0.0)
+    # A place too far for a raw stride: the worker routes there, and falls
+    # back on ``heading`` while the planner has nothing yet.
+    goal: Vector3 | None = None
     look: Vector3 | None = None
     crouch: bool = False
     sprint: bool = False
     priority: BotIntentPriority = BotIntentPriority.COMBAT
     suspect: Vector3 | None = None
+
+
+@dataclass(slots=True)
+class _Shelter:
+    """One run to a spot out of somebody's sight, and whether it got there."""
+
+    spot: Vector3 | None = None
+    reached: bool = False
+    best: float = math.inf
+    progress_at: float = 0.0
+    next_search_at: float = 0.0
+
+    def clear(self) -> None:
+        self.spot, self.reached = None, False
 
 
 @dataclass(slots=True)
@@ -91,18 +129,31 @@ class _Life:
     fire_from: Vector3 | None = None
     fire_noticed_at: float = 0.0
     fire_until: float = 0.0
-    shelter: Vector3 | None = None
+    shelter: _Shelter = field(default_factory=_Shelter)
     shelter_hits: int = 0
-    shelter_reached: bool = False
-    shelter_best: float = math.inf
-    shelter_progress_at: float = 0.0
-    next_shelter_at: float = 0.0
     dash: Vector3 | None = None
     dash_until: float = 0.0
     dashes: int = 0
     look_back_until: float = 0.0
     sighted_id: int = -1
     sighted_at: float = 0.0
+    # Outmatched: breaking off a fight that is being lost.
+    odds_at: float = 0.0
+    foes: tuple[Vector3, ...] = ()
+    foes_at: float = 0.0
+    nearest_foe: float = math.inf
+    health_log: tuple[tuple[float, int], ...] = ()
+    outmatched_since: float = 0.0
+    outmatched_at: float = 0.0
+    retreat: str = ""
+    retreat_until: float = 0.0
+    retreat_wait: float = 0.0
+    retreat_hit_at: float = 0.0
+    retreat_rest_until: float = 0.0
+    refuge: _Shelter = field(default_factory=_Shelter)
+    rally: Vector3 | None = None
+    dead_ground: Vector3 | None = None
+    dead_ground_at: float = 0.0
     # A look that rides on whatever the body is doing.
     glance: Vector3 | None = None
     glance_until: float = 0.0
@@ -143,6 +194,24 @@ def _flight_role(observer: PlayerSnapshot, decision: ModeBotDecision | None) -> 
         ModeBotPosture.EVASIVE, ModeBotPosture.SURVIVE}
 
 
+def _holds_ground(observer: PlayerSnapshot, decision: ModeBotDecision | None) -> bool:
+    """Roles whose job is to stay in a losing fight.
+
+    A carrier, a bodyguard, a defender standing on the objective it was told
+    to hold and an attacker already on top of its objective win or lose the
+    round right there.
+    """
+
+    if _flight_role(observer, decision):
+        return True
+    if decision is None or decision.objective_priority < 0.9:
+        return False
+    if decision.posture is ModeBotPosture.ESCORT:
+        return True
+    return math.dist(observer.position, decision.position) <= max(
+        12.0, 2.0 * float(decision.arrival_radius))
+
+
 class Awareness:
     """Per-life memory of stimuli and the reactions that follow from them."""
 
@@ -176,7 +245,13 @@ class Awareness:
         life = self._life(observer, now)
         if int(observer.class_id) in _ZOMBIE_CLASSES:
             return None
-        return self._under_fire(frame, observer, profile, life, visible, decision, now)
+        hunted = self._under_fire(frame, observer, profile, life, visible, decision, now)
+        retreat = self._outmatched(frame, observer, profile, life, visible, decision, now)
+        if retreat is not None:
+            # One owner: the retreat already answers whoever is shooting.
+            life.fire_from = None
+            return retreat
+        return hunted
 
     def overlay(self, frame: PerceptionFrame, intent: BotIntent) -> BotIntent:
         """Let a pending glance turn the head while the body carries on."""
@@ -219,10 +294,9 @@ class Awareness:
                     life.hits = 0
                     life.fire_noticed_at = hit_at + notice_delay(profile)
                     life.look_back_until = life.fire_noticed_at + _LOOK_BACK_SECONDS
-                    life.shelter = None
-                    life.shelter_reached = False
+                    life.shelter = _Shelter()
+                    life.shelter_hits = 0
                     life.dash = None
-                    life.next_shelter_at = 0.0
                 life.hits += 1
                 life.fire_from = tuple(float(value) for value in source)
                 committed = decision is not None and decision.objective_priority >= 0.9
@@ -252,49 +326,32 @@ class Awareness:
             return None
         life.glance = None
 
-        if life.shelter is not None and life.shelter_reached and life.hits > life.shelter_hits:
+        shelter = life.shelter
+        if shelter.reached and life.hits > life.shelter_hits:
             # Hit again where it thought it was safe: that spot is no cover.
-            life.shelter = None
-            life.shelter_reached = False
-        # Ground probes mean nothing from mid-air (a step down a terrace, the
-        # hop out of a crouch): keep the stride in hand and choose on landing.
-        airborne = not observer.grounded
-        if life.shelter is None and not airborne and now >= life.next_shelter_at:
-            life.next_shelter_at = now + _SHELTER_RETRY_SECONDS
-            # A skilled player allows for the shooter stepping sideways and
-            # looks farther for something solid; a weak one hides from the
-            # one spot the shot came from, within a few strides.
-            line = (firing_line(observer.position, threat) if profile.skill >= 0.45
-                    else (threat,))
-            side = 1.0 if mix(observer.player_id, observer.life_id, life.hits) < 0.5 else -1.0
-            life.shelter = find_shelter(
-                self.world, observer, line, reach=4.5 + 6.5 * float(profile.skill),
-                min_gap=2.5, side=side)
-            life.shelter_hits = life.hits
-            life.shelter_reached = False
-            life.shelter_best = math.inf
-            life.shelter_progress_at = now
+            shelter.clear()
+        # A skilled player allows for the shooter stepping sideways and looks
+        # farther for something solid; a weak one hides from the one spot the
+        # shot came from, within a few strides.
+        line = firing_line(observer.position, threat) if profile.skill >= 0.45 else (threat,)
+        side = 1.0 if mix(observer.player_id, observer.life_id, life.hits) < 0.5 else -1.0
+        state, heading = self._seek(observer, shelter, line, now,
+                                    reach=4.5 + 6.5 * float(profile.skill), min_gap=2.5,
+                                    side=side)
         # Each run starts with a look at where the shot came from; then the
         # eyes go where the feet are going, as a runner's do.
         startled = now < life.look_back_until
-        if life.shelter is not None:
-            gap = math.hypot(life.shelter[0] - observer.position[0],
-                             life.shelter[1] - observer.position[1])
-            if gap <= _SHELTER_ARRIVAL:
-                life.shelter_reached = True
+        airborne = not observer.grounded
+        if state == "reached":
+            if life.shelter_hits <= 0:
                 life.shelter_hits = life.hits
-            if life.shelter_reached:
-                return Reaction("under_fire_hold", look=threat, crouch=True)
-            if gap + 0.3 < life.shelter_best:
-                life.shelter_best, life.shelter_progress_at = gap, now
-            if now - life.shelter_progress_at < _SHELTER_STALL_SECONDS:
-                heading = _unit(life.shelter[0] - observer.position[0],
-                                life.shelter[1] - observer.position[1])
-                return Reaction("under_fire_cover", heading=heading,
-                                sprint=gap > _SHELTER_BRAKE,
-                                look=threat if startled else _ahead(observer, heading))
-            # Something the straight-line check missed is in the way.
-            life.shelter = None
+            return Reaction("under_fire_hold", look=threat, crouch=True)
+        if state == "run":
+            life.shelter_hits = 0
+            gap = math.hypot(shelter.spot[0] - observer.position[0],
+                             shelter.spot[1] - observer.position[1])
+            return Reaction("under_fire_cover", heading=heading, sprint=gap > _SHELTER_BRAKE,
+                            look=threat if startled else _ahead(observer, heading))
         if not airborne and (life.dash is None or now >= life.dash_until):
             life.dash = self._dash_heading(observer, threat, life)
             life.dashes += 1
@@ -306,6 +363,301 @@ class Awareness:
             return Reaction("under_fire_hold", look=threat, crouch=not airborne)
         return Reaction("under_fire_evade", heading=life.dash, sprint=True,
                         look=threat if startled else _ahead(observer, life.dash))
+
+    def _seek(self, observer: PlayerSnapshot, shelter: _Shelter, threats, now: float, *,
+              reach: float, min_gap: float, side: float) -> tuple[str, Vector3]:
+        """Advance one run for cover: ``reached``, ``run`` with a heading, or ``none``.
+
+        Searches are rate limited and never start from mid-air, where ground
+        probes mean nothing (a step down a terrace, the hop out of a crouch).
+        """
+
+        if shelter.spot is None and observer.grounded and now >= shelter.next_search_at:
+            shelter.next_search_at = now + _SHELTER_RETRY_SECONDS
+            shelter.spot = find_shelter(self.world, observer, threats, reach=reach,
+                                        min_gap=min_gap, side=side)
+            shelter.reached = False
+            shelter.best = math.inf
+            shelter.progress_at = now
+        if shelter.spot is None:
+            return "none", (0.0, 0.0, 0.0)
+        gap = math.hypot(shelter.spot[0] - observer.position[0],
+                         shelter.spot[1] - observer.position[1])
+        if gap <= _SHELTER_ARRIVAL:
+            shelter.reached = True
+        if shelter.reached:
+            return "reached", (0.0, 0.0, 0.0)
+        if gap + 0.3 < shelter.best:
+            shelter.best, shelter.progress_at = gap, now
+        if now - shelter.progress_at >= _SHELTER_STALL_SECONDS:
+            # Something the straight-line check missed is in the way.
+            shelter.clear()
+            return "none", (0.0, 0.0, 0.0)
+        return "run", _unit(shelter.spot[0] - observer.position[0],
+                            shelter.spot[1] - observer.position[1])
+
+    # -- outnumbered or nearly dead ------------------------------------------
+
+    def _count_odds(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                    life: _Life, now: float) -> None:
+        """Count the enemies this bot can see, and remember where their eyes are.
+
+        Stimulus: enemies in line of sight that are in front of the bot, at
+        arm's length, or marked by the damage indicator. Nothing behind a
+        wall is counted.
+        """
+
+        life.odds_at = now + _ODDS_SECONDS
+        life.health_log = tuple(
+            entry for entry in life.health_log
+            if now - entry[0] <= _LOSS_WINDOW_SECONDS) + ((now, int(observer.health)),)
+        candidates = []
+        for player in frame.players:
+            if (player.team == observer.team or not player.alive or not player.spawned
+                    or player.spawn_protected):
+                continue
+            distance = math.dist(observer.eye, player.eye)
+            if distance > _ODDS_REACH:
+                continue
+            dx, dy = player.eye[0] - observer.eye[0], player.eye[1] - observer.eye[1]
+            flat = math.hypot(dx, dy)
+            facing = ((observer.orientation[0] * dx + observer.orientation[1] * dy) / flat
+                      if flat > 1e-6 else 1.0)
+            marked = (observer.last_damage_source_id == player.player_id
+                      and 0.0 <= now - observer.last_damage_at <= 3.0)
+            if facing >= 0.2 or marked or distance <= 8.0:
+                candidates.append((distance, player.eye))
+        candidates.sort(key=lambda item: item[0])
+        seen = [(distance, eye) for distance, eye in candidates[:_MAX_FOES]
+                if self.world.has_line_of_sight(observer.eye, eye)]
+        if seen:
+            life.foes = tuple(eye for _distance, eye in seen)
+            life.foes_at = now
+            life.nearest_foe = seen[0][0]
+        elif now - life.foes_at > _FIGHT_MEMORY_SECONDS:
+            life.foes = ()
+            life.nearest_foe = math.inf
+
+    def _outmatched(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                    profile: BotProfile, life: _Life, visible: PlayerSnapshot | None,
+                    decision: ModeBotDecision | None, now: float) -> Reaction | None:
+        """Break off a fight that is being lost and come back on better terms.
+
+        Out of sight first, then back toward the team; the fight is taken up
+        again once there is company or the enemy has lost track. Stimulus:
+        the enemies in sight, the bot's own health and how fast it is going.
+        """
+
+        if life.retreat:
+            return self._retreat(frame, observer, profile, life, visible, now)
+        pressed = (observer.last_damage_at > 0.0
+                   and 0.0 <= now - observer.last_damage_at <= _PRESSURE_SECONDS
+                   and int(observer.last_damage_kind) not in _UNDIRECTED_DAMAGE)
+        if not pressed or now < life.retreat_rest_until:
+            life.outmatched_since = 0.0
+            if not pressed:
+                life.health_log = ()
+            return None
+        if now >= life.odds_at:
+            self._count_odds(frame, observer, life, now)
+        outmatched = False
+        odds = 0
+        if life.foes and life.nearest_foe > _POINT_BLANK and not _holds_ground(
+                observer, decision):
+            odds = len(life.foes) - (self._allies_near(frame, observer) + 1)
+            lean = float(profile.caution) - float(profile.aggression)
+            outnumbered = odds >= (1 if lean > 0.3 else 3 if lean < -0.4 else 2)
+            hurt = observer.health <= 22.0 + 26.0 * float(profile.caution) - 12.0 * float(
+                profile.aggression)
+            lost = max(health for _at, health in life.health_log) - int(observer.health)
+            # Whatever the temperament: at this rate there are seconds left,
+            # and fewer when more than one gun is doing it.
+            losing = lost >= 20 and observer.health <= (2.5 if odds >= 1 else 1.5) * lost
+            outmatched = outnumbered or hurt or losing
+        if not outmatched:
+            if now - life.outmatched_at > _FIGHT_MEMORY_SECONDS:
+                life.outmatched_since = 0.0
+            return None
+        life.outmatched_at = now
+        if life.outmatched_since <= 0.0:
+            life.outmatched_since = now
+        if now - life.outmatched_since < notice_delay(profile):
+            return None
+        refuge = _Shelter()
+        state, _heading = self._seek(observer, refuge, life.foes, now,
+                                     reach=5.0 + 5.5 * float(profile.skill), min_gap=0.0,
+                                     side=self._home_side(frame, observer, life))
+        life.rally = self._rally_point(frame, observer, life)
+        if state == "none" and (odds < 1 or life.rally is None):
+            # Hurt in the open, one on one: running only shows a back.
+            life.retreat_rest_until = now + 1.5
+            return None
+        life.refuge = refuge
+        life.retreat = "cover" if state != "none" else "fall_back"
+        life.retreat_until = now + (4.0 if life.retreat == "cover" else _FALL_BACK_SECONDS)
+        life.retreat_hit_at = float(observer.last_damage_at)
+        life.dead_ground = None
+        life.dead_ground_at = 0.0
+        life.outmatched_since = 0.0
+        return self._retreat(frame, observer, profile, life, visible, now)
+
+    @staticmethod
+    def _allies_near(frame: PerceptionFrame, observer: PlayerSnapshot) -> int:
+        """Teammates close enough to be in the same fight (the minimap shows them)."""
+
+        return sum(1 for player in frame.players
+                   if player.team == observer.team and player.alive and player.spawned
+                   and player.player_id != observer.player_id
+                   and math.dist(player.position, observer.position) <= _ALLY_REACH)
+
+    def _retreat(self, frame: PerceptionFrame, observer: PlayerSnapshot, profile: BotProfile,
+                 life: _Life, visible: PlayerSnapshot | None, now: float) -> Reaction | None:
+        """Carry out one retreat.
+
+        ``cover`` runs to something close, ``fall_back`` crosses open ground
+        toward the next fold in the terrain or the team, ``hold`` catches a
+        breath out of sight, ``regroup`` walks on to the team.
+        """
+
+        if not life.foes:
+            return self._end_retreat(life, profile, now)
+        foe = life.foes[0]
+        side = self._home_side(frame, observer, life)
+        hit_at = float(observer.last_damage_at)
+        if life.retreat == "regroup" and hit_at > life.retreat_hit_at + 1e-6:
+            # Still in somebody's sights: look for cover again.
+            life.retreat = "fall_back"
+            life.refuge = _Shelter()
+        if life.retreat == "fall_back" and life.refuge.spot is None:
+            if self._seek(observer, life.refuge, life.foes, now, reach=10.5, min_gap=0.0,
+                          side=side)[0] != "none":
+                life.retreat = "cover"
+                life.retreat_until = now + 4.0
+            elif observer.grounded and now >= life.dead_ground_at:
+                life.dead_ground_at = now + _DEAD_GROUND_SECONDS
+                life.dead_ground = find_dead_ground(self.world, observer, life.foes, side=side)
+        if life.retreat == "cover":
+            state, heading = self._seek(observer, life.refuge, life.foes, now,
+                                        reach=10.5, min_gap=0.0, side=side)
+            if state == "run" and now < life.retreat_until:
+                gap = math.hypot(life.refuge.spot[0] - observer.position[0],
+                                 life.refuge.spot[1] - observer.position[1])
+                return Reaction("disengage_cover", heading=heading,
+                                sprint=gap > _SHELTER_BRAKE, look=_ahead(observer, heading))
+            if state == "reached":
+                self._settle(life, profile, hit_at, now)
+            else:
+                life.refuge.clear()
+                life.retreat = "fall_back"
+                life.retreat_until = now + _FALL_BACK_SECONDS
+        if life.retreat == "hold":
+            if visible is not None and math.dist(visible.position, observer.position) <= 14.0:
+                # They came round the corner: fight from here.
+                return self._end_retreat(life, profile, now)
+            hit_here = hit_at > life.retreat_hit_at + 1e-6
+            if not hit_here and now < life.retreat_until:
+                return Reaction("disengage_hold", look=foe, crouch=True)
+            company = self._allies_near(frame, observer) > 0
+            life.rally = self._rally_point(frame, observer, life, reach=_REGROUP_REACH)
+            if not hit_here and life.rally is not None and not company and (
+                    self._way_exposed(observer, life.rally, life.foes)):
+                # The way back to the team crosses their sights.
+                life.rally = None
+            if not hit_here and (company or (life.rally is None and now >= life.retreat_wait)):
+                # Breath caught, and company at hand or none to be had.
+                return self._end_retreat(life, profile, now)
+            if not hit_here and life.rally is None:
+                # Nobody to join by a safe way: out of sight is the place to
+                # be until someone comes, friend or enemy.
+                life.retreat_until = now + 1.0
+                return Reaction("disengage_hold", look=foe, crouch=True)
+            if hit_here:
+                life.rally = self._rally_point(frame, observer, life)
+            # On toward the team. Cover is looked for again only if this
+            # spot turned out to be none.
+            life.retreat = "fall_back" if hit_here else "regroup"
+            life.refuge = _Shelter()
+            life.dead_ground = None
+            life.retreat_hit_at = hit_at
+            life.retreat_until = now + _FALL_BACK_SECONDS
+        rally = life.rally
+        if (rally is None or now >= life.retreat_until
+                or math.dist(rally[:2], observer.position[:2]) <= _FALL_BACK_ARRIVAL
+                or (life.retreat == "regroup" and self._allies_near(frame, observer))):
+            return self._end_retreat(life, profile, now)
+        away = _unit(observer.position[0] - foe[0], observer.position[1] - foe[1])
+        if life.retreat == "fall_back" and life.dead_ground is not None:
+            if math.dist(life.dead_ground[:2], observer.position[:2]) <= _DEAD_GROUND_ARRIVAL:
+                self._settle(life, profile, hit_at, now)
+                return Reaction("disengage_hold", look=foe, crouch=True)
+            return Reaction("fall_back", goal=life.dead_ground, heading=away, sprint=True)
+        return Reaction("regroup" if life.retreat == "regroup" else "fall_back",
+                        goal=rally, heading=away, sprint=True)
+
+    def _way_exposed(self, observer: PlayerSnapshot, rally: Vector3, foes) -> bool:
+        """Whether the first strides toward ``rally`` leave cover again."""
+
+        heading = _unit(rally[0] - observer.position[0], rally[1] - observer.position[1])
+        surface = self.world.surface(
+            int(math.floor(observer.position[0] + heading[0] * 4.0)),
+            int(math.floor(observer.position[1] + heading[1] * 4.0)),
+            observer.position[2], vertical_span=2, allow_water=False)
+        return surface is None or exposed(self.world, surface.position, foes)
+
+    @staticmethod
+    def _settle(life: _Life, profile: BotProfile, hit_at: float, now: float) -> None:
+        """Out of sight: stay down for a few seconds before deciding what next."""
+
+        life.retreat = "hold"
+        life.retreat_hit_at = hit_at
+        life.retreat_until = now + 2.0 + 3.5 * float(profile.caution)
+        life.retreat_wait = now + 5.0 + 7.0 * float(profile.caution) - 2.5 * float(
+            profile.aggression)
+
+    @staticmethod
+    def _end_retreat(life: _Life, profile: BotProfile, now: float) -> None:
+        life.retreat = ""
+        life.refuge = _Shelter()
+        # No second retreat on the heels of the first: the next fight is fought.
+        life.retreat_rest_until = now + 5.0 + 6.0 * float(profile.aggression)
+        return None
+
+    @staticmethod
+    def _rally_point(frame: PerceptionFrame, observer: PlayerSnapshot,
+                     life: _Life, reach: float = math.inf) -> Vector3 | None:
+        """Where the team is: the nearest teammate out of this fight, else the base.
+
+        Teammates and the base are on every player's minimap. With ``reach``
+        only a teammate that close counts.
+        """
+
+        foe = life.foes[0] if life.foes else None
+        mates = [player.position for player in frame.players
+                 if player.team == observer.team and player.alive and player.spawned
+                 and player.player_id != observer.player_id
+                 and math.dist(player.position, observer.position) > _FALL_BACK_ARRIVAL
+                 # Not one standing among the enemy it is running from.
+                 and (foe is None or math.dist(player.position, foe) > 12.0)]
+        if mates:
+            nearest = min(mates, key=lambda position: math.dist(position, observer.position))
+            if math.dist(nearest, observer.position) <= reach:
+                return nearest
+        if reach < math.inf:
+            return None
+        return next((item.position for item in frame.objectives
+                     if item.kind == "team_anchor" and item.team == observer.team), None)
+
+    def _home_side(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                   life: _Life) -> float:
+        """Which flank of the line away from the enemy leans toward the team."""
+
+        rally = self._rally_point(frame, observer, life)
+        if rally is None or not life.foes:
+            return 1.0
+        foe = life.foes[0]
+        away_x, away_y = observer.position[0] - foe[0], observer.position[1] - foe[1]
+        home_x, home_y = rally[0] - observer.position[0], rally[1] - observer.position[1]
+        return 1.0 if away_x * home_y - away_y * home_x >= 0.0 else -1.0
 
     def _dash_heading(self, observer: PlayerSnapshot, threat: Vector3,
                       life: _Life) -> Vector3 | None:
