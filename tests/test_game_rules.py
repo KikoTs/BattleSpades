@@ -91,9 +91,9 @@ def test_config_rules_drive_initial_info_and_selection(tmp_path):
     assert packet.enable_deathcam == 0
     assert int(C.CLASS_ENGINEER) in packet.disabled_classes
     assert int(C.AUTO_SHOTGUN_TOOL) in packet.disabled_tools
-    assert packet.movement_speed_multipliers[int(C.CLASS_SOLDIER)] == pytest.approx(
-        class_data.speed_scale(int(C.CLASS_SOLDIER), 1.5)
-    )
+    # The class scale is the rule itself; GameClass applies the class tables.
+    assert packet.movement_speed_multipliers[int(C.CLASS_SOLDIER)] == 1.5
+    assert class_data.speed_scale(int(C.CLASS_SOLDIER), 1.5) == 1.5
 
     selection = normalize_server_selection(
         config,
@@ -116,10 +116,13 @@ def test_zombie_class_speed_rule_is_identical_on_wire_and_authority(tmp_path):
 
     config = load_config(path)
     packet = build_initial_info(BattleSpadesServer(config))
-    combined_rule = 1.5 * 2.0
-    assert packet.movement_speed_multipliers[int(C.CLASS_ZOMBIE)] == pytest.approx(
-        class_data.speed_scale(int(C.CLASS_ZOMBIE), combined_rule)
-    )
+    # "Zombie Speed" scales the infected classes on top of the game speed.
+    assert packet.movement_speed_multipliers[int(C.CLASS_ZOMBIE)] == 1.5 * 2.0
+    assert packet.movement_speed_multipliers[int(C.CLASS_SOLDIER)] == 1.5
+    for class_id in (C.CLASS_ZOMBIE, C.CLASS_SOLDIER):
+        assert packet.movement_speed_multipliers[int(class_id)] == (
+            class_data.rule_speed_scale(config, int(class_id))
+        )
 
 
 def test_lobby_config_validates_lengths_and_normalizes_rotation(tmp_path):

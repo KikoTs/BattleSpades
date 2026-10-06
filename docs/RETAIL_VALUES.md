@@ -57,6 +57,7 @@ were already at 60 s because only the sample config overrode it.
 | Weapon damage `RULE_WEAPON_DAMAGE` | 100% | 100% | 100% | retail |
 | Block wallets (refill amount) `RULE_CHARACTER_BLOCK_WALLETS` | 100% | 100% | 100% | retail |
 | Character speed `RULE_CHARACTER_SPEED` | 100% (50/100/150/200) | 100% | 100% | retail |
+| InitialInfo class speed scale `movement_speed_multipliers` | 1.0 per class at 100% (original server captures; `GameClass` multiplies its accel/sprint/crouch tables by it) | the speed rule | the speed rule | fixed: it was the class sprint multiplier, so every gait was 9-200% too fast (RETAIL_MOVEMENT_PARITY.md, "Class speed scale") |
 | Fall/water damage `RULE_ENABLE_FALL_ON_WATER_DAMAGE` | ON | ON | ON | retail. The rule only zeroes the WATER landing damage; `[game] fall_damage` is the separate operator switch for all fall damage (an explicit rule no longer rewrites it; it is mirrored into the rule only when the rule is absent) |
 | One-hit kill, teabag points | OFF, OFF | OFF | OFF | retail |
 | Gravestones, corpse explosion, sniper beam, death cam, minimap, spectators, colour picker | ON | ON | ON | retail |
@@ -116,7 +117,7 @@ has ended.
 | Delay before first infection | 60 s (`CG.ZOM_TIME_BEFORE_FIRST_INFECTION`) | 60 s (code); sample config was 30 | fixed in `config.toml` |
 | Zombie respawn | 0 s (`CG.ZOM_RESPAWN_AS_ZOMBIE_TIME`) | 0 s | retail |
 | Round intermission | 5 s (`CG.ZOM_TIME_AFTER_ZOMBIE_WIN_BEFORE_SCORES`) | 5 s | retail |
-| Class speed / zombie damage | 100% / 100% | 100% / 100% | retail |
+| Zombie speed `RULE_CLASS_SPEED` / zombie damage `RULE_ZOMBIE_CLASS_DAMAGE` | 100% / 100% (50/100/200; lobby rows "Zombie Speed", "Zombie Damage") | 100% / 100% | retail defaults. Both apply to the infected classes only; the speed scope is read from the lobby label (**inferred**) |
 | Minimum players to start | none | 2 | server choice |
 | First-zombie spawn protection | 0.5 s (`C.FIRST_ZOMBIE_SPAWN_PROTECTION_TIME`) | none | (superseded: implemented, see PARITY_CHANGES_2026-09) |
 

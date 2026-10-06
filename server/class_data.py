@@ -4,10 +4,9 @@ authoritative values from the original game).
 This module is the single source of truth for anything keyed on class_id —
 movement multipliers, headshot/damage multipliers, fall thresholds, etc.
 
-The InitialInfo `movement_speed_multipliers` array order is **not** strict
-class-id order; the original game's wire format puts ENGINEER before MINER.
-We capture the exact wire order in `INITIAL_INFO_CLASS_ORDER` so the
-builder can iterate it deterministically.
+The InitialInfo `movement_speed_multipliers` list is indexed by class id and
+carries the lobby speed rules only (1.0 at 100%): the client multiplies its
+own class accel/sprint/crouch tables by it. See `speed_scale`.
 """
 
 from __future__ import annotations
@@ -16,6 +15,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import shared.constants as C
+
+from server.game_rules import get_rules
 
 
 # ---------------------------------------------------------------------------
@@ -64,30 +65,14 @@ BATTLESPADES_TEAM_CLASSES: tuple[int, ...] = (
 )
 
 
-# Wire order for the InitialInfo.movement_speed_multipliers list. Verified
-# empirically from the original server's hardcoded array: SOLDIER, SCOUT,
-# ROCKETEER, ENGINEER, MINER, ZOMBIE, CLASSIC_SOLDIER, GANGSTER_1..4,
-# GANGSTER_VIP_1..2, UGCBUILDER, FAST_ZOMBIE, JUMP_ZOMBIE, SPECIALIST, MEDIC.
-INITIAL_INFO_CLASS_ORDER: tuple[int, ...] = (
-    int(C.CLASS_SOLDIER),
-    int(C.CLASS_SCOUT),
-    int(C.CLASS_ROCKETEER),
-    int(C.CLASS_ENGINEER),     # NB: not class-id order — engineer (12) before miner (3)
-    int(C.CLASS_MINER),
+# The infected classes. RULE_CLASS_SPEED is the retail lobby's "Zombie Speed"
+# row (aoslib/strings, beside "Zombie Damage"), so it scales these classes
+# and leaves the survivors on RULE_CHARACTER_SPEED alone.
+ZOMBIE_CLASS_IDS: frozenset[int] = frozenset((
     int(C.CLASS_ZOMBIE),
-    int(C.CLASS_CLASSIC_SOLDIER),
-    int(C.CLASS_GANGSTER_1),
-    int(C.CLASS_GANGSTER_2),
-    int(C.CLASS_GANGSTER_3),
-    int(C.CLASS_GANGSTER_4),
-    int(C.CLASS_GANGSTER_VIP_1),
-    int(C.CLASS_GANGSTER_VIP_2),
-    int(C.CLASS_UGCBUILDER),
     int(C.CLASS_FAST_ZOMBIE),
     int(C.CLASS_JUMP_ZOMBIE),
-    int(C.CLASS_SPECIALIST),
-    int(C.CLASS_MEDIC),
-)
+))
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +81,8 @@ INITIAL_INFO_CLASS_ORDER: tuple[int, ...] = (
 
 @dataclass(frozen=True)
 class ClassMovement:
-    """Class-keyed movement profile — drives both server simulation and the
-    multipliers we send the client in InitialInfo so client prediction agrees.
+    """Class-keyed movement profile — drives the server simulation with the
+    same tables the client's GameClass indexes, so client prediction agrees.
 
     All values sourced from shared.constants.* tables. See class_data tests.
     """
@@ -160,38 +145,58 @@ def wire_round(value: float) -> float:
 
 def speed_scale(class_id: int, rule_multiplier: float = 1.0) -> float:
     """The per-class speed scale sent in InitialInfo, as the client decodes
-    it (wire-rounded).
+    it (wire-rounded): the lobby speed rules alone, 1.0 at 100%.
 
     Verified against the live client (aoslib/scenes/main/gameClass.py):
     the client multiplies ALL of its local CLASS_ACCEL/SPRINT/CROUCH_SNEAK
     multipliers by this value:
-        accel_eff  = CLASS_ACCEL_MULTIPLIER[id]  * scale   # 0.7*1.40625
-        sprint_eff = CLASS_SPRINT_MULTIPLIER[id] * scale   # 1.4*1.40625
+        accel_eff  = CLASS_ACCEL_MULTIPLIER[id]  * scale   # 0.7*1.0
+        sprint_eff = CLASS_SPRINT_MULTIPLIER[id] * scale   # 1.4*1.0
         crouch_eff = CLASS_CROUCH_SNEAK[id]      * scale
     (jump_multiplier is NOT scaled — confirmed by the measured -0.36*1.2
     jump impulse.)
+
+    The class tables therefore must not be folded in here as well. This used
+    to return the class sprint multiplier times the rule, which applied that
+    table twice: Soldier walked 7.9 blocks/s instead of 5.6 and Fast Zombie
+    sprinted 72 instead of 24. InitialInfo packets captured from the original
+    servers carry 1.0 for every class under default rules
+    (tests/test_class_speed_scale.py).
+
+    ``class_id`` stays in the signature because the wire list is per class;
+    ``rule_speed_scale`` composes the rule that differs between classes.
     """
-    # InitialInfo serializes the composed value to 1/64 fixed point. Apply
-    # rules before rounding so authority uses the exact number prediction
-    # receives (round(base) * rule is measurably different for e.g. 150%).
-    return wire_round(
-        get_movement(class_id).sprint_multiplier * float(rule_multiplier)
-    )
+    # InitialInfo serializes the value to 1/64 fixed point; authority must
+    # use the exact number prediction receives.
+    return wire_round(rule_multiplier)
+
+
+def rule_speed_scale(config: object, class_id: int) -> float:
+    """``speed_scale`` for one class under a server config's lobby rules.
+
+    RULE_CHARACTER_SPEED ("Game Speed") scales every class.
+    RULE_CLASS_SPEED ("Zombie Speed") scales the infected classes in Zombie
+    mode. InitialInfo and the authoritative mover both call this, so a rule
+    cannot reach prediction and authority a different number of times.
+    """
+    rules = get_rules(config)
+    multiplier = float(rules.get("RULE_CHARACTER_SPEED"))
+    if int(class_id) in ZOMBIE_CLASS_IDS and str(
+        getattr(config, "game_mode", "")
+    ).lower() in ("zom", "zombie"):
+        multiplier *= float(rules.get("RULE_CLASS_SPEED"))
+    return speed_scale(class_id, multiplier)
 
 
 def initial_info_movement_multipliers() -> list[float]:
-    """Build the InitialInfo.movement_speed_multipliers list.
+    """Build the InitialInfo.movement_speed_multipliers list at default rules.
 
     The client indexes this list directly by class id (see selectTeam.py /
     selectClass.py: `manager.movement_speed_multipliers[class_id]`), so it
-    MUST be in ascending class-id order — not the engineer-before-miner
-    permutation previously assumed.
+    MUST be in ascending class-id order. Every entry is 1.0: the class's own
+    speed lives in the client's tables (see ``speed_scale``).
     """
-    size = max(CLASS_IDS) + 1
-    out = [1.0] * size
-    for cid in CLASS_IDS:
-        out[cid] = get_movement(cid).sprint_multiplier
-    return out
+    return [speed_scale(cid) for cid in range(max(CLASS_IDS) + 1)]
 
 
 # ---------------------------------------------------------------------------

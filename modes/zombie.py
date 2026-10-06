@@ -589,13 +589,9 @@ class ZombieMode(BaseMode):
         """
         packet.friendly_fire = 0
         packet.exposed_teams_always_on_minimap = 1
-        class_speed = float(
-            self.server.config.game_rules.get("RULE_CLASS_SPEED")
-        )
-        packet.movement_speed_multipliers = [
-            float(value) * class_speed
-            for value in packet.movement_speed_multipliers
-        ]
+        # RULE_CLASS_SPEED is already in movement_speed_multipliers: the
+        # builder and Player authority share class_data.rule_speed_scale.
+        # Scaling the list again here made clients predict rule squared.
 
     def start_cue_for(self, player):
         """ZOMBIE_START_SURVIVOR / ZOMBIE_START_ZOMBIE by team.

@@ -162,9 +162,9 @@ def test_owner_acknowledgements_continue_at_normal_cadence_during_flight(pack):
 
 
 @pytest.mark.parametrize("pack,min_range,max_range,min_frames,max_frames", [
-    (66, 7.0, 10.0, 85, 90),
-    (67, 50.0, 60.0, 330, 338),
-    (68, 12.0, 18.0, 313, 322),
+    (66, 6.5, 9.0, 85, 90),
+    (67, 46.0, 55.0, 330, 338),
+    (68, 9.5, 14.5, 313, 322),
 ])
 def test_source_fuel_budget_produces_full_range_without_reignition(
     pack, min_range, max_range, min_frames, max_frames,

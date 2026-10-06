@@ -213,10 +213,16 @@ With the production default `movement_input_latch_frames=1`, frame L applies
 locomotion, jump, sneak, and sprint sampled at L-1 while crouch and orientation
 apply from L. `WorldUpdate(2).pong` is the accepted ClientData loop represented
 by that owner row. Prediction must compare the row with the journaled state for
-that exact loop, not with the current render transform. InitialInfo movement
-entries are direct scales after all rule multipliers are composed and rounded
-once to 1/64; authority calls the same `speed_scale(class, rule_multiplier)`
-function so custom speed rules cannot create server/client drift.
+that exact loop, not with the current render transform.
+
+`InitialInfo.movement_speed_multipliers[class_id]` is the lobby speed rule for
+that class and nothing else: 1.0 at 100%. Retail `GameClass` multiplies its
+own `CLASS_ACCEL_MULTIPLIER`, `CLASS_SPRINT_MULTIPLIER` and
+`CLASS_CROUCH_SNEAK_MULTIPLIER` entries by it, so the class's speed must not be
+sent here as well (see RETAIL_MOVEMENT_PARITY.md, "Class speed scale"). The
+rules are composed and rounded once to 1/64, and authority calls the same
+`class_data.rule_speed_scale(config, class_id)` function, so custom speed
+rules cannot create server/client drift.
 
 ### Proven movement code and compatibility limits
 

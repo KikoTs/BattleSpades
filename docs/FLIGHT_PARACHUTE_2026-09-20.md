@@ -98,9 +98,9 @@ policy reaches exhaustion at approximately:
 
 | Pack | Horizontal distance | Time from initial hold |
 | --- | ---: | ---: |
-| Rocket 66 | 8 blocks | 1.5 s |
-| Glider 67 | 56 blocks | 5.6 s |
-| Engineer 68 | 15 blocks | 5.3 s |
+| Rocket 66 | 7.5 blocks | 1.5 s |
+| Glider 67 | 51 blocks | 5.6 s |
+| Engineer 68 | 12 blocks | 5.3 s |
 
 These are regression baselines for the implementation, not original-server
 distance measurements. Exhaustion tests continue holding the key while fuel
@@ -191,9 +191,9 @@ recovery. The earlier original-resource tables remain the compatibility baseline
 
 | Pack | Capacity / ignition | Drain per second | Powered budget | Measured horizontal travel | Initial hold to exhaustion |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Rocket 66 | 100 / 10 | 30 | 3 s | 27.80 blocks | 3.283 s |
-| Glider 67 | 100 / 10 | 9 | 10 s | 113.05 blocks | 10.283 s |
-| Engineer 68 | 100 / 10 | 7.5 | 12 s | 34.37 blocks | 12.283 s |
+| Rocket 66 | 100 / 10 | 30 | 3 s | 25.41 blocks | 3.283 s |
+| Glider 67 | 100 / 10 | 9 | 10 s | 103.36 blocks | 10.283 s |
+| Engineer 68 | 100 / 10 | 7.5 | 12 s | 27.49 blocks | 12.283 s |
 
 Travel is measured through real ClientData ingestion, authoritative simulation
 and WorldUpdate generation, from an unobstructed airborne start with forward
@@ -263,15 +263,14 @@ Request: "flight speed is too slow for the Engineer". Nothing regressed: the
 v1 balanced profile only changes fuel, and the active Engineer air
 acceleration has been the stock `world.pyd` 0.1 (0x10012DC8, jump table
 0x10013240 sends packs 3 and 4 there; packs 1 and 2 use 0.5) on both server
-and native client since July. With the InitialInfo class scale (1.25) a
-thrusting Engineer cruises at 0.0875 native = 2.8 blocks/s walking (5 with
-sprint), 40% of its 7 blocks/s ground walk, while a Rocketeer jump pack gets
-0.5.
+and native client since July. A thrusting Engineer cruises at 0.07 native =
+2.24 blocks/s walking (4 with sprint), 40% of its 5.6 blocks/s ground walk,
+while a Rocketeer jump pack gets 0.5.
 
 | Value (Engineer, pack 68) | Stock / v1 | BSFP v2 |
 | --- | ---: | ---: |
 | Active air accel factor | 0.1 | 0.25 |
-| Horizontal cruise (W held) | 2.8 blocks/s | 7.0 blocks/s (= ground walk) |
+| Horizontal cruise (W held) | 2.24 blocks/s | 5.6 blocks/s (= ground walk) |
 | Vertical thrust | 0.020 | 0.020 (unchanged) |
 | Fuel drain / refill | 18 / 3 (v1: 7.5 / 20) | 7.5 / 20 |
 
