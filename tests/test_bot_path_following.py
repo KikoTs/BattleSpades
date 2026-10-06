@@ -169,7 +169,11 @@ def test_it_brakes_only_for_a_step_that_needs_an_exact_takeoff():
     assert brain._navigation_intent(frame, observer, state, goal, 100.0).movement.sprint
     near_jump = _walk([(11, 10), (12, 10), (13, 10)]) + _walk([(14, 10)], MovementAffordance.JUMP)
     brain, state, goal, observer, frame = _brain_case(near_jump)
-    assert not brain._navigation_intent(frame, observer, state, goal, 100.0).movement.sprint
+    # Arriving at a sprint it needs its coasting distance before the takeoff.
+    from dataclasses import replace
+    running = replace(observer, velocity=(.35, 0., 0.))
+    assert not brain._navigation_intent(
+        replace(frame, players=(running,)), running, state, goal, 100.0).movement.sprint
 
 
 def test_a_failed_straight_walk_falls_back_to_cell_by_cell_for_that_stretch():

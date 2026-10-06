@@ -154,6 +154,14 @@ _BREACH_RESERVATION_RADIUS = 2.25
 # A class that may not sprint uphill lets go of sprint this far before a step
 # up (one decision at sprint speed and a stride), and takes it up again on it.
 _SPRINT_RELEASE_REACH = 2.5
+# The clear run a body needs ahead to hold sprint for one more decision and
+# still arrive at a walk. The native mover's velocity times ten is its
+# coasting distance (2.8 blocks from a Soldier's sprint, 3.3 from a
+# Zombie's). From rest one decision of sprint only reaches 4.4 to 5.2 blocks
+# a second, under a Soldier's walk: three blocks of run-up were asked for
+# when every class moved 40 % faster than retail.
+_SPRINT_ROOM_AT_REST = 1.75
+_SPRINT_ROOM_MAX = 9.0
 _BREACH_QUEUE_SPACING = 1.15
 _BREACH_YIELD_REPLAN_SECONDS = 1.25
 _TEAM_LANE_SPACING = 8.0
@@ -3774,7 +3782,7 @@ class SimpleBotBrain:
                     state.route[last].waypoint[0] - observer.position[0],
                     state.route[last].waypoint[1] - observer.position[1])
                 sprint_allowed = (
-                    (not exact_step_next or to_run_end >= 4.5)
+                    (not exact_step_next or to_run_end >= _sprint_room(observer))
                     and (_sprints_uphill(observer) or not self._rise_ahead(
                         state.route, state.route_index, target_index, observer.position)))
             elif motor_affordance is MovementAffordance.DROP and runs_off(
@@ -3927,10 +3935,7 @@ class SimpleBotBrain:
     @staticmethod
     def _route_allows_sprint(state: _BotState, observer: PlayerSnapshot) -> bool:
         """Reserve native braking distance before turns, exact steps and landings."""
-        # The live motor uses this same velocity scale: 0.35 needs about four
-        # blocks to brake. A short approach needs walking even from rest, or
-        # sprint acceleration creates the AncientEgypt missed-waypoint orbit.
-        distance_needed = min(5.0, max(3.0, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
+        distance_needed = _sprint_room(observer)
         uphill = _sprints_uphill(observer)
         previous = observer.position
         direction = None
@@ -6249,6 +6254,13 @@ def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     return best_navigation_dig_profile(
         int(tool) for tool in getattr(observer, "loadout", ())
     )
+
+
+def _sprint_room(observer: PlayerSnapshot) -> float:
+    """Blocks of clear run this body needs to sprint one more decision."""
+
+    return min(_SPRINT_ROOM_MAX, max(
+        _SPRINT_ROOM_AT_REST, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
 
 
 def _sprints_uphill(observer: PlayerSnapshot) -> bool:
