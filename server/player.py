@@ -521,6 +521,8 @@ class Player:
         self._rocket_jump_blast_at: Optional[float] = None
         self._last_damage_source_id: int = -1
         self._last_damage_source_position = None
+        # Kill type of the last hit by a player: tells a burn tick from a bullet.
+        self._last_damage_kill_type: int = -1
         self.parachute_id: int = 0
         # ``parachute_active`` is the advertised canopy (WorldUpdate state bit
         # 0x01, HUD, sounds, observers). ``_parachute_physics_active`` is what
@@ -2174,6 +2176,7 @@ class Player:
             self._last_damage_source_position = tuple(
                 float(value) for value in source_position
             )
+            self._last_damage_kill_type = int(kill_type)
         damage_type = 0 if source is None or source == self else 1
         if hp_damage_type is not None:
             damage_type = int(hp_damage_type)

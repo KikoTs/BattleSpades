@@ -1511,6 +1511,9 @@ class BotDirector:
                         callable(getattr(player, "spawn_protection_remaining", None))
                         and player.spawn_protection_remaining() > 0.0
                     ),
+                    last_damage_kind=int(
+                        getattr(player, "_last_damage_kill_type", -1)
+                    ),
                 )
 
     def _can_shoot(self, player: "Player") -> bool:
@@ -2286,7 +2289,8 @@ class BotDirector:
             # the swing converges even while the worker already looks ahead.
             self._update_aim(runtime, pending.position, dt, purpose="precise")
         elif intent.look is not None:
-            if self._has_travel_target(intent):
+            # Awareness hook: a glance keeps the route's keys but not its gaze.
+            if self._has_travel_target(intent) and not intent.look.glance:
                 # The worker's ordinary-route gaze is horizontal, but its
                 # frozen eye height becomes wrong after a native step/jump.
                 # Refresh this explicit travel gaze from the live eye only;
@@ -2318,7 +2322,8 @@ class BotDirector:
                 aim_point,
                 dt,
                 noise_factor=1.0 / (1.0 + 2.0 * skill_settle),
-                purpose=(self._travel_gaze_purpose(intent) if self._has_travel_target(intent) else
+                purpose=(self._travel_gaze_purpose(intent)
+                         if self._has_travel_target(intent) and not intent.look.glance else
                          "combat" if intent.look.visible else
                          "precise" if (intent.movement.affordance is MovementAffordance.BREACH
                                         or intent.action.position is not None) else "focus"),
