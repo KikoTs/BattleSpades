@@ -34,6 +34,7 @@ from server.game_constants import (
 )
 from server.projectiles import BASE_GRAVITY, PROJECTILE_SPECS
 
+from .awareness import Awareness, Reaction
 from .combat_profiles import envelope_for
 from .combat_tactics import (
     Engagement,
@@ -413,6 +414,8 @@ class SimpleBotBrain:
         self.mode_policy = ModePolicyMemory()
         # Climb out of water/pits, pillar, fast-bridge (recovery_skills).
         self.skills = LocomotionSkillDriver(world)
+        # Reactions to hits, sounds and hazards around the bot (awareness).
+        self.awareness = Awareness(world)
 
     def reset_for_map(self, map_epoch: int) -> None:
         """Discard every controller and route from the previous map."""
@@ -426,6 +429,7 @@ class SimpleBotBrain:
         self.cooperative.reset()
         self.mode_policy.reset()
         self.skills.reset()
+        self.awareness.reset()
 
     def reset_bot(self, player_id: int, generation: int) -> None:
         """Discard a failed controller without interrupting healthy teammates."""
@@ -434,6 +438,7 @@ class SimpleBotBrain:
         self.cooperative.forget(int(player_id), int(generation))
         self.mode_policy.forget(int(player_id), int(generation))
         self.skills.forget(int(player_id), int(generation))
+        self.awareness.forget(int(player_id), int(generation))
 
     def request_locomotion_skill(self, frame: PerceptionFrame,
                                  request: SkillRequest) -> BotIntent | None:
@@ -505,6 +510,9 @@ class SimpleBotBrain:
         """Return the newest bounded intention for one observer."""
 
         intent = self._decide(frame)
+        if intent is not None:
+            # Awareness hook: a glance may ride on the finished intent.
+            intent = self.awareness.overlay(frame, intent)
         if (intent is None or intent.action.kind is not BotActionKind.NONE
                 or intent.priority >= BotIntentPriority.SURVIVAL
                 or (intent.look is not None and intent.look.visible)):
@@ -809,6 +817,14 @@ class SimpleBotBrain:
             state,
             mode_decision,
         )
+        # Awareness hook: a hit, a sound or a hazard may take the body before
+        # combat and navigation are considered.
+        reaction = self.awareness.react(frame, observer, profile, visible_target,
+                                        mode_decision, now)
+        if reaction is not None:
+            reacting = self._awareness_intent(frame, observer, state, reaction, now)
+            if reacting is not None:
+                return reacting
         engagement = state.engagement
         if (visible_target is None and observer.reloading and observer.grounded
                 and now < engagement.cover_until
@@ -1092,6 +1108,41 @@ class SimpleBotBrain:
                 return None
             # The planned stretch ran out in open water: carry on at once.
         return None
+
+    def _awareness_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        reaction: Reaction, now: float,
+    ) -> BotIntent | None:
+        """Resolve one awareness reaction into the single movement/aim owner."""
+        if reaction.suspect is not None:
+            # A place worth checking joins the ordinary last-seen chase.
+            state.contact_position = reaction.suspect
+            state.contact_until = now + _CONTACT_SECONDS
+        if not reaction.role:
+            return None
+        if reaction.goal is not None:
+            routed = self._navigation_intent(frame, observer, state, _Goal(
+                ("awareness", reaction.role), reaction.goal, reaction.role, 3.0,
+                reaction.sprint), now)
+            if (routed.action.kind is not BotActionKind.NONE
+                    or math.hypot(*routed.movement.direction[:2]) > 1e-6
+                    or math.hypot(*reaction.heading[:2]) <= 1e-6):
+                return routed
+            # No route yet: the raw stride below beats standing in the open.
+        else:
+            # A short run over checked ground; the old route is replanned
+            # from wherever it ends.
+            self._set_goal(state, None, observer.position, now)
+        return self._intent(
+            frame,
+            movement=MovementIntent(direction=reaction.heading, crouch=reaction.crouch,
+                                    sprint=reaction.sprint),
+            look=LookIntent(reaction.look) if reaction.look is not None else None,
+            tool_id=_weapon_tool(observer),
+            priority=reaction.priority,
+            debug_goal=reaction.look,
+            debug_role=reaction.role,
+        )
 
     def _cooperative_intent(
         self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
@@ -1692,6 +1743,8 @@ class SimpleBotBrain:
                 )
                 if oriented is not None:
                     selected_tool, oriented_aim_offset = oriented
+                    # Awareness hook: where a Molotov is about to burn.
+                    self.awareness.threw(observer, selected_tool, target.position, now)
                     action = BotAction(
                         BotActionKind.ORIENTED,
                         tool_id=selected_tool,

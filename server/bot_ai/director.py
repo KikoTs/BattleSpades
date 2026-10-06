@@ -40,6 +40,7 @@ from .messages import (
     ObjectiveSnapshot,
     PerceptionFrame,
     PlayerSnapshot,
+    StimulusKind,
     VoxelChange,
 )
 from .prefab_policy import bot_prefab_is_suitable, is_zombie_prefab
@@ -121,6 +122,7 @@ _MAX_PERCEPTION_ENTITIES = 192
 # force a full priority sort every perception refresh. Their voxel is part of
 # the collision world the planner already sees, so nothing is lost.
 _DECORATIVE_ENTITY_KINDS = frozenset(("map_flare", "static_flare", "flare_block"))
+_BLOCKFIRE_REACH = float(getattr(C, "BLOCKFIRE_CHARACTER_SPREAD_RANGE", 3.0))
 _DECORATIVE_ENTITY_TYPES = frozenset((int(getattr(C, "FLARE_BLOCK", 13)),))
 # When real entities still exceed the cap, the distance ranking of ordinary
 # (non-hazard, non-carried) entities is reused for this long instead of being
@@ -1027,6 +1029,14 @@ class BotDirector:
     def on_player_killed(self, victim: "Player", killer: "Player | None", kill_type: int) -> None:
         """Let talkative bots react to a kill the whole server just saw."""
 
+        # Awareness hook: the death cry bots nearby hear, with the kill feed's
+        # killer as its source.
+        stimuli = getattr(self.server, "bot_stimuli", None)
+        if stimuli is not None and killer is not None:
+            stimuli.publish(
+                StimulusKind.DEATH, tuple(float(value) for value in victim.position),
+                source_id=int(killer.id), team=int(getattr(victim, "team", -1)),
+            )
         if not bool(getattr(self._config, "chatter", False)) or killer is None:
             return
         if int(getattr(victim, "team", -1)) == int(getattr(killer, "team", -2)) and victim is not killer:
@@ -1292,6 +1302,10 @@ class BotDirector:
             )
             self._perception_entities = self._snapshot_entities()
             self._perception_objectives = self._snapshot_objectives()
+            # Awareness hook: the steps the roster took since the last refresh.
+            stimuli = getattr(self.server, "bot_stimuli", None)
+            if stimuli is not None:
+                stimuli.note_footsteps(self._perception_build_players, now)
             self._perception_build_players = ()
             self._perception_build_snapshots = []
             self._perception_build_index = 0
@@ -1346,6 +1360,8 @@ class BotDirector:
                             tuple(float(value) for value in bot.position),
                             now=now,
                             rng=runtime.rng,
+                            observer_id=int(bot.id),
+                            team=int(bot.team),
                         )
                         if getattr(self.server, "bot_stimuli", None) is not None
                         else ()
@@ -1520,6 +1536,9 @@ class BotDirector:
                         callable(getattr(player, "spawn_protection_remaining", None))
                         and player.spawn_protection_remaining() > 0.0
                     ),
+                    last_damage_kind=int(
+                        getattr(player, "_last_damage_kill_type", -1)
+                    ),
                 )
 
     def _can_shoot(self, player: "Player") -> bool:
@@ -1604,6 +1623,11 @@ class BotDirector:
             detonate_at = float(
                 getattr(behavior, "_detonate_at", 0.0) or 0.0
             )
+            if kind == "blockfire":
+                # Awareness hook: a burning block sets alight whoever comes
+                # within its reach, until its remaining fuse runs out.
+                blast_radius = _BLOCKFIRE_REACH
+                detonate_at = time.monotonic() + float(getattr(entity, "fuse", 0.0) or 0.0)
             result.append(
                 EntitySnapshot(
                     entity_id=int(getattr(entity, "entity_id", -1)),
@@ -1733,7 +1757,9 @@ class BotDirector:
         urgent: list[EntitySnapshot] = []
         ordinary: dict[int, EntitySnapshot] = {}
         for snapshot in result:
-            if snapshot.hazardous or snapshot.entity_id in carried_ids:
+            # Awareness hook: fire is never crowded out of a full frame.
+            if (snapshot.hazardous or snapshot.entity_id in carried_ids
+                    or snapshot.kind == "blockfire"):
                 urgent.append(snapshot)
             else:
                 ordinary[int(snapshot.entity_id)] = snapshot
@@ -2308,7 +2334,8 @@ class BotDirector:
             # the swing converges even while the worker already looks ahead.
             self._update_aim(runtime, pending.position, dt, purpose="precise")
         elif intent.look is not None:
-            if self._has_travel_target(intent):
+            # Awareness hook: a glance keeps the route's keys but not its gaze.
+            if self._has_travel_target(intent) and not intent.look.glance:
                 # The worker's ordinary-route gaze is horizontal, but its
                 # frozen eye height becomes wrong after a native step/jump.
                 # Refresh this explicit travel gaze from the live eye only;
@@ -2340,7 +2367,8 @@ class BotDirector:
                 aim_point,
                 dt,
                 noise_factor=1.0 / (1.0 + 2.0 * skill_settle),
-                purpose=(self._travel_gaze_purpose(intent) if self._has_travel_target(intent) else
+                purpose=(self._travel_gaze_purpose(intent)
+                         if self._has_travel_target(intent) and not intent.look.glance else
                          "combat" if intent.look.visible else
                          "precise" if (intent.movement.affordance is MovementAffordance.BREACH
                                         or intent.action.position is not None) else "focus"),

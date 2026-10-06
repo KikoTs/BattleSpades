@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Sequence
 
 from .messages import BotProfile, EntitySnapshot, PerceptionFrame, PlayerSnapshot, Vector3
+from .path_following import straight_walkable
 
 # AoS z grows downward. Player position is the head; the torso sits about one
 # block lower and a crouch lowers the head by roughly the same amount.
@@ -24,6 +26,11 @@ CROUCH_DROP = 0.9
 _COVER_RADII = (2.0, 3.5, 5.0, 7.0)
 _COVER_DIRECTIONS = 12
 _MAX_COVER_RAYS = 14
+_SHELTER_RADII = (2.5, 4.0, 6.0, 8.0, 10.5)
+_MAX_SHELTER_RAYS = 18
+_DEAD_GROUND_RADII = (14.0, 20.0, 27.0)
+_DEAD_GROUND_DIRECTIONS = 8
+_MAX_DEAD_GROUND_RAYS = 14
 
 
 def mix(*values: int) -> float:
@@ -229,6 +236,122 @@ def find_cover(world, observer: PlayerSnapshot, threat_eye: Vector3,
             if rays >= _MAX_COVER_RAYS:
                 return None, False
     return None, False
+
+
+def firing_line(observer_position: Vector3, threat: Vector3,
+                spread: float = 3.0) -> tuple[Vector3, ...]:
+    """The threat point and one point either side of it.
+
+    A shooter known only from a hit or a sound has moved by the time anyone
+    reacts. Cover has to hold against that step as well.
+    """
+
+    dx, dy = threat[0] - observer_position[0], threat[1] - observer_position[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return (threat,)
+    side_x, side_y = -dy / length * spread, dx / length * spread
+    return (threat,
+            (threat[0] + side_x, threat[1] + side_y, threat[2]),
+            (threat[0] - side_x, threat[1] - side_y, threat[2]))
+
+
+def exposed(world, eye: Vector3, threats: Sequence[Vector3]) -> bool:
+    """Whether any of the threat points has a sight line to this eye."""
+
+    return any(world.has_line_of_sight(eye, threat) for threat in threats)
+
+
+def find_shelter(world, observer: PlayerSnapshot, threats: Sequence[Vector3], *,
+                 reach: float = 10.5, min_gap: float = 0.0, side: float = 1.0,
+                 max_rays: int = _MAX_SHELTER_RAYS) -> Vector3 | None:
+    """Nearest spot the body can run to that every threat point is blind to.
+
+    ``find_cover`` answers "where do I reload against the enemy I am looking
+    at". This answers "where do I get out of a line of fire": several threat
+    points, a longer run, a real straight walk to it, and never a step toward
+    the first threat. ``side`` picks which flank is tried first.
+    """
+
+    if not threats:
+        return None
+    primary = threats[0]
+    away = math.atan2(observer.position[1] - primary[1],
+                      observer.position[0] - primary[0])
+    first = 1 if side >= 0.0 else -1
+    rays = 0
+    for radius in _SHELTER_RADII:
+        if radius < min_gap or radius > reach:
+            continue
+        for index in range(_COVER_DIRECTIONS):
+            step = (index + 1) // 2 * (first if index % 2 else -first)
+            if abs(step) > _COVER_DIRECTIONS // 3:
+                continue
+            angle = away + step * (2.0 * math.pi / _COVER_DIRECTIONS)
+            heading = (math.cos(angle), math.sin(angle), 0.0)
+            x = observer.position[0] + heading[0] * radius
+            y = observer.position[1] + heading[1] * radius
+            surface = world.surface(int(math.floor(x)), int(math.floor(y)),
+                                    observer.position[2], vertical_span=2,
+                                    allow_water=False)
+            if surface is None or abs(surface.position[2] - observer.position[2]) > 2.1:
+                continue
+            if not walkable_heading(world, observer, heading, reach=min(radius, 3.0)):
+                continue
+            hidden = True
+            for threat in threats:
+                rays += 1
+                if world.has_line_of_sight(surface.position, threat):
+                    hidden = False
+                    break
+            if hidden and straight_walkable(world, observer.position, surface.position):
+                return surface.position
+            if rays >= max_rays:
+                return None
+    return None
+
+
+def find_dead_ground(world, observer: PlayerSnapshot, threats: Sequence[Vector3], *,
+                     side: float = 1.0,
+                     max_rays: int = _MAX_DEAD_GROUND_RAYS) -> Vector3 | None:
+    """Farther ground no threat point can see, for a retreat across the open.
+
+    ``find_shelter`` stops at a dozen blocks because it promises a straight
+    walk. This looks out to the next fold in the terrain and promises only
+    that the spot is hidden; the route planner finds the way there.
+    """
+
+    if not threats:
+        return None
+    primary = threats[0]
+    away = math.atan2(observer.position[1] - primary[1],
+                      observer.position[0] - primary[0])
+    first = 1 if side >= 0.0 else -1
+    rays = 0
+    for radius in _DEAD_GROUND_RADII:
+        for index in range(_DEAD_GROUND_DIRECTIONS):
+            step = (index + 1) // 2 * (first if index % 2 else -first)
+            if abs(step) > _DEAD_GROUND_DIRECTIONS // 4:
+                continue  # the half of the compass away from the shooter
+            angle = away + step * (2.0 * math.pi / _DEAD_GROUND_DIRECTIONS)
+            x = observer.position[0] + math.cos(angle) * radius
+            y = observer.position[1] + math.sin(angle) * radius
+            surface = world.surface(int(math.floor(x)), int(math.floor(y)),
+                                    observer.position[2], vertical_span=6,
+                                    allow_water=False)
+            if surface is None:
+                continue
+            hidden = True
+            for threat in threats:
+                rays += 1
+                if world.has_line_of_sight(surface.position, threat):
+                    hidden = False
+                    break
+            if hidden:
+                return surface.position
+            if rays >= max_rays:
+                return None
+    return None
 
 
 def _hazard_point(entity: EntitySnapshot, now: float) -> Vector3:

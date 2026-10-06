@@ -134,7 +134,7 @@ def _sound_packet(sound_id: int, volume: float = 1.0,
 
 def play_sound(server, sound_id: int, *, volume: float = 1.0,
                position=None, attenuation: float = 1.0, exclude=None,
-               reliable: bool = True) -> None:
+               reliable: bool = True, source=None) -> None:
     """Broadcast a one-shot sound to every in-game client. With `position`
     it plays 3D-positioned (distance-attenuated); without, full-volume UI.
 
@@ -146,6 +146,9 @@ def play_sound(server, sound_id: int, *, volume: float = 1.0,
     clicks) as sequenced-unreliable ENet traffic so a burst of effects can
     never head-of-line stall reliable gameplay packets. Keep the default for
     stingers and any cue that carries game information.
+
+    ``source`` names the player whose digging or building made a positioned
+    cue, so bots within hearing distance hear it as well.
     """
     data = _sound_packet(sound_id, volume, position, attenuation)
     kwargs = {}
@@ -154,6 +157,18 @@ def play_sound(server, sound_id: int, *, volume: float = 1.0,
     if not reliable:
         kwargs["reliable"] = False
     server.broadcast(data, **kwargs)
+    stimuli = getattr(server, "bot_stimuli", None)
+    if stimuli is not None and source is not None and position is not None:
+        from server.bot_ai.messages import StimulusKind
+
+        stimuli.publish(
+            StimulusKind.BLOCK_DESTROYED,
+            # A voxel cell is heard from its centre.
+            tuple(float(value) + 0.5 for value in position),
+            source_id=int(getattr(source, "id", -1)),
+            team=int(getattr(source, "team", -1)),
+            lifetime=1.0,
+        )
 
 
 def _settled(player) -> bool:
