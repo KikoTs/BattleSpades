@@ -392,6 +392,20 @@ hole or goes round. Share of the horde's time in the queue: keep 0.15 to
 Tick p50 0.37-0.38 ms before and after; the decision is a few comparisons
 over the next eight route steps.
 
+**A swim that bank recovery could not finish.** The new sprint timing put a
+SpookyMansion zombie (islets, seed 7) into a pocket of the sea where the
+nearest-shore flow has no bank in reach: it stood there for the rest of the
+round, because a crossing that fails its four-block window was handed to
+that flow until the body had been dry for two seconds. For a bot whose way
+is across the water, recovery now gets one window of its own; when it gets
+nowhere, or has no bank to make for (`water_no_route`,
+`water_search_shore`), the crossing takes over again. SpookyMansion, four
+seeds, before / after this whole section: islets 8 of 8 on the mainland both
+(last arrival 52 s / 38 s on average), sea ring 8 of 8 in 10-11 s both,
+islet survivors infected after 52 s / 47 s. TDM kills a minute: Atlantis
+0.80 / 0.77 (15 seeds), DoubleDragon 2.15 / 2.30, CastleWars 3.00 / 2.60
+(5 seeds, within their spread).
+
 **Jump height, not done here.** The planner authors a jump for a two-block
 rise only, for every class (`simple_navigation._neighbors`,
 `-2 <= delta < -1`); the corridor search (`surface_corridor`,
