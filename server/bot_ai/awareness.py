@@ -32,6 +32,7 @@ from .messages import (
     BotProfile,
     LookIntent,
     MovementAffordance,
+    MovementIntent,
     PerceptionFrame,
     PlayerSnapshot,
     StimulusKind,
@@ -101,6 +102,24 @@ _ALLY_DOWN_REACH = 25.0
 _ALLY_DOWN_TOUCH = 10.0
 _KILL_SHOT_SECONDS = 2.0
 _MAX_SHOTS_HEARD = 6
+# Burning blocks set alight whoever comes within this of their centre
+# (retail BLOCKFIRE_CHARACTER_SPREAD_RANGE); a lit patch creeps a block or
+# two (BLOCKFIRE_SPREAD_RADIUS) while it burns its four seconds.
+_FIRE_REACH = float(getattr(C, "BLOCKFIRE_CHARACTER_SPREAD_RANGE", 3.0))
+_FIRE_SPREAD = float(getattr(C, "BLOCKFIRE_SPREAD_RADIUS", 2.0))
+_FIRE_SECONDS = float(getattr(C, "BLOCKFIRE_MAX_LIFESPAN", 4.0))
+_FIRE_PATCH = 4.5
+_FIRE_NOTICE = 16.0
+_MOLOTOV_TOOL = int(getattr(C, "MOLOTOV_TOOL", 33))
+_MOLOTOV_SPEED = float(getattr(C, "MOLOTOV_THROW_SPEED", 40.0))
+# The way ahead is checked against every hazard the bot knows of: this far
+# at a standstill, and farther by what the body covers before a new stride
+# can take effect (a sprint is a block and a half per decision).
+_STEER_AHEAD = 4.0
+_STEER_SECONDS = 0.6
+# Player velocity is in physics units: blocks per second is 32 times that.
+_PHYSICS_SCALE = 32.0
+_HAZARD_SECONDS = 0.5
 _MAX_LIVES = 128
 
 
@@ -123,6 +142,22 @@ class Reaction:
     sprint: bool = False
     priority: BotIntentPriority = BotIntentPriority.COMBAT
     suspect: Vector3 | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Hazard:
+    """A patch of ground not to walk into: a keep-out circle with an expiry.
+
+    ``reach`` is where it actually hurts; ``radius`` adds the berth this bot
+    gives it.
+    """
+
+    key: int
+    centre: Vector3
+    reach: float
+    radius: float
+    until: float
+    kind: str = "fire"
 
 
 @dataclass(slots=True)
@@ -196,6 +231,19 @@ class _Life:
     # Where each enemy last fired from, as heard: the kill feed names a killer,
     # the shot that went with it says roughly where it stood.
     shots: dict[int, tuple[Vector3, float]] = field(default_factory=dict)
+    # Ground to keep off: what the bot has seen burning, and where its own
+    # Molotov is about to. ``body`` is the snapshot they were judged from.
+    hazards: tuple[_Hazard, ...] = ()
+    hazards_at: float = 0.0
+    body: PlayerSnapshot | None = None
+    seen_fires: dict[int, float] = field(default_factory=dict)
+    pyre: _Hazard | None = None
+    # Which way round each hazard, so the stride does not swap sides mid-way.
+    steer_side: dict[int, float] = field(default_factory=dict)
+
+
+def _wrap(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _unit(dx: float, dy: float) -> Vector3:
@@ -257,9 +305,14 @@ class Awareness:
     def __init__(self, world) -> None:
         self.world = world
         self._lives: dict[tuple[int, int], _Life] = {}
+        # Burning patches of the newest entity list, shared by every bot
+        # whose frame carries that same list.
+        self._fire_entities: tuple = ()
+        self._fires: tuple[_Hazard, ...] = ()
 
     def reset(self) -> None:
         self._lives.clear()
+        self._fire_entities, self._fires = (), ()
 
     def forget(self, player_id: int, generation: int) -> None:
         self._lives.pop((int(player_id), int(generation)), None)
@@ -282,6 +335,10 @@ class Awareness:
         """Return the reaction that should own the body this decision, if any."""
 
         life = self._life(observer, now)
+        self._watch_hazards(frame, observer, profile, life, now)
+        burning = self._leave_fire(observer, life, now)
+        if burning is not None:
+            return burning
         if int(observer.class_id) in _ZOMBIE_CLASSES:
             return None
         self._listen(frame, observer, profile, life, visible, decision, now)
@@ -297,9 +354,13 @@ class Awareness:
         """Let a pending glance turn the head while the body carries on."""
 
         life = self._lives.get((int(intent.bot_id), int(intent.bot_generation)))
-        if life is None or life.glance is None:
+        if life is None:
             return intent
         now = float(frame.created_at)
+        if life.hazards and now - life.hazards_at <= _HAZARD_SECONDS:
+            intent = self._steer(life, intent, now)
+        if life.glance is None:
+            return intent
         if now >= max(life.glance_until, life.watch_until):
             life.glance = None
             return intent
@@ -309,6 +370,171 @@ class Awareness:
             # Only a bot standing its ground keeps watching that long.
             return intent
         return replace(intent, look=LookIntent(life.glance, glance=True))
+
+    # -- fire ------------------------------------------------------------------
+
+    def threw(self, observer: PlayerSnapshot, tool: int, target: Vector3, now: float) -> None:
+        """Remember where the bot's own Molotov is about to burn.
+
+        The thrower knows where it aimed before any flame exists; walking on
+        along the same line is how gangsters died in their own fire.
+        """
+
+        life = self._lives.get((int(observer.player_id), int(observer.generation)))
+        if life is None or int(tool) != _MOLOTOV_TOOL:
+            return
+        flight = math.dist(observer.position, target) / _MOLOTOV_SPEED
+        reach = _FIRE_SPREAD + _FIRE_REACH
+        life.pyre = _Hazard(-1, tuple(float(value) for value in target), reach, reach + 1.0,
+                            now + flight + 1.0 + _FIRE_SECONDS + 1.0)
+
+    def _burning_patches(self, frame: PerceptionFrame) -> tuple[_Hazard, ...]:
+        """Group the burning blocks of this frame into patches to walk around."""
+
+        if frame.entities is self._fire_entities:
+            return self._fires
+        patches: list[list] = []
+        for entity in frame.entities:
+            if entity.kind != "blockfire" or not entity.alive:
+                continue
+            for patch in patches:
+                if math.dist(patch[0], entity.position) <= _FIRE_PATCH:
+                    patch.append(entity)
+                    count = len(patch) - 1
+                    patch[0] = tuple(
+                        (patch[0][axis] * (count - 1) + entity.position[axis]) / count
+                        for axis in range(3))
+                    break
+            else:
+                patches.append([entity.position, entity])
+        fires = []
+        for centre, *members in patches:
+            extent = max(math.dist(centre[:2], member.position[:2]) for member in members)
+            reach = extent + max(member.blast_radius for member in members)
+            fires.append(_Hazard(
+                min(member.entity_id for member in members), centre, reach, reach,
+                max(member.detonate_at for member in members) + 0.3))
+        self._fire_entities, self._fires = frame.entities, tuple(fires)
+        return self._fires
+
+    def _watch_hazards(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                       profile: BotProfile, life: _Life, now: float) -> None:
+        """Collect the ground this bot knows it must keep off.
+
+        Stimulus: flames in line of sight (or at the bot's feet), and the
+        bot's own throw. Fire behind a wall is not known until it is seen.
+        A careless player cuts the corner closer than a careful one.
+        """
+
+        life.body, life.hazards_at = observer, now
+        known = []
+        margin = 0.4 + 0.8 * float(profile.skill)
+        rays = 0
+        for fire in self._burning_patches(frame) if frame.entities else ():
+            gap = math.dist(fire.centre[:2], observer.position[:2])
+            head = observer.position[2]
+            height = fire.centre[2] - min(max(fire.centre[2], head), head + 2.25)
+            if gap > fire.radius + _FIRE_NOTICE or now >= fire.until or abs(height) > _FIRE_REACH:
+                continue
+            seen_at = life.seen_fires.get(fire.key)
+            if seen_at is None:
+                if gap > fire.radius + 1.0:
+                    if rays >= 4:
+                        continue
+                    rays += 2
+                    # The flames stand on top of the block and the smoke
+                    # above them: either shows a fire in a dip.
+                    x, y, z = fire.centre
+                    if not (self.world.has_line_of_sight(observer.eye, (x, y, z - 1.0))
+                            or self.world.has_line_of_sight(observer.eye, (x, y, z - 3.5))):
+                        continue
+                if len(life.seen_fires) >= 16:
+                    life.seen_fires.pop(next(iter(life.seen_fires)))
+                seen_at = life.seen_fires[fire.key] = now
+            # Flames are hard to miss: they register faster than a sound does.
+            if now - seen_at >= 0.25 * notice_delay(profile) or gap <= fire.radius + 1.0:
+                known.append(replace(fire, radius=fire.radius + margin))
+        if life.pyre is not None:
+            if now >= life.pyre.until:
+                life.pyre = None
+            else:
+                known.append(life.pyre)
+        life.hazards = tuple(known)
+
+    def _leave_fire(self, observer: PlayerSnapshot, life: _Life, now: float) -> Reaction | None:
+        """Standing in the flames: out by the shortest way that can be walked."""
+
+        for hazard in life.hazards:
+            if hazard.kind != "fire":
+                continue
+            dx = observer.position[0] - hazard.centre[0]
+            dy = observer.position[1] - hazard.centre[1]
+            gap = math.hypot(dx, dy)
+            if gap >= hazard.reach + 0.2:
+                continue
+            out = math.atan2(dy, dx) if gap > 1e-3 else mix(
+                observer.player_id, observer.life_id, hazard.key) * 2.0 * math.pi
+            for turn in (0.0, 0.7, -0.7, 1.4, -1.4):
+                heading = (math.cos(out + turn), math.sin(out + turn), 0.0)
+                if not observer.grounded or walkable_heading(self.world, observer, heading,
+                                                             reach=2.0):
+                    return Reaction("fire_escape", heading=heading, sprint=True,
+                                    look=_ahead(observer, heading),
+                                    priority=BotIntentPriority.SURVIVAL)
+        return None
+
+    def _steer(self, life: _Life, intent: BotIntent, now: float) -> BotIntent:
+        """Bend the stride round a hazard, or stop short of it.
+
+        The route planner knows nothing of fire. For the four seconds a
+        patch burns, the way ahead is checked here: a walk is turned onto the
+        tangent that clears the patch, an exact step (a jump, a ledge) that
+        would land in it is held back until it has burnt out.
+        """
+
+        movement = intent.movement
+        length = math.hypot(*movement.direction[:2])
+        body = life.body
+        if (length <= 0.1 or body is None or intent.priority >= BotIntentPriority.SURVIVAL
+                or movement.affordance in {MovementAffordance.SWIM, MovementAffordance.JETPACK,
+                                           MovementAffordance.JETPACK_CLIMB}):
+            return intent
+        dx, dy = movement.direction[0] / length, movement.direction[1] / length
+        for hazard in life.hazards:
+            to_x = hazard.centre[0] - body.position[0]
+            to_y = hazard.centre[1] - body.position[1]
+            gap = math.hypot(to_x, to_y)
+            along = to_x * dx + to_y * dy
+            if gap <= hazard.radius or along <= 0.0 or now >= hazard.until:
+                continue  # inside is _leave_fire's business; behind is behind
+            reach = min(along, _STEER_AHEAD + _STEER_SECONDS * _PHYSICS_SCALE * math.hypot(
+                *body.velocity[:2]))
+            miss = math.hypot(to_x - dx * reach, to_y - dy * reach)
+            if miss >= hazard.radius:
+                continue
+            role = f"{intent.debug_role}:avoid_{hazard.kind}"
+            if movement.affordance is MovementAffordance.WALK and not movement.jump:
+                bearing = math.atan2(to_y, to_x)
+                spread = math.asin(min(1.0, hazard.radius / gap)) + 0.15
+                side = life.steer_side.get(hazard.key)
+                if side is None:
+                    # The side that turns the stride least.
+                    side = 1.0 if _wrap(math.atan2(dy, dx) - bearing) >= 0.0 else -1.0
+                for turn in (side, -side):
+                    angle = bearing + turn * spread
+                    heading = (math.cos(angle), math.sin(angle), 0.0)
+                    if walkable_heading(self.world, body, heading, reach=2.0):
+                        if len(life.steer_side) >= 8 and hazard.key not in life.steer_side:
+                            life.steer_side.clear()
+                        life.steer_side[hazard.key] = turn
+                        return replace(
+                            intent, debug_role=role,
+                            movement=replace(movement, direction=(
+                                heading[0] * length, heading[1] * length, 0.0)))
+            # No way round that can be walked: wait for it to burn out.
+            return replace(intent, debug_role=role, movement=MovementIntent(
+                crouch=movement.crouch))
+        return intent
 
     # -- sounds ----------------------------------------------------------------
 

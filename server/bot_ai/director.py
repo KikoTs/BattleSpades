@@ -122,6 +122,7 @@ _MAX_PERCEPTION_ENTITIES = 192
 # force a full priority sort every perception refresh. Their voxel is part of
 # the collision world the planner already sees, so nothing is lost.
 _DECORATIVE_ENTITY_KINDS = frozenset(("map_flare", "static_flare", "flare_block"))
+_BLOCKFIRE_REACH = float(getattr(C, "BLOCKFIRE_CHARACTER_SPREAD_RANGE", 3.0))
 _DECORATIVE_ENTITY_TYPES = frozenset((int(getattr(C, "FLARE_BLOCK", 13)),))
 # When real entities still exceed the cap, the distance ranking of ordinary
 # (non-hazard, non-carried) entities is reused for this long instead of being
@@ -1619,6 +1620,11 @@ class BotDirector:
             detonate_at = float(
                 getattr(behavior, "_detonate_at", 0.0) or 0.0
             )
+            if kind == "blockfire":
+                # Awareness hook: a burning block sets alight whoever comes
+                # within its reach, until its remaining fuse runs out.
+                blast_radius = _BLOCKFIRE_REACH
+                detonate_at = time.monotonic() + float(getattr(entity, "fuse", 0.0) or 0.0)
             result.append(
                 EntitySnapshot(
                     entity_id=int(getattr(entity, "entity_id", -1)),
@@ -1748,7 +1754,9 @@ class BotDirector:
         urgent: list[EntitySnapshot] = []
         ordinary: dict[int, EntitySnapshot] = {}
         for snapshot in result:
-            if snapshot.hazardous or snapshot.entity_id in carried_ids:
+            # Awareness hook: fire is never crowded out of a full frame.
+            if (snapshot.hazardous or snapshot.entity_id in carried_ids
+                    or snapshot.kind == "blockfire"):
                 urgent.append(snapshot)
             else:
                 ordinary[int(snapshot.entity_id)] = snapshot
