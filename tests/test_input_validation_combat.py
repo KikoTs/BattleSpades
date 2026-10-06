@@ -318,6 +318,32 @@ def test_human_build_beside_other_player_still_commits():
     assert server.world_manager.get_solid(*cell)
 
 
+@pytest.mark.parametrize("crouched,commits", ((False, True), (True, False)))
+def test_what_a_builder_gets_flooring_the_column_its_own_body_straddles(crouched, commits):
+    """Pins today's answer; it is not established that retail gives the same.
+
+    The refused body span is floor(z)..floor(z + 2) whatever the stance.
+    Standing, that ends one cell above the floor the builder stands on.
+    Crouched, the eye is 0.9 lower and the same span takes in the floor
+    layer, although the collision box ends at the feet, 1.35 below the eye.
+    Retail decides this in GameScene.can_place_block_on_player, which is
+    compiled and has not been read.
+    """
+    floor = 62
+    above_ground = (C.PLAYER_CROUCHING_POS_ABOVE_GROUND if crouched
+                    else C.PLAYER_STANDING_POS_ABOVE_GROUND)
+    server, builder, _ = _server_player(
+        C.BLOCK_TOOL, position=(103.7, 100.5, floor - above_ground))
+    builder.input.crouch = crouched
+    cell = (104, 100, floor)
+    server.world_manager.set_block(*cell, False, 0)  # a gap in the floor, half under the body
+    builder.blocks -= 1
+    blocks = builder.blocks
+    server.combat._commit_block_build(builder, 1, cell, 0x445566)
+    assert bool(server.world_manager.get_solid(*cell)) is commits
+    assert builder.blocks == blocks + (0 if commits else 1)
+
+
 def test_prefab_reach_helper():
     from server.prefab_actions import PrefabActionService
 

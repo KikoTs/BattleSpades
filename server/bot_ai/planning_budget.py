@@ -235,14 +235,16 @@ class PlanningBudget:
     def spare(self, observer: ObserverKey, now: float) -> bool:
         """Is there credit that no waiting observer needs? Changes nothing.
 
-        Work that can wait (map-wide guidance for a bot still walking, a route
-        extension) runs on this. Half of a batch's credit stays free for
-        whoever finds itself without a route later in the same batch.
+        Work that can wait (a slice of map-wide guidance, a route extension)
+        runs on this. Every waiting observer's credit is left alone, and so
+        is half of the rest of a batch, for whoever finds itself without a
+        route later in the same batch. With nobody waiting and credit in hand
+        it never holds a search back.
         """
         observer = int(observer[0]), int(observer[1])
         now, credits, waiters = self._preview(now)
         return (not self._used_turn(observer, now) and credits + 1e-9
-                >= 1.0 + max(1.0, self.burst / 2.0)
+                >= 1.0 + (self.burst - 1) / 2.0
                 + self._claims_ahead(observer, waiters, False))
 
     def finish(self, job: PlanningJob, seconds: float) -> None:

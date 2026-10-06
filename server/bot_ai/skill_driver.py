@@ -449,6 +449,20 @@ class LocomotionSkillDriver:
             slot.water_since = None
             slot.dry_since = None
 
+    def restart_stuck_clock(self, observer: PlayerSnapshot, now: float) -> None:
+        """A new route has arrived: it is not what the stuck clock has timed.
+
+        The worker asks for map-wide guidance when local routing gets nowhere,
+        which is also when this clock is about to expire. Starting to dig a
+        way out one decision after the walking route arrived took the body
+        away from it for twenty seconds.
+        """
+
+        slot = self._slot(observer)
+        if slot.skill is None and slot.pending is None:
+            slot.anchor = observer.position
+            slot.anchor_at = now
+
     def consider_stuck(self, observer: PlayerSnapshot, profile: BotProfile | None,
                        now: float, goal: Vector3 | None) -> SkillCommand | None:
         """A grounded body that is getting nowhere below its goal: climb."""

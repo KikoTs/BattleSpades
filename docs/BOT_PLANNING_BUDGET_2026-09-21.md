@@ -28,9 +28,10 @@ served in the order they began waiting, whatever the bot-ID or frame order.
   expansions. Each retained corridor slice also consumes one job and remains
   capped at 512 expansions. Already completed corridor searches spend nothing.
 - `PlanningBudget.spare()` reports credit beyond the waiters' claims and half
-  a batch. Work that can wait runs on it: route extensions, and map-wide
-  corridor slices, which become an ordinary request after half a second
-  without one so guidance cannot be starved either.
+  of the rest of a batch. Work that can wait runs on it: route extensions,
+  and map-wide corridor slices, which become an ordinary request after half
+  a second without one so guidance cannot be starved either. With nobody
+  waiting it never holds a search back.
 - `RoutePlan.deferred` means scheduling pressure, not inaccessible geometry.
   Callers must retain valid routes and avoid failed-site/edge learning or
   fallback retries. Deferred corridor advances keep their exact frontier.
