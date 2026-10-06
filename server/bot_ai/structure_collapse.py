@@ -180,6 +180,163 @@ def isolation(solid: SolidFn, position: Vector3, hunters: Sequence[Vector3] = ()
     return _run(iter_isolation(solid, position, hunters, **kwargs))
 
 
+@dataclass(frozen=True, slots=True)
+class Approach:
+    """How far a zombie on foot is from a survivor's floor, cell by cell.
+
+    ``steps`` maps every explored standing cell to the number of moves a
+    zombie needs from there to the survivor (walking, a two-block jump up, a
+    drop of up to four: the edges the bots' route planner really takes).
+    ``closed`` means the flood ran out of floor before it ran out of budget:
+    nothing walks in from outside, the footing is a pillar top, a platform,
+    a sealed room. Otherwise ``frontier`` is the fewest moves from any floor
+    the budget left unexplored, a lower bound for every cell not in
+    ``steps``.
+    """
+
+    support_z: int
+    steps: dict[Cell, int]
+    closed: bool
+    frontier: int
+    # Farthest explored floor from the survivor, in blocks (the footprint of
+    # a closed platform; the fall lands inside it).
+    radius: float
+    # For every explored cell but the survivor's own, the next cell on its
+    # shortest way in.
+    toward: dict[Cell, Cell]
+
+    def cell_at(self, position: Vector3) -> Cell | None:
+        """The explored standing cell under a body at ``position``."""
+
+        x, y = int(math.floor(position[0])), int(math.floor(position[1]))
+        floor = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
+        for level in (floor, floor + 1, floor - 1):
+            if (x, y, level) in self.steps:
+                return (x, y, level)
+        return None
+
+    def moves_from(self, position: Vector3) -> int | None:
+        """Moves from a body standing at ``position``; None when unexplored."""
+
+        cell = self.cell_at(position)
+        return None if cell is None else self.steps[cell]
+
+    def waypoint(self, cell: Cell, ahead: int) -> Cell:
+        """The cell ``ahead`` moves along the way in from ``cell``."""
+
+        for _ in range(max(0, int(ahead))):
+            following = self.toward.get(cell)
+            if following is None:
+                break
+            cell = following
+        return cell
+
+    def entry_near(self, position: Vector3, reach: float) -> Cell | None:
+        """Nearest explored floor on a body's own level (two blocks either way).
+
+        For a hunter the flood did not reach: where the known way in begins.
+        """
+
+        px, py = float(position[0]), float(position[1])
+        floor = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
+        best, best_gap = None, float(reach) ** 2
+        for cell in self.steps:
+            if abs(cell[2] - floor) > 2:
+                continue
+            gap = (cell[0] + 0.5 - px) ** 2 + (cell[1] + 0.5 - py) ** 2
+            if gap < best_gap:
+                best, best_gap = cell, gap
+        return best
+
+
+# The route planner's own vertical edges (simple_navigation._neighbors).
+APPROACH_JUMP = 2
+APPROACH_DROP = 4
+
+
+def iter_approach(
+    solid: SolidFn,
+    position: Vector3,
+    *,
+    limit: int = 700,
+    jump: int = APPROACH_JUMP,
+    drop: int = APPROACH_DROP,
+) -> Generator[None, None, Approach | None]:
+    """Flood outward from a survivor's floor along the ways a zombie comes in.
+
+    Breadth-first over standing cells, following every edge backwards: a
+    cell joins when a zombie standing there can step, jump or drop onto a
+    cell already reached. Bounded by ``limit`` cells, so open ground yields
+    the neighbourhood (about fifteen blocks round) and a closed footing is
+    proved closed in a few dozen probes. Returns None for a body with no
+    floor under it (falling).
+    """
+
+    support = support_cells(solid, position)
+    if not support:
+        return None
+    px, py = float(position[0]), float(position[1])
+    floor_z = support[0][2]
+    start = min(support, key=lambda c: (c[0] + 0.5 - px) ** 2 + (c[1] + 0.5 - py) ** 2)
+    steps: dict[Cell, int] = {cell: 0 for cell in support}
+    toward: dict[Cell, Cell] = {}
+    queue: deque[Cell] = deque(support)
+    frontier = 0
+    radius = 0.0
+    work = 0
+    window = range(-drop - 3, jump + 1)
+    while queue:
+        cell = queue.popleft()
+        x, y, z = cell
+        depth = steps[cell]
+        if len(steps) >= limit:
+            # Out of budget: everything still queued is unexplored floor.
+            frontier = depth
+            break
+        radius = max(radius, math.hypot(x + 0.5 - px, y + 0.5 - py))
+        for dx, dy in _CARDINAL:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                continue
+            # One scan of the neighbouring column, top to bottom.
+            column = [0 <= z + offset and solid(nx, ny, z + offset) for offset in window]
+            base = -window.start
+            for offset in range(-drop, jump + 1):
+                nz = z + offset
+                index = base + offset
+                if not (column[index] and not column[index - 1] and not column[index - 2]):
+                    continue  # no standing room at this level
+                key = (nx, ny, nz)
+                if key in steps or nz > GROUND_Z + 1:
+                    continue  # (the waterbed, one below, is waded)
+                if offset >= 1:
+                    # The zombie stands lower and comes up: its own column
+                    # must be open until its feet clear this floor.
+                    if any(column[base + k] for k in range(-2, offset - 2)):
+                        continue
+                elif offset <= -1:
+                    # It stands higher and comes down: this column must be
+                    # open from the height it walks in at (the planner asks
+                    # one cell more above a real drop).
+                    top = offset - 2 if offset == -1 else offset - 3
+                    if any(z + k >= 0 and solid(x, y, z + k) for k in range(top, -2)):
+                        continue
+                steps[key] = depth + 1
+                toward[key] = cell
+                queue.append(key)
+        work += 1
+        if work % 6 == 0:
+            yield
+    return Approach(
+        support_z=floor_z, steps=steps, closed=not queue and frontier == 0,
+        frontier=frontier, radius=radius, toward=toward,
+    )
+
+
+def approach(solid: SolidFn, position: Vector3, **kwargs) -> Approach | None:
+    return _run(iter_approach(solid, position, **kwargs))
+
+
 def _floor_below(solid: SolidFn, x: int, y: int, z: int, depth: int) -> int | None:
     for level in range(z, min(z + depth, GROUND_Z + 1) + 1):
         if solid(x, y, level):
@@ -228,23 +385,30 @@ def dig_cost(solid: SolidFn, cell: Cell, ground_floor_z: int | None = None) -> i
 
 
 def horde_floor(solid: SolidFn, position: Vector3, hunters: Sequence[Vector3] = (),
-                *, radius: float = 32.0) -> int:
-    """The floor z the horde stands on around ``position``.
+                *, radius: float = 12.0) -> int:
+    """The ground at the foot of a survivor's footing, where diggers stand.
 
-    Median floor of hunters within ``radius`` when there are any, otherwise
-    the lower quartile of the terrain floors on rings 6 and 10 blocks out
-    (first solid voxel below the player's own floor level).
+    Lower quartile of the terrain floors on rings 6 and 10 blocks out (first
+    solid voxel below the survivor's own floor level) and of the ground
+    under every hunter within ``radius``. Hunters farther off say nothing
+    about this spot: a horde still running in over higher ground used to
+    make the foot of a pillar look like part of the pillar, and the cut was
+    planned ten blocks up where no claw reaches.
     """
 
     px, py = float(position[0]), float(position[1])
-    floors = sorted(
-        int(round(float(h[2]) + PLAYER_SUPPORT_OFFSET)) for h in hunters
-        if math.hypot(float(h[0]) - px, float(h[1]) - py) <= radius
-    )
-    if floors:
-        return floors[len(floors) // 2]
     start = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
     samples = []
+    for h in hunters:
+        if math.hypot(float(h[0]) - px, float(h[1]) - py) > radius:
+            continue
+        feet = int(round(float(h[2]) + PLAYER_SUPPORT_OFFSET))
+        # A hunter in mid-jump is up to four blocks off the ground it will
+        # land on: take the floor under the body, not its height.
+        x, y = int(math.floor(float(h[0]))), int(math.floor(float(h[1])))
+        under = (_floor_below(solid, x, y, feet - 1, 6)
+                 if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE and feet >= 1 else None)
+        samples.append(feet if under is None else under)
     for ring in (6, 10):
         for step in range(8):
             angle = step * math.pi / 4.0
@@ -554,13 +718,16 @@ def _run(generator):
 
 
 __all__ = [
+    "Approach",
     "CollapsePlan",
     "Isolation",
+    "approach",
     "claw_sites",
     "dig_cost",
     "falls_after",
     "horde_floor",
     "isolation",
+    "iter_approach",
     "iter_isolation",
     "iter_plan_collapse",
     "plan_collapse",

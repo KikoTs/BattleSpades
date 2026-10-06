@@ -8,6 +8,7 @@ removed, the survivor's support must be part of a falling chunk.
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -21,11 +22,13 @@ from server.bot_ai.horde_strategy import (
     SurvivorTarget,
     pile_count,
     tunnel_cells,
+    wall_line,
 )
 from server.bot_ai.messages import BotActionKind, ObjectiveSnapshot
 from server.bot_ai.policies import ModePolicyMemory, objective_decision_for
 from server.bot_ai.simple_worker import _BotState
 from server.bot_ai.structure_collapse import (
+    approach,
     falls_after,
     isolation,
     plan_collapse,
@@ -208,24 +211,47 @@ def test_assignment_has_hysteresis_and_counts_human_hunters():
     assert fresh.assign_targets([bot] + humans, survivors)[10] == 2
 
 
-def test_watchdog_escalates_a_stalled_hunter_to_flank_then_tunnel():
+def _walled_ground():
     cells = _ground(set())
     for y in range(90, 170):          # a wall between hunter and survivor
         for z in range(FLOOR - 4, FLOOR):
             cells.add((120, y, z))
+    return cells
+
+
+def test_a_hunter_held_up_at_a_wall_claws_through_it_without_trying_a_flank_first():
+    cells = _walled_ground()
+    solid = lambda x, y, z: (x, y, z) in cells
+    coordinator = HordeCoordinator()
+    survivor = [SurvivorTarget(1, _stand(130.5, 128.5, FLOOR))]
+    roles = ["hunt"]
+    for tenth in range(0, 400):
+        # Its swings land once it has been told to claw.
+        zombie = [HordeMember(10, _stand(118.5, 128.5, FLOOR), working=roles[-1] == "tunnel")]
+        orders = coordinator.plan(zombie, survivor, {}, tenth / 10.0, solid=solid)
+        roles.append(orders[10].role)
+    roles = roles[1:]
+    # With no analysis of the survivor's surroundings the straight run looks
+    # as quick as it is short: it is tried first.
+    assert roles[0] == "hunt"
+    # Two seconds at the wall without getting closer and the claw comes out:
+    # no seven-second wait, no walk to another side of the same wall.
+    assert "tunnel" in roles[:30]
+    assert "flank" not in roles and roles[-1] == "tunnel"
+    tunnel = coordinator.plan(zombie, survivor, {}, 41.0, solid=solid)[10]
+    assert tunnel.role == "tunnel"
+    assert tunnel.cells and all(cell[0] == 120 for cell in tunnel.cells)
+
+
+def test_a_claw_that_never_lands_gives_way_to_another_side():
+    cells = _walled_ground()
     solid = lambda x, y, z: (x, y, z) in cells
     coordinator = HordeCoordinator()
     survivor = [SurvivorTarget(1, _stand(130.5, 128.5, FLOOR))]
     zombie = [HordeMember(10, _stand(118.5, 128.5, FLOOR))]
-    roles = []
-    for second in range(0, 40, 1):
-        orders = coordinator.plan(zombie, survivor, {}, float(second), solid=solid)
-        roles.append(orders[10].role)
-    assert roles[0] == "hunt"
-    assert "flank" in roles and "tunnel" in roles
-    tunnel = next(o for o in [coordinator.plan(zombie, survivor, {}, 41.0, solid=solid)[10]])
-    assert tunnel.role == "tunnel"
-    assert tunnel.cells and all(cell[0] == 120 for cell in tunnel.cells)
+    roles = [coordinator.plan(zombie, survivor, {}, tenth / 10.0, solid=solid)[10].role
+             for tenth in range(0, 200)]
+    assert "tunnel" in roles[:30] and roles[-1] == "flank"
     assert coordinator.metrics.stuck_events >= 2
 
 
@@ -439,3 +465,352 @@ def test_far_stalled_hunter_never_tunnels_and_flank_spots_avoid_walls():
     hunters = _members(*[_stand(100.5, 120.5 + 4 * i, FLOOR) for i in range(5)])
     orders = HordeCoordinator().plan(hunters, survivor, {}, 0.0, solid=solid)
     assert {o.role for o in orders.values()} == {"hunt"}
+
+
+# ------------------------------------------------ approach flood and choices
+
+def _solid(cells):
+    return lambda x, y, z: (x, y, z) in cells
+
+
+def _block(cells: set, xs, ys, zs) -> set:
+    for x in xs:
+        for y in ys:
+            for z in zs:
+                cells.add((x, y, z))
+    return cells
+
+
+def _deck_with_stairs() -> set:
+    """A 3-wide deck 8 up on two piers, a staircase at its west end."""
+
+    cells = _ground(set())
+    top = FLOOR - 8
+    _block(cells, range(120, 137), range(127, 130), [top])
+    _block(cells, list(range(120, 123)) + list(range(134, 137)), range(127, 130),
+           range(top + 1, FLOOR))
+    for step in range(1, 8):
+        _block(cells, [120 - step], range(127, 130), range(top + step, FLOOR))
+    return cells
+
+
+def _sealed_room() -> set:
+    cells = _ground(set())
+    for x in range(125, 132):
+        for y in range(125, 132):
+            cells.add((x, y, FLOOR - 4))
+            if x in (125, 131) or y in (125, 131):
+                _block(cells, [x], [y], range(FLOOR - 3, FLOOR))
+    return cells
+
+
+def _pillar_under_a_walkway() -> set:
+    """A pillar that a zombie can also drop onto from a deck with far stairs."""
+
+    cells = _ground(set(), 90, 190)
+    top = FLOOR - 10
+    _block(cells, [128], [128], range(top, FLOOR))
+    deck = top - 3
+    _block(cells, range(127, 150), (129, 130), [deck])
+    _block(cells, [136, 144], [130], range(deck + 1, FLOOR))
+    for step in range(1, 13):
+        _block(cells, [149 + step], (129, 130), range(deck + step, FLOOR))
+    return cells
+
+
+@pytest.mark.parametrize("name,builder,top", [
+    ("pillar", _pillar, 215), ("sky_platform", _sky_platform, 210),
+    ("tower", _tower, 200), ("keep", _keep, 198),
+])
+def test_nothing_walks_onto_a_footing_the_flood_closes_on(name, builder, top):
+    cells = builder()
+    found = approach(_solid(cells), _stand(128.5, 128.5, top))
+    assert found.closed and found.frontier == 0, name
+    assert all(cell[2] == top for cell in found.steps)
+    assert found.moves_from(_stand(120.5, 120.5, FLOOR)) is None
+
+
+def test_the_flood_follows_the_planners_jump_and_drop_edges_and_no_further():
+    for rise, walks_in in ((1, True), (2, True), (3, False)):
+        cells = _block(_ground(set()), range(127, 130), range(127, 130), range(FLOOR - rise, FLOOR))
+        found = approach(_solid(cells), _stand(128.5, 128.5, FLOOR - rise))
+        assert found.closed is not walks_in, rise
+        assert (found.moves_from(_stand(124.5, 128.5, FLOOR)) is not None) is walks_in
+    for depth, walks_in in ((3, True), (4, True), (5, False)):
+        cells = _ground(set())
+        for x in range(126, 131):
+            for y in range(126, 131):
+                for z in range(FLOOR, FLOOR + depth):
+                    cells.discard((x, y, z))
+        found = approach(_solid(cells), _stand(128.5, 128.5, FLOOR + depth))
+        assert found.closed is not walks_in, depth
+
+
+def test_the_flood_wades_and_is_bounded_on_open_ground():
+    cells = _hill()
+    found = approach(_solid(cells), _stand(130.5, 130.5, FLOOR - 30), limit=300)
+    assert not found.closed and len(found.steps) == 300 and found.frontier >= 8
+    # An islet in a pond: the waterbed (z 239) is waded, not a wall.
+    pond = {(x, y, 239) for x in range(100, 160) for y in range(100, 160)}
+    _block(pond, range(128, 131), range(128, 131), range(237, 239))
+    _block(pond, range(100, 120), range(100, 160), range(237, 239))
+    found = approach(_solid(pond), _stand(129.5, 129.5, 237))
+    assert not found.closed
+    assert found.moves_from((117.5, 129.5, 237 - 2.25)) is not None
+
+
+def test_the_way_in_leads_a_hunter_under_the_deck_round_to_the_stairs():
+    cells = _deck_with_stairs()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(131.5, 128.5, FLOOR - 8))
+    found = approach(solid, survivor.position, limit=1200)
+    under = _stand(131.5, 132.5, FLOOR)             # four blocks from him, eight below
+    moves = found.moves_from(under)
+    assert not found.closed and moves is not None and moves > 25
+    siege = {1: SiegeInfo(False, FLOOR, None, 0.0, found, survivor.position)}
+    coordinator = HordeCoordinator()
+    order = coordinator.plan([HordeMember(10, under)], [survivor], siege, 0.0, solid=solid)[10]
+    # Still a hunt, but toward the next stretch of the route: west, to the
+    # foot of the stairs, not the spot under his feet.
+    assert order.role == "hunt"
+    assert order.goal[0] < under[0] - 4.0
+    assert pile_count(survivor.position, [order.goal]) == 0
+    # On the deck itself the run is straight: the prey is the goal.
+    beside = _stand(126.5, 128.5, FLOOR - 8)
+    order = coordinator.plan([HordeMember(11, beside)], [survivor], siege, 0.0, solid=solid)[11]
+    assert order.role == "hunt" and order.goal == survivor.position
+
+
+def test_policy_runs_a_hunter_to_the_way_in_and_keeps_its_eyes_on_the_prey():
+    zombie = _zombie(10, (131.5, 132.5, FLOOR - 2.25))
+    survivor = _player(1, SURVIVOR_TEAM, (131.5, 128.5, FLOOR - 10.25),
+                       class_id=int(C.CLASS_SOLDIER))
+    via = (121.5, 131.5, FLOOR - 2.25)
+    order = ObjectiveSnapshot("zombie_order", ZOMBIE_TEAM, via, carrier_id=10, state=0, attacker=1)
+    decision = objective_decision_for(_frame("zom", zombie, survivor, objectives=(order,)), zombie)
+    assert decision.role == "zombie_hunt_survivor" and decision.position == via
+    assert decision.watch_position == survivor.position and decision.sprint
+    direct = replace(order, position=survivor.position)
+    decision = objective_decision_for(_frame("zom", zombie, survivor, objectives=(direct,)), zombie)
+    assert decision.position == survivor.position
+
+
+def test_a_group_rushes_the_prey_instead_of_spreading_to_flank_spots():
+    solid = _solid(_ground(set()))
+    survivor = [SurvivorTarget(1, _stand(128.5, 128.5, FLOOR))]
+    zombies = _members(*[_stand(100.5 + 2 * i, 110.5 + i, FLOOR) for i in range(8)])
+    orders = HordeCoordinator().plan(zombies, survivor, {}, 0.0, solid=solid)
+    assert {o.role for o in orders.values()} == {"hunt"}
+    assert {o.goal for o in orders.values()} == {survivor[0].position}
+
+
+def test_a_sealed_room_on_the_hordes_level_is_clawed_open_at_once_not_besieged():
+    cells = _sealed_room()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, FLOOR))
+    found = approach(solid, survivor.position)
+    assert found.closed and len(found.steps) == 25
+    siege = {1: SiegeInfo(True, FLOOR, None, 0.0, found, survivor.position)}
+    zombies = _members(_stand(121.5, 128.5, FLOOR), _stand(128.5, 136.5, FLOOR),
+                       _stand(170.5, 128.5, FLOOR))
+    coordinator = HordeCoordinator()
+    orders = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    near, also_near, far = (orders[10], orders[11], orders[12])
+    # No watchdog wait: the very first order is the claw, at the wall's face.
+    assert near.role == also_near.role == "tunnel"
+    assert coordinator.metrics.breach_choices == 2 and coordinator.metrics.stuck_events == 0
+    for order in (near, also_near):
+        assert all(solid(*cell) for cell in order.cells)
+        assert math.dist(order.goal[:2], survivor.position[:2]) <= 8.0
+    # Out of clawing range the bot simply runs in; nobody rings a ground room.
+    assert far.role == "hunt"
+    assert not {"surround", "climb", "dig_root"} & {o.role for o in orders.values()}
+    # At the wall the order carries the voxels to claw.
+    at_wall = _members(_stand(123.5, 128.5, FLOOR))
+    order = coordinator.plan(at_wall, [survivor], siege, 1.0, solid=solid)[10]
+    assert order.role == "tunnel" and order.cells and all(c[0] == 125 for c in order.cells)
+
+
+def test_a_wall_is_clawed_only_when_the_way_round_is_the_longer_one():
+    cells = _walled_ground()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(124.5, 128.5, FLOOR))
+    hunter = [HordeMember(10, _stand(116.5, 128.5, FLOOR))]
+    line = wall_line(solid, hunter[0].position, survivor.position)
+    assert (line.walls, line.columns) == (1, 1) and 2.5 <= line.first <= 4.5
+    # The flood knows this wall runs on either way as far as it looked:
+    # nothing walks round within its bound, so the claw is the quick way.
+    found = approach(solid, survivor.position)
+    assert not found.closed and found.moves_from(hunter[0].position) is None
+    long_way = {1: SiegeInfo(False, FLOOR, None, 0.0, found, survivor.position)}
+    order = HordeCoordinator().plan(hunter, [survivor], long_way, 0.0, solid=solid)[10]
+    assert order.role == "tunnel"
+    # The same wall with a gate three blocks along: walk through it.
+    for z in range(FLOOR - 4, FLOOR):
+        for y in (131, 132):
+            cells.discard((120, y, z))
+    found = approach(solid, survivor.position)
+    assert found.moves_from(hunter[0].position) <= 16
+    gate = {1: SiegeInfo(False, FLOOR, None, 0.0, found, survivor.position)}
+    order = HordeCoordinator().plan(hunter, [survivor], gate, 0.0, solid=solid)[10]
+    assert order.role == "hunt"
+
+
+def test_wall_line_follows_terraces_and_refuses_cliffs():
+    cells = _ground(set())
+    _block(cells, range(124, 140), range(120, 140), [FLOOR - 1])      # a terrace one up
+    solid = _solid(cells)
+    line = wall_line(solid, _stand(118.5, 128.5, FLOOR), _stand(130.5, 128.5, FLOOR - 1))
+    assert line is not None and line.walls == 0
+    # A target ten blocks up is no tunnel: digging does not climb through air.
+    assert wall_line(solid, _stand(118.5, 128.5, FLOOR), _stand(130.5, 128.5, FLOOR - 10)) is None
+    assert wall_line(None, (0.0, 0.0, 0.0), (5.0, 0.0, 0.0)) is None
+
+
+def test_a_footing_one_jump_up_is_hunted_not_besieged():
+    cells = _block(_ground(set()), range(127, 130), range(127, 130), range(FLOOR - 2, FLOOR))
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, FLOOR - 2))
+    found = approach(solid, survivor.position)
+    siege = {1: SiegeInfo(False, FLOOR, None, 0.0, found, survivor.position)}
+    zombies = _members(*[_stand(118.5 + i, 122.5, FLOOR) for i in range(6)])
+    orders = HordeCoordinator().plan(zombies, [survivor], siege, 0.0, solid=solid)
+    assert {o.role for o in orders.values()} == {"hunt"}
+
+
+def test_the_cut_is_dug_when_it_is_quicker_than_the_walk_and_not_otherwise():
+    cells = _pillar_under_a_walkway()
+    solid = _solid(cells)
+    top = FLOOR - 10
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    found = approach(solid, survivor.position, limit=900)
+    # Not isolated: a zombie on the deck drops onto the pillar.
+    on_deck = _stand(128.5, 129.5, top - 3)
+    assert not found.closed and found.moves_from(on_deck) == 1
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    assert plan is not None and plan.cost <= 2 and _server_drops(cells, plan.cut, plan.support)
+    siege = {1: SiegeInfo(False, FLOOR, plan, 0.0, found, survivor.position)}
+    # The horde at the pillar's foot: the stairs are forty blocks of walking
+    # away, the cut is one voxel. Dig, and wait round the foot for the fall.
+    foot = _members(*[_stand(124.5 + i, 124.5, FLOOR) for i in range(5)])
+    coordinator = HordeCoordinator()
+    orders = coordinator.plan(foot, [survivor], siege, 0.0, solid=solid)
+    roles = [o.role for o in orders.values()]
+    assert roles.count("dig_root") >= 1 and set(roles) <= {"dig_root", "surround"}
+    assert coordinator.metrics.collapse_choices == 1
+    assert pile_count(survivor.position,
+                      [o.goal for o in orders.values() if o.role == "surround"]) == 0
+    # A hunter who is already up on the deck beside him just steps off it.
+    orders = HordeCoordinator().plan([HordeMember(20, on_deck)], [survivor], siege, 0.0,
+                                     solid=solid)
+    assert orders[20].role == "hunt"
+
+
+def test_time_without_progress_turns_a_walk_that_is_not_working_into_a_siege():
+    cells = _deck_with_stairs()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(131.5, 128.5, FLOOR - 8))
+    found = approach(solid, survivor.position)
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    assert plan is not None
+    siege = {1: SiegeInfo(False, FLOOR, plan, 0.0, found, survivor.position)}
+    zombies = _members(*[_stand(124.5 + 2 * i, 133.5, FLOOR) for i in range(6)])
+    coordinator = HordeCoordinator()
+    first = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    assert {o.role for o in first.values()} == {"hunt"}       # the stairs are near
+    roles = set()
+    for tenth in range(1, 120):                              # ... but nobody moves
+        roles = {o.role for o in coordinator.plan(
+            zombies, [survivor], siege, tenth / 10.0, solid=solid).values()}
+        if "dig_root" in roles:
+            break
+    assert "dig_root" in roles and tenth <= 100
+
+
+def test_a_survivor_who_has_fallen_is_hunted_at_once_whatever_his_old_footing_was():
+    cells = _sky_platform()
+    solid = _solid(cells)
+    up = _stand(128.5, 128.5, 210)
+    plan = plan_collapse(solid, support_cells(solid, up), ground_floor_z=FLOOR)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, approach(solid, up), up)}
+    zombies = _members(*[_stand(120.5 + i, 121.5, FLOOR) for i in range(6)])
+    coordinator = HordeCoordinator()
+    before = coordinator.plan(zombies, [SurvivorTarget(1, up)], siege, 0.0, solid=solid)
+    assert "dig_root" in {o.role for o in before.values()}
+    # The legs are gone and he is on the ground: the analysis is of a spot
+    # twenty blocks above him.
+    cells.difference_update(plan.cut)
+    down = SurvivorTarget(1, _stand(128.5, 128.5, FLOOR))
+    after = coordinator.plan(zombies, [down], siege, 0.2, solid=solid)
+    assert {o.role for o in after.values()} == {"hunt"}
+    assert {o.goal for o in after.values()} == {down.position}
+
+
+def test_the_waiting_ring_hugs_the_measured_footprint():
+    cells = _sky_platform()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, 210))
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    found = approach(solid, survivor.position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, survivor.position)}
+    zombies = _members(*[_stand(100.5 + i, 100.5, FLOOR) for i in range(16)])
+    orders = HordeCoordinator().plan(zombies, [survivor], siege, 0.0, solid=solid)
+    ring = [o.goal for o in orders.values() if o.role == "surround"]
+    assert ring
+    reach = [math.dist(g[:2], survivor.position[:2]) for g in ring]
+    # Outside the 7x7 platform (corners 4.2 out), within a stride of it.
+    assert min(reach) >= 4.0 and max(reach) <= found.radius + 4.5
+    assert pile_count(survivor.position, ring) == 0
+
+
+def test_the_hordes_floor_is_the_ground_at_the_foot_not_where_far_hunters_run_or_jump():
+    cells = _pillar()
+    _block(cells, range(90, 112), range(90, 170), range(FLOOR - 4, FLOOR))   # a rise to the west
+    solid = _solid(cells)
+    survivor = _stand(128.5, 128.5, 215)
+    running_in = [_stand(100.5, 120.5 + 2 * i, FLOOR - 4) for i in range(6)]
+    assert horde_floor(solid, survivor, running_in) == FLOOR
+    # A hunter in mid-jump beside the pillar is still standing on the ground.
+    jumping = [(126.5, 128.5, FLOOR - 2.25 - 3.0)]
+    assert horde_floor(solid, survivor, jumping) == FLOOR
+    plan = plan_collapse(solid, support_cells(solid, survivor),
+                         ground_floor_z=horde_floor(solid, survivor, running_in))
+    assert plan.cost == 1 and plan.cut[0][2] == FLOOR - 1
+
+
+def test_service_analyses_only_survivors_who_stay_put_and_plans_only_cuts_worth_having():
+    cells = _deck_with_stairs()
+    world = SimpleNamespace(map_name="synthetic", get_solid=_solid(cells))
+    camper = _actor(1, _stand(131.5, 128.5, FLOOR - 8), bot=False, loadout=())
+    runner = _actor(2, _stand(100.5, 100.5, FLOOR), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(124.5 + 2 * i, 133.5, FLOOR)) for i in range(4)]
+    mode = _FakeZombieMode([camper, runner], zombies)
+    service = ZombieSiegeService(budget_seconds=0.05)
+    for tick in range(20):
+        runner.position = _stand(100.5 + tick, 100.5, FLOOR)      # eight blocks a second
+        service.objectives(mode, world, now=100.0 + tick * 0.125)
+    assert 1 in service._analyses and 2 not in service._analyses
+    info = service._analyses[1].info
+    assert info.approach is not None and not info.isolated and info.position == camper.position
+    # The stairs are right there: no collapse plan is paid for.
+    assert service.stats["plans"] == 0
+    # The hunters sent up get nowhere: now the cut is worth knowing.
+    for tick in range(20, 160):
+        service.objectives(mode, world, now=100.0 + tick * 0.125)
+    assert service.coordinator.struggling(1)
+    assert service.stats["plans"] >= 1 and service._analyses[1].info.plan is not None
+
+
+def test_service_hands_the_claw_report_to_the_watchdog():
+    cells = _walled_ground()
+    world = SimpleNamespace(map_name="synthetic", get_solid=_solid(cells))
+    survivor = _actor(1, _stand(130.5, 128.5, FLOOR), bot=False, loadout=())
+    zombie = _actor(10, _stand(118.5, 128.5, FLOOR))
+    mode = _FakeZombieMode([survivor], [zombie])
+    idle, digging = ZombieSiegeService(), ZombieSiegeService()
+    for tick in range(64):
+        now = 100.0 + tick * 0.125
+        idle.objectives(mode, world, now=now)
+        digging.objectives(mode, world, now=now, working=lambda player_id: player_id == 10)
+    assert idle.coordinator.metrics.stuck_events >= 1
+    assert digging.coordinator.metrics.stuck_events == 0
