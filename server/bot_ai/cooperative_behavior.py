@@ -322,7 +322,12 @@ class CooperativeBehavior:
             elif has_sniper and math.dist(player.position, lane) > 18:
                 site = find_sniper_outpost(self.world, player, lane, friendly_positions=friends)
                 kind = "outpost"
-            elif has_miner and combat_visible is None:
+            elif has_miner and combat_visible is None and not (
+                    (player.player_id + int(now / 4)) % 3 == 0
+                    and self._affords_prefab(player)):
+                # A Miner that has dug up the blocks for one of its prefabs
+                # gives a third of its turns to the cover below. It spawns
+                # with none and its cheapest costs 126, so most never can.
                 site = find_bridge_project(self.world, player, lane, reserved_cells=reserved)
                 kind = "bridge"
                 if site is None:
@@ -395,6 +400,11 @@ class CooperativeBehavior:
                 self.teams.event("tasks_started", task_id, "mischief", now)
                 return self._advance(frame, player, visible, life, allies)
         return None
+
+    def _affords_prefab(self, player: PlayerSnapshot) -> bool:
+        geometry = self.world.prefab_geometry
+        return any(0 < getattr(geometry.get(name.lower()), "block_count", 0) <= player.blocks
+                   for name in player.prefabs[:3])
 
     @staticmethod
     def _ammunition(player: PlayerSnapshot) -> int:
