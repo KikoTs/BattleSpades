@@ -319,6 +319,9 @@ class _BotState:
     navigation_progress_at: float = 0.0
     navigation_window_position: Vector3 | None = None
     navigation_window_at: float = 0.0
+    # The route step being attempted and since when; see _edge_has_stalled.
+    step_key: tuple[object, ...] | None = None
+    step_since: float = 0.0
     navigation_previous_position: Vector3 | None = None
     navigation_visited: dict[NodeKey, float] = field(default_factory=dict)
     navigation_coverage_at: float = 0.0
@@ -2845,6 +2848,8 @@ class SimpleBotBrain:
             self._clear_route(state, now)
         previous_position = state.navigation_previous_position
         state.navigation_previous_position = observer.position
+        if state.route_index < len(state.route):
+            self._note_step(state, state.route[state.route_index], now)
         active_goal = state.goal
         if active_goal is None:
             return self._intent(
@@ -2978,7 +2983,8 @@ class SimpleBotBrain:
             # physical-progress contract indefinitely: macOS ARM reproduced
             # a live WALK edge that remained trapped for nine seconds because
             # those early branches kept bypassing the later timeout.
-            self._invalidate_current_edge(state, observer.position, now)
+            if self._edge_has_stalled(state, now, _NAVIGATION_WINDOW_SECONDS):
+                self._invalidate_current_edge(state, observer.position, now)
             self._clear_route(state, now)
             state.navigation_progress_position = observer.position
             state.navigation_progress_at = float(now)
@@ -3458,13 +3464,16 @@ class SimpleBotBrain:
                 step,
                 now,
             )
-        if (
-            float(now) - float(state.navigation_progress_at)
-            >= _NAVIGATION_PROGRESS_SECONDS
-            or float(now) - float(state.navigation_window_at)
-            >= _NAVIGATION_WINDOW_SECONDS
-        ):
-            self._invalidate_current_edge(state, observer.position, now)
+        self._note_step(state, step, now)
+        no_progress = (float(now) - float(state.navigation_progress_at)
+                       >= _NAVIGATION_PROGRESS_SECONDS)
+        no_travel = (float(now) - float(state.navigation_window_at)
+                     >= _NAVIGATION_WINDOW_SECONDS)
+        if no_progress or no_travel:
+            if (no_progress and self._edge_has_stalled(state, now, _NAVIGATION_PROGRESS_SECONDS)
+                    or no_travel and self._edge_has_stalled(state, now,
+                                                            _NAVIGATION_WINDOW_SECONDS)):
+                self._invalidate_current_edge(state, observer.position, now)
             self._clear_route(state, now)
             state.navigation_progress_position = observer.position
             state.navigation_progress_at = float(now)
@@ -5603,6 +5612,30 @@ class SimpleBotBrain:
                 )
             ),
         )
+
+    @staticmethod
+    def _note_step(state: _BotState, step: RouteStep, now: float) -> None:
+        """Remember since when this route step has been the one attempted."""
+
+        key = (int(math.floor(step.waypoint[0])), int(math.floor(step.waypoint[1])),
+               int(round(step.waypoint[2])), step.affordance)
+        if key != state.step_key:
+            state.step_key = key
+            state.step_since = float(now)
+
+    @staticmethod
+    def _edge_has_stalled(state: _BotState, now: float, period: float) -> bool:
+        """Has the current step itself been tried for the whole expired clock?
+
+        The progress clocks time the body, not an edge: they keep running
+        through replans and expire on whatever step is current. Blaming that
+        step blocked the first edge of a route adopted a fraction of a second
+        earlier, the way out of a pocket included, for a minute. The body
+        still recovers on the clock; only a step it has really been stuck on
+        for that long is excluded.
+        """
+
+        return float(now) - float(state.step_since) >= float(period)
 
     @staticmethod
     def _remember_blocked_edge(
