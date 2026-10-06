@@ -366,3 +366,15 @@ def test_an_adopted_corridor_starts_on_fresh_clocks_instead_of_taking_the_blame(
     result = _navigate(world, brain, observer, state, goal, 102)
     assert result.movement.direction[0] > 0
     assert state.corridor == search.path and not state.blocked_edges
+
+
+def test_a_post_is_reached_on_the_ground_its_column_has_whatever_height_it_was_given(monkeypatch):
+    """Posts around a base copy the base's height. Where the ground at the
+    post is six blocks off that, the bot stood on it for the whole round
+    without arriving, replanning and being sent to climb."""
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    at_post = replace(observer, position=(30.5, 10.5, 97.75))
+    for stated in (91.75, 103.75):
+        post = replace(goal, key=("post", stated), position=(30.5, 10.5, stated))
+        result = _navigate(world, brain, at_post, _BotState(1, 1, observer.life_id), post)
+        assert result.debug_role.endswith(":arrived")

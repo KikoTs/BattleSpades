@@ -2887,8 +2887,9 @@ class SimpleBotBrain:
             float(active_goal.position[0]) - float(observer.position[0]),
             float(active_goal.position[1]) - float(observer.position[1]),
         )
+        goal_place = self._goal_place(active_goal.position)
         if (goal_distance <= active_goal.arrival_radius and not effective_wading
-                and abs(float(active_goal.position[2]) - float(observer.position[2])) <= 3.0):
+                and abs(float(goal_place[2]) - float(observer.position[2])) <= 3.0):
             if active_goal.role == "chase_last_seen":
                 state.contact_until = 0.0
                 state.contact_position = None
@@ -5612,6 +5613,21 @@ class SimpleBotBrain:
                 )
             ),
         )
+
+    def _goal_place(self, position: Vector3) -> Vector3:
+        """Where a body stands to be at this goal: its point, at its floor's height.
+
+        The planner and the map-wide search aim at the floor the goal names
+        (SimpleVoxelWorld.goal_surface). Arrival reads the same floor, or a
+        post whose height was copied from its base, with the ground there six
+        blocks off it, is stood on for the whole round without being reached.
+        """
+
+        reader = getattr(self.world, "goal_surface", None)
+        surface = reader(position) if callable(reader) else None
+        if surface is None:
+            return position
+        return (position[0], position[1], surface.position[2])
 
     @staticmethod
     def _note_step(state: _BotState, step: RouteStep, now: float) -> None:

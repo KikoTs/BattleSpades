@@ -196,6 +196,14 @@ class CompactVoxelMap:
             return MAP_HEIGHT
         return (mask & -mask).bit_length() - 1
 
+    def column_mask(self, x: int, y: int) -> int:
+        """Collision occupancy of one column, bit ``z`` set where solid."""
+
+        x, y = int(x), int(y)
+        if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
+            return 0
+        return self._columns[y * MAP_SIZE + x]
+
     def iter_column_masks(self):
         """Yield immutable integer masks for off-thread map preprocessing."""
 
