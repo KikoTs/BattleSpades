@@ -995,3 +995,37 @@ def test_the_cut_found_diving_for_the_ground_is_the_least_and_drops_the_footing(
             rest = tuple(c for c in plan.cut if c != spared)
             assert not _server_drops(cells, rest, plan.support)
     assert planned >= 40
+
+
+def test_the_first_alarm_at_a_cliff_sends_the_hunter_round_before_it_claws():
+    cells = _ground(set())
+    _block(cells, range(124, 160), range(100, 160), range(FLOOR - 6, FLOOR))   # a plateau
+    solid = _solid(cells)
+    survivor = [SurvivorTarget(1, _stand(130.5, 128.5, FLOOR - 6))]
+    hunter = [HordeMember(10, _stand(121.5, 128.5, FLOOR))]
+    # A cliff is no wall: the estimate does not choose the claw here.
+    assert wall_line(solid, hunter[0].position, survivor[0].position) is None
+    coordinator = HordeCoordinator()
+    roles = [coordinator.plan(hunter, survivor, {}, tenth / 10.0, solid=solid)[10].role
+             for tenth in range(300)]
+    assert roles[0] == "hunt" and "flank" in roles
+    dug = [i for i, role in enumerate(roles) if role in ("tunnel", "climb")]
+    assert dug and dug[0] > roles.index("flank")
+
+
+def test_a_claw_that_is_landing_is_kept_though_the_walk_looks_short_again():
+    cells = _walled_ground()
+    solid = _solid(cells)
+    coordinator = HordeCoordinator()
+    survivor = [SurvivorTarget(1, _stand(130.5, 128.5, FLOOR))]
+    at_wall = _stand(118.5, 128.5, FLOOR)
+    roles = []
+    for tenth in range(300):
+        clawing = bool(roles) and roles[-1] == "tunnel"
+        roles.append(coordinator.plan(
+            [HordeMember(10, at_wall, working=clawing)], survivor, {}, tenth / 10.0,
+            solid=solid)[10].role)
+    first = roles.index("tunnel")
+    # Landed swings count as progress, which makes the walk look as short as
+    # before the stall; the order must not flap back to it.
+    assert set(roles[first:]) == {"tunnel"}

@@ -23,8 +23,8 @@ perception snapshot and assigns every infected bot one order:
               of what is about to fall, never stacked under it.
 ``climb``     nothing walks up and no cheap cut exists (a natural spire, a
               thick fortress): dig a staircase / take the climb skill.
-``flank``     the progress watchdog fired with nothing to claw: try the
-              target from another side.
+``flank``     the progress watchdog fired on a walker: try the target
+              from another side (a second alarm lets it claw or climb).
 
 Every choice is a comparison of estimated seconds (walking, from the
 survivor's approach flood; clawing, from the claw's cadence), corrected by
@@ -796,7 +796,10 @@ class HordeCoordinator:
         clawing = self._roles.get(member.player_id) == (target.player_id, "tunnel")
         # A lower bound needs no safety margin: the walk is no shorter.
         margin = 0.0 if at_least else CHOICE_MARGIN
-        if not (dig <= walk + CHOICE_MARGIN if clawing else dig + margin <= walk):
+        if clawing and member.working:
+            pass  # a claw that is landing is not given up for a walk that
+            # only looks short again because the claw counts as progress
+        elif not (dig <= walk + CHOICE_MARGIN if clawing else dig + margin <= walk):
             return None
         if not clawing:
             self.metrics.breach_choices += 1
@@ -876,7 +879,7 @@ class HordeCoordinator:
     def _escalate(self, order: HordeOrder, member: HordeMember,
                   target: SurvivorTarget, level: int,
                   solid: SolidFn | None) -> HordeOrder:
-        """A stalled bot digs first, then climbs, then tries another side."""
+        """A stalled walker tries another side, then digs, then climbs."""
 
         if level <= 0:
             return order
@@ -898,8 +901,12 @@ class HordeCoordinator:
         # own breach edges and detours are the better tool.
         near = _xy_distance(member.position, target.position) <= TUNNEL_RANGE
         position = tuple(float(v) for v in target.position)
+        # The first alarm sends a walker round another side: where clawing
+        # was the quicker way the estimate has already chosen it (_breach),
+        # and digging at every rise of rough ground holds a horde up (on
+        # MayanJungle it kept half of it fifteen blocks short of the prey).
         cells = (tunnel_cells(solid, member.position, target.position)
-                 if near and order.role != "tunnel" else ())
+                 if near and level >= 2 and order.role != "tunnel" else ())
         if cells and member.can_dig:
             return HordeOrder(order.zombie_id, order.target_id, "tunnel", position,
                               cells=cells, aim=cells[0], stuck_level=level)
