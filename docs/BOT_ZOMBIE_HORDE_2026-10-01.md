@@ -406,6 +406,23 @@ islet survivors infected after 52 s / 47 s. TDM kills a minute: Atlantis
 0.80 / 0.77 (15 seeds), DoubleDragon 2.15 / 2.30, CastleWars 3.00 / 2.60
 (5 seeds, within their spread).
 
+**A land route taken for a water detour.** Once the planner's queue stopped
+starving bots (plans arrive at once), the last zombie off SpookyMansion's
+islets took 45 to 55 s on two seeds of twenty, and one sea-ring seed took
+38 s. A crossing follows the live bearing and only finishes a planned
+detour when the bearing ran into something; the latch for that
+(`state.water_detour`) was set by whatever route moved the body at its first
+decision in the water branch. A body hopping off its islet is still over
+the bank then, where no bearing can be taken, so the route it had brought
+from land passed for a detour and was followed cell by cell round the
+shallows, orbiting swim waypoints until the progress window failed and the
+nearest-shore flow took it somewhere else. With the slow queue there was
+seldom a route in hand at that moment. The latch is now set only afloat
+(`_over_water`). SpookyMansion, seeds 0-19, all eight zombies on the
+mainland in every run before and after; last arrival, islets: median
+27.8 s, worst 54.5 s before, median 27.3 s, worst 34.0 s after; sea ring:
+median 9.0 s both, worst 38.5 s before, 13.5 s after.
+
 **Jump height, not done here.** The planner authors a jump for a two-block
 rise only, for every class (`simple_navigation._neighbors`,
 `-2 <= delta < -1`); the corridor search (`surface_corridor`,
