@@ -79,6 +79,25 @@ class MapAmbientSound:
     attenuation: float = 0.0
 
 
+@dataclass(frozen=True)
+class AchievementRegion:
+    """One stock ``ac_*`` row: the volume of a map-specific Steam achievement.
+
+    ``kind`` is ``ACH_KILL_REGION`` (kills made from inside the box) or
+    ``ACH_BLOCK_DESTROY_REGION`` (the structure inside it is razed); one
+    achievement may own several rows. ``bounds`` are absolute inclusive
+    ``(x0, x1, y0, y1, z0, z1)``. ``team`` is the team that can earn it,
+    ``None`` for either. server/achievements.py evaluates them.
+    """
+
+    api_name: str
+    kind: int
+    bounds: tuple[float, float, float, float, float, float]
+    team: int | None = None
+    kills: int = 0
+    weapon: int = 0
+
+
 @dataclass
 class MapMetadata:
     source: Path | None = None
@@ -160,6 +179,8 @@ class MapMetadata:
     display_name: str | None = None
     cap_limit: int | None = None
     time_limit: float | None = None
+    # Retail ``ac_*`` rows (DragonIsland, MayanJungle, SpookyMansion).
+    achievement_regions: list[AchievementRegion] = field(default_factory=list)
     # Which metadata key supplied each gameplay layout family for the active
     # mode ("spawn", "base", "neutral", "occupation", "diamond"); absent
     # families fall back to the modes' terrain inference.
@@ -767,6 +788,58 @@ def _append_legacy_team_zones(result: MapMetadata, payload: dict[str, object]) -
         result.base_min_destruction[team] = max(0, minimum)
 
 
+def _append_achievement_regions(
+    result: MapMetadata,
+    payload: dict[str, object],
+) -> None:
+    """Translate the stock parallel ``ac_*`` arrays.
+
+    ``ac_ids``/``ac_types``/``ac_centres``/``ac_w_h_d`` describe each volume;
+    ``ac_teams`` (0 = either, 1 = Blue, 2 = Green), ``ac_kills`` and
+    ``ac_weapons`` are optional and may be shorter. Malformed rows are
+    ignored independently.
+    """
+
+    ids = payload.get("ac_ids", ())
+    kinds = payload.get("ac_types", ())
+    centres = payload.get("ac_centres", ())
+    sizes = payload.get("ac_w_h_d", ())
+    if not all(isinstance(rows, (list, tuple)) for rows in (ids, kinds, centres, sizes)):
+        return
+
+    def optional(key: str, index: int) -> int:
+        rows = payload.get(key, ())
+        try:
+            return int(rows[index])
+        except (IndexError, KeyError, TypeError, ValueError):
+            return 0
+
+    for index, (api_name, kind, centre, size) in enumerate(
+        zip(ids, kinds, centres, sizes)
+    ):
+        center = _point3(centre)
+        extents = _centered_extents(size)
+        if not isinstance(api_name, str) or center is None or extents is None:
+            continue
+        try:
+            kind = int(kind)
+        except (TypeError, ValueError):
+            continue
+        x0, x1, y0, y1, z0, z1 = extents
+        result.achievement_regions.append(AchievementRegion(
+            api_name=api_name,
+            kind=kind,
+            bounds=(
+                center[0] + x0, center[0] + x1,
+                center[1] + y0, center[1] + y1,
+                center[2] + z0, center[2] + z1,
+            ),
+            team={1: TEAM1, 2: TEAM2}.get(optional("ac_teams", index)),
+            kills=max(0, optional("ac_kills", index)),
+            weapon=optional("ac_weapons", index),
+        ))
+
+
 def _append_legacy_neutral_zones(
     result: MapMetadata,
     payload: dict[str, object],
@@ -1139,6 +1212,7 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     _append_legacy_neutral_zones(result, payload)
     _append_legacy_occupation(result, payload)
     _append_legacy_diamond_zones(result, payload)
+    _append_achievement_regions(result, payload)
     for team, prefix in ((TEAM1, "team_one"), (TEAM2, "team_two")):
         if result.spawn_zones[team]:
             result.layout_sources[f"spawn{team}"] = f"{prefix}_spawn_area"

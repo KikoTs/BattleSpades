@@ -577,6 +577,16 @@ class DiamondMineMode(BaseMode):
             return
         self.carriers[int(player.id)] = diamond.serial
         history = self._diamond_history.setdefault(diamond.serial, (None, set()))
+        from server import achievements
+
+        achievements.diamond_picked_up(
+            self.server, player, diamond.serial,
+            # Only a diamond nobody carried yet is still "spawning": a drop
+            # re-places it with a fresh timestamp.
+            fresh_seconds=None if history[1] else time.time() - diamond.spawned_at,
+            found_by=history[0],
+            last_team=diamond.last_team,
+        )
         history[1].add(int(player.team))
         objective_guard.end_spawn_protection_for_objective(self.server, player)
         self._remove_ground_diamond(diamond.entity_id)
@@ -674,6 +684,11 @@ class DiamondMineMode(BaseMode):
             record_profile_total(player, C.DIA_STEAL_TOTAL)
         if uncovered_by is player:
             record_profile_total(player, C.DIA_FINDANDCASHIN_TOTAL)
+        from server import achievements
+
+        achievements.diamond_cashed_in(
+            self.server, player, serial, uncovered_by is player
+        )
 
     def _loose_dropoff(self, diamond: GroundDiamond) -> DiamondDropoff | None:
         """The open drop-off a resting diamond lies in, for its last team."""

@@ -238,6 +238,7 @@ class SimulationRuntime:
             self._measure_sync("goo", goo_controller.update)
         self._guard_sync("second_schedulers", self._update_second_schedulers)
         self._guard_sync("conduct", self._tick_conduct)
+        self._guard_sync("achievements", self._tick_achievements)
 
         tick_ms = (time.perf_counter() - tick_start) * 1000.0
         self._guard_sync("metrics", lambda: server.metrics.record_tick(tick_ms))
@@ -357,6 +358,13 @@ class SimulationRuntime:
         from server import conduct
 
         conduct.tick(server, 1.0)
+
+    def _tick_achievements(self) -> None:
+        """Timed achievement progress (distance, air time) and its batched save."""
+
+        from server import achievements
+
+        achievements.tick(self.server, self.server.tick_interval)
 
     def _record_health(self, tick_ms: float) -> None:
         server = self.server

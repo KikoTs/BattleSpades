@@ -755,6 +755,16 @@ class RevivalMasterService:
             self._round_completed = True
         if not players:
             return
+        from server import achievements
+
+        for result in players:
+            unlocked = achievements.take_unreported(
+                self.server, "aosplay:" + str(result["steamid"])
+            )
+            if unlocked:
+                # Optional: absent when nothing new was unlocked, and a
+                # master that predates the field ignores it.
+                result["achievements"] = list(unlocked)
         event_id = "round_%s" % uuid4().hex
         ended_at = datetime.now(timezone.utc)
         duration = max(0, int((ended_at - self._round_started_at).total_seconds()))

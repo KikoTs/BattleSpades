@@ -2156,6 +2156,10 @@ class Player:
         record_damage_taken(
             server, self, source, health_before - self.health, int(kill_type)
         )
+        from server import achievements
+        achievements.damaged(
+            server, self, source, health_before - self.health, int(kill_type)
+        )
         conduct.record_team_harm(
             server,
             self,
@@ -2299,6 +2303,10 @@ class Player:
 
         server = self.connection.server if self.connection else None
         mode = getattr(server, "mode", None)
+        # Achievements judge the weapon that killed, not the mode's
+        # presentation type below; and the jetpack before death clears it.
+        weapon_kill_type = int(kill_type)
+        was_jetpacking = bool(getattr(self, "jetpack_active", False))
         death_kill_type = getattr(mode, "death_kill_type_for", None)
         if callable(death_kill_type):
             # Some native modes use a dedicated death transition. VIP_MODE_KILL
@@ -2389,6 +2397,8 @@ class Player:
         record_death(
             server, self, killer, int(kill_type), domination=is_domination
         )
+        from server import achievements
+        achievements.died(server, self, killer, weapon_kill_type, was_jetpacking)
 
         if server is not None:
             from shared.packet import KillAction

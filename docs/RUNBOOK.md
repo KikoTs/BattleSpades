@@ -987,7 +987,10 @@ disposable diagnostic output. New routine reports should use `tmp/`.
 Keep maps, prefabs, `tests/fixtures/`, authored UGC projects, and native modules
 needed to run the source checkout. Preserve `state/round-results.sqlite3` and
 any configured hosted-result mirror across upgrades; they can contain unsent
-match results. Old release directories may hold their own state databases.
+match results. Preserve `state/achievements.sqlite3` too: it is the only copy
+of every player's achievement progress on that server
+([ACHIEVEMENTS.md](ACHIEVEMENTS.md)). Old release directories may hold their
+own state databases.
 
 The standard packaging commands are:
 
@@ -1033,8 +1036,9 @@ replacement:
 | Bans (`[admin] bans_path`) | `/data/bans.json` (always) |
 | Pending AoSPlay round results (`[revival] results_path`) | `/data/state/round-results.sqlite3` |
 | Anti-cheat suspicion report (`[anticheat] report_path`) | `/data/logs/anticheat.jsonl` |
+| Achievement progress (`[achievements] path`) | `/data/state/achievements.sqlite3` |
 
-A relative `results_path` or `report_path` in the template is rebased below
+A relative `results_path`, `report_path` or achievements `path` in the template is rebased below
 `/data` (keeping its layout); an absolute path in a custom
 `BATTLESPADES_CONFIG_TEMPLATE` is kept as written, so point it at the volume
 yourself. Outside Docker nothing changes: relative paths stay anchored to the

@@ -75,10 +75,11 @@ Keys the parser consumes (all modes unless stated):
 | **zom only** `zombie_spawn_area`, `survivor_spawn_area` | Zombie (TEAM1) and survivor (TEAM2) spawns. The retail zombie boxes cover only the z=239 sea ring (zombies rise from the water), which the world manager never spawns on, so the default Blue box follows them as the dry complement. |
 | `name`, `cap_limit`, `time_limit` | Kept as `display_name`, `cap_limit`, `time_limit` (DragonIsland: 100 / 480 s); not yet consumed by modes. |
 | `ugc_entities` | Map Creator placements (per-mode rows). |
+| `ac_ids`, `ac_types`, `ac_centres`, `ac_w_h_d`, `ac_teams`, `ac_kills`, `ac_weapons` | Per-map Steam achievement volumes, kept as `MapMetadata.achievement_regions` and evaluated by `server/achievements.py` on stock maps. Recovered for DragonIsland, MayanJungle and SpookyMansion only; see [ACHIEVEMENTS.md](ACHIEVEMENTS.md#map-volumes-ac_). |
 
-Retail keys kept in the JSON but not consumed: `ac_*` (per-map Steam
-achievement volumes), `screenshot_camera_*`, `author`, `description`,
-`version`, `is_world_war_map`.
+Retail keys kept in the JSON but not consumed: `ac_debug`,
+`screenshot_camera_*`, `author`, `description`, `version`,
+`is_world_war_map`.
 
 `maps/retail_map_info.json` feeds `MapMetadata.retail_modes`,
 `retail_playlist_modes` and `retail_max_players`. `retail_playlist_modes`
