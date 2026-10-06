@@ -600,6 +600,8 @@ class _MotorProbe:
         self.fall_hits = 0
         self.fall_damage = 0
         self.fall_deaths = 0
+        self.ticks = 0
+        self.queue_ticks = 0
         self._last: dict[int, tuple[float, float, float]] = {}
         self._originals = None
 
@@ -614,6 +616,9 @@ class _MotorProbe:
             player = runtime.player
             if int(getattr(player, "team", -1)) == probe.team:
                 here = (float(player.x), float(player.y), time.monotonic())
+                probe.ticks += 1
+                role = str(getattr(runtime.intent, "debug_role", ""))
+                probe.queue_ticks += int(role.endswith((":breach_assist_queue", ":breach_yield")))
                 before = probe._last.get(int(player.id))
                 probe._last[int(player.id)] = here
                 if any(values[:4]):
@@ -655,6 +660,7 @@ class _MotorProbe:
         return {
             "motor_sprint_share": round(self.sprint_ticks / max(1, self.move_ticks), 3),
             "travel_speed": round(self.blocks / max(1e-9, self.seconds), 2),
+            "breach_queue_share": round(self.queue_ticks / max(1, self.ticks), 4),
             "fall_hits": self.fall_hits,
             "fall_damage": self.fall_damage,
             "fall_deaths": self.fall_deaths,
