@@ -37,6 +37,10 @@ _DEFENSIVE_SCHEMATICS = ("sandbag_wall", "cover_wall", "corner_cover", "pillbox"
 _OBJECTIVE_SCHEMATICS = ("objective_ring", "sandbag_wall", "cover_wall")
 _SNIPER_SCHEMATICS = ("sniper_nest", "watchtower")
 _GENERIC_SCHEMATICS = ("cover_wall", "sandbag_wall", "small_hut", "corner_cover")
+# Personal recovery and first aid: the tasks a bot with a mode job may still run.
+_ERRANDS = frozenset({"heal", "resupply", "seek_medic"})
+# Crate type -> what it refills, as positions in CooperativeBehavior._supplies.
+_CRATE_GIVES = {int(C.HEALTH_CRATE): (0,), int(C.BLOCK_CRATE): (1,), int(C.AMMO_CRATE): (2, 3)}
 
 
 def identity(player: PlayerSnapshot) -> Identity:
@@ -113,6 +117,7 @@ class _Life:
     partner_heading: tuple[float, float] = (1.0, 0.0)
     partner_holding: bool = False
     climb_order: TacticalOrder | None = None
+    errand_order: TacticalOrder | None = None
 
 
 class CooperativeBehavior:
@@ -172,8 +177,16 @@ class CooperativeBehavior:
             if (order is not None and not player.wade and life.task is not None
                     and life.task.kind == "schematic" and life.task.task_id == order.task_id):
                 return order
+            # The walk to a crate or a medic likewise: handed back on every
+            # hop, the mode goal turned the bot round at each step up.
+            order = life.errand_order
+            if (order is not None and not player.wade and visible is None
+                    and life.task is not None and life.task.task_id == order.task_id
+                    and now < life.task.expires_at):
+                return order
             return None
         life.climb_order = None
+        life.errand_order = None
         allies = tuple(p for p in frame.players if p.alive and p.spawned and p.team == player.team)
         # Role urgency is not permission for optional construction/formation
         # to replace the mode's actual winning job.
@@ -189,8 +202,13 @@ class CooperativeBehavior:
         defending = bool(life.task and life.task.kind in {"outpost", "cover", "strongpoint"}
             and life.task.phase == "occupy" and life.task.stage is TaskStage.USE
             and life.task.site and math.dist(player.position, life.task.site.approach) <= 1.5)
+        # With nothing left to fire, the ammunition it is walking to is the
+        # only useful answer to an enemy in view.
+        fetching_ammo = bool(life.task and life.task.kind == "resupply"
+                             and self._ammunition(player) <= 0)
         combat_interrupt = (combat_visible is not None and life.task is not None
-                            and life.task.kind != "heal" and not defending)
+                            and life.task.kind != "heal" and not defending
+                            and not fetching_ammo)
         # Schematic construction that serves the mode (a VIP shelter, a
         # requested zombie stair, a ring at an objective a defender already
         # holds) may run under a committed role; see _schematic_allowed.
@@ -198,7 +216,7 @@ class CooperativeBehavior:
         objective_support = bool(critical and life.task and (
             life.task.kind == "schematic" and (building_ok or life.task.pending is not None
                                                or self._site_finished(life.task))
-            or strategic is not None and self._supports_objective(life.task, player, strategic, now)))
+            or strategic is not None and self._errand_continues(life.task, strategic, now)))
         if (life.task and life.task.kind == "schematic" and life.task.pending is None
                 and player.last_damage_at > 0 and 0 <= now - player.last_damage_at <= 1.0):
             # Taking hits while building: stop and fight; repeated hits on the
@@ -208,7 +226,8 @@ class CooperativeBehavior:
                 self.sites.under_fire(site, now)
             self._finish(life, now, False, "under_fire")
             life.next_project = now + 6.0
-        if life.task and (critical and not objective_support or danger and life.task.kind != "heal"
+        if life.task and (critical and not objective_support
+                          or danger and life.task.kind != "heal" and not fetching_ammo
                           or combat_interrupt or self._live_hazard(frame, player)):
             self._finish(life, now, False, "combat_contact" if combat_interrupt else "urgent_interrupt")
         if (life.task and life.task.kind in {"outpost", "cover", "strongpoint", "sabotage"}
@@ -242,19 +261,28 @@ class CooperativeBehavior:
                     # Nothing feasible here: site searches plan geometry, so
                     # back off instead of re-planning every decision.
                     life.next_project = now + 4.0
+            medic = (int(C.MEDPACK_TOOL) in player.loadout
+                     and dict(player.deployable_stock).get(int(C.MEDPACK_TOOL), 0) > 0)
             if (strategic is not None and self._can_stop_for_supplies(strategic)
                     and combat_visible is None and now >= life.next_evaluate
                     and not self._live_hazard(frame, player)
-                    and (player.health < 55 or self._ammunition(player) == 0)):
+                    and (player.health < 55 or self._ammunition(player) == 0 or medic)):
                 life.next_evaluate = now + .75
-                # Only urgent personal supplies, close to the objective route,
-                # can borrow up to four seconds. No patient/partner chasing.
-                support = self._medical_task(frame, player, (player,), life)
+                # A hurt or dry bot is no use to its objective. It may leave
+                # the job for a crate or a medic that is close for how badly
+                # off it is; a medic may leave it for a patient beside it.
+                # A carrier only takes what lies on its way.
+                carrying = player.carried_entity_id >= 0
+                support = self._medical_task(
+                    frame, player, (player,) if carrying or not medic else allies, life,
+                    reach=14.0)
                 if support is None:
-                    support = self._supply_task(frame, player, life)
+                    support = self._recovery_task(frame, player, life, allies)
                 if support is not None:
-                    if self._supports_objective(support, player, strategic, now):
-                        support.expires_at = min(support.expires_at, now + 4)
+                    if self._errand_worth_it(support, player, strategic):
+                        if not self._errand_urgent(support, player):
+                            # A stop on the way borrows four seconds, no more.
+                            support.expires_at = min(support.expires_at, now + 4)
                         life.task = support
                         self.teams.event("tasks_started", support.task_id, support.kind, now)
                         return self._advance(frame, player, combat_visible, life, allies)
@@ -281,6 +309,14 @@ class CooperativeBehavior:
         # Heal a nearby patient or fight from already occupied cover, but do
         # not start optional construction/approach work instead of fighting.
         if combat_visible is not None or self._live_hazard(frame, player):
+            if (life.task is None and self._ammunition(player) <= 0
+                    and not self._live_hazard(frame, player)):
+                # An empty gun wins no fight: go and fill it.
+                supply = self._supply_task(frame, player, life)
+                if supply is not None:
+                    life.task = supply
+                    self.teams.event("tasks_started", supply.task_id, supply.kind, now)
+                    return self._advance(frame, player, combat_visible, life, allies)
             return None
         contact = life.memory.contact(player.position, now)
         lane = visible.eye if visible else contact.position if contact else (
@@ -293,7 +329,7 @@ class CooperativeBehavior:
         candidates: list[_Task] = []
         task_id = frame.frame_id * 256 + player.player_id
         if combat_visible is None:
-            supply = self._supply_task(frame, player, life)
+            supply = self._recovery_task(frame, player, life, allies)
             if supply is not None:
                 candidates.append(supply)
             sabotage = self._sabotage_task(frame, player, life, allies)
@@ -420,15 +456,42 @@ class CooperativeBehavior:
         }
 
     @staticmethod
-    def _supports_objective(task: _Task, player: PlayerSnapshot,
-                            strategic: ModeBotDecision, now: float) -> bool:
-        """Permit only short, nearby survival stops, never an objective detour."""
-        if task.kind not in {"heal", "resupply"} or now - task.started_at >= 4:
+    def _errand_worth_it(task: _Task, player: PlayerSnapshot,
+                         strategic: ModeBotDecision) -> bool:
+        """May a bot with a mode job leave it for this crate, pack or patient?
+
+        A bot under 40 health or with nothing left to fire is no use to its
+        objective and goes up to 28 blocks, a long way round included; so
+        does a medic for the teammate beside it. A carrier, and a bot that is
+        merely scratched, take only what lies on their route.
+        """
+        if task.kind not in _ERRANDS or not CooperativeBehavior._can_stop_for_supplies(strategic):
             return False
         distance = math.dist(player.position, task.goal)
         detour = distance + math.dist(task.goal, strategic.position) - math.dist(
             player.position, strategic.position)
-        return (distance <= 6 and detour <= 3
+        if not CooperativeBehavior._errand_urgent(task, player):
+            return distance <= 6 and detour <= 3
+        if task.kind == "heal" and task.patient != identity(player):
+            return distance <= 14
+        return distance <= 28 and detour <= 36
+
+    @staticmethod
+    def _errand_urgent(task: _Task, player: PlayerSnapshot) -> bool:
+        if player.carried_entity_id >= 0:
+            return False
+        if task.kind == "heal" and task.patient != identity(player):
+            return True  # first aid is the medic's job, whatever its own state
+        return player.health < 40 or CooperativeBehavior._ammunition(player) == 0
+
+    @staticmethod
+    def _errand_continues(task: _Task, strategic: ModeBotDecision, now: float) -> bool:
+        """An errand once begun is finished, until its own deadline.
+
+        Testing its distance again on every decision dropped it whenever the
+        objective moved, and picked it up again the decision after.
+        """
+        return (task.kind in _ERRANDS and now < task.expires_at
                 and CooperativeBehavior._can_stop_for_supplies(strategic))
 
     @staticmethod
@@ -449,12 +512,13 @@ class CooperativeBehavior:
         return math.dist(player.eye, visible.eye) <= effective_range
 
     def _medical_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
-                      allies: tuple[PlayerSnapshot, ...], life: _Life) -> _Task | None:
+                      allies: tuple[PlayerSnapshot, ...], life: _Life, *,
+                      reach: float = 24.0) -> _Task | None:
         now = frame.created_at
         packs = [e for e in frame.entities if e.alive and e.tool_id == int(C.MEDPACK_TOOL)
                  and e.team == player.team and e.uses_remaining != 0]
         patients = sorted((p for p in allies if p.health < 80
-            and math.dist(player.position, p.position) <= 24),
+            and math.dist(player.position, p.position) <= reach),
             key=lambda p: (p.health + math.dist(player.position, p.position) * 2, p.player_id))
         for patient in patients[:4]:
             claim = self.patients.get(identity(patient))
@@ -485,30 +549,86 @@ class CooperativeBehavior:
         return (player.health, player.blocks, player.ammo_clip + player.ammo_reserve,
                 sum(count for _, count in player.deployable_stock))
 
-    def _supply_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
-                     life: _Life) -> _Task | None:
-        desired = set()
+    def _supply_reach(self, player: PlayerSnapshot) -> dict[int, float]:
+        """Crate type -> how far this bot goes for one, by how badly it needs it."""
+        reach: dict[int, float] = {}
         if player.health < 55:
-            desired.add(int(C.HEALTH_CRATE))
+            # 24 blocks for a scratch, 48 on its last quarter.
+            reach[int(C.HEALTH_CRATE)] = 24.0 + (55 - max(0, player.health)) * .8
+        ammunition = self._ammunition(player)
         depleted_medical = (int(C.MEDPACK_TOOL) in player.loadout
             and dict(player.deployable_stock).get(int(C.MEDPACK_TOOL), 0) <= 0)
+        if ammunition <= 0:
+            reach[int(C.AMMO_CRATE)] = 64.0  # nothing left to fire: worth a walk
+        elif ammunition < 6 or depleted_medical:
+            reach[int(C.AMMO_CRATE)] = 28.0
         if player.blocks < 12:
-            desired.add(int(C.BLOCK_CRATE))
-        if self._ammunition(player) < 6 or depleted_medical:
-            desired.add(int(C.AMMO_CRATE))
-        sources = sorted((entity for entity in frame.entities[:96]
-            if entity.alive and entity.entity_type in desired
-            and math.dist(player.position, entity.position) < 32
-            and life.memory.penalty("resupply", entity.position, frame.created_at) < .7),
-            key=lambda entity: math.dist(player.position, entity.position))
-        for entity in sources[:3]:
-            if not self.world.has_line_of_sight(player.eye, entity.position):
+            reach[int(C.BLOCK_CRATE)] = 20.0
+        return reach
+
+    def _supply_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                     life: _Life) -> _Task | None:
+        """Walk to the crate this bot needs most for its distance.
+
+        Crates lie where the map puts them and show on every player's map, so
+        one behind a wall is as well known as one in view. (The old test was a
+        sight line to the crate's foot, which the ground itself cut half the
+        time at fourteen blocks.)
+        """
+        reach = self._supply_reach(player)
+        now = frame.created_at
+        best = None
+        for entity in frame.entities[:96]:
+            limit = reach.get(entity.entity_type)
+            if limit is None or not entity.alive:
                 continue
-            return _Task(frame.frame_id * 256 + player.player_id, "resupply",
-                entity.position, entity.position, frame.created_at, frame.created_at + 12,
-                .88, progress_at=frame.created_at, source_entity_id=entity.entity_id,
-                starting_supplies=self._supplies(player))
-        return None
+            distance = math.dist(player.position, entity.position)
+            if distance > limit or life.memory.penalty("resupply", entity.position, now) >= .7:
+                continue
+            if best is None or distance / limit < best[0]:
+                best = (distance / limit, distance, entity)
+        if best is None:
+            return None
+        _, distance, entity = best
+        urgent = player.health < 40 or self._ammunition(player) <= 0
+        return _Task(frame.frame_id * 256 + player.player_id, "resupply",
+            entity.position, entity.position, now, now + 8 + distance / 3,
+            .97 if urgent else .88, progress_at=now, source_entity_id=entity.entity_id,
+            starting_supplies=self._supplies(player))
+
+    def _seek_medic_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                         life: _Life, allies: tuple[PlayerSnapshot, ...]) -> _Task | None:
+        """A hurt bot walks to a teammate who still has a medpack to give."""
+        now = frame.created_at
+        medpack = int(C.MEDPACK_TOOL)
+        if player.health >= 55 or medpack in player.loadout:
+            return None
+        limit = 24.0 + (55 - max(0, player.health)) * .8
+        medics = [p for p in allies if p.player_id != player.player_id
+                  and medpack in p.loadout and dict(p.deployable_stock).get(medpack, 0) > 0
+                  and math.dist(player.position, p.position) <= limit
+                  and life.memory.penalty("seek_medic", p.position, now) < .7]
+        medic = min(medics, key=lambda p: (math.dist(player.position, p.position), p.player_id),
+                    default=None)
+        if medic is None:
+            return None
+        distance = math.dist(player.position, medic.position)
+        return _Task(frame.frame_id * 256 + player.player_id, "seek_medic", medic.position,
+            medic.position, now, now + 8 + distance / 3, .97 if player.health < 40 else .88,
+            patient=identity(medic), patient_health=player.health, progress_at=now)
+
+    def _recovery_task(self, frame: PerceptionFrame, player: PlayerSnapshot, life: _Life,
+                       allies: tuple[PlayerSnapshot, ...]) -> _Task | None:
+        """The crate or the medic, whichever is nearer."""
+        supply = self._supply_task(frame, player, life)
+        medic = self._seek_medic_task(frame, player, life, allies)
+        if supply is None or medic is None:
+            return supply or medic
+        wants_health = any(e.entity_id == supply.source_entity_id
+                           and e.entity_type == int(C.HEALTH_CRATE) for e in frame.entities[:96])
+        nearer_medic = (math.dist(player.position, medic.goal)
+                        < math.dist(player.position, supply.goal))
+        return medic if wants_health and nearer_medic else supply
 
     def _sabotage_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
                        life: _Life, allies: tuple[PlayerSnapshot, ...]) -> _Task | None:
@@ -540,6 +660,17 @@ class CooperativeBehavior:
     def _advance(self, frame: PerceptionFrame, player: PlayerSnapshot,
                  visible: PlayerSnapshot | None, life: _Life,
                  allies: tuple[PlayerSnapshot, ...]) -> TacticalOrder | None:
+        order = self._advance_task(frame, player, visible, life, allies)
+        task = life.task
+        # Only the plain walk of an errand outlives a hop; see decide.
+        life.errand_order = order if (
+            order is not None and task is not None and task.kind in _ERRANDS
+            and not order.hold and order.action.kind is BotActionKind.NONE) else None
+        return order
+
+    def _advance_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                      visible: PlayerSnapshot | None, life: _Life,
+                      allies: tuple[PlayerSnapshot, ...]) -> TacticalOrder | None:
         task = life.task
         assert task is not None
         now = frame.created_at
@@ -651,13 +782,59 @@ class CooperativeBehavior:
                 return None
             return self._move(task, task.goal, "investigate_sound", 3)
         if task.kind == "resupply":
-            if any(after > before for after, before in zip(self._supplies(player), task.starting_supplies)):
+            source = next((e for e in frame.entities
+                           if e.entity_id == task.source_entity_id and e.alive), None)
+            gained = [after > before for after, before
+                      in zip(self._supplies(player), task.starting_supplies)]
+            # Judged by what this crate gives: a block dug out of the way on
+            # the walk to a health crate is not what the bot came for.
+            gives = _CRATE_GIVES.get(source.entity_type, ()) if source is not None else ()
+            if any(gained[index] for index in gives) if gives else any(gained):
                 self._finish(life, now, True, "supplies_restored")
                 return None
-            if not any(e.entity_id == task.source_entity_id and e.alive for e in frame.entities):
+            if source is None:
                 self._finish(life, now, False, "supply_unavailable")
                 return None
+            distance = math.dist(player.position, task.goal)
+            if distance < task.best_distance - .5:
+                task.best_distance, task.progress_at = distance, now
+            if now - task.progress_at > 6:
+                # No way to it from here. Remembered, so the next evaluation
+                # does not send the bot straight back at the same wall.
+                self._finish(life, now, False, "supply_unreachable")
+                return None
             return self._move(task, task.goal, "resupply", 1)
+        if task.kind == "seek_medic":
+            medic = next((p for p in allies if identity(p) == task.patient), None)
+            if player.health > task.patient_health:
+                self._finish(life, now, True, "patient_healed")
+                return None
+            pack = next((e for e in frame.entities if e.alive and e.tool_id == int(C.MEDPACK_TOOL)
+                         and e.team == player.team and e.uses_remaining != 0
+                         and math.dist(e.position, player.position) < 8), None)
+            if pack is not None:
+                # The pack is down: this is now the ordinary walk onto it.
+                task.kind, task.phase = "heal", "use_pack"
+                task.goal = task.lane = pack.position
+                task.patient = identity(player)
+                self.patients[task.patient] = (life.key, now + 3)
+                return TacticalOrder(task.task_id, "use_medpack", task.goal, task.lane,
+                                     arrival_radius=1)
+            if medic is None or dict(medic.deployable_stock).get(int(C.MEDPACK_TOOL), 0) <= 0:
+                self._finish(life, now, False, "medic_unavailable")
+                return None
+            distance = math.dist(player.position, medic.position)
+            if distance < task.best_distance - .5:
+                task.best_distance, task.progress_at = distance, now
+            if distance <= 3.5:
+                task.progress_at = now
+                return TacticalOrder(task.task_id, "await_medic", player.position, medic.eye,
+                                     hold=True)
+            if now - task.progress_at > 6:
+                self._finish(life, now, False, "medic_unreachable")
+                return None
+            task.goal = medic.position
+            return self._move(task, medic.position, "seek_medic", 2.5)
         if task.kind == "sabotage":
             target = next((e for e in frame.entities if e.entity_id == task.source_entity_id
                            and e.alive and e.team != player.team), None)
