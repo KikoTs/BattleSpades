@@ -2046,7 +2046,20 @@ class BotDirector:
             from .zombie_siege import ZombieSiegeService
 
             service = self._zombie_siege = ZombieSiegeService()
-        return service.objectives(mode, self.server.world_manager)
+        now = time.monotonic()
+
+        def working(player_id: int) -> bool:
+            # A claw swing that landed in the last moments: digging through
+            # something is work, which the stall watchdog must not punish.
+            runtime = self._runtime.get(int(player_id))
+            return bool(
+                runtime is not None
+                and runtime.feedback_action_kind == BotActionKind.MELEE.value
+                and runtime.feedback_action_accepted
+                and now - float(runtime.feedback_action_at) <= 1.5
+            )
+
+        return service.objectives(mode, self.server.world_manager, working=working)
 
     def _objectives_zombie_refuge(self, mode) -> list[ObjectiveSnapshot]:
         refuge = self._zombie_refuge_objective(mode)
