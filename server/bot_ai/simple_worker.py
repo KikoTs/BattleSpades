@@ -3047,6 +3047,11 @@ class SimpleBotBrain:
                 # unchanged walking corridor or spend another planning grant.
                 state.route_topology_version = int(frame.topology_version)
                 topology_changed = False
+                # Nor is a local query coming for the map-wide search to wait
+                # on. While blocks changed anywhere each decision, it kept
+                # yielding to one and took eight seconds over one second's
+                # work, with the body pacing its pocket meanwhile.
+                state.corridor_yield_local = False
         if (topology_changed and state.route_index < len(state.route)
                 and state.route[state.route_index].affordance in {
                     MovementAffordance.WALK, MovementAffordance.CROUCH}
