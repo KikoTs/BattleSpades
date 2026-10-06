@@ -394,6 +394,31 @@ class RevivalMasterConfig:
 
 
 @dataclass
+class SteamHostConfig:
+    """Steam relay hosting: players join through Steam instead of the IP.
+
+    Runs ``battlespades-steam-host`` beside the server (server/steam_host.py).
+    For players whose provider blocks the server's address. Also enabled by
+    ``AOS_STEAM_HOST=1``.
+    """
+
+    enabled: bool = False
+    #: Blank finds ``steam-host/battlespades-steam-host`` beside the server.
+    executable: str = ""
+    #: One helper per Steam application: Ace of Spades owners (224540) and
+    #: everyone else, who attach as Spacewar (480).
+    app_ids: list = field(default_factory=lambda: [224540, 480])
+    #: Game server login token for 224540 (steamcommunity.com/dev/managegameservers).
+    #: Keeps the SteamID across restarts; blank logs on anonymously.
+    #: Also ``AOS_STEAM_GSLT_FILE``. The file holds the token on one line.
+    token_file: str = ""
+    #: Linux: directory with Valve's steamclient.so (from SteamCMD).
+    #: Also ``AOS_STEAM_RUNTIME_DIR``.
+    runtime_dir: str = ""
+    max_clients: int = 64
+
+
+@dataclass
 class ServerConfig:
     """Server configuration container."""
 
@@ -676,6 +701,10 @@ class ServerConfig:
     conduct: ConductConfig = field(default_factory=ConductConfig)
     steam: SteamMasterConfig = field(default_factory=SteamMasterConfig)
     revival: RevivalMasterConfig = field(default_factory=RevivalMasterConfig)
+    steam_host: SteamHostConfig = field(default_factory=SteamHostConfig)
+    #: Runtime state, not configuration: ``sdr=<SteamID>`` tags of the relay
+    #: hosts that are logged on, appended to the Steam game tags.
+    steam_relay_tags: tuple = ()
 
     # Map-entity (crate/intel) wire emission. The Entity byte layout was
     # RE-verified against the compiled client (shared/packet.pyx Entity.read/
@@ -1540,6 +1569,25 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 )
         if config.steam.secure and not config.steam.public:
             raise ValueError("steam.secure requires steam.public")
+
+    if "steam_host" in data:
+        steam_host = data["steam_host"]
+        if not isinstance(steam_host, dict):
+            raise ValueError("steam_host must be a TOML table")
+        config.steam_host.enabled = bool(steam_host.get("enabled", config.steam_host.enabled))
+        config.steam_host.executable = str(steam_host.get("executable", config.steam_host.executable)).strip()
+        config.steam_host.token_file = str(steam_host.get("token_file", config.steam_host.token_file)).strip()
+        config.steam_host.runtime_dir = str(steam_host.get("runtime_dir", config.steam_host.runtime_dir)).strip()
+        app_ids = steam_host.get("app_ids", config.steam_host.app_ids)
+        if (
+            not isinstance(app_ids, list)
+            or not app_ids
+            or len(app_ids) > 4
+            or any(isinstance(app, bool) or not isinstance(app, int) or app <= 0 for app in app_ids)
+        ):
+            raise ValueError("steam_host.app_ids must list one to four Steam application ids")
+        config.steam_host.app_ids = [int(app) for app in app_ids]
+        config.steam_host.max_clients = min(256, max(1, int(steam_host.get("max_clients", config.steam_host.max_clients))))
 
     if "revival" in data:
         revival = data["revival"]

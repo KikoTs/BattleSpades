@@ -452,24 +452,33 @@ class RevivalMasterService:
         import os
         import time
 
+        # Relay hosts (server/steam_host.py): the SteamIDs players dial to
+        # join through Steam, one per Steam application.
+        registration: dict = {}
+        hosts = getattr(getattr(self.server, "steam_host", None), "host_ids", lambda: {})()
+        if hosts.get(224540):
+            registration["steam_host_id"] = str(hosts[224540])
+        if hosts.get(480):
+            registration["steam_host_id_480"] = str(hosts[480])
+
         path = str(getattr(self.config, "steam_sidecar_status", "") or "").strip()
         path = path or os.environ.get("AOS_STEAM_SIDECAR_STATUS", "").strip()
         if not path:
-            return {}
+            return registration
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 status = json.load(handle)
             age = time.time() - float(status.get("updated", 0.0))
             steam_id = int(status.get("steam_id") or 0)
             if not status.get("logged_on") or steam_id <= 0 or not 0.0 <= age <= self.STEAM_STATUS_MAX_AGE_SECONDS:
-                return {}
-            registration = {"steam_server_id": str(steam_id)}
+                return registration
+            registration["steam_server_id"] = str(steam_id)
             game_port = int(status.get("game_port") or 0)
             if 0 < game_port < 65536:
                 registration["steam_game_port"] = game_port
             return registration
         except (OSError, ValueError, TypeError, AttributeError):
-            return {}
+            return registration
 
     async def publish_heartbeat(self) -> None:
         heartbeat = self.heartbeat_payload()
