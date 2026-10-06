@@ -449,7 +449,10 @@ class SimpleVoxelWorld:
             return min(candidates)[1] if candidates else None
 
         source = endpoint(start, 1, 1.5)
-        target = endpoint(goal, 6, 12.0)
+        named = self.goal_surface(goal)
+        # A goal inside a wall or over open water has no floor of its own.
+        target = (named.y * MAP_SIZE + named.x + named.support_z * MAP_SIZE * MAP_SIZE
+                  if named is not None else endpoint(goal, 6, 12.0))
         if source is None or target is None:
             return None
         blocked = frozenset(
@@ -466,7 +469,8 @@ class SimpleVoxelWorld:
         search = SurfaceCorridorSearch(bytes(supports), MAP_SIZE, MAP_SIZE,
                                        source % area, target % area, blocked,
                                        surface_at=layer_at, start_height=source // area,
-                                       target_height=target // area)
+                                       target_height=target // area,
+                                       layers_of=self.standable_supports)
         return (_BudgetedCorridorSearch(self, search)
                 if self.planning_budget is not None else search)
 
@@ -569,6 +573,52 @@ class SimpleVoxelWorld:
             ):
                 return SurfaceNode(x, y, support_z)
         return None
+
+    def standable_supports(self, x: int, y: int, *, allow_water: bool = False) -> tuple[int, ...]:
+        """Every body-clear support of one column, highest first."""
+
+        x, y = int(x), int(y)
+        if not 0 <= x < MAP_SIZE or not 0 <= y < MAP_SIZE or self._vxl is None:
+            return ()
+        limit = MAP_HEIGHT if allow_water else WATER_SUPPORT_Z
+        reader = getattr(self._vxl, "column_mask", None)
+        if not callable(reader):
+            return tuple(z for z in range(2, limit) if self.solid(x, y, z)
+                         and not self.solid(x, y, z - 1) and not self.solid(x, y, z - 2))
+        mask = int(reader(x, y))
+        exposed = mask & ~(mask << 1) & ~(mask << 2) & ((1 << limit) - 1) & ~0b11
+        supports = []
+        while exposed:
+            lowest = exposed & -exposed
+            supports.append(lowest.bit_length() - 1)
+            exposed ^= lowest
+        return tuple(supports)
+
+    def goal_surface(self, goal: Vector3, *, allow_water: bool = False) -> SurfaceNode | None:
+        """The floor a goal point names: where a body stands to be there.
+
+        Goals arrive in two conventions. A base anchor or a post is a player
+        position, 2.25 above its floor; a bomb or an intel is an entity
+        position, on its floor. Both lie inside the body of someone standing
+        on the right floor, so that floor is the one in the goal's own column
+        whose standing body is nearest the point. Rounding an entity's height
+        as if it were an eye picked a ledge three blocks under BlockNess's
+        tower top, in the next column, that nothing leads to.
+
+        A height with no floor near it (a post that copied its base's height,
+        a zone centre in mid-air) still names its column: the nearest floor
+        there is where the bot can be.
+        """
+
+        x, y = int(math.floor(goal[0])), int(math.floor(goal[1]))
+        height = float(goal[2])
+        best: tuple[float, int] | None = None
+        for support in self.standable_supports(x, y, allow_water=allow_water):
+            # Distance from the point to the span between eye and feet.
+            gap = max(0.0, support - PLAYER_SUPPORT_OFFSET - height, height - support)
+            if best is None or gap < best[0]:
+                best = (gap, support)
+        return SurfaceNode(x, y, best[1]) if best is not None else None
 
     def plan(
         self,
@@ -710,12 +760,12 @@ class SimpleVoxelWorld:
             target_x == int(math.floor(goal[0]))
             and target_y == int(math.floor(goal[1]))
         )
-        target_surface = self.surface(
-            target_x,
-            target_y,
-            float(goal[2]),
-            vertical_span=12,
-            allow_water=allow_water,
+        target_surface = (
+            self.goal_surface(goal, allow_water=allow_water)
+            if local_goal_reachable
+            # Farther than one segment reaches: only a heading, at any height.
+            else self.surface(target_x, target_y, float(goal[2]), vertical_span=12,
+                              allow_water=allow_water)
         )
         target_support = (
             int(target_surface.support_z)

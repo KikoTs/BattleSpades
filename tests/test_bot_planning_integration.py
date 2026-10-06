@@ -366,3 +366,56 @@ def test_an_adopted_corridor_starts_on_fresh_clocks_instead_of_taking_the_blame(
     result = _navigate(world, brain, observer, state, goal, 102)
     assert result.movement.direction[0] > 0
     assert state.corridor == search.path and not state.blocked_edges
+
+
+def test_a_post_is_reached_on_the_ground_its_column_has_whatever_height_it_was_given(monkeypatch):
+    """Posts around a base copy the base's height. Where the ground at the
+    post is six blocks off that, the bot stood on it for the whole round
+    without arriving, replanning and being sent to climb."""
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    at_post = replace(observer, position=(30.5, 10.5, 97.75))
+    for stated in (91.75, 103.75):
+        post = replace(goal, key=("post", stated), position=(30.5, 10.5, stated))
+        result = _navigate(world, brain, at_post, _BotState(1, 1, observer.life_id), post)
+        assert result.debug_role.endswith(":arrived")
+
+
+class _GroundUnderARoof:
+    """Ground at 100 and a slab twenty blocks over it around (30, 10)."""
+
+    def get_solid(self, x, y, z):
+        return z >= 100 or (z == 80 and 28 <= x <= 32 and 8 <= y <= 12)
+
+
+def _under_the_roof(monkeypatch):
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    world._vxl = _GroundUnderARoof()
+    on_the_roof = replace(goal, key=("roof",), position=(30.5, 10.5, 77.75))
+    return world, brain, replace(observer, position=(27.5, 10.5, 97.75)), state, on_the_roof
+
+
+def test_a_goal_on_the_roof_above_is_far_and_short_plans_under_it_are_a_dead_end(monkeypatch):
+    """Three columns from its base and twenty blocks under it, a carrier's
+    plans end where it stands. Far used to mean far on the map, so this was
+    not a dead end, and the map-wide route waited for the six-second rule."""
+    world, brain, observer, state, goal = _under_the_roof(monkeypatch)
+    _navigate(world, brain, observer, state, goal, 100.0)
+    assert state.route and state.short_plans == 1 and not state.dead_end
+    # The segment is walked and the next plan, from two columns on, is as short.
+    state.route = ()
+    _navigate(world, brain, replace(observer, position=(29.5, 10.5, 97.75)), state, goal, 101.0)
+    assert state.short_plans == 2 and state.dead_end
+
+
+def test_a_bot_under_its_goal_asks_for_a_walk_before_it_starts_to_climb(monkeypatch):
+    world, brain, observer, state, goal = _under_the_roof(monkeypatch)
+    brain._set_goal(state, goal, observer.position, 100.0)
+    state.corridor_retry_at = state.dead_end_retry_at = 200.0  # not asked for other reasons
+    for now in (100.0, 107.0, 107.125):
+        _navigate(world, brain, observer, state, goal, now)
+    # Stuck long enough to climb: the question is asked first. This world has
+    # no map-wide search, which is an answer: no walk is known.
+    assert "stuck_considered" not in brain.skills.metrics
+    assert state.walkless_goal == goal.position
+    _navigate(world, brain, observer, state, goal, 107.25)
+    assert brain.skills.metrics["stuck_considered"] == 1

@@ -360,6 +360,9 @@ class _BotState:
     corridor_rejected_goal: Vector3 | None = None
     corridor_rejected_until: float = 0.0
     corridor_failed_goal: Vector3 | None = None
+    # The goal the map-wide search last found no walk to; cleared when it finds one.
+    walkless_goal: Vector3 | None = None
+    walk_answer_wanted: bool = False  # a climb to the goal is due and waits on that search
     support_retry_at: float = 0.0
     support_rejected_goal: Vector3 | None = None
     support_progress_anchor: Vector3 | None = None
@@ -3101,8 +3104,9 @@ class SimpleBotBrain:
             float(active_goal.position[0]) - float(observer.position[0]),
             float(active_goal.position[1]) - float(observer.position[1]),
         )
+        goal_place = self._goal_place(active_goal.position)
         if (goal_distance <= active_goal.arrival_radius and not effective_wading
-                and abs(float(active_goal.position[2]) - float(observer.position[2])) <= 3.0):
+                and abs(float(goal_place[2]) - float(observer.position[2])) <= 3.0):
             if active_goal.role == "chase_last_seen":
                 state.contact_until = 0.0
                 state.contact_position = None
@@ -3126,13 +3130,21 @@ class SimpleBotBrain:
                 debug_role=f"{active_goal.role}:arrived",
             )
 
+        state.walk_answer_wanted = False
         if not effective_wading:
             # Stuck in a pit / on a cut-off beach below the goal: climb out
             # (staircase or pillar) instead of cycling escape segments.
+            # Build or dig up to a goal only once the map-wide search has
+            # found no walk to it; until then the stairs are still an answer.
+            walkless = (state.walkless_goal is not None and math.dist(
+                state.walkless_goal, active_goal.position) < 3.0)
             climb = self._skill_result(frame, observer, state, self.skills.consider_stuck(
-                observer, frame.profile, now, active_goal.position), now)
+                observer, frame.profile, now, active_goal.position, climb_to_goal=walkless), now)
             if climb is not None:
                 return climb
+            # A climb that is due asks for that answer now, not at the next stall.
+            state.walk_answer_wanted = (not walkless and self.skills.climb_awaits_walk_answer(
+                observer, now, active_goal.position))
 
         repeated_coverage = self._navigation_revisits(state, observer.position, active_goal, now)
         current_step = (state.route[state.route_index]
@@ -3539,9 +3551,13 @@ class SimpleBotBrain:
             # side, where bots climbed a terrace, met a lip, came down and went
             # up again. Stop poking and ask for the map-wide route at once
             # instead of after six seconds without progress.
+            # (Far counts height: a base on the roof two columns away is as
+            # much another place as one across the map, and its carrier used
+            # to pace under it until the six-second rule noticed.)
             reach = remaining_distance(plan.steps, 0, observer.position)
             if (state.escape_goal is None and not plan.reached_segment_goal
-                    and goal_distance > 12.0 and plan.steps and reach <= 5.0
+                    and math.dist(observer.position, goal_place) > 12.0
+                    and plan.steps and reach <= 5.0
                     and not any(step.breach is not None for step in plan.steps)):
                 state.short_plans = (state.short_plans + 1
                                      if now - state.short_plan_at <= 6.0 else 1)
@@ -4258,7 +4274,8 @@ class SimpleBotBrain:
         if (not state.corridor and state.corridor_search is None
                 and (state.dead_end and now >= state.dead_end_retry_at
                      or now >= state.corridor_retry_at
-                     and now - state.goal_progress_at >= _GOAL_STALL_SECONDS)
+                     and now - state.goal_progress_at >= _GOAL_STALL_SECONDS
+                     or state.walk_answer_wanted)
                 and not (now < state.corridor_rejected_until
                          and state.corridor_rejected_goal is not None
                          and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)):
@@ -4273,6 +4290,8 @@ class SimpleBotBrain:
                 if state.corridor_search is None and goal.role == "tdm_squad_support":
                     state.support_failed_goal = goal.position
                     state.support_failure_at = now
+            if state.corridor_search is None:
+                state.walkless_goal = goal.position
             state.corridor_retry_at = now + 15.0
             state.dead_end_retry_at = now + 5.0
         search = state.corridor_search
@@ -4331,9 +4350,11 @@ class SimpleBotBrain:
                         entry = None
                         state.corridor_rejected_goal = goal.position
                         state.corridor_rejected_until = now + 45.0
+                        state.walkless_goal = goal.position
                     if entry is not None:
                         state.corridor = search.path
                         state.corridor_index = entry
+                        state.walkless_goal = None
                         state.dry_detour_goal = None
                         self._clear_route(state, now)
                         # This guidance was asked for because local routing
@@ -4347,6 +4368,8 @@ class SimpleBotBrain:
                         state.navigation_window_position = observer.position
                         state.navigation_window_at = float(now)
                         self.skills.restart_stuck_clock(observer, now)
+                else:
+                    state.walkless_goal = goal.position
                 state.corridor_search = None
                 state.corridor_join_index = 0
                 state.corridor_yield_local = False
@@ -5861,6 +5884,21 @@ class SimpleBotBrain:
                 )
             ),
         )
+
+    def _goal_place(self, position: Vector3) -> Vector3:
+        """Where a body stands to be at this goal: its point, at its floor's height.
+
+        The planner and the map-wide search aim at the floor the goal names
+        (SimpleVoxelWorld.goal_surface). Arrival reads the same floor, or a
+        post whose height was copied from its base, with the ground there six
+        blocks off it, is stood on for the whole round without being reached.
+        """
+
+        reader = getattr(self.world, "goal_surface", None)
+        surface = reader(position) if callable(reader) else None
+        if surface is None:
+            return position
+        return (position[0], position[1], surface.position[2])
 
     @staticmethod
     def _note_step(state: _BotState, step: RouteStep, now: float) -> None:
