@@ -1283,6 +1283,10 @@ class BotDirector:
             )
             self._perception_entities = self._snapshot_entities()
             self._perception_objectives = self._snapshot_objectives()
+            # Awareness hook: the steps the roster took since the last refresh.
+            stimuli = getattr(self.server, "bot_stimuli", None)
+            if stimuli is not None:
+                stimuli.note_footsteps(self._perception_build_players, now)
             self._perception_build_players = ()
             self._perception_build_snapshots = []
             self._perception_build_index = 0
@@ -1337,6 +1341,8 @@ class BotDirector:
                             tuple(float(value) for value in bot.position),
                             now=now,
                             rng=runtime.rng,
+                            observer_id=int(bot.id),
+                            team=int(bot.team),
                         )
                         if getattr(self.server, "bot_stimuli", None) is not None
                         else ()

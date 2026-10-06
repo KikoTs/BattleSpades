@@ -2,14 +2,22 @@
 
 from dataclasses import replace
 import math
+import random
+import time
+from types import SimpleNamespace
 
 import pytest
 
 import shared.constants as C
 from server.bot_ai.awareness import Awareness, Reaction, notice_delay
 from server.bot_ai.combat_tactics import exposed, find_shelter, firing_line
-from server.bot_ai.messages import BotIntentPriority, LookIntent, MovementAffordance, MovementIntent
+from server.bot_ai.messages import (
+    BotAction, BotActionKind, BotIntentPriority, LookIntent, MovementAffordance,
+    Stimulus, StimulusKind,
+)
+from server.bot_ai.messages import MovementIntent
 from server.bot_ai.policies import ModeBotDecision, ModeBotPosture
+from server.bot_ai.stimuli import HEARING_DISTANCE, BotStimulusBus
 from server.bot_ai.simple_navigation import RouteStep
 from server.bot_ai.simple_worker import SimpleBotBrain, _BotState
 from server.game_constants import TEAM1, TEAM2
@@ -202,8 +210,10 @@ def test_a_glance_never_takes_the_eyes_off_exact_work():
     jumping = replace(walking, movement=replace(walking.movement, jump=True,
                                                 affordance=MovementAffordance.JUMP))
     aiming = replace(walking, look=LookIntent((20.0, 0.0, 20.0), visible=True))
-    ledge = replace(walking, movement=replace(walking.movement, walk_drop=4))
-    for busy in (jumping, aiming, ledge):
+    dropping = replace(walking, movement=replace(walking.movement,
+                                                 affordance=MovementAffordance.DROP))
+    digging = replace(walking, action=BotAction(BotActionKind.MELEE, position=(1.0, 0.0, 22.0)))
+    for busy in (jumping, aiming, dropping, digging):
         assert awareness.overlay(frame, busy) == busy
     # The glance itself is short.
     assert awareness.overlay(_frame(observer, created_at=104.0), walking) == walking
@@ -469,3 +479,227 @@ def test_worker_routes_a_fall_back_and_strides_away_while_no_route_exists():
                                        _BotState(1, 1, observer.life_id), reaction, 100.0)
     assert walking.debug_role.startswith("fall_back")
     assert walking.movement.travel_waypoint is not None and routed_world.plan_calls
+
+
+# -- sounds -----------------------------------------------------------------
+
+def _walker(player_id=7, team=TEAM2, position=(30.0, 10.0, 37.75), *, speed=5.0, alive=True,
+            grounded=True, crouch=False, sneak=False, sprint=False):
+    return SimpleNamespace(
+        id=player_id, team=team, position=position, alive=alive, spawned=True,
+        grounded=grounded, vx=speed, vy=0.0,
+        input=SimpleNamespace(crouch=crouch, sneak=sneak, sprint=sprint))
+
+
+def test_sounds_carry_no_farther_than_the_game_plays_them():
+    bus = BotStimulusBus()
+    assert HEARING_DISTANCE == float(C.HEARING_DISTANCE) == 50.0
+    bus.publish(StimulusKind.SHOT, (0.0, 0.0, 0.0), source_id=3, team=TEAM2, radius=72.0, now=10.0)
+    bus.publish(StimulusKind.EXPLOSION, (0.0, 0.0, 0.0), source_id=4, team=TEAM2, radius=80.0,
+                now=10.0)
+    near = bus.perceive((45.0, 0.0, 0.0), now=10.1, rng=random.Random(1))
+    assert {event.kind for event in near} == {StimulusKind.SHOT, StimulusKind.EXPLOSION}
+    assert bus.perceive((55.0, 0.0, 0.0), now=10.1, rng=random.Random(1)) == ()
+
+
+@pytest.mark.parametrize("changes,steps", (
+    ({}, 2),                      # a walk: one step per 0.512 s
+    ({"sprint": True}, 3),        # a sprint: one per 0.386 s
+    ({"crouch": True}, 0),
+    ({"sneak": True}, 0),
+    ({"grounded": False}, 0),
+    ({"speed": 0.4}, 0),
+    ({"alive": False}, 0),
+))
+def test_footsteps_follow_the_retail_rule(changes, steps):
+    bus = BotStimulusBus()
+    walker = _walker(**changes)
+    # One second of perception refreshes at 10 Hz.
+    published = sum(bus.note_footsteps((walker,), 20.0 + tick * 0.1) for tick in range(10))
+    assert published == steps
+    heard = bus.perceive((20.0, 10.0, 37.75), now=20.95, rng=random.Random(2))
+    assert all(event.kind is StimulusKind.FOOTSTEP and event.source_id == 7 for event in heard)
+    assert bool(heard) == bool(steps)
+
+
+def test_a_listener_is_spared_its_own_noise_and_its_squads_steps():
+    bus = BotStimulusBus()
+    bus.note_footsteps((_walker(1, TEAM1, (10.0, 10.0, 37.75)),      # the listener
+                        _walker(2, TEAM1, (12.0, 10.0, 37.75)),      # a teammate
+                        _walker(7, TEAM2, (20.0, 10.0, 37.75))), 30.0)
+    bus.publish(StimulusKind.SHOT, (12.0, 10.0, 37.0), source_id=2, team=TEAM1, now=30.0)
+    bus.publish(StimulusKind.SHOT, (10.0, 10.0, 37.0), source_id=1, team=TEAM1, now=30.0)
+    heard = bus.perceive((10.0, 10.0, 37.75), now=30.1, rng=random.Random(3),
+                         observer_id=1, team=TEAM1)
+    assert sorted((event.kind.value, event.source_id) for event in heard) == [
+        ("footstep", 7), ("shot", 2)]
+    # Without a listener identity nothing is filtered (older callers).
+    assert len(bus.perceive((10.0, 10.0, 37.75), now=30.1, rng=random.Random(3))) == 5
+    # A step is gone long before the shot that was published with it.
+    late = bus.perceive((10.0, 10.0, 37.75), now=30.9, rng=random.Random(3))
+    assert {event.kind for event in late} == {StimulusKind.SHOT}
+
+
+def test_digging_and_building_are_heard_only_when_someone_made_them():
+    from server.audio import SND_DIG_HIT_BLOCK, play_sound
+
+    sent = []
+    server = SimpleNamespace(bot_stimuli=BotStimulusBus(),
+                             broadcast=lambda data, **kwargs: sent.append(data))
+    digger = SimpleNamespace(id=7, team=TEAM2)
+    play_sound(server, SND_DIG_HIT_BLOCK, position=(20, 10, 40), reliable=False, source=digger)
+    play_sound(server, SND_DIG_HIT_BLOCK, position=(60, 10, 40), reliable=False)  # no actor
+    play_sound(server, SND_DIG_HIT_BLOCK, source=digger)                          # no place
+    assert len(sent) == 3
+    heard = server.bot_stimuli.perceive((10.0, 10.0, 40.0), now=time.monotonic() + 0.1,
+                                        rng=random.Random(4), limit=8)
+    assert [(event.kind, event.source_id, event.team) for event in heard] == [
+        (StimulusKind.BLOCK_DESTROYED, 7, TEAM2)]
+
+
+def _sound(kind, position, at, *, source=7, team=TEAM2):
+    return Stimulus(kind=kind, position=position, created_at=at, expires_at=at + 1.25,
+                    source_id=source, team=team, uncertainty=1.5)
+
+
+def _hear(awareness, observer, now, *sounds, profile=None, visible=None, decision=None,
+          others=()):
+    profile = profile or _expert()
+    frame = replace(_frame(observer, *others, created_at=now), profile=profile, stimuli=sounds)
+    return awareness.react(frame, observer, profile, visible, decision, now)
+
+
+def _look(awareness, observer, now, intent=None):
+    intent = intent or replace(travel_intent(), bot_id=1, bot_generation=1)
+    return awareness.overlay(_frame(observer, created_at=now), intent).look
+
+
+def test_an_unseen_shot_turns_the_head_and_nothing_else():
+    awareness = _awake(_GridWorld())
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    behind = (-14.5, 12.5, observer.position[2])
+    assert _hear(awareness, observer, 100.1, _sound(StimulusKind.SHOT, behind, 100.05)) is None
+    # Not before it has sunk in.
+    assert not _look(awareness, observer, 100.12).glance
+    look = _look(awareness, observer, 100.1 + 0.5 * notice_delay(_expert()) + 0.05)
+    assert look.glance and look.target[:2] == behind[:2] and look.target[2] == observer.eye[2]
+    life = awareness._lives[(1, 1)]
+    assert life.alert > 0.3
+    # The glance is short for a bot on the move ...
+    assert not _look(awareness, observer, life.glance_until + 0.05).glance
+    # ... and longer for one standing its ground.
+    standing = replace(travel_intent(), bot_id=1, bot_generation=1, movement=MovementIntent())
+    assert _look(awareness, observer, life.glance_until + 0.05, standing).glance
+    assert not _look(awareness, observer, life.watch_until + 0.05, standing).glance
+
+
+@pytest.mark.parametrize("case", ("silence", "friendly", "own", "in_view", "old_news"))
+def test_no_sound_no_glance(case):
+    awareness = _awake(_GridWorld())
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    sounds, others = (), ()
+    if case == "friendly":
+        sounds = (_sound(StimulusKind.SHOT, (-14.5, 12.5, 37.75), 100.05, source=5, team=TEAM1),)
+    elif case == "own":
+        sounds = (_sound(StimulusKind.BLOCK_DESTROYED, (11.5, 10.5, 40.0), 100.05, source=1,
+                         team=TEAM1),)
+    elif case == "in_view":
+        # The bot is looking straight at the enemy who fired.
+        others = (_fighter(7, TEAM2, 40.5, 10.5),)
+        sounds = (_sound(StimulusKind.SHOT, (40.5, 10.5, 37.75), 100.05),)
+    elif case == "old_news":
+        _hear(awareness, observer, 99.0, _sound(StimulusKind.SHOT, (-14.5, 12.5, 37.75), 98.9))
+        awareness._lives[(1, 1)].glance = None
+        sounds = (_sound(StimulusKind.SHOT, (-14.5, 12.5, 37.75), 98.9),)  # the same event again
+    for step in range(12):
+        now = 100.1 + step * 0.125
+        assert _hear(awareness, observer, now, *sounds, others=others) is None
+        assert not _look(awareness, observer, now).glance
+
+
+def test_what_is_heard_depends_on_the_sound_the_distance_and_the_listener():
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+
+    def notices(kind, distance, profile):
+        awareness = _awake(_GridWorld(), profile=profile)
+        _hear(awareness, observer, 100.1, _sound(
+            kind, (10.5 - distance, 10.5, observer.position[2]), 100.05), profile=profile)
+        return awareness._lives[(1, 1)].glance is not None
+
+    assert notices(StimulusKind.SHOT, 40.0, _expert())
+    assert not notices(StimulusKind.SHOT, 40.0, _casual())
+    assert notices(StimulusKind.SHOT, 25.0, _casual())
+    assert notices(StimulusKind.FOOTSTEP, 12.0, _casual())
+    assert notices(StimulusKind.FOOTSTEP, 28.0, _expert())
+    assert not notices(StimulusKind.FOOTSTEP, 28.0, _casual())
+    assert not notices(StimulusKind.FOOTSTEP, 45.0, _expert())
+    assert notices(StimulusKind.BLOCK_DESTROYED, 20.0, _expert())
+
+
+def test_a_fight_in_hand_and_a_place_already_checked_are_not_looked_at_again():
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    behind = (-14.5, 12.5, observer.position[2])
+    enemy = _fighter(9, TEAM2, 40.5, 10.5)
+    fighting = _awake(_GridWorld())
+    _hear(fighting, observer, 100.1, _sound(StimulusKind.SHOT, behind, 100.05),
+          visible=enemy, others=(enemy,))
+    assert fighting._lives[(1, 1)].glance is None
+    # Loud enough to wind the bot up even so.
+    assert fighting._lives[(1, 1)].alert > 0.0
+
+    awareness = _awake(_GridWorld())
+    _hear(awareness, observer, 100.1, _sound(StimulusKind.SHOT, behind, 100.05))
+    life = awareness._lives[(1, 1)]
+    first = life.glance_from
+    # More shots from the same place: already looked there.
+    _hear(awareness, observer, life.glance_ready_at + 0.1, _sound(
+        StimulusKind.SHOT, (behind[0] + 3.0, behind[1], behind[2]), life.glance_ready_at))
+    assert life.glance_from == first
+    # The noise has come much closer: that is news.
+    closer = (0.5, 11.5, observer.position[2])
+    _hear(awareness, observer, life.glance_ready_at + 0.5, _sound(
+        StimulusKind.FOOTSTEP, closer, life.glance_ready_at + 0.4))
+    assert life.glance_from > first and life.glance[:2] == closer[:2]
+
+
+def test_objective_carriers_do_not_look_round_for_noises():
+    awareness = _awake(_GridWorld())
+    carrier = replace(_fighter(1, TEAM1, 10.5, 10.5), carried_entity_id=7)
+    _hear(awareness, carrier, 100.1, _sound(StimulusKind.SHOT, (-14.5, 12.5, 37.75), 100.05))
+    assert awareness._lives[(1, 1)].glance is None
+
+
+def test_a_bot_that_has_been_hearing_gunfire_understands_a_hit_sooner():
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    calm, tense = _awake(_GridWorld(_pillar())), _awake(_GridWorld(_pillar()))
+    _hear(tense, observer, 100.0, _sound(StimulusKind.EXPLOSION, (4.5, 10.5, 37.75), 99.95))
+    hit = _hit(observer, 100.1)
+    at = 100.1 + 0.7 * notice_delay(_expert())
+    assert _react(calm, hit, at) is None
+    assert _react(tense, hit, at) is not None
+
+
+def test_director_publishes_footsteps_and_filters_what_each_bot_hears():
+    server, director, bot, runtime = _facing_fixture()
+    frames = []
+    director.supervisor = SimpleNamespace(submit_frame=frames.append)
+    server.bot_stimuli = BotStimulusBus()
+    enemy = _walker(77, TEAM2, (bot.x + 12.0, bot.y, bot.z))
+    server.players[77] = enemy
+    bot.vx, bot.grounded = 5.0, True
+    now = time.monotonic()
+    try:
+        director._perception_cache_until = 0.0
+        director._perception_build_players = (bot, enemy)
+        director._perception_build_snapshots = []
+        director._perception_build_index = 0
+        director._snapshot_player = lambda player: SimpleNamespace(
+            player_id=int(player.id), position=tuple(player.position))
+        runtime.next_perception_at = 0.0
+        assert director._publish_due_perception(now)       # snapshots, and the footsteps
+        assert not director._publish_due_perception(now)   # the observer frame
+    finally:
+        server.players.pop(77, None)
+    assert {event.source_id for event in server.bot_stimuli._events} == {int(bot.id), 77}
+    assert [(event.kind, event.source_id) for event in frames[-1].stimuli] == [
+        (StimulusKind.FOOTSTEP, 77)]

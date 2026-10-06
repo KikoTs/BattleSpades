@@ -34,9 +34,11 @@ from .messages import (
     MovementAffordance,
     PerceptionFrame,
     PlayerSnapshot,
+    StimulusKind,
     Vector3,
 )
 from .policies import ModeBotDecision, ModeBotPosture
+from .stimuli import HEARING_DISTANCE
 
 _ZOMBIE_CLASSES = frozenset({
     int(C.CLASS_ZOMBIE),
@@ -79,6 +81,20 @@ _FALL_BACK_ARRIVAL = 8.0
 _REGROUP_REACH = 60.0
 _DEAD_GROUND_SECONDS = 1.5
 _DEAD_GROUND_ARRIVAL = 2.5
+# How much of a listener's attention each sound takes at point-blank range.
+# All of them fade to nothing at the hearing distance; a footstep, the
+# quietest, fades fastest.
+_LOUDNESS = {
+    StimulusKind.EXPLOSION: 1.0,
+    StimulusKind.SHOT: 0.8,
+    StimulusKind.BLOCK_DESTROYED: 0.5,
+    StimulusKind.FOOTSTEP: 0.6,
+}
+_ALERT_FADE_SECONDS = 6.0
+# A place already looked at is not looked at again for every further shot
+# from it, unless the noise has come much closer.
+_CHECKED_RADIUS = 12.0
+_CHECKED_SECONDS = 8.0
 _MAX_LIVES = 128
 
 
@@ -154,9 +170,22 @@ class _Life:
     rally: Vector3 | None = None
     dead_ground: Vector3 | None = None
     dead_ground_at: float = 0.0
-    # A look that rides on whatever the body is doing.
+    # A look that rides on whatever the body is doing: from/until bound the
+    # glance on the move, watch_until the longer look of a bot standing guard.
     glance: Vector3 | None = None
+    glance_from: float = 0.0
     glance_until: float = 0.0
+    watch_until: float = 0.0
+    glance_ready_at: float = 0.0
+    # Sounds: the newest one weighed, how wound up the bot is, what it checked.
+    heard_at: float = 0.0
+    alert: float = 0.0
+    alert_at: float = 0.0
+    noise: Vector3 | None = None
+    noise_at: float = 0.0
+    checked: Vector3 | None = None
+    checked_at: float = 0.0
+    checked_range: float = 0.0
 
 
 def _unit(dx: float, dy: float) -> Vector3:
@@ -245,6 +274,7 @@ class Awareness:
         life = self._life(observer, now)
         if int(observer.class_id) in _ZOMBIE_CLASSES:
             return None
+        self._listen(frame, observer, profile, life, visible, decision, now)
         hunted = self._under_fire(frame, observer, profile, life, visible, decision, now)
         retreat = self._outmatched(frame, observer, profile, life, visible, decision, now)
         if retreat is not None:
@@ -259,12 +289,85 @@ class Awareness:
         life = self._lives.get((int(intent.bot_id), int(intent.bot_generation)))
         if life is None or life.glance is None:
             return intent
-        if float(frame.created_at) >= life.glance_until:
+        now = float(frame.created_at)
+        if now >= max(life.glance_until, life.watch_until):
             life.glance = None
             return intent
-        if not _head_is_free(intent):
+        if now < life.glance_from or not _head_is_free(intent):
+            return intent
+        if now >= life.glance_until and math.hypot(*intent.movement.direction[:2]) > 0.1:
+            # Only a bot standing its ground keeps watching that long.
             return intent
         return replace(intent, look=LookIntent(life.glance, glance=True))
+
+    # -- sounds ----------------------------------------------------------------
+
+    def _listen(self, frame: PerceptionFrame, observer: PlayerSnapshot, profile: BotProfile,
+                life: _Life, visible: PlayerSnapshot | None,
+                decision: ModeBotDecision | None, now: float) -> None:
+        """Weigh the sounds of this frame: raise the alert and plan a glance.
+
+        Stimulus: shots, blasts, digging, building and footsteps within the
+        game's hearing distance. A sound says roughly where, never who is
+        there; a teammate's noise is told apart as on the minimap. The body
+        keeps doing what it was doing: sounds only turn the head.
+        """
+
+        if life.alert > 0.0:
+            life.alert *= math.exp(-max(0.0, now - life.alert_at) / _ALERT_FADE_SECONDS)
+        life.alert_at = now
+        newest, loudest = life.heard_at, None
+        for event in frame.stimuli:
+            if event.created_at <= life.heard_at:
+                continue
+            newest = max(newest, event.created_at)
+            base = _LOUDNESS.get(event.kind)
+            if base is None or event.team == observer.team:
+                continue
+            distance = math.dist(event.position, observer.position)
+            fade = max(0.0, 1.0 - distance / HEARING_DISTANCE)
+            loudness = base * (fade * fade if event.kind is StimulusKind.FOOTSTEP else fade)
+            if loudest is None or loudness > loudest[0]:
+                loudest = (loudness, event, distance)
+        life.heard_at = newest
+        if loudest is None:
+            return
+        loudness, event, distance = loudest
+        # A fight in hand leaves little attention for anything else; a weak
+        # player misses what is not loud, a wound-up one misses less.
+        threshold = (0.06 + 0.22 * (1.0 - float(profile.skill))
+                     + (0.3 if visible is not None else 0.0) - 0.1 * life.alert)
+        if loudness < threshold or self._in_view(frame, observer, event.source_id):
+            return
+        life.alert = min(1.0, life.alert + loudness)
+        life.noise, life.noise_at = event.position, now
+        if visible is not None or now < life.glance_ready_at or _flight_role(observer, decision):
+            return
+        if (life.checked is not None and now - life.checked_at <= _CHECKED_SECONDS
+                and math.dist(life.checked, event.position) <= _CHECKED_RADIUS
+                and distance > 0.7 * life.checked_range):
+            return
+        life.checked, life.checked_at, life.checked_range = event.position, now, distance
+        dwell = 0.6 + 0.6 * float(profile.caution)
+        life.glance = (event.position[0], event.position[1], observer.eye[2])
+        life.glance_from = now + 0.5 * notice_delay(profile)
+        life.glance_until = life.glance_from + dwell
+        life.watch_until = life.glance_from + 3.0 * dwell
+        life.glance_ready_at = life.glance_until + 1.0 + 2.5 * (1.0 - float(profile.caution))
+
+    def _in_view(self, frame: PerceptionFrame, observer: PlayerSnapshot, player_id: int) -> bool:
+        """Whether the maker of a sound is someone the bot is looking at."""
+
+        for player in frame.players:
+            if player.player_id != player_id:
+                continue
+            dx, dy = player.eye[0] - observer.eye[0], player.eye[1] - observer.eye[1]
+            flat = math.hypot(dx, dy)
+            facing = ((observer.orientation[0] * dx + observer.orientation[1] * dy) / flat
+                      if flat > 1e-6 else 1.0)
+            return (player.alive and facing >= 0.3
+                    and self.world.has_line_of_sight(observer.eye, player.eye))
+        return False
 
     # -- shot at by someone who is not in sight ------------------------------
 
@@ -292,7 +395,9 @@ class Awareness:
                     and not _same_team(frame, observer, attacker)):
                 if now >= life.fire_until:
                     life.hits = 0
-                    life.fire_noticed_at = hit_at + notice_delay(profile)
+                    # Wound up by what it has been hearing, it understands sooner.
+                    life.fire_noticed_at = hit_at + notice_delay(profile) * (
+                        1.0 - 0.5 * life.alert)
                     life.look_back_until = life.fire_noticed_at + _LOOK_BACK_SECONDS
                     life.shelter = _Shelter()
                     life.shelter_hits = 0
@@ -322,7 +427,8 @@ class Awareness:
         eager = profile.skill >= 0.35 or profile.caution >= 0.7
         if life.hits < (1 if eager else 2):
             # A weak player's first hit is only a look over the shoulder.
-            life.glance, life.glance_until = threat, now + 0.8
+            life.glance, life.glance_from = threat, now
+            life.glance_until = life.watch_until = now + 0.8
             return None
         life.glance = None
 
@@ -685,7 +791,8 @@ def _head_is_free(intent: BotIntent) -> bool:
     """Whether the eyes can leave the work in hand for a moment.
 
     Aiming at a visible enemy, digging, building and any exact step (a jump,
-    a ledge run-off, a swim) need the view where the task has put it.
+    a lined-up drop, a swim) need the view where the task has put it. Plain
+    walking does not: the keys are worked out from wherever the eyes point.
     """
 
     movement = intent.movement
@@ -693,4 +800,4 @@ def _head_is_free(intent: BotIntent) -> bool:
             and intent.priority < BotIntentPriority.SURVIVAL
             and not (intent.look is not None and intent.look.visible)
             and movement.affordance is MovementAffordance.WALK
-            and not movement.jump and movement.walk_drop <= 1)
+            and not movement.jump)
