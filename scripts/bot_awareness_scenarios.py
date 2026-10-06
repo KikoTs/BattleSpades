@@ -186,6 +186,35 @@ def make_scenario(kind: str):
                     ctx["volleys"] += 1
                     log(t, "ally_shot", dead=not mate.alive,
                         dist=round(math.dist(mate.position[:2], (bot.x, bot.y)), 1))
+            elif kind in ("fire_ahead", "fire_behind_wall"):
+                if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
+                    runtime = director._runtime.get(int(bot.id))
+                    intent = runtime.intent if runtime is not None else None
+                    if intent is None or math.hypot(*intent.movement.direction[:2]) < 0.1:
+                        return
+                    heading = _heading(director, bot)
+                    # A Molotov has just landed on the bot's line of march. The
+                    # control puts the same fire well off to one side.
+                    ahead, aside = (15.0, 0.0) if kind == "fire_ahead" else (0.0, 16.0)
+                    spot = A.ground(world, bot.x + heading[0] * ahead - heading[1] * aside,
+                                    bot.y + heading[1] * ahead + heading[0] * aside)
+                    if abs(spot[2] - bot.z) > 3.0 or world.is_water_column(
+                            int(spot[0]), int(spot[1])):
+                        return
+                    far = A.ground(world, bot.x - heading[0] * 60.0, bot.y - heading[1] * 60.0)
+                    thrower = A.spawn_dummy(server, TEAM2, far, name="Thrower")
+                    remember(thrower, "owner")
+                    lit = server.fire_controller.ignite_impact(
+                        spot[0], spot[1], spot[2] + 2.25, thrower, now=clock.time())
+                    ctx["fire"] = (spot[0], spot[1])
+                    ctx["placed"], ctx["t0"] = True, t
+                    log(t, "fire", cells=len(lit), pos=[round(v, 1) for v in spot],
+                        dist=round(math.dist(spot[:2], (bot.x, bot.y)), 1))
+                elif ctx["placed"] and tick % SAMPLE_TICKS == 0:
+                    burning = len(server.fire_controller.block_fires)
+                    state.setdefault("fire_samples", []).append([
+                        round(t, 2), burning, 1 if getattr(bot, "on_fire", False) else 0,
+                        round(math.dist(ctx["fire"], (bot.x, bot.y)), 1)])
             elif kind == "wounded_duel":
                 if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
                     if not place_shooters(t, (0.0,), (30, 26, 34)):
@@ -236,6 +265,12 @@ def measure(result) -> dict:
 
         out["t_face"] = next((round(row[0] - t0, 2) for row in alive if facing(row) >= 0.8), None)
         out["looked_away_at_start"] = bool(alive) and facing(alive[0]) < 0.3
+    fire = scenario.get("fire_samples")
+    if fire is not None:
+        lit = [row for row in fire if row[1] > 0]
+        out["burned"] = any(row[2] for row in fire)
+        out["nearest_to_fire"] = min((row[3] for row in lit), default=None)
+        out["fire_seconds"] = round(lit[-1][0] - lit[0][0], 1) if lit else 0.0
     volleys = [e for e in events if e["name"] == "volley"]
     out["hits_taken"] = sum(e["seen_by"] for e in volleys)
     out["shooters_killed"] = (volleys[0]["alive"] - volleys[-1]["alive"]) if volleys else 0
@@ -268,6 +303,16 @@ def summarise(kind, rows) -> dict:
     faced = [row["t_face"] for row in rows if row.get("t_face") is not None]
     away = [row for row in rows if row.get("looked_away_at_start")]
     turned = [row["t_face"] for row in away if row.get("t_face") is not None and row["t_face"] <= 3.0]
+    if rows and "burned" in rows[0]:
+        nearest = [row["nearest_to_fire"] for row in rows if row.get("nearest_to_fire") is not None]
+        return {
+            "kind": kind, "runs": len(rows),
+            "burned": sum(1 for row in rows if row["burned"]),
+            "died": sum(1 for row in rows if row["died"]),
+            "hp_min_median": statistics.median(row["hp_min"] for row in rows),
+            "nearest_to_fire_median": round(statistics.median(nearest), 1) if nearest else None,
+            "reacted": len(reacted),
+        }
     return {
         "kind": kind, "runs": len(rows),
         "faced_within_3s": sum(1 for value in faced if value <= 3.0),

@@ -1582,6 +1582,8 @@ class SimpleBotBrain:
                 )
                 if oriented is not None:
                     selected_tool, oriented_aim_offset = oriented
+                    # Awareness hook: where a Molotov is about to burn.
+                    self.awareness.threw(observer, selected_tool, target.position, now)
                     action = BotAction(
                         BotActionKind.ORIENTED,
                         tool_id=selected_tool,
