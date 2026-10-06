@@ -21,6 +21,8 @@ from .messages import MovementAffordance, Vector3
 _MAX_LOOKAHEAD_STEPS = 16
 _MAX_LOOKAHEAD_DISTANCE = 12.0
 _BODY_HALF_WIDTH = 0.42
+# The native collision box, which decides what the body stands on.
+_FOOTPRINT_HALF_WIDTH = 0.45
 _SAMPLE_SPACING = 0.5
 _STEP_HEIGHT = 1.05
 # Candidates are tried far to near; the first straight walk wins, so open
@@ -122,6 +124,8 @@ def straight_walkable(world, origin: Vector3, target: Vector3,
     ux, uy = dx / length, dy / length
     side_x, side_y = -uy * half_width, ux * half_width
     height = origin[2]
+    behind = (int(math.floor(origin[0])), int(math.floor(origin[1])))
+    solid = getattr(world, "solid", None)
     samples = max(1, int(math.ceil(length / _SAMPLE_SPACING)))
     for number in range(1, samples + 1):
         travelled = min(length, number * _SAMPLE_SPACING)
@@ -133,8 +137,45 @@ def straight_walkable(world, origin: Vector3, target: Vector3,
                 return False
             if centre is None:
                 centre = surface
+        here = (int(math.floor(x)), int(math.floor(y)))
+        if callable(solid):
+            lifted = _lifted(solid, x, y, centre)
+            if lifted < height - 0.5:
+                # The body rises while it is still in the column it is
+                # leaving. A ceiling there at the new head height stops the
+                # native mover dead against the step, keys held.
+                head = int(round(lifted + 2.25)) - 3
+                if solid(*behind, head) or solid(*here, head):
+                    return False
+            centre = lifted
         height = centre
+        behind = here
     return abs(height - target[2]) <= _STEP_HEIGHT
+
+
+def _lifted(solid, x: float, y: float, height: float) -> float:
+    """Head height once the body's footprint is counted, not only its centre.
+
+    The native mover lifts the whole body the moment its 0.9-wide box reaches
+    into a column one block higher, however slightly. A diagonal that clips
+    such a corner is then walked a block up: under a low ceiling the body
+    cannot enter the next cell from there, and it stood on the lip until the
+    route was given up.
+    """
+
+    feet = int(round(height + 2.25))
+    seen = {(int(math.floor(x)), int(math.floor(y)))}
+    for offset_x in (-_FOOTPRINT_HALF_WIDTH, _FOOTPRINT_HALF_WIDTH):
+        for offset_y in (-_FOOTPRINT_HALF_WIDTH, _FOOTPRINT_HALF_WIDTH):
+            cell = (int(math.floor(x + offset_x)), int(math.floor(y + offset_y)))
+            if cell in seen:
+                continue
+            seen.add(cell)
+            # A step, not a wall: one block up with standing room above it.
+            if solid(*cell, feet - 1) and not any(
+                    solid(*cell, z) for z in (feet - 2, feet - 3, feet - 4)):
+                return height - 1.0
+    return height
 
 
 def _ground(world, x: float, y: float, height: float) -> float | None:
