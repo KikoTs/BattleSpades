@@ -1679,7 +1679,13 @@ class DiamondMineBotPolicy:
 
 
 class OccupationBotPolicy:
-    """Attackers deliver/escort bombs; defenders intercept and dispose of them.
+    """Attackers bring bombs in as a group; defenders intercept and dispose of them.
+
+    A carrier is unarmed and cannot sprint, so the attack travels with it:
+    two close escorts and everyone else as a vanguard between the bomb and
+    the base, where the defenders come from. A bomb that falls is lit; its
+    fuse (a public rule) decides whether a teammate can still run it in or
+    everybody clears the blast.
 
     A defender carrying a bomb runs it to ONE disposal point, chosen when it
     picked the bomb up (away from the target), where the mode drops it. The
@@ -1693,9 +1699,25 @@ class OccupationBotPolicy:
     _INTERCEPT_RADIUS = 36.0
     # A loose, unarmed bomb is only worth denying with an attacker this close.
     _DENY_RADIUS = 24.0
+    _FUSE = float(getattr(C, "BOMB_EXPLOSION_FUSE", 10.0))
+    # Blast radius plus a few steps: nobody waits inside this of a lit bomb.
+    _BLAST_CLEARANCE = float(getattr(C, "BOMB_EXPLOSION_RADIUS", 7.0)) + 6.0
+    # A dropped bomb cannot be picked up again for this long.
+    _PICKUP_LOCK = float(getattr(C, "NO_PICKUP_AFTER_DROP_TIME", 2.5))
+    # Blocks a second: a free bot sprinting over ordinary ground, and a
+    # burdened carrier (no sprint).
+    _RUN_PACE = 9.0
+    _CARRY_PACE = 5.5
+    # The mode releases a defender's bomb this far outside the target.
+    _DISPOSAL_DISTANCE = 20.0
 
     def __init__(self) -> None:
         self._dispose: dict[tuple[int, int, int], Vector3] = {}
+        # Round-scoped memory of what every player can see or hear: when each
+        # live bomb was lit and where fresh bombs appear.
+        self._epoch: tuple[int, int] = (-1, -1)
+        self._lit: dict[tuple, float] = {}
+        self._spawn: Vector3 | None = None
 
     def decide(
         self,
@@ -1707,10 +1729,22 @@ class OccupationBotPolicy:
             None,
         )
         bombs = [item for item in frame.objectives if item.kind == "oc_bomb"]
+        self._observe(frame, bombs)
         attacker = observer.team == int(C.TEAM1)
         carry_key = (observer.player_id, observer.generation, observer.life_id)
         if observer.carried_entity_id == int(C.BOMB_PICKUP):
             if attacker and target is not None:
+                if self._lets_escort_lead(frame, observer, target):
+                    return ModeBotDecision(
+                        observer.position,
+                        "occupation_follow_escort",
+                        sprint=False,
+                        arrival_radius=2.0,
+                        posture=ModeBotPosture.EVASIVE,
+                        objective_priority=1.0,
+                        engagement_radius=7.0,
+                        watch_position=target.position,
+                    )
                 return ModeBotDecision(
                     target.position,
                     "occupation_deliver_bomb",
@@ -1749,25 +1783,83 @@ class OccupationBotPolicy:
                   if player.team == observer.team and player.alive and player.spawned]
         carried = [item for item in bombs if item.carrier_id >= 0]
         loose = [item for item in bombs if item.carrier_id < 0]
+        lit = [item for item in loose if int(item.state)]
 
         if attacker:
             friendly_carrier = next(
                 (item for item in carried if item.team == observer.team
                  and item.carrier_id != observer.player_id), None)
-            if friendly_carrier is not None and self._nearest_few(
-                    observer, allies, friendly_carrier.position, 2,
-                    exclude=friendly_carrier.carrier_id):
-                return ModeBotDecision(
-                    _formation_point(friendly_carrier.position, observer.player_id, 4.5),
-                    "occupation_escort_carrier",
-                    sprint=True,
-                    arrival_radius=2.5,
-                    posture=ModeBotPosture.ESCORT,
-                    objective_priority=0.92,
-                    engagement_radius=36.0,
-                )
-            if loose:
-                bomb = min(loose, key=lambda item: _distance_squared(
+            if friendly_carrier is not None:
+                rank = self._rank(observer, allies, friendly_carrier.position,
+                                  exclude=friendly_carrier.carrier_id)
+                if rank < 2:
+                    return ModeBotDecision(
+                        # A few steps ahead of the carrier on either side:
+                        # between it and the guns it is walking toward.
+                        self._beside_ahead(friendly_carrier.position, target.position,
+                                           -1.0 if rank == 0 else 1.0)
+                        if target is not None else
+                        _formation_point(friendly_carrier.position, observer.player_id, 4.5),
+                        "occupation_escort_carrier",
+                        sprint=True,
+                        arrival_radius=2.5,
+                        posture=ModeBotPosture.ESCORT,
+                        objective_priority=0.92,
+                        # Whoever can hit the carrier is this escort's
+                        # business, and rifles reach well past the formation.
+                        engagement_radius=60.0,
+                    )
+                if target is not None:
+                    # The defenders come out of the base at the carrier:
+                    # everyone else walks ahead of it and meets them first.
+                    return ModeBotDecision(
+                        _toward(friendly_carrier.position, target.position,
+                                22.0 + 4.0 * (observer.player_id % 3)),
+                        "occupation_escort_vanguard",
+                        sprint=True,
+                        arrival_radius=4.0,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.9,
+                        engagement_radius=90.0,
+                    )
+            for bomb in sorted(lit, key=lambda item: _distance_squared(
+                    observer.position, item.position)):
+                left = self._fuse_left(frame, bomb)
+                planted = target is not None and self._footprint_distance(
+                    target, bomb.position) <= 0.0
+                if (not planted and target is not None
+                        and self._nearest_few(observer, allies, bomb.position, 1)
+                        and self._can_carry(observer, bomb, left, self._footprint_distance(
+                            target, bomb.position) + 2.0)):
+                    # Close enough to finish the run before it goes off.
+                    return ModeBotDecision(
+                        bomb.position,
+                        "occupation_retrieve_bomb",
+                        sprint=True,
+                        arrival_radius=1.75,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.96,
+                        engagement_radius=56.0,
+                    )
+                gap = math.dist(observer.position, bomb.position)
+                if planted and gap <= 60.0:
+                    # Planted: keep the defenders off it from outside the blast.
+                    keep = self._BLAST_CLEARANCE + 2.0
+                    return ModeBotDecision(
+                        _toward(bomb.position, observer.position, keep) if gap >= keep
+                        else _away_from(observer.position, bomb.position, keep - gap),
+                        "occupation_cover_plant",
+                        sprint=True,
+                        arrival_radius=3.0,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.94,
+                        engagement_radius=60.0,
+                    )
+                if gap <= self._BLAST_CLEARANCE:
+                    return self._clear_blast(observer, bomb)
+            fresh = [item for item in loose if not int(item.state)]
+            if fresh:
+                bomb = min(fresh, key=lambda item: _distance_squared(
                     observer.position, item.position))
                 return ModeBotDecision(
                     bomb.position,
@@ -1792,21 +1884,42 @@ class OccupationBotPolicy:
                     objective_priority=0.92,
                     engagement_radius=100.0,
                 )
-        else:
-            live = [item for item in loose if int(item.state) and target is not None
-                    and math.dist(item.position, target.position) <= self._INTERCEPT_RADIUS]
-            if live:
-                bomb = min(live, key=lambda item: _distance_squared(
-                    observer.position, item.position))
+            if self._spawn is not None:
+                # No bomb to carry yet: gather where the last one appeared
+                # instead of running at the base without one.
                 return ModeBotDecision(
-                    bomb.position,
-                    "occupation_intercept_live_bomb",
+                    _formation_point(self._spawn, observer.player_id, 7.0),
+                    "occupation_await_bomb",
                     sprint=True,
-                    arrival_radius=1.75,
-                    posture=ModeBotPosture.SURVIVE,
-                    objective_priority=0.96,
-                    engagement_radius=10.0,
+                    arrival_radius=4.0,
+                    posture=ModeBotPosture.BALANCED,
+                    objective_priority=0.8,
+                    engagement_radius=90.0,
                 )
+        else:
+            live = [item for item in lit if target is not None
+                    and math.dist(item.position, target.position) <= self._INTERCEPT_RADIUS]
+            for bomb in sorted(live, key=lambda item: _distance_squared(
+                    observer.position, item.position)):
+                # One defender carries it off, and only with fuse to spare;
+                # the rest stay out of the blast.
+                if (self._nearest_few(observer, allies, bomb.position, 1)
+                        and self._can_carry(
+                            observer, bomb, self._fuse_left(frame, bomb),
+                            max(0.0, self._DISPOSAL_DISTANCE
+                                - self._footprint_distance(target, bomb.position)))):
+                    return ModeBotDecision(
+                        bomb.position,
+                        "occupation_intercept_live_bomb",
+                        sprint=True,
+                        arrival_radius=1.75,
+                        posture=ModeBotPosture.SURVIVE,
+                        objective_priority=0.96,
+                        engagement_radius=10.0,
+                    )
+            for bomb in lit:
+                if math.dist(observer.position, bomb.position) <= self._BLAST_CLEARANCE:
+                    return self._clear_blast(observer, bomb)
             hostile_carrier = next(
                 (item for item in carried if item.team != observer.team), None)
             if (hostile_carrier is not None
@@ -1863,15 +1976,146 @@ class OccupationBotPolicy:
             engagement_radius=120.0,
         )
 
+    def _observe(self, frame: PerceptionFrame, bombs) -> None:
+        """Note when each bomb was lit and where a fresh one lies."""
+
+        epoch = (frame.map_epoch, frame.mode_epoch)
+        if epoch != self._epoch:
+            self._epoch = epoch
+            self._lit = {}
+            self._spawn = None
+        now = float(frame.created_at)
+        seen = {}
+        for bomb in bombs:
+            if int(bomb.state):
+                seen[self._bomb_key(bomb)] = bomb
+            elif bomb.carrier_id < 0:
+                self._spawn = bomb.position
+        gone = sorted((since, key) for key, since in self._lit.items() if key not in seen)
+        for key in seen:
+            if key not in self._lit:
+                # A lit bomb changing hands keeps its fuse.
+                self._lit[key] = gone.pop(0)[0] if gone else now
+            elif self._lit[key] > now:
+                self._lit[key] = now
+        for key in [key for key in self._lit if key not in seen]:
+            del self._lit[key]
+
     @staticmethod
-    def _nearest_few(observer: PlayerSnapshot, allies, position: Vector3,
-                     count: int, *, exclude: int = -1) -> bool:
+    def _bomb_key(bomb) -> tuple:
+        if bomb.carrier_id >= 0:
+            return ("carried", int(bomb.carrier_id))
+        return ("ground", round(bomb.position[0]), round(bomb.position[1]))
+
+    def _fuse_left(self, frame: PerceptionFrame, bomb) -> float:
+        since = self._lit.get(self._bomb_key(bomb), float(frame.created_at))
+        return self._FUSE - (float(frame.created_at) - since)
+
+    def _can_carry(self, observer: PlayerSnapshot, bomb, left: float,
+                   distance: float) -> bool:
+        """Whether the observer can fetch a lit bomb and walk it ``distance``."""
+
+        reach = math.dist(observer.position, bomb.position) / self._RUN_PACE
+        lock = self._PICKUP_LOCK - (self._FUSE - left)
+        return max(reach, lock) + distance / self._CARRY_PACE + 1.0 <= left
+
+    @staticmethod
+    def _footprint_distance(target, position: Vector3) -> float:
+        """Horizontal blocks from ``position`` to the target footprint (0 inside)."""
+
+        if len(target.bounds) >= 4:
+            x0, x1, y0, y1 = target.bounds[:4]
+            dx = max(x0 - position[0], 0.0, position[0] - x1)
+            dy = max(y0 - position[1], 0.0, position[1] - y1)
+            return math.hypot(dx, dy)
+        return max(0.0, math.hypot(position[0] - target.position[0],
+                                   position[1] - target.position[1]) - 8.0)
+
+    def _clear_blast(self, observer: PlayerSnapshot, bomb) -> ModeBotDecision:
+        return ModeBotDecision(
+            _away_from(observer.position, bomb.position, self._BLAST_CLEARANCE + 4.0),
+            "occupation_clear_blast",
+            sprint=True,
+            arrival_radius=3.0,
+            posture=ModeBotPosture.SURVIVE,
+            objective_priority=1.0,
+            engagement_radius=6.0,
+        )
+
+    # The carrier follows: it walks while a teammate within this range is at
+    # least a couple of steps nearer the base than it is, and waits for
+    # teammates who are on their way from no farther than the support range.
+    _LEAD_RANGE = 45.0
+    _LEAD_STEPS = 2.5
+    _SUPPORT_RANGE = 120.0
+    # Inside this distance of the base it just goes for the plant.
+    _FINAL_RUN = 28.0
+
+    @classmethod
+    def _lets_escort_lead(cls, frame: PerceptionFrame, observer: PlayerSnapshot,
+                          target) -> bool:
+        """Whether the bomb carrier waits for a teammate to go in front.
+
+        Unarmed and unable to sprint, the carrier used to walk point: nine
+        in ten died with no teammate even five blocks ahead of them, about
+        75 blocks short of the base and with three defenders in range. It
+        now walks behind whoever is nearby and waits for teammates who are
+        on their way. The wait ends when someone is in front, when nobody
+        is close enough to come, under fire, on the final run, and in any
+        case for six seconds of every twenty, so a teammate that cannot get
+        ahead never parks the bomb.
+        """
+
+        own = cls._footprint_distance(target, observer.position)
+        if own <= cls._FINAL_RUN:
+            return False
+        now = float(frame.created_at)
+        if observer.last_damage_at > 0.0 and 0.0 <= now - observer.last_damage_at <= 3.0:
+            return False
+        if now % 20.0 < 6.0:
+            return False
+        coming = False
+        for player in frame.players:
+            if (player.team != observer.team or not player.alive or not player.spawned
+                    or player.player_id == observer.player_id):
+                continue
+            gap = math.dist(player.position, observer.position)
+            if gap > cls._SUPPORT_RANGE:
+                continue
+            if (gap <= cls._LEAD_RANGE and cls._footprint_distance(
+                    target, player.position) <= own - cls._LEAD_STEPS):
+                return False
+            coming = True
+        return coming
+
+    @staticmethod
+    def _beside_ahead(carrier: Vector3, target: Vector3, side: float) -> Vector3:
+        dx, dy = target[0] - carrier[0], target[1] - carrier[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return carrier
+        ux, uy = dx / length, dy / length
+        return (
+            min(510.0, max(1.0, carrier[0] + ux * 8.0 - uy * 4.0 * side)),
+            min(510.0, max(1.0, carrier[1] + uy * 8.0 + ux * 4.0 * side)),
+            carrier[2],
+        )
+
+    @staticmethod
+    def _rank(observer: PlayerSnapshot, allies, position: Vector3, *,
+              exclude: int = -1) -> int:
+        """How many free allies are nearer ``position`` than the observer."""
+
         own = (math.dist(observer.position, position), observer.player_id)
-        closer = sum(1 for player in allies
-                     if player.player_id not in (observer.player_id, exclude)
-                     and player.carried_entity_id < 0
-                     and (math.dist(player.position, position), player.player_id) < own)
-        return closer < count
+        return sum(1 for player in allies
+                   if player.player_id not in (observer.player_id, exclude)
+                   and player.carried_entity_id < 0
+                   and (math.dist(player.position, position), player.player_id) < own)
+
+    @classmethod
+    def _nearest_few(cls, observer: PlayerSnapshot, allies, position: Vector3,
+                     count: int, *, exclude: int = -1) -> bool:
+        return cls._rank(observer, allies, position, exclude=exclude) < count
 
 
 _FALLBACK = PatrolCombatPolicy()

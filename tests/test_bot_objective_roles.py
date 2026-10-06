@@ -418,3 +418,174 @@ def test_ctf_raider_does_not_stutter_between_waiting_and_going():
     assert role(_AFTER_WAVE + 2.5, coming) == "ctf_attack_intel"
     assert role(_AFTER_WAVE + 6.0, coming) == "ctf_rally"
     assert role(_AFTER_WAVE + 6.5, inside, hit_at=_AFTER_WAVE + 6.2) == "ctf_attack_intel"
+
+
+# -------------------------------------------------- Occupation attack (F04)
+
+OC_TARGET = ObjectiveSnapshot("oc_target", GREEN, (400.5, 256.5, 40.0),
+                              bounds=(384, 416, 240, 272, 30, 50))
+BOMB = int(C.BOMB_PICKUP)
+
+
+def _oc(observer, *others, bombs=(), now=NOW, policy=None, target=OC_TARGET):
+    policy = policy or _POLICIES["oc"].__class__()
+    frame = _frame("oc", observer, *others, objectives=(target, *bombs, *_anchors()), now=now)
+    return policy.decide(frame, observer), policy
+
+
+def test_occupation_attack_travels_with_its_carrier():
+    carrier = _player(0, BLUE, (250.0, 256.5, 40.0), carried=BOMB)
+    team = [_player(index * 2, BLUE, (250.0 - 12.0 * index, 256.5, 40.0)) for index in range(1, 6)]
+    bomb = ObjectiveSnapshot("oc_bomb", BLUE, carrier.position, carrier_id=0)
+    roles = {}
+    for observer in team:
+        others = [carrier] + [player for player in team if player is not observer]
+        roles[observer.player_id] = _oc(observer, *others, bombs=(bomb,))[0]
+    close = [pid for pid, decision in roles.items() if decision.role == "occupation_escort_carrier"]
+    vanguard = [decision for decision in roles.values()
+                if decision.role == "occupation_escort_vanguard"]
+    assert sorted(close) == [2, 4]                 # the two nearest stay on the carrier
+    assert len(vanguard) == 3                      # nobody runs at the base alone
+    for decision in vanguard:
+        # Between the carrier and the base, where the defenders come from.
+        assert carrier.position[0] + 15.0 < decision.position[0] < OC_TARGET.position[0]
+    assert roles[2].engagement_radius >= 50.0
+
+
+def test_occupation_attackers_wait_for_the_next_bomb_where_the_last_one_lay():
+    observer = _player(0, BLUE, (300.0, 256.5, 40.0))
+    fresh = ObjectiveSnapshot("oc_bomb", 1, (250.0, 260.0, 40.0))
+    decision, policy = _oc(observer, bombs=(fresh,))
+    assert decision.role == "occupation_retrieve_bomb"
+    waiting, _ = _oc(observer, bombs=(), now=NOW + 30.0, policy=policy)
+    assert waiting.role == "occupation_await_bomb"
+    assert math.dist(waiting.position, fresh.position) <= 10.0
+    # A new round forgets the old spawn.
+    other_round = replace(_frame("oc", observer, objectives=(OC_TARGET, *_anchors())), mode_epoch=2)
+    assert policy.decide(other_round, observer).role == "occupation_pressure_enemy_side"
+
+
+def test_occupation_attacker_runs_in_a_lit_bomb_only_if_the_fuse_allows():
+    fuse = float(C.BOMB_EXPLOSION_FUSE)
+    near_drop = ObjectiveSnapshot("oc_bomb", 1, (360.0, 256.5, 40.0), state=1)   # 24 from the base
+    far_drop = ObjectiveSnapshot("oc_bomb", 1, (250.0, 256.5, 40.0), state=1)    # 134 from the base
+    runner = _player(0, BLUE, (355.0, 256.5, 40.0))
+    assert _oc(runner, bombs=(near_drop,))[0].role == "occupation_retrieve_bomb"
+    # The same bomb with most of its fuse gone is left alone.
+    decision, policy = _oc(runner, bombs=(near_drop,))
+    late, _ = _oc(runner, bombs=(near_drop,), now=NOW + fuse - 3.0, policy=policy)
+    assert late.role == "occupation_clear_blast"
+    bystander = _player(0, BLUE, (247.0, 256.5, 40.0))
+    hopeless, _ = _oc(bystander, bombs=(far_drop,))
+    assert hopeless.role == "occupation_clear_blast"
+    assert math.dist(hopeless.position, far_drop.position) > math.dist(
+        bystander.position, far_drop.position) + 10.0
+
+
+def test_occupation_only_the_nearest_attacker_goes_for_a_lit_bomb():
+    lit = ObjectiveSnapshot("oc_bomb", 1, (360.0, 256.5, 40.0), state=1)
+    near = _player(0, BLUE, (357.0, 256.5, 40.0))
+    second = _player(2, BLUE, (352.0, 256.5, 40.0))
+    assert _oc(near, second, bombs=(lit,))[0].role == "occupation_retrieve_bomb"
+    assert _oc(second, near, bombs=(lit,))[0].role == "occupation_clear_blast"
+
+
+def test_occupation_lit_bomb_keeps_its_fuse_when_it_changes_hands():
+    fuse = float(C.BOMB_EXPLOSION_FUSE)
+    policy = _POLICIES["oc"].__class__()
+    runner = _player(0, BLUE, (355.0, 256.5, 40.0))
+    lit = ObjectiveSnapshot("oc_bomb", 1, (360.0, 256.5, 40.0), state=1)
+    _oc(runner, bombs=(lit,), policy=policy)
+    carrier = _player(2, BLUE, (362.0, 256.5, 40.0), carried=BOMB)
+    carried = ObjectiveSnapshot("oc_bomb", BLUE, carrier.position, carrier_id=2, state=1)
+    _oc(runner, carrier, bombs=(carried,), now=NOW + 4.0, policy=policy)
+    dropped = ObjectiveSnapshot("oc_bomb", 1, (370.0, 256.5, 40.0), state=1)
+    frame = _frame("oc", runner, objectives=(OC_TARGET, dropped), now=NOW + 6.0)
+    policy.decide(frame, runner)
+    assert policy._fuse_left(frame, dropped) == pytest.approx(fuse - 6.0)
+
+
+def test_occupation_attackers_cover_a_planted_bomb_from_outside_the_blast():
+    planted = ObjectiveSnapshot("oc_bomb", 1, (400.0, 256.5, 40.0), state=1)
+    for distance in (1.0, 5.0, 12.0, 40.0):       # on it, inside the blast, outside
+        cover = _player(0, BLUE, (400.0 - distance, 256.5, 40.0))
+        decision, _ = _oc(cover, bombs=(planted,))
+        assert decision.role == "occupation_cover_plant"
+        kept = math.dist(decision.position, planted.position)
+        assert float(C.BOMB_EXPLOSION_RADIUS) + 4.0 < kept < 25.0, distance
+
+
+def test_occupation_one_defender_carries_off_a_live_bomb_and_the_rest_clear_out():
+    fuse = float(C.BOMB_EXPLOSION_FUSE)
+    live = ObjectiveSnapshot("oc_bomb", 1, (400.0, 256.5, 40.0), state=1)
+    near = _player(1, GREEN, (398.0, 256.5, 40.0))
+    beside = _player(3, GREEN, (404.0, 259.0, 40.0))
+    away = _player(5, GREEN, (430.0, 256.5, 40.0))
+    policy = _POLICIES["oc"].__class__()
+    assert _oc(near, beside, away, bombs=(live,), policy=policy)[0].role == (
+        "occupation_intercept_live_bomb")
+    assert _oc(beside, near, away, bombs=(live,), policy=policy)[0].role == "occupation_clear_blast"
+    assert _oc(away, near, beside, bombs=(live,), policy=policy)[0].role == "occupation_defend_base"
+    # With the fuse almost out nobody can get it clear: everyone near it leaves.
+    late = _oc(near, beside, away, bombs=(live,), now=NOW + fuse - 2.0, policy=policy)[0]
+    assert late.role == "occupation_clear_blast"
+
+
+# A moment outside the six seconds of every twenty in which the carrier walks anyway.
+_HOLD_TIME = NOW - NOW % 20.0 + 10.0
+
+
+def _carrier_decision(*teammates, at=(250.0, 256.5, 40.0), now=_HOLD_TIME, hit_at=0.0):
+    carrier = replace(_player(0, BLUE, at, carried=BOMB), last_damage_at=hit_at)
+    bomb = ObjectiveSnapshot("oc_bomb", BLUE, carrier.position, carrier_id=0)
+    return _oc(carrier, *teammates, bombs=(bomb,), now=now)[0]
+
+
+def test_occupation_carrier_walks_behind_its_escort_not_in_front_of_it():
+    # Nine in ten killed carriers had nobody even five blocks ahead of them.
+    beside = _player(2, BLUE, (248.0, 252.0, 40.0))
+    waiting = _carrier_decision(beside)
+    assert waiting.role == "occupation_follow_escort"
+    assert waiting.position == (250.0, 256.5, 40.0)
+    ahead = _player(2, BLUE, (258.0, 254.0, 40.0))
+    going = _carrier_decision(ahead)
+    assert going.role == "occupation_deliver_bomb"
+    assert going.position == OC_TARGET.position
+
+
+def test_occupation_carrier_waits_only_for_teammates_who_can_come():
+    assert _carrier_decision().role == "occupation_deliver_bomb"                 # alone
+    far = _player(2, BLUE, (60.0, 256.5, 40.0))                                 # 190 blocks back
+    assert _carrier_decision(far).role == "occupation_deliver_bomb"
+    coming = _player(2, BLUE, (160.0, 256.5, 40.0))                             # 90 blocks back
+    assert _carrier_decision(coming).role == "occupation_follow_escort"
+    dead = replace(coming, alive=False)
+    assert _carrier_decision(dead).role == "occupation_deliver_bomb"
+
+
+def test_occupation_carrier_never_parks_the_bomb():
+    beside = _player(2, BLUE, (248.0, 252.0, 40.0))
+    # Under fire it keeps moving.
+    assert _carrier_decision(beside, hit_at=_HOLD_TIME - 1.0).role == "occupation_deliver_bomb"
+    # On the final run it goes for the plant.
+    close = (OC_TARGET.bounds[0] - 20.0, 256.5, 40.0)
+    assert _carrier_decision(replace(beside, position=(close[0] - 3.0, 250.0, 40.0)),
+                             at=close).role == "occupation_deliver_bomb"
+    # And a teammate that never gets ahead costs it at most 14 s in 20.
+    roles = [_carrier_decision(beside, now=_HOLD_TIME + step * 0.5).role for step in range(80)]
+    waits = "".join("w" if role == "occupation_follow_escort" else " " for role in roles).split()
+    assert max(len(run) for run in waits) * 0.5 <= 14.0
+    assert roles.count("occupation_deliver_bomb") * 0.5 >= 11.0
+
+
+def test_occupation_close_escorts_take_post_ahead_of_the_carrier():
+    carrier = _player(0, BLUE, (250.0, 256.5, 40.0), carried=BOMB)
+    bomb = ObjectiveSnapshot("oc_bomb", BLUE, carrier.position, carrier_id=0)
+    first = _player(2, BLUE, (246.0, 256.5, 40.0))
+    second = _player(4, BLUE, (240.0, 256.5, 40.0))
+    posts = [_oc(observer, carrier, other, bombs=(bomb,))[0]
+             for observer, other in ((first, second), (second, first))]
+    assert [post.role for post in posts] == ["occupation_escort_carrier"] * 2
+    for post in posts:
+        assert 5.0 <= post.position[0] - carrier.position[0] <= 12.0     # toward the base
+    assert posts[0].position[1] != posts[1].position[1]                  # one on each side
