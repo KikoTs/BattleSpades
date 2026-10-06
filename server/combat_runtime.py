@@ -1378,6 +1378,7 @@ class CombatSystem:
             SND_BUILD,
             position=position,
             reliable=False,
+            source=player,
         )
 
     # Longest line the server will accept. The client regenerates the cells
@@ -1594,6 +1595,7 @@ class CombatSystem:
                 SND_BUILD,
                 position=successful_cells[0],
                 reliable=False,
+                source=player,
             )
             self._queue_blocks_built(player, successful_cells)
 
@@ -2494,6 +2496,7 @@ class CombatSystem:
             SND_DIG_HIT_BLOCK,
             position=position,
             reliable=False,
+            source=player,
         )
 
     def _broadcast_entity_hit(self, entity, position) -> None:
@@ -2648,6 +2651,7 @@ class CombatSystem:
                 sound_id,
                 position=block_pos,
                 reliable=False,
+                source=player,
             )
 
     def record_exact_block_destroy_catchup(self, player, positions,

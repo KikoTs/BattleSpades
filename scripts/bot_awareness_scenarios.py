@@ -98,7 +98,8 @@ def make_scenario(kind: str):
                     round(t, 2), 1 if (bot.alive and bot.spawned) else 0, int(bot.health),
                     _role(director, bot),
                     sum(1 for s in ctx["shooters"] if _sees(server, s, bot)),
-                    round(float(bot.x), 1), round(float(bot.y), 1)])
+                    round(float(bot.x), 1), round(float(bot.y), 1),
+                    round(float(bot.o_x), 2), round(float(bot.o_y), 2)])
             if not (bot.alive and bot.spawned):
                 return
             if kind in ("outnumbered_los", "outnumbered_allies"):
@@ -116,6 +117,42 @@ def make_scenario(kind: str):
                 elif ctx["placed"] and t >= ctx["next"] and ctx["volleys"] < 20:
                     volley(t, 4)
                     ctx["next"] = t + 0.7
+            elif kind in ("footsteps_unseen", "digging_unseen", "silent_behind"):
+                if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
+                    # Somebody just out of sight behind the bot. Only the sound
+                    # (if any) can tell the bot that it is there.
+                    spot = A.find_spot(server, bot, _heading(director, bot),
+                                       dist_range=(14, 12, 16, 18, 20), arc=math.pi,
+                                       want_los=False, level=30.0)
+                    if spot is None:
+                        return
+                    walker = A.spawn_dummy(server, TEAM2, spot, name="Walker")
+                    ctx["shooters"] = [walker]
+                    remember(walker, "enemy")
+                    ctx["placed"], ctx["next"], ctx["t0"] = True, t + 0.5, t + 0.5
+                    log(t, "placed", dist=round(math.dist(spot[:2], (bot.x, bot.y)), 1))
+                elif ctx["placed"] and t >= ctx["next"] and ctx["volleys"] < 10:
+                    walker = ctx["shooters"][0]
+                    if kind == "footsteps_unseen":
+                        from server.bot_ai.messages import StimulusKind
+                        from server.bot_ai.stimuli import (
+                            FOOTSTEP_INTERVAL_SPRINT, HEARING_DISTANCE)
+                        server.bot_stimuli.publish(
+                            StimulusKind.FOOTSTEP, tuple(walker.position),
+                            source_id=int(walker.id), team=int(walker.team),
+                            radius=HEARING_DISTANCE, lifetime=0.45)
+                        ctx["next"] = t + FOOTSTEP_INTERVAL_SPRINT
+                    elif kind == "digging_unseen":
+                        from server.audio import SND_DIG_HIT_BLOCK, play_sound
+                        cell = (int(walker.x), int(walker.y), int(walker.z) + 3)
+                        play_sound(server, SND_DIG_HIT_BLOCK, position=cell, reliable=False,
+                                   source=walker)
+                        ctx["next"] = t + 0.5
+                    else:
+                        ctx["next"] = t + 0.5
+                    ctx["volleys"] += 1
+                    log(t, "sound" if kind != "silent_behind" else "nothing",
+                        dist=round(math.dist(walker.position[:2], (bot.x, bot.y)), 1))
             elif kind == "wounded_duel":
                 if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
                     if not place_shooters(t, (0.0,), (30, 26, 34)):
@@ -154,6 +191,17 @@ def measure(result) -> dict:
     out["exposed_share"] = round(sum(1 for row in alive if row[4] > 0) / max(1, len(alive)), 2)
     hidden = next((row[0] for row in alive if row[4] == 0), None)
     out["t_out_of_sight"] = round(hidden - t0, 2) if hidden is not None else None
+    threat = scenario.get("dummies", {}).get("enemy")
+    if threat is not None:
+        # First moment the bot looks toward the source, as the audit measures it.
+        for row in alive:
+            dx, dy = threat["pos"][0] - row[5], threat["pos"][1] - row[6]
+            flat = math.hypot(dx, dy)
+            if flat > 1e-6 and (row[7] * dx + row[8] * dy) / flat >= 0.8:
+                out["t_face"] = round(row[0] - t0, 2)
+                break
+        else:
+            out["t_face"] = None
     volleys = [e for e in events if e["name"] == "volley"]
     out["hits_taken"] = sum(e["seen_by"] for e in volleys)
     out["shooters_killed"] = (volleys[0]["alive"] - volleys[-1]["alive"]) if volleys else 0
@@ -182,8 +230,11 @@ def summarise(kind, rows) -> dict:
     rows = [row for row in rows if "error" not in row and "note" not in row]
     reacted = [row["t_react"] for row in rows if row.get("t_react") is not None]
     hidden = [row["t_out_of_sight"] for row in rows if row.get("t_out_of_sight") is not None]
+    faced = [row["t_face"] for row in rows if row.get("t_face") is not None]
     return {
         "kind": kind, "runs": len(rows),
+        "faced_within_3s": sum(1 for value in faced if value <= 3.0),
+        "t_face_median": round(statistics.median(faced), 2) if faced else None,
         "reacted": len(reacted),
         "t_react_median": round(statistics.median(reacted), 2) if reacted else None,
         "out_of_sight": len(hidden),
