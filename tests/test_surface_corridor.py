@@ -71,18 +71,55 @@ def test_unreachable_map_wide_search_releases_its_bounded_working_set() -> None:
 def test_failure_discovered_mid_search_cannot_return_a_stale_parent_chain(monkeypatch) -> None:
     import server.bot_ai.surface_corridor as corridor_module
     monkeypatch.setattr(corridor_module, "_SLICE_EXPANSIONS", 1)
-    search = SurfaceCorridorSearch(bytes([20]) * 4, 2, 2, 0, 1)
-    search.advance()  # The direct edge is already in the parent tree.
-    state = _BotState(1, 1, 1, corridor_search=search)
+    # A causeway has one way along it: the excluded edge stays in the tree
+    # the two ends meet through, and that chain must not come back as a path.
+    causeway = SurfaceCorridorSearch(bytes([20]) * 5, 5, 1, 0, 4)
+    causeway.advance()  # The first edge is already in the parent tree.
+    state = _BotState(1, 1, 1, corridor_search=causeway)
     SimpleBotBrain._remember_blocked_edge(state, ((0, 0, 20), (1, 0, 20)), 100.)
-    assert state.corridor_search is search
+    assert state.corridor_search is causeway
+    for _ in range(8):
+        causeway.advance()
+    assert causeway.done and not causeway.path
+    # Where there is a way round, the search already under way finds it.
+    search = SurfaceCorridorSearch(bytes([20]) * 4, 2, 2, 0, 1)
     search.advance()
-    assert search.done and not search.path
+    search.exclude_edge((0, 0, 20), (1, 0, 20))
+    for _ in range(8):
+        search.advance()
+    assert search.done and search.path[-1] == (1.5, 0.5, 17.75)
+    assert any(point[1] == 1.5 for point in search.path)
     retry = SurfaceCorridorSearch(bytes([20]) * 4, 2, 2, 0, 1, search.blocked)
-    for _ in range(4):
+    for _ in range(8):
         retry.advance()
     assert retry.path[-1] == (1.5, 0.5, 17.75)
     assert any(point[1] == 1.5 for point in retry.path)
+
+
+def test_a_search_from_both_ends_settles_the_boxed_in_end_first() -> None:
+    """A goal on a perch nothing leads to, or up a tower with one stair.
+
+    From the ground the whole map is nearer than the top, and the search
+    used to flood it: 32,768 expansions to learn there was no way up to a
+    statue's head, 12,711 to find the stairs of a building it stood in.
+    """
+    width = 128
+    ground, top = 100, 60
+    supports = bytearray([ground]) * width ** 2
+    supports[64 * width + 64] = top  # a perch: forty blocks up, sheer
+    perch = SurfaceCorridorSearch(bytes(supports), width, width, 64 * width + 20,
+                                  64 * width + 64)
+    perch.advance()
+    assert perch.done and not perch.path and perch.expansions <= 4
+    # Stairs come down its far side, two levels a cell.
+    for step in range(1, 20):
+        supports[64 * width + 64 + step] = top + 2 * step
+    stairs = SurfaceCorridorSearch(bytes(supports), width, width, 64 * width + 20,
+                                   64 * width + 64)
+    while not stairs.done:
+        stairs.advance()
+    assert stairs.path and stairs.path[-1] == (64.5, 64.5, top - 2.25)
+    assert stairs.expansions < 1024
 
 
 @pytest.mark.parametrize("terrain,class_id", [
