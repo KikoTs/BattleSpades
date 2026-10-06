@@ -647,11 +647,18 @@ class SimpleBotBrain:
                 # every alternation, so blacklist the currently selected
                 # edge when the body fails the map-level four-block swim
                 # contract across the whole window.
+                spent = state.water_recovery
                 state.water_escape_position = observer.position
                 state.water_escape_at = now
                 state.water_recovery = True
                 self._clear_route(state, now)
                 force_water_edge = True
+                if spent and self._crosses_water(frame, observer, state, now):
+                    # Bank recovery has failed the same four blocks. Its turn
+                    # is over: this swimmer's way is across, and a failed
+                    # swim used to leave it to the nearest shore for good.
+                    state.water_recovery = False
+                    force_water_edge = False
             if self.skills.active(observer):
                 # A climb out (staircase/pillar from the water) owns the body
                 # until it stands on main ground or gives up.
@@ -747,13 +754,24 @@ class SimpleBotBrain:
                 ),
                 blocked_edges=self._water_exclusions(state, now),
             )
-            return self._water_intent(
+            shore = self._water_intent(
                 frame,
                 observer,
                 water_step,
                 now,
                 force_block_edge=force_water_edge,
             )
+            if (shore.debug_role in ("water_no_route", "water_search_shore")
+                    and state.water_recovery
+                    and self._crosses_water(frame, observer, state, now)):
+                # No bank for recovery to make for: it roams, or stands (a
+                # zombie stood in SpookyMansion's sea until the round ended).
+                # This swimmer knows where it is going: take the swim up again.
+                state.water_recovery = False
+                crossing = self._water_crossing_intent(frame, observer, state, profile, now)
+                if crossing is not None:
+                    return crossing
+            return shore
 
         # A single dry contact on a lip is enough to resume walking, but not
         # enough to forget a failed swim. Retain recovery across brief bank
