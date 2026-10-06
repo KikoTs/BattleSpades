@@ -28,6 +28,9 @@ _COVER_DIRECTIONS = 12
 _MAX_COVER_RAYS = 14
 _SHELTER_RADII = (2.5, 4.0, 6.0, 8.0, 10.5)
 _MAX_SHELTER_RAYS = 18
+_DEAD_GROUND_RADII = (14.0, 20.0, 27.0)
+_DEAD_GROUND_DIRECTIONS = 8
+_MAX_DEAD_GROUND_RAYS = 14
 
 
 def mix(*values: int) -> float:
@@ -302,6 +305,49 @@ def find_shelter(world, observer: PlayerSnapshot, threats: Sequence[Vector3], *,
                     hidden = False
                     break
             if hidden and straight_walkable(world, observer.position, surface.position):
+                return surface.position
+            if rays >= max_rays:
+                return None
+    return None
+
+
+def find_dead_ground(world, observer: PlayerSnapshot, threats: Sequence[Vector3], *,
+                     side: float = 1.0,
+                     max_rays: int = _MAX_DEAD_GROUND_RAYS) -> Vector3 | None:
+    """Farther ground no threat point can see, for a retreat across the open.
+
+    ``find_shelter`` stops at a dozen blocks because it promises a straight
+    walk. This looks out to the next fold in the terrain and promises only
+    that the spot is hidden; the route planner finds the way there.
+    """
+
+    if not threats:
+        return None
+    primary = threats[0]
+    away = math.atan2(observer.position[1] - primary[1],
+                      observer.position[0] - primary[0])
+    first = 1 if side >= 0.0 else -1
+    rays = 0
+    for radius in _DEAD_GROUND_RADII:
+        for index in range(_DEAD_GROUND_DIRECTIONS):
+            step = (index + 1) // 2 * (first if index % 2 else -first)
+            if abs(step) > _DEAD_GROUND_DIRECTIONS // 4:
+                continue  # the half of the compass away from the shooter
+            angle = away + step * (2.0 * math.pi / _DEAD_GROUND_DIRECTIONS)
+            x = observer.position[0] + math.cos(angle) * radius
+            y = observer.position[1] + math.sin(angle) * radius
+            surface = world.surface(int(math.floor(x)), int(math.floor(y)),
+                                    observer.position[2], vertical_span=6,
+                                    allow_water=False)
+            if surface is None:
+                continue
+            hidden = True
+            for threat in threats:
+                rays += 1
+                if world.has_line_of_sight(surface.position, threat):
+                    hidden = False
+                    break
+            if hidden:
                 return surface.position
             if rays >= max_rays:
                 return None
