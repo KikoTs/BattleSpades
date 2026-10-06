@@ -2098,3 +2098,44 @@ def test_distant_team_routes_receive_stable_distinct_segment_lanes() -> None:
     assert styles.count(_TraversalStyle.DRY) == 4
     assert styles.count(_TraversalStyle.SWIM) == 4
     assert styles.count(_TraversalStyle.BRIDGE) == 4
+
+
+def _tower_beside_a_ledge() -> SimpleVoxelWorld:
+    """Ground at 237. Column (10, 10) has a tower top at 198; the next column
+    has a ledge at 201 that nothing leads to."""
+    solids = {(x, y, 237) for x in range(24) for y in range(24)}
+    solids.update({(10, 10, 198), (11, 10, 201)})
+    return _world(solids)
+
+
+def test_a_goal_names_the_floor_in_its_own_column_whose_standing_body_holds_it():
+    world = _tower_beside_a_ledge()
+
+    def floor(goal):
+        surface = world.goal_surface(goal)
+        return surface and (surface.x, surface.y, surface.support_z)
+
+    # An entity lies on its floor; a player position is 2.25 above its own.
+    assert floor((10.5, 10.5, 198.0)) == (10, 10, 198)
+    assert floor((10.5, 10.5, 195.75)) == (10, 10, 198)
+    assert floor((10.5, 10.5, 234.75)) == (10, 10, 237)
+    assert floor((11.5, 10.5, 198.75)) == (11, 10, 201)
+    # A height with no floor near it still names its column.
+    assert floor((5.5, 5.5, 200.0)) == (5, 5, 237)
+    assert floor((40.5, 40.5, 200.0)) is None
+    assert world.standable_supports(10, 10) == (198, 237)
+
+
+def test_the_map_wide_search_aims_at_the_floor_under_an_entity_not_a_ledge_beside_it():
+    """BlockNess: the bomb lies on the tower top at z=198. Read as an eye
+    height it rounded to a floor at 200, the ledge at 201 in the next column
+    was the nearest match, and 32,768 expansions later there was no route."""
+    world = _tower_beside_a_ledge()
+    area = 512 * 512
+    world._atlas = SimpleNamespace(primary_support=bytes([255]) * area, flags=bytes(area),
+                                   layer_count=bytes(area), width=512, height=512)
+    search = world.begin_corridor((2.5, 2.5, 234.75), (10.5, 10.5, 198.0),
+                                  blocked_edges=frozenset())
+    assert search is not None
+    assert (search.target % area % 512, search.target % area // 512,
+            search.target // area) == (10, 10, 198)
