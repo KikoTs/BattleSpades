@@ -180,6 +180,192 @@ def isolation(solid: SolidFn, position: Vector3, hunters: Sequence[Vector3] = ()
     return _run(iter_isolation(solid, position, hunters, **kwargs))
 
 
+@dataclass(frozen=True, slots=True)
+class Approach:
+    """How far a zombie on foot is from a survivor's floor, cell by cell.
+
+    ``steps`` maps every explored standing cell to the number of moves a
+    zombie needs from there to the survivor (walking, a two-block jump up, a
+    drop of up to four: the edges the bots' route planner really takes).
+    ``closed`` means the flood ran out of floor before it ran out of budget:
+    nothing walks in from outside, the footing is a pillar top, a platform,
+    a sealed room. Otherwise ``frontier`` is the fewest moves from any floor
+    the budget left unexplored, a lower bound for every cell not in
+    ``steps``.
+    """
+
+    support_z: int
+    steps: dict[Cell, int]
+    closed: bool
+    frontier: int
+    # Farthest explored floor from the survivor, in blocks (the footprint of
+    # a closed platform; the fall lands inside it).
+    radius: float
+    # For every explored cell but the survivor's own, the next cell on its
+    # shortest way in.
+    toward: dict[Cell, Cell]
+    # The explored cells by eight-block square, for entry_near.
+    squares: dict[tuple[int, int], tuple[Cell, ...]]
+
+    def cell_at(self, position: Vector3) -> Cell | None:
+        """The explored standing cell under a body at ``position``."""
+
+        x, y = int(math.floor(position[0])), int(math.floor(position[1]))
+        floor = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
+        for level in (floor, floor + 1, floor - 1):
+            if (x, y, level) in self.steps:
+                return (x, y, level)
+        return None
+
+    def moves_from(self, position: Vector3) -> int | None:
+        """Moves from a body standing at ``position``; None when unexplored."""
+
+        cell = self.cell_at(position)
+        return None if cell is None else self.steps[cell]
+
+    def waypoint(self, cell: Cell, ahead: int) -> Cell:
+        """The cell ``ahead`` moves along the way in from ``cell``."""
+
+        for _ in range(max(0, int(ahead))):
+            following = self.toward.get(cell)
+            if following is None:
+                break
+            cell = following
+        return cell
+
+    def entry_near(self, position: Vector3, reach: float) -> Cell | None:
+        """Nearest explored floor on a body's own level (two blocks either way).
+
+        For a hunter the flood did not reach: where the known way in begins.
+        """
+
+        px, py = float(position[0]), float(position[1])
+        floor = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
+        best, best_gap = None, float(reach) ** 2
+        sx, sy = int(math.floor(px)) >> 3, int(math.floor(py)) >> 3
+        squares = self.squares
+        # Square rings outward: a ring that is wholly farther than the best
+        # floor found so far ends the search.
+        for ring in range(int(reach) // 8 + 2):
+            if best is not None and best_gap <= (8.0 * (ring - 1)) ** 2:
+                break
+            for ox in range(-ring, ring + 1):
+                edge = abs(ox) == ring
+                for oy in (range(-ring, ring + 1) if edge else (-ring, ring)):
+                    for cell in squares.get((sx + ox, sy + oy), ()):
+                        if abs(cell[2] - floor) > 2:
+                            continue
+                        gap = (cell[0] + 0.5 - px) ** 2 + (cell[1] + 0.5 - py) ** 2
+                        if gap < best_gap:
+                            best, best_gap = cell, gap
+        return best
+
+
+# The route planner's own vertical edges (simple_navigation._neighbors).
+APPROACH_JUMP = 2
+APPROACH_DROP = 4
+
+
+def iter_approach(
+    solid: SolidFn,
+    position: Vector3,
+    *,
+    limit: int = 700,
+    jump: int = APPROACH_JUMP,
+    drop: int = APPROACH_DROP,
+) -> Generator[None, None, Approach | None]:
+    """Flood outward from a survivor's floor along the ways a zombie comes in.
+
+    Breadth-first over standing cells, following every edge backwards: a
+    cell joins when a zombie standing there can step, jump or drop onto a
+    cell already reached. Bounded by ``limit`` cells, so open ground yields
+    the neighbourhood (about fifteen blocks round) and a closed footing is
+    proved closed in a few dozen probes. Returns None for a body with no
+    floor under it (falling).
+    """
+
+    support = support_cells(solid, position)
+    if not support:
+        return None
+    px, py = float(position[0]), float(position[1])
+    floor_z = support[0][2]
+    start = min(support, key=lambda c: (c[0] + 0.5 - px) ** 2 + (c[1] + 0.5 - py) ** 2)
+    steps: dict[Cell, int] = {cell: 0 for cell in support}
+    toward: dict[Cell, Cell] = {}
+    queue: deque[Cell] = deque(support)
+    frontier = 0
+    radius = 0.0
+    work = 0
+    window = range(-drop - 3, jump + 1)
+    span = range(-drop, jump + 1)
+    base = -window.start
+    # A column read from one level, top to bottom, and the levels of it with
+    # standing room: on level ground each is asked for by four neighbours.
+    scans: dict[Cell, tuple[tuple[bool, ...], tuple[int, ...]]] = {}
+
+    def scan(cx: int, cy: int, cz: int):
+        column = tuple(0 <= cz + offset and solid(cx, cy, cz + offset) for offset in window)
+        found = scans[(cx, cy, cz)] = (column, tuple(
+            offset for offset in span
+            if column[base + offset] and not column[base + offset - 1]
+            and not column[base + offset - 2]))
+        return found
+
+    while queue:
+        cell = queue.popleft()
+        x, y, z = cell
+        depth = steps[cell]
+        if len(steps) >= limit:
+            # Out of budget: everything still queued is unexplored floor.
+            frontier = depth
+            break
+        radius = max(radius, math.hypot(x + 0.5 - px, y + 0.5 - py))
+        own = None
+        for dx, dy in _CARDINAL:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                continue
+            column, levels = scans.get((nx, ny, z)) or scan(nx, ny, z)
+            for offset in levels:
+                nz = z + offset
+                key = (nx, ny, nz)
+                if key in steps or nz > GROUND_Z + 1:
+                    continue  # (the waterbed, one below, is waded)
+                if offset >= 1:
+                    # The zombie stands lower and comes up: its own column
+                    # must be open until its feet clear this floor.
+                    if any(column[base + k] for k in range(-2, offset - 2)):
+                        continue
+                elif offset <= -1:
+                    # It stands higher and comes down: this column must be
+                    # open from the height it walks in at (the planner asks
+                    # one cell more above a real drop).
+                    if own is None:
+                        own = (scans.get(cell) or scan(x, y, z))[0]
+                    top = offset - 2 if offset == -1 else offset - 3
+                    if any(own[base + k] for k in range(top, -2)):
+                        continue
+                steps[key] = depth + 1
+                toward[key] = cell
+                queue.append(key)
+        work += 1
+        if work % 6 == 0:
+            yield
+    yield
+    squares: dict[tuple[int, int], list[Cell]] = {}
+    for cell in steps:
+        squares.setdefault((cell[0] >> 3, cell[1] >> 3), []).append(cell)
+    return Approach(
+        support_z=floor_z, steps=steps, closed=not queue and frontier == 0,
+        frontier=frontier, radius=radius, toward=toward,
+        squares={key: tuple(cells) for key, cells in squares.items()},
+    )
+
+
+def approach(solid: SolidFn, position: Vector3, **kwargs) -> Approach | None:
+    return _run(iter_approach(solid, position, **kwargs))
+
+
 def _floor_below(solid: SolidFn, x: int, y: int, z: int, depth: int) -> int | None:
     for level in range(z, min(z + depth, GROUND_Z + 1) + 1):
         if solid(x, y, level):
@@ -228,23 +414,30 @@ def dig_cost(solid: SolidFn, cell: Cell, ground_floor_z: int | None = None) -> i
 
 
 def horde_floor(solid: SolidFn, position: Vector3, hunters: Sequence[Vector3] = (),
-                *, radius: float = 32.0) -> int:
-    """The floor z the horde stands on around ``position``.
+                *, radius: float = 12.0) -> int:
+    """The ground at the foot of a survivor's footing, where diggers stand.
 
-    Median floor of hunters within ``radius`` when there are any, otherwise
-    the lower quartile of the terrain floors on rings 6 and 10 blocks out
-    (first solid voxel below the player's own floor level).
+    Lower quartile of the terrain floors on rings 6 and 10 blocks out (first
+    solid voxel below the survivor's own floor level) and of the ground
+    under every hunter within ``radius``. Hunters farther off say nothing
+    about this spot: a horde still running in over higher ground used to
+    make the foot of a pillar look like part of the pillar, and the cut was
+    planned ten blocks up where no claw reaches.
     """
 
     px, py = float(position[0]), float(position[1])
-    floors = sorted(
-        int(round(float(h[2]) + PLAYER_SUPPORT_OFFSET)) for h in hunters
-        if math.hypot(float(h[0]) - px, float(h[1]) - py) <= radius
-    )
-    if floors:
-        return floors[len(floors) // 2]
     start = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
     samples = []
+    for h in hunters:
+        if math.hypot(float(h[0]) - px, float(h[1]) - py) > radius:
+            continue
+        feet = int(round(float(h[2]) + PLAYER_SUPPORT_OFFSET))
+        # A hunter in mid-jump is up to four blocks off the ground it will
+        # land on: take the floor under the body, not its height.
+        x, y = int(math.floor(float(h[0]))), int(math.floor(float(h[1])))
+        under = (_floor_below(solid, x, y, feet - 1, 6)
+                 if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE and feet >= 1 else None)
+        samples.append(feet if under is None else under)
     for ring in (6, 10):
         for step in range(8):
             angle = step * math.pi / 4.0
@@ -378,8 +571,13 @@ def iter_plan_collapse(
     sink_flow = [0] * count                   # out_i -> SINK flow
     total = 0
     SOURCE, SINK = -1, -2
+    # Paths are first looked for depth first, downward: the way from a floor
+    # to the ground is down a leg, and a breadth-first pass reads the whole
+    # structure to find each one. The breadth-first pass below still has the
+    # last word: it finishes the flow and proves no path is left.
+    diving = True
     while True:
-        # BFS over states: ("in", i) encoded 2i, ("out", i) encoded 2i+1.
+        # States: ("in", i) encoded 2i, ("out", i) encoded 2i+1.
         parent: dict[int, int] = {}
         queue: deque[int] = deque()
         for i in source_set:
@@ -387,6 +585,36 @@ def iter_plan_collapse(
             queue.append(2 * i)
         found = -1
         steps = 0
+        while diving and queue and found < 0:
+            node = queue.pop()
+            i, side = divmod(node, 2)
+            if side == 0:
+                for j in adjacency[i]:
+                    if edge_flow.get((j, i), 0) > 0 and (2 * j + 1) not in parent:
+                        parent[2 * j + 1] = node
+                        queue.append(2 * j + 1)
+                if vertex_residual[i] > 0 and (2 * i + 1) not in parent:
+                    parent[2 * i + 1] = node
+                    queue.append(2 * i + 1)
+            else:
+                if to_sink[i]:
+                    found = node
+                    break
+                if vertex_back[i] > 0 and (2 * i) not in parent:
+                    parent[2 * i] = node
+                    queue.append(2 * i)
+                depth = cells[i][2]
+                for lower in (False, True):   # the cells below are tried first
+                    for j in adjacency[i]:
+                        if (cells[j][2] > depth) is lower and (2 * j) not in parent:
+                            parent[2 * j] = node
+                            queue.append(2 * j)
+            steps += 1
+            if steps % (_WORK_PER_YIELD * 8) == 0:
+                yield
+        if diving and found < 0:
+            diving = False
+            continue
         while queue and found < 0:
             node = queue.popleft()
             i, side = divmod(node, 2)
@@ -554,13 +782,16 @@ def _run(generator):
 
 
 __all__ = [
+    "Approach",
     "CollapsePlan",
     "Isolation",
+    "approach",
     "claw_sites",
     "dig_cost",
     "falls_after",
     "horde_floor",
     "isolation",
+    "iter_approach",
     "iter_isolation",
     "iter_plan_collapse",
     "plan_collapse",
