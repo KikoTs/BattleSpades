@@ -69,6 +69,25 @@ if sys.platform == "win32":
     if all(path.is_file() for path in relay_files):
         datas.extend((str(path), "relay") for path in relay_files)
 
+# Steam relay host for dedicated servers (tools/steam_host): players join
+# through Steam's relay network where the server's address is blocked. Shipped
+# with the Steamworks redistributable library it links; a build that did not
+# produce it (no Steamworks library for the platform) simply ships without.
+steam_host_names = (
+    ("battlespades-steam-host.exe", "steam_api64.dll")
+    if sys.platform == "win32"
+    else ("battlespades-steam-host", "libsteam_api.so")
+)
+for steam_host_dir in (
+    project_root / "build" / "steam-host" / "Release",
+    project_root / "build" / "steam-host",
+):
+    steam_host_files = [steam_host_dir / name for name in steam_host_names]
+    if all(path.is_file() for path in steam_host_files):
+        # Opaque data: a separately launched program, not an in-process binary.
+        datas.extend((str(path), "steam-host") for path in steam_host_files)
+        break
+
 # Desktop host assets: our own icon and the OFL heading font with its licence.
 for gui_asset in ("assets", "fonts"):
     for asset in sorted((project_root / "server_gui" / gui_asset).glob("*")):

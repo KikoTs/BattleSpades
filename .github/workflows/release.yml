@@ -104,6 +104,18 @@ jobs:
           cmake --build build/steam-bridge --config Release --parallel
           if ($LASTEXITCODE -ne 0) { throw "Steam bridge build failed" }
 
+      - name: Build Steam relay host
+        # Lets players join through Steam's relay network where the server's
+        # address is blocked (tools/steam_host). Valve ships no Steamworks
+        # library for Windows on Arm, and macOS has no dedicated-server Steam
+        # runtime. Never fatal: the server ships without it if this fails.
+        if: (matrix.platform == 'windows' && matrix.architecture == 'x86_64') || matrix.platform == 'linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          cmake -S tools/steam_host -B build/steam-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/steam-host --config Release --parallel
+
       - name: Run complete source test suite
         run: python -m pytest tests -q
 

@@ -69,10 +69,12 @@ the Valve components. If you modify BattleSpades, you may extend this
 permission to your version, but you are not obliged to.
 
 The ordinary server's legacy master-registration helper loads Valve runtime
-files supplied by the operator. The optional retail Steam relay package also
-includes the Steamworks SDK's `steam_api64.dll` redistributable beside its
-separate helper. That Valve binary is not covered by the AGPL; it retains
-Valve's Steamworks SDK terms. No original retail game binary is distributed
+files supplied by the operator. The optional retail Steam relay package and
+the Steam relay host for dedicated servers (`steam-host/`) each include the
+Steamworks SDK's redistributable library (`steam_api64.dll`, or
+`libsteam_api.so` on Linux) beside their separate helper. That Valve binary
+is not covered by the AGPL; it retains Valve's Steamworks SDK terms. Valve's
+`steamclient` runtime is never shipped: the operator supplies it. No original retail game binary is distributed
 in the retail patch package.
 
 ## Names and trademarks
