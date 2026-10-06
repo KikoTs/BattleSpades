@@ -166,7 +166,11 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     # ---- Server identity ------------------------------------------------
     pkt.server_steam_id = _server_steam_id(server)
     steam_master = getattr(server, 'steam_master', None)
-    pkt.server_ip = int(getattr(steam_master, 'public_ip', 0) or 0)
+    # Steam reports the address as an unsigned 32-bit value, but the wire
+    # field is a signed int: any IP from 128.0.0.0 up overflowed and aborted
+    # every join. The two's-complement value writes the same four bytes.
+    public_ip = int(getattr(steam_master, 'public_ip', 0) or 0) & 0xFFFFFFFF
+    pkt.server_ip = public_ip - (1 << 32) if public_ip >= 1 << 31 else public_ip
     pkt.server_port = int(cfg.port)
     if bool(getattr(steam_master, 'query_active', False)):
         pkt.query_port = int(cfg.steam.effective_query_port(cfg.port))
