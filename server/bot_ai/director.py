@@ -40,6 +40,7 @@ from .messages import (
     ObjectiveSnapshot,
     PerceptionFrame,
     PlayerSnapshot,
+    StimulusKind,
     VoxelChange,
 )
 from .prefab_policy import bot_prefab_is_suitable, is_zombie_prefab
@@ -1024,6 +1025,14 @@ class BotDirector:
     def on_player_killed(self, victim: "Player", killer: "Player | None", kill_type: int) -> None:
         """Let talkative bots react to a kill the whole server just saw."""
 
+        # Awareness hook: the death cry bots nearby hear, with the kill feed's
+        # killer as its source.
+        stimuli = getattr(self.server, "bot_stimuli", None)
+        if stimuli is not None and killer is not None:
+            stimuli.publish(
+                StimulusKind.DEATH, tuple(float(value) for value in victim.position),
+                source_id=int(killer.id), team=int(getattr(victim, "team", -1)),
+            )
         if not bool(getattr(self._config, "chatter", False)) or killer is None:
             return
         if int(getattr(victim, "team", -1)) == int(getattr(killer, "team", -2)) and victim is not killer:

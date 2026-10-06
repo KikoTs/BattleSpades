@@ -15,7 +15,7 @@ from server.bot_ai.messages import (
     BotAction, BotActionKind, BotIntentPriority, LookIntent, MovementAffordance,
     Stimulus, StimulusKind,
 )
-from server.bot_ai.messages import MovementIntent
+from server.bot_ai.messages import MovementIntent, ObjectiveSnapshot
 from server.bot_ai.policies import ModeBotDecision, ModeBotPosture
 from server.bot_ai.stimuli import HEARING_DISTANCE, BotStimulusBus
 from server.bot_ai.simple_navigation import RouteStep
@@ -703,3 +703,125 @@ def test_director_publishes_footsteps_and_filters_what_each_bot_hears():
     assert {event.source_id for event in server.bot_stimuli._events} == {int(bot.id), 77}
     assert [(event.kind, event.source_id) for event in frames[-1].stimuli] == [
         (StimulusKind.FOOTSTEP, 77)]
+
+
+# -- a teammate killed beside the bot ---------------------------------------
+
+_SNIPER = (-25.5, 10.5, _FLOOR - 2.25)
+
+
+def _death(position, at, *, killer=7, team=TEAM1):
+    return Stimulus(kind=StimulusKind.DEATH, position=position, created_at=at,
+                    expires_at=at + 1.5, source_id=killer, team=team, uncertainty=0.75)
+
+
+def _kill_beside(awareness, observer, now, *, profile=None, decision=None, visible=None,
+                 shot=True, death=None, others=(), objectives=()):
+    """One frame in which a teammate two blocks away is shot dead."""
+
+    death = death or _death((10.5, 12.5, observer.position[2]), now - 0.05)
+    sounds = ((_sound(StimulusKind.SHOT, _SNIPER, now - 0.06),) if shot else ()) + (death,)
+    profile = profile or _expert()
+    frame = replace(_frame(observer, *others, created_at=now, objectives=objectives),
+                    profile=profile, stimuli=sounds)
+    return awareness.react(frame, observer, profile, visible, decision, now)
+
+
+def test_director_publishes_a_death_with_its_killer_for_bots_in_earshot():
+    server, director, bot, _runtime = _facing_fixture()
+    server.bot_stimuli = BotStimulusBus()
+    killer = SimpleNamespace(id=42, team=TEAM2, name="Sniper", position=(0.0, 0.0, 0.0))
+    director.on_player_killed(bot, killer, int(C.HEADSHOT_KILL))
+    heard = server.bot_stimuli.perceive(tuple(bot.position), now=time.monotonic() + 0.1,
+                                        rng=random.Random(5))
+    assert [(event.kind, event.source_id, event.team) for event in heard] == [
+        (StimulusKind.DEATH, 42, int(bot.team))]
+    far = (bot.x + HEARING_DISTANCE + 5.0, bot.y, bot.z)
+    assert server.bot_stimuli.perceive(far, now=time.monotonic() + 0.1,
+                                       rng=random.Random(5)) == ()
+
+
+def test_a_teammate_shot_dead_beside_the_bot_turns_it_to_the_shot_and_into_cover():
+    world = _GridWorld(_wall(8, range(12, 18), range(_FLOOR - 4, _FLOOR))
+                       | _wall(7, range(12, 18), range(_FLOOR - 4, _FLOOR)))
+    awareness = _awake(world)
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    assert _kill_beside(awareness, observer, 100.1) is None  # not inside its reaction time
+    life = awareness._lives[(1, 1)]
+    assert life.alert >= 0.6
+    look = _look(awareness, observer, life.glance_from + 0.05)
+    assert look.glance and look.target[:2] == _SNIPER[:2]
+    run = _react(awareness, observer, life.fire_noticed_at + 0.05)
+    assert run is not None and run.role == "ally_down_cover"
+    spot = life.shelter.spot
+    assert not world.has_line_of_sight(spot, _SNIPER)
+    hold = _react(awareness, replace(observer, position=spot, eye=spot),
+                  life.fire_noticed_at + 0.4)
+    assert hold.role == "ally_down_hold" and hold.look == _SNIPER and hold.crouch
+    # A hit while it lies there makes this an ordinary fight under fire.
+    hit = _hit(replace(observer, position=spot, eye=spot), life.fire_noticed_at + 0.5,
+               source=_SNIPER, attacker=7)
+    assert _react(awareness, hit, life.fire_noticed_at + 0.6).role.startswith("under_fire")
+
+
+@pytest.mark.parametrize("case", ("far", "out_of_sight", "enemy_died", "accident", "none"))
+def test_only_a_teammate_killed_by_an_enemy_within_sight_is_the_bots_business(case):
+    world = _GridWorld()
+    awareness = _awake(world)
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    height, others, death = observer.position[2], (), None
+    if case == "far":
+        death = _death((10.5, 40.5, height), 100.05)
+    elif case == "out_of_sight":
+        world.cells |= _wall(10, range(18, 22), range(_FLOOR - 4, _FLOOR))
+        death = _death((10.5, 24.5, height), 100.05)
+    elif case == "enemy_died":
+        death = _death((10.5, 12.5, height), 100.05, killer=5, team=TEAM2)
+    elif case == "accident":
+        # Killed by a teammate's stray rocket: nobody to hide from.
+        death = _death((10.5, 12.5, height), 100.05, killer=5)
+        others = (_fighter(5, TEAM1, 20.5, 10.5),)
+    for step in range(16):
+        now = 100.1 + step * 0.125
+        if case == "none":
+            assert _react(awareness, observer, now) is None
+        else:
+            assert _kill_beside(awareness, observer, now, death=death, others=others,
+                                shot=False) is None
+    life = awareness._lives[(1, 1)]
+    assert life.fire_from is None and life.glance is None and life.alert == 0.0
+
+
+def test_a_killer_too_far_to_hear_leaves_the_enemy_side_of_the_map():
+    awareness = _awake(_GridWorld())
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    anchors = (ObjectiveSnapshot("team_anchor", TEAM2, (200.5, 10.5, observer.position[2])),)
+    _kill_beside(awareness, observer, 100.1, shot=False, objectives=anchors)
+    life = awareness._lives[(1, 1)]
+    assert life.glance is not None and life.glance[0] > 40.0  # toward the enemy base
+    # Without even that, there is nothing to turn to.
+    blind = _awake(_GridWorld())
+    _kill_beside(blind, observer, 100.1, shot=False)
+    assert blind._lives[(1, 1)].glance is None and blind._lives[(1, 1)].fire_from is None
+
+
+def test_temperament_and_the_objective_decide_between_a_look_and_cover():
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    bold = _awake(_GridWorld(), profile=_casual(caution=0.3))
+    _kill_beside(bold, observer, 100.1, profile=_casual(caution=0.3))
+    assert bold._lives[(1, 1)].glance is not None and bold._lives[(1, 1)].fire_from is None
+
+    raid = ModeBotDecision((90.0, 10.0, 0.0), "ctf_attack_intel", objective_priority=0.9)
+    raider = _awake(_GridWorld())
+    _kill_beside(raider, observer, 100.1, decision=raid)
+    assert raider._lives[(1, 1)].glance is not None and raider._lives[(1, 1)].fire_from is None
+
+    carrier = _awake(_GridWorld())
+    _kill_beside(carrier, replace(observer, carried_entity_id=7), 100.1)
+    assert carrier._lives[(1, 1)].glance is None
+
+    # A bot already shooting at someone keeps shooting.
+    enemy = _fighter(9, TEAM2, 40.5, 10.5)
+    busy = _awake(_GridWorld())
+    _kill_beside(busy, observer, 100.1, visible=enemy, others=(enemy,))
+    assert busy._lives[(1, 1)].glance is None and busy._lives[(1, 1)].alert >= 0.6

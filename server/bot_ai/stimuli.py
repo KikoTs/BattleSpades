@@ -24,7 +24,7 @@ _FOOTSTEP_SPEED = 1.5
 _FOOTSTEP_LIFETIME = 0.45
 _SOUNDS = frozenset({
     StimulusKind.SHOT, StimulusKind.EXPLOSION, StimulusKind.BLOCK_DESTROYED,
-    StimulusKind.FOOTSTEP, StimulusKind.DEPLOYABLE,
+    StimulusKind.FOOTSTEP, StimulusKind.DEPLOYABLE, StimulusKind.DEATH,
 })
 
 
