@@ -137,17 +137,21 @@ def test_classic_ctf_does_not_track_a_hidden_enemy_carrier() -> None:
     assert decision.role == "classic_ctf_attack_intel"
     assert decision.position == enemy_intel.position
 
-    hidden_drop = ObjectiveSnapshot(
+    # The enemy intel a teammate dropped is where that teammate fell, which
+    # the team knows without a minimap; the hidden enemy carrier stays hidden.
+    far_drop = ObjectiveSnapshot(
         "ctf_intel", 3, (275.0, 180.0, 60.0), state=1
     )
-    assert objective_decision_for(
+    decision = objective_decision_for(
         _frame(
             "cctf",
             observer,
-            objectives=(own_base, stolen, hidden_drop),
+            objectives=(own_base, stolen, far_drop),
         ),
         observer,
-    ) is None
+    )
+    assert decision.role == "classic_ctf_attack_intel"
+    assert decision.position == far_drop.position
 
 
 def test_zombie_policy_changes_from_preparation_to_last_man_hunt() -> None:
