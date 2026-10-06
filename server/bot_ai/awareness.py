@@ -890,7 +890,10 @@ class Awareness:
             outnumbered = odds >= (1 if lean > 0.3 else 3 if lean < -0.4 else 2)
             hurt = observer.health <= 22.0 + 26.0 * float(profile.caution) - 12.0 * float(
                 profile.aggression)
-            lost = max(health for _at, health in life.health_log) - int(observer.health)
+            # The log restarts whenever the pressure lets up; the enemies seen
+            # just before may still be remembered when it does.
+            lost = max((health for _at, health in life.health_log),
+                       default=int(observer.health)) - int(observer.health)
             # Whatever the temperament: at this rate there are seconds left,
             # and fewer when more than one gun is doing it.
             losing = lost >= 20 and observer.health <= (2.5 if odds >= 1 else 1.5) * lost
