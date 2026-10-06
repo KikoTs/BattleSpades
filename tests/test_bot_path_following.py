@@ -202,15 +202,15 @@ def test_waiting_for_a_plan_keeps_walking_only_over_plain_ground():
 class _Voxels:
     """Columns of solid ground with a real ``solid`` query, for ledges."""
 
-    def __init__(self, floors, *, default=_FLOOR, walls=(), water=()):
+    def __init__(self, floors, *, default=_FLOOR, walls=(), water=(), cells=()):
         self.floors, self.default = dict(floors), default
-        self.walls, self.water = set(walls), set(water)
+        self.walls, self.water, self.cells = set(walls), set(water), set(cells)
 
     def _floor(self, x, y):
         return self.floors.get((x, y), self.default)
 
     def solid(self, x, y, z):
-        return (x, y) in self.walls or z >= self._floor(x, y)
+        return (x, y) in self.walls or z >= self._floor(x, y) or (x, y, z) in self.cells
 
     def surface(self, x, y, height, *, vertical_span=1, allow_water=False, **_kwargs):
         floor = self._floor(x, y)
@@ -344,3 +344,20 @@ def test_casual_errands_are_not_swapped_every_second_but_real_business_never_wai
     brain.world.plan = lambda *_args, **_kwargs: RoutePlan(_STRAIGHT, True, 1)
     brain._navigation_intent(frame, observer, state, goal, 100.1)  # "trip" is not a casual errand
     assert state.goal.key == goal.key
+
+
+def test_a_line_counts_the_whole_footprint_not_only_the_centre_and_shoulders():
+    """The mover lifts the body as soon as its box reaches a higher column.
+
+    A line a twentieth of a block inside a ledge's column is walked a block
+    up. In the open that is a bump. Under a roof three blocks up the rise is
+    refused and the body stops against the ledge, so that line is no walk.
+    """
+    ledge = {(15, 11): _FLOOR - 1}
+    roof = {(x, 10, _FLOOR - 4) for x in range(8, 24)}
+    grazing = ((10.5, 10.6, _HEAD), (20.5, 10.6, _HEAD))
+    centred = ((10.5, 10.5, _HEAD), (20.5, 10.5, _HEAD))
+    assert straight_walkable(_Voxels(ledge), *grazing)
+    assert not straight_walkable(_Voxels(ledge, cells=roof), *grazing)
+    assert straight_walkable(_Voxels(ledge, cells=roof), *centred)
+    assert straight_walkable(_Voxels({}, cells=roof), *grazing)
