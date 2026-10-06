@@ -2161,16 +2161,27 @@ def standing_order_for(frame: PerceptionFrame, observer: PlayerSnapshot) -> Mode
     A policy with nothing to say (objectives not published yet, a state it
     does not cover) used to leave the worker without a goal, and the bot
     stood where it was until the state changed. Push on the enemy side when
-    the map names one, otherwise walk a beat around home or the spot itself.
+    the map names one, otherwise walk a beat around home. A frame that names
+    no place at all gives nowhere to walk to: the bot holds its ground with
+    a named order (wandering from the spot walked a bot that had just
+    climbed out of London's river back toward it).
     """
 
     push = _FALLBACK.decide(frame, observer)
     if push is not None:
         return push
     home = _objective(frame, "team_anchor", observer.team)
+    if home is None:
+        return ModeBotDecision(
+            observer.position,
+            "hold_no_objective",
+            sprint=False,
+            arrival_radius=3.0,
+            posture=ModeBotPosture.BALANCED,
+            objective_priority=0.3,
+        )
     return ModeBotDecision(
-        _guard_beat(frame, observer,
-                    home.position if home is not None else observer.position, 8.0),
+        _guard_beat(frame, observer, home.position, 8.0),
         "patrol_no_objective",
         sprint=False,
         arrival_radius=3.0,

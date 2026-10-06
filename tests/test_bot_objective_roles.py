@@ -178,11 +178,14 @@ def test_every_mode_has_an_order_for_a_bot_whatever_the_objectives_say(mode, tea
         # The policy itself, not only the worker's safety net behind it.
         decision = objective_decision_for(frame, observer)
         assert decision is not None and decision.role, (mode, frame.mode_phase)
-    # Even with nothing published at all the worker's bot walks a beat.
+    # Even with nothing published at all the worker's bot has a named order.
     bare = ModePolicyMemory().decide(_frame(mode, observer), observer)
-    assert bare is not None
-    if not bare.role.endswith("_passive") and mode != "dia":
-        assert bare.position != observer.position
+    assert bare is not None and bare.role
+    # With only its own base known it walks a beat there.
+    own = (ObjectiveSnapshot("team_anchor", team, BLUE_HOME),)
+    home = ModePolicyMemory().decide(_frame(mode, observer, objectives=own), observer)
+    if home.role == "patrol_no_objective":
+        assert math.dist(home.position, BLUE_HOME) <= 14.0
 
 
 # ------------------------------------------------------- CTF team split (F05)
