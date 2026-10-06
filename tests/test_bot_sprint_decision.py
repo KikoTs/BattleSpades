@@ -109,3 +109,40 @@ def test_a_class_that_may_not_lets_go_of_sprint_just_before_the_step(class_id):
     # Down a slope there is nothing to climb.
     intent, state = _far_case(class_id, [0, -1, -1, -2, -2, -3, -3, -4, -4, -5, -5, -6])
     assert state.lookahead_active and intent.movement.sprint
+
+
+def _flat(blocks, *, velocity, class_id=int(C.CLASS_SOLDIER)):
+    """Is sprint held with one straight flat stride of ``blocks`` ahead?"""
+
+    observer = replace(_player(1, 1, _START, class_id=class_id, is_bot=True),
+                       velocity=(velocity, 0., 0.))
+    route = (RouteStep((_START[0] + blocks, 10.5, _HEAD), MovementAffordance.WALK),)
+    return SimpleBotBrain._route_allows_sprint(_BotState(1, 1, 0, route=route), observer)
+
+
+def test_the_run_a_sprint_needs_grows_with_the_speed_it_has_to_lose():
+    # From rest one decision of sprint stays under a walk: two blocks do.
+    assert _flat(2.0, velocity=0.0) and not _flat(1.5, velocity=0.0)
+    # At a Soldier's sprint (0.35 in the mover's units) the body coasts 2.8
+    # blocks after the keys and covers 1.4 before the next decision.
+    assert not _flat(3.5, velocity=.35) and _flat(4.5, velocity=.35)
+    # A Zombie's sprint is faster and needs more.
+    zombie = int(C.CLASS_ZOMBIE)
+    assert not _flat(4.5, velocity=.4125, class_id=zombie)
+    assert _flat(5.0, velocity=.4125, class_id=zombie)
+
+
+def test_a_standing_bot_sprints_the_short_run_to_a_takeoff_and_a_running_one_brakes():
+    from tests.test_bot_path_following import _brain_case, _walk
+
+    near_jump = _walk([(11, 10), (12, 10), (13, 10)]) + _walk([(14, 10)], MovementAffordance.JUMP)
+    brain, state, goal, observer, frame = _brain_case(near_jump)
+    assert brain._navigation_intent(frame, observer, state, goal, 100.0).movement.sprint
+    brain, state, goal, observer, frame = _brain_case(near_jump)
+    running = replace(observer, velocity=(.35, 0., 0.))
+    assert not brain._navigation_intent(
+        replace(frame, players=(running,)), running, state, goal, 100.0).movement.sprint
+    # One stride from the takeoff nobody starts a sprint.
+    at_jump = _walk([(11, 10)]) + _walk([(12, 10)], MovementAffordance.JUMP)
+    brain, state, goal, observer, frame = _brain_case(at_jump)
+    assert not brain._navigation_intent(frame, observer, state, goal, 100.0).movement.sprint
