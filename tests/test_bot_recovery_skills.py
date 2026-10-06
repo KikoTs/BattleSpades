@@ -386,6 +386,24 @@ def test_bridge_brakes_at_the_lip_then_lays_a_line():
     assert lay.look[0] < stopped.eye[0]
 
 
+@pytest.mark.parametrize("x,crouches", [(20.3, True), (20.6, False)])
+def test_bridge_lays_standing_while_the_body_reaches_into_the_line(x, crouches):
+    """The server counts a crouched body down to the floor layer.
+
+    A body at 20.6 is 0.9 wide and reaches into column 21, the line's first
+    cell. Crouching there cancelled the accepted line at its commit, without
+    a rejection the skill could count: DoubleDragon bot 11 re-laid the same
+    line for 17 s.
+    """
+    world = World(ground(z=100, xs=range(0, 21)) | ground(z=100, xs=range(28, 40)))
+    abilities = ClimbAbilities(None, 30, True)
+    plan = find_gap_bridge(world, (20.5, 10.5, 97.75), (35.5, 10.5, 97.75), abilities)
+    lay = _skill(plan, skill=0.8).update(snapshot((x, 10.5, 97.75)), world, 1.5, abilities)
+    assert lay.action.kind is BotActionKind.BUILD_LINE
+    assert tuple(int(v) for v in lay.action.position) == (21, 10, 100)
+    assert lay.crouch is crouches
+
+
 # -- driver --------------------------------------------------------------------------
 
 
