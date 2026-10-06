@@ -462,7 +462,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
   original client executable or proprietary game code. Portable server
   releases include the project's tracked VXL/KV6 gameplay content.
 - Networking via [pyenet](https://github.com/piqueserver/pyenet) / [ENet](http://enet.bespin.org/).
-- Community fixes: build & setup improvements from [@TylerJaacks](https://github.com/TylerJaacks).
+- Community fixes: build & setup improvements from [@TylerJaacks](https://github.com/TylerJaacks);
+  the Steam public-IP join fix from [@Coletex](https://github.com/Coletex).
 
 ## License
 
