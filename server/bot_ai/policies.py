@@ -455,17 +455,12 @@ class CTFBotPolicy:
                 engagement_radius=38.0,
             )
 
-        if (
-            enemy_intel is not None
-            and enemy_intel.carrier_id < 0
-            and (
-                int(enemy_intel.state) == 0
-                or not classic
-                # A dropped intel is an ordinary visible ground entity; only
-                # Classic's missing minimap limits it to what a bot can see.
-                or self._visible_drop(classic, observer, enemy_intel.position)
-            )
-        ):
+        # The enemy intel only ever leaves its home in a teammate's hands, so
+        # where it lies is where that teammate fell: the whole team knows the
+        # spot without a minimap. Limiting Classic to drops within sight left
+        # every far bot with no order for the rest of the match (Classic
+        # never returns a dropped intel).
+        if enemy_intel is not None and enemy_intel.carrier_id < 0:
             if own_base is not None and self._should_rally(
                     frame, observer, own_base.position, enemy_intel.position):
                 return ModeBotDecision(
@@ -487,11 +482,23 @@ class CTFBotPolicy:
                 objective_priority=0.82,
                 engagement_radius=90.0,
             )
-        return None
+        if enemy_intel is not None and enemy_intel.carrier_id != observer.player_id:
+            # A carrier the roster did not describe: its marker is still the
+            # teammate to close up on.
+            return ModeBotDecision(
+                enemy_intel.position,
+                f"{prefix}ctf_escort",
+                sprint=True,
+                arrival_radius=4.5,
+                posture=ModeBotPosture.ESCORT,
+                objective_priority=0.88,
+                engagement_radius=32.0,
+            )
+        # No intel published (its snapshot failed): fight on like any team.
+        return _FALLBACK.decide(frame, observer)
 
-
-    # Perception range: a dropped Classic intel farther than this is off
-    # screen with no minimap marker to reveal it.
+    # Perception range: our own dropped Classic intel farther than this is
+    # off screen with no minimap marker to reveal it.
     _CLASSIC_DROP_SIGHT = 160.0
 
     @classmethod
@@ -956,7 +963,7 @@ class VIPBotPolicy:
         if phase != "active":
             anchor = own_anchor or own_vip
             if anchor is None:
-                return None
+                return _FALLBACK.decide(frame, observer)
             return ModeBotDecision(
                 _formation_point(anchor.position, observer.player_id, 7.0),
                 "vip_form_up",
@@ -1106,7 +1113,15 @@ class ArenaBotPolicy:
             float(observer.last_damage_at) > 0.0
             and 0.0 <= frame.created_at - observer.last_damage_at <= 8.0
         )
-        if observer.health >= 55 or not recently_wounded:
+        teammates = [
+            player for player in frame.players
+            if player.team == observer.team
+            and player.player_id != observer.player_id
+            and player.alive
+        ]
+        # The last one standing has nobody to fall back on: it keeps hunting
+        # instead of waiting out the round where it was hit.
+        if observer.health >= 55 or not recently_wounded or not teammates:
             assault = _FALLBACK.decide(frame, observer)
             if assault is None:
                 return None
@@ -1119,14 +1134,6 @@ class ArenaBotPolicy:
                 objective_priority=0.62,
                 engagement_radius=120.0,
             )
-        teammates = [
-            player for player in frame.players
-            if player.team == observer.team
-            and player.player_id != observer.player_id
-            and player.alive
-        ]
-        if not teammates:
-            return None
         nearest = min(
             teammates,
             key=lambda player: _distance_squared(observer.position, player.position),
@@ -1266,7 +1273,7 @@ class DemolitionBotPolicy:
         phase = str(frame.mode_phase).lower()
         if phase in ("waiting", "building"):
             if own_base is None:
-                return None
+                return _FALLBACK.decide(frame, observer)
             return ModeBotDecision(
                 _formation_point(own_base.position, observer.player_id, 5.0),
                 "demolition_build_defences",
@@ -1344,7 +1351,8 @@ class DemolitionBotPolicy:
                 objective_priority=0.9,
                 engagement_radius=12.0 if at_base else 90.0,
             )
-        return None
+        # No enemy base published (its snapshot failed): fight on like any team.
+        return _FALLBACK.decide(frame, observer)
 
     @staticmethod
     def _is_repairer(frame: PerceptionFrame, observer: PlayerSnapshot, base) -> bool:
@@ -1762,6 +1770,30 @@ def objective_decision_for(
     return _watch_approach(frame, observer, decision)
 
 
+def standing_order_for(frame: PerceptionFrame, observer: PlayerSnapshot) -> ModeBotDecision:
+    """The order of a bot whose mode policy had none: it never stands idle.
+
+    A policy with nothing to say (objectives not published yet, a state it
+    does not cover) used to leave the worker without a goal, and the bot
+    stood where it was until the state changed. Push on the enemy side when
+    the map names one, otherwise walk a beat around home or the spot itself.
+    """
+
+    push = _FALLBACK.decide(frame, observer)
+    if push is not None:
+        return push
+    home = _objective(frame, "team_anchor", observer.team)
+    return ModeBotDecision(
+        _guard_beat(frame, observer,
+                    home.position if home is not None else observer.position, 8.0),
+        "patrol_no_objective",
+        sprint=False,
+        arrival_radius=3.0,
+        posture=ModeBotPosture.BALANCED,
+        objective_priority=0.3,
+    )
+
+
 def mode_objective_committed(decision: ModeBotDecision | None) -> bool:
     """Mode jobs keep locomotion ownership despite optional team activity.
 
@@ -1833,14 +1865,16 @@ class ModePolicyMemory:
         self._states.pop((int(player_id), int(generation)), None)
 
     def decide(self, frame: PerceptionFrame,
-               observer: PlayerSnapshot) -> ModeBotDecision | None:
+               observer: PlayerSnapshot) -> ModeBotDecision:
         epoch = (frame.map_epoch, frame.mode_epoch)
         if self.epoch != epoch:
             self.reset()
             self.epoch = epoch
         key = (observer.player_id, observer.generation)
         decision = objective_decision_for(frame, observer)
-        if decision is None or not mode_objective_committed(decision):
+        if decision is None:
+            decision = standing_order_for(frame, observer)
+        if not mode_objective_committed(decision):
             self._states.pop(key, None)
             return decision
         now = float(frame.created_at)
@@ -2079,4 +2113,5 @@ __all__ = [
     "mode_strategy_for",
     "objective_decision_for",
     "objective_goal_for",
+    "standing_order_for",
 ]
