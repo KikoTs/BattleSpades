@@ -4113,6 +4113,17 @@ class SimpleBotBrain:
                         state.corridor_index = entry
                         state.dry_detour_goal = None
                         self._clear_route(state, now)
+                        # This guidance was asked for because local routing
+                        # got nowhere, so the progress clocks are about to
+                        # expire as it arrives. Left running, they blamed the
+                        # corridor's first edge within a second, blocked the
+                        # way out for a minute and dropped the corridor. An
+                        # escape already starts on fresh clocks; so does this.
+                        state.navigation_progress_position = observer.position
+                        state.navigation_progress_at = float(now)
+                        state.navigation_window_position = observer.position
+                        state.navigation_window_at = float(now)
+                        self.skills.restart_stuck_clock(observer, now)
                 state.corridor_search = None
                 state.corridor_join_index = 0
                 state.corridor_yield_local = False
