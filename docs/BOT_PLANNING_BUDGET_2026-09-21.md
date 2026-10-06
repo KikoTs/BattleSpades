@@ -102,6 +102,24 @@ and Multi-Hill; 240 simulated seconds, 12 bots, production configuration):
 `snapshot()` additionally reports `wait_p95_s` over the last 256 grants and
 `wait_max_s` since start.
 
+The locomotion fixes merged afterwards (`bots-integration`) include one that
+touches the same waits: the map-wide search no longer yields a grant to a
+local query that never comes when the terrain edit was far away. Measured
+again over the same 34 cases, and over the audit's own twelve A/B cases
+(six maps, TDM seeds 0 and 1):
+
+| bot time in `planning_wait` | 34 cases | audit's 12 |
+| --- | --- | --- |
+| FIFO, before the merge | 6.1% | 7.7% |
+| FIFO, with the merged fixes | 5.1% | 5.1% |
+| this version, with the merged fixes | 0.1% | 0.1% |
+
+Counted by the rule that refused the request, the FIFO's waiting decisions
+were 86% "one job per observer per timestamp", 14% head of line and 0.4%
+credit before the merge, and 89%, 11% and 0.4% after it. What is left with
+this version is 95% a bot's own three-job decision allowance (a boxed-in bot
+working through its escape candidates) and 4% credit.
+
 ## Local terrain invalidation
 
 `SimpleVoxelWorld.route_needs_replan()` retains simple WALK/CROUCH routes
