@@ -469,7 +469,8 @@ class SimpleVoxelWorld:
         search = SurfaceCorridorSearch(bytes(supports), MAP_SIZE, MAP_SIZE,
                                        source % area, target % area, blocked,
                                        surface_at=layer_at, start_height=source // area,
-                                       target_height=target // area)
+                                       target_height=target // area,
+                                       layers_of=self.standable_supports)
         return (_BudgetedCorridorSearch(self, search)
                 if self.planning_budget is not None else search)
 
