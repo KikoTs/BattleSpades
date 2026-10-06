@@ -2,19 +2,36 @@
 
 `server/bot_ai/planning_budget.py` enforces `path_requests_per_second` in both
 the production thread supervisor and the simple process entry point. It uses
-perception timestamps and one shared FIFO for `(observer_id, generation)`.
-Requests coalesce; a denied observer keeps its position rather than repeatedly
-competing in sorted bot-ID order.
+perception timestamps and work credits for `(observer_id, generation)`. One
+credit is one full route job of 512 search expansions. Waiting observers are
+served in the order they began waiting, whatever the bot-ID or frame order.
 
 ## Bounds and deferral contract
 
 - The default 24 requests/second at 8 decisions/second permits a burst of
   three jobs. Idle credits cannot exceed `ceil(rate / decision_hz)`, capped at
-  eight jobs; admission is bounded by `rate * elapsed + burst`.
-- One observer can start at most one job at a decision timestamp. An admitted
-  route includes up to two ordinary/breach searches and 512 total expansions.
-  Each retained corridor slice also consumes one job and remains capped at
-  512 expansions. Already completed corridor searches spend nothing.
+  eight jobs. A job reserves one credit when admitted and is charged for the
+  expansions it used (at least an eighth of a job) when it finishes; the rest
+  is returned. Search work is therefore bounded by
+  `(rate * elapsed + burst) * 512` expansions, and one worker batch by
+  `burst * 512`.
+- A request is admitted when the credits cover it and every observer that has
+  been waiting longer. The longest waiter owns the next credit, so nobody is
+  starved; a waiter that is not asking at this instant no longer stops the
+  bots behind it. (The first version was a head-of-line FIFO with one job per
+  observer per timestamp. See the 2026-10-06 section.)
+- One observer's decision may spend up to three jobs of work: a route with its
+  detour and water fallbacks, or several of an escape's small candidate
+  searches. Everything after its first job comes only from credit that no
+  waiting observer has a claim on, and a refused follow-up joins no queue. An
+  admitted route includes up to two ordinary/breach searches and 512 total
+  expansions. Each retained corridor slice also consumes one job and remains
+  capped at 512 expansions. Already completed corridor searches spend nothing.
+- `PlanningBudget.spare()` reports credit beyond the waiters' claims and half
+  of the rest of a batch. Work that can wait runs on it: route extensions,
+  and map-wide corridor slices, which become an ordinary request after half
+  a second without one so guidance cannot be starved either. With nobody
+  waiting it never holds a search back.
 - `RoutePlan.deferred` means scheduling pressure, not inaccessible geometry.
   Callers must retain valid routes and avoid failed-site/edge learning or
   fallback retries. Deferred corridor advances keep their exact frontier.
@@ -27,8 +44,9 @@ competing in sorted bot-ID order.
   and digging choices to receive a turn. Completed corridor joins retain their
   candidate index while waiting. Scheduling time pauses physical stall timers
   without inventing goal progress or erasing a retained breach.
-- The pending queue and recent-grant table hold at most 128 observers. A
-  departed requester expires after `max(1 second, 2 / decision_hz)`. A batch
+- The waiting list and per-decision table hold at most 128 observers. A
+  departed requester expires after `max(1 second, 2 / decision_hz)`; until
+  then it holds back one credit, not the fleet. A batch
   refreshes its alive waiters before execution so an overloaded worker does
   not expire later bot IDs before serving them. Completed combat/non-planning
   decisions cancel unused pending turns; decision-frequency skips retain them.
@@ -40,6 +58,67 @@ incremental corridor expansion. Cheap LOS/body probes, bounded corridor
 endpoint setup, and the existing separate water-recovery search are not new
 rate-controlled jobs in this change. It does not claim a bound on authoritative
 terrain collapse, rendering, replication, or total server tick time.
+
+## 2026-10-06: starvation under the FIFO, and what replaced it
+
+An audit of 500 simulated matches found bots standing in `planning_wait`:
+53 of 388 runs lost 5% or more of bot time, single bots 54-75%, with spells of
+minutes. Instrumenting the same production path showed that credits were
+almost never the limit (17-69 of about 5,000 denials per CastleWars match).
+The denials came from the two queueing rules. Head of line: every bot waited
+for the head's next decision, so a queue of N turned once per N decision
+intervals. One job per observer per timestamp: a corridor slice, or a dry
+route that failed, cost the bot its detour or its local route until the next
+decision. With both removed outright (no budget at all) the same matches did
+the same total search work, 4,917 against 4,948 expansions a second, with no
+waiting and 9% more distance covered: the FIFO delayed work without saving
+any. What the budget does bound is the peak per batch.
+
+Two sources of wasted work were removed with it, in the brain:
+
+- A map-wide corridor search that runs out of nodes without a route runs out
+  again from the same ground. On CastleWars 110 of 139 searches did, each
+  its full 32,768 nodes, three quarters of all planner work. The brain now
+  remembers the failure for two minutes within 24 blocks of where it started
+  and of its goal.
+- A body that has not moved, asking the same query of unchanged terrain, gets
+  the answer it got within the last three seconds. A bot with no way on was
+  repeating its whole failed chain every decision (two fifths of route
+  searches on CastleWars).
+
+Measured over the same 34 cases (six maps, five seeds of TDM, plus CTF, Zombie
+and Multi-Hill; 240 simulated seconds, 12 bots, production configuration):
+
+| | FIFO | this version |
+| --- | --- | --- |
+| bot time in `planning_wait` | 6.1% | 0.1% |
+| worst single bot, mean of runs / worst run | 23% / 65% | 0.8% / 10% |
+| longest wait, mean of runs / worst run | 12.9 s / 70 s | 0.3 s / 1.25 s |
+| runs losing 5% or more | 20 of 34 | 0 |
+| distance covered per bot-second | 3.27 | 3.54 |
+| search expansions per second | 4,884 | 3,769 |
+| most expansions in one batch, mean of runs (cap 4,096) | 3,241 | 3,281 |
+
+`snapshot()` additionally reports `wait_p95_s` over the last 256 grants and
+`wait_max_s` since start.
+
+The locomotion fixes merged afterwards (`bots-integration`) include one that
+touches the same waits: the map-wide search no longer yields a grant to a
+local query that never comes when the terrain edit was far away. Measured
+again over the same 34 cases, and over the audit's own twelve A/B cases
+(six maps, TDM seeds 0 and 1):
+
+| bot time in `planning_wait` | 34 cases | audit's 12 |
+| --- | --- | --- |
+| FIFO, before the merge | 6.1% | 7.7% |
+| FIFO, with the merged fixes | 5.1% | 5.1% |
+| this version, with the merged fixes | 0.1% | 0.1% |
+
+Counted by the rule that refused the request, the FIFO's waiting decisions
+were 86% "one job per observer per timestamp", 14% head of line and 0.4%
+credit before the merge, and 89%, 11% and 0.4% after it. What is left with
+this version is 95% a bot's own three-job decision allowance (a boxed-in bot
+working through its escape candidates) and 4% credit.
 
 ## Local terrain invalidation
 
