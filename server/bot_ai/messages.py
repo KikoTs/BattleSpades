@@ -76,6 +76,8 @@ class StimulusKind(str, Enum):
     OBJECTIVE = "objective"
     DEPLOYABLE = "deployable"
     TEAM_SIGHTING = "team_sighting"
+    # A player died here: the death cry, with the kill feed's killer as source.
+    DEATH = "death"
 
 
 @dataclass(frozen=True, slots=True)

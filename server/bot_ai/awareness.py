@@ -95,6 +95,12 @@ _ALERT_FADE_SECONDS = 6.0
 # from it, unless the noise has come much closer.
 _CHECKED_RADIUS = 12.0
 _CHECKED_SECONDS = 8.0
+# A teammate dying this close is "beside it" when the bot can see the spot;
+# at arm's length it needs no sight line to know.
+_ALLY_DOWN_REACH = 25.0
+_ALLY_DOWN_TOUCH = 10.0
+_KILL_SHOT_SECONDS = 2.0
+_MAX_SHOTS_HEARD = 6
 _MAX_LIVES = 128
 
 
@@ -143,6 +149,7 @@ class _Life:
     hit_at: float = 0.0
     hits: int = 0
     fire_from: Vector3 | None = None
+    fire_cause: str = "under_fire"
     fire_noticed_at: float = 0.0
     fire_until: float = 0.0
     shelter: _Shelter = field(default_factory=_Shelter)
@@ -186,6 +193,9 @@ class _Life:
     checked: Vector3 | None = None
     checked_at: float = 0.0
     checked_range: float = 0.0
+    # Where each enemy last fired from, as heard: the kill feed names a killer,
+    # the shot that went with it says roughly where it stood.
+    shots: dict[int, tuple[Vector3, float]] = field(default_factory=dict)
 
 
 def _unit(dx: float, dy: float) -> Vector3:
@@ -316,20 +326,31 @@ class Awareness:
         if life.alert > 0.0:
             life.alert *= math.exp(-max(0.0, now - life.alert_at) / _ALERT_FADE_SECONDS)
         life.alert_at = now
-        newest, loudest = life.heard_at, None
+        newest, loudest, fallen = life.heard_at, None, None
         for event in frame.stimuli:
             if event.created_at <= life.heard_at:
                 continue
             newest = max(newest, event.created_at)
+            if event.kind is StimulusKind.DEATH:
+                if event.team == observer.team:
+                    fallen = event
+                continue
             base = _LOUDNESS.get(event.kind)
             if base is None or event.team == observer.team:
                 continue
+            if event.kind is StimulusKind.SHOT:
+                if len(life.shots) >= _MAX_SHOTS_HEARD and event.source_id not in life.shots:
+                    life.shots.pop(min(life.shots, key=lambda key: life.shots[key][1]))
+                life.shots[event.source_id] = (event.position, event.created_at)
             distance = math.dist(event.position, observer.position)
             fade = max(0.0, 1.0 - distance / HEARING_DISTANCE)
             loudness = base * (fade * fade if event.kind is StimulusKind.FOOTSTEP else fade)
             if loudest is None or loudness > loudest[0]:
                 loudest = (loudness, event, distance)
         life.heard_at = newest
+        if fallen is not None and self._ally_down(frame, observer, profile, life, fallen,
+                                                  visible, decision, now):
+            return
         if loudest is None:
             return
         loudness, event, distance = loudest
@@ -354,6 +375,64 @@ class Awareness:
         life.glance_until = life.glance_from + dwell
         life.watch_until = life.glance_from + 3.0 * dwell
         life.glance_ready_at = life.glance_until + 1.0 + 2.5 * (1.0 - float(profile.caution))
+
+    def _ally_down(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                   profile: BotProfile, life: _Life, event, visible: PlayerSnapshot | None,
+                   decision: ModeBotDecision | None, now: float) -> bool:
+        """A teammate was killed beside the bot: face the shot, and get down.
+
+        Stimulus: the death cry within hearing, the body in sight (or at arm's
+        length), the kill feed naming the killer, and the shot heard from that
+        killer a moment before. A killer too far to hear leaves only the side
+        of the map the enemy is on.
+        """
+
+        distance = math.dist(event.position, observer.position)
+        if distance > _ALLY_DOWN_REACH or _same_team(frame, observer, event.source_id):
+            return False  # too far to be this bot's business, or no enemy did it
+        if distance > _ALLY_DOWN_TOUCH and not self.world.has_line_of_sight(
+                observer.eye, event.position):
+            return False
+        life.alert = min(1.0, life.alert + 0.6)
+        heard = life.shots.get(event.source_id)
+        if heard is not None and 0.0 <= event.created_at - heard[1] <= _KILL_SHOT_SECONDS:
+            origin = heard[0]
+        else:
+            anchor = next((item.position for item in frame.objectives
+                           if item.kind == "team_anchor" and item.team != observer.team), None)
+            if anchor is None:
+                return False
+            toward = _unit(anchor[0] - event.position[0], anchor[1] - event.position[1])
+            origin = (event.position[0] + toward[0] * 40.0,
+                      event.position[1] + toward[1] * 40.0, event.position[2])
+        if visible is not None or _flight_role(observer, decision) or life.retreat:
+            return True
+        delay = notice_delay(profile) * (1.0 - 0.5 * life.alert)
+        dwell = 1.0 + 0.6 * float(profile.caution)
+        life.glance = (origin[0], origin[1], observer.eye[2])
+        life.glance_from = now + delay
+        life.glance_until = life.glance_from + dwell
+        life.watch_until = life.glance_from + 3.0 * dwell
+        life.glance_ready_at = life.glance_until + 1.0
+        life.checked, life.checked_at, life.checked_range = origin, now, math.dist(
+            origin, observer.position)
+        committed = decision is not None and decision.objective_priority >= 0.9
+        careful = profile.caution >= 0.45 or profile.skill >= 0.6
+        if committed or not careful or (life.fire_from is not None and now < life.fire_until):
+            # The objective, a bold temperament or a fight already in hand:
+            # the look is all there is time for.
+            return True
+        # The next shot may be meant for this bot: out of that line.
+        life.fire_from, life.fire_cause = origin, "ally_down"
+        life.hits = 2
+        life.fire_noticed_at = now + delay
+        life.look_back_until = life.fire_noticed_at + _LOOK_BACK_SECONDS
+        life.fire_until = life.fire_noticed_at + 0.8 * (
+            1.4 + 2.2 * float(profile.caution) - 0.8 * float(profile.aggression))
+        life.shelter = _Shelter()
+        life.shelter_hits = 0
+        life.dash = None
+        return True
 
     def _in_view(self, frame: PerceptionFrame, observer: PlayerSnapshot, player_id: int) -> bool:
         """Whether the maker of a sound is someone the bot is looking at."""
@@ -393,6 +472,7 @@ class Awareness:
                     and int(observer.last_damage_kind) not in _UNDIRECTED_DAMAGE
                     and 0.0 <= now - hit_at <= _HIT_NEWS_SECONDS
                     and not _same_team(frame, observer, attacker)):
+                life.fire_cause = "under_fire"
                 if now >= life.fire_until:
                     life.hits = 0
                     # Wound up by what it has been hearing, it understands sooner.
@@ -451,12 +531,13 @@ class Awareness:
         if state == "reached":
             if life.shelter_hits <= 0:
                 life.shelter_hits = life.hits
-            return Reaction("under_fire_hold", look=threat, crouch=True)
+            return Reaction(life.fire_cause + "_hold", look=threat, crouch=True)
         if state == "run":
             life.shelter_hits = 0
             gap = math.hypot(shelter.spot[0] - observer.position[0],
                              shelter.spot[1] - observer.position[1])
-            return Reaction("under_fire_cover", heading=heading, sprint=gap > _SHELTER_BRAKE,
+            return Reaction(life.fire_cause + "_cover", heading=heading,
+                            sprint=gap > _SHELTER_BRAKE,
                             look=threat if startled else _ahead(observer, heading))
         if not airborne and (life.dash is None or now >= life.dash_until):
             life.dash = self._dash_heading(observer, threat, life)
@@ -466,8 +547,8 @@ class Awareness:
                 startled = True
                 life.look_back_until = now + _LOOK_BACK_SECONDS
         if life.dash is None:
-            return Reaction("under_fire_hold", look=threat, crouch=not airborne)
-        return Reaction("under_fire_evade", heading=life.dash, sprint=True,
+            return Reaction(life.fire_cause + "_hold", look=threat, crouch=not airborne)
+        return Reaction(life.fire_cause + "_evade", heading=life.dash, sprint=True,
                         look=threat if startled else _ahead(observer, life.dash))
 
     def _seek(self, observer: PlayerSnapshot, shelter: _Shelter, threats, now: float, *,

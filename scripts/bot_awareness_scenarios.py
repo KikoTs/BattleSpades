@@ -153,6 +153,39 @@ def make_scenario(kind: str):
                     ctx["volleys"] += 1
                     log(t, "sound" if kind != "silent_behind" else "nothing",
                         dist=round(math.dist(walker.position[:2], (bot.x, bot.y)), 1))
+            elif kind in ("ally_killed_beside", "ally_killed_hidden", "ally_killed_far"):
+                if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
+                    # A sniper behind the bot with a sight line, and a teammate
+                    # beside the bot (or, for the control, far ahead of it).
+                    heading = _heading(director, bot)
+                    hidden = kind == "ally_killed_hidden"
+                    spot = A.find_spot(server, bot, heading, dist_range=(42, 38, 46, 34),
+                                       arc=math.pi, want_los=not hidden,
+                                       level=30.0 if hidden else 4.0)
+                    if spot is None:
+                        return
+                    killer = A.spawn_dummy(server, TEAM2, spot, name="Enemy")
+                    ctx["shooters"] = [killer]
+                    remember(killer, "enemy")
+                    if kind != "ally_killed_far":
+                        mate_spot = A.ground(world, bot.x - heading[1] * 3.0,
+                                             bot.y + heading[0] * 3.0)
+                    else:
+                        mate_spot = A.ground(world, bot.x + heading[0] * 45.0,
+                                             bot.y + heading[1] * 45.0)
+                    ctx["mate"] = A.spawn_dummy(server, TEAM1, mate_spot, name="Ally")
+                    remember(ctx["mate"], "ally")
+                    ctx["placed"], ctx["next"], ctx["t0"] = True, t + 0.5, t + 0.5
+                    log(t, "placed", dist=round(math.dist(spot[:2], (bot.x, bot.y)), 1))
+                elif ctx["placed"] and t >= ctx["next"] and ctx["volleys"] < 1:
+                    killer, mate = ctx["shooters"][0], ctx["mate"]
+                    A.publish_shot(server, killer)
+                    # A fresh spawn is shielded; this teammate has been there a while.
+                    mate.end_spawn_protection()
+                    mate.damage(200, killer, int(C.HEADSHOT_KILL))
+                    ctx["volleys"] += 1
+                    log(t, "ally_shot", dead=not mate.alive,
+                        dist=round(math.dist(mate.position[:2], (bot.x, bot.y)), 1))
             elif kind == "wounded_duel":
                 if not ctx["placed"] and t >= 4.0 and tick % 15 == 0:
                     if not place_shooters(t, (0.0,), (30, 26, 34)):
@@ -193,15 +226,16 @@ def measure(result) -> dict:
     out["t_out_of_sight"] = round(hidden - t0, 2) if hidden is not None else None
     threat = scenario.get("dummies", {}).get("enemy")
     if threat is not None:
-        # First moment the bot looks toward the source, as the audit measures it.
-        for row in alive:
+        # First moment the bot looks toward the source, as the audit measures
+        # it. A bot that happened to look that way already proves nothing, so
+        # ``turned`` counts only those that started out looking elsewhere.
+        def facing(row):
             dx, dy = threat["pos"][0] - row[5], threat["pos"][1] - row[6]
             flat = math.hypot(dx, dy)
-            if flat > 1e-6 and (row[7] * dx + row[8] * dy) / flat >= 0.8:
-                out["t_face"] = round(row[0] - t0, 2)
-                break
-        else:
-            out["t_face"] = None
+            return (row[7] * dx + row[8] * dy) / flat if flat > 1e-6 else 1.0
+
+        out["t_face"] = next((round(row[0] - t0, 2) for row in alive if facing(row) >= 0.8), None)
+        out["looked_away_at_start"] = bool(alive) and facing(alive[0]) < 0.3
     volleys = [e for e in events if e["name"] == "volley"]
     out["hits_taken"] = sum(e["seen_by"] for e in volleys)
     out["shooters_killed"] = (volleys[0]["alive"] - volleys[-1]["alive"]) if volleys else 0
@@ -211,8 +245,9 @@ def measure(result) -> dict:
     return out
 
 
-REACTION_ROLES = ("disengage", "fall_back", "regroup", "under_fire", "cover_", "avoid_",
-                  "ally_down", "alert_", "mine_", "turret_", "tdm_regroup")
+# Roles only the awareness layer produces.
+REACTION_ROLES = ("disengage", "fall_back", "regroup", "under_fire", "ally_down", "avoid_",
+                  "mine_", "turret_")
 
 
 async def run(kind, seed, mode, map_name, seconds):
@@ -231,10 +266,15 @@ def summarise(kind, rows) -> dict:
     reacted = [row["t_react"] for row in rows if row.get("t_react") is not None]
     hidden = [row["t_out_of_sight"] for row in rows if row.get("t_out_of_sight") is not None]
     faced = [row["t_face"] for row in rows if row.get("t_face") is not None]
+    away = [row for row in rows if row.get("looked_away_at_start")]
+    turned = [row["t_face"] for row in away if row.get("t_face") is not None and row["t_face"] <= 3.0]
     return {
         "kind": kind, "runs": len(rows),
         "faced_within_3s": sum(1 for value in faced if value <= 3.0),
         "t_face_median": round(statistics.median(faced), 2) if faced else None,
+        "looked_away_at_start": len(away),
+        "turned_within_3s": len(turned),
+        "t_turn_median": round(statistics.median(turned), 2) if turned else None,
         "reacted": len(reacted),
         "t_react_median": round(statistics.median(reacted), 2) if reacted else None,
         "out_of_sight": len(hidden),
