@@ -482,3 +482,20 @@ def test_dragon_island_swimmers_climb_back_onto_the_island():
     # Wall-clock guard against planner stalls. Shared CI runners are slower
     # than a desktop (428 ms observed on GitHub ubuntu-24.04), so keep headroom.
     assert result.slowest_decision_ms < 1000.0
+
+
+def test_a_goal_overhead_is_climbed_to_only_once_no_walk_is_known():
+    """A base on a roof is overhead from every floor under it, stairs or not."""
+    driver = LocomotionSkillDriver(World(ground(z=100)))
+    body = snapshot((10.5, 10.5, 97.75))
+    roof = (12.5, 10.5, 77.75)
+    assert driver.consider_stuck(body, None, 0.0, roof, climb_to_goal=False) is None
+    assert not driver.climb_awaits_walk_answer(body, 3.0, roof)
+    # Stuck for six seconds: the climb is due, and waits to hear about a walk.
+    assert driver.consider_stuck(body, None, 7.0, roof, climb_to_goal=False) is None
+    assert driver.climb_awaits_walk_answer(body, 7.0, roof)
+    assert not driver.metrics and not driver.active(body)
+    driver.consider_stuck(body, None, 7.125, roof, climb_to_goal=True)
+    assert driver.metrics["stuck_considered"] == 1
+    # A goal on the body's own level never waited on that answer.
+    assert not driver.climb_awaits_walk_answer(body, 7.0, (12.5, 10.5, 97.75))

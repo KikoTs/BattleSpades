@@ -463,9 +463,32 @@ class LocomotionSkillDriver:
             slot.anchor = observer.position
             slot.anchor_at = now
 
+    def climb_awaits_walk_answer(self, observer: PlayerSnapshot, now: float,
+                                 goal: Vector3 | None) -> bool:
+        """Is a climb to this goal due, but for knowing whether a walk leads there?"""
+
+        slot = self._slots.get((int(observer.player_id), int(observer.generation)))
+        if (slot is None or slot.life_id != int(observer.life_id) or goal is None
+                or slot.skill is not None or slot.pending is not None or slot.anchor is None
+                or not observer.grounded or observer.wade or now < slot.retry_at
+                or not self._voxel_world):
+            return False
+        position = observer.position
+        goal_support = int(round(float(goal[2]) + SUPPORT_OFFSET))
+        return (now - slot.anchor_at >= _STUCK_SECONDS
+                and goal_support <= node_of(position)[2] - 3
+                and math.dist(position[:2], goal[:2]) <= 40.0)
+
     def consider_stuck(self, observer: PlayerSnapshot, profile: BotProfile | None,
-                       now: float, goal: Vector3 | None) -> SkillCommand | None:
-        """A grounded body that is getting nowhere below its goal: climb."""
+                       now: float, goal: Vector3 | None, *,
+                       climb_to_goal: bool = True) -> SkillCommand | None:
+        """A grounded body that is getting nowhere below its goal: climb.
+
+        ``climb_to_goal`` is false until the worker knows no walk leads up
+        to a goal overhead. A goal on a roof is overhead from every floor of
+        the building, stairs or not, and six seconds beside them used to
+        start a pillar.
+        """
 
         slot = self._slot(observer)
         if slot.skill is not None:
@@ -512,6 +535,10 @@ class LocomotionSkillDriver:
             slot.low_since = None
         goal_support = int(round(float(goal[2]) + SUPPORT_OFFSET))
         goal_above = goal_support <= start[2] - 3 and math.dist(position[:2], goal[:2]) <= 40.0
+        if goal_above and not climb_to_goal:
+            # Whether a walk leads up there is being asked. Climbing out of
+            # the pocket to somewhere else meanwhile would only answer for it.
+            return None
         stalled = now - slot.anchor_at >= _STUCK_SECONDS
         pocket_due = slot.low_since is not None and now - slot.low_since >= _LOW_POCKET_SECONDS
         if not ((stalled and (goal_above or low_pocket)) or pocket_due):

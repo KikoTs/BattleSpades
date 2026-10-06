@@ -343,6 +343,9 @@ class _BotState:
     corridor_rejected_goal: Vector3 | None = None
     corridor_rejected_until: float = 0.0
     corridor_failed_goal: Vector3 | None = None
+    # The goal the map-wide search last found no walk to; cleared when it finds one.
+    walkless_goal: Vector3 | None = None
+    walk_answer_wanted: bool = False  # a climb to the goal is due and waits on that search
     support_retry_at: float = 0.0
     support_rejected_goal: Vector3 | None = None
     support_progress_anchor: Vector3 | None = None
@@ -2913,13 +2916,21 @@ class SimpleBotBrain:
                 debug_role=f"{active_goal.role}:arrived",
             )
 
+        state.walk_answer_wanted = False
         if not effective_wading:
             # Stuck in a pit / on a cut-off beach below the goal: climb out
             # (staircase or pillar) instead of cycling escape segments.
+            # Build or dig up to a goal only once the map-wide search has
+            # found no walk to it; until then the stairs are still an answer.
+            walkless = (state.walkless_goal is not None and math.dist(
+                state.walkless_goal, active_goal.position) < 3.0)
             climb = self._skill_result(frame, observer, state, self.skills.consider_stuck(
-                observer, frame.profile, now, active_goal.position), now)
+                observer, frame.profile, now, active_goal.position, climb_to_goal=walkless), now)
             if climb is not None:
                 return climb
+            # A climb that is due asks for that answer now, not at the next stall.
+            state.walk_answer_wanted = (not walkless and self.skills.climb_awaits_walk_answer(
+                observer, now, active_goal.position))
 
         repeated_coverage = self._navigation_revisits(state, observer.position, active_goal, now)
         current_step = (state.route[state.route_index]
@@ -4049,7 +4060,8 @@ class SimpleBotBrain:
         if (not state.corridor and state.corridor_search is None
                 and (state.dead_end and now >= state.dead_end_retry_at
                      or now >= state.corridor_retry_at
-                     and now - state.goal_progress_at >= _GOAL_STALL_SECONDS)
+                     and now - state.goal_progress_at >= _GOAL_STALL_SECONDS
+                     or state.walk_answer_wanted)
                 and not (now < state.corridor_rejected_until
                          and state.corridor_rejected_goal is not None
                          and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)):
@@ -4064,6 +4076,8 @@ class SimpleBotBrain:
                 if state.corridor_search is None and goal.role == "tdm_squad_support":
                     state.support_failed_goal = goal.position
                     state.support_failure_at = now
+            if state.corridor_search is None:
+                state.walkless_goal = goal.position
             state.corridor_retry_at = now + 15.0
             state.dead_end_retry_at = now + 5.0
         search = state.corridor_search
@@ -4122,9 +4136,11 @@ class SimpleBotBrain:
                         entry = None
                         state.corridor_rejected_goal = goal.position
                         state.corridor_rejected_until = now + 45.0
+                        state.walkless_goal = goal.position
                     if entry is not None:
                         state.corridor = search.path
                         state.corridor_index = entry
+                        state.walkless_goal = None
                         state.dry_detour_goal = None
                         self._clear_route(state, now)
                         # This guidance was asked for because local routing
@@ -4138,6 +4154,8 @@ class SimpleBotBrain:
                         state.navigation_window_position = observer.position
                         state.navigation_window_at = float(now)
                         self.skills.restart_stuck_clock(observer, now)
+                else:
+                    state.walkless_goal = goal.position
                 state.corridor_search = None
                 state.corridor_join_index = 0
                 state.corridor_yield_local = False

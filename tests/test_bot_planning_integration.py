@@ -405,3 +405,17 @@ def test_a_goal_on_the_roof_above_is_far_and_short_plans_under_it_are_a_dead_end
     state.route = ()
     _navigate(world, brain, replace(observer, position=(29.5, 10.5, 97.75)), state, goal, 101.0)
     assert state.short_plans == 2 and state.dead_end
+
+
+def test_a_bot_under_its_goal_asks_for_a_walk_before_it_starts_to_climb(monkeypatch):
+    world, brain, observer, state, goal = _under_the_roof(monkeypatch)
+    brain._set_goal(state, goal, observer.position, 100.0)
+    state.corridor_retry_at = state.dead_end_retry_at = 200.0  # not asked for other reasons
+    for now in (100.0, 107.0, 107.125):
+        _navigate(world, brain, observer, state, goal, now)
+    # Stuck long enough to climb: the question is asked first. This world has
+    # no map-wide search, which is an answer: no walk is known.
+    assert "stuck_considered" not in brain.skills.metrics
+    assert state.walkless_goal == goal.position
+    _navigate(world, brain, observer, state, goal, 107.25)
+    assert brain.skills.metrics["stuck_considered"] == 1
