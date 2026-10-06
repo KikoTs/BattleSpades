@@ -380,9 +380,9 @@ class Awareness:
         along the same line is how gangsters died in their own fire.
         """
 
-        life = self._lives.get((int(observer.player_id), int(observer.generation)))
-        if life is None or int(tool) != _MOLOTOV_TOOL:
+        if int(tool) != _MOLOTOV_TOOL:
             return
+        life = self._life(observer, now)
         flight = math.dist(observer.position, target) / _MOLOTOV_SPEED
         reach = _FIRE_SPREAD + _FIRE_REACH
         life.pyre = _Hazard(-1, tuple(float(value) for value in target), reach, reach + 1.0,
@@ -505,17 +505,19 @@ class Awareness:
             to_y = hazard.centre[1] - body.position[1]
             gap = math.hypot(to_x, to_y)
             along = to_x * dx + to_y * dy
-            if gap <= hazard.radius or along <= 0.0 or now >= hazard.until:
+            if gap <= hazard.reach + 0.2 or along <= 0.0 or now >= hazard.until:
                 continue  # inside is _leave_fire's business; behind is behind
-            reach = min(along, _STEER_AHEAD + _STEER_SECONDS * _PHYSICS_SCALE * math.hypot(
-                *body.velocity[:2]))
+            speed = _PHYSICS_SCALE * math.hypot(*body.velocity[:2])
+            # A running body does not turn on the spot: the faster, the wider.
+            berth = hazard.radius + 0.2 * speed
+            reach = min(along, _STEER_AHEAD + _STEER_SECONDS * speed)
             miss = math.hypot(to_x - dx * reach, to_y - dy * reach)
-            if miss >= hazard.radius:
+            if miss >= berth:
                 continue
             role = f"{intent.debug_role}:avoid_{hazard.kind}"
             if movement.affordance is MovementAffordance.WALK and not movement.jump:
                 bearing = math.atan2(to_y, to_x)
-                spread = math.asin(min(1.0, hazard.radius / gap)) + 0.15
+                spread = math.asin(min(1.0, berth / gap)) + 0.15
                 side = life.steer_side.get(hazard.key)
                 if side is None:
                     # The side that turns the stride least.
@@ -529,8 +531,11 @@ class Awareness:
                         life.steer_side[hazard.key] = turn
                         return replace(
                             intent, debug_role=role,
-                            movement=replace(movement, direction=(
-                                heading[0] * length, heading[1] * length, 0.0)))
+                            movement=replace(
+                                movement,
+                                direction=(heading[0] * length, heading[1] * length, 0.0),
+                                # Nobody sprints along the edge of a fire.
+                                sprint=movement.sprint and gap > berth + 4.0))
             # No way round that can be walked: wait for it to burn out.
             return replace(intent, debug_role=role, movement=MovementIntent(
                 crouch=movement.crouch))
