@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -814,3 +815,183 @@ def test_service_hands_the_claw_report_to_the_watchdog():
         digging.objectives(mode, world, now=now, working=lambda player_id: player_id == 10)
     assert idle.coordinator.metrics.stuck_events >= 1
     assert digging.coordinator.metrics.stuck_events == 0
+
+
+# ------------------------------------------------------- the cost of knowing
+
+class _Steps:
+    """A budget counter that charges a tenth of a millisecond per reading."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        self.now += 0.0001
+        return self.now
+
+
+class _EditedWorld:
+    """A world that reports its terrain edits, as the world manager does."""
+
+    map_name = "synthetic"
+
+    def __init__(self, cells):
+        self.cells = cells
+        self.listeners = {}
+
+    def get_solid(self, x, y, z):
+        return (x, y, z) in self.cells
+
+    def subscribe_mutations(self, callback):
+        token = len(self.listeners) + 1
+        self.listeners[token] = callback
+        return token
+
+    def unsubscribe_mutations(self, token):
+        self.listeners.pop(token, None)
+
+    def edit(self, cell, solid):
+        (self.cells.add if solid else self.cells.discard)(cell)
+        for callback in tuple(self.listeners.values()):
+            callback(*cell, solid, 0, 1)
+
+
+def test_the_nearest_explored_floor_is_found_without_reading_every_cell():
+    cells = _deck_with_stairs()
+    found = approach(_solid(cells), _stand(131.5, 128.5, FLOOR - 8), limit=1200)
+
+    def brute(position, reach):
+        floor = int(round(position[2] + 2.25))
+        best, best_gap = None, reach ** 2
+        for cell in found.steps:
+            gap = (cell[0] + 0.5 - position[0]) ** 2 + (cell[1] + 0.5 - position[1]) ** 2
+            if abs(cell[2] - floor) <= 2 and gap < best_gap:
+                best, best_gap = cell, gap
+        return best_gap if best is not None else None
+
+    asked = 0
+    for x in range(60, 200, 7):
+        for y in range(60, 200, 7):
+            for z in (FLOOR, FLOOR - 8):
+                position = _stand(x + 0.5, y + 0.5, z)
+                near = found.entry_near(position, 24.0)
+                expected = brute(position, 24.0)
+                if expected is None:
+                    assert near is None
+                    continue
+                asked += 1
+                gap = (near[0] + 0.5 - position[0]) ** 2 + (near[1] + 0.5 - position[1]) ** 2
+                assert gap == expected
+    assert asked > 50
+    assert sum(len(v) for v in found.squares.values()) == len(found.steps)
+
+
+def test_the_whole_snapshot_call_stays_inside_its_millisecond():
+    cells = _deck_with_stairs()
+    world = SimpleNamespace(map_name="synthetic", get_solid=_solid(cells))
+    camper = _actor(1, _stand(131.5, 128.5, FLOOR - 8), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(124.5 + 2 * i, 133.5, FLOOR)) for i in range(6)]
+    mode = _FakeZombieMode([camper], zombies)
+    steps = _Steps()
+    service = ZombieSiegeService(budget_clock=steps)
+    spent, first = [], None
+    for tick in range(80):
+        before = steps.now
+        service.objectives(mode, world, now=100.0 + tick * 0.125)
+        spent.append(steps.now - before)
+        if first is None and 1 in service._analyses:
+            first = tick
+    # A flood of over a thousand floors is too much for one call: it takes
+    # a dozen or more, and none of them runs past the millisecond by more
+    # than the step it was in (plus this counter's own readings).
+    assert first is not None and first >= 12
+    assert max(spent) <= service.budget_seconds + 0.00035
+    assert service._analyses[1].info.approach is not None
+
+
+def test_a_flood_is_taken_again_only_when_the_ground_under_it_changes():
+    cells = _sealed_room()
+    world = _EditedWorld(cells)
+    survivor = _actor(1, _stand(128.5, 128.5, FLOOR), bot=False, loadout=())
+    zombies = [_actor(10, _stand(118.5, 128.5, FLOOR))]
+    mode = _FakeZombieMode([survivor], zombies)
+    service = ZombieSiegeService(budget_seconds=0.05)
+
+    def run(start, seconds):
+        for tick in range(int(seconds * 8)):
+            service.objectives(mode, world, now=start + tick * 0.125)
+        return service.stats["analyses"]
+
+    assert run(100.0, 10.0) == 1                      # ten seconds, one flood
+    taken = service._analyses[1].info.approach
+    assert taken.closed and service._analyses[1].info.isolated
+    # The hunter moves; who stands where is brought up to date for nothing.
+    zombies[0].position = _stand(120.5, 128.5, FLOOR)
+    assert run(110.0, 5.0) == 1 and service._analyses[1].info.approach is taken
+    assert service._analyses[1].info.analysed_at >= 112.0
+    # Digging on the far side of the map is none of this room's business.
+    world.edit((300, 300, FLOOR), False)
+    assert run(115.0, 5.0) == 1
+    # A zombie claws the wall open: the room is flooded again and is closed
+    # no longer.
+    for z in range(FLOOR - 3, FLOOR):
+        world.edit((125, 128, z), False)
+    assert run(120.0, 5.0) == 2
+    assert not service._analyses[1].info.approach.closed
+    # A world that reports nothing is flooded on the old timer.
+    plain = SimpleNamespace(map_name="plain", get_solid=_solid(_sealed_room()))
+    service = ZombieSiegeService(budget_seconds=0.05)
+    for tick in range(80):
+        service.objectives(mode, plain, now=200.0 + tick * 0.125)
+    assert service.stats["analyses"] >= 3
+
+
+def test_the_terrain_listener_goes_with_the_round_and_with_a_long_silence():
+    world = _EditedWorld(_sealed_room())
+    survivor = _actor(1, _stand(128.5, 128.5, FLOOR), bot=False, loadout=())
+    mode = _FakeZombieMode([survivor], [_actor(10, _stand(118.5, 128.5, FLOOR))])
+    service = ZombieSiegeService(budget_seconds=0.05)
+    service.objectives(mode, world, now=100.0)
+    assert len(world.listeners) == 1
+    service.reset()
+    assert not world.listeners
+    for tick in range(16):
+        service.objectives(mode, world, now=101.0 + tick * 0.125)
+    assert len(world.listeners) == 1 and service.stats["analyses"] == 1
+    # Another mode runs for a long time: thousands of edits, nobody asking.
+    for index in range(5000):
+        world.edit((300 + index % 50, 300, FLOOR - 1), index % 2 == 0)
+    assert not world.listeners
+    # Back in the round, nothing learned before the silence is trusted.
+    for tick in range(40):
+        service.objectives(mode, world, now=110.0 + tick * 0.125)
+    assert len(world.listeners) == 1 and service.stats["analyses"] == 2
+
+
+def test_the_cut_found_diving_for_the_ground_is_the_least_and_drops_the_footing():
+    rng = random.Random(61006)
+    planned = 0
+    for _ in range(60):
+        cells = _ground(set())
+        top = FLOOR - rng.randrange(5, 16)
+        half = rng.randrange(1, 4)
+        _block(cells, range(128 - half, 129 + half), range(128 - half, 129 + half), [top])
+        legs = []
+        for _ in range(rng.randrange(1, 5)):
+            x, y = 128 + rng.randrange(-half, half + 1), 128 + rng.randrange(-half, half + 1)
+            legs.append((x, y))
+            _block(cells, [x], [y], range(top, FLOOR))
+        solid = _solid(cells)
+        support = support_cells(solid, _stand(128.5, 128.5, top))
+        plan = plan_collapse(solid, support, ground_floor_z=FLOOR)
+        if plan is None:
+            continue
+        planned += 1
+        assert _server_drops(cells, plan.cut, plan.support)
+        # Thin legs under one slab: no cut is cheaper than one voxel a leg,
+        # and none of the voxels chosen can be spared.
+        assert len(plan.cut) <= len(set(legs))
+        for spared in plan.cut:
+            rest = tuple(c for c in plan.cut if c != spared)
+            assert not _server_drops(cells, rest, plan.support)
+    assert planned >= 40

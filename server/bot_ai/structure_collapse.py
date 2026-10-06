@@ -204,6 +204,8 @@ class Approach:
     # For every explored cell but the survivor's own, the next cell on its
     # shortest way in.
     toward: dict[Cell, Cell]
+    # The explored cells by eight-block square, for entry_near.
+    squares: dict[tuple[int, int], tuple[Cell, ...]]
 
     def cell_at(self, position: Vector3) -> Cell | None:
         """The explored standing cell under a body at ``position``."""
@@ -240,12 +242,22 @@ class Approach:
         px, py = float(position[0]), float(position[1])
         floor = int(round(float(position[2]) + PLAYER_SUPPORT_OFFSET))
         best, best_gap = None, float(reach) ** 2
-        for cell in self.steps:
-            if abs(cell[2] - floor) > 2:
-                continue
-            gap = (cell[0] + 0.5 - px) ** 2 + (cell[1] + 0.5 - py) ** 2
-            if gap < best_gap:
-                best, best_gap = cell, gap
+        sx, sy = int(math.floor(px)) >> 3, int(math.floor(py)) >> 3
+        squares = self.squares
+        # Square rings outward: a ring that is wholly farther than the best
+        # floor found so far ends the search.
+        for ring in range(int(reach) // 8 + 2):
+            if best is not None and best_gap <= (8.0 * (ring - 1)) ** 2:
+                break
+            for ox in range(-ring, ring + 1):
+                edge = abs(ox) == ring
+                for oy in (range(-ring, ring + 1) if edge else (-ring, ring)):
+                    for cell in squares.get((sx + ox, sy + oy), ()):
+                        if abs(cell[2] - floor) > 2:
+                            continue
+                        gap = (cell[0] + 0.5 - px) ** 2 + (cell[1] + 0.5 - py) ** 2
+                        if gap < best_gap:
+                            best, best_gap = cell, gap
         return best
 
 
@@ -285,6 +297,20 @@ def iter_approach(
     radius = 0.0
     work = 0
     window = range(-drop - 3, jump + 1)
+    span = range(-drop, jump + 1)
+    base = -window.start
+    # A column read from one level, top to bottom, and the levels of it with
+    # standing room: on level ground each is asked for by four neighbours.
+    scans: dict[Cell, tuple[tuple[bool, ...], tuple[int, ...]]] = {}
+
+    def scan(cx: int, cy: int, cz: int):
+        column = tuple(0 <= cz + offset and solid(cx, cy, cz + offset) for offset in window)
+        found = scans[(cx, cy, cz)] = (column, tuple(
+            offset for offset in span
+            if column[base + offset] and not column[base + offset - 1]
+            and not column[base + offset - 2]))
+        return found
+
     while queue:
         cell = queue.popleft()
         x, y, z = cell
@@ -294,18 +320,14 @@ def iter_approach(
             frontier = depth
             break
         radius = max(radius, math.hypot(x + 0.5 - px, y + 0.5 - py))
+        own = None
         for dx, dy in _CARDINAL:
             nx, ny = x + dx, y + dy
             if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
                 continue
-            # One scan of the neighbouring column, top to bottom.
-            column = [0 <= z + offset and solid(nx, ny, z + offset) for offset in window]
-            base = -window.start
-            for offset in range(-drop, jump + 1):
+            column, levels = scans.get((nx, ny, z)) or scan(nx, ny, z)
+            for offset in levels:
                 nz = z + offset
-                index = base + offset
-                if not (column[index] and not column[index - 1] and not column[index - 2]):
-                    continue  # no standing room at this level
                 key = (nx, ny, nz)
                 if key in steps or nz > GROUND_Z + 1:
                     continue  # (the waterbed, one below, is waded)
@@ -318,8 +340,10 @@ def iter_approach(
                     # It stands higher and comes down: this column must be
                     # open from the height it walks in at (the planner asks
                     # one cell more above a real drop).
+                    if own is None:
+                        own = (scans.get(cell) or scan(x, y, z))[0]
                     top = offset - 2 if offset == -1 else offset - 3
-                    if any(z + k >= 0 and solid(x, y, z + k) for k in range(top, -2)):
+                    if any(own[base + k] for k in range(top, -2)):
                         continue
                 steps[key] = depth + 1
                 toward[key] = cell
@@ -327,9 +351,14 @@ def iter_approach(
         work += 1
         if work % 6 == 0:
             yield
+    yield
+    squares: dict[tuple[int, int], list[Cell]] = {}
+    for cell in steps:
+        squares.setdefault((cell[0] >> 3, cell[1] >> 3), []).append(cell)
     return Approach(
         support_z=floor_z, steps=steps, closed=not queue and frontier == 0,
         frontier=frontier, radius=radius, toward=toward,
+        squares={key: tuple(cells) for key, cells in squares.items()},
     )
 
 
@@ -542,8 +571,13 @@ def iter_plan_collapse(
     sink_flow = [0] * count                   # out_i -> SINK flow
     total = 0
     SOURCE, SINK = -1, -2
+    # Paths are first looked for depth first, downward: the way from a floor
+    # to the ground is down a leg, and a breadth-first pass reads the whole
+    # structure to find each one. The breadth-first pass below still has the
+    # last word: it finishes the flow and proves no path is left.
+    diving = True
     while True:
-        # BFS over states: ("in", i) encoded 2i, ("out", i) encoded 2i+1.
+        # States: ("in", i) encoded 2i, ("out", i) encoded 2i+1.
         parent: dict[int, int] = {}
         queue: deque[int] = deque()
         for i in source_set:
@@ -551,6 +585,36 @@ def iter_plan_collapse(
             queue.append(2 * i)
         found = -1
         steps = 0
+        while diving and queue and found < 0:
+            node = queue.pop()
+            i, side = divmod(node, 2)
+            if side == 0:
+                for j in adjacency[i]:
+                    if edge_flow.get((j, i), 0) > 0 and (2 * j + 1) not in parent:
+                        parent[2 * j + 1] = node
+                        queue.append(2 * j + 1)
+                if vertex_residual[i] > 0 and (2 * i + 1) not in parent:
+                    parent[2 * i + 1] = node
+                    queue.append(2 * i + 1)
+            else:
+                if to_sink[i]:
+                    found = node
+                    break
+                if vertex_back[i] > 0 and (2 * i) not in parent:
+                    parent[2 * i] = node
+                    queue.append(2 * i)
+                depth = cells[i][2]
+                for lower in (False, True):   # the cells below are tried first
+                    for j in adjacency[i]:
+                        if (cells[j][2] > depth) is lower and (2 * j) not in parent:
+                            parent[2 * j] = node
+                            queue.append(2 * j)
+            steps += 1
+            if steps % (_WORK_PER_YIELD * 8) == 0:
+                yield
+        if diving and found < 0:
+            diving = False
+            continue
         while queue and found < 0:
             node = queue.popleft()
             i, side = divmod(node, 2)

@@ -398,7 +398,8 @@ class HordeCoordinator:
         self._roles: dict[int, tuple[int, str]] = {}
         # Per zombie: (decided at, target, its column, the breach decision).
         self._breaches: dict[int, tuple] = {}
-        # Per zombie: (decided at, the approach used, columns, the via point).
+        # Per zombie: (searched at, the approach used, its column, the via
+        # point, the flood's nearest floor when it stands outside the flood).
         self._vias: dict[int, tuple] = {}
         # Per survivor: the highest stuck level among the hunters sent at him.
         self._stuck: dict[int, int] = {}
@@ -729,16 +730,21 @@ class HordeCoordinator:
         approach = siege.approach if siege is not None else None
         if approach is None:
             return None
-        here = (int(math.floor(member.position[0])), int(math.floor(member.position[1])),
-                int(math.floor(target.position[0])), int(math.floor(target.position[1])))
+        here = (int(math.floor(member.position[0])), int(math.floor(member.position[1])))
         cached = self._vias.get(member.player_id)
-        if (cached is not None and cached[1] is approach and cached[2] == here
-                and now - cached[0] < BREACH_REFRESH):
+        fresh = (cached is not None and cached[1] is approach
+                 and now - cached[0] < BREACH_REFRESH)
+        if fresh and cached[2] == here:
             return cached[3]
         via = None
+        entry = None
         cell = approach.cell_at(member.position)
         if cell is None and not approach.closed:
-            cell = approach.entry_near(member.position, VIA_ENTRY_REACH)
+            # Outside the flood: where its nearest floor is changes slowly,
+            # so the search is repeated on the refresh, not at every stride.
+            entry = cached[4] if fresh else approach.entry_near(
+                member.position, VIA_ENTRY_REACH)
+            cell = entry
         if cell is not None:
             moves = approach.steps[cell]
             flat = _xy_distance(member.position, target.position)
@@ -747,7 +753,8 @@ class HordeCoordinator:
                                       or abs(rise) >= VIA_RISE):
                 x, y, z = approach.waypoint(cell, VIA_AHEAD)
                 via = (x + 0.5, y + 0.5, float(z) - PLAYER_SUPPORT_OFFSET)
-        self._vias[member.player_id] = (now, approach, here, via)
+        self._vias[member.player_id] = (
+            cached[0] if fresh else now, approach, here, via, entry)
         return via
 
     def _breach(self, member: HordeMember, target: SurvivorTarget,

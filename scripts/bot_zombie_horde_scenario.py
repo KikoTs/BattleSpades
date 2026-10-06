@@ -584,6 +584,18 @@ class _Clock:
         return False
 
 
+class _StepClock:
+    """A budget counter that charges a fixed cost for every reading."""
+
+    def __init__(self, step: float) -> None:
+        self.now = 0.0
+        self.step = float(step)
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
+
+
 def scenario_args(**overrides) -> argparse.Namespace:
     """Default options of one run, for callers that are not the CLI."""
 
@@ -649,8 +661,13 @@ async def _run_scenario(args, clock: _Clock) -> dict:
     director = BotDirector(server, supervisor=supervisor)
     server.bots = director
     # The horde's timers (stall watchdog, analysis freshness) must run on the
-    # simulated clock like everything else.
-    director._zombie_siege = ZombieSiegeService(clock=lambda: clock.now)
+    # simulated clock like everything else. Its millisecond of analysis per
+    # snapshot is charged by the step, at the measured cost of one (0.07 ms
+    # for six flooded cells on a busy machine, rounded up), so an analysis
+    # arrives as late here as it does on a live server.
+    director._zombie_siege = ZombieSiegeService(
+        clock=lambda: clock.now,
+        budget_clock=None if args.real_budgets else _StepClock(0.0001))
     await director.start(initial_count=0)
 
     survivors: list[Player] = []
