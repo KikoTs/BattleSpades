@@ -86,7 +86,14 @@ from .policies import (
     mode_decision_allows_combat,
     mode_objective_committed,
 )
-from .simple_navigation import RoutePlan, RouteStep, SimpleVoxelWorld
+from .navigation_atlas import ColumnFlag
+from .simple_navigation import (
+    PLAYER_SUPPORT_OFFSET,
+    WATER_SUPPORT_Z,
+    RoutePlan,
+    RouteStep,
+    SimpleVoxelWorld,
+)
 from .recovery_skills import SkillCommand
 from .skill_driver import (
     SKILL_DIRECTIVES,
@@ -122,6 +129,12 @@ _BLOCKED_EDGE_SECONDS = 60.0
 _JUMP_BLOCKED_EDGE_SECONDS = 12.0
 _WATER_BLOCKED_EDGE_SECONDS = 20.0
 _WATER_GOAL_RELEASE_RADIUS = 4.0
+# A wading zombie turns on a visible survivor this close, whatever its order,
+# and claws once inside the same reach _combat_intent uses on land.
+_INFECTED_WADE_FIGHT_RANGE = 8.0
+_INFECTED_WADE_MELEE_REACH = 2.35
+# Highest bank (blocks above the waterbed support) a Zombie's water hop mounts.
+_INFECTED_BANK_RISE = 3
 _DRY_BANK_RELEASE_VERTICAL = 1.5
 _MAX_BLOCKED_EDGES = 8
 _TEAM_ORIENTED_SPACING_SECONDS = 1.0
@@ -290,6 +303,9 @@ class _BotState:
     water_progress_at: float = 0.0
     water_recovery: bool = False
     water_committed: bool = False
+    # A crossing swimmer is following a planned stretch around something its
+    # straight bearing ran into (see _water_crossing_intent).
+    water_detour: bool = False
     water_dry_since: float | None = None
     water_goal_reached: bool = False
     water_escape_position: Vector3 | None = None
@@ -626,6 +642,10 @@ class SimpleBotBrain:
                 # longer has a water-flow step. Both physical progress clocks
                 # remain authoritative; this cannot renew a failed swim.
                 return self._water_intent(frame, observer, landing, now)
+            if self._crosses_water(frame, observer, state, now):
+                crossing = self._water_crossing_intent(frame, observer, state, profile, now)
+                if crossing is not None:
+                    return crossing
             water_edge_blocked = any(
                 int(source[2]) >= int(C.Z_ABOVE_WATERPLANE) + 1
                 for source, _target in self._water_exclusions(state, now)
@@ -727,6 +747,7 @@ class SimpleBotBrain:
             state.water_search_until = 0.0
             state.water_search_origin = None
             state.water_dry_since = None
+            state.water_detour = False
         # A one-block foothold can briefly clear wade before the body falls
         # back in. Keep shoreline failure memory through that landing; its
         # ordinary TTL and the next life/map reset still bound it.
@@ -928,6 +949,145 @@ class SimpleBotBrain:
             goal,
             now,
         )
+
+    def _crossing_personality(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot,
+    ) -> _TraversalPersonality:
+        """The bot's route identity, as far as its body can honour it.
+
+        The infected swim: they have no block tool to bridge with and nothing
+        to fear from water (retail spawns them in the sea), and a dry or
+        builder identity kept two of three zombies pacing the shore opposite
+        a survivor. So does a builder with nothing left to build with.
+        """
+
+        personality = self._traversal_personality(frame, observer)
+        if int(observer.class_id) in _ZOMBIE_CLASSES or (
+                personality.style is _TraversalStyle.BRIDGE
+                and (int(C.BLOCK_TOOL) not in observer.loadout or int(observer.blocks) <= 0)):
+            return replace(personality, style=_TraversalStyle.SWIM)
+        return personality
+
+    def _crosses_water(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                       state: _BotState, now: float) -> bool:
+        """Is this body's swim a crossing, or a fall to be climbed out of?
+
+        Swimmers and the infected head for their goal. A dry-route or builder
+        identity does so once its shoreline search is spent or pointless (see
+        _dry_detours_before_swim); until then a wet foot is an accident and
+        the nearest bank is the way back to the dry search.
+        """
+
+        if int(observer.class_id) in _ZOMBIE_CLASSES:
+            return True
+        goal = state.goal
+        if goal is None:
+            return False
+        if self._crossing_personality(frame, observer).style is _TraversalStyle.SWIM:
+            return True
+        return state.dry_route_failures >= self._dry_detours_before_swim(
+            observer, state, goal, now)
+
+    def _water_crossing_intent(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        profile: BotProfile, now: float,
+    ) -> BotIntent | None:
+        """Carry a swim through to the far bank instead of the nearest one.
+
+        The branch below treats every swim as an emergency. The first route
+        segment that runs out (about thirteen cells of water) hands the body
+        to the nearest-shore flow for the rest of the swim, so a bot crossing
+        anything wider came back to the bank it had just left: on Atlantis
+        171 of 178 water entries in a match ended that way. Zombies, which
+        retail drops into the sea, were carried from their spawn to whatever
+        islet that flow pointed at and stayed there.
+
+        Open water is crossed on the live bearing to the goal, recomputed
+        every decision, so a hop past a cell costs nothing; the bounded
+        planner only routes around what that bearing runs into. Returns None
+        once neither advances, or after the shared four-block progress window
+        has failed: bank recovery then owns high banks and dead ends, exactly
+        as before.
+
+        The infected also hunt in water as on land: they track their prey's
+        live position and claw a survivor standing in the sea (retail counts
+        those kills).
+        """
+
+        infected = int(observer.class_id) in _ZOMBIE_CLASSES
+        if infected:
+            decision = self.mode_policy.decide(frame, observer)
+            if decision is None:
+                return None
+            target = self._visible_target(frame, observer, state, decision)
+            reach = math.inf if target is None else math.hypot(
+                target.position[0] - observer.position[0],
+                target.position[1] - observer.position[1])
+            if reach <= _INFECTED_WADE_MELEE_REACH:
+                # A fight is not a failed swim.
+                state.water_escape_position = observer.position
+                state.water_escape_at = now
+                return self._combat_intent(
+                    frame, observer, target, state, profile, now, decision)
+        if state.water_recovery or self.skills.active(observer):
+            return None
+        if not infected:
+            goal = state.goal
+        elif reach <= _INFECTED_WADE_FIGHT_RANGE:
+            # Prey in sight a few strokes away outranks the standing order.
+            goal = _Goal(("enemy", int(target.player_id), int(target.generation)),
+                         target.position, "combat_pursuit", 1.5, True)
+        else:
+            goal = self._select_goal(frame, observer, state, now, decision=decision)
+        if goal is None:
+            return None
+        remaining = math.hypot(goal.position[0] - observer.position[0],
+                               goal.position[1] - observer.position[1])
+        if not infected and remaining <= max(
+                _WATER_GOAL_RELEASE_RADIUS, float(goal.arrival_radius)):
+            return None  # Beside the goal: the nearest bank is the way out.
+
+        def gains(step: RouteStep | None) -> bool:
+            return step is not None and math.hypot(
+                goal.position[0] - step.waypoint[0],
+                goal.position[1] - step.waypoint[1]) < remaining - 0.25
+
+        for _segment in range(2):
+            if not (state.water_detour and state.route_index < len(state.route)):
+                # No planned detour in hand: take the bearing while it gains.
+                exclusions = self._water_exclusions(state, now)
+                step = self.world.water_step(
+                    observer.position, preferred_goal=goal.position,
+                    blocked_edges=exclusions)
+                if step is None and infected:
+                    # A bank the shared flow leaves to builders and diggers
+                    # (two blocks up or more). A Zombie's hop clears three.
+                    bank = self.world.assisted_water_step(
+                        observer.position, preferred_goal=goal.position,
+                        blocked_edges=exclusions)
+                    if bank is not None and (
+                            WATER_SUPPORT_Z - round(bank.waypoint[2] + PLAYER_SUPPORT_OFFSET)
+                            <= _INFECTED_BANK_RISE):
+                        step = replace(bank, affordance=MovementAffordance.JUMP)
+                if gains(step):
+                    state.water_detour = False
+                    if state.route:
+                        # A cell-by-cell route cannot be held through the hop.
+                        self._clear_route(state, now)
+                    self._set_goal(state, goal, observer.position, now)
+                    return self._water_intent(frame, observer, step, now)
+            intent = self._navigation_intent(frame, observer, state, goal, now,
+                                             water_context=True)
+            if (intent.action.kind is not BotActionKind.NONE
+                    or math.hypot(*intent.movement.direction[:2]) > 1e-6
+                    or intent.debug_role.endswith(":planning_wait")):
+                state.water_detour = True
+                return intent
+            state.water_detour = False
+            if not intent.debug_role.endswith(":segment_complete"):
+                return None
+            # The planned stretch ran out in open water: carry on at once.
+        return None
 
     def _cooperative_intent(
         self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
@@ -3080,7 +3240,7 @@ class SimpleBotBrain:
             previous_breach_key = state.breach_key
             previous_breach_started_at = state.breach_started_at
             previous_next_breach_at = state.next_breach_at
-            personality = self._traversal_personality(frame, observer)
+            personality = self._crossing_personality(frame, observer)
             if state.dry_detour_goal is not None and (
                 float(now) >= float(state.dry_detour_until)
                 or math.hypot(
@@ -3251,7 +3411,7 @@ class SimpleBotBrain:
                     if (
                         not crowd_detour_active
                         and state.dry_route_failures
-                        < _DRY_DETOURS_BEFORE_SWIM
+                        < self._dry_detours_before_swim(observer, state, active_goal, now)
                     ):
                         state.dry_route_failures += 1
                         state.dry_detour_goal = self._dry_detour_segment_goal(
@@ -5267,6 +5427,41 @@ class SimpleBotBrain:
             forward_bias=forward_bias,
         )
 
+    def _dry_detours_before_swim(self, observer: PlayerSnapshot, state: _BotState,
+                                 goal: _Goal, now: float) -> int:
+        """Shoreline searches a dry or builder identity makes before it swims.
+
+        The lateral probes exist because a bounded search at the water's edge
+        cannot prove there is no way round. The map's ground regions can:
+        when the goal stands on another land mass, or in the water, or the
+        only dry route has just been rejected as absurdly long, every probe
+        is twelve seconds of pacing the shore before the same swim. Unknown
+        ground (no atlas, a covered or layered column) keeps the probes.
+        """
+
+        atlas = getattr(self.world, "_atlas", None)
+        regions = getattr(atlas, "regions", None)
+        if regions is None:
+            return _DRY_DETOURS_BEFORE_SWIM
+
+        def region(position: Vector3) -> int | None:
+            x, y = int(math.floor(position[0])), int(math.floor(position[1]))
+            if not (0 <= x < atlas.width and 0 <= y < atlas.height):
+                return None
+            index = y * atlas.width + x
+            if int(atlas.flags[index]) & int(ColumnFlag.WATER):
+                return -1
+            return int(regions[index]) or None
+
+        here, there = region(observer.position), region(goal.position)
+        if there == -1 or (here and there and here != there):
+            return 0
+        if (now < state.corridor_rejected_until
+                and state.corridor_rejected_goal is not None
+                and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0):
+            return 0
+        return _DRY_DETOURS_BEFORE_SWIM
+
     @staticmethod
     def _dry_detour_segment_goal(
         observer: PlayerSnapshot,
@@ -6145,6 +6340,13 @@ def _route_step_reached(
         # cells too: skipping one can cut the following corner through the
         # bank before the body has entered the water column.
         return False
+    if step.affordance is MovementAffordance.SWIM and bool(wading):
+        # A swimmer hops off the waterbed (held ascent); a Zombie's stronger
+        # jump keeps it blocks above the water-plane waypoint for most of
+        # each hop, so the height test below almost never saw it arrive and
+        # the crossing was abandoned as a blocked edge. Open water has one
+        # level: the wade flag is the vertical contract.
+        return True
     # XY-only completion skipped GreatWall's two-block landing while the body
     # was still below it, then issued WALK for the upper corridor forever.
     return abs(float(step.waypoint[2]) - float(position[2])) <= vertical_tolerance
