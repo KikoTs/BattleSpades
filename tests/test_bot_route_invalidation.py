@@ -1,6 +1,7 @@
 """Distant builds cannot consume every bot's next route grant."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -143,3 +144,33 @@ def test_real_brain_keeps_moving_without_a_grant_and_retries_an_affected_route(l
     assert not intent.debug_role.endswith(":planning_wait")
     # Only the unaffected route is marked current; the edited one asks again.
     assert state.route_topology_version == (0 if local_edit else 1)
+
+
+def test_distant_edits_do_not_starve_a_pending_map_wide_search():
+    """On a live map a block changes somewhere before nearly every decision.
+
+    The map-wide search yields a decision to the local planner whenever the
+    route might be stale. When the edit was far away no local query follows,
+    and the yield was never released: the search got one slice per local
+    replan, and a second of work took eight while the bot paced its pocket.
+    """
+    world = _world()
+    observer = _player(1, 1, POSITION, is_bot=True)
+    brain = SimpleBotBrain(world)
+    state = _BotState(1, 1, observer.life_id)
+    goal = _Goal(("far_side",), (300.5, 10.5, 97.75), "far_side", 1, True)
+    brain._set_goal(state, goal, POSITION, 100)
+    state.route, state.route_topology_version = ROUTE, 0
+    slices = []
+    search = SimpleNamespace(done=False, path=(), advance=lambda: slices.append(len(slices)))
+    state.corridor_search = search
+    for decision in range(1, 9):
+        now = 100 + decision / 8
+        world.apply(WorldDelta(1, decision, (VoxelChange(200, 300, 100, bool(decision % 2)),)))
+        frame = replace(_frame(observer, created_at=now), topology_version=decision)
+        world.begin_planning((1, 1), now)
+        intent = brain._navigation_intent(frame, observer, state, goal, now)
+        world.end_planning()
+        assert state.route is ROUTE and intent.movement.direction[0] > 0
+    assert state.corridor_search is search
+    assert len(slices) == 8

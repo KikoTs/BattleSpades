@@ -456,11 +456,14 @@ def _long_search(world):
     return search, _BudgetedCorridorSearch(world, search)
 
 
-@pytest.mark.parametrize("rate, slices", [(8, (512, 512, 512, 512, 1024)),
-                                           (64, (512, 1024, 1536, 2048, 2560))])
-def test_map_wide_guidance_runs_on_spare_credit_and_is_never_starved(monkeypatch, rate, slices):
-    world = SimpleVoxelWorld(planning_budget=PlanningBudget(rate))
+@pytest.mark.parametrize("spare, slices", [(False, (512, 512, 512, 512, 1024)),
+                                            (True, (512, 1024, 1536, 2048, 2560))])
+def test_map_wide_guidance_runs_on_spare_credit_and_is_never_starved(monkeypatch, spare, slices):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(64))
     world, brain, observer, state, goal = _setup(monkeypatch, world=world)
+    if not spare:
+        # Teammates are waiting on every credit the batch has.
+        monkeypatch.setattr(world.planning_budget, "spare", lambda *_args: False)
     goal = replace(goal, position=(400.5, 400.5, 97.75))
     brain._set_goal(state, goal, observer.position, 100)
     # The bot has ground to walk: its sixty-four slices of guidance can wait.
@@ -474,28 +477,35 @@ def test_map_wide_guidance_runs_on_spare_credit_and_is_never_starved(monkeypatch
         brain._corridor_segment_goal(state, observer, goal, now)
         world.end_planning()
         seen.append(search.expansions)
-    # One job per decision is all the small budget has, so nothing is ever
-    # spare: the search takes a slice every half second as an ordinary
-    # request. With credit to spare it takes one every decision.
+    # With nothing spare the search asks for a slice every half second, as
+    # an ordinary request that waits its turn like any other. With credit to
+    # spare it takes one every decision.
     assert tuple(seen) == slices
-    if rate == 8:
+    if not spare:
         assert world.planning_budget.snapshot()["requested"] == 2
 
 
-@pytest.mark.parametrize("rate, extended", [(8, False), (64, True)])
-def test_looking_further_ahead_never_takes_the_last_credit(monkeypatch, rate, extended):
-    world = SimpleVoxelWorld(planning_budget=PlanningBudget(rate))
+@pytest.mark.parametrize("waiting, extended", [(True, False), (False, True)])
+def test_looking_further_ahead_never_takes_a_waiting_teammates_credit(
+        monkeypatch, waiting, extended):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(8))
     world, brain, observer, state, goal = _setup(monkeypatch, world=world)
     goal = replace(goal, position=(60.5, 10.5, 97.75))
     brain._set_goal(state, goal, observer.position, 100)
     state.route = (RouteStep((14.5, 10.5, 97.75), MovementAffordance.WALK),)
     state.route_topology_version = world.topology_version
+    budget = world.planning_budget
+    if waiting:
+        # One credit a decision: observer 3 had the last, observer 2 wants the next.
+        assert budget.try_acquire((3, 1), 99.875) and budget.try_acquire((2, 1), 99.875) is None
+    asked = budget.snapshot()["requested"]
     frame = replace(_frame(observer, created_at=100.0), topology_version=world.topology_version)
     world.begin_planning((1, 1), 100.0)
     brain._extend_route(frame, observer, state, goal, 100.0)
     world.end_planning()
     assert (len(state.route) > 1) is extended
-    assert world.planning_budget.snapshot()["requested"] == (1 if extended else 0)
+    assert budget.snapshot()["requested"] - asked == (1 if extended else 0)
+    assert not waiting or budget.would_grant((2, 1), 100.0)
 
 
 class _WalledGround:
@@ -517,3 +527,28 @@ def test_a_waiting_bot_walks_on_toward_its_goal_when_its_old_heading_meets_a_wal
     blocked = replace(goal, position=(10.5, 30.5, 97.75))
     state.travel_heading = (0.0, 1.0, 0.0)
     assert brain._coast(observer, state, blocked, 100.0).direction == (0.0, 0.0, 0.0)
+
+
+def test_an_adopted_corridor_starts_on_fresh_clocks_instead_of_taking_the_blame(monkeypatch):
+    """Map-wide guidance is asked for because the body got nowhere.
+
+    Its progress clocks are therefore expired, or about to be, when the
+    answer arrives. They used to fire on the corridor's first step: that
+    edge was excluded for a minute and the corridor dropped with it.
+    """
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    brain._set_goal(state, goal, observer.position, 90)
+    brain.skills._slot(observer).anchor_at = 90
+    search = SurfaceCorridorSearch(bytes([100]) * 1024, 32, 32,
+                                   10 * 32 + 12, 10 * 32 + 30)
+    state.corridor_search = _BudgetedCorridorSearch(world, search)
+    for now in (100, 101):
+        world.begin_planning((1, 1), now)
+        brain._corridor_segment_goal(state, observer, goal, now)
+        world.end_planning()
+    assert state.corridor == search.path
+    assert state.navigation_progress_at == state.navigation_window_at == 101
+    assert brain.skills._slot(observer).anchor_at == 101
+    result = _navigate(world, brain, observer, state, goal, 102)
+    assert result.movement.direction[0] > 0
+    assert state.corridor == search.path and not state.blocked_edges

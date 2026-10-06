@@ -403,8 +403,11 @@ def test_spare_credit_leaves_half_a_batch_for_bots_without_a_route():
     assert not budget.spare((9, 1), 0.0)
     assert budget.would_grant((9, 1), 0.0)
     assert budget.snapshot() == before
-    # A budget of one job per decision never has anything to spare.
-    assert not PlanningBudget(8, decision_hz=8).spare((1, 1), 0.0)
+    # One job per decision: it is spare until somebody is waiting for it.
+    small = PlanningBudget(8, decision_hz=8)
+    assert small.spare((1, 1), 0.0)
+    assert small.try_acquire((2, 1), 0.0) and small.try_acquire((3, 1), 0.0) is None
+    assert not small.spare((1, 1), 0.125) and small.would_grant((3, 1), 0.125)
 
 
 def test_a_waiting_observer_has_first_call_on_spare_credit():
@@ -412,6 +415,6 @@ def test_a_waiting_observer_has_first_call_on_spare_credit():
     for bot in range(8):
         assert budget.try_acquire((bot, 1), 0.0)
     assert budget.try_acquire((8, 1), 0.0) is None and budget.try_acquire((9, 1), 0.0) is None
-    now = 6 / 64  # Six credits back: five would be spare, but two are spoken for.
+    now = 6 / 64  # Six credits back and two spoken for: half a batch is not left.
     assert not budget.spare((20, 1), now)
     assert budget.spare((20, 1), 7 / 64)
