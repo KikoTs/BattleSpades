@@ -15,7 +15,8 @@ from server.bot_ai.messages import (
     BotAction, BotActionKind, BotIntentPriority, LookIntent, MovementAffordance,
     Stimulus, StimulusKind,
 )
-from server.bot_ai.messages import MovementIntent, ObjectiveSnapshot
+from server.bot_ai.director import BotDirector
+from server.bot_ai.messages import EntitySnapshot, MovementIntent, ObjectiveSnapshot
 from server.bot_ai.policies import ModeBotDecision, ModeBotPosture
 from server.bot_ai.stimuli import HEARING_DISTANCE, BotStimulusBus
 from server.bot_ai.simple_navigation import RouteStep
@@ -827,3 +828,179 @@ def test_temperament_and_the_objective_decide_between_a_look_and_cover():
     busy = _awake(_GridWorld())
     _kill_beside(busy, observer, 100.1, visible=enemy, others=(enemy,))
     assert busy._lives[(1, 1)].glance is None and busy._lives[(1, 1)].alert >= 0.6
+
+
+# -- fire -------------------------------------------------------------------
+
+def _flame(entity_id, x, y, *, until=104.0, z=_FLOOR - 0.01):
+    """One burning block as the director snapshots it."""
+
+    return EntitySnapshot(entity_id=entity_id, entity_type=int(C.BLOCKFIRE), team=-1,
+                          owner_id=7, position=(x + 0.5, y + 0.5, z), kind="blockfire",
+                          blast_radius=3.0, detonate_at=until)
+
+
+def _patch(x=20, y=10, **kwargs):
+    return tuple(_flame(50 + index, x + dx, y + dy, **kwargs)
+                 for index, (dx, dy) in enumerate(((0, 0), (1, 0), (0, 1), (-1, 0), (0, -1))))
+
+
+def _stride(heading=(1.0, 0.0, 0.0), **changes):
+    """An ordinary route step from the bot's spot toward +x."""
+
+    intent = travel_intent(source=(10.5, 10.5, _FLOOR - 2.25),
+                           waypoint=(18.5, 10.5, _FLOOR - 2.25), direction=heading)
+    return replace(intent, bot_id=1, bot_generation=1, debug_role="assault",
+                   movement=replace(intent.movement, sprint=True, **changes))
+
+
+def _burn(awareness, observer, now, fires, *, profile=None, intent=None):
+    """One decision with ``fires`` on the frame: the reaction and the stride that results."""
+
+    profile = profile or _expert()
+    fires = tuple(fires)
+    # The flames were first seen a moment ago: long enough to have registered.
+    earlier = replace(_frame(observer, created_at=now - 0.6), profile=profile, entities=fires)
+    awareness.react(earlier, observer, profile, None, None, now - 0.6)
+    frame = replace(_frame(observer, created_at=now), profile=profile, entities=fires)
+    reaction = awareness.react(frame, observer, profile, None, None, now)
+    return reaction, awareness.overlay(frame, intent or _stride())
+
+
+def test_director_snapshots_a_burning_block_with_its_reach_and_remaining_fuse():
+    server, director, bot, _runtime = _facing_fixture()
+    block = (int(bot.x) + 6, int(bot.y), int(bot.z) + 3)
+    assert server.world_manager.get_solid(*block)
+    assert server.fire_controller.ignite_block(block, bot, now=time.time()) is not None
+    fire = next(entity for entity in director._snapshot_entities() if entity.kind == "blockfire")
+    assert fire.blast_radius == float(C.BLOCKFIRE_CHARACTER_SPREAD_RANGE) == 3.0
+    assert 3.0 < fire.detonate_at - time.monotonic() <= float(C.BLOCKFIRE_MAX_LIFESPAN)
+    assert not fire.hazardous  # grenade dodging and task interrupts are not its business
+
+    crowd = [EntitySnapshot(entity_id=1000 + index, entity_type=3, team=-1, owner_id=-1,
+                            position=(float(index), 0.0, 0.0), kind="pickup")
+             for index in range(400)]
+    kept = BotDirector._select_perception_entities(
+        SimpleNamespace(server=SimpleNamespace(metrics=None)), [*crowd, fire], {})
+    assert len(kept) < len(crowd) and fire in kept
+
+
+def test_a_bot_walks_round_fire_it_can_see_on_its_way():
+    awareness = _awake(_GridWorld())
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5), velocity=(5.6 / 32.0, 0.0, 0.0))
+    reaction, stride = _burn(awareness, observer, 100.5, _patch())
+    assert reaction is None  # the body keeps its job; only the stride bends
+    assert stride.debug_role == "assault:avoid_fire"
+    dx, dy, _ = stride.movement.direction
+    assert dx > 0.3 and abs(dy) > 0.4 and math.hypot(dx, dy) == pytest.approx(1.0)
+    assert stride.movement.travel_waypoint is not None  # still the same route step
+    # Followed for its whole length, that heading clears the flames' reach.
+    patch_centre, reach = (20.5, 10.5), 1.0 + 3.0
+    for step in range(1, 40):
+        x, y = 10.5 + dx * step * 0.5, 10.5 + dy * step * 0.5
+        assert math.dist((x, y), patch_centre) > reach
+    # The side once chosen is kept, and nobody sprints along the edge of it.
+    near = replace(observer, position=(14.5, 10.5 + math.copysign(3.0, dy), observer.position[2]))
+    _, close = _burn(awareness, near, 100.75, _patch())
+    assert close.movement.direction[1] * dy > 0.0 and not close.movement.sprint
+
+
+@pytest.mark.parametrize("case", (
+    "no_fire", "burnt_out", "beside_the_way", "behind", "other_storey", "behind_a_wall"))
+def test_no_fire_in_the_way_no_change_of_stride(case):
+    world = _GridWorld()
+    awareness = _awake(world)
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5), velocity=(5.6 / 32.0, 0.0, 0.0))
+    fires = _patch()
+    if case == "no_fire":
+        fires = ()
+    elif case == "burnt_out":
+        fires = _patch(until=100.2)
+    elif case == "beside_the_way":
+        fires = _patch(y=22)
+    elif case == "behind":
+        fires = _patch(x=2)
+    elif case == "other_storey":
+        fires = _patch(z=_FLOOR - 9.01)
+    else:
+        # Flames and smoke both hidden: what the bot cannot see it does not know.
+        world.cells |= _wall(14, range(4, 18), range(_FLOOR - 9, _FLOOR))
+    for step in range(6):
+        reaction, stride = _burn(awareness, observer, 100.5 + step * 0.125, fires)
+        assert reaction is None and stride == _stride()
+
+
+def test_a_bot_standing_in_the_flames_runs_out_of_them():
+    awareness = _awake(_GridWorld())
+    caught = _fighter(1, TEAM1, 18.5, 10.5)
+    reaction, _ = _burn(awareness, caught, 100.5, _patch())
+    assert reaction.role == "fire_escape" and reaction.sprint
+    assert reaction.priority is BotIntentPriority.SURVIVAL
+    assert reaction.heading[0] < -0.7  # straight away from the patch at x=20
+    # Zombies burn like anyone else.
+    undead = _awake(_GridWorld())
+    zombie = replace(caught, class_id=int(C.CLASS_ZOMBIE))
+    assert _burn(undead, zombie, 100.5, _patch())[0].role == "fire_escape"
+
+
+def test_an_exact_step_or_a_walled_in_way_waits_for_the_fire_to_burn_out():
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5), velocity=(5.6 / 32.0, 0.0, 0.0))
+    jump = _stride(jump=True, affordance=MovementAffordance.JUMP)
+    _, held = _burn(_awake(_GridWorld()), observer, 100.5, _patch(), intent=jump)
+    assert held.movement.direction == (0.0, 0.0, 0.0) and held.debug_role == "assault:avoid_fire"
+
+    # A corridor one block wide: no tangent to step onto.
+    corridor = _GridWorld({(x, y, z) for x in range(6, 30) for y in (9, 11)
+                           for z in range(_FLOOR - 4, _FLOOR)})
+    _, waiting = _burn(_awake(corridor), observer, 100.5, _patch())
+    assert waiting.movement.direction == (0.0, 0.0, 0.0)
+    # Once it has burnt out the way is walked again.
+    _, onward = _burn(_awake(corridor), observer, 100.5, _patch(until=100.2))
+    assert onward == _stride()
+
+
+def test_a_thrower_keeps_off_the_ground_its_own_molotov_is_about_to_light():
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5), velocity=(5.6 / 32.0, 0.0, 0.0))
+    target = (24.5, 10.5, observer.position[2])
+    awareness = _awake(_GridWorld())
+    awareness.threw(observer, int(C.MOLOTOV_TOOL), target, 100.4)
+    _, stride = _burn(awareness, observer, 100.5, ())  # no flame exists yet
+    assert stride.debug_role == "assault:avoid_fire" and abs(stride.movement.direction[1]) > 0.4
+    life = awareness._lives[(1, 1)]
+    assert life.pyre.until > 100.4 + 4.0
+    # Long after it has burnt out the ground is ground again.
+    _, later = _burn(awareness, observer, life.pyre.until + 0.5, ())
+    assert later == _stride()
+    # A grenade lights nothing.
+    other = _awake(_GridWorld())
+    other.threw(observer, int(C.GRENADE_TOOL), target, 100.4)
+    assert _burn(other, observer, 100.5, ())[1] == _stride()
+
+
+def test_worker_reports_its_molotov_throw_to_the_awareness_layer():
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5),
+                       loadout=(int(C.MINIGUN_TOOL), int(C.MOLOTOV_TOOL), int(C.SPADE_TOOL)))
+    enemy = _fighter(2, TEAM2, 24.5, 10.5)
+    brain = SimpleBotBrain(_TacticalWorld())
+    brain._oriented_attack_choice = lambda *args: (int(C.MOLOTOV_TOOL), 0.0)
+    frame = replace(_frame(observer, enemy), profile=_expert())
+    intent = brain._combat_intent(frame, observer, enemy, _BotState(1, 1, observer.life_id),
+                                  _expert(), 100.0)
+    assert intent.action.kind is BotActionKind.ORIENTED
+    assert brain.awareness._lives[(1, 1)].pyre.centre == enemy.position
+
+
+def test_burning_blocks_are_grouped_once_per_frame_and_skill_sets_the_berth():
+    awareness = _awake(_GridWorld())
+    observer = replace(_fighter(1, TEAM1, 10.5, 10.5), velocity=(5.6 / 32.0, 0.0, 0.0))
+    fires = (*_patch(), *_patch(x=60, y=40))
+    frame = replace(_frame(observer, created_at=100.5), entities=fires)
+    patches = awareness._burning_patches(frame)
+    assert len(patches) == 2 and patches[0].reach == pytest.approx(4.0)
+    assert awareness._burning_patches(replace(frame, frame_id=2)) is patches  # shared
+
+    careful, careless = _awake(_GridWorld()), _awake(_GridWorld(), profile=_casual())
+    _burn(careful, observer, 100.5, _patch())
+    _burn(careless, observer, 100.5, _patch(), profile=_casual())
+    wide, narrow = careful._lives[(1, 1)].hazards[0], careless._lives[(1, 1)].hazards[0]
+    assert wide.radius > narrow.radius > narrow.reach == wide.reach
