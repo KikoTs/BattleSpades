@@ -341,3 +341,179 @@ def test_thread_behavior_snapshot_cannot_be_mutated_by_a_reader():
     report["events"][0]["reason"] = "reader"
     assert supervisor.behavior_metrics()["counters"]["tasks_started"] == 1
     assert supervisor.behavior_metrics()["events"][0]["reason"] == "original"
+
+
+def test_a_fallback_chain_runs_in_one_decision_when_credit_is_free(monkeypatch):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(24))
+    world, brain, observer, state, goal = _setup(monkeypatch, island=True, world=world)
+    # Dry route, lateral detour and the swim are three small searches. With
+    # credit nobody is waiting for they no longer take three decisions.
+    result = _navigate(world, brain, observer, state, goal)
+    assert not result.debug_role.endswith(":planning_wait")
+    assert any(step.affordance is MovementAffordance.SWIM for step in state.route)
+    assert world.planning_budget.snapshot()["granted"] == 3
+
+
+class _NoWayOut(SimpleVoxelWorld):
+    """Every search comes back empty; counts the searches actually run."""
+
+    searches = 0
+
+    def _plan(self, start, goal, **arguments):
+        type(self).searches += 1
+        return RoutePlan((), False, 0)
+
+
+def test_a_bot_with_no_way_on_does_not_search_the_same_dead_end_every_decision(monkeypatch):
+    monkeypatch.setattr(_NoWayOut, "searches", 0)
+    world, brain, observer, state, goal = _setup(
+        monkeypatch, world=_NoWayOut(planning_budget=PlanningBudget(64)))
+    for tick in range(7):
+        result = _navigate(world, brain, observer, state, goal, 100 + tick / 8)
+        assert not result.debug_role.endswith(":planning_wait")
+    # Dry, detour and wet once; after that only each new lateral detour is a
+    # new question. Without the memory this is seventeen searches.
+    assert _NoWayOut.searches == 5
+    assert not state.blocked_edges
+    state.escape_retry_at = math.inf  # Keep the separate escape search out of the count.
+    # The answer is trusted for a few seconds, not for ever...
+    _navigate(world, brain, observer, state, goal, 104)
+    assert _NoWayOut.searches == 7
+    # ...and never across a change of terrain or a step to somewhere else.
+    world.apply(WorldDelta(map_epoch=1, topology_version=2, changed_cells=()))
+    _navigate(world, brain, observer, state, goal, 104.125)
+    assert _NoWayOut.searches == 9
+    moved = replace(observer, position=(11.5, 10.5, 97.75))
+    _navigate(world, brain, moved, state, goal, 104.25)
+    assert _NoWayOut.searches == 11
+
+
+def _coarse_dead_end():
+    """A 64x64 plain cut by water the coarse search cannot cross."""
+    supports = bytearray([100]) * (64 * 64)
+    for y in range(64):
+        supports[y * 64 + 20] = 239
+    return SurfaceCorridorSearch(bytes(supports), 64, 64, 10 * 64 + 10, 10 * 64 + 40)
+
+
+def test_a_map_wide_search_that_found_nothing_is_not_repeated_from_the_same_ground(monkeypatch):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(64))
+    world, brain, observer, state, goal = _setup(monkeypatch, world=world)
+    goal = replace(goal, position=(40.5, 10.5, 97.75))
+    brain._set_goal(state, goal, observer.position, 100)
+    state.route = (RouteStep((12.5, 10.5, 97.75), MovementAffordance.WALK),)
+    state.route_topology_version = world.topology_version
+    started = []
+
+    def begin(_world, start, _goal, *, blocked_edges):
+        started.append(start)
+        return _coarse_dead_end()
+
+    monkeypatch.setattr(SimpleVoxelWorld, "begin_corridor", begin)
+
+    def guide(body, target, now):
+        state.dead_end, state.dead_end_retry_at = True, 0.0
+        world.begin_planning((1, 1), now)
+        try:
+            return brain._corridor_segment_goal(state, body, target, now)
+        finally:
+            world.end_planning()
+
+    now = 100.0
+    while not started or state.corridor_search is not None:
+        assert guide(observer, goal, now) is None
+        now += 0.125
+    assert len(started) == 1 and state.corridor_futile
+    # Asking again from the same ground would flood the same bank again.
+    for later in (now + 5, now + 20, now + 60):
+        guide(replace(observer, position=(14.5, 12.5, 97.75)), goal, later)
+    assert len(started) == 1
+    # Somewhere else, another target, or much later is a new question.
+    guide(replace(observer, position=(10.5, 40.5, 97.75)), goal, now + 61)
+    assert len(started) == 2
+    state.corridor_search = None
+    guide(observer, replace(goal, position=(40.5, 60.5, 97.75)), now + 62)
+    assert len(started) == 3
+    state.corridor_search = None
+    state.corridor_futile.clear()
+    guide(observer, goal, now + 63)
+    assert len(started) == 4
+    while state.corridor_search is not None:
+        now += 0.125
+        guide(observer, goal, now + 63)
+    guide(observer, goal, now + 100)
+    assert len(started) == 4
+    guide(observer, goal, now + 200)
+    assert len(started) == 5
+
+
+def _long_search(world):
+    supports = bytearray([100]) * (512 * 512)
+    for y in range(512):
+        supports[y * 512 + 100] = 239
+    search = SurfaceCorridorSearch(bytes(supports), 512, 512,
+                                   10 * 512 + 10, 400 * 512 + 400)
+    return search, _BudgetedCorridorSearch(world, search)
+
+
+@pytest.mark.parametrize("rate, slices", [(8, (512, 512, 512, 512, 1024)),
+                                           (64, (512, 1024, 1536, 2048, 2560))])
+def test_map_wide_guidance_runs_on_spare_credit_and_is_never_starved(monkeypatch, rate, slices):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(rate))
+    world, brain, observer, state, goal = _setup(monkeypatch, world=world)
+    goal = replace(goal, position=(400.5, 400.5, 97.75))
+    brain._set_goal(state, goal, observer.position, 100)
+    # The bot has ground to walk: its sixty-four slices of guidance can wait.
+    state.route = (RouteStep((12.5, 10.5, 97.75), MovementAffordance.WALK),)
+    state.route_topology_version = world.topology_version
+    search, state.corridor_search = _long_search(world)
+    seen = []
+    for tick in range(5):
+        now = 100 + tick / 8
+        world.begin_planning((1, 1), now)
+        brain._corridor_segment_goal(state, observer, goal, now)
+        world.end_planning()
+        seen.append(search.expansions)
+    # One job per decision is all the small budget has, so nothing is ever
+    # spare: the search takes a slice every half second as an ordinary
+    # request. With credit to spare it takes one every decision.
+    assert tuple(seen) == slices
+    if rate == 8:
+        assert world.planning_budget.snapshot()["requested"] == 2
+
+
+@pytest.mark.parametrize("rate, extended", [(8, False), (64, True)])
+def test_looking_further_ahead_never_takes_the_last_credit(monkeypatch, rate, extended):
+    world = SimpleVoxelWorld(planning_budget=PlanningBudget(rate))
+    world, brain, observer, state, goal = _setup(monkeypatch, world=world)
+    goal = replace(goal, position=(60.5, 10.5, 97.75))
+    brain._set_goal(state, goal, observer.position, 100)
+    state.route = (RouteStep((14.5, 10.5, 97.75), MovementAffordance.WALK),)
+    state.route_topology_version = world.topology_version
+    frame = replace(_frame(observer, created_at=100.0), topology_version=world.topology_version)
+    world.begin_planning((1, 1), 100.0)
+    brain._extend_route(frame, observer, state, goal, 100.0)
+    world.end_planning()
+    assert (len(state.route) > 1) is extended
+    assert world.planning_budget.snapshot()["requested"] == (1 if extended else 0)
+
+
+class _WalledGround:
+    def get_solid(self, x, y, z):
+        return z >= 100 or (y == 13 and 90 <= z < 100)
+
+
+def test_a_waiting_bot_walks_on_toward_its_goal_when_its_old_heading_meets_a_wall(monkeypatch):
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    world._vxl = _WalledGround()
+    state.navigation_window_at = 100.0
+    state.travel_heading = (0.0, 1.0, 0.0)
+    movement = brain._coast(observer, state, goal, 100.0)
+    assert movement.direction[0] > 0.9 and abs(movement.direction[1]) < 0.1
+    # The old heading is still preferred where it is open...
+    state.travel_heading = (0.0, -1.0, 0.0)
+    assert brain._coast(observer, state, goal, 100.0).direction[1] < -0.9
+    # ...and nothing is invented when neither way is plain walking.
+    blocked = replace(goal, position=(10.5, 30.5, 97.75))
+    state.travel_heading = (0.0, 1.0, 0.0)
+    assert brain._coast(observer, state, blocked, 100.0).direction == (0.0, 0.0, 0.0)

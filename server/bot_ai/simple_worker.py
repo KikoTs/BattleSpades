@@ -105,6 +105,16 @@ _VISUAL_RANGE = 160.0
 _CONTACT_SECONDS = 4.0
 _CONTACT_GAZE_SECONDS = 2.0
 _CORRIDOR_WINDOW = 16
+# A map-wide search that ran out of work without a route runs out again from
+# the same ground. Do not repeat it until the body is somewhere else.
+_CORRIDOR_FUTILE_SECONDS = 120.0
+_CORRIDOR_FUTILE_START_RADIUS = 24.0
+_CORRIDOR_FUTILE_GOAL_RADIUS = 24.0
+# Longest a map-wide search goes without a slice while planner credit is short.
+_CORRIDOR_SLICE_PATIENCE = 0.5
+# The same question from the same spot on unchanged ground has the same answer.
+_PLAN_MEMORY_SECONDS = 3.0
+_PLAN_MEMORY_SIZE = 6
 _INTENT_TTL_SECONDS = 0.4
 _WAYPOINT_RADIUS = 0.9
 _WAYPOINT_STALL_SECONDS = 1.75
@@ -261,6 +271,8 @@ class _BotState:
     planning_context: tuple[object, ...] | None = None
     planning_results: dict[tuple[object, ...], RoutePlan] = field(default_factory=dict)
     planning_wait_at: float | None = None
+    # Finished queries by (topology, query): (until, plan). See request_plan.
+    plan_memory: dict[tuple[object, ...], tuple[float, RoutePlan]] = field(default_factory=dict)
     next_oriented_at: float = 0.0
     next_support_at: float = 0.0
     next_deploy_at: float = 0.0
@@ -337,6 +349,10 @@ class _BotState:
     corridor_join_index: int = 0
     corridor_yield_local: bool = False
     corridor_retry_at: float = 0.0
+    corridor_origin: Vector3 | None = None
+    corridor_slice_at: float = 0.0
+    # (start, goal, until) of map-wide searches that found nothing.
+    corridor_futile: list[tuple[Vector3, Vector3, float]] = field(default_factory=list)
     corridor_rejected_goal: Vector3 | None = None
     corridor_rejected_until: float = 0.0
     corridor_failed_goal: Vector3 | None = None
@@ -3136,7 +3152,22 @@ class SimpleBotBrain:
                     (name, frozenset(value) if isinstance(value, set) else value)
                     for name, value in arguments.items())))
                 if key not in state.planning_results:
-                    result = self.world.plan(start, destination, **arguments)
+                    # A body that has not moved, asking the same question of the
+                    # same terrain, gets the answer it got a moment ago. A bot
+                    # with no way on used to run its whole failed chain again
+                    # every decision: two fifths of all route searches.
+                    memory_key = (int(frame.topology_version), *key)
+                    remembered = state.plan_memory.get(memory_key)
+                    if remembered is not None and now < remembered[0]:
+                        result = remembered[1]
+                    else:
+                        result = self.world.plan(start, destination, **arguments)
+                        if not result.deferred:
+                            state.plan_memory.pop(memory_key, None)
+                            while len(state.plan_memory) >= _PLAN_MEMORY_SIZE:
+                                del state.plan_memory[next(iter(state.plan_memory))]
+                            state.plan_memory[memory_key] = (
+                                now + _PLAN_MEMORY_SECONDS, result)
                     if not result.deferred:
                         state.corridor_yield_local = False
                     if not result.deferred and len(state.planning_results) < 4:
@@ -3694,6 +3725,10 @@ class SimpleBotBrain:
                 <= goal.arrival_radius + 2.0
                 or remaining_distance(route, state.route_index, observer.position) > 12.0):
             return
+        if not self._planning_spare(observer, now):
+            # Looking further ahead can wait for a quiet moment; it must not
+            # take the credit of a teammate that has no route at all.
+            return
         state.next_extension_at = now + 0.35
         target = self._team_lane_segment_goal(frame, replace(observer, position=last),
                                               goal.position)
@@ -3872,23 +3907,27 @@ class SimpleBotBrain:
 
         Nobody halts mid-field to think. The stretch ahead must be plain,
         body-wide, walkable ground; the motor's live probes still guard it.
-        Anything else (water, ledges, walls, flight), or a body that has not
-        physically got anywhere for a few seconds, keeps the old full stop.
+        Where the old heading meets a wall, open ground straight toward the
+        goal will do. Anything else (water, ledges, walls, flight), or a body
+        that has not physically got anywhere for a few seconds, keeps the old
+        full stop.
         """
 
-        heading = state.travel_heading or _normalized_xy(
-            goal.position[0] - observer.position[0], goal.position[1] - observer.position[1])
-        if (not observer.grounded or observer.wade or math.hypot(*heading[:2]) < 0.5
-                or state.dead_end
+        if (not observer.grounded or observer.wade or state.dead_end
                 or now - state.navigation_window_at >= _STUCK_REPLAN_SECONDS
                 or not callable(getattr(self.world, "surface", None))):
             return MovementIntent()
-        ahead = (observer.position[0] + heading[0] * 4.0,
-                 observer.position[1] + heading[1] * 4.0, observer.position[2])
-        if not straight_walkable(self.world, observer.position, ahead):
-            return MovementIntent()
-        return MovementIntent(direction=heading, travel_source=observer.position,
-                              travel_waypoint=ahead)
+        toward = _normalized_xy(
+            goal.position[0] - observer.position[0], goal.position[1] - observer.position[1])
+        for heading in (state.travel_heading, toward):
+            if heading is None or math.hypot(*heading[:2]) < 0.5:
+                continue
+            ahead = (observer.position[0] + heading[0] * 4.0,
+                     observer.position[1] + heading[1] * 4.0, observer.position[2])
+            if straight_walkable(self.world, observer.position, ahead):
+                return MovementIntent(direction=heading, travel_source=observer.position,
+                                      travel_waypoint=ahead)
+        return MovementIntent()
 
     def _escape_empty_route(
         self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
@@ -4033,13 +4072,15 @@ class SimpleBotBrain:
                      and now - state.goal_progress_at >= _GOAL_STALL_SECONDS)
                 and not (now < state.corridor_rejected_until
                          and state.corridor_rejected_goal is not None
-                         and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)):
+                         and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)
+                and not self._corridor_futile(state, observer.position, goal.position, now)):
             reader = getattr(self.world, "begin_corridor", None)
             if callable(reader):
                 state.corridor_search = reader(
                     observer.position, goal.position,
                     blocked_edges=frozenset(state.blocked_edges),
                 )
+                state.corridor_origin = observer.position
                 state.corridor_failed_goal = (goal.position
                                              if state.corridor_search is None else None)
                 if state.corridor_search is None and goal.role == "tdm_squad_support":
@@ -4059,11 +4100,29 @@ class SimpleBotBrain:
                 # query completes. Otherwise a long search consumes every
                 # grant first and leaves it motionless for seconds.
                 return None
+            if (not search.done and now - state.corridor_slice_at < _CORRIDOR_SLICE_PATIENCE
+                    and not self._planning_spare(observer, now)):
+                # Up to sixty-four slices of guidance can wait; a teammate with
+                # no route at all cannot. Take a slice when credit is going
+                # spare, or as an ordinary request once this search has waited.
+                return None
+            was_done = search.done
             search.advance()
             if getattr(search, "deferred", False):
                 return None
+            if not was_done:
+                state.corridor_slice_at = now
             state.corridor_yield_local = True
             if search.done:
+                if not search.path and state.corridor_origin is not None:
+                    # CastleWars: twelve bots repeated the same cross-map search
+                    # every fifteen seconds for a whole match; 110 of 139 ran
+                    # their full 32768 nodes for nothing, three quarters of all
+                    # planner work, while routes that could move a bot queued.
+                    state.corridor_futile = [
+                        entry for entry in state.corridor_futile if now < entry[2]][-7:]
+                    state.corridor_futile.append(
+                        (state.corridor_origin, goal.position, now + _CORRIDOR_FUTILE_SECONDS))
                 if search.path:
                     # The bot may have moved during incremental search. Join
                     # a nearby corner only after proving a short dry connection;
@@ -4112,6 +4171,21 @@ class SimpleBotBrain:
                 state.corridor_join_index = 0
                 state.corridor_yield_local = False
         return self._corridor_point_ahead(state, observer.position)
+
+    @staticmethod
+    def _corridor_futile(state: _BotState, position: Vector3, goal: Vector3,
+                         now: float) -> bool:
+        """Did a map-wide search from about here to about there just fail?"""
+        return any(
+            now < until
+            and math.dist(position, start) <= _CORRIDOR_FUTILE_START_RADIUS
+            and math.dist(goal, target) <= _CORRIDOR_FUTILE_GOAL_RADIUS
+            for start, target, until in state.corridor_futile)
+
+    def _planning_spare(self, observer: PlayerSnapshot, now: float) -> bool:
+        """May work that can wait run now without taking a waiting bot's turn?"""
+        spare = getattr(getattr(self.world, "planning_budget", None), "spare", None)
+        return not callable(spare) or spare((observer.player_id, observer.generation), now)
 
     @staticmethod
     def _corridor_point_ahead(state: _BotState, position: Vector3) -> Vector3 | None:

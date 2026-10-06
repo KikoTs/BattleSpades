@@ -10,7 +10,7 @@ import time
 import pytest
 
 from server.bot_ai.planning_budget import (
-    MAX_EXPANSIONS_PER_JOB, MAX_PENDING_OBSERVERS, MAX_PROFILE_SAMPLES,
+    MAX_DECISION_JOBS, MAX_EXPANSIONS_PER_JOB, MAX_PENDING_OBSERVERS, MAX_PROFILE_SAMPLES,
     PlanningBudget, PlanningJob,
 )
 from server.bot_ai.simple_navigation import SimpleVoxelWorld, _BudgetedCorridorSearch
@@ -270,3 +270,148 @@ def test_would_grant_predicts_admission_without_spending_it():
     assert budget.try_acquire((1, 1), 0.0) is not None
     assert not budget.would_grant((2, 1), 0.0)  # this instant's allowance is spent
     assert budget.snapshot()["granted"] == 1
+
+
+def _work(budget, observer, now, expansions=MAX_EXPANSIONS_PER_JOB):
+    """Run one job of the given size, as the planner does; False when denied."""
+    job = budget.try_acquire(observer, now)
+    if job is None:
+        return False
+    job.expansions = expansions
+    budget.finish(job, 0.0)
+    return True
+
+
+def test_a_waiter_that_is_not_asking_does_not_block_the_bots_behind_it():
+    budget = PlanningBudget(24, decision_hz=8)
+    for bot in (1, 2, 3):
+        assert budget.try_acquire((bot, 1), 0.0)
+    assert budget.try_acquire((4, 1), 0.0) is None
+    assert budget.try_acquire((5, 1), 0.0) is None
+    # Observer 4 is alive but has not reached its next decision. A head-of-line
+    # queue denied everyone behind it until it asked again; with three credits
+    # in hand there is one for it and one for observer 5.
+    assert budget.try_acquire((5, 1), 0.125)
+    assert budget.try_acquire((4, 1), 0.125)
+
+
+def test_the_longest_waiter_owns_the_next_credit_when_credit_is_short():
+    budget = PlanningBudget(8, decision_hz=8)
+    assert budget.try_acquire((1, 1), 0.0)
+    assert budget.try_acquire((2, 1), 0.0) is None
+    assert budget.try_acquire((3, 1), 0.0) is None
+    # The one credit that accrued is observer 2's, whoever asks first.
+    assert budget.try_acquire((3, 1), 0.125) is None
+    assert budget.try_acquire((2, 1), 0.125)
+    assert budget.try_acquire((3, 1), 0.25)
+    assert budget.snapshot()["wait_max_s"] == 0.25
+
+
+@pytest.mark.parametrize("fleet", [12, 24, 48])
+def test_no_bot_waits_long_when_every_bot_wants_a_full_route_every_decision(fleet):
+    budget = PlanningBudget(24, decision_hz=8)
+    budget.scale_for(fleet)
+    served = Counter()
+    asked_at = {}
+    longest = 0.0
+    for tick in range(240):
+        now = tick / 8.0
+        # Frame order changes from batch to batch in play.
+        for bot in ((index + tick * 5) % fleet for index in range(fleet)):
+            asked_at.setdefault(bot, now)
+            if _work(budget, (bot, 1), now):
+                longest = max(longest, now - asked_at.pop(bot))
+                served[bot] += 1
+    assert len(served) == fleet
+    assert longest <= 1.0 and budget.snapshot()["wait_max_s"] <= 1.0
+    assert max(served.values()) - min(served.values()) <= 1
+    assert budget.expansions <= (budget.burst + 30 * budget.requests_per_second) * 512
+
+
+def test_short_routes_are_charged_for_the_work_they_did():
+    budget = PlanningBudget(8, decision_hz=8)
+    assert _work(budget, (1, 1), 0.0, expansions=64)
+    # An eighth of the job was used and the rest came back.
+    assert not _work(budget, (2, 1), 0.0)
+    assert _work(budget, (2, 1), 0.02)
+    full = PlanningBudget(8, decision_hz=8)
+    assert _work(full, (1, 1), 0.0)
+    assert not _work(full, (2, 1), 0.1)
+    assert _work(full, (2, 1), 0.125)
+
+
+def test_work_admitted_never_exceeds_the_rate_however_cheap_the_jobs():
+    budget = PlanningBudget(24, decision_hz=8)
+    spent = 0
+    for tick in range(800):
+        now = tick / 100.0
+        for bot in range(16):
+            size = (17, 64, 200, 512)[(bot + tick) % 4]
+            if _work(budget, (bot, 1), now, expansions=size):
+                spent += size
+        assert spent <= (budget.burst + now * 24) * MAX_EXPANSIONS_PER_JOB + 1e-6
+    assert spent > 0.5 * 8 * 24 * MAX_EXPANSIONS_PER_JOB  # and the credit is used, not hoarded
+
+
+def test_one_decision_chains_its_fallbacks_only_from_credit_nobody_is_waiting_for():
+    budget = PlanningBudget(32, decision_hz=8)
+    # A route and both its fallbacks in one decision. That is the allowance:
+    # a fourth request is refused with credit in hand and joins no queue.
+    assert all(_work(budget, (1, 1), 0.0) for _ in range(3))
+    assert not _work(budget, (1, 1), 0.0)
+    assert budget.snapshot()["pending"] == 0
+    assert _work(budget, (2, 1), 0.0)
+    assert not _work(budget, (3, 1), 0.0)
+    # Two credits accrue. Observer 1 takes one; a second helping would be the
+    # credit observer 3 has been waiting for.
+    now = 2 / 32
+    assert _work(budget, (1, 1), now)
+    assert not _work(budget, (1, 1), now)
+    assert _work(budget, (3, 1), now)
+
+
+def test_cheap_searches_share_one_decision_allowance():
+    budget = PlanningBudget(64, decision_hz=8)
+    done = 0
+    while _work(budget, (1, 1), 0.0, expansions=128):
+        done += 1
+    # Escape candidates are small: nine fit where three full routes would.
+    assert done == 9
+    assert budget.expansions <= MAX_DECISION_JOBS * MAX_EXPANSIONS_PER_JOB
+    assert _work(budget, (1, 1), 0.125, expansions=128)
+
+
+def test_an_unfinished_job_is_the_only_one_its_observer_holds():
+    budget = PlanningBudget(64, decision_hz=8)
+    job = budget.try_acquire((1, 1), 0.0)
+    assert job is not None and budget.try_acquire((1, 1), 0.0) is None
+    budget.finish(job, 0.0)
+    budget.finish(job, 0.0)  # A repeated completion hands nothing back twice.
+    assert budget.try_acquire((1, 1), 0.0) is not None
+    assert budget.snapshot()["granted"] == 2
+
+
+def test_spare_credit_leaves_half_a_batch_for_bots_without_a_route():
+    budget = PlanningBudget(64, decision_hz=8)
+    assert budget.burst == 8 and budget.spare((9, 1), 0.0)
+    for bot in (1, 2, 3):
+        assert budget.try_acquire((bot, 1), 0.0)
+    assert budget.spare((9, 1), 0.0)
+    assert budget.try_acquire((4, 1), 0.0)
+    before = budget.snapshot()
+    # Half the batch is gone: background work stops, ordinary requests do not.
+    assert not budget.spare((9, 1), 0.0)
+    assert budget.would_grant((9, 1), 0.0)
+    assert budget.snapshot() == before
+    # A budget of one job per decision never has anything to spare.
+    assert not PlanningBudget(8, decision_hz=8).spare((1, 1), 0.0)
+
+
+def test_a_waiting_observer_has_first_call_on_spare_credit():
+    budget = PlanningBudget(64, decision_hz=8)
+    for bot in range(8):
+        assert budget.try_acquire((bot, 1), 0.0)
+    assert budget.try_acquire((8, 1), 0.0) is None and budget.try_acquire((9, 1), 0.0) is None
+    now = 6 / 64  # Six credits back: five would be spare, but two are spoken for.
+    assert not budget.spare((20, 1), now)
+    assert budget.spare((20, 1), 7 / 64)
