@@ -17,7 +17,7 @@ import logging
 import math
 import queue
 import time
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import shared.constants as C
 from server.dig_profiles import (
@@ -151,6 +151,9 @@ _CROWD_DETOUR_MIN_GOAL_DISTANCE = 40.0
 _CROWD_BLOCKED_EDGE_SECONDS = 20.0
 _CROWD_DETOUR_ROUTE_SECONDS = 20.0
 _BREACH_RESERVATION_RADIUS = 2.25
+# A class that may not sprint uphill lets go of sprint this far before a step
+# up (one decision at sprint speed and a stride), and takes it up again on it.
+_SPRINT_RELEASE_REACH = 2.5
 _BREACH_QUEUE_SPACING = 1.15
 _BREACH_YIELD_REPLAN_SECONDS = 1.25
 _TEAM_LANE_SPACING = 8.0
@@ -3725,7 +3728,6 @@ class SimpleBotBrain:
         sprint_allowed = (
             motor_affordance is MovementAffordance.SWIM
             or (motor_affordance is MovementAffordance.WALK
-                and not step.waypoint[2] < observer.position[2] - 0.25
                 and self._route_allows_sprint(state, observer)))
         walk_drop = 1
         if (motor_affordance in {MovementAffordance.WALK, MovementAffordance.DROP}
@@ -3771,7 +3773,10 @@ class SimpleBotBrain:
                 to_run_end = math.hypot(
                     state.route[last].waypoint[0] - observer.position[0],
                     state.route[last].waypoint[1] - observer.position[1])
-                sprint_allowed = not exact_step_next or to_run_end >= 4.5
+                sprint_allowed = (
+                    (not exact_step_next or to_run_end >= 4.5)
+                    and (_sprints_uphill(observer) or not self._rise_ahead(
+                        state.route, state.route_index, target_index, observer.position)))
             elif motor_affordance is MovementAffordance.DROP and runs_off(
                     self.world, step, observer.position):
                 # A lone ledge is walked off like any other; no shuffle first.
@@ -3903,21 +3908,48 @@ class SimpleBotBrain:
                 state.route_index = index
 
     @staticmethod
+    def _rise_ahead(route: Sequence[RouteStep], index: int, last: int,
+                    position: Vector3, reach: float = _SPRINT_RELEASE_REACH) -> bool:
+        """Is the next step up of this run within ``reach`` blocks of the body?"""
+
+        previous = position
+        distance = 0.0
+        for step in route[index:last + 1]:
+            distance += math.hypot(step.waypoint[0] - previous[0],
+                                   step.waypoint[1] - previous[1])
+            if distance > reach:
+                return False
+            if step.waypoint[2] < previous[2] - 0.25:  # z grows downward
+                return True
+            previous = step.waypoint
+        return False
+
+    @staticmethod
     def _route_allows_sprint(state: _BotState, observer: PlayerSnapshot) -> bool:
-        """Reserve native braking distance before turns, steps and landings."""
+        """Reserve native braking distance before turns, exact steps and landings."""
         # The live motor uses this same velocity scale: 0.35 needs about four
         # blocks to brake. A short approach needs walking even from rest, or
         # sprint acceleration creates the AncientEgypt missed-waypoint orbit.
         distance_needed = min(5.0, max(3.0, 0.65 + math.hypot(*observer.velocity[:2]) * 10.0))
+        uphill = _sprints_uphill(observer)
         previous = observer.position
         direction = None
         distance = 0.0
         for step in state.route[state.route_index:state.route_index + 8]:
-            if (step.affordance is not MovementAffordance.WALK
-                    or abs(step.waypoint[2] - previous[2]) > 0.25):
+            if step.affordance is not MovementAffordance.WALK:
                 return False
             dx, dy = step.waypoint[0] - previous[0], step.waypoint[1] - previous[1]
             length = math.hypot(dx, dy)
+            change = step.waypoint[2] - previous[2]  # z grows downward
+            if abs(change) > 0.25:
+                # A block up or down per stride is still a run: the native
+                # mover takes it at nine tenths of the flat speed, and used
+                # to be walked at a third of it (a Zombie walks at 4 blocks a
+                # second and sprints at 13). Only a class retail refuses to
+                # climb for while it sprints must walk into a rise.
+                if (abs(change) > max(1.0, length) * 1.05
+                        or (change < 0.0 and not uphill)):
+                    return False
             if length > 1e-6:
                 heading = (dx / length, dy / length)
                 if direction is None:
@@ -6217,6 +6249,16 @@ def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     return best_navigation_dig_profile(
         int(tool) for tool in getattr(observer, "loadout", ())
     )
+
+
+def _sprints_uphill(observer: PlayerSnapshot) -> bool:
+    """Retail's CLASS_CAN_SPRINT_UPHILL for this body's class.
+
+    The native mover does not lift a sprinting Classic Soldier or Jump Zombie
+    onto a step: it stands against it, keys held, until sprint is released.
+    """
+
+    return bool(C.CLASS_CAN_SPRINT_UPHILL.get(int(observer.class_id), True))
 
 
 def _movement_abilities(
