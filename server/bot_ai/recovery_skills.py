@@ -1356,8 +1356,14 @@ class LocomotionSkill:
         edge = (source[0] + 0.5 + travel[0] * 0.25, source[1] + 0.5 + travel[1] * 0.25,
                 position_z(observer))
         command = self._steer(observer, edge, role + "_lay", False, tolerance=0.12, sneak=True)
+        # The server's body check counts a crouched body one cell lower, down
+        # to the floor layer. Crouching while the body reaches into the line's
+        # first column cancels the accepted line at its commit, unreported,
+        # and the bot re-lays it for as long as it stands there.
+        crouch = (action.kind is not BotActionKind.NONE
+                  and not _body_overlaps_column(observer.position, line[0], margin=0.15))
         return SkillCommand("running", role=role + "_lay", direction=command.direction,
-                            sneak=True, crouch=action.kind is not BotActionKind.NONE,
+                            sneak=True, crouch=crouch,
                             affordance=MovementAffordance.WALK,
                             look=look, tool_id=int(C.BLOCK_TOOL), action=action)
 
