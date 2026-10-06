@@ -794,10 +794,11 @@ class Player:
 
     def _apply_class_profile_to_world(self, world_object) -> None:
         # The client scales its accel/sprint/crouch multipliers by the
-        # InitialInfo speed scale (wire-rounded); the server simulation must
-        # use identical effective values or prediction drifts (rubber-band).
-        from server.class_data import speed_scale
-        rule_multiplier = 1.0
+        # InitialInfo speed scale (the lobby speed rules, wire-rounded); the
+        # server simulation must use identical effective values or prediction
+        # drifts (rubber-band).
+        from server.class_data import rule_speed_scale, speed_scale
+        scale = speed_scale(self._class_id)
         water_damage_multiplier = self.movement_profile.fall_on_water_damage_multiplier
         server = self.connection.server if self.connection else None
         config = getattr(server, "config", None)
@@ -809,12 +810,7 @@ class Player:
             # when this InitialInfo rule is disabled, not only a later HP gate.
             if not rules.enabled("RULE_ENABLE_FALL_ON_WATER_DAMAGE"):
                 water_damage_multiplier = 0.0
-            rule_multiplier *= float(rules.get("RULE_CHARACTER_SPEED"))
-            if str(getattr(config, "game_mode", "")).lower() in (
-                "zom", "zombie"
-            ):
-                rule_multiplier *= float(rules.get("RULE_CLASS_SPEED"))
-        scale = speed_scale(self._class_id, rule_multiplier)
+            scale = rule_speed_scale(config, self._class_id)
         world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier * scale)
         world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier * scale)
         world_object.set_class_jump_multiplier(self.movement_profile.jump_multiplier)

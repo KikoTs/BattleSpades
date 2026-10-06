@@ -396,7 +396,7 @@ Mode rules and accepted choices:
 |---|---|
 | TDM | `RULE_TDM_SCORE_TARGET`: OFF, 5–50 presets, 60–100 by 10, or 200 |
 | CTF/CCTF | shoot with intel, return on touch, auto-return booleans; hidden own-intel-at-base boolean; score 1–10 |
-| Zombie | rounds 1–5, first infected 1–5, class speed 50/100/200%, zombie damage 50/100/200% |
+| Zombie | rounds 1–5, first infected 1–5, zombie speed (`RULE_CLASS_SPEED`, infected classes only) 50/100/200%, zombie damage 50/100/200% |
 | VIP | rounds 1–5, VIP health 50/100/200%, sudden death boolean |
 | Multi-Hill | active bases 1–5; base time 30/60/90, then 120–600 presets. Retail has no Multi-Hill score rule; set the target with `[modes.mh] score_limit` (default 100) |
 | Territory Control | active bases 2–5; capture rate 50/100/200% |

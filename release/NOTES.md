@@ -18,6 +18,14 @@ follow-up gameplay and stability fixes into one server release.
 
 ## Movement and networking
 
+- Correct class movement speed. The per-class speed scale in InitialInfo is
+  now the lobby speed rule alone, as on the original servers, instead of the
+  class sprint multiplier, which was being applied twice. A Soldier walks 5.6
+  and sprints 11.2 blocks per second (was 7.9 and 15.8), a Classic Soldier
+  walks 8 as in Ace of Spades 0.75, and every other class slows by its own
+  sprint factor; jetpack travel shortens with it. Zombie Speed
+  (`RULE_CLASS_SPEED`) now scales the infected classes once on both client and
+  server.
 - Give retail clients nominal 30 Hz airborne owner updates while preserving
   the native BattleSpades client's six-tick cadence.
 - Improve lost-input recovery, bounded idle backlog handling, jump replay

@@ -26,6 +26,59 @@ checked against the original Python 2 bytecode assignments. Water-fall damage
 is zeroed in the native class profile when its game rule is disabled, as in
 the original `GameClass` constructor.
 
+## Class speed scale
+
+`InitialInfo.movement_speed_multipliers[class_id]` multiplies all three ground
+tables of a class in the original client (`aoslib/scenes/main/gameClass.py`):
+
+```python
+self.accel_multiplier = CLASS_ACCEL_MULTIPLIER[self.id] * speed_multiplier
+self.sprint_multiplier = CLASS_SPRINT_MULTIPLIER[self.id] * speed_multiplier
+self.crouch_sneak_multiplier = CLASS_CROUCH_SNEAK_MULTIPLIER[self.id] * speed_multiplier
+```
+
+The server therefore sends the lobby speed rule alone, 1.0 at 100%. Up to
+0.2.1-beta.7 it sent each class's sprint multiplier, which applied that table
+a second time to all three gaits. Prediction and authority used the same wrong
+value, so nothing rubber-banded: every class except Jump Zombie was simply 9%
+(Rocketeer) to 200% (Fast Zombie, UGC Builder) too fast.
+
+Evidence that 1.0 is the original value:
+
+- Three InitialInfo packets recorded from live Jagex servers (TDM on London
+  and Tokyo Neon, Classic CTF; community pyckaxe protocol notes) carry
+  `0x0040`, 1.0, for each of the 14 classes of those builds. One is kept in
+  `tests/test_class_speed_scale.py`.
+- `RULE_CHARACTER_SPEED` defaults to "100%" in `constants_matchmaking.py`.
+- Classic Soldier's acceleration entry is 1.0, which is 8 blocks/s: the
+  walking speed of Ace of Spades 0.75 that the class reproduces.
+
+Ground terminal speed is acceleration over the ground friction of 4, at 32
+blocks per native velocity unit: 8 blocks/s per class multiplier.
+
+| Class | Walk | Sprint | Crouch / sneak | Walk / sprint before the fix |
+| --- | ---: | ---: | ---: | ---: |
+| Soldier, Miner | 5.6 | 11.2 | 4.0 | 7.9 / 15.8 |
+| Scout | 5.6 | 11.6 | 4.0 | 8.1 / 16.9 |
+| Rocketeer | 5.6 | 8.8 | 4.0 | 6.1 / 9.6 |
+| Engineer | 5.6 | 10.0 | 4.0 | 7.0 / 12.5 |
+| Specialist | 6.8 | 12.4 | 4.0 | 10.5 / 19.2 |
+| Medic | 4.8 | 10.8 | 4.0 | 6.5 / 14.5 |
+| Classic Soldier | 8.0 | 10.6 | 4.0 | 10.6 / 14.1 |
+| Gangster | 5.6 | 12.0 | 4.0 | 8.4 / 18.0 |
+| Zombie | 4.0 | 13.2 | 4.0 | 6.6 / 21.9 |
+| Fast Zombie | 8.8 | 24.0 | 2.0 | 26.4 / 72.0 |
+| Jump Zombie | 4.0 | 8.0 | 4.0 | unchanged |
+| UGC Builder | 8.0 | 24.0 | 4.0 | 24.0 / 72.0 |
+
+`RULE_CHARACTER_SPEED` ("Game Speed" in the lobby) scales every class.
+`RULE_CLASS_SPEED` is the Zombie-mode "Zombie Speed" row, beside "Zombie
+Damage", so it scales the three infected classes and not the survivors. No
+original server code or capture with that rule changed exists; the class
+scope is read from the lobby label. `class_data.rule_speed_scale` composes
+both rules for InitialInfo and for the authoritative mover, which previously
+applied the zombie rule twice on the wire and once in the simulation.
+
 ## Independent regression fixtures
 
 | Fixture | Cases | Original execution covered |

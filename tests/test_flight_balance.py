@@ -147,7 +147,7 @@ def test_early_parachute_press_waits_for_descent_without_jump_boost():
 
 
 @pytest.mark.parametrize("pack,min_range,min_frames,max_frames", [
-    (66, 25.0, 195, 200), (67, 100.0, 615, 620), (68, 30.0, 735, 740),
+    (66, 22.5, 195, 200), (67, 90.0, 615, 620), (68, 24.0, 735, 740),
 ])
 def test_longer_range_through_real_clientdata_and_replicated_fuel(pack, min_range, min_frames, max_frames):
     async def run():
@@ -213,8 +213,8 @@ from server.flight_profile import (  # noqa: E402
 )
 
 RETAIL_TERMINAL = 0.05 * 32.0   # stock canopy: 1.6 blocks/s
-# Engineer class accel 0.7 x InitialInfo speed scale (its sprint 1.25).
-ENGINEER_ACCEL = 0.7 * 1.25
+# Engineer class accel 0.7 x InitialInfo speed scale (1.0 at default rules).
+ENGINEER_ACCEL = 0.7
 V2_TERMINAL = 0.15625 * 32.0    # BattleSpades canopy: 5 blocks/s
 
 
@@ -268,16 +268,16 @@ async def _engineer_cruise_blocks(profile, frames=60):
 
 @pytest.mark.parametrize("profile", [RETAIL_FLIGHT, BALANCED_FLIGHT])
 def test_engineer_flight_speed_stays_retail_for_stock_and_v1_owners(profile):
-    # Stock world.pyd: active Engineer air accel 0.1 x class accel 0.7 x the
-    # InitialInfo class speed scale 1.25, drag 1+dt: terminal 0.0875 native
-    # = 2.8 blocks/s (40% of the Engineer's 7 blocks/s walk).
+    # Stock world.pyd: active Engineer air accel 0.1 x class accel 0.7, drag
+    # 1+dt: terminal 0.07 native = 2.24 blocks/s (40% of the Engineer's
+    # 5.6 blocks/s walk).
     blocks = asyncio.run(_engineer_cruise_blocks(profile))
     assert blocks == pytest.approx(ENGINEER_ACCEL * 0.1 * 32.0, rel=0.03)
 
 
 def test_engineer_flies_at_ground_walking_speed_with_the_v2_profile():
-    # 0.25 x 0.875 = 0.21875 native = 7 blocks/s: the Engineer's own walking
-    # speed (0.875 / ground friction 4) and 2.5x the stock flight speed.
+    # 0.25 x 0.7 = 0.175 native = 5.6 blocks/s: the Engineer's own walking
+    # speed (0.7 / ground friction 4) and 2.5x the stock flight speed.
     retail = asyncio.run(_engineer_cruise_blocks(RETAIL_FLIGHT))
     tuned = asyncio.run(_engineer_cruise_blocks(BALANCED_FLIGHT_V2))
     assert tuned == pytest.approx(ENGINEER_ACCEL * 0.25 * 32.0, rel=0.03)

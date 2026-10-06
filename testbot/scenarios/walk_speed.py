@@ -20,12 +20,13 @@ import time as _t
 NAME = 'walk_speed'
 TIMEOUT = 30.0
 
-# Default: SOLDIER (class_id=0). With sprint_multiplier=1.4 the server
-# should produce ~10-12 blocks/sec sprint speed. Tighten the bounds once
-# we measure a few classes against the live client.
+# Default: SOLDIER (class_id=0). With sprint_multiplier=1.4 the sprint
+# terminal is 8 * 1.4 = 11.2 blocks/sec, about 10 averaged over this window
+# from a standing start. An average near 14 means the InitialInfo speed scale
+# carries the sprint table a second time (terminal 15.75).
 SPRINT_DURATION_S = 2.0
 EXPECTED_SPEED_MIN = 6.0    # blocks/sec; below this, something's broken
-EXPECTED_SPEED_MAX = 25.0   # above this, multiplier or scaling is wrong
+EXPECTED_SPEED_MAX = 12.0   # above the terminal: a multiplier is applied twice
 
 
 def script(c):

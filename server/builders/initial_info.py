@@ -130,14 +130,10 @@ def _map_checksum(server: 'BattleSpadesServer') -> int:
 
 
 def _movement_speed_multipliers(server: 'BattleSpadesServer') -> list[float]:
-    rules = get_rules(server.config)
-    multiplier = float(rules.get("RULE_CHARACTER_SPEED"))
-    if str(getattr(server.config, "game_mode", "")).lower() in (
-        "zom", "zombie"
-    ):
-        multiplier *= float(rules.get("RULE_CLASS_SPEED"))
+    # The lobby speed rules per class id, 1.0 at 100%. Player authority reads
+    # the same class_data.rule_speed_scale, so the two cannot disagree.
     return [
-        class_data.speed_scale(class_id, multiplier)
+        class_data.rule_speed_scale(server.config, class_id)
         for class_id in range(len(class_data.initial_info_movement_multipliers()))
     ]
 
