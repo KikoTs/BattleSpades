@@ -22,6 +22,7 @@ from typing import Iterable
 import shared.constants as C
 from server.dig_profiles import (
     DigProfile,
+    MAP_BLOCK_HEALTH,
     PRIMARY_DIG_PROFILES,
     best_navigation_dig_profile,
     melee_dig_positions,
@@ -68,6 +69,7 @@ from .messages import (
     BotIntent,
     BotIntentPriority,
     BotProfile,
+    EntitySnapshot,
     LookIntent,
     MapSnapshot,
     MovementAffordance,
@@ -113,6 +115,16 @@ _VISUAL_RANGE = 160.0
 _CONTACT_SECONDS = 4.0
 _CONTACT_GAZE_SECONDS = 2.0
 _CORRIDOR_WINDOW = 16
+# A map-wide search that ran out of work without a route runs out again from
+# the same ground. Do not repeat it until the body is somewhere else.
+_CORRIDOR_FUTILE_SECONDS = 120.0
+_CORRIDOR_FUTILE_START_RADIUS = 24.0
+_CORRIDOR_FUTILE_GOAL_RADIUS = 24.0
+# Longest a map-wide search goes without a slice while planner credit is short.
+_CORRIDOR_SLICE_PATIENCE = 0.5
+# The same question from the same spot on unchanged ground has the same answer.
+_PLAN_MEMORY_SECONDS = 3.0
+_PLAN_MEMORY_SIZE = 6
 _INTENT_TTL_SECONDS = 0.4
 _WAYPOINT_RADIUS = 0.9
 _WAYPOINT_STALL_SECONDS = 1.75
@@ -175,6 +187,17 @@ _CASUAL_ERRANDS = _HUNT_ROLES | {
     "tdm_squad_support", "tdm_overwatch_lane", "squad_advance"}
 _ERRAND_COMMITMENT_SECONDS = 3.0
 _ROCKET_TOOLS = frozenset((int(C.RPG_TOOL), int(C.RPG2_TOOL)))
+_CHARGE_TOOLS = (int(C.DYNAMITE_TOOL), int(C.C4_TOOL))
+# The placement service accepts five blocks from the body; keep a margin.
+_CHARGE_REACH = 4.5
+# How far outside its own blast a bot goes before it stops running.
+_CHARGE_CLEARANCE = 2.5
+# Outward normals of attachment faces 0-5 (entities.behaviors).
+_FACE_NORMALS = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
+_BLOCK_CANNON_TOOL = int(getattr(C, "SNOWBLOWER_TOOL", 29))
+# Nearest a Block Cannon shot may land: its splash, the gateway's block of
+# clearance beyond that, and a little for the aim settling.
+_BLOCK_CANNON_MIN_RANGE = float(PROJECTILE_SPECS[_BLOCK_CANNON_TOOL].blast_radius) + 1.3
 _ORIENTED_ATTACK_TOOLS = frozenset(int(tool) for tool in PROJECTILE_SPECS) - {
     int(C.DYNAMITE_TOOL),
     int(C.LANDMINE_TOOL),
@@ -275,10 +298,31 @@ class _BotState:
     planning_context: tuple[object, ...] | None = None
     planning_results: dict[tuple[object, ...], RoutePlan] = field(default_factory=dict)
     planning_wait_at: float | None = None
+    # Finished queries by (topology, query): (until, plan). See request_plan.
+    plan_memory: dict[tuple[object, ...], tuple[float, RoutePlan]] = field(default_factory=dict)
     next_oriented_at: float = 0.0
     next_support_at: float = 0.0
     next_deploy_at: float = 0.0
     next_cover_at: float = 0.0
+    # Miner charges: next attempt, refused attempts, and where the bot runs to
+    # while a charge of its own is live.
+    next_charge_at: float = 0.0
+    charge_attempts: int = 0
+    charge_entity: int = -1
+    charge_retreat: Vector3 | None = None
+    # C4 trap: the ground cell being walked to, where to stand to reach it,
+    # and whether the live charge is one (fired under an enemy, not at once).
+    trap_cell: tuple[int, int, int] | None = None
+    trap_stand: Vector3 | None = None
+    trap_until: float = 0.0
+    next_trap_at: float = 0.0
+    charge_trap: bool = False
+    # Block Cannon barricade: the cells still to shoot into place.
+    cannon_cells: tuple[tuple[int, int, int], ...] = ()
+    cannon_origin: Vector3 | None = None
+    cannon_until: float = 0.0
+    cannon_shot_at: float = 0.0
+    next_cannon_at: float = 0.0
     next_hop_at: float = 0.0
     last_hop_damage_at: float = 0.0
     breach_key: tuple[object, ...] | None = None
@@ -357,6 +401,10 @@ class _BotState:
     corridor_join_index: int = 0
     corridor_yield_local: bool = False
     corridor_retry_at: float = 0.0
+    corridor_origin: Vector3 | None = None
+    corridor_slice_at: float = 0.0
+    # (start, goal, until) of map-wide searches that found nothing.
+    corridor_futile: list[tuple[Vector3, Vector3, float]] = field(default_factory=list)
     corridor_rejected_goal: Vector3 | None = None
     corridor_rejected_until: float = 0.0
     corridor_failed_goal: Vector3 | None = None
@@ -829,6 +877,14 @@ class SimpleBotBrain:
             if reacting is not None:
                 return reacting
         engagement = state.engagement
+        cooperative = frame.behavior_version == "cooperative"
+        if cooperative:
+            # Before anything else, combat included: nobody stands a firefight
+            # out beside dynamite they lit themselves.
+            clearing = self._own_charge_intent(frame, observer, state, now,
+                                               fighting=visible_target is not None)
+            if clearing is not None:
+                return clearing
         if (visible_target is None and observer.reloading and observer.grounded
                 and now < engagement.cover_until
                 and (engagement.cover_duck or engagement.cover is not None)
@@ -870,6 +926,11 @@ class SimpleBotBrain:
                 now,
                 mode_decision,
             )
+
+        if cooperative:
+            charge = self._plant_charge_intent(frame, observer, state, now, mode_decision)
+            if charge is not None:
+                return charge
 
         if (
             mode_decision is not None
@@ -916,19 +977,26 @@ class SimpleBotBrain:
         if support is not None:
             return support
 
-        deployable = (
-            self._strategic_deploy_intent(
-                frame,
-                observer,
-                state,
-                now,
-                decision=mode_decision,
+        if cooperative:
+            # The team layer builds outposts and strongpoints when a bot has
+            # nothing more pressing, which in an objective mode is never. What
+            # a class carries is used here, where the bot already stands.
+            deployable = self._class_deploy_intent(
+                frame, observer, state, now, mode_decision)
+        else:
+            deployable = (
+                self._strategic_deploy_intent(
+                    frame,
+                    observer,
+                    state,
+                    now,
+                    decision=mode_decision,
+                )
+                if (mode_decision is None
+                or mode_decision.directive == "fortify"
+                or mode_decision.objective_priority < 0.85)
+                else None
             )
-            if frame.behavior_version != "cooperative" and (mode_decision is None
-            or mode_decision.directive == "fortify"
-            or mode_decision.objective_priority < 0.85)
-            else None
-        )
         if deployable is not None:
             return deployable
 
@@ -2576,6 +2644,612 @@ class SimpleBotBrain:
             debug_role=f"deploy_{selected}_{strategic_role}",
         )
 
+    def _class_deploy_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        now: float,
+        decision: ModeBotDecision | None,
+    ) -> BotIntent | None:
+        """Use the gadget a class carries, from where the bot already stands.
+
+        A defender arms the post it holds: a turret or radar beside it, mines
+        on the side the enemy comes from, a barricade shot up with the Block
+        Cannon, a disguise while nothing is in sight. Anyone who has just lost
+        sight of an enemy leaves a turret or a mine for them, and a fighter
+        without an objective does the same at its meeting point. A carrier,
+        and a bot still crossing the map to its job, do neither.
+        """
+
+        if (not observer.grounded or observer.wade
+                or observer.carried_entity_id >= 0
+                or int(observer.class_id) in _ZOMBIE_CLASSES):
+            return None
+        if state.cannon_cells and now < state.cannon_until:
+            return self._block_cannon_intent(frame, observer, state, now)
+        if now < state.next_deploy_at:
+            return None
+        distance = (math.dist(observer.position, decision.position)
+                    if decision is not None else math.inf)
+        if decision is not None and decision.directive == "fortify" and distance <= 14.0:
+            cover = self._prefab_cover_intent(frame, observer, state, decision.position, now)
+            if cover is not None:
+                return cover
+        holding = (decision is not None
+                   and decision.posture is ModeBotPosture.DEFEND
+                   and distance <= decision.arrival_radius + 6.0)
+        contact = (state.contact_position
+                   if state.contact_position is not None and now < state.contact_until
+                   else None)
+        if contact is not None:
+            focus, reach, role = contact, math.dist(observer.position, contact), "contact"
+        elif holding:
+            focus = decision.watch_position or next(
+                (item.position for item in frame.objectives
+                 if item.kind == "team_anchor" and item.team != observer.team), None)
+            reach, role = 0.0, "post"
+        elif (decision is not None and decision.objective_priority < 0.85
+                and not mode_objective_committed(decision)):
+            focus, reach, role = decision.position, distance, "front"
+        else:
+            return None
+        heading = (_normalized_xy(focus[0] - observer.position[0],
+                                  focus[1] - observer.position[1])
+                   if focus is not None else (0.0, 0.0, 0.0))
+        if math.hypot(*heading[:2]) < 0.5:
+            heading = _normalized_xy(observer.orientation[0], observer.orientation[1])
+        if math.hypot(*heading[:2]) < 0.5:
+            return None
+        look = focus if focus is not None else (
+            observer.eye[0] + heading[0] * 8.0, observer.eye[1] + heading[1] * 8.0,
+            observer.eye[2])
+        stock = dict(observer.deployable_stock)
+        owned = {int(tool) for tool in observer.loadout}
+        placement = tuple(float(value) for value in observer.position)
+
+        def carried(tool: int) -> bool:
+            return tool in owned and stock.get(tool, 0) > 0
+
+        def own(tool: int) -> int:
+            return sum(1 for entity in frame.entities
+                       if entity.alive and int(entity.tool_id) == tool
+                       and int(entity.owner_id) == int(observer.player_id))
+
+        def crowded(tool: int, radius: float) -> bool:
+            # Only the team's own devices: an enemy's are not ours to know of.
+            return any(entity.alive and int(entity.tool_id) == tool
+                       and int(entity.team) == int(observer.team)
+                       and math.dist(entity.position, placement) <= radius
+                       for entity in frame.entities)
+
+        turret, radar = int(C.ROCKET_TURRET_TOOL), int(C.RADAR_STATION_TOOL)
+        landmine, disguise = int(C.LANDMINE_TOOL), int(C.DISGUISE_TOOL)
+        at_post = holding and distance <= decision.arrival_radius + 1.0
+        quiet = contact is None and now - observer.last_damage_at > 6.0
+        selected, cooldown = -1, 20.0
+        if (carried(turret) and (holding or reach <= 18.0) and own(turret) < 2
+                and not crowded(turret, 12.0)):
+            selected, cooldown = turret, 24.0
+        elif (carried(radar) and (holding or reach <= 22.0) and not own(radar)
+                and not crowded(radar, 18.0)):
+            selected, cooldown = radar, 35.0
+        elif (carried(landmine) and own(landmine) < 3
+                and (holding or reach <= (20.0 if contact is not None else 10.0))):
+            spot = self._mine_spot(frame, observer, heading)
+            if spot is None:
+                state.next_deploy_at = now + 4.0
+                return None
+            selected, cooldown, placement = landmine, 14.0, spot
+        elif (carried(disguise) and at_post and quiet
+                and math.hypot(observer.velocity[0], observer.velocity[1]) < 0.2):
+            # Retail Disguise lasts while its wearer stands still, which is
+            # what a sentry at its post does.
+            selected, cooldown = disguise, 30.0
+        elif (_BLOCK_CANNON_TOOL in owned and now >= state.next_cannon_at
+                and int(observer.blocks) >= 12
+                and (holding and quiet or contact is not None and reach >= 14.0)):
+            # A sentry digs in at its post. Anyone else throws a wall up when
+            # an enemy at rifle range has just dropped out of sight.
+            return self._block_cannon_start(frame, observer, state, now, heading)
+        if selected < 0:
+            return None
+        state.next_deploy_at = float(now) + cooldown
+        return self._intent(
+            frame,
+            movement=MovementIntent(crouch=True),
+            look=LookIntent(look, visible=False),
+            tool_id=selected,
+            action=BotAction(
+                BotActionKind.DEPLOY,
+                tool_id=selected,
+                position=None if selected == disguise else placement,
+                yaw=math.atan2(heading[1], heading[0]),
+            ),
+            priority=BotIntentPriority.ROUTINE,
+            debug_goal=look,
+            debug_role=f"deploy_{selected}_{role}",
+        )
+
+    def _mine_spot(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                   heading: Vector3) -> Vector3 | None:
+        """Level ground a few steps toward the enemy, clear of friends and mines."""
+
+        tool = int(C.LANDMINE_TOOL)
+        base = math.atan2(heading[1], heading[0])
+        for turn, reach in ((0.0, 4.0), (0.5, 4.0), (-0.5, 4.0), (0.0, 2.5),
+                            (1.0, 3.5), (-1.0, 3.5)):
+            x = observer.position[0] + math.cos(base + turn) * reach
+            y = observer.position[1] + math.sin(base + turn) * reach
+            surface = self.world.surface(int(math.floor(x)), int(math.floor(y)),
+                                         observer.position[2], vertical_span=1,
+                                         allow_water=False)
+            if surface is None or abs(surface.position[2] - observer.position[2]) > 1.25:
+                continue
+            spot = (float(surface.position[0]), float(surface.position[1]),
+                    float(surface.position[2]))
+            if (any(entity.alive and int(entity.tool_id) == tool
+                    and int(entity.team) == int(observer.team)
+                    and math.dist(entity.position, spot) <= 7.0 for entity in frame.entities)
+                    or any(item.kind != "team_anchor" and math.dist(item.position, spot) < 3.0
+                           for item in frame.objectives)
+                    or not self._explosive_target_safe(frame, observer, spot, tool,
+                                                       ignore_observer=True)):
+                continue
+            return spot
+        return None
+
+    def _block_cannon_start(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                            state: _BotState, now: float,
+                            heading: Vector3) -> BotIntent | None:
+        """Plan a two-high barricade across the approach, built from where it stands.
+
+        The Block Cannon adds one block where each shot lands, so the wall is
+        shot up from the ground: three cells, then three on top. It goes just
+        beyond the cannon's own splash. Whoever comes for the post can no
+        longer shoot at it from down the lane, and has to come round the wall
+        inside the range of the Engineer's SMG.
+        """
+
+        state.next_cannon_at = now + 40.0
+        for along in (6.5, 7.5, 8.5):
+            cells: list[tuple[int, int, int]] = []
+            for across in (-1.0, 0.0, 1.0):
+                x = observer.position[0] + heading[0] * along - heading[1] * across
+                y = observer.position[1] + heading[1] * along + heading[0] * across
+                surface = self.world.surface(int(math.floor(x)), int(math.floor(y)),
+                                             observer.position[2], vertical_span=1,
+                                             allow_water=False)
+                if surface is None or abs(surface.position[2] - observer.position[2]) > 0.5:
+                    cells = []
+                    break
+                cell = (int(surface.x), int(surface.y), int(surface.support_z) - 1)
+                if cell not in cells:
+                    cells.append(cell)
+            if len(cells) < 2:
+                continue
+            wall = (*cells, *((x, y, z - 1) for x, y, z in cells))
+            centres = [(x + 0.5, y + 0.5, z + 0.5) for x, y, z in wall]
+            if (any(self.world.solid(*cell) for cell in wall)
+                    or any(math.dist(observer.eye, (x + 0.5, y + 0.5, z + 1.0))
+                           < _BLOCK_CANNON_MIN_RANGE for x, y, z in wall)
+                    or not all(self.world.has_line_of_sight(
+                        observer.eye, (x + 0.5, y + 0.5, z + 0.9)) for x, y, z in cells)
+                    or any(player.alive and player.spawned
+                           and math.dist(player.position, centre) < 2.0
+                           for player in frame.players for centre in centres)
+                    or any(item.kind != "team_anchor" and math.dist(item.position, centre) < 4.0
+                           for item in frame.objectives for centre in centres)):
+                continue
+            state.cannon_cells = wall
+            state.cannon_origin = observer.position
+            state.cannon_until = now + 10.0
+            state.cannon_shot_at = 0.0
+            return self._block_cannon_intent(frame, observer, state, now)
+        return None
+
+    def _block_cannon_intent(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                             state: _BotState, now: float) -> BotIntent | None:
+        """Shoot the next missing cell of the planned barricade into place."""
+
+        if (state.cannon_shot_at > 0.0 and not observer.last_action_accepted
+                and str(observer.last_action_kind) == BotActionKind.ORIENTED.value
+                and float(observer.last_action_at) >= state.cannon_shot_at - 0.6 - 1e-6):
+            # The server would not have this wall from here, and the same
+            # shot again gets the same answer.
+            state.cannon_cells = ()
+            return None
+        remaining = tuple(cell for cell in state.cannon_cells if not self.world.solid(*cell))
+        state.cannon_cells = remaining
+        ready = next((cell for cell in remaining
+                      if self.world.solid(cell[0], cell[1], cell[2] + 1)), None)
+        if (ready is None or int(observer.blocks) <= 0 or state.cannon_origin is None
+                or math.dist(observer.position, state.cannon_origin) > 1.0):
+            # Finished, out of blocks, or knocked or called off the spot the
+            # wall was measured from: a shot from anywhere else lands inside
+            # its own splash, or the gateway refuses it.
+            state.cannon_cells = ()
+            return None
+        # A shot lands in the last free cell before what it hits: aim at the
+        # top of the block underneath.
+        aim = (ready[0] + 0.5, ready[1] + 0.5, float(ready[2] + 1))
+        action = BotAction()
+        if now >= state.cannon_shot_at:
+            # One shot, then wait for the block to arrive: a second into the
+            # same cell would stack one higher than planned.
+            state.cannon_shot_at = now + 0.6
+            action = BotAction(BotActionKind.ORIENTED, tool_id=_BLOCK_CANNON_TOOL, position=aim)
+        return self._intent(
+            frame,
+            movement=MovementIntent(),
+            look=LookIntent(aim, visible=False),
+            tool_id=_BLOCK_CANNON_TOOL,
+            action=action,
+            priority=BotIntentPriority.ROUTINE,
+            debug_goal=aim,
+            debug_role="block_cannon_cover",
+        )
+
+    def _own_charge_intent(self, frame: PerceptionFrame, observer: PlayerSnapshot,
+                           state: _BotState, now: float, *,
+                           fighting: bool) -> BotIntent | None:
+        """Get clear of a charge this bot set, then fire its C4 from safety.
+
+        Friendly charges are otherwise only noticed in their last seconds and
+        not by every temperament. The bot that lit one always knows.
+        """
+
+        # C4 only ever goes off by its owner's detonator. A bot that came back
+        # as another class cannot fire the charges of its last life: they are
+        # no danger to it, and trying stopped it every second to be refused.
+        detonator = int(C.C4_TOOL) in observer.loadout
+        charges = [entity for entity in frame.entities
+                   if entity.alive and int(entity.owner_id) == int(observer.player_id)
+                   and int(entity.tool_id) in _CHARGE_TOOLS and entity.blast_radius > 0.0
+                   and (detonator or int(entity.tool_id) != int(C.C4_TOOL))]
+        if not charges:
+            state.charge_retreat = None
+            state.charge_trap = False
+            return None
+        state.charge_attempts = 0
+
+        def margin(entity: EntitySnapshot) -> float:
+            return math.dist(entity.position, observer.position) - float(entity.blast_radius)
+
+        nearest = min(charges, key=margin)
+        if margin(nearest) < _CHARGE_CLEARANCE:
+            if (state.charge_retreat is None or state.charge_entity != nearest.entity_id
+                    or math.dist(observer.position, state.charge_retreat) < 1.5):
+                state.charge_entity = int(nearest.entity_id)
+                state.charge_retreat = self._charge_retreat_point(observer, nearest)
+            goal = _Goal(("own_charge", int(nearest.entity_id)), state.charge_retreat,
+                         "clear_own_charge", 1.0, True)
+            return self._navigation_intent(frame, observer, state, goal, now)
+        state.charge_retreat = None
+        remote = [entity for entity in charges if int(entity.tool_id) == int(C.C4_TOOL)]
+        friends_near = any(
+            player.alive and player.spawned and int(player.team) == int(observer.team)
+            and int(player.player_id) != int(observer.player_id)
+            and math.dist(player.position, entity.position) <= float(entity.blast_radius) + 1.5
+            for player in frame.players for entity in remote)
+        if state.charge_trap:
+            # Laid on an approach: it waits, through a firefight too, for an
+            # enemy this bot can see standing well inside the blast.
+            sprung = any(
+                player.alive and player.spawned and int(player.team) != int(observer.team)
+                and math.dist(player.position, entity.position)
+                <= float(entity.blast_radius) - 2.5
+                and math.dist(player.eye, observer.eye) <= _VISUAL_RANGE
+                and self.world.has_line_of_sight(observer.eye, player.eye)
+                for player in frame.players for entity in remote)
+            if not sprung or friends_near or now < state.next_charge_at:
+                return None
+        elif fighting or not observer.grounded:
+            return None
+        if remote and not friends_near and now >= state.next_charge_at:
+            state.next_charge_at = now + 1.0
+            return self._intent(
+                frame,
+                movement=MovementIntent(),
+                look=LookIntent(remote[0].position, visible=False),
+                tool_id=int(C.C4_TOOL),
+                action=BotAction(BotActionKind.DEPLOY, tool_id=int(C.C4_TOOL),
+                                 argument="detonate"),
+                priority=BotIntentPriority.ROUTINE,
+                debug_goal=remote[0].position,
+                debug_role="detonate_c4",
+            )
+        if margin(nearest) < _CHARGE_CLEARANCE + 6.0 and not (remote and friends_near):
+            # Just outside the blast with the fuse burning (or the detonator
+            # about to be pressed): wait it out here. Walking back to the job
+            # only to run out again is how a bot gets caught by its own charge.
+            return self._intent(
+                frame,
+                movement=MovementIntent(),
+                look=LookIntent(nearest.position, visible=False),
+                tool_id=_weapon_tool(observer),
+                priority=BotIntentPriority.ROUTINE,
+                debug_goal=nearest.position,
+                debug_role="await_own_charge",
+            )
+        return None
+
+    def _charge_retreat_point(self, observer: PlayerSnapshot,
+                              charge: EntitySnapshot) -> Vector3:
+        """Standing ground just outside the blast, on the side the bot is on."""
+
+        away = _normalized_xy(observer.position[0] - charge.position[0],
+                              observer.position[1] - charge.position[1])
+        if math.hypot(*away[:2]) < 0.5:
+            angle = (observer.player_id * 2.39996) % (2.0 * math.pi)
+            away = (math.cos(angle), math.sin(angle), 0.0)
+        reach = float(charge.blast_radius) + _CHARGE_CLEARANCE + 2.0
+        base = math.atan2(away[1], away[0])
+        for turn in (0.0, 0.6, -0.6, 1.2, -1.2, 1.9, -1.9):
+            x = charge.position[0] + math.cos(base + turn) * reach
+            y = charge.position[1] + math.sin(base + turn) * reach
+            surface = self.world.surface(int(math.floor(x)), int(math.floor(y)),
+                                         observer.position[2], vertical_span=4,
+                                         allow_water=False)
+            if surface is not None:
+                return (float(surface.position[0]), float(surface.position[1]),
+                        float(surface.position[2]))
+        return (charge.position[0] + away[0] * reach, charge.position[1] + away[1] * reach,
+                observer.position[2])
+
+    def _plant_charge_intent(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        now: float,
+        decision: ModeBotDecision | None,
+    ) -> BotIntent | None:
+        """Set a Miner's dynamite or C4 on what it was carried for.
+
+        That is a block of the base Demolition wants brought down, or the wall
+        an enemy has just gone behind. The gateway refuses a charge beside a
+        teammate; the bot itself leaves through ``_own_charge_intent``.
+        """
+
+        if (now < state.next_charge_at or not observer.grounded or observer.wade
+                or observer.carried_entity_id >= 0):
+            return None
+        stock = dict(observer.deployable_stock)
+        tool = next((item for item in _CHARGE_TOOLS
+                     if item in observer.loadout and stock.get(item, 0) > 0), None)
+        if tool is None:
+            return None
+        target = self._charge_target(frame, observer, state, now, decision)
+        if target is None and tool == int(C.C4_TOOL):
+            target = self._c4_trap_target(frame, observer, state, now, decision)
+            if isinstance(target, BotIntent):
+                return target  # still walking out to the spot
+        if target is None:
+            return None
+        cell, face, purpose = target
+        center = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+        if not self._charge_site_safe(frame, observer, center, tool):
+            state.next_charge_at = now + 2.0
+            return None
+        # A refused placement leaves no charge behind to reset this; try the
+        # next one later and later instead of every few seconds for a match.
+        state.charge_attempts += 1
+        state.next_charge_at = now + min(30.0, 3.0 * state.charge_attempts)
+        state.charge_trap = purpose == "trap"
+        state.trap_cell = None
+        name = "dynamite" if tool == int(C.DYNAMITE_TOOL) else "c4"
+        return self._intent(
+            frame,
+            movement=MovementIntent(crouch=True),
+            look=LookIntent(center, visible=False),
+            tool_id=tool,
+            action=BotAction(BotActionKind.DEPLOY, tool_id=tool, position=center, face=face),
+            priority=BotIntentPriority.ROUTINE,
+            debug_goal=center,
+            debug_role=f"plant_{name}_{purpose}",
+        )
+
+    def _c4_trap_target(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        now: float,
+        decision: ModeBotDecision | None,
+    ) -> tuple[tuple[int, int, int], int, str] | BotIntent | None:
+        """A defender's C4 goes on the ground the attack has to cross.
+
+        The spot is far enough down the watched approach that the post itself
+        is outside the blast, and in view of the post, so the Miner can go
+        back, hold it as before, and fire the charge when it sees an enemy
+        standing on it. Returns the cell once in reach, the walk out to it
+        until then, or nothing.
+        """
+
+        contact = state.contact_position is not None and now < state.contact_until
+        if (decision is None or decision.posture is not ModeBotPosture.DEFEND or contact
+                or now - observer.last_damage_at <= 6.0):
+            state.trap_cell = None
+            return None
+        post = decision.position
+        if state.trap_cell is None:
+            if (now < state.next_trap_at
+                    or math.dist(observer.position, post) > decision.arrival_radius + 2.0):
+                return None
+            state.next_trap_at = now + 30.0
+            threat = decision.watch_position or next(
+                (item.position for item in frame.objectives
+                 if item.kind == "team_anchor" and item.team != observer.team), None)
+            if threat is None:
+                return None
+            heading = _normalized_xy(threat[0] - post[0], threat[1] - post[1])
+            if math.hypot(*heading[:2]) < 0.5:
+                return None
+            clear = float(getattr(C, "C4_EXPLOSION_RADIUS", 8.0)) + _CHARGE_CLEARANCE + 0.5
+            eye_height = observer.eye[2] - observer.position[2]
+            for along in (clear + 1.0, clear, clear + 2.5):
+                spot = self.world.surface(
+                    int(math.floor(post[0] + heading[0] * along)),
+                    int(math.floor(post[1] + heading[1] * along)),
+                    post[2], vertical_span=3, allow_water=False)
+                stand = self.world.surface(
+                    int(math.floor(post[0] + heading[0] * (along - 2.5))),
+                    int(math.floor(post[1] + heading[1] * (along - 2.5))),
+                    post[2], vertical_span=3, allow_water=False)
+                if spot is None or stand is None:
+                    continue
+                centre = (spot.x + 0.5, spot.y + 0.5, spot.support_z + 0.5)
+                if (math.dist(spot.position, post) < clear
+                        or math.dist(stand.position, centre) > _CHARGE_REACH
+                        or any(item.kind != "team_anchor"
+                               and math.dist(item.position, spot.position) < 3.0
+                               for item in frame.objectives)
+                        or not self.world.has_line_of_sight(
+                            (post[0], post[1], post[2] + eye_height),
+                            (spot.position[0], spot.position[1],
+                             spot.position[2] + eye_height))):
+                    continue
+                state.trap_cell = (int(spot.x), int(spot.y), int(spot.support_z))
+                state.trap_stand = tuple(float(value) for value in stand.position)
+                state.trap_until = now + 20.0
+                break
+            if state.trap_cell is None:
+                return None
+        cell = state.trap_cell
+        centre = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+        if now >= state.trap_until or not self.world.solid(*cell) or self.world.solid(
+                cell[0], cell[1], cell[2] - 1):
+            state.trap_cell = None  # too far to walk, or the ground changed
+            return None
+        if math.dist(observer.position, centre) <= _CHARGE_REACH:
+            return cell, 4, "trap"
+        goal = _Goal(("c4_trap", cell), state.trap_stand, "lay_c4_trap", 1.0, False)
+        return self._navigation_intent(frame, observer, state, goal, now)
+
+    @staticmethod
+    def _charge_site_safe(frame: PerceptionFrame, observer: PlayerSnapshot,
+                          position: Vector3, tool: int) -> bool:
+        """No teammate and no other live charge of ours inside the blast.
+
+        The gateway applies the same radii at placement; asking here first
+        keeps the Miner from walking up to a wall it will be refused at.
+        C4 is not a projectile, so the shared projectile check knows no
+        radius for it.
+        """
+
+        spec = PROJECTILE_SPECS.get(int(tool))
+        radius = max(
+            float({int(C.DYNAMITE_TOOL): getattr(C, "DYNAMITE_EXPLOSION_RADIUS", 5.0),
+                   int(C.C4_TOOL): getattr(C, "C4_EXPLOSION_RADIUS", 8.0)}.get(int(tool), 0.0)),
+            float(getattr(spec, "blast_radius", 0.0) or 0.0))
+        if radius <= 0.0:
+            return False
+        if any(player.alive and player.spawned and int(player.team) == int(observer.team)
+               and int(player.player_id) != int(observer.player_id)
+               and math.dist(player.position, position) <= radius + 1.5
+               for player in frame.players):
+            return False
+        return not any(
+            entity.alive and entity.hazardous
+            and (int(entity.team) == int(observer.team) or entity.kind == "projectile")
+            and math.dist(entity.position, position)
+            <= radius + max(0.0, float(entity.blast_radius)) + 1.0
+            for entity in frame.entities)
+
+    def _charge_target(
+        self,
+        frame: PerceptionFrame,
+        observer: PlayerSnapshot,
+        state: _BotState,
+        now: float,
+        decision: ModeBotDecision | None,
+    ) -> tuple[tuple[int, int, int], int, str] | None:
+        """The block and exposed face a charge belongs on, within arm's reach.
+
+        In order: the Demolition base; the wall an enemy has just gone behind;
+        a wall somebody built in front of the objective being attacked.
+        """
+
+        eye = tuple(float(value) for value in observer.eye)
+        cell, purpose = None, ""
+        if decision is not None and decision.directive == "demolish":
+            base = next((item for item in frame.objectives
+                         if item.kind == "dem_base" and item.team != observer.team), None)
+            if base is not None:
+                hit = self._demolish_cell(eye, base, state.block_work_skip)
+                bounds = tuple(int(value) for value in base.bounds)
+                # The swing chooser also returns whatever stands in the way.
+                # A charge is for the base itself, or a block touching it.
+                if hit is not None and (
+                        hit in {tuple(int(v) for v in item) for item in base.cells}
+                        or len(bounds) == 6 and all(
+                            bounds[2 * axis] - 1 <= hit[axis] <= bounds[2 * axis + 1] + 1
+                            for axis in range(3))):
+                    cell, purpose = hit, "objective"
+        contact = (state.contact_position
+                   if state.contact_position is not None and now < state.contact_until
+                   else None)
+        if cell is None and contact is not None:
+            cell, purpose = self._cover_cell(observer, contact), "cover"
+        gap = (math.dist(observer.position, decision.position)
+               if decision is not None else math.inf)
+        if (cell is None and decision is not None
+                and decision.posture is ModeBotPosture.ASSAULT and gap <= 16.0):
+            # Nobody but its defenders builds within ten blocks of an
+            # objective, so a built wall in the way of this attack is theirs.
+            hit = self._first_solid_on_ray(
+                eye, (decision.position[0], decision.position[1], eye[2]), _CHARGE_REACH)
+            health = getattr(self.world, "block_health", None)
+            if (hit is not None and callable(health)
+                    and health(*hit) != MAP_BLOCK_HEALTH
+                    and math.dist(decision.position,
+                                  (hit[0] + 0.5, hit[1] + 0.5, hit[2] + 0.5)) <= 12.0):
+                cell, purpose = hit, "fortification"
+        if cell is None:
+            return None
+        center = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+        if math.dist(observer.position, center) > _CHARGE_REACH:
+            return None
+        outward = tuple(eye[axis] - center[axis] for axis in range(3))
+        faces = sorted(
+            (index for index, normal in enumerate(_FACE_NORMALS)
+             if not self.world.solid(cell[0] + normal[0], cell[1] + normal[1],
+                                     cell[2] + normal[2])),
+            key=lambda index: -sum(_FACE_NORMALS[index][axis] * outward[axis]
+                                   for axis in range(3)))
+        if not faces:
+            return None
+        return cell, faces[0], purpose
+
+    def _cover_cell(self, observer: PlayerSnapshot,
+                    contact: Vector3) -> tuple[int, int, int] | None:
+        """The near face of a thin wall between the bot and a lost enemy."""
+
+        eye = tuple(float(value) for value in observer.eye)
+        target = (float(contact[0]), float(contact[1]),
+                  float(contact[2]) + (eye[2] - float(observer.position[2])))
+        delta = tuple(target[axis] - eye[axis] for axis in range(3))
+        length = math.sqrt(sum(value * value for value in delta))
+        if not 3.0 <= math.hypot(delta[0], delta[1]) <= 14.0 or abs(delta[2]) > 4.0:
+            return None
+        if self.world.has_line_of_sight(eye, target):
+            return None  # nothing to bring down: that is a shot, not a charge
+        first = None
+        for index in range(1, int(min(length, _CHARGE_REACH + 3.5) / 0.25) + 1):
+            fraction = index * 0.25 / length
+            cell = tuple(int(math.floor(eye[axis] + delta[axis] * fraction))
+                         for axis in range(3))
+            if self.world.solid(*cell):
+                if first is None:
+                    if index * 0.25 > _CHARGE_REACH:
+                        return None
+                    first = cell
+            elif first is not None:
+                # Air again within three blocks: a wall, not a hillside.
+                return first
+        return None
+
     def _objective_mine_intent(
         self,
         frame: PerceptionFrame,
@@ -3373,7 +4047,22 @@ class SimpleBotBrain:
                     (name, frozenset(value) if isinstance(value, set) else value)
                     for name, value in arguments.items())))
                 if key not in state.planning_results:
-                    result = self.world.plan(start, destination, **arguments)
+                    # A body that has not moved, asking the same question of the
+                    # same terrain, gets the answer it got a moment ago. A bot
+                    # with no way on used to run its whole failed chain again
+                    # every decision: two fifths of all route searches.
+                    memory_key = (int(frame.topology_version), *key)
+                    remembered = state.plan_memory.get(memory_key)
+                    if remembered is not None and now < remembered[0]:
+                        result = remembered[1]
+                    else:
+                        result = self.world.plan(start, destination, **arguments)
+                        if not result.deferred:
+                            state.plan_memory.pop(memory_key, None)
+                            while len(state.plan_memory) >= _PLAN_MEMORY_SIZE:
+                                del state.plan_memory[next(iter(state.plan_memory))]
+                            state.plan_memory[memory_key] = (
+                                now + _PLAN_MEMORY_SECONDS, result)
                     if not result.deferred:
                         state.corridor_yield_local = False
                     if not result.deferred and len(state.planning_results) < 4:
@@ -3938,6 +4627,10 @@ class SimpleBotBrain:
                 <= goal.arrival_radius + 2.0
                 or remaining_distance(route, state.route_index, observer.position) > 12.0):
             return
+        if not self._planning_spare(observer, now):
+            # Looking further ahead can wait for a quiet moment; it must not
+            # take the credit of a teammate that has no route at all.
+            return
         state.next_extension_at = now + 0.35
         target = self._team_lane_segment_goal(frame, replace(observer, position=last),
                                               goal.position)
@@ -4116,23 +4809,27 @@ class SimpleBotBrain:
 
         Nobody halts mid-field to think. The stretch ahead must be plain,
         body-wide, walkable ground; the motor's live probes still guard it.
-        Anything else (water, ledges, walls, flight), or a body that has not
-        physically got anywhere for a few seconds, keeps the old full stop.
+        Where the old heading meets a wall, open ground straight toward the
+        goal will do. Anything else (water, ledges, walls, flight), or a body
+        that has not physically got anywhere for a few seconds, keeps the old
+        full stop.
         """
 
-        heading = state.travel_heading or _normalized_xy(
-            goal.position[0] - observer.position[0], goal.position[1] - observer.position[1])
-        if (not observer.grounded or observer.wade or math.hypot(*heading[:2]) < 0.5
-                or state.dead_end
+        if (not observer.grounded or observer.wade or state.dead_end
                 or now - state.navigation_window_at >= _STUCK_REPLAN_SECONDS
                 or not callable(getattr(self.world, "surface", None))):
             return MovementIntent()
-        ahead = (observer.position[0] + heading[0] * 4.0,
-                 observer.position[1] + heading[1] * 4.0, observer.position[2])
-        if not straight_walkable(self.world, observer.position, ahead):
-            return MovementIntent()
-        return MovementIntent(direction=heading, travel_source=observer.position,
-                              travel_waypoint=ahead)
+        toward = _normalized_xy(
+            goal.position[0] - observer.position[0], goal.position[1] - observer.position[1])
+        for heading in (state.travel_heading, toward):
+            if heading is None or math.hypot(*heading[:2]) < 0.5:
+                continue
+            ahead = (observer.position[0] + heading[0] * 4.0,
+                     observer.position[1] + heading[1] * 4.0, observer.position[2])
+            if straight_walkable(self.world, observer.position, ahead):
+                return MovementIntent(direction=heading, travel_source=observer.position,
+                                      travel_waypoint=ahead)
+        return MovementIntent()
 
     def _escape_empty_route(
         self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
@@ -4278,13 +4975,15 @@ class SimpleBotBrain:
                      or state.walk_answer_wanted)
                 and not (now < state.corridor_rejected_until
                          and state.corridor_rejected_goal is not None
-                         and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)):
+                         and math.dist(goal.position, state.corridor_rejected_goal) <= 24.0)
+                and not self._corridor_futile(state, observer.position, goal.position, now)):
             reader = getattr(self.world, "begin_corridor", None)
             if callable(reader):
                 state.corridor_search = reader(
                     observer.position, goal.position,
                     blocked_edges=frozenset(state.blocked_edges),
                 )
+                state.corridor_origin = observer.position
                 state.corridor_failed_goal = (goal.position
                                              if state.corridor_search is None else None)
                 if state.corridor_search is None and goal.role == "tdm_squad_support":
@@ -4306,11 +5005,29 @@ class SimpleBotBrain:
                 # query completes. Otherwise a long search consumes every
                 # grant first and leaves it motionless for seconds.
                 return None
+            if (not search.done and now - state.corridor_slice_at < _CORRIDOR_SLICE_PATIENCE
+                    and not self._planning_spare(observer, now)):
+                # Up to sixty-four slices of guidance can wait; a teammate with
+                # no route at all cannot. Take a slice when credit is going
+                # spare, or as an ordinary request once this search has waited.
+                return None
+            was_done = search.done
             search.advance()
             if getattr(search, "deferred", False):
                 return None
+            if not was_done:
+                state.corridor_slice_at = now
             state.corridor_yield_local = True
             if search.done:
+                if not search.path and state.corridor_origin is not None:
+                    # CastleWars: twelve bots repeated the same cross-map search
+                    # every fifteen seconds for a whole match; 110 of 139 ran
+                    # their full 32768 nodes for nothing, three quarters of all
+                    # planner work, while routes that could move a bot queued.
+                    state.corridor_futile = [
+                        entry for entry in state.corridor_futile if now < entry[2]][-7:]
+                    state.corridor_futile.append(
+                        (state.corridor_origin, goal.position, now + _CORRIDOR_FUTILE_SECONDS))
                 if search.path:
                     # The bot may have moved during incremental search. Join
                     # a nearby corner only after proving a short dry connection;
@@ -4374,6 +5091,21 @@ class SimpleBotBrain:
                 state.corridor_join_index = 0
                 state.corridor_yield_local = False
         return self._corridor_point_ahead(state, observer.position)
+
+    @staticmethod
+    def _corridor_futile(state: _BotState, position: Vector3, goal: Vector3,
+                         now: float) -> bool:
+        """Did a map-wide search from about here to about there just fail?"""
+        return any(
+            now < until
+            and math.dist(position, start) <= _CORRIDOR_FUTILE_START_RADIUS
+            and math.dist(goal, target) <= _CORRIDOR_FUTILE_GOAL_RADIUS
+            for start, target, until in state.corridor_futile)
+
+    def _planning_spare(self, observer: PlayerSnapshot, now: float) -> bool:
+        """May work that can wait run now without taking a waiting bot's turn?"""
+        spare = getattr(getattr(self.world, "planning_budget", None), "spare", None)
+        return not callable(spare) or spare((observer.player_id, observer.generation), now)
 
     @staticmethod
     def _corridor_point_ahead(state: _BotState, position: Vector3) -> Vector3 | None:
