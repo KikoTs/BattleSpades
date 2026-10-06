@@ -661,6 +661,16 @@ announce_kicks = true
 # Extra reserved names on top of Server/Admin/Console/System/Moderator/...
 reserved_names = []
 
+# The 77 retail Steam achievements, evaluated by this server on every match
+# (docs/ACHIEVEMENTS.md). Deliberately no official/ranked gate: a local
+# Create Match server unlocks them too. An unlock is saved, then announced to
+# everyone as "<player> has unlocked the "<name>" achievement".
+[achievements]
+enabled = true
+count_bot_kills = true      # kills OF bots count; bots never earn achievements
+# Preserve this database across upgrades; it holds every player's progress.
+path = "state/achievements.sqlite3"
+
 [admin]
 # In-game `/admin <password>` login. It is DISABLED (and startup logs a
 # WARNING) while this is the shipped "changeme", empty, or shorter than 12

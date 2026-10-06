@@ -78,6 +78,9 @@ FLAT_KEYS = [
     ("bots", "name_prefix", "bots.name_prefix", "[BOT]"),
     ("admin", "creator_token", "admin_creator_token", ""),
     ("admin", "auto_admin", "admin_auto_ids", []),
+    ("achievements", "enabled", "achievements.enabled", True),
+    ("achievements", "count_bot_kills", "achievements.count_bot_kills", True),
+    ("achievements", "path", "achievements.path", "state/achievements.sqlite3"),
 ]
 
 

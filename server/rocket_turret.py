@@ -288,6 +288,9 @@ class RocketTurretController:
             ROCKET_TURRET_ROCKET_SPEC, pos, vel, turret.owner_id)
         if projectile is None:
             return
+        # Achievements count kills per turret and blocks its misses break.
+        projectile.turret = turret
+        projectile.turret_target_id = getattr(target, "id", None)
         owner = self.server.players.get(turret.owner_id)
         self.server.spawn_projectile_entity(projectile, owner, pos, vel)
         turret.ammo -= 1

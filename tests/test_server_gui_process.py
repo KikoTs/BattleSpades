@@ -30,6 +30,8 @@ def _session_config(tmp_path: Path) -> Path:
     document["bots"]["enabled"] = False
     document["plugins"]["enabled"] = False
     document["logging"]["file"] = str(tmp_path / "server.log")
+    # A started server opens its achievement store: keep it out of the checkout.
+    document["achievements"]["path"] = str(tmp_path / "achievements.sqlite3")
     path = tmp_path / "session.toml"
     path.write_text(tomlkit.dumps(document), encoding="utf-8")
     return path
@@ -66,6 +68,7 @@ def test_start_command_and_graceful_stop_of_a_real_server(tmp_path: Path) -> Non
         assert _wait(lambda: (read_status(status_file) or {}).get("state") == "running", 120), "\n".join(lines[-40:])
         status = read_status(status_file)
         assert status["humans"] == 0 and status["map"] and status["mode"] == "tdm"
+        assert (tmp_path / "achievements.sqlite3").is_file()
         assert process.send_command("status")
         assert process.send_command("tp 1 2 3")
         assert _wait(lambda: any("| players 0+0 bots" in line for line in lines), 20), "\n".join(lines[-40:])
