@@ -378,3 +378,30 @@ def test_a_post_is_reached_on_the_ground_its_column_has_whatever_height_it_was_g
         post = replace(goal, key=("post", stated), position=(30.5, 10.5, stated))
         result = _navigate(world, brain, at_post, _BotState(1, 1, observer.life_id), post)
         assert result.debug_role.endswith(":arrived")
+
+
+class _GroundUnderARoof:
+    """Ground at 100 and a slab twenty blocks over it around (30, 10)."""
+
+    def get_solid(self, x, y, z):
+        return z >= 100 or (z == 80 and 28 <= x <= 32 and 8 <= y <= 12)
+
+
+def _under_the_roof(monkeypatch):
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    world._vxl = _GroundUnderARoof()
+    on_the_roof = replace(goal, key=("roof",), position=(30.5, 10.5, 77.75))
+    return world, brain, replace(observer, position=(27.5, 10.5, 97.75)), state, on_the_roof
+
+
+def test_a_goal_on_the_roof_above_is_far_and_short_plans_under_it_are_a_dead_end(monkeypatch):
+    """Three columns from its base and twenty blocks under it, a carrier's
+    plans end where it stands. Far used to mean far on the map, so this was
+    not a dead end, and the map-wide route waited for the six-second rule."""
+    world, brain, observer, state, goal = _under_the_roof(monkeypatch)
+    _navigate(world, brain, observer, state, goal, 100.0)
+    assert state.route and state.short_plans == 1 and not state.dead_end
+    # The segment is walked and the next plan, from two columns on, is as short.
+    state.route = ()
+    _navigate(world, brain, replace(observer, position=(29.5, 10.5, 97.75)), state, goal, 101.0)
+    assert state.short_plans == 2 and state.dead_end
