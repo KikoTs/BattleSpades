@@ -313,3 +313,104 @@ One older test was replaced: "watchdog escalates a stalled hunter to flank
 then tunnel" asserted that a hunter at a wall walks to another side of the
 same wall before clawing; it now claws at once (the estimate), and the
 flank-first step is kept for a hunter the estimate did not send to claw.
+
+## 2026-10-08: when a bot sprints, and who waits behind a breach (all bots)
+
+Measured on dry ground with the same seeds before and after (before =
+`bots-integration` efa0321): the zombie harness on MayanJungle (10 seeds)
+and on ArcticBase, TokyoNeon, AncientEgypt and BranCastle (4 seeds each),
+and `scripts/bot_audit_harness.py` TDM on MayanJungle, TokyoNeon,
+AncientEgypt and ArcticBase (3 seeds, 180 s each). The harness now reports
+what the motor pressed: `motor_sprint_share`, `travel_speed` (blocks a
+second while a movement key is held), `fall_hits` / `fall_damage` /
+`fall_deaths`, `breach_queue_share`.
+
+The native mover, measured (`aoslib.world`, flat ground and a staircase of
+one block every two):
+
+| Class | Walk | Sprint | Coast after sprint | Sprints up a step | Stairs, walk / sprint | Mounts with one jump |
+|---|---|---|---|---|---|---|
+| Soldier (jump x1.2) | 5.6 | 11.2 | 2.8 | yes | 5.3 / 10.5 | 3 |
+| Zombie, Scout (x1.5) | 4.0 (Zombie) | 13.2 | 3.3 | yes | 3.8 / 12.4 | 4 |
+| Classic Soldier (x1.0) | 8.0 | 10.6 | 2.7 | no: stands at the step | 7.5 / 2.2 | 2 (1 sprinting) |
+| Jump Zombie (x3.0) | 4.0 | 8.0 | 2.0 | no | 3.8 / 2.2 | 10 |
+| Fast Zombie (x2.5) | 8.8 | 24.0 | 6.0 | yes | 8.3 / 22.4 | 9 |
+
+What each reason for walking protected, and what became of it
+(`simple_worker._route_allows_sprint`, `_sprint_room`, `_rise_ahead`):
+
+- **Slope** (a stride of the next eight rises or falls a block, cell-by-cell
+  steering). Nothing in the game: it was the waypoint tolerance of the old
+  speeds. Now retail's `CLASS_CAN_SPRINT_UPHILL` decides. A class that may
+  sprints the staircase; the Classic Soldier and the Jump Zombie let go of
+  sprint 2.5 blocks before a step up and take it again on it, also on a run
+  steered at a far point, where they used to stand against the step until
+  the edge timed out (39 % of a Classic CTF bot's walking was that timeout's
+  aftermath; its travel speed went from 5.3 to 6.7 blocks a second).
+- **Short run** and **far** (three blocks of clear run from rest; 4.5 before
+  a takeoff whatever the speed). They protect the stop before a turn, a
+  route's end or an exact step, and still do, but by the speed there is to
+  lose: the mover's velocity times ten is its coasting distance, and one
+  decision of sprint from rest stays under a Soldier's walk. A standing or
+  slow bot sprints a run of 1.75 blocks; a bot at full sprint brakes where
+  it did. (One block from rest was tried: no clear gain.)
+- **Airborne**: the same rules while the body is in the air; fixed with the
+  slope.
+- **Turn** (more than 20 degrees inside the run), **before a breach**,
+  **`jump:exact`**: kept. A sprinting body swings a block wide at a corner
+  it is steered round cell by cell; a jump takes 0.45 s and is 2-3 % of a
+  bot's time.
+
+What is left is not the sprint flag. On MayanJungle a third of the walking
+decisions are the last step of a one- or two-step route handed out while the
+map-wide corridor search runs (16 % of all travel decisions): the body
+creeps a block at a time from rest. In TDM about a quarter of the walking (ArcticBase)
+is `investigate_sound`, which asks for a walk.
+
+**Breach queue** (`_waits_for_breach`). Every bot within five blocks of a
+landing spade or claw backed into `breach_assist_queue` for as long as it
+kept landing: other diggers of the same siege, the ring, bots passing by.
+Now a bot with voxels of its own to claw goes to them, one whose way does
+not lead through that hole carries on, and a follower that does wait gives
+the digger two seconds, then leaves that cell to him and opens a second
+hole or goes round. Share of the horde's time in the queue: keep 0.15 to
+0.06, platform 0.16 to 0.05, tower 0.18 to 0.08, MayanJungle 0.10 to 0.05.
+
+| | Before | After |
+|---|---|---|
+| Zombies, four dry maps: sprint share / blocks a second | 0.71 / 8.0 | 0.77 / 8.4 |
+| ... median zombie reaches a survivor (s) | 29.8 | 27.9 |
+| Zombies, MayanJungle: sprint share / blocks a second | 0.44 / 4.3 | 0.47 / 4.4 |
+| ... first contact (s) / zombies reached of 8 | 74.0 / 3.3 | 73.1 / 3.0 |
+| Zombies, ground chase: sprint share / blocks a second | 0.55 / 6.2 | 0.65 / 6.7 |
+| ... last survivor infected (s) | 77.4 | 72.3 |
+| TDM: sprint share / blocks a second | 0.53 / 6.8 | 0.60 / 7.1 |
+| ... kills a minute | 9.2 | 10.6 |
+| TDM falls: hits / damage / deaths | 110 / 2610 / 11 | 94 / 2168 / 8 |
+| Zombie falls (46 runs): hits / deaths | 89 / 0 | 87 / 1 |
+
+Tick p50 0.37-0.38 ms before and after; the decision is a few comparisons
+over the next eight route steps.
+
+**A swim that bank recovery could not finish.** The new sprint timing put a
+SpookyMansion zombie (islets, seed 7) into a pocket of the sea where the
+nearest-shore flow has no bank in reach: it stood there for the rest of the
+round, because a crossing that fails its four-block window was handed to
+that flow until the body had been dry for two seconds. For a bot whose way
+is across the water, recovery now gets one window of its own; when it gets
+nowhere, or has no bank to make for (`water_no_route`,
+`water_search_shore`), the crossing takes over again. SpookyMansion, four
+seeds, before / after this whole section: islets 8 of 8 on the mainland both
+(last arrival 52 s / 38 s on average), sea ring 8 of 8 in 10-11 s both,
+islet survivors infected after 52 s / 47 s. TDM kills a minute: Atlantis
+0.80 / 0.77 (15 seeds), DoubleDragon 2.15 / 2.30, CastleWars 3.00 / 2.60
+(5 seeds, within their spread).
+
+**Jump height, not done here.** The planner authors a jump for a two-block
+rise only, for every class (`simple_navigation._neighbors`,
+`-2 <= delta < -1`); the corridor search (`surface_corridor`,
+`-2 <= rise <= 1`) and the motor's gate (`director._probe_surface_is_live`,
+`JUMP: (2, 3)`) assume the same. The table above has what each class really
+mounts. Using it needs a per-class rise in those three places, which belong
+to the navigation work in progress; `structure_collapse.APPROACH_JUMP`
+follows the planner and would follow that.
