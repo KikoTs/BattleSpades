@@ -310,3 +310,28 @@ def test_bank_recovery_that_gets_nowhere_gives_the_swim_back():
     again = brain.decide(_zombie_frame(observer, survivor, created_at=105.0))
     assert again is not None and again.movement.direction[0] > 0.5
     assert not state.water_recovery
+
+
+def test_a_route_brought_from_land_is_not_finished_in_the_shallows_as_a_water_detour():
+    world = _strait()
+    brain = SimpleBotBrain(world)
+    survivor = _player(9, TEAM2, (80.5, 20.5, 234.75))
+    afloat = _zombie(1, (15.5, 20.5, WADE_Z), wade=True, grounded=False)
+    first = brain.decide(_zombie_frame(afloat, survivor, created_at=100.0))
+    assert first is not None and first.movement.direction[0] > 0.5
+    state = brain._states[(afloat.player_id, afloat.generation)]
+    # The plan made on the islet a moment ago: along its shore, cell by cell.
+    state.route = tuple(RouteStep((15.5, 20.5 + stride, SWIM_Z), MovementAffordance.SWIM)
+                        for stride in range(1, 9))
+    state.route_index, state.route_topology_version = 0, 1
+    state.water_detour = False
+    # Leaving the islet, the body hops over its bank for a decision: no water
+    # column under it, no bearing to take. The route in hand moves it on.
+    on_bank = _zombie(1, (14.6, 20.5, 230.5), wade=False, grounded=False)
+    leaving = brain.decide(_zombie_frame(on_bank, survivor, created_at=100.13))
+    assert leaving is not None
+    # ... but it is not a detour to be finished: afloat, the bearing is asked
+    # again, and the swim heads for the prey instead of along the shore.
+    again = brain.decide(_zombie_frame(afloat, survivor, created_at=100.26))
+    assert again is not None and again.movement.direction[0] > 0.5, again.debug_role
+    assert abs(again.movement.direction[1]) < 0.5

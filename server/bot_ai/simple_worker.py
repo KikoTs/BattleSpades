@@ -1184,8 +1184,10 @@ class SimpleBotBrain:
                 goal.position[1] - step.waypoint[1]) < remaining - 0.25
 
         for _segment in range(2):
+            afloat = True
             if not (state.water_detour and state.route_index < len(state.route)):
                 # No planned detour in hand: take the bearing while it gains.
+                afloat = self._over_water(observer.position)
                 exclusions = self._water_exclusions(state, now)
                 step = self.world.water_step(
                     observer.position, preferred_goal=goal.position,
@@ -1212,7 +1214,12 @@ class SimpleBotBrain:
             if (intent.action.kind is not BotActionKind.NONE
                     or math.hypot(*intent.movement.direction[:2]) > 1e-6
                     or intent.debug_role.endswith(":planning_wait")):
-                state.water_detour = True
+                # A detour is a route round something the bearing ran into,
+                # and is finished before the bearing is asked again. A body
+                # still over the bank it is leaving has no bearing yet: the
+                # route it brought from land must not pass for one, or it is
+                # followed cell by cell round the shallows of its own islet.
+                state.water_detour = afloat
                 return intent
             state.water_detour = False
             if not intent.debug_role.endswith(":segment_complete"):
@@ -6304,6 +6311,14 @@ class SimpleBotBrain:
                 float(surface.position[2]) - float(observer.position[2])
             ) <= _DRY_BANK_RELEASE_VERTICAL
         )
+
+    def _over_water(self, position: Vector3) -> bool:
+        """Is the column under this body water (where the bearing can be taken)?"""
+
+        surface = self.world.surface(
+            int(math.floor(position[0])), int(math.floor(position[1])),
+            float(position[2]), vertical_span=6, allow_water=True)
+        return surface is not None and surface.support_z >= WATER_SUPPORT_Z
 
     def _water_contact(self, observer: PlayerSnapshot) -> bool:
         """Return whether native state or live VXL geometry owns water motion.
