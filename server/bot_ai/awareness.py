@@ -46,10 +46,13 @@ _ZOMBIE_CLASSES = frozenset({
     int(C.CLASS_FAST_ZOMBIE),
     int(C.CLASS_JUMP_ZOMBIE),
 })
-# Damage that draws no direction arrow on the victim's screen (the client
-# shows a burn flash instead), so it says nothing about where an enemy is.
+# Damage that says nothing about where an enemy stands. A burn tick draws no
+# direction arrow at all (the client shows a burn flash). A turret's rocket is
+# credited to the turret's owner, who may be anywhere on the map: hiding from
+# that point kept bots crouched in the turret's own line of fire.
 _UNDIRECTED_DAMAGE = frozenset(
-    int(getattr(C, name)) for name in ("BLOCKFIRE_KILL",) if hasattr(C, name))
+    int(getattr(C, name)) for name in ("BLOCKFIRE_KILL", "ROCKET_TURRET_KILL")
+    if hasattr(C, name))
 # A hit older than this is not news any more: the bot was busy (swimming,
 # mid-flight) and the moment to react has passed.
 _HIT_NEWS_SECONDS = 2.0

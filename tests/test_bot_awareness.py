@@ -149,7 +149,7 @@ def test_the_reaction_ends_and_the_bold_go_looking():
     assert timid._lives[(1, 1)].fire_from is None
 
 
-@pytest.mark.parametrize("case", ("burn", "self", "teammate", "stale", "previous_life"))
+@pytest.mark.parametrize("case", ("burn", "turret", "self", "teammate", "stale", "previous_life"))
 def test_damage_that_names_no_enemy_direction_is_not_a_shot(case):
     awareness = Awareness(_GridWorld(_pillar()))
     observer = _fighter(1, TEAM1, 10.5, 10.5)
@@ -163,6 +163,9 @@ def test_damage_that_names_no_enemy_direction_is_not_a_shot(case):
         now = 100.6
         if case == "burn":
             hit = _hit(observer, 100.1, kind=int(C.BLOCKFIRE_KILL))
+        elif case == "turret":
+            # Credited to the turret's owner, wherever that player is.
+            hit = _hit(observer, 100.1, kind=int(C.ROCKET_TURRET_KILL))
         elif case == "self":
             hit = _hit(observer, 100.1, attacker=1)
         elif case == "teammate":
