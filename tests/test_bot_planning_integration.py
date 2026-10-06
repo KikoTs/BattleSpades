@@ -341,3 +341,28 @@ def test_thread_behavior_snapshot_cannot_be_mutated_by_a_reader():
     report["events"][0]["reason"] = "reader"
     assert supervisor.behavior_metrics()["counters"]["tasks_started"] == 1
     assert supervisor.behavior_metrics()["events"][0]["reason"] == "original"
+
+
+def test_an_adopted_corridor_starts_on_fresh_clocks_instead_of_taking_the_blame(monkeypatch):
+    """Map-wide guidance is asked for because the body got nowhere.
+
+    Its progress clocks are therefore expired, or about to be, when the
+    answer arrives. They used to fire on the corridor's first step: that
+    edge was excluded for a minute and the corridor dropped with it.
+    """
+    world, brain, observer, state, goal = _setup(monkeypatch)
+    brain._set_goal(state, goal, observer.position, 90)
+    brain.skills._slot(observer).anchor_at = 90
+    search = SurfaceCorridorSearch(bytes([100]) * 1024, 32, 32,
+                                   10 * 32 + 12, 10 * 32 + 30)
+    state.corridor_search = _BudgetedCorridorSearch(world, search)
+    for now in (100, 101):
+        world.begin_planning((1, 1), now)
+        brain._corridor_segment_goal(state, observer, goal, now)
+        world.end_planning()
+    assert state.corridor == search.path
+    assert state.navigation_progress_at == state.navigation_window_at == 101
+    assert brain.skills._slot(observer).anchor_at == 101
+    result = _navigate(world, brain, observer, state, goal, 102)
+    assert result.movement.direction[0] > 0
+    assert state.corridor == search.path and not state.blocked_edges

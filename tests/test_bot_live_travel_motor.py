@@ -1,11 +1,13 @@
 """Explicit route metadata removes snapshot-lag steering and pitch errors."""
 
+import asyncio
 from dataclasses import replace
 import math
 from types import SimpleNamespace
 
 import pytest
 
+import shared.constants as C
 from server.bot_ai.director import BotDirector
 from server.bot_ai.messages import BotAction, BotActionKind, BotIntent, LookIntent, MovementAffordance, MovementIntent
 from tests.test_bot_architecture import _facing_fixture
@@ -192,3 +194,88 @@ def test_a_walk_runs_off_a_small_ledge_only_when_the_worker_validated_one():
     terrace = _LedgeWorld({**{(11, y): 3 for y in range(8, 14)}, (11, 11): 9})
     assert BotDirector._waypoint_is_live(_walker(terrace, 4), (1., 0., 0.))
     assert not BotDirector._waypoint_is_live(_walker(terrace, 1), (1., 0., 0.))
+
+
+def _lane_under_a_roof_past_a_side_ledge(y):
+    """A soldier at ``y`` about to walk west along row 100 of the flat map.
+
+    The lane has a roof three blocks up; beside it, in row 99, one column is
+    a block higher with open sky above.
+    """
+    server, director, bot, runtime = _facing_fixture(class_id=int(C.CLASS_SOLDIER))
+    for x in (102, 103, 104):
+        server.world_manager.set_block(x, 100, 58, True, 0x808080)
+    server.world_manager.set_block(103, 99, 61, True, 0x808080)
+    bot.set_position(106.5, y, 59.75)
+    bot.set_orientation_vector(-1., 0., 0.)
+    runtime.motor.yaw = math.pi
+    return server, director, bot, runtime
+
+
+def _tick(server, bot, ticks, before_each=lambda tick: None):
+    async def run():
+        for tick in range(ticks):
+            server.loop_count = tick
+            before_each(tick)
+            await bot.simulate_tick(1. / 60.)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("y,passes", ((100.5, True), (100.44, False)))
+def test_the_native_mover_stops_dead_at_a_step_it_has_no_headroom_to_climb(y, passes):
+    """The premise of the motor's gate, on the mover itself with W simply held.
+
+    A hundredth of a block of shoulder over the ledge is a step to climb, and
+    the roof over the lane refuses the rise: the body stands there, keys down.
+    """
+    server, director, bot, runtime = _lane_under_a_roof_past_a_side_ledge(y)
+    director._set_movement_state(runtime, (True,) + (False,) * 7)
+    _tick(server, bot, 180)
+    assert (bot.x < 102.) is passes
+    if not passes:
+        assert 104.44 < bot.x < 104.46 and math.hypot(bot.vx, bot.vy) < 1e-3
+
+
+def test_a_walk_along_a_roofed_lane_is_not_caught_on_a_ledge_beside_it():
+    server, director, bot, runtime = _lane_under_a_roof_past_a_side_ledge(100.44)
+    here = tuple(bot.position)
+    intent = travel_intent(source=here, waypoint=(98.5, 100.5, 59.75), direction=(-1., 0., 0.))
+    runtime.intent = replace(intent, bot_id=bot.id, bot_generation=runtime.generation,
+                             expires_at=200., look=LookIntent((here[0] - 6., here[1], here[2])))
+    _tick(server, bot, 180, lambda tick: tick % 2 or director._apply_motor(
+        runtime, 100. + tick / 60., 2. / 60.))
+    assert bot.x < 102.
+
+
+def test_a_step_under_a_low_roof_is_not_a_live_heading_and_the_lane_centre_is():
+    _, _, bot, runtime = _lane_under_a_roof_past_a_side_ledge(100.44)
+    bot.set_position(104.6, 100.44, 59.75)
+    _tick(runtime.player.connection.server, bot, 20)  # settle on the floor
+    west = (-1., 0., 0.)
+    assert not BotDirector._waypoint_is_live(runtime, west)
+    steered = BotDirector._live_movement_direction(runtime, west, now=100.)
+    assert steered[0] < -.9 and steered[1] > 0.
+    # Centred in the lane no shoulder reaches the ledge, and nothing is refused.
+    bot.set_position(104.6, 100.5, bot.z)
+    assert BotDirector._waypoint_is_live(runtime, west)
+
+
+def test_a_heading_into_the_next_lane_is_not_pulled_back_to_the_middle_of_this_one():
+    """Turning into a roofed lane round a ledge: slide to the lane, do not re-centre.
+
+    The diagonal is refused while a shoulder is still over the ledge. Aiming
+    at the middle of the row being left looked live, because the ledge can be
+    climbed from there; the body went back, the diagonal was asked again, and
+    it shuffled on the spot until the route was given up.
+    """
+    server, _, bot, runtime = _facing_fixture(class_id=int(C.CLASS_SOLDIER))
+    server.world_manager.set_block(105, 100, 58, True, 0x808080)  # roof over the lane
+    server.world_manager.set_block(105, 101, 61, True, 0x808080)  # ledge beside its mouth
+    bot.set_position(106.45, 101.2, 59.75)
+    _tick(server, bot, 20)
+    into_lane = (105.5 - bot.x, 100.3 - bot.y)
+    length = math.hypot(*into_lane)
+    request = (into_lane[0] / length, into_lane[1] / length, 0.)
+    assert not BotDirector._waypoint_is_live(runtime, request)
+    steered = BotDirector._live_movement_direction(runtime, request, now=100.)
+    assert steered == pytest.approx((0., -1., 0.))
