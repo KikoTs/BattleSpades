@@ -3326,9 +3326,13 @@ class SimpleBotBrain:
             # side, where bots climbed a terrace, met a lip, came down and went
             # up again. Stop poking and ask for the map-wide route at once
             # instead of after six seconds without progress.
+            # (Far counts height: a base on the roof two columns away is as
+            # much another place as one across the map, and its carrier used
+            # to pace under it until the six-second rule noticed.)
             reach = remaining_distance(plan.steps, 0, observer.position)
             if (state.escape_goal is None and not plan.reached_segment_goal
-                    and goal_distance > 12.0 and plan.steps and reach <= 5.0
+                    and math.dist(observer.position, goal_place) > 12.0
+                    and plan.steps and reach <= 5.0
                     and not any(step.breach is not None for step in plan.steps)):
                 state.short_plans = (state.short_plans + 1
                                      if now - state.short_plan_at <= 6.0 else 1)
