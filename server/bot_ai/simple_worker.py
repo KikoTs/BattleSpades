@@ -164,6 +164,12 @@ _SPRINT_ROOM_AT_REST = 1.75
 _SPRINT_ROOM_MAX = 9.0
 _BREACH_QUEUE_SPACING = 1.15
 _BREACH_YIELD_REPLAN_SECONDS = 1.25
+# A follower waits this long for a teammate to open the wall on its own way
+# (about one cell of it), then makes a hole of its own or goes round, and
+# does not queue again for the release time.
+_BREACH_QUEUE_PATIENCE = 2.0
+_BREACH_QUEUE_RELEASE_SECONDS = 6.0
+_BREACH_FACE_RADIUS = 2.25
 _TEAM_LANE_SPACING = 8.0
 _TEAM_LANE_MAX_OFFSET = 20.0
 _TEAM_LANE_MIN_GOAL_DISTANCE = 96.0
@@ -306,6 +312,11 @@ class _BotState:
     mine_site_index: int = 0
     yielded_breach_edge: EdgeKey | None = None
     yielded_breach_started_at: float = 0.0
+    # Queueing behind a teammate's excavation: whose, since when, and until
+    # when this bot has had enough of waiting for any.
+    breach_wait_digger: int | None = None
+    breach_wait_since: float = 0.0
+    breach_wait_released_until: float = 0.0
     next_water_build_at: float = 0.0
     water_step_key: tuple[int, int, int, str] | None = None
     water_landing_step: RouteStep | None = None
@@ -3189,7 +3200,8 @@ class SimpleBotBrain:
             observer,
             now,
         )
-        if active_digger is not None:
+        if active_digger is not None and self._waits_for_breach(
+                frame, observer, state, active_goal, active_digger, now):
             return self._breach_assist_queue_intent(
                 frame,
                 observer,
@@ -4550,6 +4562,61 @@ class SimpleBotBrain:
             )
         )
         return min(candidates, key=lambda player: int(player.player_id), default=None)
+
+    def _waits_for_breach(
+        self, frame: PerceptionFrame, observer: PlayerSnapshot, state: _BotState,
+        goal: _Goal, digger: PlayerSnapshot, now: float,
+    ) -> bool:
+        """Queue behind a teammate's excavation only while it opens this bot's way.
+
+        Everybody within five blocks of a landing spade or claw used to back
+        into the queue for as long as it kept landing: the other diggers of
+        the same siege (a keep's cut was dug one site at a time), the ring
+        round it and bots merely passing. Now a bot with voxels of its own to
+        claw goes to them, a bot whose way does not lead through that hole
+        carries on, and one that does wait gives the digger about a cell's
+        worth of swings before it opens a second hole or goes round.
+        """
+
+        target = digger.last_action_position
+        if target is None or now < state.breach_wait_released_until:
+            return False
+        if any(item.kind == "zombie_order" and item.carrier_id == observer.player_id
+               and item.cells for item in frame.objectives):
+            return False
+        ahead = state.route[state.route_index:state.route_index + 8]
+        shared = next((step for step in ahead if step.breach is not None and math.dist(
+            step.breach.target, target) <= _BREACH_FACE_RADIUS), None)
+        on_way = shared is not None or any(
+            math.hypot(step.waypoint[0] - target[0], step.waypoint[1] - target[1]) <= 1.25
+            and abs(step.waypoint[2] - target[2]) <= 3.0 for step in ahead)
+        if not ahead:
+            # No route yet: is the hole on the straight line to the goal?
+            dx = goal.position[0] - observer.position[0]
+            dy = goal.position[1] - observer.position[1]
+            length = math.hypot(dx, dy)
+            if length > 1e-6:
+                rx, ry = target[0] - observer.position[0], target[1] - observer.position[1]
+                along = (rx * dx + ry * dy) / length
+                across = abs(ry * dx - rx * dy) / length
+                on_way = 0.0 <= along <= min(length, 6.0) and across <= 1.5
+        if not on_way:
+            state.breach_wait_digger = None
+            return False
+        if state.breach_wait_digger != int(digger.player_id):
+            state.breach_wait_digger = int(digger.player_id)
+            state.breach_wait_since = float(now)
+        elif now - state.breach_wait_since >= _BREACH_QUEUE_PATIENCE:
+            state.breach_wait_digger = None
+            state.breach_wait_released_until = float(now) + _BREACH_QUEUE_RELEASE_SECONDS
+            if shared is not None:
+                # The planner offers the same cheapest cell again unless it
+                # is told that one is taken.
+                self._remember_blocked_edge(
+                    state, (shared.breach.source, shared.breach.destination), now)
+                self._clear_route(state, now)
+            return False
+        return True
 
     def _breach_assist_queue_intent(
         self,
