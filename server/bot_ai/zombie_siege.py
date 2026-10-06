@@ -4,11 +4,12 @@ The director calls :meth:`ZombieSiegeService.objectives` from its objective
 snapshot (at most ~10 Hz). The service
 
 * reads the live survivors and infected from the mode,
-* keeps a structural analysis per survivor (walk-flood isolation, then the
-  minimum collapse cut from ``structure_collapse``) fresh with bounded
-  generator jobs advanced under a per-call time budget, exactly like the
-  refuge election, so a slow analysis spreads over several ticks instead of
-  stalling one,
+* keeps a structural analysis per survivor fresh with bounded generator jobs
+  advanced under a per-call time budget, exactly like the refuge election,
+  so a slow analysis spreads over several ticks instead of stalling one:
+  the approach flood (how a zombie on foot gets to him, and whether anything
+  does), then, for a survivor nothing walks to or who stands well above the
+  horde, the minimum collapse cut from ``structure_collapse``,
 * asks :class:`HordeCoordinator` for one order per infected bot and
   publishes them as ``zombie_order`` objectives (``carrier_id`` = the zombie,
   ``attacker`` = its target survivor, ``state`` = role code, ``cells`` = the
@@ -34,6 +35,9 @@ from typing import Callable, Iterable
 import shared.constants as C
 
 from .horde_strategy import (
+    ELEVATED_RISE,
+    MOVE_BLOCKS,
+    RUN_SPEED,
     HordeCoordinator,
     HordeMember,
     HordeOrder,
@@ -43,8 +47,10 @@ from .horde_strategy import (
 )
 from .messages import ObjectiveSnapshot
 from .structure_collapse import (
+    PLAYER_SUPPORT_OFFSET,
+    Approach,
     horde_floor,
-    iter_isolation,
+    iter_approach,
     iter_plan_collapse,
     support_cells,
 )
@@ -52,13 +58,34 @@ from .structure_collapse import (
 logger = logging.getLogger(__name__)
 
 ZOMBIE_ORDER_KIND = "zombie_order"
-# Gameplay-thread time per objective snapshot spent on structural analysis.
+# Gameplay-thread time per objective snapshot: the orders and what they leave
+# of it for structural analysis (never less than a quarter).
 SIEGE_BUDGET_SECONDS = 0.001
+# How often a survivor's analysis is looked at again. The flood itself is
+# repeated only when the ground near him changed since (or the world cannot
+# say); otherwise only who stands inside it is brought up to date.
 ISOLATION_TTL = 2.5
+# Terrain edits remembered between looks; more than this and every analysis
+# is simply redone.
+EDIT_LOG = 512
 # Survivors with no hunter this close need no structural analysis yet.
 ANALYSIS_RANGE = 48.0
 PLAN_TTL = 6.0
 PLAN_MOVE_TOLERANCE = 2.0
+# Only a survivor who has stayed put this long is analysed: one on the run
+# is simply hunted, and a flood restarted at every stride never finishes.
+SETTLED_SECONDS = 0.75
+SETTLED_MOVE = 1.5
+# A walkable footing above the horde gets a collapse cut only while no
+# hunter within PLAN_HUNTER_RANGE walks up to it in PLAN_WORTH_SECONDS, or
+# the hunters sent up are getting nowhere.
+PLAN_HUNTER_RANGE = 24.0
+PLAN_WORTH_SECONDS = 4.0
+# Floors explored round a survivor: about seventeen blocks of open ground,
+# and twice the floors for one standing above the horde, whose way up
+# (stairs round the back, a ramp) starts well away from his feet.
+APPROACH_CELLS = 600
+APPROACH_CELLS_ELEVATED = 1200
 _BUILD_TOOLS = frozenset({int(C.BLOCK_TOOL), int(getattr(C, "ZOMBIE_PREFAB_TOOL", 28))})
 _DIG_TOOLS = frozenset(int(t) for t in getattr(C, "ALL_MELEE_WEAPONS", ()))
 
@@ -69,29 +96,51 @@ class _Analysis:
     info: SiegeInfo
     isolation_at: float
     plan_at: float
+    # Whether the collapse cut is worth keeping fresh: nothing walks in, or
+    # the footing stands well above the horde.
+    wants_plan: bool = False
+    # The terrain edit count when the flood began (None: edits unknown).
+    edits: int | None = None
 
 
 @dataclass(slots=True)
 class _Job:
     survivor_id: int
     position: tuple[float, float, float]
-    stage: str  # "isolation" | "plan"
+    stage: str  # "approach" | "plan"
     generator: object
     floor_z: int = 0
+    edits: int | None = None
 
 
 class ZombieSiegeService:
     """Bounded, fail-safe horde orders for the director."""
 
     def __init__(self, *, budget_seconds: float = SIEGE_BUDGET_SECONDS,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] | None = None,
+                 budget_clock: Callable[[], float] | None = None) -> None:
         self.coordinator = HordeCoordinator()
         self.budget_seconds = float(budget_seconds)
-        self._clock = clock
+        # Looked up now, not at import: an accelerated harness replaces the
+        # clock before the director creates this service.
+        self._clock = clock if clock is not None else time.monotonic
+        # What the budget is measured with (None: time.perf_counter, read at
+        # each call). A harness passes a counter that models the cost of one
+        # analysis step, so a run does not depend on the machine's load.
+        self._budget_clock = budget_clock
+        # Smoothed cost of the orders, taken off the analysis budget.
+        self._order_seconds = 0.0
+        # Terrain edits since the service began watching this world.
+        self._edits: deque[tuple[int, int, int]] = deque(maxlen=EDIT_LOG)
+        self._edit_count = 0
+        self._unseen_edits = 0
+        self._watched: tuple[object, int] | None = None
         self._epoch: object = None
         self._analyses: dict[int, _Analysis] = {}
         self._job: _Job | None = None
         self._queue: deque[int] = deque()
+        # Per survivor: where he was last seen to move from, and when.
+        self._settled: dict[int, tuple[tuple[float, float, float], float]] = {}
         self._last_failure_log = -math.inf
         self.last_orders: dict[int, HordeOrder] = {}
         self.stats = {
@@ -104,13 +153,73 @@ class ZombieSiegeService:
         self._analyses.clear()
         self._job = None
         self._queue.clear()
+        self._settled.clear()
         self.last_orders = {}
+        self._unwatch()
+
+    def _watch(self, world) -> bool:
+        """Follow the world's terrain edits; False when it cannot report them."""
+
+        self._unseen_edits = 0
+        if self._watched is not None and self._watched[0] is world:
+            return True
+        self._unwatch()
+        subscribe = getattr(world, "subscribe_mutations", None)
+        if not callable(subscribe):
+            return False
+
+        def edited(x, y, z, solid, color, version) -> None:
+            if self._watched is None:
+                return
+            self._edit_count += 1
+            self._edits.append((self._edit_count, int(x), int(y)))
+            self._unseen_edits += 1
+            if self._unseen_edits > 8 * EDIT_LOG:
+                # Nobody has asked for orders in a long while (another mode
+                # is running): stop listening until somebody does.
+                self._unwatch()
+
+        self._watched = (world, subscribe(edited))
+        return True
+
+    def _unwatch(self) -> None:
+        watched, self._watched = self._watched, None
+        self._edits.clear()
+        # Edits go unseen from here on: no analysis taken so far is current.
+        self._edit_count += 1
+        if watched is not None:
+            unsubscribe = getattr(watched[0], "unsubscribe_mutations", None)
+            if callable(unsubscribe):
+                unsubscribe(watched[1])
+
+    def _edited_near(self, analysis: _Analysis) -> bool:
+        """Has the ground the flood covered changed since it was taken?"""
+
+        if analysis.edits is None or self._watched is None:
+            return True
+        if self._edit_count == analysis.edits:
+            return False
+        if not self._edits or self._edits[0][0] > analysis.edits + 1:
+            return True  # some of the edits since have left the log
+        approach = analysis.info.approach
+        reach = (approach.radius if approach is not None else 0.0) + 3.0
+        px, py = analysis.position[0], analysis.position[1]
+        for count, x, y in reversed(self._edits):
+            if count <= analysis.edits:
+                break
+            if abs(x + 0.5 - px) <= reach and abs(y + 0.5 - py) <= reach:
+                return True
+        return False
 
     # ------------------------------------------------------------------
 
-    def objectives(self, mode, world, *, now: float | None = None) -> list[ObjectiveSnapshot]:
+    def objectives(self, mode, world, *, now: float | None = None,
+                   working: Callable[[int], bool] | None = None) -> list[ObjectiveSnapshot]:
+        """``working(player_id)``: did that bot's claw land in the last moments?"""
+
         try:
-            return self._objectives(mode, world, self._clock() if now is None else now)
+            return self._objectives(mode, world, self._clock() if now is None else now,
+                                    working)
         except Exception:  # noqa: BLE001 - bot planning must never stall the tick
             if self._clock() - self._last_failure_log >= 60.0:
                 self._last_failure_log = self._clock()
@@ -118,11 +227,14 @@ class ZombieSiegeService:
             self.reset()
             return []
 
-    def _objectives(self, mode, world, now: float) -> list[ObjectiveSnapshot]:
+    def _objectives(self, mode, world, now: float,
+                    working: Callable[[int], bool] | None = None) -> list[ObjectiveSnapshot]:
         if not hasattr(mode, "phase") or not hasattr(mode, "_living_survivors"):
             return []
         from modes.zombie import ZOMBIE_TEAM, ZombiePhase
 
+        budget_clock = self._budget_clock or time.perf_counter
+        started = budget_clock()
         epoch = (id(mode), getattr(world, "map_name", ""))
         phase = getattr(mode, "phase", None)
         if epoch != self._epoch or phase is not ZombiePhase.ACTIVE:
@@ -142,6 +254,7 @@ class ZombieSiegeService:
                 is_bot=bool(getattr(p, "is_bot", False)),
                 can_dig=bool(_DIG_TOOLS & set(_loadout(p))),
                 can_build=bool(_BUILD_TOOLS & set(_loadout(p))),
+                working=bool(working is not None and working(int(p.id))),
             )
             for p in mode._zombies()
             if bool(getattr(p, "alive", False)) and bool(getattr(p, "spawned", False))
@@ -153,12 +266,21 @@ class ZombieSiegeService:
         if not callable(solid):
             solid = None
         if solid is not None:
-            self._advance_analysis(solid, survivors, zombies, now)
+            watching = self._watch(world)
+            self._advance_analysis(
+                solid, survivors, zombies, now, budget_clock,
+                started + max(0.25 * self.budget_seconds,
+                              self.budget_seconds - self._order_seconds),
+                self._edit_count if watching else None)
         sieges = {
             sid: analysis.info for sid, analysis in self._analyses.items()
             if any(s.player_id == sid for s in survivors)
         }
+        ordering = budget_clock()
         orders = self.coordinator.plan(zombies, survivors, sieges, now, solid=solid)
+        # (One stalled call must not starve the analysis for the next dozen.)
+        self._order_seconds += 0.2 * (
+            min(budget_clock() - ordering, self.budget_seconds) - self._order_seconds)
         self.last_orders = orders
         self.stats["orders"] = len(orders)
         self.stats["max_pile"] = max(self.stats["max_pile"], self.coordinator.metrics.max_pile)
@@ -179,31 +301,44 @@ class ZombieSiegeService:
 
     # ------------------------------------------------------------------
 
-    def _advance_analysis(self, solid, survivors, zombies, now: float) -> None:
+    def _advance_analysis(self, solid, survivors, zombies, now: float,
+                          budget_clock: Callable[[], float], deadline: float,
+                          edits: int | None) -> None:
         alive = {s.player_id: s for s in survivors}
         for sid in tuple(self._analyses):
             if sid not in alive:
                 self._analyses.pop(sid, None)
+        for sid in tuple(self._settled):
+            if sid not in alive:
+                self._settled.pop(sid, None)
+        for sid, survivor in alive.items():
+            seen = self._settled.get(sid)
+            if seen is None or math.dist(seen[0], survivor.position) > SETTLED_MOVE:
+                self._settled[sid] = (survivor.position, now)
         if self._job is not None and self._job.survivor_id not in alive:
             self._job = None
         hunters = [z.position for z in zombies]
-        if self._job is None:
-            self._job = self._next_job(solid, alive, hunters, now)
-        deadline = time.perf_counter() + self.budget_seconds
-        while self._job is not None:
+        while True:
+            if self._job is None:
+                self._job = self._next_job(
+                    solid, alive, hunters, now, budget_clock, deadline, edits)
+                if self._job is None or budget_clock() >= deadline:
+                    return
             job = self._job
             try:
                 while True:
                     next(job.generator)
-                    if time.perf_counter() >= deadline:
+                    if budget_clock() >= deadline:
                         return
             except StopIteration as done:
+                self._job = None
                 self._finish(job, done.value, solid, hunters, now)
-            self._job = self._next_job(solid, alive, hunters, now)
-            if time.perf_counter() >= deadline:
+            if budget_clock() >= deadline:
                 return
 
-    def _next_job(self, solid, alive, hunters, now: float) -> _Job | None:
+    def _next_job(self, solid, alive, hunters, now: float,
+                  budget_clock: Callable[[], float], deadline: float,
+                  edits: int | None) -> _Job | None:
         if not self._queue:
             self._queue.extend(sorted(alive))
         for _ in range(len(self._queue)):
@@ -214,15 +349,38 @@ class ZombieSiegeService:
             if not any(math.dist(h, survivor.position) <= ANALYSIS_RANGE for h in hunters):
                 self._analyses.pop(sid, None)
                 continue
+            if now - self._settled[sid][1] < SETTLED_SECONDS:
+                continue
             analysis = self._analyses.get(sid)
             moved = (analysis is None or math.dist(analysis.position, survivor.position)
                      > PLAN_MOVE_TOLERANCE)
-            if moved or now - analysis.isolation_at >= ISOLATION_TTL:
-                return _Job(sid, survivor.position, "isolation",
-                            iter_isolation(solid, survivor.position, hunters))
-            if (analysis.info.isolated and now - analysis.plan_at >= PLAN_TTL):
-                return self._plan_job(solid, sid, survivor.position, analysis.info.floor_z)
+            if not moved and now - analysis.isolation_at >= ISOLATION_TTL:
+                if analysis.info.approach is None or self._edited_near(analysis):
+                    moved = True
+                else:
+                    # The same ground: only the hunters on it have changed.
+                    self._assess(sid, analysis.position, analysis.info.approach,
+                                 solid, hunters, now, analysis.edits)
+                    analysis = self._analyses[sid]
+                    if budget_clock() >= deadline:
+                        return None
+            if moved:
+                return _Job(sid, survivor.position, "approach",
+                            self._flood(solid, survivor.position, hunters), edits=edits)
+            if analysis.wants_plan and now - analysis.plan_at >= PLAN_TTL:
+                planned = self._plan_job(solid, sid, survivor.position, analysis.info.floor_z)
+                if planned is not None:
+                    return planned
         return None
+
+    @staticmethod
+    def _flood(solid, position, hunters):
+        yield  # (the floor below is a step of its own)
+        feet = int(round(position[2] + PLAYER_SUPPORT_OFFSET))
+        above = horde_floor(solid, position, hunters) - feet >= ELEVATED_RISE
+        yield
+        return (yield from iter_approach(
+            solid, position, limit=APPROACH_CELLS_ELEVATED if above else APPROACH_CELLS))
 
     def _plan_job(self, solid, sid: int, position, floor_z: int) -> _Job | None:
         support = support_cells(solid, position)
@@ -233,36 +391,8 @@ class ZombieSiegeService:
                     floor_z=floor_z)
 
     def _finish(self, job: _Job, value, solid, hunters, now: float) -> None:
-        if job.stage == "isolation":
-            self.stats["analyses"] += 1
-            isolated = bool(value is not None and value.isolated)
-            previous = self._analyses.get(job.survivor_id)
-            if not isolated:
-                self._analyses[job.survivor_id] = _Analysis(
-                    job.position, SiegeInfo(False, int(getattr(value, "support_z", 0))),
-                    now, now)
-                return
-            self.stats["isolated"] += 1
-            floor_z = horde_floor(solid, job.position, hunters)
-            keep_plan = (
-                previous is not None and previous.info.isolated
-                and previous.info.plan is not None
-                and math.dist(previous.position, job.position) <= PLAN_MOVE_TOLERANCE
-                and now - previous.plan_at < PLAN_TTL
-                and any(solid(*c) for c in previous.info.plan.cut)
-            )
-            if keep_plan:
-                self._analyses[job.survivor_id] = _Analysis(
-                    previous.position,
-                    SiegeInfo(True, floor_z, previous.info.plan, previous.info.analysed_at),
-                    now, previous.plan_at)
-                return
-            self._analyses[job.survivor_id] = _Analysis(
-                job.position, SiegeInfo(True, floor_z, None, now), now, -math.inf)
-            # Plan right away: an elevated survivor is the urgent case.
-            planned = self._plan_job(solid, job.survivor_id, job.position, floor_z)
-            if planned is not None:
-                self._queue.appendleft(job.survivor_id)
+        if job.stage == "approach":
+            self._finish_approach(job, value, solid, hunters, now)
             return
         self.stats["plans"] += 1
         analysis = self._analyses.get(job.survivor_id)
@@ -274,10 +404,77 @@ class ZombieSiegeService:
                 "Zombie siege: survivor %d collapse cut %d voxels (%d claw sites, cost %d)",
                 job.survivor_id, len(value.cut), len(value.sites), value.cost,
             )
+        info = analysis.info
         self._analyses[job.survivor_id] = _Analysis(
             analysis.position,
-            SiegeInfo(True, job.floor_z, value, now),
-            analysis.isolation_at, now)
+            SiegeInfo(info.isolated, job.floor_z, value, now, info.approach, info.position),
+            analysis.isolation_at, now, analysis.wants_plan, analysis.edits)
+
+    def _finish_approach(self, job: _Job, approach: Approach | None, solid,
+                         hunters, now: float) -> None:
+        self.stats["analyses"] += 1
+        if approach is None:
+            # No floor under him (falling, jumping): nothing to analyse yet.
+            self._analyses[job.survivor_id] = _Analysis(
+                job.position, SiegeInfo(False, 0, None, now, None, job.position), now, now)
+            return
+        self._assess(job.survivor_id, job.position, approach, solid, hunters, now, job.edits)
+
+    def _assess(self, sid: int, position, approach: Approach, solid, hunters,
+                now: float, edits: int | None) -> None:
+        """Read a flood against the hunters as they stand now."""
+
+        previous = self._analyses.get(sid)
+        isolated = approach.closed and not any(
+            approach.moves_from(h) is not None for h in hunters)
+        floor_z = horde_floor(solid, position, hunters)
+        wants_plan = isolated or self._cut_worth_planning(
+            sid, position, approach, floor_z, hunters)
+        if isolated and (previous is None or not previous.info.isolated
+                         or previous.info.approach is not approach):
+            self.stats["isolated"] += 1
+        plan, plan_at = None, -math.inf
+        if (wants_plan and previous is not None and previous.info.plan is not None
+                and math.dist(previous.position, position) <= PLAN_MOVE_TOLERANCE
+                and now - previous.plan_at < PLAN_TTL
+                and any(solid(*c) for c in previous.info.plan.cut)):
+            plan, plan_at = previous.info.plan, previous.plan_at
+        elif (wants_plan and previous is not None and previous.info.plan is None
+                and previous.wants_plan
+                and math.dist(previous.position, position) <= PLAN_MOVE_TOLERANCE
+                and now - previous.plan_at < PLAN_TTL):
+            plan_at = previous.plan_at  # planned recently: no cheap cut exists
+        self._analyses[sid] = _Analysis(
+            position,
+            SiegeInfo(isolated, floor_z, plan, now, approach, position),
+            now, plan_at, wants_plan, edits)
+        if wants_plan and plan_at == -math.inf:
+            # Plan right away: an elevated survivor is the urgent case.
+            self._queue.appendleft(sid)
+
+    def _cut_worth_planning(self, sid: int, position, approach: Approach, floor_z: int,
+                            hunters) -> bool:
+        """Is a walkable footing worth the cost of a collapse plan?
+
+        Only one well above the horde, and only while the hunters near it do
+        not simply walk up: none of them inside the flood within
+        PLAN_WORTH_SECONDS, or the ones sent after him stuck.
+        """
+
+        if floor_z - approach.support_z < ELEVATED_RISE:
+            return False
+        if self.coordinator.struggling(sid):
+            return True
+        near = [h for h in hunters
+                if math.hypot(h[0] - position[0], h[1] - position[1])
+                <= PLAN_HUNTER_RANGE]
+        if not near:
+            return False
+        for hunter in near:
+            moves = approach.moves_from(hunter)
+            if moves is not None and moves * MOVE_BLOCKS / RUN_SPEED <= PLAN_WORTH_SECONDS:
+                return False
+        return True
 
     def debug_rows(self) -> list[dict]:
         rows = []

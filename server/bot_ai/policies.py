@@ -805,14 +805,18 @@ class ZombieBotPolicy:
         )
         target_position = target.position if target is not None else order.position
         if role == "hunt":
+            # The order's own position is the prey, or the next stretch of a
+            # known way in to it (stairs round the back, a ramp, a door).
+            via = math.dist(order.position, target_position) > 2.5
             return ModeBotDecision(
-                target_position,
+                order.position if via else target_position,
                 "zombie_hunt_survivor",
                 sprint=True,
                 arrival_radius=1.25,
                 posture=ModeBotPosture.ASSAULT,
                 objective_priority=0.98,
                 engagement_radius=160.0,
+                watch_position=target_position if via else None,
             )
         if role == "flank":
             return ModeBotDecision(
