@@ -1007,3 +1007,20 @@ def test_burning_blocks_are_grouped_once_per_frame_and_skill_sets_the_berth():
     _burn(careless, observer, 100.5, _patch(), profile=_casual())
     wide, narrow = careful._lives[(1, 1)].hazards[0], careless._lives[(1, 1)].hazards[0]
     assert wide.radius > narrow.radius > narrow.reach == wide.reach
+
+
+def test_pressure_that_lets_up_and_returns_at_once_is_read_without_a_health_history():
+    """The health log restarts when the pressure stops; the foes seen are still remembered."""
+
+    awareness = _awake(_GridWorld(_pillar()))
+    foes = _foes(10.5, 14.5)
+    observer = _fighter(1, TEAM1, 10.5, 10.5)
+    assert _fight(awareness, _pressed(observer, 100.1, health=92), 100.2, foes) is None
+    life = awareness._lives[(1, 1)]
+    assert life.foes and life.health_log
+    # The damage is older than the pressure window by the next decision ...
+    quiet = replace(_pressed(observer, 97.0, health=92), last_damage_at=97.0)
+    assert _fight(awareness, quiet, 100.3, foes) is None and life.health_log == ()
+    # ... and a new hit lands before the enemies are counted again.
+    assert life.odds_at > 100.4
+    assert _fight(awareness, _pressed(observer, 100.35, health=80), 100.4, foes) is None
