@@ -480,6 +480,9 @@ class BotDirector:
         for bot in list(self.bots):
             await self.remove_bot(bot, force=True)
         self._unbind_world_mutations()
+        siege = getattr(self, "_zombie_siege", None)
+        if siege is not None:
+            siege.reset()  # (drops its own terrain listener)
         self.supervisor.close()
         self._pending_gateway_actions.clear()
         self._reconnect_count = None
