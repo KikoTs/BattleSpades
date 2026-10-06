@@ -361,8 +361,39 @@ class PassiveIsolatedModePolicy:
         )
 
 
+# The minimap marks an intel carrier only after it has carried this long
+# (the mode's exposure timer); until then nobody on the robbed team knows
+# where the thief is.
+_CTF_MARKER_DELAY = float(getattr(C, "INTEL_MINIMAP_EXPOSURE_TIME", 30))
+# A carrier is burdened and cannot sprint: about this many blocks a second.
+_CTF_CARRIER_PACE = 6.0
+
+
 class CTFBotPolicy:
-    """Assign capture, escort, recovery, defence, and assault roles."""
+    """Split a team between carrying, escorting, intercepting, guarding and raiding.
+
+    Every teammate reads the same roster and runs the same allocation, so the
+    team agrees on who does what without talking: one job is filled nearest
+    first, then the next from whoever is left.
+
+    ===================  ==================================================
+    both intels at home  home guard (1; 2 from seven players), the rest raid
+    we carry theirs      home guard, two close escorts, the rest cover the walk
+    they carry ours      about half intercept (three at most), the rest raid
+    both carried         two escorts, everyone else intercepts
+    ours lies dropped    the two nearest hold it; nobody guards an empty base
+    ===================  ==================================================
+
+    Teams under three players keep no guard. Classic has no minimap and so
+    no carrier marker: nobody hunts a thief there, the raid on the enemy
+    base (where the thief has to score) goes on instead.
+    """
+
+    def __init__(self) -> None:
+        # Per intel: where it last lay (None when first met in a thief's
+        # hands), the carrier and when the carry began. The thief's own
+        # position is never stored: it is hidden until the marker appears.
+        self._tracks: dict[tuple[int, int, int], list] = {}
 
     def decide(
         self,
@@ -373,6 +404,9 @@ class CTFBotPolicy:
         prefix = "classic_" if classic else ""
         own_base = _objective(frame, "ctf_base", observer.team)
         own_intel = _objective(frame, "ctf_intel", observer.team)
+        enemy_base = next(
+            (item for item in frame.objectives
+             if item.kind == "ctf_base" and item.team != observer.team), None)
         enemy_intel = next(
             (
                 item for item in frame.objectives
@@ -380,6 +414,11 @@ class CTFBotPolicy:
             ),
             None,
         )
+        team = [player for player in frame.players
+                if player.team == observer.team and player.alive and player.spawned]
+        thief = own_intel is not None and own_intel.carrier_id >= 0 and not classic
+        track = (self._track(frame, own_intel)
+                 if own_intel is not None and not classic else None)
 
         if observer.carried_entity_id >= 0 and own_base is not None:
             return ModeBotDecision(
@@ -392,67 +431,117 @@ class CTFBotPolicy:
                 engagement_radius=8.0,
             )
 
-        # Normal CTF publishes the native high-visibility carrier marker.
-        # Classic disables its minimap, so do not turn an invisible marker
-        # into worker omniscience: Classic defenders hold the base instead.
-        if (
-            not classic
-            and own_intel is not None
-            and own_intel.carrier_id >= 0
-        ):
-            return ModeBotDecision(
-                own_intel.position,
-                "ctf_intercept_carrier",
-                sprint=True,
-                arrival_radius=2.5,
-                posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.94,
-                engagement_radius=160.0,
-            )
+        carrier = (
+            _friendly_player(frame, observer, enemy_intel.carrier_id)
+            if enemy_intel is not None and enemy_intel.carrier_id >= 0 else None
+        )
+        if carrier is not None and carrier.player_id == observer.player_id:
+            carrier = None
+        me = observer.player_id
+        free = [player for player in team
+                if carrier is None or player.player_id != carrier.player_id]
+        if all(player.player_id != me for player in free):
+            free.append(observer)
 
-        if enemy_intel is not None and enemy_intel.carrier_id >= 0:
-            carrier = _friendly_player(frame, observer, enemy_intel.carrier_id)
-            if carrier is not None and carrier.player_id != observer.player_id:
-                escort = _formation_point(carrier.position, observer.player_id, 4.5)
+        own_home = (own_intel is not None and own_intel.carrier_id < 0
+                    and int(own_intel.state) == 0)
+        if own_base is not None and own_home:
+            # An intel at home is the only thing worth guarding there; once
+            # it is gone the guard joins the hunt or the raid.
+            guards = self._nearest(free, own_base.position,
+                                   0 if len(team) < 3 else 1 if len(team) < 7 else 2,
+                                   within=90.0)
+            if me in guards:
                 return ModeBotDecision(
-                    escort,
-                    f"{prefix}ctf_escort",
-                    sprint=True,
-                    arrival_radius=2.5,
-                    posture=ModeBotPosture.ESCORT,
-                    objective_priority=0.88,
-                    engagement_radius=32.0,
+                    self._guard_point(frame, observer, own_base.position, enemy_intel),
+                    f"{prefix}ctf_defend",
+                    sprint=False,
+                    arrival_radius=3.0,
+                    posture=ModeBotPosture.DEFEND,
+                    objective_priority=0.74,
+                    engagement_radius=38.0,
                 )
+            free = [player for player in free if player.player_id not in guards]
 
         if (
             own_intel is not None
             and own_intel.carrier_id < 0
             and int(own_intel.state) == 1
             and self._visible_drop(classic, observer, own_intel.position)
-            and self._is_recoverer(frame, observer, own_intel.position)
         ):
             # A dropped friendly intel lies in the open: the nearest two
             # teammates guard it (touch-return where the server allows it)
             # instead of letting the enemy walk back and re-take it.
-            return ModeBotDecision(
-                own_intel.position,
-                f"{prefix}ctf_recover_intel",
-                sprint=True,
-                arrival_radius=1.5,
-                posture=ModeBotPosture.ASSAULT,
-                objective_priority=0.9,
-                engagement_radius=60.0,
-            )
+            holders = self._nearest(free, own_intel.position, 2)
+            if me in holders:
+                return ModeBotDecision(
+                    own_intel.position,
+                    f"{prefix}ctf_recover_intel",
+                    sprint=True,
+                    arrival_radius=1.5,
+                    posture=ModeBotPosture.ASSAULT,
+                    objective_priority=0.9,
+                    engagement_radius=60.0,
+                )
+            free = [player for player in free if player.player_id not in holders]
 
-        if own_base is not None and self._is_defender(frame, observer, own_base.position):
+        if carrier is not None:
+            close = self._nearest(free, carrier.position,
+                                  # With both intels on the move the hunt
+                                  # needs bodies too.
+                                  2 if thief or len(free) <= 5 else 3)
+            if me in close:
+                return ModeBotDecision(
+                    _formation_point(carrier.position, observer.player_id, 4.5),
+                    f"{prefix}ctf_escort",
+                    sprint=True,
+                    arrival_radius=2.5,
+                    posture=ModeBotPosture.ESCORT,
+                    objective_priority=0.9,
+                    # Whoever can hit the carrier is this escort's business,
+                    # and rifles reach well past the formation.
+                    engagement_radius=60.0,
+                )
+            free = [player for player in free if player.player_id not in close]
+
+        if thief:
+            point = self._thief_estimate(frame, own_intel, enemy_base, track)
+            if point is not None:
+                hunters = free if carrier is not None or enemy_intel is None else [
+                    # A raider already at the enemy intel stays on it: taking
+                    # it answers the theft, and the thief must come that way.
+                    player for player in free
+                    if math.dist(player.position, enemy_intel.position) > 60.0]
+                wanted = (len(hunters) if carrier is not None
+                          else min(3, max(1, (len(hunters) + 1) // 2)))
+                if me in self._nearest(hunters, point, wanted):
+                    return ModeBotDecision(
+                        point,
+                        "ctf_intercept_carrier",
+                        sprint=True,
+                        arrival_radius=2.5,
+                        posture=ModeBotPosture.ASSAULT,
+                        objective_priority=0.94,
+                        engagement_radius=160.0,
+                    )
+
+        if carrier is not None:
+            # Everyone not needed elsewhere covers the walk home: a teammate
+            # coming from home clears the road ahead, the others hold off the
+            # pursuit from the side the intel was taken on.
+            ahead = (own_base is not None
+                     and math.dist(observer.position, own_base.position)
+                     < math.dist(carrier.position, own_base.position))
+            toward = own_base if ahead else enemy_base
             return ModeBotDecision(
-                self._guard_point(frame, observer, own_base.position, enemy_intel),
-                f"{prefix}ctf_defend",
-                sprint=False,
-                arrival_radius=3.0,
-                posture=ModeBotPosture.DEFEND,
-                objective_priority=0.74,
-                engagement_radius=38.0,
+                (_toward(carrier.position, toward.position, 16.0 + 4.0 * (me % 3))
+                 if toward is not None else carrier.position),
+                f"{prefix}ctf_escort_cover",
+                sprint=True,
+                arrival_radius=4.0,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.88,
+                engagement_radius=90.0,
             )
 
         # The enemy intel only ever leaves its home in a teammate's hands, so
@@ -461,8 +550,11 @@ class CTFBotPolicy:
         # every far bot with no order for the rest of the match (Classic
         # never returns a dropped intel).
         if enemy_intel is not None and enemy_intel.carrier_id < 0:
-            if own_base is not None and self._should_rally(
-                    frame, observer, own_base.position, enemy_intel.position):
+            if own_base is not None and (
+                self._should_rally(frame, observer, own_base.position, enemy_intel.position)
+                or int(enemy_intel.state) == 0
+                and self._awaits_wave(frame, observer, free, enemy_intel.position)
+            ):
                 return ModeBotDecision(
                     observer.position,
                     f"{prefix}ctf_rally",
@@ -492,7 +584,7 @@ class CTFBotPolicy:
                 arrival_radius=4.5,
                 posture=ModeBotPosture.ESCORT,
                 objective_priority=0.88,
-                engagement_radius=32.0,
+                engagement_radius=60.0,
             )
         # No intel published (its snapshot failed): fight on like any team.
         return _FALLBACK.decide(frame, observer)
@@ -507,20 +599,55 @@ class CTFBotPolicy:
         return not classic or math.dist(observer.position, position) <= cls._CLASSIC_DROP_SIGHT
 
     @staticmethod
-    def _is_recoverer(frame: PerceptionFrame, observer: PlayerSnapshot,
-                      intel: Vector3) -> bool:
-        """Only the two living teammates nearest a dropped intel go for it."""
+    def _nearest(pool, point: Vector3, count: int, *,
+                 within: float = math.inf) -> tuple[int, ...]:
+        """Ids of the ``count`` players of ``pool`` nearest ``point`` (id breaks ties)."""
 
-        own = math.dist(observer.position, intel)
-        closer = sum(
-            1 for player in frame.players
-            if player.team == observer.team and player.alive and player.spawned
-            and player.player_id != observer.player_id
-            and player.carried_entity_id < 0
-            and (math.dist(player.position, intel), player.player_id)
-            < (own, observer.player_id)
-        )
-        return closer < 2
+        if count <= 0 or not pool:
+            return ()
+        ranked = sorted((math.dist(player.position, point), player.player_id)
+                        for player in pool)
+        return tuple(player_id for distance, player_id in ranked[:count]
+                     if distance <= within)
+
+    def _track(self, frame: PerceptionFrame, intel) -> list:
+        """Remember where ``intel`` last lay and since when it is carried."""
+
+        key = (frame.map_epoch, frame.mode_epoch, intel.team)
+        now = float(frame.created_at)
+        track = self._tracks.get(key)
+        if track is None:
+            if len(self._tracks) >= 8:
+                self._tracks.clear()
+            track = self._tracks[key] = [None, -1, now]
+        if intel.carrier_id < 0:
+            # The minimap shows an intel on the ground wherever it lies.
+            track[0] = intel.position
+            track[1] = -1
+        elif track[1] != intel.carrier_id or now < track[2]:
+            track[1] = intel.carrier_id
+            track[2] = now
+        return track
+
+    @staticmethod
+    def _thief_estimate(frame: PerceptionFrame, intel, enemy_base, track) -> Vector3 | None:
+        """Where the team may look for the enemy carrying its intel.
+
+        Marked on the minimap: the marker. Before that a player only knows
+        where the intel was taken and that the thief is walking it to the
+        enemy base, so the hunt follows that line at a carrier's pace and
+        ends on the base it has to reach.
+        """
+
+        ground, _carrier_id, since = track
+        elapsed = max(0.0, float(frame.created_at) - float(since))
+        if elapsed >= _CTF_MARKER_DELAY:
+            return intel.position
+        if enemy_base is None:
+            return None
+        if ground is None:
+            return enemy_base.position
+        return _toward(ground, enemy_base.position, _CTF_CARRIER_PACE * elapsed)
 
     @staticmethod
     def _should_rally(frame: PerceptionFrame, observer: PlayerSnapshot,
@@ -555,28 +682,42 @@ class CTFBotPolicy:
                    and math.dist(player.position, observer.position) <= 70.0
                    for player in allies)
 
-    @staticmethod
-    def _is_defender(frame: PerceptionFrame, observer: PlayerSnapshot,
-                     base: Vector3) -> bool:
-        """Keep the teammates nearest home on guard; everyone else attacks.
+    # The last stop before a guarded intel: raiders arriving inside this band
+    # of distance from it go in together, at the latest every wave period.
+    _WAVE_BAND = (60.0, 85.0)
+    _WAVE_PERIOD = 20.0
+    _WAVE_WINDOW = 5.0
 
-        Fixed ``id % 3`` sentries froze four of ten bots for a whole match.
-        Proximity rotates the duty by itself: a fresh respawn beside the base
-        relieves the previous guard, who then joins the push.
+    @classmethod
+    def _awaits_wave(cls, frame: PerceptionFrame, observer: PlayerSnapshot,
+                     raiders, goal: Vector3) -> bool:
+        """Hold just outside the enemy base until the raid goes in as a group.
+
+        A carrier is unarmed and cannot sprint, and raiders arrived strung
+        out (the second teammate 77 blocks behind at the median pickup), so
+        the grab was a solo act that ended six seconds later. The wait cannot
+        last: three raiders go at once, anyone follows a push already inside,
+        and the team's shared clock sends whoever is there every period.
         """
-        team = [player for player in frame.players
-                if player.team == observer.team and player.alive and player.spawned]
-        wanted = 0 if len(team) < 3 else 1 if len(team) < 7 else 2
-        if wanted == 0:
+
+        near, far = cls._WAVE_BAND
+        own = math.dist(observer.position, goal)
+        if not near <= own <= far:
             return False
-        own = math.dist(observer.position, base)
-        closer = sorted(math.dist(player.position, base) for player in team
-                        if player.player_id != observer.player_id)
-        if len(closer) < wanted:
-            return True
-        # A relief must be clearly nearer before the duty changes hands, so
-        # two bots at similar range do not swap roles every decision.
-        return own <= closer[wanted - 1] + 6.0 and own <= 90.0
+        if (observer.last_damage_at > 0.0
+                and 0.0 <= frame.created_at - observer.last_damage_at <= 4.0):
+            return False
+        if (float(frame.created_at) + 7.0 * observer.team) % cls._WAVE_PERIOD < cls._WAVE_WINDOW:
+            return False
+        beside = 0
+        for player in raiders:
+            if player.player_id == observer.player_id:
+                continue
+            distance = math.dist(player.position, goal)
+            if distance < near:
+                return False  # the push already left
+            beside += distance <= far
+        return beside < 2
 
     @staticmethod
     def _guard_point(frame: PerceptionFrame, observer: PlayerSnapshot, base: Vector3,
@@ -1841,6 +1982,30 @@ def _tracks_live_position(role: str) -> bool:
     return role in _LIVE_TARGET_ROLES or any(word in role for word in _LIVE_TARGET_ROLE_WORDS)
 
 
+# A raider that stops to wait finishes at least this much of the wait, and
+# one that has just set off does not stop again for a few seconds: the
+# conditions of a rally (who is alongside, who is ahead) flicker as teammates
+# move, and a third of all waits used to last half a second.
+_RALLY_MIN_HOLD = 1.5
+_RALLY_REARM = 3.0
+
+
+def _steady_rally(previous: "_ModeCommitment", decision: ModeBotDecision,
+                  observer: PlayerSnapshot, now: float) -> ModeBotDecision:
+    before = previous.decision
+    waited = before.role.endswith("ctf_rally")
+    if waited == decision.role.endswith("ctf_rally"):
+        return decision
+    age = now - previous.role_since
+    if waited:
+        under_fire = (observer.last_damage_at > 0.0
+                      and 0.0 <= now - observer.last_damage_at <= 4.0)
+        return before if age < _RALLY_MIN_HOLD and not under_fire else decision
+    if before.role.endswith("ctf_attack_intel") and age < _RALLY_REARM:
+        return before
+    return decision
+
+
 @dataclass(slots=True)
 class _ModeCommitment:
     signature: tuple[object, ...]
@@ -1901,6 +2066,7 @@ class ModePolicyMemory:
                 decision = _watch_approach(frame, observer, VIPBotPolicy().decide(
                     frame, observer, retained_role=previous.decision.role))
                 assert decision is not None
+            decision = _steady_rally(previous, decision, observer, now)
             if decision.role == previous.decision.role:
                 separation = math.dist(decision.position, previous.decision.position)
                 moving_role = _tracks_live_position(decision.role)
