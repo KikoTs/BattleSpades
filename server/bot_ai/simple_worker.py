@@ -958,16 +958,17 @@ class SimpleBotBrain:
     ) -> _TraversalPersonality:
         """The bot's route identity, as far as its body can honour it.
 
-        The infected swim: they have no block tool to bridge with and nothing
-        to fear from water (retail spawns them in the sea), and a dry or
-        builder identity kept two of three zombies pacing the shore opposite
-        a survivor. So does a builder with nothing left to build with.
+        A builder with nothing to build with swims: every Zombie (no block
+        tool) and a soldier out of blocks used to pace the shore instead.
+        The dry identity is kept, for the infected too: it takes the bridge
+        where there is one (a Zombie swims at half its sprint; sending the
+        whole horde through the Thames cost London a third more time) and
+        swims at once when its goal has no dry way (_dry_detours_before_swim).
         """
 
         personality = self._traversal_personality(frame, observer)
-        if int(observer.class_id) in _ZOMBIE_CLASSES or (
-                personality.style is _TraversalStyle.BRIDGE
-                and (int(C.BLOCK_TOOL) not in observer.loadout or int(observer.blocks) <= 0)):
+        if personality.style is _TraversalStyle.BRIDGE and (
+                int(C.BLOCK_TOOL) not in observer.loadout or int(observer.blocks) <= 0):
             return replace(personality, style=_TraversalStyle.SWIM)
         return personality
 

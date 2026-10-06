@@ -91,7 +91,7 @@ def _brain_with_goal(world, observer, goal_position):
     return brain, state
 
 
-def test_the_infected_and_builders_with_nothing_to_build_with_swim_and_the_rest_keep_their_style():
+def test_builders_with_nothing_to_build_with_swim_and_the_rest_keep_their_style():
     zombies = [_zombie(i, (10.0 + i, 10.0, 20.0)) for i in range(1, 7)]
     humans = [_player(10 + i, TEAM2, (40.0 + i, 10.0, 20.0), is_bot=True,
                       loadout=BUILDER_KIT) for i in range(6)]
@@ -101,8 +101,10 @@ def test_the_infected_and_builders_with_nothing_to_build_with_swim_and_the_rest_
     for team in (zombies, humans):
         assert {SimpleBotBrain._traversal_personality(frame, p).style for p in team} == {
             _TraversalStyle.DRY, _TraversalStyle.SWIM, _TraversalStyle.BRIDGE}
-    assert {brain._crossing_personality(frame, z).style for z in zombies} == {
-        _TraversalStyle.SWIM}
+    # No Zombie carries a block tool: its builders swim, its dry runners
+    # still take a bridge where there is one.
+    styles = [brain._crossing_personality(frame, z).style for z in zombies]
+    assert styles.count(_TraversalStyle.SWIM) == 4 and styles.count(_TraversalStyle.DRY) == 2
     assert {brain._crossing_personality(frame, h).style for h in humans} == {
         _TraversalStyle.DRY, _TraversalStyle.SWIM, _TraversalStyle.BRIDGE}
     # A builder out of blocks, or carrying no block tool, cannot bridge.
