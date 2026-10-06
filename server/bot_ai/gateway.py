@@ -343,6 +343,9 @@ class BotActionGateway:
         position = action.position
         if tool == int(C.DISGUISE_TOOL):
             return bool(service.set_disguise(player, active=True))
+        if tool == int(C.C4_TOOL) and action.argument == "detonate":
+            # The detonator fires every live charge this Miner owns.
+            return bool(service.detonate_c4(player))
         if position is None:
             return False
         if tool in {
@@ -352,7 +355,9 @@ class BotActionGateway:
         } and not self._explosive_deploy_safe(player, position, tool):
             return False
         if tool == int(C.DYNAMITE_TOOL):
-            return bool(service.place_dynamite(player, position))
+            # The charge goes off from the face it hangs on, not inside the block.
+            face = int(action.face) if 0 <= int(action.face) <= 5 else 4
+            return bool(service.place_dynamite(player, position, face=face))
         if tool == int(C.LANDMINE_TOOL):
             return bool(service.place_landmine(player, position))
         if tool == int(C.C4_TOOL):
@@ -466,6 +471,8 @@ class BotActionGateway:
         direction,
         spec,
         target=None,
+        *,
+        clearance: float = 3.0,
     ) -> bool:
         """Revalidate the live muzzle lane and optional direct target ray."""
 
@@ -482,7 +489,7 @@ class BotActionGateway:
                     direction[0],
                     direction[1],
                     direction[2],
-                    radius + 3.0,
+                    radius + clearance,
                 )
             except (TypeError, ValueError):
                 return False
@@ -588,6 +595,9 @@ class BotActionGateway:
                 direction,
                 spec,
                 direct_target,
+                # A Block Cannon shot is meant to land on terrain: it only has
+                # to land outside its own ten-damage splash.
+                clearance=1.0 if spec.name == "snowball" else 3.0,
             )
             or not self.select_tool(player, tool)
         ):
