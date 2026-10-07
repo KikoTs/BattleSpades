@@ -3,6 +3,33 @@ follow-up gameplay and stability fixes into one server release.
 
 ## Gameplay and compatibility
 
+- Bots, measured over simulated matches on every map and mode:
+  - They cross water. A swim is carried to the far bank instead of ending on
+    the bank it started from, so Zombie bots spawned on an islet or in the sea
+    reach the survivors, and teams meet on island maps.
+  - The Zombie horde chooses between walking in, clawing through and
+    collapsing a structure by estimated time, sprints up slopes when its class
+    can, and no longer queues behind one teammate's hole.
+  - They walk up to an objective on another storey instead of pillaring or
+    digging underneath it, and a bot whose local route dead-ends no longer
+    paces for seconds while the map-wide search waits its turn.
+  - Classic CTF bots no longer stand idle once an intel is dropped far away;
+    CTF teams split into carrier, escorts, hunters, raiders and a home guard;
+    bots no longer know a thief's position before the minimap marks it.
+  - They react to being shot by someone they cannot see, to gunfire,
+    footsteps, digging and building within hearing distance, to a teammate
+    killed beside them and to burning blocks, and they break off a fight they
+    are losing.
+  - They use the tools their class carries (landmines, radar, turret, Block
+    Cannon, disguise, C4, dynamite), and a hurt or dry bot goes to a crate or
+    a medic.
+  - The route planner's queue no longer leaves bots waiting for a plan.
+- Evaluate 71 of the 77 original achievements on the server, on any server
+  including a player's own Create Match, and announce each unlock in game
+  (`docs/ACHIEVEMENTS.md`). Six map achievements still need their regions.
+- Dedicated servers can be joined through Steam's relay network where their
+  address is blocked (`[steam_host]`, off by default; see
+  `deploy/steam-linux/README.md`).
 - Fix transparent terrain on late join after earlier players dig or destroy
   blocks: newly exposed solid faces now carry their colors into map transfer.
 - Correct map lighting, marker/light colors and player block colors. Placed

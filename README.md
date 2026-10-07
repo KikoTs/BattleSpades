@@ -463,7 +463,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
   releases include the project's tracked VXL/KV6 gameplay content.
 - Networking via [pyenet](https://github.com/piqueserver/pyenet) / [ENet](http://enet.bespin.org/).
 - Community fixes: build & setup improvements from [@TylerJaacks](https://github.com/TylerJaacks);
-  the Steam public-IP join fix from [@Coletex](https://github.com/Coletex).
+  the Steam public-IP join fix from [@Coletex](https://github.com/Coletex);
+  the class movement speed report from [@Kresslib2](https://github.com/Kresslib2).
 
 ## License
 
