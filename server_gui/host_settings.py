@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from server_gui.config_doc import ConfigDocument
+from shared.lan_discovery import STEAM_LAN_PORTS
 
 RETAIL_GAME_PORT = 32887          # server/steam_master.py RETAIL_BROWSER_GAME_PORT
 SHIPPED_SAMPLE_PORT = 27015       # config.toml sample default
@@ -189,6 +190,25 @@ def server_ports(doc: ConfigDocument, port: int | None = None) -> list[int]:
 def query_port(doc: ConfigDocument) -> int:
     game = int(doc.get("server", "port", SHIPPED_SAMPLE_PORT))
     return int(doc.get("steam", "query_port", 0) or 0) or game + 1
+
+
+def firewall_ports(doc: ConfigDocument) -> list[int]:
+    """Include LAN scan ports in local firewall rules, not router mappings."""
+    ports = set(server_ports(doc))
+    game = int(doc.get("server", "port", SHIPPED_SAMPLE_PORT))
+    if doc.get("server", "lan_discovery", True) and game not in STEAM_LAN_PORTS:
+        ports.update(STEAM_LAN_PORTS)
+    return sorted(ports)
+
+
+def lan_discovery_note(doc: ConfigDocument) -> str:
+    """Describe the next startup's LAN discovery setting."""
+    if not doc.get("server", "lan_discovery", True):
+        return "Extra LAN listener disabled. Direct A2S queries still work on the game port."
+    game = int(doc.get("server", "port", SHIPPED_SAMPLE_PORT))
+    endpoint = f"UDP {game}" if game in STEAM_LAN_PORTS else "the first free UDP port in 27015-27020"
+    return (f"Steam LAN discovery uses {endpoint}. Allow the server through your local firewall. "
+            "No Steam runtime or router forwarding needed. Applies when the server starts.")
 
 
 @dataclass

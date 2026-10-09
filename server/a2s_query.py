@@ -2,7 +2,8 @@
 A2S Steam Query Protocol Handler
 Allows the server to appear in Steam's server browser and LAN discovery.
 
-Runs as a separate asyncio UDP server to avoid breaking ENet.
+Uses the ENet intercept on the game port, plus an optional Steam LAN query
+socket on 27015..27020 when the game port is outside that range.
 - A2S_INFO, A2S_PLAYER, A2S_RULES queries
 - LAN discovery (HELLO, HELLOLAN)
 """
@@ -14,9 +15,11 @@ import random
 import logging
 import sys
 import time
+import socket
 from typing import TYPE_CHECKING, Optional, Tuple, Dict
 
 from .game_constants import TEAM1, TEAM2
+from shared.lan_discovery import STEAM_LAN_PORTS
 from .mode_data import get as get_mode_data
 from .steam_master import (
     build_game_tags,
@@ -44,6 +47,10 @@ class A2SProtocol(asyncio.DatagramProtocol):
     
     def datagram_received(self, data: bytes, addr: tuple):
         """Handle incoming UDP datagram."""
+        # HELLOLAN clients join the reply's source port, so that protocol
+        # must only answer on the actual ENet game socket.
+        if not data.startswith(A2SConstants.PREFIX_BYTES):
+            return
         response = self.handler.handle_packet(data, addr)
         if response:
             self.transport.sendto(response, addr)
@@ -78,9 +85,8 @@ class A2SConstants:
 
 class A2SHandler:
     """
-    A2S Query handler - runs as separate asyncio UDP server.
-    Handles Steam server browser queries and LAN discovery.
-    NOTE: Cannot share same port as ENet, so runs on port+1.
+    Shared responses for game-port queries and Steam LAN discovery.
+    The extra query socket never binds over ENet or the Steam registrar.
     """
     
     def __init__(self, server: 'BattleSpadesServer'):
@@ -90,6 +96,7 @@ class A2SHandler:
         self._transport = None
         self._protocol = None
         self._running = False
+        self.lan_query_port: Optional[int] = None
         # id(player) -> (player, monotonic first-seen). Player has no join
         # timestamp, so A2S_PLAYER durations are measured from the first
         # roster sweep that saw each player (update() sweeps every second).
@@ -156,43 +163,59 @@ class A2SHandler:
             except Exception as e:
                 logger.error(f"Failed to send response to {address}: {e}")
     
-    async def _start_udp_server(self):
-        """Create and start the UDP server."""
-        import asyncio
-        import socket
-        
-        # Use same port as game server - we'll try to create a second socket
-        # This may not work, in which case A2S won't be available
-        port = self.server.config.port
-        
-        try:
-            loop = asyncio.get_event_loop()
-            
-            # Create a UDP socket that can coexist with ENet
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except AttributeError:
-                pass  # Windows doesn't have SO_REUSEPORT
-            sock.setblocking(False)
-            sock.bind(('0.0.0.0', port))
-            
-            self._transport, self._protocol = await loop.create_datagram_endpoint(
-                lambda: A2SProtocol(self),
-                sock=sock
-            )
+    async def start(self) -> None:
+        """Expose A2S on a Steam LAN scan port without sharing game sockets."""
+        config = self.server.config
+        if self._running or not config.lan_discovery:
+            return
+        if config.port in STEAM_LAN_PORTS:
+            self.lan_query_port = config.port
             self._running = True
-            logger.info(f"A2S UDP server started on port {port}")
-        except OSError as e:
-            logger.warning(f"Could not start A2S server on port {port}: {e}")
-            logger.warning("A2S/LAN discovery will not be available")
+            logger.info("Steam LAN discovery uses game UDP port %d", config.port)
+            return
+
+        reserved = set()
+        if config.steam.enabled:
+            reserved.update((config.steam.steam_port,
+                             config.steam.effective_query_port(config.port)))
+        loop = asyncio.get_running_loop()
+        for port in STEAM_LAN_PORTS:
+            if port in reserved:
+                continue
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Never steal datagrams from another local game server.
+                if sys.platform == "win32":
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                sock.setblocking(False)
+                sock.bind(('0.0.0.0', port))
+                self._transport, self._protocol = await loop.create_datagram_endpoint(
+                    lambda: A2SProtocol(self), sock=sock,
+                )
+            except OSError as exc:
+                logger.debug("Steam LAN query port %d unavailable: %s", port, exc)
+                continue
+            finally:
+                # On success the asyncio transport owns the socket. Also
+                # close on cancellation or failure to create the endpoint.
+                if self._transport is None:
+                    sock.close()
+            self.lan_query_port = port
+            self._running = True
+            logger.info("Steam LAN discovery listening on UDP %d (game UDP %d)",
+                        port, config.port)
+            return
+        logger.warning("Steam LAN discovery unavailable: UDP 27015-27020 are busy. "
+                       "Direct connections and game-port A2S still work on UDP %d.",
+                       config.port)
     
-    def stop(self):
-        """Stop the A2S UDP server."""
+    def stop(self) -> None:
+        """Close the extra query socket; ENet owns the game-port listener."""
         if self._transport:
             self._transport.close()
             self._transport = None
+        self._protocol = None
+        self.lan_query_port = None
         self._running = False
     
     def handle_packet(self, data: bytes, addr: tuple) -> Optional[bytes]:

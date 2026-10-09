@@ -105,6 +105,9 @@ class MapMetadata:
     # client presentation assets (sky mesh and ambience); it is never a map-
     # synchronization shortcut.
     official_map: bool = False
+    # Headerless 64-high retail maps can be indistinguishable from Classic.
+    # Stock maps keep retail semantics; custom sidecars can override detection.
+    vxl_format: str = "auto"
     # StateData carries gravity as signed 1.6 fixed point.  Store the
     # wire-canonical value here and apply this same scalar to the server's
     # native World; otherwise an authored value such as Lunar's 0.4 becomes
@@ -370,6 +373,7 @@ _SKYBOX_AMBIENTS = {
 }
 
 _LEGACY_ENVIRONMENT_KEYS = frozenset((
+    "vxl_format",
     "skybox_texture", "skybox_name", "skybox", "fog_color", "gravity",
     "light_color", "light_direction", "back_light_color",
     "back_light_direction", "ambient_light_color",
@@ -1180,9 +1184,13 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     if ambient_intensity is not None and not 0.0 <= ambient_intensity <= 4.0:
         ambient_intensity = None
 
+    vxl_format = str(payload.get("vxl_format", "retail" if official_map else "auto")).lower()
+    if vxl_format not in ("auto", "retail", "classic64"):
+        raise ValueError("vxl_format must be auto, retail or classic64")
     result = MapMetadata(
         source=sidecar,
         official_map=official_map,
+        vxl_format=vxl_format,
         gravity=canonical_gravity(
             payload.get("gravity", _STOCK_MAP_GRAVITY.get(map_key, 1.0))
         ),

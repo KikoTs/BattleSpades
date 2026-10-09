@@ -36,5 +36,6 @@ def build_validation_config(
     # Private tests must never advertise themselves to either public master.
     config.revival.enabled = False
     config.steam.enabled = False
+    config.lan_discovery = False
     config.steam.query_port = 0
     return config

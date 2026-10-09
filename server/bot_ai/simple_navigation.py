@@ -285,21 +285,23 @@ class SimpleVoxelWorld:
         raw_vxl = map_snapshot_vxl_bytes(snapshot)
         if not raw_vxl:
             return
-        vxl = CompactVoxelMap(raw_vxl)
+        vxl = CompactVoxelMap(raw_vxl, source_format=snapshot.source_format)
         for change in snapshot.changed_cells:
             vxl.set_solid(change.x, change.y, change.z, change.solid)
             self._record_cell_health(change)
             self._dirty_columns.add((int(change.x), int(change.y)))
         self._vxl = vxl
+        # Old caches were derived using retail marker stripping/height rules.
+        cacheable = not snapshot.changed_cells and snapshot.source_format != "classic64"
         try:
             self._atlas, _cache_hit = load_or_build_atlas(
                 vxl,
                 raw_vxl,
                 map_name=(
-                    snapshot.map_name if not snapshot.changed_cells else ""
+                    snapshot.map_name if cacheable else ""
                 ),
                 map_directory=(
-                    snapshot.map_directory if not snapshot.changed_cells else ""
+                    snapshot.map_directory if cacheable else ""
                 ),
             )
         except (OSError, RuntimeError, TypeError, ValueError):

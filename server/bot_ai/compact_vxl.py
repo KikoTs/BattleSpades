@@ -18,29 +18,32 @@ MAP_AREA = MAP_SIZE * MAP_SIZE
 FLOOR_BIT = 1 << (MAP_HEIGHT - 1)
 
 
-def _raw_vxl_size(data: bytes) -> tuple[int, int]:
+def _raw_vxl_size(data: bytes) -> tuple[int, int, bool]:
     position = 0
     columns = 0
     maximum_reference = 0
+    classic_height = True
     limit = len(data)
     while position < limit:
         if position + 4 > limit:
-            return 0, 0
+            return 0, 0, False
         span_words = data[position]
         top_start = data[position + 1]
         top_end = data[position + 2]
         air_start = data[position + 3]
+        classic_height = classic_height and top_end < 64
         maximum_reference = max(
             maximum_reference, top_start, top_end, air_start
         )
         while span_words:
             position += span_words * 4
             if position + 4 > limit:
-                return 0, 0
+                return 0, 0, False
             span_words = data[position]
             top_start = data[position + 1]
             top_end = data[position + 2]
             air_start = data[position + 3]
+            classic_height = classic_height and top_end < 64
             maximum_reference = max(
                 maximum_reference, top_start, top_end, air_start
             )
@@ -48,8 +51,8 @@ def _raw_vxl_size(data: bytes) -> tuple[int, int]:
         position += 4 + top_length * 4
         columns += 1
     if position != limit:
-        return 0, 0
-    return columns, maximum_reference
+        return 0, 0, False
+    return columns, maximum_reference, classic_height
 
 
 def _range_mask(start: int, end_exclusive: int) -> int:
@@ -69,7 +72,7 @@ class CompactVoxelMap:
 
     __slots__ = ("_columns", "source_z_shift")
 
-    def __init__(self, raw_data: bytes) -> None:
+    def __init__(self, raw_data: bytes, *, source_format: str = "retail") -> None:
         if not isinstance(raw_data, (bytes, bytearray, memoryview)):
             raise ValueError(
                 f"VXL snapshot must be bytes, not {type(raw_data).__name__}"
@@ -77,15 +80,24 @@ class CompactVoxelMap:
         # Own an immutable copy: a bytearray or memoryview handed across a
         # thread boundary can change or be released while we walk it.
         raw_data = bytes(raw_data)
-        columns, maximum_reference = _raw_vxl_size(raw_data)
+        columns, maximum_reference, classic_height = _raw_vxl_size(raw_data)
         edge = math.isqrt(columns) if columns > 0 else 0
         if edge <= 0 or edge * edge != columns or edge > MAP_SIZE:
             raise ValueError("invalid VXL column stream")
-        self.source_z_shift = max(0, (MAP_HEIGHT - 1) - maximum_reference)
+        if source_format not in ("auto", "retail", "classic64"):
+            raise ValueError("VXL source_format must be auto, retail or classic64")
+        classic = source_format == "classic64" or (
+            source_format == "auto" and edge == MAP_SIZE
+            and maximum_reference <= 64 and classic_height
+        )
+        if classic and (edge != MAP_SIZE or maximum_reference > 64):
+            raise ValueError("classic VXL requires 512 x 512 x 64 dimensions")
+        self.source_z_shift = 176 if classic else max(0, (MAP_HEIGHT - 1) - maximum_reference)
         self._columns = [FLOOR_BIT] * MAP_AREA
         offset = (MAP_SIZE - edge) // 2
         position = 0
         limit = len(raw_data)
+        depth = 64 if classic else MAP_HEIGHT
         markers: list[tuple[int, int, int]] = []
 
         for source_y in range(edge):
@@ -101,6 +113,10 @@ class CompactVoxelMap:
                     span_words = raw_data[position]
                     top_start = raw_data[position + 1]
                     top_end = raw_data[position + 2]
+                    if (top_start > depth or top_end >= depth
+                            or raw_data[position + 3] > depth
+                            or top_start > top_end + 1):
+                        raise ValueError("out-of-range VXL span")
                     position += 4
                     top_length = (
                         top_end - top_start + 1 if top_end >= top_start else 0
@@ -114,7 +130,7 @@ class CompactVoxelMap:
                         color = int.from_bytes(
                             raw_data[color_position:color_position + 4], "little"
                         )
-                        if _marker_color(color):
+                        if not classic and _marker_color(color):
                             markers.append((x, y, shifted_top + index))
                     position += top_length * 4
                     has_surface = has_surface or top_length > 0
@@ -136,6 +152,9 @@ class CompactVoxelMap:
                     ):
                         raise ValueError("invalid VXL bottom span")
                     next_air_start = raw_data[next_header + 3]
+                    if (next_air_start > raw_data[next_header + 1]
+                            or raw_data[next_header + 1] <= top_start):
+                        raise ValueError("overlapping VXL air span")
                     bottom_start = next_air_start - bottom_length
                     if bottom_start < top_end + 1:
                         raise ValueError("overlapping VXL spans")
@@ -148,7 +167,7 @@ class CompactVoxelMap:
                         color = int.from_bytes(
                             raw_data[color_position:color_position + 4], "little"
                         )
-                        if _marker_color(color):
+                        if not classic and _marker_color(color):
                             markers.append(
                                 (
                                     x,

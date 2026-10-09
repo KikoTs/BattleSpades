@@ -37,6 +37,8 @@ def build_command(
     status_file: Path | None = None,
     config_path: Path | None = None,
     port: int | None = None,
+    offline: bool = False,
+    master_url: str | None = None,
 ) -> list[str]:
     """Command line for one supervised server session."""
 
@@ -47,7 +49,13 @@ def build_command(
         command += ["--port", str(int(port))]
     if status_file is not None:
         command += ["--status-file", str(status_file)]
-    if steam_p2p:
+    if offline:
+        command.append("--offline")
+    if master_url is not None:
+        from server.network_options import normalize_master_url
+
+        command += ["--master-url", normalize_master_url(master_url)]
+    if steam_p2p and not offline:
         command.append("--steam-p2p")
     return command
 

@@ -107,6 +107,8 @@ class SteamHostService:
         return getattr(self.server.config, "steam_host", None)
 
     def enabled(self) -> bool:
+        if getattr(self.server.config, "offline_mode", False):
+            return False
         settings = self._settings()
         return bool(getattr(settings, "enabled", False)) or os.environ.get("AOS_STEAM_HOST", "") == "1"
 

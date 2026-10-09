@@ -48,8 +48,8 @@ class ClassicCTFMode(CTFMode):
     tick and accept only normalized class selections.
     """
 
-    name = "Classic CTF"
-    description = "Classic Deuce CTF: capture the enemy intel!"
+    name = "Classic+"
+    description = "Classic+ CTF: capture the enemy intel!"
     mode_code = "cctf"
     death_representation = CLASSIC_CORPSE_REPRESENTATION
     intel_auto_return_default = False

@@ -122,6 +122,7 @@ class MapSnapshot:
     raw_vxl_size: int = 0
     map_directory: str = ""
     prefab_geometry: tuple[PrefabGeometry, ...] = ()
+    source_format: str = "retail"
 
 
 @dataclass(frozen=True, slots=True)

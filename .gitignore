@@ -86,6 +86,9 @@ selfrow_samples.ndjson
 *.exp
 *.lib
 *.obj
+# Local compiler/probe output at the repository root.
+/vc140.pdb
+/p.out
 
 # ── Agent / assistant tooling ───────────────────────────────────────
 .worktrees/

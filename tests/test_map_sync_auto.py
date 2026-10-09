@@ -217,15 +217,17 @@ def _edit(wm, seed=7, count=60):
 
 
 @pytest.mark.parametrize("name", ["MayanJungle", "20thCenturyTown"])
-def test_fresh_map_needs_no_record_and_the_local_file_is_the_world(name):
+def test_fresh_map_only_needs_finalized_marker_columns(name):
     wm, raw = _world(name)
     reply, stream = _join(_server(wm), _wire_crc(raw))
 
     assert reply == _wire_crc(raw)
-    assert stream == b""
+    delta = _records(stream)
+    marker_columns = {(x, y) for x, y, _z in wm.map.retail_marker_positions}
+    assert set(delta) == marker_columns
     rng = random.Random(1)
     sample = [(rng.randrange(512), rng.randrange(512)) for _ in range(1500)]
-    assert _assert_same_world(wm, raw, {}, sample) > 1000
+    assert _assert_same_world(wm, raw, delta, sample + sorted(marker_columns)) > 1000
 
 
 @pytest.mark.parametrize("name", ["MayanJungle", "20thCenturyTown"])
@@ -236,7 +238,8 @@ def test_local_file_plus_delta_is_the_server_world(name):
     _reply, stream = _join(_server(wm), _wire_crc(raw))
     delta = _records(stream)
 
-    assert set(delta) == set(wm.dirty_columns)
+    marker_columns = {(x, y) for x, y, _z in wm.map.retail_marker_positions}
+    assert set(delta) == set(wm.dirty_columns) | marker_columns
     assert touched <= set(delta)
     rng = random.Random(2)
     neighbours = {

@@ -285,7 +285,9 @@ def _attempt(name: str, operation: Callable[[], str]) -> CheckItem:
         return CheckItem(name=name, ok=False, detail=str(exc))
 
 
-def run_release_check(paths: RuntimePaths) -> CheckReport:
+def run_release_check(
+    paths: RuntimePaths, *, offline: bool = False, master_url: str | None = None,
+) -> CheckReport:
     """Validate a staged server without opening a gameplay listener.
 
     Checks execute synchronously during operator startup or CI and never touch
@@ -309,7 +311,15 @@ def run_release_check(paths: RuntimePaths) -> CheckReport:
     if not items[-1].ok:
         return CheckReport(tuple(items))
 
-    config = apply_runtime_paths(load_config(paths.config), paths)
+    try:
+        loaded = (
+            load_config(paths.config, offline=offline, master_url=master_url)
+            if offline or master_url is not None else load_config(paths.config)
+        )
+        config = apply_runtime_paths(loaded, paths)
+    except (OSError, ValueError, TypeError) as exc:
+        items.append(CheckItem("configuration values", False, str(exc)))
+        return CheckReport(tuple(items))
 
     def check_maps() -> str:
         maps_root = Path(config.maps_path)

@@ -26,6 +26,21 @@ def _comment_lines(text: str) -> list[str]:
 # ---------------------------------------------------------------- config doc
 
 
+def test_lan_discovery_defaults_and_firewall_do_not_enable_public_listing() -> None:
+    doc = ConfigDocument("[server]\nport = 32887\n")
+    assert host_settings.server_ports(doc) == [32887]
+    assert host_settings.firewall_ports(doc) == [27015, 27016, 27017, 27018, 27019, 27020, 32887]
+    assert "first free UDP port" in host_settings.lan_discovery_note(doc)
+    doc.set("server", "lan_discovery", False)
+    assert host_settings.firewall_ports(doc) == [32887]
+    assert "disabled" in host_settings.lan_discovery_note(doc)
+    assert not doc.get("steam", "enabled", False)
+    doc.set("server", "lan_discovery", True)
+    doc.set("server", "port", 27017)
+    assert host_settings.firewall_ports(doc) == [27017]
+    assert "UDP 27017" in host_settings.lan_discovery_note(doc)
+
+
 def test_untouched_document_round_trips_byte_for_byte() -> None:
     doc = ConfigDocument(SHIPPED)
     assert doc.text() == SHIPPED

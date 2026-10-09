@@ -1149,6 +1149,7 @@ class BotDirector:
             map_name=str(getattr(world, "map_name", "")),
             map_directory=str(getattr(world, "maps_path", "")),
             prefab_geometry=load_bot_prefab_geometry(BOT_PREFAB_BLOCK_COUNTS),
+            source_format=str(getattr(getattr(world, "map", None), "source_format", "retail")),
         )
 
     def _on_world_mutation(

@@ -438,7 +438,7 @@ class WorkerVoxelWorld:
         try:
             from server.bot_ai.compact_vxl import CompactVoxelMap
 
-            self._vxl = CompactVoxelMap(raw_vxl)
+            self._vxl = CompactVoxelMap(raw_vxl, source_format=snapshot.source_format)
             # The bridge retains a canonical overlay for worker restarts and
             # overflow rebases. Applying it while loading yields one coherent
             # current navigation snapshot without serializing VXL on the game
@@ -459,7 +459,7 @@ class WorkerVoxelWorld:
             # the authored base map, so derive its atlas from the already
             # patched worker copy. Normal map loads consume the content-hashed
             # precomputed cache shipped beside the VXL.
-            cacheable = not snapshot.changed_cells
+            cacheable = not snapshot.changed_cells and snapshot.source_format != "classic64"
             self.navigation_atlas, self.navigation_cache_hit = (
                 load_or_build_atlas(
                     self._vxl,

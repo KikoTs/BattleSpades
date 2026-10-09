@@ -27,20 +27,37 @@ Pick a name, mode and map, then press START. The window runs the normal
 server from this folder with the same `config.toml`, and saves only settings
 the server accepts.
 
-- Host: name, mode, map rotation, players, bots, passwords, and "Import from
-  Steam Workshop…", which copies your subscribed Workshop maps into `maps/`
-  (Steam does not need to be running). Steam P2P is on by default on Windows: friends using the retail client with the Steam relay
+- Host: name, mode, map rotation, players, bots, passwords, and "Workshop maps…".
+  Public Workshop downloads maps by search or item link without Steam or game
+  ownership. "On this computer" imports existing Steam/client downloads.
+  Maps go into [world] maps_path (`maps/` by default); choose one as the start
+  map or add it to a custom rotation. Steam P2P is on by default on Windows: friends using the retail client with the Steam relay
   drop-in can join through Steam without port forwarding.
 - Network: the game port (32887, the original game's port, is used if the
-  file still has the 27015 sample), Steam server browser listing, optional
+  file still has the 27015 sample), Steam LAN discovery (on by default), optional
+  public Steam server listing, optional
   automatic port forwarding (UPnP/NAT-PMP), a connection check that reports
   only what it can measure, a firewall helper, and router guides.
+  LAN discovery needs no Steam runtime or router forwarding. Allow the server
+  through the local firewall; query UDP 27015-27020 is included in the helper.
 - Console: the live log, plus admin commands such as `say`, `kick`, `ban`,
   `map`, `restart` and `bots add 4`.
 - Advanced: every config.toml setting, with the file's own comments as help.
 
 Closing the window stops the server gracefully, and asks first if players
 are online.
+
+Console map downloads (no Steam needed)
+--------------------------------------
+
+  BattleSpades.exe --workshop-download 185279489
+  ./BattleSpades --workshop-download "https://steamcommunity.com/sharedfiles/filedetails/?id=185279489"
+
+Use --config <path> for another server configuration. The command installs into
+that configuration's [world] maps_path and exits; it does not start a server or
+change your settings. It prints the map basename to use in [game] default_map
+or [lobby] map_rotation. Repeating a download updates the same imported map.
+Only public downloadable Ace of Spades maps are supported.
 
 Per-session local hosting
 -------------------------
