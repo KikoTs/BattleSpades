@@ -71,14 +71,65 @@ jobs:
       - name: Compile original native extensions
         run: python setup.py build_ext --inplace
 
+      - name: Preserve compiled extensions for diagnosis
+        shell: bash
+        run: tar -czf "$RUNNER_TEMP/beta03-native-intel.tgz" enet*.so shared/*.so aoslib/*.so server/bot_ai/*.so
+
+      - name: Upload original compiled extensions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: beta03-native-intel-6f6c9fe
+          path: ${{ runner.temp }}/beta03-native-intel.tgz
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Recheck original timing limit three times
         shell: bash
         run: |
           test -f maps/Invasion.vxl
+          cat > "$RUNNER_TEMP/benchmark-cpu.py" <<'PY'
+          import sys
+          import time
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+          import pytest
+
+          class Measure:
+              def __init__(self):
+                  self.timings = []
+
+              def pytest_runtest_call(self, item):
+                  from server.entities import behaviors
+                  self.original = behaviors._detonate_deployable
+                  def measured(*args, **kwargs):
+                      wall = time.perf_counter_ns()
+                      cpu = time.thread_time_ns()
+                      try:
+                          return self.original(*args, **kwargs)
+                      finally:
+                          self.timings.append(((time.perf_counter_ns() - wall) / 1e6,
+                                               (time.thread_time_ns() - cpu) / 1e6))
+                  behaviors._detonate_deployable = measured
+
+              def pytest_runtest_teardown(self, item):
+                  from server.entities import behaviors
+                  behaviors._detonate_deployable = self.original
+
+          measure = Measure()
+          status = pytest.main(["tests/test_grave_blast_cost.py::test_grave_detonation_costs_under_five_ms", "-q", "-s"], plugins=[measure])
+          print("DIAGNOSTIC: wall_ms / thread_cpu_ms for slowest detonations:")
+          for wall, cpu in sorted(measure.timings, reverse=True)[:10]:
+              print(f"  {wall:.3f} / {cpu:.3f}")
+          if measure.timings:
+              print(f"DIAGNOSTIC: max thread CPU {max(cpu for wall, cpu in measure.timings):.3f} ms")
+          raise SystemExit(status)
+          PY
+          status=0
           for trial in 1 2 3; do
             echo "Unchanged benchmark trial $trial/3"
-            python -m pytest tests/test_grave_blast_cost.py::test_grave_detonation_costs_under_five_ms -q -s
+            python "$RUNNER_TEMP/benchmark-cpu.py" || status=1
           done
+          exit "$status"
 
       - name: Freeze one-directory server
         run: python -m PyInstaller --noconfirm --clean BattleSpades.spec
