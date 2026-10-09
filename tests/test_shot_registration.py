@@ -417,6 +417,9 @@ def test_dropped_shot_is_logged_with_reason(caplog, monkeypatch):
     _stream(shooter, 1000, 1010)
     server.combat.handle_shot(shooter, _shot(shooter, direction, label=1010))
     caplog.set_level("INFO", logger="combat.shots")
+    # Only inspect the empty-clip attempt. The setup shot can legitimately
+    # log a near miss when another test has already enabled INFO logging.
+    caplog.clear()
     server.combat.handle_shot(shooter, _shot(shooter, direction, label=1011))
     lines = [r.getMessage() for r in caplog.records if r.name == "combat.shots"]
     assert lines and "reason=empty_clip" in lines[0]

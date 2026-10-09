@@ -66,7 +66,7 @@ def test_release_title_does_not_import_server_runtime(tmp_path: Path) -> None:
         cwd=tmp_path, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "BattleSpades Beta 0.2"
+    assert result.stdout.strip() == "BattleSpades Beta 0.3"
 
 
 def test_tag_is_validated_against_version_file() -> None:
