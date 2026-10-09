@@ -34,7 +34,8 @@ jobs:
           import subprocess
 
           def api(path):
-              return subprocess.check_output(["gh", "api", path], text=True)
+              # Capture CI ANSI formatting as data; never echo or execute it.
+              return subprocess.check_output(["gh", "api", "--allow-escape-sequences", path], text=True)
 
           source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           run = json.loads(api("repos/KikoTs/BattleSpades/actions/runs/37957931517"))
@@ -73,6 +74,7 @@ jobs:
       - name: Recheck original timing limit three times
         shell: bash
         run: |
+          test -f maps/Invasion.vxl
           for trial in 1 2 3; do
             echo "Unchanged benchmark trial $trial/3"
             python -m pytest tests/test_grave_blast_cost.py::test_grave_detonation_costs_under_five_ms -q -s
