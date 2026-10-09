@@ -1,0 +1,111 @@
+name: Recheck Beta 0.3 Intel Mac timing and package
+
+# One-off release recovery: all 11,566 other tests passed on this exact commit.
+# The original 5 ms wall-clock benchmark had one 5.93 ms outlier. Re-run that
+# unchanged test three times on a fresh runner; never relax its threshold.
+# This produces an artifact only. The normal release workflow remains intact.
+on:
+  push:
+    branches: [ci/beta03-macos-recheck]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recheck:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Check out the original release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: 6f6c9fe7037034bd80a4adc741bf1992687b76d9
+          persist-credentials: false
+
+      - name: Require the prior complete suite and unchanged release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+
+          def api(path):
+              return subprocess.check_output(["gh", "api", path], text=True)
+
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          run = json.loads(api("repos/KikoTs/BattleSpades/actions/runs/37957931517"))
+          assert run["head_sha"] == source == "6f6c9fe7037034bd80a4adc741bf1992687b76d9"
+          assert run["conclusion"] == "failure" and run["path"] == ".github/workflows/release.yml"
+          jobs = json.loads(api("repos/KikoTs/BattleSpades/actions/runs/37957931517/jobs?per_page=100"))["jobs"]
+          builds = [job for job in jobs if job["name"].startswith("Build ")]
+          assert len(builds) == 6
+          failed = [job for job in builds if job["conclusion"] != "success"]
+          assert len(failed) == 1 and failed[0]["id"] == 113913200970
+          assert failed[0]["name"] == "Build macos x86_64"
+          assert [step["name"] for step in failed[0]["steps"] if step["conclusion"] == "failure"] == ["Run complete source test suite"]
+          log = api("repos/KikoTs/BattleSpades/actions/jobs/113913200970/logs")
+          failures = re.findall(r"(?m)^.*?FAILED (tests/\S+) -", log)
+          assert failures == ["tests/test_grave_blast_cost.py::test_grave_detonation_costs_under_five_ms"], failures
+          assert "1 failed, 11566 passed, 16 skipped" in log
+          print("Verified complete suite evidence: 11,566 passed, one timing-only failure; all five other platforms passed.")
+          PY
+
+      - name: Set up the pinned Intel Python runtime
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-release.txt
+
+      - name: Install pinned release dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-release.txt
+
+      - name: Compile original native extensions
+        run: python setup.py build_ext --inplace
+
+      - name: Recheck original timing limit three times
+        shell: bash
+        run: |
+          for trial in 1 2 3; do
+            echo "Unchanged benchmark trial $trial/3"
+            python -m pytest tests/test_grave_blast_cost.py::test_grave_detonation_costs_under_five_ms -q -s
+          done
+
+      - name: Freeze one-directory server
+        run: python -m PyInstaller --noconfirm --clean BattleSpades.spec
+
+      - name: Stage and archive native release
+        run: >-
+          python scripts/package_release.py
+          --frozen-dir dist/BattleSpades --output-root release-dist
+          --platform macos --architecture x86_64
+
+      - name: Smoke packaged launchers outside archive
+        shell: bash
+        run: |
+          bundle="$(find "$GITHUB_WORKSPACE/release-dist" -mindepth 1 -maxdepth 1 -type d -name 'BattleSpades-*' -print -quit)"
+          test -n "$bundle"
+          cd "$RUNNER_TEMP"
+          cp "$bundle/config.toml" "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpades" --version
+          "$bundle/BattleSpades" --check --config "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpadesTutorial" --version
+          "$bundle/BattleSpadesTutorial" --check --config "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpadesMapCreator" --version
+          "$bundle/BattleSpadesServer" --self-check
+
+      - name: Upload verified Intel Mac archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-macos-x86_64
+          path: release-dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
