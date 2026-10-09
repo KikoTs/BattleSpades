@@ -52,7 +52,7 @@ do not establish exact parity for every map, mode or network condition. See
 The cleaned local outputs are `dist/` and `release-dist/`; `release/` contains
 tracked packaging inputs. Retained binaries can predate source edits. Build and
 check the exact release you intend to use. The native client's current commands
-and feature guides are indexed in [its documentation](../BattleSpadesClient/docs/README.md).
+and feature guides are indexed in [its documentation](https://github.com/KikoTs/BattleSpadesClient/blob/main/docs/README.md).
 
 - Run the unit/regression suite with `py -3.12 -m pytest tests -q`.
 - Run the capacity and retail-client validation gates described in
@@ -183,7 +183,14 @@ menu; an optional same-stem `.png` is its Workshop preview. It requires the
 operator's legally installed retail `ugc/maps` and `ugc/kv6` assets;
 BattleSpades does not redistribute those proprietary baseplates or models.
 
-No system Python or compiler is needed. Change the default admin password
+Server maps can also be downloaded without Steam: open **Host → Workshop maps…**
+in the server GUI, or run `python run_server.py --workshop-download 185279489`
+from source (`BattleSpades.exe --workshop-download 185279489` in a Windows bundle).
+Files install into `[world] maps_path` (`maps/` by default). See the
+[hosting guide](docs/ADMIN_GUIDE.md#desktop-host-battlespadesserver) for map files,
+public downloads, local imports and adding maps to the rotation.
+
+No system Python or compiler is needed for a release bundle. Change the default admin password
 `changeme` before exposing UDP port 27015. Verify the downloaded zip against
 the release's `SHA256SUMS.txt`.
 
@@ -241,7 +248,7 @@ BattleSpades/
 ├── maps/               # stock .vxl maps (shipped)
 ├── scripts/            # build + reverse-engineering / verification tooling
 ├── tests/              # pytest suite
-└── docs/               # six focused server/operator/reversal references
+└── docs/               # server, operator, hosting and protocol references
 ```
 
 **Design principles**
@@ -417,7 +424,7 @@ IDs, and the recovered template variables are documented in
 
 ## Documentation
 
-These six references describe the maintained server. Check configuration and
+These references describe the maintained server. Check configuration and
 implementation details against `config.toml`, source, and tests; dated session
 reports and obsolete deployment claims are not current documentation.
 
@@ -432,6 +439,12 @@ reports and obsolete deployment claims are not current documentation.
   safe cache format, map-matrix simulation, and water/stuck recovery.
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release,
   and container deployment.
+- [`docs/MASTER_SERVER.md`](docs/MASTER_SERVER.md): open-source master, local
+  deployment, hosting providers and relay operation.
+- [`docs/OFFLINE_AND_LAUNCH_OPTIONS.md`](docs/OFFLINE_AND_LAUNCH_OPTIONS.md):
+  master-free LAN hosting, offline profiles and custom-master launch options.
+- [`docs/DEMO_RECORDING.md`](docs/DEMO_RECORDING.md): unattended spectator
+  recording and client playback.
 
 ## Roadmap
 

@@ -283,6 +283,43 @@ def test_dedicated_runtime_is_locked_and_uses_retail_prefab_catalog(
     assert configured.game_rules.enabled("RULE_ENABLE_PREFABS") is True
 
 
+def test_offline_launcher_clears_cloud_owner_and_keeps_project_editable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server import launcher, ugc_launcher
+
+    layout = _fake_retail_assets(tmp_path)
+    paths = RuntimePaths.from_root(tmp_path / "server")
+    paths.root.mkdir()
+    paths.config.write_text(
+        '[revival]\nenabled=true\nrequire_identity=true\nbase_url="obsolete"\n'
+        '[steam_host]\nenabled=true\n', encoding="utf-8",
+    )
+    monkeypatch.setenv("AOS_UGC_OWNER_ID", "1234567")
+    monkeypatch.setenv("AOS_STEAM_HOST", "1")
+    observed = []
+
+    async def serve(config, _logging, **_kwargs):
+        observed.append(config)
+
+    monkeypatch.setattr(launcher, "_serve", serve)
+    result = ugc_launcher.run(
+        ["--offline", "--master-url", "http://127.0.0.1:9", "--control-stdin",
+         "--retail-root", str(layout.root), "--project", "OfflineEditor"],
+        paths=paths,
+    )
+
+    assert result == 0 and len(observed) == 1
+    configured = observed[0]
+    assert configured.ugc_runtime and configured.offline_mode
+    assert configured.default_map == "OfflineEditor"
+    assert Path(configured.ugc_sidecar_path).is_file()
+    assert configured.ugc_owner_legacy_id == ""
+    assert not configured.revival.enabled and not configured.revival.require_identity
+    assert configured.revival.base_url == "http://127.0.0.1:9"
+    assert not configured.steam_host.enabled and not configured.steam_p2p_enabled
+
+
 def test_selected_prefab_palette_survives_save_and_initial_info(tmp_path: Path) -> None:
     project = _complete_ctf_project()
     project.prefab_set = 0  # Lunar constructs on the existing Grassland baseplate.

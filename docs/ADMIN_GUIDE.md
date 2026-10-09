@@ -44,8 +44,9 @@ Only one window can be open per server folder.
 | Host: auto-admin | `[admin] auto_admin`: comma-separated `steam:<SteamID64>` or `aosplay:<account id>` entries that become admin on join (see [Room creator and auto-admin](#room-creator-and-auto-admin)) |
 | Host: Steam P2P (on by default) | launch option `--steam-p2p`. It is offered only where the server can start it: a Windows host with the bundled `relay/aos-retail-relay.exe` and `[revival] require_identity = false` |
 | Network: game port | `[server] port`. The window uses 32887, the port the stock browser connects to, when the file still has the sample 27015 the first time it opens |
-| Network: Steam server browser | `[steam] enabled` and `public = true` (also needs `steam_api.dll` and forwarded ports; see `[steam]`) |
-| Host: Import from Steam Workshop | copies subscribed Ace of Spades Workshop maps into `[world] maps_path` (see below) |
+| Network: Steam LAN discovery (on by default) | `[server] lan_discovery`; automatic A2S discovery on the local network without Steam runtime files or router forwarding |
+| Network: Public Steam server listing | `[steam] enabled` and `public = true` (also needs `steam_api.dll` and forwarded ports; see `[steam]`) |
+| Host: Workshop maps | downloads public Ace of Spades maps without Steam, or imports local copies into `[world] maps_path` (see below) |
 | Advanced | every key in `config.toml`, grouped by table, with that key's comments as help |
 
 Settings are checked by `server.config.load_config`, the loader the server
@@ -55,19 +56,79 @@ Everything applies at the next start, and the window offers a restart when the
 server is running. "Restore section defaults" uses a pristine copy of the
 shipped file (`_internal/server_gui/config.defaults.toml` in a release).
 
-"Import from Steam Workshop…" (`server_gui/workshop_import.py`) reads the
-Workshop's legacy items straight from disk, so Steam does not need to be
-running. It looks in `steamapps/workshop/content/224540/<id>/*_legacy.bin` in
-every Steam library listed in `steamapps/libraryfolders.vdf`, or in a folder
-you pick, which can also be a client's `ugc/maps` with `Subscribed_<id>.*`
-files. Each `.aos` container (`VXL\0`/`UGC\0` chunks) is bounds-checked. The
+**LAN play:** start the server, allow it through the host's firewall, and refresh
+the Steam / original game's LAN browser on another computer on the same network.
+A2S always answers on the game port. With `lan_discovery = true` (also the default
+for older configs), a game port outside UDP 27015–27020 gets an additional query
+listener on the first free port in that range. Replies advertise the actual game
+port. The startup log names the selected query port or warns if none is free.
+The Network firewall helper includes these LAN query ports; router forwarding
+does not. The original client still needs game port 32887 to join from its browser.
+Disable the extra listener with the LAN switch or `[server] lan_discovery = false`.
+
+**Where to install maps:** the server's `[world] maps_path` directory, which is
+`maps/` beside the server by default. Relative paths are anchored to the server
+folder, including when using `--config` from another working directory.
+Custom maps need their `.vxl` terrain and same-stem `.txt`/`.ugc` metadata;
+the metadata supplies spawns, objectives and supported modes.
+
+In the GUI, open **Host → Workshop maps… → Public Workshop**. Search by name,
+browse pages, or paste an Ace of Spades Workshop item link / ID, select maps,
+and press **Download selected**. No Steam installation, login, API key or game
+ownership is needed for these public legacy downloads. Network work runs in
+the background with Cancel; closing during work cancels remaining downloads
+and waits for the current operation to finish safely. Closing the dialog
+refreshes the map selector; choose a supported mode and save the start map or
+custom rotation. An active match is not changed by installing files.
+
+Use **Order** for Most popular, Top rated, Most subscribed, Newest or Recently
+updated; popular maps also have a time-period filter. **Game mode** filters
+the complete Steam catalog. Each page keeps all 30 Steam results. Click a map
+image or title for its screenshot gallery, description, size, dates and modes,
+then use **Download this map** or tick several maps for a batch download.
+Results appear before thumbnails, which fill in on background workers.
+Page metadata and galleries are cached for quick return visits, and stale
+image results are discarded when you change pages or maps.
+
+Console-only hosts use the same downloader and validation:
+
+```sh
+# Source (Windows may use py -3.12 in place of python)
+python run_server.py --workshop-download 185279489
+python run_server.py --config configs/my-server.toml --workshop-download 185279489 187262961
+
+# Portable release (Windows: .\BattleSpades.exe)
+./BattleSpades --workshop-download "https://steamcommunity.com/sharedfiles/filedetails/?id=185279489"
+```
+
+The command prints the installed map basename, exits without starting a server,
+and leaves configuration unchanged. Set `[game] default_map` or add that basename
+to `[lobby] map_rotation`. Repeating a download updates the same imported map.
+Restart a running server to apply changed startup settings.
+
+The downloader (`server_gui/workshop_public.py`) reads public browse-page links
+and resolves downloads through Valve's `ISteamRemoteStorage/GetPublishedFileDetails/v1`
+API. If browse-page markup changes, direct item links still work. Only public,
+downloadable app 224540 maps are accepted, from supported HTTPS Steam CDN hosts
+without redirects. Private items and items without a public file URL cannot be
+downloaded this way. Files are limited to 64 MiB and checked against the API size.
+
+**On this computer** keeps the existing offline import workflow. It looks in
+`steamapps/workshop/content/224540/<id>/*_legacy.bin` in every Steam library
+listed in `steamapps/libraryfolders.vdf`, or a folder selected with **Pick folder…**.
+This also accepts the client's `ugc/maps` with `Subscribed_<id>.*` or the new
+public-download `Subscribed_Web_steam_<id>.*` and `Subscribed_Web_aosplay_<uuid>.*`
+files. Steam need not be running.
+
+Each `.aos` container (`VXL\0`/`UGC\0` chunks) is bounds-checked. The
 VXL must load in the server's own parser as a full 512x512 map, and the sidecar
-must load in `server.map_metadata`. The map is then written atomically as
+must load in `server.map_metadata` in a staging directory. The map is then installed as
 `<Title>.vxl`, `.txt` and `.ugc`, the layout Map Creator projects use. Names
 are ASCII; Cyrillic is transliterated, and a title with nothing usable becomes
-`Workshop_<id>`. An existing map is never overwritten: a clash gets a `_2`
+`Workshop_<id>`. Unrelated existing maps are preserved: a clash gets a `_2`
 suffix. Re-importing the same item updates it in place, tracked in
-`maps/.workshop_imports.json`. The sidecar's `tags` decide which modes list
+`<maps_path>/.workshop_imports.json`. Failed file or receipt writes restore the
+previous revision. The sidecar's `tags` decide which modes list
 the map in the window. The server's retail-playlist vote only offers stock
 maps, so use an imported map as the start map or put it in a custom rotation.
 

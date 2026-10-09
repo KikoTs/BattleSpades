@@ -24,7 +24,7 @@ def _read_source_bytes(source, size_or_detail: int) -> bytes:
 
     if isinstance(source, bytes):
         data = source
-    elif isinstance(source, bytearray):
+    elif isinstance(source, (bytearray, memoryview)):
         data = bytes(source)
     else:
         return b""
@@ -41,17 +41,7 @@ def _raw_vxl_size(data: bytes) -> tuple[int, int]:
     max_ref = 0
 
     while pos < limit:
-        if pos + 4 > limit:
-            return (0, 0)
-
-        span_words = data[pos]
-        v1 = data[pos + 1]
-        v2 = data[pos + 2]
-        v3 = data[pos + 3]
-        max_ref = max(max_ref, v1, v2, v3)
-
-        while span_words:
-            pos += 4 * span_words
+        while True:
             if pos + 4 > limit:
                 return (0, 0)
             span_words = data[pos]
@@ -59,12 +49,24 @@ def _raw_vxl_size(data: bytes) -> tuple[int, int]:
             v2 = data[pos + 2]
             v3 = data[pos + 3]
             max_ref = max(max_ref, v1, v2, v3)
-
-        if v2 >= v1:
-            pos += 8 + 4 * (v2 - v1)
-        else:
-            pos += 4
+            if v1 > MAP_HEIGHT or v2 >= MAP_HEIGHT or v3 > MAP_HEIGHT or v1 > v2 + 1:
+                return (0, 0)
+            top_len = max(0, v2 - v1 + 1)
+            if not span_words:
+                pos += 4 + top_len * 4
+                break
+            bottom_len = span_words - top_len - 1
+            next_header = pos + span_words * 4
+            if bottom_len < 0 or next_header + 4 > limit:
+                return (0, 0)
+            next_top = data[next_header + 1]
+            next_air = data[next_header + 3]
+            if next_air - bottom_len < v2 + 1 or next_top < next_air or next_top <= v1:
+                return (0, 0)
+            pos = next_header
         columns += 1
+        if columns > MAP_SIZE * MAP_SIZE:
+            return (0, 0)
 
     if pos != limit:
         return (0, 0)
@@ -197,17 +199,30 @@ def _find_first_surface_column(data: bytes) -> tuple[int, int, int] | None:
 
 
 class ServerVXL(VXL):
-    def __init__(self, state, source, size_or_detail, detail_level=2):
+    def __init__(self, state, source, size_or_detail, detail_level=2,
+                 source_format="auto"):
         raw_data = _read_source_bytes(source, size_or_detail)
         # C walks (GIL released): a map load runs on the transition worker
         # thread while the live match keeps ticking on the main thread.
         columns, max_ref = raw_vxl_size(raw_data) if raw_data else (0, EMPTY_TOP_END)
         edge = math.isqrt(columns) if columns > 0 else 0
-        self.source_z_shift = (
-            max(0, EMPTY_TOP_END - max_ref)
-            if edge * edge == columns and edge <= MAP_SIZE else 0
+        # Read once, then load exactly the bytes whose metadata we inspected.
+        # The native loader validates before allocating its colour table.
+        native_detail = (
+            size_or_detail
+            if isinstance(source, str) and os.path.exists(source)
+            and detail_level == 2 and 0 <= size_or_detail <= 32 else detail_level
         )
-        super().__init__(state, source, size_or_detail, detail_level)
+        super().__init__(state, raw_data, len(raw_data), native_detail,
+                         source_format=source_format)
+        if raw_data and not self.ready:
+            raise ValueError("Invalid VXL column stream")
+        if self.source_format == "classic64":
+            self.source_z_shift = 176
+        elif edge * edge == columns and 0 < edge <= MAP_SIZE:
+            self.source_z_shift = max(0, EMPTY_TOP_END - max_ref)
+        else:
+            self.source_z_shift = 0
         self.retail_marker_positions = ()
         self.retail_marker_families = ()
         # Battle Builder maps can embed blue/green chroma-key voxels as ordinary
@@ -218,7 +233,7 @@ class ServerVXL(VXL):
         # paired native operation: a type-13 entity restores the resolved RGB
         # voxel/light on the client, and authoritative collision restores the
         # same voxel. A marker with no valid UGC palette remains air on both.
-        if raw_data:
+        if raw_data and self.source_format != "classic64":
             # find_marker_voxels == filtering _iter_explicit_voxels by
             # _is_retail_marker_color, in C.
             markers = tuple(

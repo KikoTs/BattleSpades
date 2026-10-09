@@ -327,7 +327,7 @@ class WorldManager:
         """Load a VXL map file."""
         # Try with and without extension
         map_path = os.path.join(self.maps_path, name)
-        if not map_path.endswith('.vxl'):
+        if not map_path.lower().endswith('.vxl'):
             map_path += '.vxl'
         
         if not os.path.exists(map_path):
@@ -338,10 +338,19 @@ class WorldManager:
             return True
         
         try:
-            self.map = VXL(1, map_path, 3)
-            self.map_name = name.replace('.vxl', '')
             with open(map_path, 'rb') as handle:
                 raw = handle.read()
+            if not raw:
+                raise ValueError("Empty VXL map file")
+            metadata = load_map_metadata(
+                map_path, str(getattr(self.config, "game_mode", "nor"))
+            )
+            # Validate the new map completely before replacing the live one.
+            loaded_map = VXL(1, raw, len(raw), 3, source_format=metadata.vxl_format)
+            if not loaded_map.ready:
+                raise ValueError("Invalid VXL column stream")
+            self.map = loaded_map
+            self.map_name = name[:-4] if name.lower().endswith('.vxl') else name
             self.map_raw_bytes = raw
             self._full_sync_chunks = None
             self._prepared_sync_key = None
@@ -358,9 +367,7 @@ class WorldManager:
             self._surface_cache.clear()
             self._spawn_candidates = {TEAM1: [], TEAM2: []}
             self._team_base_anchors.clear()
-            self.map_metadata = load_map_metadata(
-                map_path, str(getattr(self.config, "game_mode", "nor"))
-            )
+            self.map_metadata = metadata
             self._refresh_world()
             # Candidate discovery performs thousands of terrain probes on
             # voxel-only maps. Do it while the map is loading (startup or the
@@ -1965,6 +1972,13 @@ class WorldManager:
         turn, then can wrap/compress this snapshot without touching the VXL.
         """
         columns = frozenset(snapshot_columns or ())
+        # MapSync describes the finalized collision world. Raw spans are
+        # byte-faithful for ordinary columns, but authored chroma markers
+        # were removed (or restored with a palette colour) during load.
+        # Send these columns for a full sync and a CRC-matched local raw base.
+        columns = columns.union(
+            (x, y) for x, y, _z in getattr(self.map, "retail_marker_positions", ())
+        )
         revision = self.topology_version
         cache_key = (id(self.map_raw_bytes), revision, bool(full), columns)
         cached = (

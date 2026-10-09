@@ -22,6 +22,7 @@ import toml
 
 from server.release_check import CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, apply_runtime_paths, read_version
+from server.network_options import add_network_arguments, apply_network_config
 
 
 SOURCE_ENTRYPOINT = Path(__file__).resolve().parents[1] / "run_server.py"
@@ -59,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
             "manifest; never replaces files of this installation"
         ),
     )
+    action.add_argument(
+        "--workshop-download", nargs="+", metavar="ID_OR_URL",
+        help="download public Ace of Spades maps into world.maps_path without Steam, then exit",
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -92,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--steam-p2p-bridge', type=Path, help='path to the portable aos-retail-relay.exe helper')
     parser.add_argument('--steam-p2p-port', type=int, choices=range(1000), default=168, metavar='0..999', help='Steam virtual port (default 168; unique per hosting account)')
     parser.add_argument('--steam-p2p-private', action='store_true', help='validation only: keep the advertisement out of the public retail browser')
+    add_network_arguments(parser)
     return parser
 
 
@@ -141,6 +147,8 @@ def _apply_network_options(config: object, arguments) -> object:
     config.steam_p2p_bridge = str(arguments.steam_p2p_bridge.resolve()) if arguments.steam_p2p_bridge else None
     config.steam_p2p_port = arguments.steam_p2p_port
     config.steam_p2p_private = arguments.steam_p2p_private
+    if arguments.offline or arguments.master_url is not None:
+        apply_network_config(config, offline=arguments.offline, master_url=arguments.master_url)
     return config
 
 
@@ -595,6 +603,34 @@ def _run_update_command(paths: RuntimePaths) -> int:
     )
 
 
+def _run_workshop_download(paths: RuntimePaths, values: Sequence[str]) -> int:
+    """Install public maps without starting a server or changing its rotation."""
+    from server.config import load_config
+    from server_gui import workshop_public
+    from server_gui.workshop_import import WorkshopError
+
+    try:
+        config = load_config(paths.config)
+        maps_dir = paths.resolve_configured_path(config.maps_path)
+    except (OSError, ValueError) as exc:
+        print(f"Workshop failed: {exc}", file=sys.stderr)
+        return 1
+    failed = False
+    for value in values:
+        try:
+            item = workshop_public.get_item(value)
+            result = workshop_public.download_item(item, maps_dir)
+            if not result.ok:
+                raise WorkshopError(result.message)
+            print(f"Installed {item.display_title} as {result.stem} in {maps_dir}")
+            print(f'  Start map: [game] default_map = "{result.stem}"; '
+                  f'custom rotation: [lobby] map_rotation = ["{result.stem}"]')
+        except (OSError, WorkshopError) as exc:
+            failed = True
+            print(f"Workshop {value}: {exc}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def _run_server(
     paths: RuntimePaths,
     *,
@@ -602,6 +638,8 @@ def _run_server(
     banner: str = "BattleSpades Server - Protocol 1.0 Battle Builders",
     control_stdin: bool = False,
     status_file: Path | None = None,
+    offline: bool = False,
+    master_url: str | None = None,
 ) -> int:
     """Configure process resources, run one server variant, and close sinks.
 
@@ -616,11 +654,17 @@ def _run_server(
     from server.logging_runtime import configure_logging
 
     _configure_console_encoding()
-    config = apply_runtime_paths(load_config(paths.config), paths)
+    loaded = (
+        load_config(paths.config, offline=offline, master_url=master_url)
+        if offline or master_url is not None else load_config(paths.config)
+    )
+    config = apply_runtime_paths(loaded, paths)
     if config_transform is not None:
         transformed = config_transform(config)
         if transformed is not None:
             config = transformed
+    if offline:
+        apply_network_config(config, offline=True, master_url=master_url)
     paths.logs.mkdir(parents=True, exist_ok=True)
     logging_runtime = configure_logging(config, paths.logs)
     logger = logging.getLogger("BattleSpades")
@@ -691,6 +735,9 @@ def run(
         return int(exc.code or 0)
 
     runtime_paths = paths or RuntimePaths.discover(source_entry=SOURCE_ENTRYPOINT)
+    if arguments.offline and (arguments.update or arguments.workshop_download is not None or arguments.steam_p2p):
+        print("Server startup failed: --offline cannot be combined with downloads or --steam-p2p", file=sys.stderr)
+        return 2
     if arguments.version:
         print(f"BattleSpades {read_version(runtime_paths.root)}")
         return 0
@@ -703,10 +750,12 @@ def run(
             or arguments.steam_p2p
             or arguments.steam_p2p_bridge is not None
             or arguments.steam_p2p_private
+            or arguments.offline
+            or arguments.master_url is not None
         ):
             print(
                 "Server startup failed: --fleet cannot be combined with "
-                "--config, --port, --control-stdin, or Steam relay hosting options",
+                "--config, --port, --control-stdin, --offline, --master-url, or Steam relay hosting options",
                 file=sys.stderr,
             )
             return 2
@@ -728,12 +777,20 @@ def run(
         print(f"Server startup failed: {exc}", file=sys.stderr)
         return 1
     if arguments.check:
+        if arguments.offline or arguments.master_url is not None:
+            return _emit_check_report(run_release_check(
+                runtime_paths, offline=arguments.offline, master_url=arguments.master_url,
+            ))
         return _emit_check_report(run_release_check(runtime_paths))
     if arguments.update:
         return _run_update_command(runtime_paths)
+    if arguments.workshop_download is not None:
+        return _run_workshop_download(runtime_paths, arguments.workshop_download)
     return _run_server(
         runtime_paths,
         config_transform=lambda config: _apply_network_options(config, arguments),
+        offline=arguments.offline,
+        master_url=arguments.master_url,
         control_stdin=arguments.control_stdin,
         status_file=(
             arguments.status_file.resolve()

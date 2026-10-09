@@ -288,6 +288,9 @@ cdef bint _scan_vxl_size(
     cdef int v1
     cdef int v2
     cdef int v3
+    cdef int top_len
+    cdef int bottom_len
+    cdef Py_ssize_t next_header
 
     columns_out[0] = 0
     max_ref_out[0] = 0
@@ -308,8 +311,21 @@ cdef bint _scan_vxl_size(
             max_ref = v3
 
         while span_words:
+            top_len = v2 - v1 + 1 if v2 >= v1 else 0
+            bottom_len = span_words - top_len - 1
+            next_header = pos + 4 * span_words
+            if (v1 > MAP_HEIGHT or v2 >= MAP_HEIGHT or v3 > MAP_HEIGHT
+                    or v1 > v2 + 1 or bottom_len < 0 or next_header + 4 > limit):
+                return False
+            # The following header anchors this span's bottom colour run.
+            # Validate before reserving the colour table or reading colours.
+            if data[next_header + 3] - bottom_len < v2 + 1:
+                return False
+            if (data[next_header + 1] < data[next_header + 3]
+                    or data[next_header + 1] <= v1):
+                return False
             colour_words += span_words - 1
-            pos += 4 * span_words
+            pos = next_header
             if pos + 4 > limit:
                 return False
             span_words = data[pos]
@@ -323,18 +339,39 @@ cdef bint _scan_vxl_size(
             if v3 > max_ref:
                 max_ref = v3
 
+        if v1 > MAP_HEIGHT or v2 >= MAP_HEIGHT or v3 > MAP_HEIGHT or v1 > v2 + 1:
+            return False
         if v2 >= v1:
             colour_words += v2 - v1 + 1
             pos += 8 + 4 * (v2 - v1)
         else:
             pos += 4
         columns += 1
+        if columns > MAP_AREA:
+            return False
 
     if pos != limit:
         return False
     columns_out[0] = columns
     max_ref_out[0] = max_ref
     colour_words_out[0] = colour_words
+    return True
+
+
+cdef bint _has_classic_height(const unsigned char* data, Py_ssize_t limit) noexcept nogil:
+    """Distinguish a 64 sentinel from an explicitly coloured retail z=64.
+
+    The caller has already validated all span offsets and maximum z <= 64.
+    """
+    cdef Py_ssize_t pos = 0
+    cdef int words
+    cdef int top_len
+    while pos < limit:
+        if data[pos + 2] >= 64:
+            return False
+        words = data[pos]
+        top_len = data[pos + 2] - data[pos + 1] + 1
+        pos += words * 4 if words else 4 + max(0, top_len) * 4
     return True
 
 
@@ -355,7 +392,7 @@ cdef tuple _get_vxl_size(bytes data):
 cpdef tuple raw_vxl_size(object data):
     """``(columns, max_z_reference)`` of a raw VXL, ``(0, 0)`` if malformed.
 
-    Same walk as ``server.runtime_vxl._raw_vxl_size`` without the GIL."""
+    Runs without the GIL and validates span bounds before allocating colours."""
     return _get_vxl_size(_coerce_raw_bytes(data))
 
 
@@ -784,6 +821,7 @@ cdef class VXL:
     cdef int _source_max_z
     cdef int _source_offset
     cdef int _z_shift
+    cdef readonly object source_format
     cdef bint _dirty
     cdef bint _overview_dirty
     cdef bytes _raw_data
@@ -822,6 +860,7 @@ cdef class VXL:
         self._source_max_z = EMPTY_TOP_END
         self._source_offset = 0
         self._z_shift = 0
+        self.source_format = "retail"
         self._dirty = False
         self._overview_dirty = True
         self._raw_data = _BLANK_VXL
@@ -839,11 +878,14 @@ cdef class VXL:
         free(self._bottom_z)
         self._bottom_z = NULL
 
-    def __init__(self, object state, object source, int size_or_detail, int detail_level=2):
+    def __init__(self, object state, object source, int size_or_detail, int detail_level=2,
+                 source_format="retail"):
         cdef object data = b""
         cdef bint loaded = False
 
         self._reset_blank()
+        if source_format not in ("auto", "retail", "classic64"):
+            raise ValueError("VXL source_format must be auto, retail or classic64")
 
         if isinstance(source, str) and _os.path.exists(source):
             if detail_level == 2 and 0 <= size_or_detail <= 32:
@@ -859,7 +901,7 @@ cdef class VXL:
                 data = data[:size_or_detail]
 
         if data:
-            loaded = self._load_source(data)
+            loaded = self._load_source(data, source_format)
             if loaded:
                 self._raw_data = data
                 self._dirty = False
@@ -880,6 +922,7 @@ cdef class VXL:
         self._source_max_z = EMPTY_TOP_END
         self._source_offset = 0
         self._z_shift = 0
+        self.source_format = "retail"
         self._raw_data = _BLANK_VXL
         self.estimated_size = 0
         self.ready = True
@@ -1022,7 +1065,7 @@ cdef class VXL:
                     # _store_block with colour 0 == _store_fill (no entry).
                     self._store_fill(x, y, z)
 
-    cdef bint _load_source(self, bytes data):
+    cdef bint _load_source(self, bytes data, object source_format):
         cdef const unsigned char* buf = data
         cdef Py_ssize_t limit = len(data)
         cdef Py_ssize_t columns = 0
@@ -1031,6 +1074,7 @@ cdef class VXL:
         cdef int edge
         cdef int offset
         cdef int z_shift
+        cdef int source_height
         cdef bint ok
         cdef _ColorTable colors
 
@@ -1043,6 +1087,12 @@ cdef class VXL:
 
         edge = int(sqrt(columns))
         if edge * edge != columns or edge > MAP_SIZE or max_z >= 241:
+            return False
+        if source_format == "auto":
+            with nogil:
+                ok = edge == MAP_SIZE and max_z <= 64 and _has_classic_height(buf, limit)
+            source_format = "classic64" if ok else "retail"
+        if source_format == "classic64" and (edge != MAP_SIZE or max_z > 64):
             return False
 
         colors = _ColorTable()
@@ -1058,7 +1108,11 @@ cdef class VXL:
         # Retail Battle Builder normalizes legacy/short VXL maps into its
         # 240-high world. The deepest referenced source z becomes the fixed
         # z=239 bed, placing dry terrain beside the z=238 waterplane.
-        z_shift = max(0, EMPTY_TOP_END - max_z)
+        # Classic's coordinate system is always 64 high, including a map
+        # with no explicit floor colour or an empty (64, 63) water column.
+        z_shift = 176 if source_format == "classic64" else max(0, EMPTY_TOP_END - max_z)
+        source_height = 64 if source_format == "classic64" else MAP_HEIGHT
+        self.source_format = source_format
 
         self._source_size = edge
         self._source_max_z = max_z
@@ -1066,7 +1120,8 @@ cdef class VXL:
         self._z_shift = z_shift
 
         with nogil:
-            ok = self._parse_columns(buf, limit, edge, offset, z_shift, colors)
+            ok = self._parse_columns(buf, limit, edge, offset, z_shift, colors,
+                                     source_height)
         return ok
 
     cdef inline void _load_explicit(
@@ -1087,6 +1142,7 @@ cdef class VXL:
         int offset,
         int z_shift,
         _ColorTable colors,
+        int source_height,
     ) noexcept nogil:
         cdef Py_ssize_t pos = 0
         cdef int src_x
@@ -1119,6 +1175,11 @@ cdef class VXL:
                     span_words = data[pos]
                     top_start = data[pos + 1]
                     top_end = data[pos + 2]
+                    if (top_start > source_height or top_end >= source_height
+                            or data[pos + 3] > source_height):
+                        return False
+                    if source_height == 64 and top_start > top_end + 1:
+                        return False
                     pos += 4
 
                     if top_end >= top_start:
@@ -1164,7 +1225,7 @@ cdef class VXL:
                         # terrain. Measured 2026-07-09: fill was color 0 at z>=176.
                         if has_surface:
                             self._column_fill[_column_index(x, y)] = surface_color
-                            for z in range(top_end + 1, MAP_HEIGHT):
+                            for z in range(top_end + 1, MAP_HEIGHT - z_shift):
                                 self._store_fill(x, y, z + z_shift)
                         break
 
@@ -1175,6 +1236,8 @@ cdef class VXL:
                         return False
 
                     next_air_start = data[pos + (bottom_len * 4) + 3]
+                    if source_height == 64 and next_air_start > data[pos + (bottom_len * 4) + 1]:
+                        return False
                     bottom_start = next_air_start - bottom_len
                     if bottom_start < top_end + 1:
                         return False

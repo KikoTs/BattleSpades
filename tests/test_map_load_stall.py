@@ -123,8 +123,14 @@ def test_responsiveness_probe_detects_gil_held_work(monkeypatch):
     assert statistics.median(gap for gap, _ in samples) >= 0.030
 
 
-@pytest.mark.parametrize("name", ["MayanJungle", "Classic"])
-def test_background_map_load_keeps_main_thread_responsive(name):
+@pytest.mark.parametrize("name", ["MayanJungle", "Classic", "ClassicImport"])
+def test_background_map_load_keeps_main_thread_responsive(name, tmp_path, monkeypatch):
+    if name == "ClassicImport":
+        # A full 64-high source with no explicit floor exercises automatic
+        # detection, fixed height conversion and native GIL-free filling.
+        raw = (bytes((0, 20, 20, 0)) + bytes((0, 255, 0, 128))) * (512 * 512)
+        (tmp_path / "ClassicImport.vxl").write_bytes(raw)
+        monkeypatch.setattr(sys.modules[__name__], "MAPS", tmp_path)
     if not (MAPS / f"{name}.vxl").is_file():
         pytest.skip("retail map not present")
     winmm = None

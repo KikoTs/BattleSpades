@@ -9,7 +9,36 @@ The Windows BattleSpades registration bridge was tested successfully on
 2026-09-20. A separate, confirmed bug was fixed: its browser tag used the
 gameplay mode ID where the retail client expects a **server category**.
 
-## How discovery works
+## LAN discovery
+
+Local discovery is enabled by default through `[server] lan_discovery = true`,
+including configurations written before that key existed. The GUI exposes it
+under **Network → Steam LAN discovery (A2S)**. It is independent of public
+registration and does not need proprietary Steam runtime files on the server.
+
+The game socket already answers A2S through the ENet intercept. When the game
+port is outside Steam's LAN scan range, the server also binds the first free
+UDP port in 27015–27020, avoiding ports reserved for the Steam helper. The
+reply's EDF game-port field points to the real game socket (32887 by default
+in the GUI). The extra socket accepts A2S only: HELLOLAN replies remain on the
+game socket so clients cannot mistake a query port for a join endpoint.
+If every candidate is occupied, startup logs a warning and direct play stays
+available. Shutdown closes the extra socket.
+
+The local firewall must allow the server's game and LAN query ports. The GUI
+firewall helper includes them, while UPnP/router forwarding remains limited
+to the ports used for internet play. The original game's browser still joins
+port 32887, regardless of the advertised game port.
+
+Verified on Windows on 2026-10-08 with the real Steamworks
+`RequestLANServerList(224540)` API: it discovered a BattleSpades A2S listener
+on query port 27015 and reported the correct game port 32887. The capture
+included the full INFO query, challenge and INFO response. The server-side
+probe used no Steam registration helper. Automated tests cover live UDP
+responses, an occupied query port, the existing game-port intercept, opt-out,
+reserved Steam ports, shutdown cleanup and GUI persistence.
+
+## Internet discovery
 
 ```mermaid
 sequenceDiagram

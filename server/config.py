@@ -443,6 +443,9 @@ class ServerConfig:
     # explicit opt-in (docs/ADMIN_GUIDE.md), not the fallback.
     name: str = "BattleSpades Server"
     port: int = 27015
+    # Add a query listener on Steam's LAN scan ports when the game uses
+    # another port. Does not require Steam registration or a Valve runtime.
+    lan_discovery: bool = True
     max_players: int = 24
     tick_rate: int = 60
     # Stable uint64 identity used by InitialInfo for non-Steam dedicated hosts.
@@ -955,12 +958,17 @@ def resolve_mode_code(value) -> str:
     return code
 
 
-def load_config(path: Optional[Path] = None) -> ServerConfig:
+def load_config(
+    path: Optional[Path] = None, *, offline: bool = False, master_url: Optional[str] = None,
+) -> ServerConfig:
     """
     Load configuration from a TOML file.
     Falls back to defaults if file doesn't exist.
     """
     config = ServerConfig()
+    from server.network_options import apply_network_config, apply_network_document
+
+    apply_network_config(config, offline=offline, master_url=master_url)
 
     if path is None:
         path = Path("config.toml")
@@ -983,6 +991,8 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
         print(f"Warning: Failed to load config from {path}: {e}")
         return config
 
+    apply_network_document(data, offline=offline, master_url=master_url)
+
     if "server" in data:
         s = data["server"]
         config.name = s.get("name", config.name)
@@ -996,6 +1006,9 @@ def load_config(path: Optional[Path] = None) -> ServerConfig:
                 str(config.name)[:MAX_SERVER_NAME_SIZE],
             )
         config.port = s.get("port", config.port)
+        config.lan_discovery = s.get("lan_discovery", config.lan_discovery)
+        if not isinstance(config.lan_discovery, bool):
+            raise ValueError("server.lan_discovery must be a boolean")
         config.max_players = min(255, max(1, int(
             s.get("max_players", config.max_players)
         )))

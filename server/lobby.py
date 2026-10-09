@@ -50,7 +50,7 @@ LOBBY_MODES: dict[str, LobbyModeDefinition] = {
         (16, 20, 24),
     ),
     "cctf": LobbyModeDefinition(
-        "cctf", "Classic CTF", 5400.0,
+        "cctf", "Classic+", 5400.0,
         ("Crossroads", "Hiesville", "ToTheBridge", "Trenches", "WinterValley", "WW1", "Classic"),
         (32,), classic=True,
     ),

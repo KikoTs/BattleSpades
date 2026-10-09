@@ -26,6 +26,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
 from typing import Iterable
 
 APP_ID = "224540"
@@ -36,7 +37,9 @@ MAX_STEM = 40
 INDEX_NAME = ".workshop_imports.json"
 _TAGS = {b"VXL\0": "vxl", b"UGC\0": "ugc"}
 _RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
-_SUBSCRIBED = re.compile(r"^Subscribed_([1-9][0-9]{0,19})$")
+_SUBSCRIBED = re.compile(r"^Subscribed_(?:Web_steam_)?([1-9][0-9]{0,19})$")
+_ARCHIVE_SUBSCRIBED = re.compile(r"^Subscribed_Web_aosplay_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$")
+_ARCHIVE_KEY = re.compile(r"^aosplay_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 #: Mode tags the server understands for hosting (the stock Match Lobby modes).
 HOSTABLE_MODES = ("tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc")
 
@@ -72,6 +75,19 @@ class WorkshopItem:
     size: int = 0
     error: str = ""
     imported_as: str = ""
+    download_url: str = ""       # public items are fetched before local import
+    preview_url: str = ""
+    preview_path: Path | None = None
+    description: str = ""
+    created: int = 0
+    updated: int = 0
+    subscribers: int = 0
+    favorites: int = 0
+    views: int = 0
+    preview_urls: list[str] = field(default_factory=list)
+    preview_paths: list[Path | None] = field(default_factory=list)
+    gallery_loaded: bool = False
+    gallery_error: str = ""
 
     @property
     def ok(self) -> bool:
@@ -197,7 +213,9 @@ def load_index(maps_dir: Path) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(k): str(v) for k, v in data.items() if str(k).isdigit() and re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", str(v))}
+    return {str(k): str(v) for k, v in data.items()
+            if (str(k).isdigit() or _ARCHIVE_KEY.fullmatch(str(k)))
+            and re.fullmatch(r"[A-Za-z0-9_\-]{1,64}", str(v))}
 
 
 def _save_index(maps_dir: Path, index: dict[str, str]) -> None:
@@ -319,9 +337,12 @@ def scan_folder(folder: Path) -> list[WorkshopItem]:
                 items.append(WorkshopItem(entry.name, container))
         elif entry.is_file() and entry.suffix.lower() == ".vxl":
             match = _SUBSCRIBED.match(entry.stem)
+            archive_match = _ARCHIVE_SUBSCRIBED.match(entry.stem)
             sidecar = entry.with_suffix(".ugc")
             if match and sidecar.is_file():
                 items.append(WorkshopItem(match.group(1), entry, sidecar))
+            elif archive_match and sidecar.is_file():
+                items.append(WorkshopItem("aosplay_" + archive_match.group(1), entry, sidecar))
     if not items and folder.name.isdigit():
         container = _container_in(folder)
         if container is not None:
@@ -359,8 +380,12 @@ def describe(item: WorkshopItem, maps_dir: Path | None = None, index: dict[str, 
         sidecar = parse_sidecar(container.ugc)
         item.title = _text(sidecar.get("title")) or _text(sidecar.get("description"))
         item.author = _text(sidecar.get("author"), 64)
+        item.description = str(sidecar.get("description") or "")[:8192]
         item.modes = sidecar_modes(sidecar)
         item.size = len(container.vxl) + len(container.ugc)
+        preview = item.source.with_suffix(".png")
+        if preview.is_file() and not preview.is_symlink():
+            item.preview_path = preview
         item.error = ""
     except WorkshopError as exc:
         item.error = str(exc)
@@ -412,7 +437,7 @@ class ImportResult:
     message: str = ""
 
 
-def import_item(item: WorkshopItem, maps_dir: Path) -> ImportResult:
+def import_item(item: WorkshopItem, maps_dir: Path, *, cancel: Event | None = None) -> ImportResult:
     """Validate and install one item as ``<stem>.vxl/.txt/.ugc``."""
 
     maps_dir = Path(maps_dir)
@@ -424,18 +449,46 @@ def import_item(item: WorkshopItem, maps_dir: Path) -> ImportResult:
         return ImportResult(item, False, message=str(exc))
     title = _text(sidecar.get("title")) or _text(sidecar.get("description"))
     modes = sidecar_modes(sidecar)
-    maps_dir.mkdir(parents=True, exist_ok=True)
-    index = load_index(maps_dir)
-    stem = choose_stem(maps_dir, title, item.published_id, index)
-    targets = [maps_dir / f"{stem}{suffix}" for suffix in (".vxl", ".txt", ".ugc")]
-    existed = {path: path.read_bytes() if path.is_file() else None for path in targets}
     try:
-        # .ugc last, like the client, so a scanner never sees half a map.
+        maps_dir.mkdir(parents=True, exist_ok=True)
+        index = load_index(maps_dir)
+        stem = choose_stem(maps_dir, title, item.published_id, index)
+        targets = [maps_dir / f"{stem}{suffix}" for suffix in (".vxl", ".txt", ".ugc")]
+        preview = None
+        if item.preview_path:
+            from server_gui.workshop_previews import read_preview
+            preview = read_preview(item.preview_path)
+        if preview:
+            targets.append(maps_dir / f"{stem}.png")
+        # Validate in an isolated directory before replacing an installed revision.
+        with tempfile.TemporaryDirectory(prefix=".workshop-", dir=maps_dir) as temporary:
+            stage = Path(temporary) / f"{stem}.vxl"
+            stage.write_bytes(container.vxl)
+            stage.with_suffix(".txt").write_bytes(container.ugc)
+            stage.with_suffix(".ugc").write_bytes(container.ugc)
+            _check_metadata(stage, modes)
+        if cancel is not None and cancel.is_set():
+            raise WorkshopError("Workshop operation cancelled.")
+        receipt = maps_dir / INDEX_NAME
+        for target in [*targets, receipt]:
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise WorkshopError(f"Workshop destination is not a regular file: {target.name}")
+            if target.exists() and target.stat().st_size > MAX_ITEM_BYTES:
+                raise WorkshopError(f"Existing map file is too large: {target.name}")
+        existed = {path: path.read_bytes() if path.is_file() else None for path in [*targets, receipt]}
+    except (OSError, WorkshopError) as exc:
+        return ImportResult(item, False, message=str(exc))
+    try:
+        # Hide the old scanner marker during an update and publish it last.
+        targets[2].unlink(missing_ok=True)
         _atomic_write(targets[0], container.vxl)
         _atomic_write(targets[1], container.ugc)
+        if preview:
+            _atomic_write(targets[3], preview)
         _atomic_write(targets[2], container.ugc)
-        _check_metadata(targets[0], modes)
-    except (OSError, WorkshopError) as exc:
+        index[item.published_id] = stem
+        _save_index(maps_dir, index)
+    except OSError as exc:
         for path, previous in existed.items():
             try:
                 if previous is None:
@@ -445,11 +498,6 @@ def import_item(item: WorkshopItem, maps_dir: Path) -> ImportResult:
             except OSError:
                 pass
         return ImportResult(item, False, message=str(exc))
-    index[item.published_id] = stem
-    try:
-        _save_index(maps_dir, index)
-    except OSError:
-        pass
     item.title, item.modes, item.imported_as = title, modes, stem
     return ImportResult(item, True, stem, f"Imported as {stem}")
 

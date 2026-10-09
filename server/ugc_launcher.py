@@ -25,6 +25,7 @@ from server.launcher import (
 )
 from server.release_check import CheckItem, CheckReport, run_release_check
 from server.runtime_paths import RuntimePaths, read_version
+from server.network_options import add_network_arguments
 from server.ugc_project import (
     TERRAINS,
     TARGET_MODES,
@@ -49,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="BattleSpadesMapCreator",
         description="Retail-compatible Ace of Spades hosted UGC Map Creator",
     )
+    add_network_arguments(parser)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--version", action="store_true", help="print version and exit")
     action.add_argument(
@@ -418,7 +420,7 @@ def configure_ugc_runtime(
     config.steam.enabled = False
     config.steam.public = False
     config.steam.require_registration = False
-    owner_id = os.environ.get("AOS_UGC_OWNER_ID", "")
+    owner_id = "" if getattr(config, "offline_mode", False) else os.environ.get("AOS_UGC_OWNER_ID", "")
     config.ugc_owner_legacy_id = owner_id if owner_id.isascii() and owner_id.isdigit() else ""
     config.revival.enabled = bool(config.revival.enabled and config.ugc_owner_legacy_id)
     config.revival.require_identity = config.revival.enabled
@@ -439,10 +441,15 @@ def configure_ugc_runtime(
     return config
 
 
-def _ugc_check(paths: RuntimePaths, retail_root: str | Path | None) -> CheckReport:
+def _ugc_check(
+    paths: RuntimePaths, retail_root: str | Path | None, *, offline: bool = False, master_url: str | None = None,
+) -> CheckReport:
     """Append genuine retail editor-asset evidence to the release check."""
 
-    report = run_release_check(paths)
+    report = (
+        run_release_check(paths, offline=offline, master_url=master_url)
+        if offline or master_url is not None else run_release_check(paths)
+    )
     items = list(report.items)
     try:
         assets = discover_ugc_assets(retail_root)
@@ -496,6 +503,10 @@ def run(
         print(f"Map Creator startup failed: {exc}", file=sys.stderr)
         return 1
     if arguments.check:
+        if arguments.offline or arguments.master_url is not None:
+            return _emit_check_report(_ugc_check(
+                runtime_paths, arguments.retail_root, offline=arguments.offline, master_url=arguments.master_url,
+            ))
         return _emit_check_report(_ugc_check(runtime_paths, arguments.retail_root))
 
     try:
@@ -520,6 +531,8 @@ def run(
     )
     return _run_server(
         runtime_paths,
+        offline=arguments.offline,
+        master_url=arguments.master_url,
         config_transform=lambda config: configure_ugc_runtime(
             config,
             paths=runtime_paths,

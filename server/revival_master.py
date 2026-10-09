@@ -146,7 +146,9 @@ class RevivalMasterService:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.config is not None and getattr(self.config, "enabled", False))
+        return not getattr(self.server.config, "offline_mode", False) and bool(
+            self.config is not None and getattr(self.config, "enabled", False)
+        )
 
     @property
     def write_token(self) -> str:
@@ -154,8 +156,10 @@ class RevivalMasterService:
 
     @property
     def base_url(self) -> str:
-        configured = os.environ.get("AOS_MASTER_URL") or getattr(
-            self.config, "base_url", "https://www.aosplay.net"
+        configured = (
+            getattr(self.server.config, "master_url_override", None)
+            or os.environ.get("AOS_MASTER_URL")
+            or getattr(self.config, "base_url", "https://www.aosplay.net")
         )
         return str(configured).rstrip("/")
 
@@ -329,6 +333,8 @@ class RevivalMasterService:
         path: str,
         payload: dict[str, Any],
     ) -> tuple[int, dict[str, Any]]:
+        if getattr(self.server.config, "offline_mode", False):
+            raise RevivalMasterError("master requests are disabled by --offline")
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = Request(
             self.base_url + path,
@@ -365,6 +371,8 @@ class RevivalMasterService:
         return status, decoded if isinstance(decoded, dict) else {}
 
     async def _post(self, path: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if getattr(self.server.config, "offline_mode", False):
+            raise RevivalMasterError("master requests are disabled by --offline")
         if not self.write_token:
             raise RevivalMasterError("AOS_MASTER_WRITE_TOKEN is not configured")
         return await asyncio.to_thread(self._request_json, path, payload)

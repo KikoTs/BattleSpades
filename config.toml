@@ -4,6 +4,10 @@
 [server]
 name = "BattleSpades Server"
 port = 27015
+# Steam LAN browser discovery; no Steam runtime or router forwarding needed.
+# A2S always answers on the game port. If it is outside 27015..27020, also
+# listen on the first free UDP port in that range. Restart after changing.
+lan_discovery = true
 max_players = 24 # stock Match Lobby maximum; dedicated protocol accepts 1..255
 tick_rate = 60  # MUST match client ~60fps loop; 120 broke jump (loop_count 2x-rate desync)
 steam_id = 90087911866072064 # stable uint64 identity for non-Steam hosting

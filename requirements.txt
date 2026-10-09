@@ -22,6 +22,8 @@ py_trees>=2.5,<2.6
 # config.toml editor. Not needed for the console server.
 customtkinter>=5.2,<5.3
 tomlkit>=0.13,<0.14
+# Workshop PNG/JPEG decoding and normalized map previews.
+Pillow>=11.2.1,<12
 
 # --- development / testing (optional for just running the server) ---
 pytest>=7.0.0

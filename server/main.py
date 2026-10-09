@@ -1841,6 +1841,7 @@ class BattleSpadesServer:
         await self.steam_p2p.start()
         # After the master: the relay hello carries this server's AoSPlay id.
         await self.steam_host.start()
+        await self.a2s_handler.start()
 
         # Auto-discover + load plugins from the plugins/ package.
         await self._load_plugins()
@@ -1893,6 +1894,7 @@ class BattleSpadesServer:
             # is in progress.
             self._stopping = True
             self.running = False
+            self.a2s_handler.stop()
 
             try:
                 await self._deactivate_mode_for_shutdown()
