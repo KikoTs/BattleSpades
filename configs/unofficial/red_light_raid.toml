@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Red Light, Green Light"
+
+[game]
+default_mode = "red_light_raid"
+default_map = "SignalSprint"
+
+[lobby]
+map_rotation = ["SignalSprint"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.red_light_raid]
+rounds = 4
+round_time = 480
+prepare_time = 8

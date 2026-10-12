@@ -1,0 +1,29 @@
+# Official BattleSpades Hardcore variant. Normal objective rules and maps.
+# Class kits and Hardcore switches are selected by the mode code itself.
+[server]
+name = "BattleSpades Hardcore OC"
+port = 27015
+max_players = 24
+
+[game]
+default_mode = "hc_oc"
+default_map = "ArcticBase"
+maps_path = "maps"
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+difficulty = "normal"
+
+[steam]
+enabled = false
+
+[revival]
+enabled = false
+
+[game_rules]
+RULE_ENABLE_GRAVESTONES = false
+RULE_ENABLE_CORPSE_EXPLOSION = false
+RULE_POINTS_FROM_TEABAGGING = true

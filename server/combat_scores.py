@@ -188,8 +188,9 @@ def round_tick(player, server, dt: float) -> None:
 
 def record_damage(server, victim, source, damage: float, *, now: float | None = None) -> None:
     """Remember actual enemy HP removed, never overkill or rejected damage."""
+    from server.mode_controls import opponents
     if (server is None or not _scoring_active(server) or source is None
-            or source is victim or source.team == victim.team
+            or source is victim or not opponents(server, source, victim)
             or int(source.team) not in (TEAM1, TEAM2)
             or int(victim.team) not in (TEAM1, TEAM2) or damage <= 0):
         return
@@ -241,7 +242,8 @@ def record_death(server, victim, killer, kill_type: int, *, now: float | None = 
         ):
             round_stats(victim).increment(C.MOST_SUICIDES)
         return
-    if (killer.team == victim.team or int(killer.team) not in (TEAM1, TEAM2)
+    from server.mode_controls import opponents
+    if (not opponents(server, killer, victim) or int(killer.team) not in (TEAM1, TEAM2)
             or int(victim.team) not in (TEAM1, TEAM2)):
         return
     state = round_stats(killer)
@@ -278,6 +280,9 @@ def record_death(server, victim, killer, kill_type: int, *, now: float | None = 
     if domination:
         state.increment(C.MOST_DOMINATIONS)
         round_stats(victim).increment(C.MOST_DOMINATED)
+    # Solo players have no allies to earn assist or kill-steal awards.
+    if bool(getattr(getattr(getattr(server, "mode", None), "spec", None), "solo", False)):
+        return
     current = time.monotonic() if now is None else now
     threshold = float(MAX_HEALTH) * float(CG.GENERIC_ASSIST_PERCENTAGE) / 100.0
     # Kill steal: the killer's own recent damage is below the assist share

@@ -244,6 +244,10 @@ def record_team_harm(
 ) -> float:
     """Charge ``source`` for HP removed from a teammate; return points added."""
 
+    enemy_relation = getattr(getattr(server, "mode", None), "players_are_enemies", None)
+    if source is not None and victim is not None and callable(enemy_relation) and enemy_relation(source, victim):
+        return 0.0
+
     if (
         server is None
         or source is None

@@ -16,3 +16,6 @@ packaging==25.0
 tomlkit==0.13.2
 # Workshop previews are an explicit dependency, not a CustomTkinter extra.
 Pillow==11.2.1
+
+# Dedicated server system tray integration.
+pystray==0.19.5

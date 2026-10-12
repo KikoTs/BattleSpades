@@ -83,3 +83,5 @@ def send_join_greeting(connection: Connection) -> None:
         packet.chat_type = CHAT_SYSTEM
         packet.value = line
         connection.send(bytes(packet.generate()), reliable=True)
+    if callable(getattr(getattr(connection.server, "mode", None), "on_player_ready", None)):
+        connection.server.queue_mode_event("on_player_ready", connection.player)

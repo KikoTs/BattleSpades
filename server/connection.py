@@ -243,6 +243,8 @@ class Connection:
         self.steam_key: Optional[bytes] = None  # Set when SteamSessionTicket received
         self.flight_profile = RETAIL_FLIGHT
         self.flight_profile_capable = False
+        self.hardcore_capable = False
+        self.race_momentum_capable = False
         self.pending_selection = None
         # Compatibility mirrors for callers still constructing the old
         # handshake fields independently. Runtime join logic consumes the
@@ -1154,10 +1156,11 @@ class Connection:
             logger.info(f"Received SteamSessionTicket from {self.peer.address}")
             try:
                 packet = SteamSessionTicket(reader)
-                # BSCF v1 natives get the fuel balance; v2 natives also get
-                # the Engineer speed / canopy tuning (server/flight_profile.py).
+                # v1/v2 negotiate flight; v3 also supports exact Hardcore movement.
                 capability = ticket_flight_capability(data)
                 self.flight_profile_capable = capability > 0
+                self.hardcore_capable = capability >= 3
+                self.race_momentum_capable = capability >= 4
                 self.flight_profile = profile_for_capability(capability)
                 # Set steam key immediately - subsequent packets will be decrypted
                 self.steam_key = getattr(packet, 'ticket', None)
@@ -1168,6 +1171,9 @@ class Connection:
                     logger.debug(f"No steam key (offline mode)")
                 # Now send all connection data
                 await self._continue_join()
+            except ConnectionError as exc:
+                logger.info("Join refused: %s", exc)
+                return
             except Exception as e:
                 logger.error(f"Error parsing SteamSessionTicket: {e}")
                 # Still proceed even if parsing fails
@@ -1387,6 +1393,12 @@ class Connection:
         place to drive map/mode/multipliers from real state.
         """
         from server.builders import build_initial_info
+        from server.hardcore import enabled
+        if enabled(self.server.config) and not self.hardcore_capable:
+            # Fail before any world/class state reaches an older predictor.
+            from shared.constants import DISCONNECT
+            self.disconnect(reason=int(DISCONNECT.ERROR_CLIENT_OUT_OF_DATE))
+            raise ConnectionError("Hardcore requires a BSCF v3 client with exact movement support")
         packet = build_initial_info(self.server)
         # UGC distinguishes its first connected editor (host) from observing
         # clients in InitialInfo.  This must be per connection; mutating the
@@ -1838,8 +1850,8 @@ class Connection:
         create_packet.ori_y = player.o_y
         create_packet.ori_z = player.o_z
         create_packet.name = player.name
-        create_packet.loadout = list(selection.loadout)
-        create_packet.prefabs = list(selection.prefabs)
+        create_packet.loadout = list(player.loadout)
+        create_packet.prefabs = list(player.prefabs)
 
         # The joiner needs its OWN CreatePlayer to bind its local player to the
         # server id — deliver it directly (one packet is safe mid-transition).

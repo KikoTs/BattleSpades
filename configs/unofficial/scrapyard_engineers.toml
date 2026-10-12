@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Scrapyard Engineers"
+
+[game]
+default_mode = "scrapyard_engineers"
+default_map = "SalvageWorks"
+
+[lobby]
+map_rotation = ["SalvageWorks"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.scrapyard_engineers]
+rounds = 4
+round_time = 240
+prepare_time = 8

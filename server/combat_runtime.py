@@ -569,6 +569,9 @@ class CombatSystem:
         self._queue_canonical_terrain_repair(positions)
 
     def handle_shot(self, player, packet) -> bool:
+        from server.mode_controls import allows
+        if not allows(self.server, player, "shoot") and not player.is_spade_tool():
+            return False
         if not player.alive or not player.spawned:
             self._log_shot_drop(player, packet, "not_spawned")
             return False
@@ -633,6 +636,9 @@ class CombatSystem:
         # request must not clear a later activation. The return value below
         # describes a hit, so an accepted miss must clear it here as well.
         player.disguised = False
+        fired = getattr(getattr(self.server, "mode", None), "weapon_fired", None)
+        if callable(fired):
+            fired(player, int(player.tool))
         from server.profile_stats import shot
         shot(player)
         from server.combat_scores import record_shot
@@ -1241,6 +1247,7 @@ class CombatSystem:
         )
 
     def handle_block_build(self, player, packet) -> bool:
+        from server.mode_controls import allows
         from server.game_rules import get_rules
         if (
             not player.alive
@@ -1261,6 +1268,9 @@ class CombatSystem:
         if not self._cell_in_map(position) or not self._cell_within_reach(
             player, position, self._build_reach()
         ):
+            return False
+        if not allows(self.server, player, "build", position):
+            self._queue_canonical_terrain_repair((position,))
             return False
         if not self._cell_in_sight(
             player, position, loop=getattr(packet, "loop_count", None),
@@ -1403,6 +1413,7 @@ class CombatSystem:
         Explicit colored cells also avoid server SetColor packets changing the
         local player's held-block selection.
         """
+        from server.mode_controls import allows
         from server.game_rules import get_rules
         if (
             not player.alive
@@ -1437,6 +1448,9 @@ class CombatSystem:
         )
         reach = self._build_reach()
         if near > reach or far > reach + self.BLOCK_LINE_MAX_CELLS:
+            return False
+        if not allows(self.server, player, "build"):
+            self._queue_canonical_terrain_repair(self.block_line_cells(start, end))
             return False
         # The current hit cube is visible to the builder; the drag start may
         # have scrolled out of view while moving, so either endpoint counts.
@@ -1833,9 +1847,17 @@ class CombatSystem:
 
         world = self.server.world_manager
         rgb = self._unpack_rgb(color)
+        choose_color = getattr(getattr(self.server, "mode", None), "paint_color_for", None)
+        if callable(choose_color):
+            rgb = self._unpack_rgb(choose_color(player))
+        from server.mode_controls import allows
+        paint_hook = getattr(getattr(self.server, "mode", None), "on_block_paint", None)
         changed = 0
         for x, y, z in positions:
             x, y, z = int(x), int(y), int(z)
+            if not allows(self.server, player, "paint", (x, y, z)):
+                self._repair_rejected_paint((x, y, z))
+                continue
             if not (0 <= x < 512 and 0 <= y < 512 and 0 <= z <= 238):
                 continue
             if not world.get_solid(x, y, z):
@@ -1861,6 +1883,8 @@ class CombatSystem:
             # transfer, so it does not always retain the original host's local
             # paint mutation. Include the owner in this idempotent echo.
             self.server.broadcast(bytes(packet.generate()))
+            if callable(paint_hook):
+                self.server.queue_mode_event("on_block_paint", player, x, y, z)
             changed += 1
         return changed
 
@@ -2080,6 +2104,10 @@ class CombatSystem:
         x, y, z = block_pos
         wm = self.server.world_manager
         positions = _melee_dig_positions(block_pos, pattern)
+        from server.mode_controls import allows
+        if not allows(self.server, player, "dig", block_pos):
+            self._queue_canonical_terrain_repair(positions)
+            return False
         if block_dmg <= 0.0:
             # Non-digging melee (Riot tools) can still produce a
             # client-side predicted crack.  Reassert the canonical voxel, but
@@ -2537,6 +2565,10 @@ class CombatSystem:
     def _apply_block_damage(self, attacker, block_pos, damage: float,
                             damage_type: int = None,
                             causer_id: int = None) -> bool:
+        from server.mode_controls import allows
+        if attacker is not None and not allows(self.server, attacker, "dig", block_pos):
+            self._queue_canonical_terrain_repair((block_pos,))
+            return False
         if not getattr(self.server.config, "build_damage", True):
             return False
 
@@ -3215,10 +3247,8 @@ class CombatSystem:
         for target in self.server.players.values():
             if target is attacker or not target.alive or not target.spawned:
                 continue
-            if (
-                not getattr(self.server.config, "friendly_fire", False)
-                and target.team == attacker.team
-            ):
+            from server.mode_controls import enemies
+            if not enemies(self.server, attacker, target):
                 continue
 
             from server import lag_compensation
@@ -3350,8 +3380,11 @@ class CombatSystem:
             if headshot:
                 damage *= float(getattr(profile, "headshot_multiplier", 1.0))
         if target is not None:
-            damage *= victim_damage_multiplier(
-                target, headshot=bool(headshot) and not profile.is_melee
+            from server.hardcore import bullet_multiplier
+            hardcore_scale = bullet_multiplier(target, headshot=bool(headshot), melee=profile.is_melee)
+            damage *= (
+                hardcore_scale if hardcore_scale is not None else
+                victim_damage_multiplier(target, headshot=bool(headshot) and not profile.is_melee)
             )
         if damage <= 0.0:
             return 0.0

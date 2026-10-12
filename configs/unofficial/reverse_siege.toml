@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Reverse Siege"
+
+[game]
+default_mode = "reverse_siege"
+default_map = "BreachCitadel"
+
+[lobby]
+map_rotation = ["BreachCitadel"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.reverse_siege]
+rounds = 4
+round_time = 180
+prepare_time = 20

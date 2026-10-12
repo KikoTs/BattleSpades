@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: One in the Chamber"
+
+[game]
+default_mode = "one_in_the_spade"
+default_map = "TheKiln"
+
+[lobby]
+map_rotation = ["TheKiln"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.one_in_the_spade]
+rounds = 4
+round_time = 180
+prepare_time = 8

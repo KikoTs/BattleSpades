@@ -112,3 +112,6 @@ aceofspades/
 
 # Machine-specific Steam paths and generated local admin password.
 /config.steam-local.toml
+
+# Local GUI playtest configuration (paths, ports and private host settings).
+/configs/unofficial/gui-playtest.toml

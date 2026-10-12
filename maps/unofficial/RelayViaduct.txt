@@ -1,0 +1,174 @@
+{
+  "vxl_format": "retail",
+  "gravity": 1.0,
+  "fog_color": [
+    174,
+    199,
+    214
+  ],
+  "unofficial": {
+    "layout": "bridge",
+    "anchors": {
+      "blue": [
+        204.5,
+        256.5,
+        93.75
+      ],
+      "green": [
+        308.5,
+        256.5,
+        93.75
+      ],
+      "center": [
+        256.5,
+        256.5,
+        93.75
+      ],
+      "waiting": [
+        185.5,
+        202.5,
+        85.75
+      ],
+      "exit": [
+        308.5,
+        280.5,
+        93.75
+      ],
+      "fort": [
+        256.5,
+        256.5,
+        93.75
+      ],
+      "core_blue": [
+        210,
+        256,
+        95
+      ],
+      "core_green": [
+        302,
+        256,
+        95
+      ],
+      "loot1": [
+        236.5,
+        232.5,
+        94.5
+      ],
+      "loot2": [
+        276.5,
+        232.5,
+        94.5
+      ],
+      "loot3": [
+        236.5,
+        280.5,
+        94.5
+      ],
+      "loot4": [
+        276.5,
+        280.5,
+        94.5
+      ],
+      "loot5": [
+        256.5,
+        224.5,
+        94.5
+      ],
+      "loot6": [
+        256.5,
+        288.5,
+        94.5
+      ]
+    },
+    "fall_z": 115,
+    "paint_bounds": [
+      235,
+      277,
+      242,
+      270,
+      96
+    ],
+    "design_version": 3,
+    "title": "RelayViaduct",
+    "mode": "bridge_chicken",
+    "bounds": [
+      180,
+      332,
+      196,
+      316
+    ],
+    "theme": "alpine"
+  },
+  "name": "RelayViaduct",
+  "author": "BattleSpades community arenas",
+  "ugc_entities": [
+    {
+      "item": "flare_block",
+      "position": [
+        181,
+        199,
+        80
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    }
+  ],
+  "skybox_texture": "ArcticBase.txt",
+  "light_color": [
+    226,
+    237,
+    241
+  ],
+  "light_direction": [
+    0.3,
+    0.4,
+    0.85
+  ],
+  "back_light_color": [
+    137,
+    160,
+    182
+  ],
+  "back_light_direction": [
+    -0.5,
+    -0.3,
+    0.7
+  ],
+  "ambient_light_color": [
+    137,
+    160,
+    182
+  ],
+  "ambient_light_intensity": 0.65,
+  "ambient_sounds": [
+    [
+      "amb_doomwind",
+      [],
+      0.38,
+      0.0
+    ]
+  ],
+  "ground_colors": [
+    [
+      78,
+      64,
+      51,
+      32
+    ],
+    [
+      58,
+      49,
+      40,
+      238
+    ],
+    [
+      70,
+      94,
+      105,
+      239
+    ]
+  ]
+}

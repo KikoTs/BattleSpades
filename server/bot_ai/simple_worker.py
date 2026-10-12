@@ -288,6 +288,9 @@ class _BotState:
     mode_epoch: int
     life_id: int
     next_decision_at: float = 0.0
+    fun_waypoint: int = 1
+    fun_action_at: float = 0.0
+    fun_direction: Vector3 = (1.0, 0.0, 0.0)
     goal: _Goal | None = None
     route: tuple[RouteStep, ...] = ()
     route_index: int = 0
@@ -583,6 +586,8 @@ class SimpleBotBrain:
         """Return the newest bounded intention for one observer."""
 
         intent = self._decide(frame)
+        if frame.fun is not None:
+            return intent
         if intent is not None:
             # Awareness hook: a glance may ride on the finished intent.
             intent = self.awareness.overlay(frame, intent)
@@ -649,6 +654,10 @@ class SimpleBotBrain:
         state.next_decision_at = now + self._decision_interval
         self._prune_state(frame)
         self._prune_blocked_edges(state, now)
+
+        if frame.fun is not None:
+            from .unofficial import intent_for
+            return intent_for(self, frame, observer, state, now)
 
         profile = frame.profile or _fallback_profile(observer.player_id)
         if state.flight_step is not None:
@@ -7172,7 +7181,7 @@ def _melee_swing_interval(tool: int | None) -> float:
 def _dig_profile(observer: PlayerSnapshot) -> DigProfile | None:
     """Return the fastest owned tool under the authoritative dig model."""
 
-    if not observer.can_shoot:
+    if not observer.can_shoot or not observer.can_dig:
         return None
     return best_navigation_dig_profile(
         int(tool) for tool in getattr(observer, "loadout", ())

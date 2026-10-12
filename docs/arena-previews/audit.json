@@ -1,0 +1,223 @@
+[
+  {
+    "mode": "block_hunt",
+    "map": "LanternQuarter",
+    "solid_voxels": 2535283,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "BranCastle.txt",
+    "ambience": [
+      "amb_zombieisland"
+    ]
+  },
+  {
+    "mode": "crumbling_run",
+    "map": "FoundryRun",
+    "solid_voxels": 5981337,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "SecretBase.txt",
+    "ambience": [
+      "amb_doomwind"
+    ]
+  },
+  {
+    "mode": "last_exit",
+    "map": "DuskwaterDocks",
+    "solid_voxels": 2529724,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "Chicago.txt",
+    "ambience": [
+      "amb_ww_lighter"
+    ]
+  },
+  {
+    "mode": "night_shift",
+    "map": "BlackPineOutpost",
+    "solid_voxels": 4714226,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "BranCastle.txt",
+    "ambience": [
+      "amb_zombieisland"
+    ]
+  },
+  {
+    "mode": "bridge_chicken",
+    "map": "RelayViaduct",
+    "solid_voxels": 2230412,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "ArcticBase.txt",
+    "ambience": [
+      "amb_doomwind"
+    ]
+  },
+  {
+    "mode": "towerfall",
+    "map": "TwinBellFoundry",
+    "solid_voxels": 2523768,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "SecretBase.txt",
+    "ambience": [
+      "amb_doomwind"
+    ]
+  },
+  {
+    "mode": "floor_tax",
+    "map": "Glassworks",
+    "solid_voxels": 1287302,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "ArcticBase.txt",
+    "ambience": [
+      "amb_doomwind"
+    ]
+  },
+  {
+    "mode": "hot_potato",
+    "map": "FuseCourtyard",
+    "solid_voxels": 1161374,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "WW1.txt",
+    "ambience": [
+      "amb_ww_lighter"
+    ]
+  },
+  {
+    "mode": "one_in_the_spade",
+    "map": "TheKiln",
+    "solid_voxels": 2520088,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "SecretBase.txt",
+    "ambience": [
+      "amb_doomwind"
+    ]
+  },
+  {
+    "mode": "borrowed_arsenal",
+    "map": "ArsenalArcade",
+    "solid_voxels": 2535734,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "WW1.txt",
+    "ambience": [
+      "amb_ww_lighter"
+    ]
+  },
+  {
+    "mode": "kingmaker",
+    "map": "CrownGardens",
+    "solid_voxels": 2523145,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "MayanJungle.txt",
+    "ambience": [
+      "amb_jungle"
+    ]
+  },
+  {
+    "mode": "red_light_raid",
+    "map": "SignalSprint",
+    "solid_voxels": 5981337,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "BranCastle.txt",
+    "ambience": [
+      "amb_zombieisland"
+    ]
+  },
+  {
+    "mode": "spadeball",
+    "map": "SpadeStadium",
+    "solid_voxels": 2538122,
+    "components": 1,
+    "floating_voxels": 0,
+    "invalid_positions": [],
+    "dig_collapse_sizes": [
+      0,
+      0
+    ],
+    "unreachable_objectives": [],
+    "sky": "MayanJungle.txt",
+    "ambience": [
+      "amb_jungle"
+    ]
+  }
+]

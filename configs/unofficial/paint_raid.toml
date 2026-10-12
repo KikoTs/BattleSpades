@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Paint Raid"
+
+[game]
+default_mode = "paint_raid"
+default_map = "ChromaticPlaza"
+
+[lobby]
+map_rotation = ["ChromaticPlaza"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.paint_raid]
+rounds = 4
+round_time = 150
+prepare_time = 8

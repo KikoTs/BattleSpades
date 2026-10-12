@@ -199,7 +199,11 @@ def test_registered_mode_codes_match_the_server_registry() -> None:
 
 def test_mode_choices_and_pools_use_installed_maps() -> None:
     choices = catalog.mode_choices()
-    assert [c.code for c in choices] == ["tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc"]
+    assert [c.code for c in choices[:20:2]] == ["tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc"]
+    assert [c.code for c in choices[1:20:2]] == ["hc_" + c.code for c in choices[:20:2]]
+    from modes.unofficial.catalog import SPECS
+    assert [c.code for c in choices[20:]] == [s.code for s in SPECS]
+    assert all(c.title.startswith("[Unofficial]") for c in choices[20:])
     installed = set(catalog.available_maps(PROJECT_ROOT / "maps"))
     for choice in choices:
         pool = catalog.mode_pool(PROJECT_ROOT / "maps", choice.code)
@@ -214,6 +218,21 @@ def test_mode_pool_falls_back_to_lobby_preset(tmp_path: Path) -> None:
     for name in ("Alcatraz", "CityOfChicago", "London"):
         (tmp_path / f"{name}.vxl").write_bytes(b"")
     assert catalog.mode_pool(tmp_path, "tc") == ["Alcatraz", "CityOfChicago"]
+
+
+def test_unofficial_gui_selection_saves_a_loadable_subdirectory_map():
+    doc = ConfigDocument(SHIPPED)
+    settings = host_settings.read(doc)
+    settings.mode = "false_wall"
+    settings.start_map = catalog.mode_pool(PROJECT_ROOT / "maps", settings.mode)[0]
+    settings.rotation = "single"
+    host_settings.apply(doc, settings)
+    assert settings.start_map == "unofficial/FacadeDistrict"
+    assert validate_text(doc.text(), maps_dir=PROJECT_ROOT / "maps").ok
+    settings.mode = "night_shift"
+    host_settings.apply(doc, settings)
+    assert doc.get("bots", "population_mode") == "admin"
+    assert doc.get("bots", "max_bots") == 12
 
 
 # ------------------------------------------------------------- host settings

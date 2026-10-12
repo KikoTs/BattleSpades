@@ -1,0 +1,27 @@
+[server]
+name = "Unofficial: Survival"
+
+[game]
+default_mode = "night_shift"
+default_map = "BlackPineOutpost"
+
+[lobby]
+map_rotation = ["BlackPineOutpost"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "admin"
+max_bots = 12
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.night_shift]
+rounds = 4
+round_time = 900
+prepare_time = 8

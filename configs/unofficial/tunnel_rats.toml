@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Tunnel Rats"
+
+[game]
+default_mode = "tunnel_rats"
+default_map = "Coppercatacombs"
+
+[lobby]
+map_rotation = ["Coppercatacombs"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.tunnel_rats]
+rounds = 4
+round_time = 240
+prepare_time = 8

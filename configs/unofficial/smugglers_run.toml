@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Smuggler's Run"
+
+[game]
+default_mode = "smugglers_run"
+default_map = "MoonshineWharf"
+
+[lobby]
+map_rotation = ["MoonshineWharf"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.smugglers_run]
+rounds = 4
+round_time = 180
+prepare_time = 8

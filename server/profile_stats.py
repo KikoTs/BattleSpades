@@ -79,10 +79,12 @@ def shot(player) -> None:
 
 
 def hit(player, target) -> None:
+    from server.mode_controls import opponents
+    server = getattr(getattr(player, "connection", None), "server", None)
     state = tracker(player)
     tool = int(getattr(player, "tool", -1))
     if (state is not None and player is not target
-            and player.team != target.team and 0 <= tool < C.STATS_MAX_WEAPONS
+            and opponents(server, player, target) and 0 <= tool < C.STATS_MAX_WEAPONS
             and state.shot_serial > 0 and state.hit_serial != state.shot_serial):
         # A shotgun trigger counts once even if several pellets damage players.
         state.hit_serial = state.shot_serial
@@ -128,7 +130,9 @@ def death(victim, killer, kill_type: int) -> None:
         return
     if killer is None:
         return
-    if killer.team == victim.team:
+    from server.mode_controls import opponents
+    server = getattr(getattr(killer, "connection", None), "server", None)
+    if not opponents(server, killer, victim):
         add(killer, C.KILL_SCORE_TEAMKILL_REASON)
         return
     add(killer, C.KILL_SCORE_REASON)

@@ -807,6 +807,11 @@ class Player:
         if config is not None:
             from server.game_rules import get_rules
 
+            from server.hardcore import enabled, BY_CLASS, movement_profile
+            if enabled(config) and self._class_id in BY_CLASS:
+                self.movement_profile = movement_profile(self.movement_profile)
+                water_damage_multiplier = self.movement_profile.fall_on_water_damage_multiplier
+
             rules = get_rules(config)
             # Retail GameClass.__init__ passes zero into the native mover
             # when this InitialInfo rule is disabled, not only a later HP gate.
@@ -831,6 +836,22 @@ class Player:
         world_object.set_class_falling_damage_max_damage(
             self.movement_profile.falling_damage_max_damage
         )
+
+    def _apply_race_momentum(self, world_object) -> None:
+        server = self.connection.server if self.connection else None
+        if (getattr(getattr(server, "mode", None), "mode_code", "") != "crumbling_run"
+                or not (getattr(self.connection, "race_momentum_capable", False)
+                        or (self.is_bot and getattr(server.mode, "data", {}).get("design_version", 0) >= 3))):
+            return
+        from server.class_data import rule_speed_scale
+        # Stateless velocity curve: prediction replay can derive the same
+        # acceleration after corrections without synchronizing a hidden timer.
+        speed = math.hypot(world_object.velocity.x, world_object.velocity.y)
+        factor = .65 + .7 * min(1.0, speed / .35)
+        scale = rule_speed_scale(server.config, self.class_id)
+        world_object.set_class_accel_multiplier(self.movement_profile.accel_multiplier * scale * factor)
+        world_object.set_class_sprint_multiplier(self.movement_profile.sprint_multiplier * scale * factor)
+        world_object.set_class_crouch_sneak_multiplier(self.movement_profile.crouch_sneak_multiplier * scale * factor)
 
     def _ensure_world_object(self, reset: bool = False):
         world = self._get_world()
@@ -1181,9 +1202,12 @@ class Player:
 
         if not isinstance(selection, ClassSelection):
             raise TypeError("selection must be a ClassSelection")
-        self.class_id = int(selection.class_id)
         server = self.connection.server if self.connection else None
         config = getattr(server, "config", None)
+        from server.hardcore import enabled, normalize_selection
+        if enabled(config):
+            selection = normalize_selection(selection.class_id, selection.loadout)
+        self.class_id = int(selection.class_id)
         if config is None:
             self.loadout = list(selection.loadout)
             self.prefabs = list(selection.prefabs)
@@ -1540,6 +1564,7 @@ class Player:
         # already expose the equipped model to observers.
         if self.is_bot:
             self.input.can_display_weapon = True
+        self._hardcore_next_heal = 0.0
         # Re-anchor the input cursor to the next inputs that arrive after
         # this spawn (stale pre-spawn inputs must not drive the new body).
         self.input_history = {}
@@ -2126,10 +2151,13 @@ class Player:
         )
         if callable(modify_damage):
             amount = modify_damage(self, amount, source, kill_type)
+            if amount <= 0:
+                return False  # A mode veto also precedes one-hit-kill rules.
 
         if rules is not None and source is not None and source is not self:
             amount = float(amount) * float(rules.get("RULE_WEAPON_DAMAGE"))
-            mode_code = str(getattr(config, "default_mode", "")).lower()
+            from server.hardcore import base_code
+            mode_code = base_code(getattr(config, "default_mode", ""))
             if mode_code in ("zom", "zombie") and int(
                 getattr(source, "class_id", -1)
             ) in {
@@ -2370,7 +2398,8 @@ class Player:
         kill_count = 0
         is_domination = is_revenge = False
         kill_feed.reset_multikill(self)
-        if killer and killer != self and killer.team != self.team and not transition_death:
+        from server.mode_controls import opponents
+        if killer and killer != self and opponents(server, killer, self) and not transition_death:
             killer.kills += 1
             killer.kill_streak = min(255, int(killer.kill_streak) + 1)
             kill_count = kill_feed.register_multikill(killer, time.monotonic())
@@ -2456,17 +2485,17 @@ class Player:
                     schedule_normal(self, grave_enabled=grave_enabled)
 
         # Notify the active mode (drained next tick, never inline-async). Every
-        # death fires on_player_death; a CROSS-TEAM kill by another player also
-        # fires on_player_kill (the scoring hook). The team guard keeps
+        # death fires on_player_death; an enemy kill by another player also
+        # fires on_player_kill (the scoring hook). The opponent relation keeps
         # friendly-fire / environmental self-credit from awarding score even if
-        # a future path passes a same-team killer; team-change deaths come
+        # a future path passes a same-team killer (except opt-in FFA); team-change deaths come
         # through with killer=None and so never score.
         if server is not None and getattr(server, "mode", None) is not None:
             server.queue_mode_event("on_player_death", self, killer, kill_type)
             if (
                 killer is not None
                 and killer is not self
-                and killer.team != self.team
+                and opponents(server, killer, self)
                 and not transition_death
             ):
                 server.queue_mode_event("on_player_kill", killer, self, kill_type)
@@ -2552,6 +2581,9 @@ class Player:
         """Return the Match Lobby wallet scale for this authoritative body."""
 
         server = self.connection.server if self.connection else None
+        mode_wallet = getattr(getattr(server, "mode", None), "block_wallet_multiplier", None)
+        if mode_wallet is not None:
+            return float(mode_wallet)
         config = getattr(server, "config", None)
         if config is None:
             return 1.0
@@ -3134,6 +3166,7 @@ class Player:
         # jump fix already removes Character's extra cache reset; reproducing
         # that reset here fights patched clients and creates a new correction.
         # An absent BSCF flight capability cannot identify an unpatched client.
+        self._apply_race_momentum(world_object)
         result = world_object.update(dt, positions)
         if (
             world_object.jump_this_frame

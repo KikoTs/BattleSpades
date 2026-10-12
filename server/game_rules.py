@@ -408,7 +408,9 @@ def get_rules(config: object) -> GameRules:
     """Return a config's rule service, including lightweight test doubles."""
 
     rules = getattr(config, "game_rules", None)
-    return rules if isinstance(rules, GameRules) else GameRules.server_defaults()
+    rules = rules if isinstance(rules, GameRules) else GameRules.server_defaults()
+    from server.hardcore import enabled, effective_rules
+    return effective_rules(config, rules) if enabled(config) else rules
 
 
 __all__ = [

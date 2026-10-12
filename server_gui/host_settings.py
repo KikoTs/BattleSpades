@@ -167,6 +167,9 @@ def apply(doc: ConfigDocument, settings: HostSettings) -> None:
         if int(doc.get("bots", "max_bots", 0) or 0) < target:
             doc.set("bots", "max_bots", target)
     doc.set("bots", "difficulty", settings.difficulty)
+    if settings.mode == "night_shift":
+        doc.set("bots", "population_mode", "admin")
+        doc.set("bots", "max_bots", 12)
     doc.set("server", "password", settings.password)
     if settings.admin_password:
         doc.set("admin", "password", settings.admin_password)

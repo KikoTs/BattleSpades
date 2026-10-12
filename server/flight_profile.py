@@ -16,6 +16,8 @@ carries two native-mover tunings that the native client predicts exactly:
   it reaches that terminal; a fast body brakes exactly as the stock canopy.
 
 Stock clients, bots and version-1 native clients keep the stock values.
+The BSCF v3 capability also advertises Hardcore movement support; its flight
+payload remains BSFP v2. Hardcore itself is negotiated in InitialInfo rules.
 """
 from __future__ import annotations
 
@@ -104,6 +106,10 @@ def ticket_flight_capability(packet: bytes) -> int:
     if not 0 <= length <= 2048:
         return 0
     trailer = packet[5 + length:]
+    if trailer == b"BSCF\x04":
+        return 4  # Adds the optional Crumbling Run momentum profile.
+    if trailer == b"BSCF\x03":
+        return 3  # BSFP v2 plus the negotiated Hardcore movement profile.
     if trailer == CAPABILITY_V2:
         return 2
     if trailer == CAPABILITY:

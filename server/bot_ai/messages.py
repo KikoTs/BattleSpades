@@ -10,7 +10,10 @@ from __future__ import annotations
 import zlib
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
+
+if TYPE_CHECKING:
+    from .fun_messages import FunState
 
 from .prefab_policy import PrefabGeometry
 
@@ -32,6 +35,9 @@ class BotActionKind(str, Enum):
     PLACE_PREFAB = "place_prefab"
     DEPLOY = "deploy"
     ORIENTED = "oriented"
+    PAINT = "paint"
+    DISGUISE = "disguise"
+    MODE_COMMAND = "mode_command"
 
 
 class MovementAffordance(str, Enum):
@@ -258,6 +264,7 @@ class PlayerSnapshot:
     # Kill type of that last hit (bullet, blast, burn tick, ...). The client
     # is told the same through the damage indicator it draws.
     last_damage_kind: int = -1
+    can_dig: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +349,7 @@ class PerceptionFrame:
     behavior_version: str = "classic"
     friendly_mischief: bool = True
     local_safety_complete: bool = True
+    fun: FunState | None = None
 
 
 @dataclass(frozen=True, slots=True)

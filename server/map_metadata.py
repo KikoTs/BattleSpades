@@ -113,6 +113,8 @@ class MapMetadata:
     # native World; otherwise an authored value such as Lunar's 0.4 becomes
     # 0.40625 on the retail client while authority continues integrating 0.4.
     gravity: float = 1.0
+    # Inert community-arena description; validated by the selected fun mode.
+    unofficial: dict[str, object] = field(default_factory=dict)
     # Stock VXL files do not embed their original spawn rectangles.  Most use
     # Blue/TEAM1 on the west side and Green/TEAM2 on the east side, but Tokyo
     # Neon is authored the other way around.  These regions are used only when
@@ -548,7 +550,8 @@ def canonical_mode_code(mode: object) -> str:
     value = str(mode or "").strip().lower()
     if not value:
         return value
-    code = mode_data.get(value).code
+    from server.hardcore import base_code
+    code = base_code(mode_data.get(value).code)
     return value if code == "nor" and value != "nor" else code
 
 
@@ -1189,6 +1192,7 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         raise ValueError("vxl_format must be auto, retail or classic64")
     result = MapMetadata(
         source=sidecar,
+        unofficial=dict(payload.get("unofficial", {})) if isinstance(payload.get("unofficial"), dict) else {},
         official_map=official_map,
         vxl_format=vxl_format,
         gravity=canonical_gravity(

@@ -144,9 +144,8 @@ _WALK_STEER_ANGLES = tuple(
 _WATER_STEER_ANGLES = tuple(
     math.radians(value) for value in (20.0, 40.0, 60.0, 80.0)
 )
-# The BattleSpades combat roster (stock six plus Rocketeer). _choose_class
-# filters it through is_class_selectable, so bots never field a class the
-# human class picker does not offer in the current mode.
+# Fallback for modes without an advertised class roster. Modes with a roster
+# (including TC's Gangsters) must use that list before applying operator rules.
 _DEFAULT_CLASSES = tuple(
     int(value)
     for value in BATTLESPADES_TEAM_CLASSES
@@ -441,6 +440,7 @@ class BotDirector:
         self._perception_players: tuple[PlayerSnapshot, ...] = ()
         self._perception_entities: tuple[EntitySnapshot, ...] = ()
         self._perception_objectives: tuple[ObjectiveSnapshot, ...] = ()
+        self._perception_fun = None
         self._perception_build_players: tuple[Player, ...] = ()
         self._perception_build_snapshots: list[PlayerSnapshot] = []
         self._perception_build_index = 0
@@ -565,6 +565,7 @@ class BotDirector:
         self._perception_players = ()
         self._perception_entities = ()
         self._perception_objectives = ()
+        self._perception_fun = None
         self._perception_build_players = ()
         self._perception_build_snapshots = []
         self._perception_build_index = 0
@@ -668,6 +669,10 @@ class BotDirector:
 
         from server.player import Player
 
+        bot_gate = getattr(self.server.mode, "allows_bot_join", None)
+        if callable(bot_gate) and not bot_gate(team):
+            return None
+
         if len(self.bots) >= int(getattr(self._config, "max_bots", 12)):
             return None
         player_id = self.server.get_next_player_id()
@@ -676,6 +681,7 @@ class BotDirector:
             return None
         requested_team = int(team) if team in _PLAYABLE_TEAMS else self._balanced_team()
         prepare_team = getattr(self.server.mode, "prepare_join_team", None)
+        prepare_team = getattr(self.server.mode, "prepare_bot_team", prepare_team)
         selected_team = (
             int(prepare_team(requested_team))
             if callable(prepare_team)
@@ -697,11 +703,12 @@ class BotDirector:
                     "name": str(name)[:15],
                 }
             )
-        selected_class = (
-            int(class_id)
-            if class_id is not None
-            else self._choose_class(selected_team, profile)
+        selected_class = self._choose_class(
+            selected_team, profile, requested_class=class_id,
         )
+        if selected_class is None:
+            logger.warning("BotDirector: no enabled class for mode=%s", self._mode_id())
+            return None
         from server.prefabs import allowed_prefabs_for_class
 
         available_prefabs = sorted(allowed_prefabs_for_class(selected_class))
@@ -763,6 +770,8 @@ class BotDirector:
         connection.player = player
         player.is_bot = True
         player.apply_class_selection(selection)
+        if getattr(self.server.mode, "unofficial", False):
+            self.server.mode.prepare_player_spawn(player)
         self._select_spawn_weapon(player)
 
         self.server.players[player_id] = player
@@ -1180,6 +1189,8 @@ class BotDirector:
         )
 
     async def _maintain_population(self, now: float) -> None:
+        if getattr(self.server.mode, "owns_bot_population", False):
+            return
         if self._reconnect_count is not None:
             return
         if now < self._next_population_at:
@@ -1303,6 +1314,8 @@ class BotDirector:
             )
             self._perception_entities = self._snapshot_entities()
             self._perception_objectives = self._snapshot_objectives()
+            fun_snapshot = getattr(self.server.mode, "bot_snapshot", None)
+            self._perception_fun = fun_snapshot() if callable(fun_snapshot) else None
             # Awareness hook: the steps the roster took since the last refresh.
             stimuli = getattr(self.server, "bot_stimuli", None)
             if stimuli is not None:
@@ -1356,6 +1369,7 @@ class BotDirector:
                     behavior_version=self.server.config.bots.behavior_version,
                     friendly_mischief=self.server.config.bots.friendly_mischief,
                     local_safety_complete=len(players) <= 32,
+                    fun=self._perception_fun,
                     stimuli=(
                         self.server.bot_stimuli.perceive(
                             tuple(float(value) for value in bot.position),
@@ -2056,7 +2070,9 @@ class BotDirector:
         # not hidden live-player positions. Without them TDM teams spawned 400
         # blocks apart and random-patrolled forever because perception is
         # correctly capped at 160 blocks.
-        anchor_reader = getattr(self.server.world_manager, "team_base_anchor", None)
+        anchor_reader = getattr(mode, "bot_team_anchor", None)
+        if not callable(anchor_reader):
+            anchor_reader = getattr(self.server.world_manager, "team_base_anchor", None)
         if not callable(anchor_reader):
             return []
         result = []
@@ -4056,6 +4072,9 @@ class BotDirector:
             runtime.class_lives_remaining -= 1
             if runtime.class_lives_remaining <= 0:
                 selected_class = self._choose_class(int(player.team), runtime.profile)
+                if selected_class is None:
+                    runtime.was_alive = alive
+                    return
                 from server.prefabs import allowed_prefabs_for_class
 
                 available = sorted(allowed_prefabs_for_class(selected_class))
@@ -4092,17 +4111,51 @@ class BotDirector:
                 runtime.class_lives_remaining = runtime.rng.randint(2, 5)
         runtime.was_alive = alive
 
-    def _choose_class(self, team: int, profile: BotProfile | None = None) -> int:
+    def _choose_class(
+        self,
+        team: int,
+        profile: BotProfile | None = None,
+        *,
+        requested_class: int | None = None,
+    ) -> int | None:
         """Choose a mode-useful class while avoiding deterministic team stacks."""
 
-        if not _DEFAULT_CLASSES:
-            return int(C.DEFAULT_CLASS)
-        counts = {class_id: 0 for class_id in _DEFAULT_CLASSES}
+        from server import mode_data
+        from server.game_rules import get_rules
+        from server.hardcore import enabled, CLASS_IDS
+
+        mode = self._mode_id()
+        hardcore = enabled(self.server.config)
+        roster = (
+            CLASS_IDS if hardcore
+            else mode_data.get(mode).allowed_classes or _DEFAULT_CLASSES
+        )
+        if mode in ("zom", "hc_zom"):
+            # The advertised menu is a union; survivors and infected cannot
+            # borrow one another's classes. Mode hooks still own variants.
+            roster = (
+                (int(C.CLASS_ZOMBIE),) if team == TEAM1
+                else getattr(self.server.mode, "survivor_class_order", _DEFAULT_CLASSES)
+            )
+        rules = get_rules(self.server.config)
+        candidates = [
+            int(candidate) for candidate in roster
+            if int(candidate) in C.CLASS_ITEMS and rules.is_class_enabled(candidate)
+        ]
+        if not candidates:
+            return None
+        if requested_class is not None and int(requested_class) in candidates:
+            return int(requested_class)
+
+        counts = {class_id: 0 for class_id in candidates}
         for player in self.server.teams[team].players:
             class_id = int(getattr(player, "class_id", -1))
             if class_id in counts:
                 counts[class_id] += 1
-        mode = self._mode_id()
+        if hardcore:
+            return int(self._rng.choices(
+                candidates, weights=[1 / (1 + counts[cid]) for cid in candidates],
+            )[0])
         mode_weights: dict[int, float] = {}
         if mode in ("ctf", "cctf"):
             mode_weights = {
@@ -4135,20 +4188,6 @@ class BotDirector:
             # Cap the sniper stack: more than two scouts turns TDM passive.
             mode_weights[int(C.CLASS_SCOUT)] = 0.2
         preferred = set(profile.class_preferences if profile is not None else ())
-        candidates = list(_DEFAULT_CLASSES)
-        try:
-            from server.handlers.equipment import is_class_selectable
-
-            selectable = [
-                candidate for candidate in candidates
-                if is_class_selectable(self.server, candidate)
-            ]
-        except Exception:  # noqa: BLE001 - class choice must not fail a join
-            selectable = []
-        if selectable:
-            # Honour operator RULE_ENABLE_CLASS_* switches and the mode's
-            # advertised class list, exactly like a human SetClassLoadout.
-            candidates = selectable
         weights = []
         for candidate in candidates:
             diversity = 1.0 / (1.0 + counts[candidate] * 0.85)

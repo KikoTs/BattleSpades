@@ -110,6 +110,33 @@ class BotActionGateway:
 
         if action.kind is BotActionKind.NONE:
             return False
+        if action.kind is BotActionKind.PAINT:
+            if action.position is None or not self.select_tool(player, int(C.BLOCK_TOOL)):
+                return False
+            from shared.packet import PaintBlockPacket
+            packet = PaintBlockPacket()
+            packet.x, packet.y, packet.z = (int(v) for v in action.position)
+            color = int(player.block_color)
+            packet.color = ((color >> 16) & 255, (color >> 8) & 255, color & 255)
+            packet.loop_count = int(self.server.loop_count)
+            return bool(self.server.combat.handle_paint_packet(player, packet))
+        if action.kind is BotActionKind.DISGUISE:
+            mode = self.server.mode
+            if (not getattr(mode, "unofficial", False)
+                    or player not in mode.participants
+                    or player in mode.eliminated
+                    or mode.phase not in ("prepare", "live")
+                    or not self.select_tool(player, int(C.DISGUISE_TOOL))):
+                return False
+            return bool(self.server.deployable_actions.set_disguise(player, active=True))
+        if action.kind is BotActionKind.MODE_COMMAND:
+            mode = self.server.mode
+            if (not getattr(mode, "unofficial", False)
+                    or action.argument not in ("stash", "pass")
+                    or player not in mode.participants or player in mode.eliminated):
+                return False
+            self.server.queue_mode_event("on_bot_command", player, action.argument, action.position)
+            return True
         if action.kind is BotActionKind.FIRE:
             if action.tool_id >= 0 and not self.select_tool(player, action.tool_id):
                 return False

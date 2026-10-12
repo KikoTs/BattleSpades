@@ -9,7 +9,7 @@ We source these from `shared.constants_gamemode` (`MODE_*` ints + the
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import shared.constants as C
 import shared.constants_gamemode as MG
@@ -121,13 +121,25 @@ MODES: dict[str, ModeData] = {
                   'dia', 'tc', 'vip', 'zom', 'tut', 'ugc')
 }
 
+# Community names are server-side identifiers, never unknown retail mode IDs
+# or invented localization keys. Chat explains the custom rules.
+from modes.unofficial.catalog import CATALOG as _FUN_CATALOG, canonical as _fun_code
+for _spec in _FUN_CATALOG.values():
+    MODES[_spec.code] = ModeData(
+        code=_spec.code, mode_id=MG.MODE_TDM,
+        title_string="TDM_TITLE", description_string="TDM_DESCRIPTION",
+        default_score_limit=4, default_time_limit=0,
+        allowed_classes=(int(C.CLASS_ENGINEER),),
+    )
+
 
 def get(code: str) -> ModeData:
     # Human-facing commands use "zombie" while the retail protocol table uses
     # the historical short code "zom". Resolve aliases before packet builders
     # read mode_id/class data, otherwise the rules object is ZombieMode but the
     # client is incorrectly told MODE_NORMAL.
-    normalized = str(code).strip().lower()
+    from server.hardcore import canonical
+    normalized = canonical(code)
     normalized = {
         'zombie': 'zom',
         'classic_ctf': 'cctf',
@@ -142,4 +154,13 @@ def get(code: str) -> ModeData:
         'occupation': 'oc',
         'tutorial': 'tut',
     }.get(normalized, normalized)
-    return MODES.get(normalized, MODES['nor'])
+    return MODES.get(_fun_code(normalized), MODES['nor'])
+
+
+from server.hardcore import BASE_MODES as _HC_BASE_MODES, CLASS_IDS as _HC_CLASSES
+for _base in _HC_BASE_MODES:
+    _code = "hc_" + _base
+    MODES[_code] = replace(
+        MODES[_base], code=_code, classic=False, mafia=False,
+        allowed_classes=_HC_CLASSES + ((int(C.CLASS_ZOMBIE),) if _base == "zom" else ()),
+    )

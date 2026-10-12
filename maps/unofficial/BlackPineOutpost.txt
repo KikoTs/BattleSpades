@@ -1,0 +1,246 @@
+{
+  "name": "BlackPineOutpost",
+  "author": "BattleSpades",
+  "vxl_format": "retail",
+  "gravity": 1.0,
+  "skybox_texture": "BranCastle.txt",
+  "fog_color": [
+    59,
+    76,
+    89
+  ],
+  "light_color": [
+    158,
+    182,
+    205
+  ],
+  "light_direction": [
+    0.3,
+    0.4,
+    0.85
+  ],
+  "ambient_light_color": [
+    88,
+    109,
+    132
+  ],
+  "ambient_light_intensity": 0.72,
+  "ambient_sounds": [
+    [
+      "amb_zombieisland",
+      [],
+      0.38,
+      0.0
+    ]
+  ],
+  "ugc_entities": [
+    {
+      "item": "flare_block",
+      "position": [
+        190,
+        247,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        190,
+        266,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        220,
+        247,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        220,
+        266,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        254,
+        247,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        254,
+        266,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        288,
+        247,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        288,
+        266,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        336,
+        247,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        336,
+        266,
+        88
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    }
+  ],
+  "unofficial": {
+    "layout": "yard",
+    "bounds": [
+      148,
+      364,
+      180,
+      332
+    ],
+    "anchors": {
+      "blue": [
+        199.5,
+        256.5,
+        93.75
+      ],
+      "green": [
+        346.5,
+        256.5,
+        93.75
+      ],
+      "center": [
+        225.5,
+        256.5,
+        93.75
+      ],
+      "exit": [
+        167.5,
+        256.5,
+        93.75
+      ],
+      "waiting": [
+        163.5,
+        194.5,
+        93.75
+      ],
+      "enemy_north": [
+        344.5,
+        216.5,
+        93.75
+      ],
+      "enemy_south": [
+        344.5,
+        296.5,
+        93.75
+      ]
+    },
+    "fall_z": 120,
+    "repair_cells": [
+      [
+        222,
+        240,
+        93
+      ],
+      [
+        223,
+        240,
+        93
+      ],
+      [
+        224,
+        240,
+        93
+      ],
+      [
+        225,
+        240,
+        93
+      ],
+      [
+        226,
+        240,
+        93
+      ]
+    ],
+    "mode": "night_shift",
+    "design_version": 3,
+    "title": "BlackPineOutpost",
+    "theme": "night"
+  }
+}

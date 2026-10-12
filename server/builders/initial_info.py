@@ -247,4 +247,15 @@ def build_initial_info(server: 'BattleSpadesServer') -> InitialInfo:
     )
     if callable(configure):
         configure(pkt)
+    # The retail wire has an explosion flag, but no gravestone flag. Carry the
+    # latter in its extensible rule list so native clients can retain bodies
+    # when both death replacements are disabled, without a protocol change.
+    pkt.custom_game_rules = [
+        (name, value) for name, value in pkt.custom_game_rules
+        if name != "RULE_ENABLE_GRAVESTONES"
+    ]
+    pkt.custom_game_rules.append((
+        "RULE_ENABLE_GRAVESTONES",
+        "1" if rules.enabled("RULE_ENABLE_GRAVESTONES") else "0",
+    ))
     return pkt

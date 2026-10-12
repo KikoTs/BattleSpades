@@ -59,3 +59,22 @@ def test_steam_public_ip_above_2_31_serializes_instead_of_aborting_the_join():
 
     assert packet.server_ip & 0xFFFFFFFF == 0xD5986593
     assert data[9:13] == (0xD5986593).to_bytes(4, "little")
+
+
+def test_death_rules_survive_initial_info_wire_roundtrip():
+    from shared.bytes import ByteReader
+    from shared.packet import InitialInfo
+
+    for graves in (False, True):
+        for explosions in (False, True):
+            config = ServerConfig()
+            config.game_rules.apply({
+                "RULE_ENABLE_GRAVESTONES": graves,
+                "RULE_ENABLE_CORPSE_EXPLOSION": explosions,
+            })
+            packet = build_initial_info(BattleSpadesServer(config))
+            data = bytes(packet.generate())
+            decoded = InitialInfo(ByteReader(data[1:]))
+            assert decoded.enable_corpse_explosion == explosions
+            assert dict(decoded.custom_game_rules)["RULE_ENABLE_GRAVESTONES"] == str(int(graves))
+            assert decoded.ugc_mode == packet.ugc_mode

@@ -2941,11 +2941,21 @@ cdef class InitialInfo(Loader): # Should be working :D
             b = reader.read_byte()
             a = reader.read_byte()
             self.ground_colors.append((r, g, b, a))
-        reader.read_byte()  # Null terminator
+        # Native InitialInfo: (class, slot) -> counted list of tool ids.
+        self.loadout_overrides = {}
+        for i in range(reader.read_byte() & 0xFF):
+            class_id = reader.read_byte() & 0xFF
+            slot_id = reader.read_byte() & 0xFF
+            items = []
+            for j in range(reader.read_byte() & 0xFF):
+                items.append(reader.read_byte() & 0xFF)
+            self.loadout_overrides[(class_id, slot_id)] = items
 
         self.allow_shooting_holding_intel = reader.read_byte() & 0xFF
         self.friendly_fire = reader.read_byte() & 0xFF
-        reader.read_byte()  # Padding byte
+        self.custom_game_rules = []
+        for i in range(reader.read_byte() & 0xFF):
+            self.custom_game_rules.append((reader.read_string(), reader.read_string()))
         self.enable_corpse_explosion = reader.read_byte() & 0xFF
         self.ugc_mode = reader.read_byte() & 0xFF
 
@@ -3014,11 +3024,28 @@ cdef class InitialInfo(Loader): # Should be working :D
                     writer.write_byte(component)
             else:
                 writer.write_byte(ground_color)
-        writer.write_byte(0)  # Null terminator
+        if len(self.loadout_overrides) > 255:
+            raise ValueError("InitialInfo supports at most 255 loadout overrides")
+        writer.write_byte(len(self.loadout_overrides))
+        for (class_id, slot_id), items in self.loadout_overrides.items():
+            if not 0 <= class_id <= 255 or not 0 <= slot_id <= 255 or len(items) > 255:
+                raise ValueError("Invalid InitialInfo loadout override")
+            writer.write_byte(class_id)
+            writer.write_byte(slot_id)
+            writer.write_byte(len(items))
+            for item in items:
+                if not 0 <= item <= 255:
+                    raise ValueError("Invalid InitialInfo loadout tool id")
+                writer.write_byte(item)
 
         writer.write_byte(self.allow_shooting_holding_intel & 0xFF)
         writer.write_byte(self.friendly_fire & 0xFF)
-        writer.write_byte(0x00)  # Padding byte
+        if len(self.custom_game_rules) > 255:
+            raise ValueError("InitialInfo supports at most 255 custom game rules")
+        writer.write_byte(len(self.custom_game_rules))
+        for name, value in self.custom_game_rules:
+            writer.write_string(name)
+            writer.write_string(value)
         writer.write_byte(self.enable_corpse_explosion & 0xFF)
         writer.write_byte(self.ugc_mode & 0xFF)
 

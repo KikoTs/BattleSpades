@@ -1,0 +1,174 @@
+{
+  "vxl_format": "retail",
+  "gravity": 1.0,
+  "fog_color": [
+    140,
+    115,
+    100
+  ],
+  "unofficial": {
+    "layout": "tunnels",
+    "anchors": {
+      "blue": [
+        212.5,
+        256.5,
+        99.75
+      ],
+      "green": [
+        300.5,
+        256.5,
+        99.75
+      ],
+      "center": [
+        256.5,
+        276.5,
+        100.5
+      ],
+      "waiting": [
+        185.5,
+        202.5,
+        85.75
+      ],
+      "exit": [
+        308.5,
+        280.5,
+        93.75
+      ],
+      "fort": [
+        256.5,
+        256.5,
+        93.75
+      ],
+      "core_blue": [
+        210,
+        256,
+        95
+      ],
+      "core_green": [
+        302,
+        256,
+        95
+      ],
+      "cache1": [
+        240.5,
+        235.5,
+        100.5
+      ],
+      "cache2": [
+        256.5,
+        276.5,
+        100.5
+      ],
+      "cache3": [
+        272.5,
+        240.5,
+        100.5
+      ],
+      "loot1": [
+        236.5,
+        232.5,
+        94.5
+      ],
+      "loot2": [
+        276.5,
+        232.5,
+        94.5
+      ],
+      "loot3": [
+        236.5,
+        280.5,
+        94.5
+      ],
+      "loot4": [
+        276.5,
+        280.5,
+        94.5
+      ],
+      "loot5": [
+        256.5,
+        224.5,
+        94.5
+      ],
+      "loot6": [
+        256.5,
+        288.5,
+        94.5
+      ]
+    },
+    "fall_z": 115,
+    "paint_bounds": [
+      235,
+      277,
+      242,
+      270,
+      96
+    ],
+    "design_version": 2,
+    "title": "Coppercatacombs",
+    "mode": "tunnel_rats",
+    "bounds": [
+      180,
+      332,
+      196,
+      316
+    ],
+    "theme": "forge"
+  },
+  "name": "Coppercatacombs",
+  "author": "BattleSpades community arenas",
+  "skybox_texture": "SecretBase.txt",
+  "light_color": [
+    225,
+    178,
+    137
+  ],
+  "light_direction": [
+    0.3,
+    0.4,
+    0.85
+  ],
+  "back_light_color": [
+    130,
+    118,
+    107
+  ],
+  "back_light_direction": [
+    -0.5,
+    -0.3,
+    0.7
+  ],
+  "ambient_light_color": [
+    130,
+    118,
+    107
+  ],
+  "ambient_light_intensity": 0.65,
+  "ambient_sounds": [
+    [
+      "amb_doomwind",
+      [],
+      0.38,
+      0.0
+    ]
+  ],
+  "ground_colors": [
+    [
+      78,
+      64,
+      51,
+      32
+    ],
+    [
+      58,
+      49,
+      40,
+      238
+    ],
+    [
+      70,
+      94,
+      105,
+      239
+    ]
+  ]
+}

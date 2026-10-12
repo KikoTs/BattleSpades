@@ -1,0 +1,215 @@
+{
+  "name": "Glassworks",
+  "author": "BattleSpades",
+  "vxl_format": "retail",
+  "gravity": 1.0,
+  "skybox_texture": "ArcticBase.txt",
+  "fog_color": [
+    174,
+    199,
+    214
+  ],
+  "light_color": [
+    226,
+    237,
+    241
+  ],
+  "light_direction": [
+    0.3,
+    0.4,
+    0.85
+  ],
+  "ambient_light_color": [
+    137,
+    160,
+    182
+  ],
+  "ambient_light_intensity": 0.72,
+  "ambient_sounds": [
+    [
+      "amb_doomwind",
+      [],
+      0.38,
+      0.0
+    ]
+  ],
+  "ugc_entities": [
+    {
+      "item": "flare_block",
+      "position": [
+        230,
+        230,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        230,
+        243,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        230,
+        256,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        230,
+        269,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        230,
+        282,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        282,
+        230,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        282,
+        243,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        282,
+        256,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        282,
+        269,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    },
+    {
+      "item": "flare_block",
+      "position": [
+        282,
+        282,
+        67
+      ],
+      "color": [
+        243,
+        205,
+        120
+      ]
+    }
+  ],
+  "unofficial": {
+    "layout": "floors",
+    "bounds": [
+      204,
+      308,
+      204,
+      308
+    ],
+    "anchors": {
+      "blue": [
+        242.5,
+        250.5,
+        79.75
+      ],
+      "green": [
+        270.5,
+        262.5,
+        79.75
+      ],
+      "center": [
+        256.5,
+        256.5,
+        79.75
+      ],
+      "waiting": [
+        216.5,
+        256.5,
+        78.75
+      ]
+    },
+    "fall_z": 113,
+    "play_bounds": [
+      232,
+      281,
+      232,
+      281
+    ],
+    "floor_levels": [
+      82,
+      92,
+      102
+    ],
+    "mode": "floor_tax",
+    "design_version": 3,
+    "title": "Glassworks",
+    "theme": "alpine"
+  }
+}

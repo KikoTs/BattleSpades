@@ -15,6 +15,8 @@ from .player import *
 from .server_commands import *
 from .anticheat_admin import *
 from .hud_admin import *
+from .fun import *
+from .hardcore import *
 
 __all__ = [
     "handle_command",

@@ -206,6 +206,10 @@ def normalize_server_selection(
 
     from server.game_rules import get_rules
 
+    from server.hardcore import enabled, normalize_selection
+    if enabled(config):
+        return normalize_selection(class_id, loadout, fallback_class_id=fallback_class_id)
+
     # Both the stock class table and map/UGC extensions inspect this input.
     # Materialize once so callers may supply a generator without losing its
     # map constructs after the first validation pass.

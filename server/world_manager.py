@@ -430,7 +430,8 @@ class WorldManager:
         # StateData and authoritative physics must consume one canonical map
         # scalar.  This matters on LunarBase and for every jetpack recurrence,
         # whose thrust formula includes the global gravity value.
-        self.world.set_gravity(float(self.map_metadata.gravity))
+        from server.hardcore import enabled
+        self.world.set_gravity(1.0 if enabled(self.config) else float(self.map_metadata.gravity))
     
     def get_solid(self, x: int, y: int, z: int) -> bool:
         """Check if block at position is solid."""

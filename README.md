@@ -55,6 +55,10 @@ check the exact release you intend to use. The native client's current commands
 and feature guides are indexed in [its documentation](https://github.com/KikoTs/BattleSpadesClient/blob/main/docs/README.md).
 
 - Run the unit/regression suite with `py -3.12 -m pytest tests -q`.
+- Thirteen curated community modes and their themed arenas are
+  documented in [Unofficial fun modes](docs/UNOFFICIAL_MODES.md).
+- Ten first-party [Hardcore variants](docs/HARDCORE_MODES.md) add a five-class
+  roster and shared movement rules; these require the updated native client.
 - Run the capacity and retail-client validation gates described in
   [`docs/RUNBOOK.md`](docs/RUNBOOK.md) before a release. Historical test counts
   and timing measurements are not guarantees for the current checkout.

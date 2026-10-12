@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Lockdown"
+
+[game]
+default_mode = "lockdown"
+default_map = "BreakwaterPrison"
+
+[lobby]
+map_rotation = ["BreakwaterPrison"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.lockdown]
+rounds = 4
+round_time = 240
+prepare_time = 8

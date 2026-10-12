@@ -45,6 +45,12 @@ _modes = {
     "occupation": OccupationMode,
 }
 
+from .unofficial import register as _register_unofficial
+_register_unofficial(_modes)
+
+from .hardcore import register as _register_hardcore
+_register_hardcore(_modes)
+
 
 def get_mode_class(name: str) -> Optional[Type[BaseMode]]:
     """Get mode class by name."""

@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Spadeball"
+
+[game]
+default_mode = "spadeball"
+default_map = "SpadeStadium"
+
+[lobby]
+map_rotation = ["SpadeStadium"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.spadeball]
+rounds = 4
+round_time = 180
+prepare_time = 8

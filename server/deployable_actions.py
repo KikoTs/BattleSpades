@@ -576,6 +576,9 @@ class DeployableActionService:
             changed = bool(getattr(player, "disguised", False))
             player.disguised = False
             return changed
+        from server.mode_controls import allows
+        if not allows(self.server, player, "disguise"):
+            return False
         if not deployable_authorized(player, C.DISGUISE_TOOL):
             return False
         if bool(getattr(player, "disguised", False)):
@@ -604,5 +607,8 @@ class DeployableActionService:
             if action_clock.label_plausible(player, loop_count)
             else None
         )
+        on_activated = getattr(getattr(self.server, "mode", None), "on_disguise_activated", None)
+        if callable(on_activated):
+            on_activated(player)
         logger.info("DISGUISE %s activated (%d remaining)", player.name, player.disguise_stock)
         return True

@@ -183,6 +183,10 @@ def canonical_mode_id(mode_id: str) -> str:
 def mode_strategy_for(mode_id: str) -> ModeBotStrategy:
     """Return the declared strategy for every protocol and public mode."""
 
+    from modes.unofficial.catalog import CATALOG
+    spec = CATALOG.get(_canonical_mode(mode_id))
+    if spec is not None:
+        return ModeBotStrategy(spec.code, spec.description, ModeBotPosture.BALANCED)
     return _MODE_STRATEGIES.get(
         _canonical_mode(mode_id),
         _MODE_STRATEGIES["nor"],
@@ -2153,6 +2157,9 @@ def objective_decision_for(
 ) -> ModeBotDecision | None:
     """Return the complete role decision for worker navigation/debugging."""
 
+    if frame.fun is not None:
+        from .unofficial import decision_for
+        return decision_for(frame, observer)
     decision = _POLICIES.get(
         _canonical_mode(frame.mode_id), _FALLBACK
     ).decide(frame, observer)

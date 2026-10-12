@@ -448,6 +448,14 @@ class MedpackBehavior(DamageableEntityBehavior):
             return False
         if getattr(player, "health", 0) >= getattr(player, "max_health", 100):
             return False
+        from server.hardcore import enabled, can_heal
+        hardcore = enabled(getattr(ctx.server, "config", None))
+        if hardcore:
+            import time
+            now = time.time()
+            if not can_heal(player, now):
+                return False
+            player._hardcore_next_heal = now + 2.0
         player.heal(self.heal_amount)
         self.uses -= 1
         if self.uses <= 0:

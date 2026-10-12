@@ -1,0 +1,186 @@
+{
+  "vxl_format": "retail",
+  "gravity": 1.0,
+  "fog_color": [
+    163,
+    156,
+    135
+  ],
+  "unofficial": {
+    "layout": "yard",
+    "anchors": {
+      "blue": [
+        204.5,
+        256.5,
+        93.75
+      ],
+      "green": [
+        308.5,
+        256.5,
+        93.75
+      ],
+      "center": [
+        256.5,
+        256.5,
+        93.75
+      ],
+      "waiting": [
+        185.5,
+        202.5,
+        85.75
+      ],
+      "exit": [
+        308.5,
+        280.5,
+        93.75
+      ],
+      "fort": [
+        256.5,
+        256.5,
+        93.75
+      ],
+      "core_blue": [
+        210,
+        256,
+        95
+      ],
+      "core_green": [
+        302,
+        256,
+        95
+      ],
+      "loot1": [
+        236.5,
+        232.5,
+        94.5
+      ],
+      "loot2": [
+        276.5,
+        232.5,
+        94.5
+      ],
+      "loot3": [
+        236.5,
+        280.5,
+        94.5
+      ],
+      "loot4": [
+        276.5,
+        280.5,
+        94.5
+      ],
+      "loot5": [
+        256.5,
+        224.5,
+        94.5
+      ],
+      "loot6": [
+        256.5,
+        288.5,
+        94.5
+      ]
+    },
+    "fall_z": 115,
+    "paint_bounds": [
+      235,
+      277,
+      242,
+      270,
+      96
+    ],
+    "repair_cells": [
+      [
+        254,
+        240,
+        95
+      ],
+      [
+        255,
+        240,
+        95
+      ],
+      [
+        256,
+        240,
+        95
+      ],
+      [
+        257,
+        240,
+        95
+      ],
+      [
+        258,
+        240,
+        95
+      ]
+    ],
+    "design_version": 2,
+    "title": "FacadeDistrict",
+    "mode": "false_wall",
+    "bounds": [
+      180,
+      332,
+      196,
+      316
+    ],
+    "theme": "town"
+  },
+  "name": "FacadeDistrict",
+  "author": "BattleSpades community arenas",
+  "skybox_texture": "WW1.txt",
+  "light_color": [
+    238,
+    216,
+    183
+  ],
+  "light_direction": [
+    0.3,
+    0.4,
+    0.85
+  ],
+  "back_light_color": [
+    124,
+    133,
+    137
+  ],
+  "back_light_direction": [
+    -0.5,
+    -0.3,
+    0.7
+  ],
+  "ambient_light_color": [
+    124,
+    133,
+    137
+  ],
+  "ambient_light_intensity": 0.65,
+  "ambient_sounds": [
+    [
+      "amb_ww_lighter",
+      [],
+      0.38,
+      0.0
+    ]
+  ],
+  "ground_colors": [
+    [
+      78,
+      64,
+      51,
+      32
+    ],
+    [
+      58,
+      49,
+      40,
+      238
+    ],
+    [
+      70,
+      94,
+      105,
+      239
+    ]
+  ]
+}

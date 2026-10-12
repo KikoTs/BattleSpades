@@ -84,6 +84,10 @@ class ZombiePhase(Enum):
 
 
 class ZombieMode(BaseMode):
+    survivor_class_order = _SURVIVOR_CLASS_ORDER
+    survivor_classes = _SURVIVOR_CLASSES
+    normalize_survivor_selection = staticmethod(normalize_class_selection)
+
     """Run survivor preparation, infection, last-man radar, and round wins.
 
     All methods execute on the 60 Hz gameplay event loop.  Role changes are
@@ -432,9 +436,9 @@ class ZombieMode(BaseMode):
         if int(team) == ZOMBIE_TEAM:
             return self._zombie_selection()
         class_id = int(selection.class_id)
-        if class_id not in _SURVIVOR_CLASSES:
+        if class_id not in self.survivor_classes:
             class_id = int(C.CLASS_SOLDIER)
-        return normalize_class_selection(
+        return self.normalize_survivor_selection(
             class_id,
             selection.loadout,
             selection.prefabs,
@@ -456,10 +460,10 @@ class ZombieMode(BaseMode):
         """
 
         if int(team) != ZOMBIE_TEAM:
-            if int(selection.class_id) in _SURVIVOR_CLASSES:
+            if int(selection.class_id) in self.survivor_classes:
                 return selection
             # Never let a bot spawn a human with a zombie/mode-only kit.
-            return normalize_class_selection(int(C.CLASS_SOLDIER))
+            return self.normalize_survivor_selection(int(C.CLASS_SOLDIER))
         return self._zombie_selection(int(C.CLASS_ZOMBIE))
 
     def allows_class_selection(self, player: Player, selection: ClassSelection) -> bool:
@@ -470,7 +474,7 @@ class ZombieMode(BaseMode):
         loadout edits stay legal.
         """
         team = int(getattr(player, "team", -1))
-        allowed = _ZOMBIE_CLASSES if team == ZOMBIE_TEAM else _SURVIVOR_CLASSES
+        allowed = _ZOMBIE_CLASSES if team == ZOMBIE_TEAM else self.survivor_classes
         if int(selection.class_id) not in allowed:
             return False
         if (
@@ -543,7 +547,7 @@ class ZombieMode(BaseMode):
         packet.team1_name = _ZOMBIE_TEAM_NAME_ID
         packet.team2_name = _SURVIVOR_TEAM_NAME_ID
         packet.team1_classes = [int(C.CLASS_ZOMBIE)]
-        packet.team2_classes = list(_SURVIVOR_CLASS_ORDER)
+        packet.team2_classes = list(self.survivor_class_order)
         packet.team1_locked = self.phase is not ZombiePhase.ACTIVE
         packet.team2_locked = self.phase is ZombiePhase.ACTIVE
         # The Zombie team sees every survivor on the minimap and big map.
@@ -741,10 +745,10 @@ class ZombieMode(BaseMode):
         if int(getattr(player, "team", -1)) == ZOMBIE_TEAM:
             return
         class_id = int(getattr(player, "class_id", C.CLASS_SOLDIER))
-        if class_id in _SURVIVOR_CLASSES:
+        if class_id in self.survivor_classes:
             # Restored when the next round returns this body to the humans.
             self._survivor_selection_by_player[int(player.id)] = (
-                normalize_class_selection(
+                self.normalize_survivor_selection(
                     class_id,
                     getattr(player, "loadout", ()) or (),
                     getattr(player, "prefabs", ()) or (),
@@ -781,8 +785,8 @@ class ZombieMode(BaseMode):
         selection = self._survivor_selection_by_player.pop(int(player.id), None)
         if selection is None:
             class_id = int(getattr(player, "class_id", C.CLASS_SOLDIER))
-            if class_id in _SURVIVOR_CLASSES:
-                selection = normalize_class_selection(
+            if class_id in self.survivor_classes:
+                selection = self.normalize_survivor_selection(
                     class_id,
                     getattr(player, "loadout", ()) or (),
                     getattr(player, "prefabs", ()) or (),
@@ -790,12 +794,12 @@ class ZombieMode(BaseMode):
                 )
             else:
                 # A zombie's hand/prefab kit is not a human loadout.
-                selection = normalize_class_selection(int(C.CLASS_SOLDIER))
+                selection = self.normalize_survivor_selection(int(C.CLASS_SOLDIER))
         player.apply_class_selection(selection)
         pending = getattr(player, "pending_selection", None)
         if (
             pending is not None
-            and int(getattr(pending, "class_id", -1)) not in _SURVIVOR_CLASSES
+            and int(getattr(pending, "class_id", -1)) not in self.survivor_classes
         ):
             # A staged zombie kit must not be applied at the next respawn.
             self._clear_pending_selection(player)

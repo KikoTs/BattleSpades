@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Prop Hunt"
+
+[game]
+default_mode = "block_hunt"
+default_map = "LanternQuarter"
+
+[lobby]
+map_rotation = ["LanternQuarter"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.block_hunt]
+rounds = 4
+round_time = 180
+prepare_time = 30

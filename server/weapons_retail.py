@@ -281,12 +281,20 @@ def _class_row(class_id, table_name: str, default: float) -> float:
 
 def class_damage_multiplier(target) -> float:
     """Stock CLASS_DAMAGE_MULTIPLIER of the class TAKING the damage."""
+    from server.hardcore import enabled, BY_CLASS
+    config = getattr(getattr(getattr(target, "connection", None), "server", None), "config", None)
+    if enabled(config) and int(getattr(target, "class_id", -1)) in BY_CLASS:
+        return 1.0
     return _class_row(getattr(target, "class_id", C.CLASS_SOLDIER),
                       "CLASS_DAMAGE_MULTIPLIER", 1.0)
 
 
 def class_headshot_multiplier(target) -> float:
     """Stock CLASS_HEADSHOT_DAMAGE_MULTIPLIER of the class hit in the head."""
+    from server.hardcore import enabled, BY_CLASS
+    config = getattr(getattr(getattr(target, "connection", None), "server", None), "config", None)
+    if enabled(config) and int(getattr(target, "class_id", -1)) in BY_CLASS:
+        return 1.0
     return _class_row(getattr(target, "class_id", C.CLASS_SOLDIER),
                       "CLASS_HEADSHOT_DAMAGE_MULTIPLIER", 1.0)
 

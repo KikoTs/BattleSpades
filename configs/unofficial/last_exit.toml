@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Extraction"
+
+[game]
+default_mode = "last_exit"
+default_map = "DuskwaterDocks"
+
+[lobby]
+map_rotation = ["DuskwaterDocks"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.last_exit]
+rounds = 4
+round_time = 240
+prepare_time = 8

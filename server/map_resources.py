@@ -79,7 +79,7 @@ class MapResourceService:
             return
 
         self._remove_previous()
-        pickup_count = self._place_pickups()
+        pickup_count = self._place_pickups() if getattr(getattr(server, "mode", None), "map_pickups_enabled", True) else 0
         flare_count = self._place_static_flares()
         logger.info(
             "Map resources rebuilt for %s: %d pickups, %d static flare lights%s",

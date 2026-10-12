@@ -35,6 +35,14 @@ as the console server, and runs that server as a child process with
 window crashes, the server sees the pipe close and shuts down cleanly as well.
 Only one window can be open per server folder.
 
+Use **Minimize to tray** in the header, or the window's minimize button, to keep
+hosting in the background. The tray menu has **Start**, **Stop**, **Settings**
+(also the default double-click action), and **Exit**. Settings restores the Host
+tab; Stop and Exit retain the usual player-online and unsaved-settings prompts.
+If the desktop has no working tray menu, the window stays accessible on the
+taskbar. The close button still exits normally; it does not silently hide.
+
+
 | Window | What it changes |
 | --- | --- |
 | Host: name, mode, start map, players | `[server] name`, `[game] default_mode`, `[game] default_map`, `[server] max_players` |

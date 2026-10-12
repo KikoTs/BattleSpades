@@ -181,8 +181,11 @@ def rule_speed_scale(config: object, class_id: int) -> float:
     """
     rules = get_rules(config)
     multiplier = float(rules.get("RULE_CHARACTER_SPEED"))
+    from server.hardcore import enabled, speed_multiplier, base_code
+    if enabled(config):
+        multiplier *= speed_multiplier(class_id)
     if int(class_id) in ZOMBIE_CLASS_IDS and str(
-        getattr(config, "game_mode", "")
+        base_code(getattr(config, "game_mode", ""))
     ).lower() in ("zom", "zombie"):
         multiplier *= float(rules.get("RULE_CLASS_SPEED"))
     return speed_scale(class_id, multiplier)

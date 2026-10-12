@@ -1,0 +1,28 @@
+[server]
+name = "Unofficial: Spleef"
+
+[game]
+default_mode = "floor_tax"
+default_map = "Glassworks"
+
+[lobby]
+map_rotation = ["Glassworks"]
+
+[world]
+maps_path = "maps/unofficial"
+entities_wire_ready = true
+
+[bots]
+enabled = true
+population_mode = "backfill"
+fill_target = 6
+max_bots = 8
+reserve_human_slots = 2
+
+[achievements]
+enabled = false
+
+[modes.floor_tax]
+rounds = 4
+round_time = 180
+prepare_time = 8

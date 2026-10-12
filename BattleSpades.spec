@@ -11,6 +11,7 @@ project_root = Path(SPECPATH).resolve()
 
 hiddenimports = [
     "enet",
+    "pystray",  # Its PyInstaller hook selects the native desktop backend.
     "shared.bytes",
     "shared.glm",
     "shared.packet",

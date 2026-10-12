@@ -27,6 +27,7 @@ from server_gui import catalog, console, firewall, host_settings, logparse, netw
 from server_gui.config_doc import ConfigDocument, KeySpec, RESTART_NOTE, coerce, format_toml_value, load_defaults
 from server_gui.gui_state import GuiState, SingleInstance
 from server_gui.process import ServerProcess, build_command, format_uptime, read_status
+from server_gui.tray import ServerTray
 
 APP_TITLE = "BattleSpades Server"
 PORTFORWARD_GUIDE = "https://portforward.com/router.htm"
@@ -189,6 +190,11 @@ class App(ctk.CTk):
         self.doc_version = 0
         self.restart_needed = False
         self.closing = False
+        self._tray_hide_pending = False
+        self.tray = ServerTray(self.call_soon, {
+            "Start": self._tray_start, "Stop": self._tray_stop,
+            "Settings": self._tray_settings, "Exit": self._tray_exit,
+        })
         self.version = _read_version(paths.root)
 
         self.title(APP_TITLE)
@@ -225,6 +231,7 @@ class App(ctk.CTk):
         self._restore_geometry()
         self.show_tab(state.tab if state.tab in TAB_NAMES else "Host")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<Unmap>", self._on_minimize, add="+")
         self.after(50, self._drain_calls)
         self.after(1000, self._poll_status)
         self.background(self._refresh_addresses)
@@ -317,6 +324,8 @@ class App(ctk.CTk):
                      text_color=theme.OLIVE_BRIGHT, anchor="w").grid(row=1, column=1, sticky="nw", pady=(0, 8))
         self.header_state = ctk.CTkLabel(bar, text="●  STOPPED", font=heading_font(20), text_color=theme.MUTED)
         self.header_state.grid(row=0, column=2, rowspan=2, padx=22)
+        quiet_button(bar, "Minimize to tray", self.minimize_to_tray, width=130).grid(
+            row=0, column=3, rowspan=2, padx=(0, 18))
         ctk.CTkFrame(self, height=2, fg_color=theme.OLIVE, corner_radius=0).grid(row=0, column=0, sticky="sew")
 
     def _build_tabbar(self) -> None:
@@ -381,6 +390,8 @@ class App(ctk.CTk):
 
     def _remember_geometry(self) -> None:
         try:
+            if self.state() not in ("normal", "zoomed"):
+                return
             zoomed = self.state() == "zoomed"
             self.state_data.zoomed = zoomed
             if not zoomed:
@@ -472,7 +483,7 @@ class App(ctk.CTk):
                                                  steam_running=host_settings.steam_running())
 
     def start_server(self) -> None:
-        if self.doc is None or self.server_state != "stopped":
+        if self.closing or self.doc is None or self.server_state != "stopped":
             return
         self.set_server_state("starting")
 
@@ -584,6 +595,7 @@ class App(ctk.CTk):
 
     def set_server_state(self, state: str) -> None:
         self.server_state = state
+        self.tray.update(state, closing=self.closing)
         colours = {"stopped": theme.MUTED, "starting": theme.WARN, "running": theme.OK, "stopping": theme.WARN}
         self.header_state.configure(text=f"●  {state.upper()}", text_color=colours.get(state, theme.MUTED))
         self.host_page.refresh_status()
@@ -715,6 +727,55 @@ class App(ctk.CTk):
 
         self.background(lambda: updates.check(self.paths.root, url or None), done)
 
+    # ---- system tray ------------------------------------------------------
+    def _on_minimize(self, event) -> None:
+        if event.widget is self and self.state() == "iconic" and not self.closing:
+            self.minimize_to_tray()
+
+    def minimize_to_tray(self) -> None:
+        if self.closing or self._tray_hide_pending:
+            return
+        self._remember_geometry()
+        self._tray_hide_pending = True
+        self.tray.start(self._tray_ready, self._tray_unavailable)
+        self.after(3000, self._tray_start_timeout)
+
+    def _tray_ready(self) -> None:
+        if self._tray_hide_pending and not self.closing:
+            self._tray_hide_pending = False
+            self.withdraw()
+
+    def _tray_start_timeout(self) -> None:
+        if self._tray_hide_pending:
+            self._tray_unavailable("The tray did not become available")
+
+    def _tray_unavailable(self, message: str) -> None:
+        self._tray_hide_pending = False
+        # Never withdraw until a working menu has been installed.
+        self.footer(f"System tray unavailable: {message}. The window remains accessible.", theme.WARN)
+
+    def _tray_restore(self) -> None:
+        self._tray_hide_pending = False
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _tray_start(self) -> None:
+        self._tray_restore()
+        self.start_server()
+
+    def _tray_stop(self) -> None:
+        self._tray_restore()
+        self.toggle_server()
+
+    def _tray_settings(self) -> None:
+        self._tray_restore()
+        self.show_tab("Host")
+
+    def _tray_exit(self) -> None:
+        self._tray_restore()
+        self.on_close()
+
     # ---- closing ----------------------------------------------------------
     def on_close(self) -> None:
         if self.closing:
@@ -736,6 +797,7 @@ class App(ctk.CTk):
 
     def _begin_close(self) -> None:
         self.closing = True
+        self.tray.update(self.server_state, closing=True)
         self._remember_geometry()
         self.state_data.save(self.paths.gui_state)
         if self.server is not None:
@@ -745,6 +807,7 @@ class App(ctk.CTk):
             self._finish_close()
 
     def _finish_close(self) -> None:
+        self.tray.stop()
         if self.forwarder.mapped:
             try:
                 self.forwarder.close()
@@ -1033,7 +1096,9 @@ class HostPage(ctk.CTkFrame):
 
     def on_mode_change(self) -> None:
         mode = self.mode_codes.get(self.mode_var.get(), "tdm")
-        self._fill_maps(mode, self.map_display.get(self.map_var.get()))
+        self._fill_maps(mode, None)
+        if mode in catalog.CATALOG:
+            self.rotation_var.set("This map only")
         self.on_change()
 
     def on_rotation_change(self, push: bool = True) -> None:
@@ -2589,12 +2654,17 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="BattleSpadesServer", description="BattleSpades desktop server host")
     parser.add_argument("--version", action="store_true")
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--config", type=Path, help="Edit a separate server configuration")
+    parser.add_argument("--autostart", action="store_true", help="Start the selected server after opening")
     add_network_arguments(parser)
     try:
         options = parser.parse_args(arguments)
     except SystemExit as exc:
         return int(exc.code or 0)
     paths = host_paths.discover()
+    if options.config:
+        from dataclasses import replace
+        paths = replace(paths, config=options.config.resolve())
     if options.version:
         print(f"BattleSpadesServer {_read_version(paths.root)}")
         return 0
@@ -2612,12 +2682,16 @@ def main(argv=None) -> int:
         return 1
     try:
         state = GuiState.load(paths.gui_state)
+        if options.config:
+            state.port_default_applied = True
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
         theme.register_fonts()
         _detect_heading_font()
         app = App(paths, state, lock, offline=options.offline, master_url=options.master_url)
         _configure_scaling(app)
+        if options.autostart:
+            app.after(500, app.start_server)
         app.mainloop()
     finally:
         lock.release()
