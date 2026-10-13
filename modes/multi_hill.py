@@ -63,21 +63,17 @@ class MultiHillMode(BaseMode):
         "Watch out for airstrikes!"
     )
     mode_code = "mh"
+    # This is also set per-instance. Never inherit BaseMode's score target.
+    score_limit = 0
+    BUILD_MARKER = "MH_TIME_ONLY_2026_10_13_V3"
 
     def __init__(self, server) -> None:
         super().__init__(server)
         data = mode_data.get(self.mode_code)
-        # Retail has no Multi-Hill score-target rule: the Match Lobby's mh
-        # rules are only RULE_MULTIHILL_MAX_ACTIVE_BASES and
-        # RULE_BASE_ACTIVE_TIME (constants_matchmaking MODE_RULES,
-        # docs/RETAIL_VALUES.md). The target is therefore the server's
-        # [modes.mh] score_limit, defaulting to mode_data's 100. (This used
-        # to query a nonexistent RULE_MH_SCORE_TARGET.)
-        overlay = getattr(getattr(server, "config", None), "mode_settings", {})
-        overlay = overlay.get(self.mode_code, {}) if isinstance(overlay, dict) else {}
-        self.score_limit = max(1, int(overlay.get(
-            "score_limit", data.default_score_limit
-        )))
+        # Multi-Hill is time-only: scores determine the winner exclusively
+        # when the match clock expires. In BaseMode, score_limit <= 0 also
+        # disables generic score-based victory checks.
+        self.score_limit = 0
         resolve_time = getattr(getattr(server, "config", None), "configured_time_limit", None)
         self.time_limit = (
             float(resolve_time(self.mode_code, data.default_time_limit))
@@ -114,8 +110,39 @@ class MultiHillMode(BaseMode):
         self._last_score_at = 0.0
         self.resupply = CapturePointResupply(server, self.mode_code)
 
+    def configure_state_data(self, packet) -> None:
+        """Tell stock clients this match has NO score target.
+
+        StateData defaults may carry the old Multi-Hill target of 100.
+        Suppress the HUD's max-score bars but keep current team scores.
+        Do not broadcast StateData during gameplay (it resets the scene).
+        """
+        packet.score_limit = 0
+        packet.team1_show_max_score = False
+        packet.team2_show_max_score = False
+
+    async def check_win_condition(self) -> None:
+        """Always wait for the clock, irrespective of accumulated points."""
+        return None
+
+    async def _end_by_score(self, winner: int) -> None:
+        """Protect against any generic/legacy score-win dispatcher."""
+        logger.warning(
+            "%s: blocked an attempted SCORE-limit end (team=%r, scores=%s)",
+            self.BUILD_MARKER,
+            winner,
+            {team_id: team.score for team_id, team in self.server.teams.items()},
+        )
+
     async def on_mode_start(self) -> None:
+        self.score_limit = 0
         await super().on_mode_start()
+        # Some server wrappers reload configured limits at a round restart.
+        self.score_limit = 0
+        logger.warning(
+            "%s LOADED from %s; SCORE LIMIT DISABLED; match time=%.1fs",
+            self.BUILD_MARKER, __file__, float(self.time_limit),
+        )
         for team in self.server.teams.values():
             team.reset()
         # An in-place restart reuses this instance: retire the previous
@@ -147,43 +174,82 @@ class MultiHillMode(BaseMode):
         await super().deactivate()
 
     async def on_tick(self, tick: int) -> None:
+        """Settle hill points before resolving the match's time deadline.
+
+        BaseMode ends a match when the clock expires. If called first, its
+        ``ended`` flag may prevent the last eligible hill score tick from
+        being counted. Keep the objective clock bound to the same wall-clock
+        deadline, and use a bounded timeout fallback if queued mode events
+        delay BaseMode's final result beyond the HUD's 00:00 display.
+        """
+        if self.ended:
+            return
+        if self.score_limit != 0:
+            logger.error(
+                "%s: score_limit was overwritten to %r; resetting to 0",
+                self.BUILD_MARKER, self.score_limit,
+            )
+            self.score_limit = 0
+        now = time.time()
+        deadline = (
+            self.start_time + float(self.time_limit)
+            if self.started and self.time_limit > 0
+            else None
+        )
+        in_time = deadline is None or now < deadline
+
+        if self.phase == "intermission":
+            # Never activate a new hill after the match timer expires.
+            if in_time and now >= self._next_activation_at:
+                self._activate_next(now)
+        elif self.phase == "active":
+            # Arrivals after the deadline must not claim an expired hill.
+            if in_time and now < self._next_rotation_at:
+                self._update_control(now)
+            score_until = min(
+                now,
+                self._next_rotation_at,
+                deadline if deadline is not None else now,
+            )
+            await self._award_team_ticks(score_until)
+            if self.ended:
+                return
+            if in_time:
+                self._award_presence_scores(score_until)
+                if now >= self._next_rotation_at:
+                    expired = tuple(self.active_zones)
+                    if expired:
+                        # Retail BASE_DEPLETED "Hill depleted! \nAirstrike incoming!"
+                        self.announce_localised(
+                            "BASE_DEPLETED", override_previous=True
+                        )
+                    for zone in expired:
+                        achievements.hill_expired(
+                            self.server, zone,
+                            self.zone_occupants.get(zone.index),
+                        )
+                        trigger_airstrike(self.server, zone.center)
+                    self._clear_active_zones()
+                    self.zone_occupants = {}
+                    self.phase = "intermission"
+                    self._next_activation_at = (
+                        now + float(CG.MH_TIME_BETWEEN_BASE_ACTIVATIONS)
+                    )
+
+        # The common mode handles the clock, countdown cues and normal end
+        # sequence. Do this *after* settling eligible objective points.
         await super().on_tick(tick)
         if self.ended:
             return
-        now = time.time()
 
-        if self.phase == "intermission":
-            if now >= self._next_activation_at:
-                self._activate_next(now)
-            return
-
-        # A delayed tick must not let a newly arrived player claim an expired
-        # hill, or score the stalled time after its configured active window.
-        # Settle the last ownership sample only through the expiry boundary.
-        if now < self._next_rotation_at:
-            self._update_control(now)
-        score_until = min(now, self._next_rotation_at)
-        await self._award_team_ticks(score_until)
-        if self.ended:
-            return
-        self._award_presence_scores(score_until)
-        if now >= self._next_rotation_at:
-            expired = tuple(self.active_zones)
-            if expired:
-                # Retail BASE_DEPLETED "Hill depleted! \nAirstrike incoming!"
-                # (server-sent; no client binary references it). Timing: at
-                # the hill timeout that launches the airstrike (inferred from
-                # the text).
-                self.announce_localised("BASE_DEPLETED", override_previous=True)
-            for zone in expired:
-                achievements.hill_expired(
-                    self.server, zone, self.zone_occupants.get(zone.index)
-                )
-                trigger_airstrike(self.server, zone.center)
-            self._clear_active_zones()
-            self.zone_occupants = {}
-            self.phase = "intermission"
-            self._next_activation_at = now + float(CG.MH_TIME_BETWEEN_BASE_ACTIVATIONS)
+        # In rare overloads the mode-event drain cannot empty the captured
+        # timeout queue promptly. Never leave players stuck at HUD 00:00.
+        # Allow a one-second grace for pre-deadline mode events to settle.
+        if deadline is not None and now >= deadline + 1.0:
+            logger.warning(
+                "Multi-Hill forced clock result after timeout drain delay"
+            )
+            await self._end_by_time()
 
     def reveal_to(self, connection) -> None:
         super().reveal_to(connection)
@@ -475,25 +541,6 @@ class MultiHillMode(BaseMode):
                 )
             except TypeError:
                 self.server.broadcast_set_score(team)
-        if not any(
-            self.server.teams[team_id].score >= self.score_limit
-            for team_id in _PLAYABLE_TEAMS
-        ):
-            return
-        # Both teams can cross the limit on the same tick (two hills held).
-        # Higher score wins; an exact tie is a draw, like the base time end.
-        blue = self.server.teams[TEAM1].score
-        green = self.server.teams[TEAM2].score
-        if blue == green:
-            await self._end_in_draw()
-        else:
-            await self._end_by_score(TEAM1 if blue > green else TEAM2)
-
-    async def _end_in_draw(self) -> None:
-        if self.ended:
-            return
-        await self.broadcast_localised_message("GAME_DRAWN")
-        await self.on_mode_end(None)
 
     def _award_presence_scores(self, now: float) -> None:
         """MH_SCORE_OCCUPY / MH_SCORE_CONTEST every MH_SCORE_OCCUPY_INTERVAL.

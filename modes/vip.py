@@ -1,4 +1,4 @@
-"""VIP mode: protect each team's boss, then eliminate the survivors.
+"""VIP mode: win by killing three opposing bosses.
 
 The retail client already contains the gangster and boss character models. The
 server owns the round state machine, promotes one player per team to the
@@ -50,6 +50,10 @@ SUDDEN_DEATH_DAMAGE_TYPE = 4
 # the retail VIP amounts were not recovered.
 VIP_SCORE_ASSAULT = int(CG.CTF_SCORE_ASSAULT)
 VIP_SCORE_ASSAULT_ENEMY = int(CG.CTF_SCORE_ASSAULT_ENEMY)
+# New server rules for the six-second post-VIP-death final minute.
+VIP_SUDDEN_DEATH_GRACE_SECONDS = 6.0
+VIP_FINAL_MINUTE_SECONDS = 60.0
+
 # Damage on the enemy VIP older than this earns no "VIP Assault" credit; the
 # same bounded window as the generic assist (server/combat_scores.py).
 VIP_ASSAULT_ENEMY_WINDOW = 10.0
@@ -72,12 +76,12 @@ def _other_team(team: int) -> int:
 class VIPMode(BaseMode):
     """Run the retail gangster VIP rules as a bounded state machine.
 
-    Both teams respawn until their own VIP dies. That team then enters sudden
-    death and its remaining lives become permanent. The opposing team keeps
-    respawning while its VIP remains alive. Eliminating every survivor on a
-    VIP-less team awards one round. The configured number of sub-rounds is
-    played, then the team with more round wins takes the match (a tie draws).
-    This round-count policy is inferred; the retail server is not recovered.
+    Both teams respawn until their own VIP dies. Killing an opposing VIP
+    immediately earns a team point and reveals the survivors to the attackers.
+    Six seconds later those survivors lose HP and at most a minute remains in
+    the sub-round. Reaching the VIP kill target does not interrupt the
+    current sub-round: the opposing team has time to counterattack.
+    A 3:3 tie immediately ends the match in a draw, without overtime.
     """
 
     name = "VIP"
@@ -156,8 +160,14 @@ class VIPMode(BaseMode):
         self._vip_attackers: dict[int, dict[int, tuple[object, float]]] = {
             TEAM1: {}, TEAM2: {},
         }
-        # Sub-rounds finished this match (RULE_VIP_NOOF_ROUNDS counts them).
+        # RULE_VIP_NOOF_ROUNDS now means VIP kills required to win the match.
+        # A sub-round ends independently when survivors are cleared or its
+        # capped timer runs out. Never overwrite BaseMode.time_limit.
         self.rounds_played = 0
+        self._subround_deadline: float | None = None
+        self._vip_points_awarded: set[int] = set()
+        # The set contains teams whose players can see opposing enemy icons.
+        self._revealed_enemy_to: set[int] = set()
 
     async def on_mode_start(self) -> None:
         """Reset the full match and wait until both teams can choose a VIP."""
@@ -177,10 +187,10 @@ class VIPMode(BaseMode):
                 player.apply_class_selection(self._ordinary_selection(player))
         await self._begin_round(reset_players=False)
         logger.info(
-            "VIP mode started (rounds=%d selection=%.1fs intermission=%.1fs)",
+            "VIP UPDATE 2026-10-13: first to %d VIP kills, enemy radar on kill, "
+            "6-second grace, final 60-second sub-round, instant draw on 3:3 (selection=%.1fs)",
             self.score_limit,
             self.selection_delay,
-            self.round_intermission,
         )
 
     async def deactivate(self) -> None:
@@ -191,6 +201,34 @@ class VIPMode(BaseMode):
         self._clear_sudden_death()
         self._clear_vip_markers()
         await super().deactivate()
+
+    def countdown_seconds_remaining(self, now: float | None = None) -> float:
+        """Provide the actual sub-round countdown to the 1-Hz HUD refresh."""
+        if self._subround_deadline is not None:
+            return max(0.0, self._subround_deadline - time.monotonic())
+        if self.time_limit <= 0:
+            return 0.0
+        return max(0.0, self.time_limit - (
+            (time.time() if now is None else now) - self.start_time))
+
+    def _reset_subround_clock(self) -> None:
+        """Re-arm the inherited 15-minute round clock for the next VIP draw."""
+        self.start_time = time.time()
+        self.elapsed_time = 0.0
+        self._timeout_events_remaining = None
+        self._timeout_music_played = False
+        self._countdown_fired.clear()
+        self._countdown_last_remaining = float("inf")
+
+    async def _end_by_time(self) -> None:
+        """Time ran out in one VIP sub-round; do not end the whole match."""
+        if self.ended or self.phase is VIPPhase.INTERMISSION:
+            return
+        if self.phase is not VIPPhase.ACTIVE:
+            self._reset_subround_clock()
+            return
+        live = [t for t in _PLAYABLE_TEAMS if self.vip_alive.get(t, False)]
+        await self._finish_round(live[0] if len(live) == 1 else None)
 
     async def on_tick(self, tick: int) -> None:
         """Advance selection and elimination checks on the gameplay tick."""
@@ -554,6 +592,8 @@ class VIPMode(BaseMode):
                 and self._is_connected(vip)
             ):
                 self._set_vip_marker(vip, True, connection=connection)
+        for team in sorted(self._revealed_enemy_to):
+            self._set_enemy_map_visibility(team, True, connection=connection)
         self._tell_locked_out(connection)
 
     def _locked_out(self, player) -> bool:
@@ -602,6 +642,11 @@ class VIPMode(BaseMode):
         self._round_reset_queue.clear()
         self._promotion_deaths.clear()
         self._clear_sudden_death()
+        self._vip_points_awarded.clear()
+        # BaseMode treats the timer as a whole-match timer. VIP treats it
+        # as an independent sub-round timer. This also prevents a stale clock
+        # from expiring while clients respawn / the next VIP is selected.
+        self._reset_subround_clock()
 
         if reset_players:
             for player in list(self.server.players.values()):
@@ -717,6 +762,7 @@ class VIPMode(BaseMode):
         for team in _PLAYABLE_TEAMS:
             self._promote_vip(team, selected[team])
         self.vip_alive = {TEAM1: True, TEAM2: True}
+        self._reset_subround_clock()
         self.phase = VIPPhase.ACTIVE
         from server import achievements
 
@@ -837,16 +883,33 @@ class VIPMode(BaseMode):
         vip: Player,
         killer: Player | None,
     ) -> None:
-        """Enter sudden death for one team and play team-relative cues."""
+        """Award one team point and let the attackers locate survivors."""
+        # Redundant queued death/leave callbacks must never grant extra points.
+        # Use the scored-team guard rather than vip_alive: a failed VIP
+        # reassign temporarily sets vip_alive=False before death resolution.
+        if team in self._vip_points_awarded:
+            return
         self.vip_alive[team] = False
         self.respawn_enabled[team] = not self.sudden_death_enabled
         attackers = self._vip_attackers.get(team, {})
         self._vip_attackers[team] = {}
+        scoring_team = _other_team(team)
+        if team not in self._vip_points_awarded:
+            from server.scoreboard import send_team_score
+
+            self._vip_points_awarded.add(team)
+            team_record = self.server.teams[scoring_team]
+            team_record.add_score(1)
+            send_team_score(self.server, team_record)
+            logger.info("VIP killed: team %s scored, score=%s/%s",
+                        scoring_team,
+                        self.server.teams[TEAM1].score,
+                        self.server.teams[TEAM2].score)
+        # Packet 83's team id is the team that GAINS radar visibility.
+        self._reveal_enemies_on_map(scoring_team)
         if self.sudden_death_enabled:
-            # GAME_MODE_CALLBACK_VIP_SUDDEN_DEATH_DELAY: sudden death
-            # activates VIP_SUDDEN_DEATH_DELAY_AFTER_VIP_KILL after the kill.
-            self._sudden_death_activate_at[team] = time.monotonic() + float(
-                CG.VIP_SUDDEN_DEATH_DELAY_AFTER_VIP_KILL
+            self._sudden_death_activate_at[team] = (
+                time.monotonic() + VIP_SUDDEN_DEATH_GRACE_SECONDS
             )
             self._sudden_death_damage_at[team] = None
         if self._is_connected(vip):
@@ -890,11 +953,18 @@ class VIPMode(BaseMode):
             if int(getattr(killer, "team", -1)) != team:
                 self._award_vip_assault_enemy(team, killer, attackers)
 
-        # This compatibility option is useful for servers that want the old
-        # kill-the-boss rule without the elimination phase. The retail rule
-        # keeps sudden death enabled and follows the elimination check below.
-        if not self.sudden_death_enabled:
-            await self._finish_round(_other_team(team))
+        # A lead such as 3:2 must leave the opponents a chance to answer
+        # during the final minute. When that answer ties the score at 3:3,
+        # the entire match ends as a draw immediately, with no extra round.
+        score1 = int(self.server.teams[TEAM1].score)
+        score2 = int(self.server.teams[TEAM2].score)
+        if (self.score_limit > 0
+                and score1 == score2
+                and score1 >= self.score_limit):
+            await self._finish_round(None)
+        elif not self.sudden_death_enabled:
+            # Keep the opt-out's original kill-the-boss instant-end policy.
+            await self._finish_round(scoring_team)
 
     def _award_periodic_scores(self, now: float) -> None:
         """Award the two retail timed VIP score types without catch-up bursts.
@@ -1015,31 +1085,60 @@ class VIPMode(BaseMode):
                 int(C.SCORE_REASON.VIP_ASSAULT_ENEMY_SCORE_REASON),
             )
 
+    def _set_enemy_map_visibility(
+        self, team: int, visible: bool, connection=None
+    ) -> None:
+        """Toggle enemy icons on the minimap for the specified friendly team."""
+        from shared.packet import TeamMapVisibility
+
+        packet = TeamMapVisibility()
+        packet.team_id = int(team)
+        packet.visible = int(bool(visible))
+        data = bytes(packet.generate())
+        if connection is None:
+            self.server.broadcast(data, reliable=True)
+        else:
+            connection.send(data, reliable=True)
+
+    def _reveal_enemies_on_map(self, team: int) -> None:
+        if team not in self._revealed_enemy_to:
+            self._revealed_enemy_to.add(team)
+            self._set_enemy_map_visibility(team, True)
+
+    def _cap_round_time_to_one_minute(self) -> None:
+        """Apply only to this sub-round. Do not touch BaseMode.time_limit."""
+        remaining = self.countdown_seconds_remaining()
+        if self.time_limit <= 0 and self._subround_deadline is None:
+            remaining = float("inf")
+        if remaining <= VIP_FINAL_MINUTE_SECONDS:
+            return
+        self._subround_deadline = time.monotonic() + VIP_FINAL_MINUTE_SECONDS
+        from server.scoreboard import send_round_timer
+        send_round_timer(self.server, VIP_FINAL_MINUTE_SECONDS, reliable=True)
+
     def _clear_sudden_death(self) -> None:
+        self._subround_deadline = None
+        for team in sorted(self._revealed_enemy_to):
+            self._set_enemy_map_visibility(team, False)
+        self._revealed_enemy_to.clear()
         self._sudden_death_activate_at = {TEAM1: None, TEAM2: None}
         self._sudden_death_damage_at = {TEAM1: None, TEAM2: None}
         self._vip_attackers = {TEAM1: {}, TEAM2: {}}
 
     async def _advance_sudden_death(self, now: float) -> None:
-        """Run the retail sudden-death damage over time.
-
-        Values (shared/constants_gamemode.py): sudden death activates
-        VIP_SUDDEN_DEATH_DELAY_AFTER_VIP_KILL (5 s) after a VIP dies and is
-        announced with VIP_SUDDEN_DEATH_ACTIVATED; VIP_SUDDEN_DEATH_TIME
-        (60 s) later every living member of that team starts losing
-        VIP_SUDDEN_DEATH_DAMAGE (1 HP) each VIP_SUDDEN_DEATH_DAMAGE_FREQUENCY
-        (1 s) until the sub-round ends. A stalled tick deals at most one
-        step (no catch-up burst of reliable SetHP packets).
-        """
+        """After 6 s, cap the clock and bleed the VIP-less team once per s."""
+        if self._subround_deadline is not None and now >= self._subround_deadline:
+            live = [t for t in _PLAYABLE_TEAMS if self.vip_alive.get(t, False)]
+            await self._finish_round(live[0] if len(live) == 1 else None)
+            return
         for team in _PLAYABLE_TEAMS:
             if self.ended or self.phase is not VIPPhase.ACTIVE:
                 return
             activate_at = self._sudden_death_activate_at.get(team)
             if activate_at is not None and now >= activate_at:
                 self._sudden_death_activate_at[team] = None
-                self._sudden_death_damage_at[team] = now + float(
-                    CG.VIP_SUDDEN_DEATH_TIME
-                )
+                self._cap_round_time_to_one_minute()
+                self._sudden_death_damage_at[team] = now  # first HP tick at t+6s
                 self.announce_localised(
                     "VIP_SUDDEN_DEATH_ACTIVATED",
                     (self.server.teams[team].name,),
@@ -1154,7 +1253,7 @@ class VIPMode(BaseMode):
         return int(C.TEAM_SCORES_DRAW)
 
     async def _finish_round(self, winner: int | None) -> None:
-        """Score one sub-round, then either finish the match or restart it."""
+        """End a sub-round, then decide whether either team won the match."""
         if self.phase is VIPPhase.INTERMISSION or self.ended:
             return
         from server import achievements
@@ -1164,33 +1263,35 @@ class VIPMode(BaseMode):
         self._clear_sudden_death()
         self._clear_vip_markers()
         self._last_man_announced.clear()
+        self.rounds_played += 1
 
-        # RULE_VIP_NOOF_ROUNDS / VIP_NOOF_ROUNDS_BEFORE_NEXT_MAP (3) is the
-        # number of sub-rounds PLAYED on the map -- the same rule shape and
-        # "_BEFORE_NEXT_MAP" name as Zombie's rounds -- not a win target. The
-        # match winner is the team with more round wins (a tie is a draw).
-        # Inferred without a retail capture (rules audit 2026-09-27 #15).
-        self.rounds_played = int(getattr(self, "rounds_played", 0)) + 1
-        last_round = self.rounds_played >= self.score_limit
-        if winner is None:
-            if last_round:
-                await self._end_by_time()
+        # VIP deaths award points immediately; _finish_round never awards
+        # another point. The match ends once a team has the required score
+        # after the final sub-round, or immediately if the last VIP kill
+        # equalised the score at 3:3 (no tiebreak round).
+        score1 = int(self.server.teams[TEAM1].score)
+        score2 = int(self.server.teams[TEAM2].score)
+        if self.score_limit > 0 and max(score1, score2) >= self.score_limit:
+            if score1 != score2:
+                winning_team = TEAM1 if score1 > score2 else TEAM2
+                await self._end_by_score(winning_team)
                 return
+            logger.info(
+                "VIP draw: %d:%d after %d sub-rounds; ending match",
+                score1, score2, self.rounds_played,
+            )
+            # self._end_by_time is overridden by VIP to finish only one
+            # sub-round, so explicitly call BaseMode's end-of-match flow.
+            await super()._end_by_time()
+            return
+
+        if winner is None:
             await self.broadcast_localised_message("GAME_DRAWN")
         else:
-            from server.scoreboard import send_team_score
-
-            team = self.server.teams[winner]
-            team.add_score(1)
-            send_team_score(self.server, team)
-            if last_round:
-                # The match-end sequence announces TEAM_DEFEAT itself.
-                await self._end_by_time()
-                return
             await self.broadcast_localised_message(
-                "TEAM_DEFEAT", (team.name,), localise_parameters=True
+                "TEAM_DEFEAT", (self.server.teams[winner].name,),
+                localise_parameters=True,
             )
-
         self._round_task = asyncio.create_task(self._round_intermission_task())
 
     async def _round_intermission_task(self) -> None:

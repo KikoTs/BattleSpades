@@ -86,7 +86,7 @@ SND_PAINT = 47
 # Retail scheduled it through GAME_MODE_CALLBACK_ZOMBIE_PICK_SOUND, a
 # separate callback ahead of GAME_MODE_CALLBACK_ZOMBIE_PICK, so it is started
 # this long before the pick rather than when the 60 s clock arms.
-ZOMBIE_TIMER_SOUND_LEAD = 8.0
+ZOMBIE_TIMER_SOUND_LEAD = 4.0
 
 # Skyboxes of the space maps: the airstrike uses its "_space" flyby there.
 SPACE_SKYBOXES = frozenset(("LunarBase.txt", "User_Lunar.txt"))
