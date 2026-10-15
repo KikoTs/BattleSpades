@@ -405,7 +405,7 @@ def test_vip_sudden_death_team_gets_the_never_respawn_sentinel():
 # -- #15: VIP rounds played ---------------------------------------------------------------
 
 
-def test_vip_match_ends_after_the_configured_rounds_played():
+def test_vip_match_ends_at_the_kill_target_not_the_number_of_subrounds():
     import asyncio
 
     from modes.vip import VIPMode, VIPPhase
@@ -416,24 +416,32 @@ def test_vip_match_ends_after_the_configured_rounds_played():
     mode.score_limit = 3
     ends = []
 
-    async def end_by_time():
-        ends.append(mode.rounds_played)
+    async def end_by_score(winner):
+        ends.append((winner, mode.rounds_played))
 
-    mode._end_by_time = end_by_time
+    mode._end_by_score = end_by_score
 
     async def play():
-        for winner in (TEAM1, None, TEAM2):
+        for winner in (TEAM1, None, TEAM2, TEAM1):
+            # VIP deaths award match points; sub-round completion must not
+            # award a second point or count a draw toward the kill target.
+            if winner is not None:
+                server.teams[winner].score += 1
             mode.phase = VIPPhase.ACTIVE
             await mode._finish_round(winner)
+            assert ends == []
             task = getattr(mode, "_round_task", None)
             if task is not None:
                 task.cancel()
                 mode._round_task = None
+        server.teams[TEAM1].score += 1
+        mode.phase = VIPPhase.ACTIVE
+        await mode._finish_round(TEAM1)
 
     asyncio.run(play())
-    assert mode.rounds_played == 3
-    assert ends == [3]
-    assert server.teams[TEAM1].score == 1 and server.teams[TEAM2].score == 1
+    assert mode.rounds_played == 5
+    assert ends == [(TEAM1, 5)]
+    assert server.teams[TEAM1].score == 3 and server.teams[TEAM2].score == 1
 
 
 # -- #12: CTF claim ---------------------------------------------------------------------

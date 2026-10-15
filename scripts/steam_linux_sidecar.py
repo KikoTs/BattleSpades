@@ -31,13 +31,26 @@ else:
 
 # This helper is installed with check_steam_registration.py alone, without the
 # server package. Tests pin its public-mode contract to server.mode_data.
-PUBLIC_MODES = ("tdm", "ctf", "cctf", "zom", "vip", "tc", "dia", "dem", "mh", "oc")
+_BASE_MODES = ("tdm", "ctf", "cctf", "zom", "vip", "tc", "dia", "dem", "mh", "oc")
+PUBLIC_MODES = _BASE_MODES + tuple("hc_" + code for code in _BASE_MODES) + (
+    "block_hunt", "false_wall", "crumbling_run", "last_exit", "night_shift",
+    "tunnel_rats", "bridge_chicken", "towerfall", "floor_tax", "hot_potato",
+    "lockdown", "paint_raid", "smugglers_run", "one_in_the_spade",
+    "borrowed_arsenal", "reverse_siege", "kingmaker", "red_light_raid",
+    "scrapyard_engineers", "spadeball",
+)
 _MODE_ALIASES = {
     "zombie": "zom", "classic_ctf": "cctf", "classic-ctf": "cctf",
     "multihill": "mh", "multi-hill": "mh", "territory_control": "tc",
     "territory-control": "tc", "diamond": "dia", "diamond_mine": "dia",
     "demolition": "dem", "occupation": "oc",
+    "prop_hunt": "block_hunt", "prophunt": "block_hunt", "bhop": "crumbling_run",
+    "parkour": "crumbling_run", "extraction": "last_exit", "survival": "night_shift",
+    "ffa": "borrowed_arsenal", "spleef": "floor_tax", "gun_game": "borrowed_arsenal",
+    "koth": "kingmaker", "one_in_the_chamber": "one_in_the_spade",
+    "bridge_race": "bridge_chicken",
 }
+_MODE_ALIASES.update(("hardcore_" + code, "hc_" + code) for code in _BASE_MODES)
 _REGION_ALIASES = {
     "us_west": "us_west", "uswest": "us_west", "usw": "us_west", "west": "us_west",
     "us_east": "us_east", "useast": "us_east", "use": "us_east", "east": "us_east",

@@ -171,7 +171,8 @@ def _canonical_mode(mode_id: str) -> str:
     # Spaces and hyphens are spelling noise ("Classic CTF", "multi-hill");
     # class-name fallbacks arrive run together ("DiamondMine").
     normalized = "_".join(str(mode_id).strip().lower().replace("-", " ").split())
-    return _MODE_ALIASES.get(normalized, normalized)
+    from server.hardcore import canonical
+    return canonical(_MODE_ALIASES.get(normalized, normalized))
 
 
 def canonical_mode_id(mode_id: str) -> str:
@@ -184,6 +185,11 @@ def mode_strategy_for(mode_id: str) -> ModeBotStrategy:
     """Return the declared strategy for every protocol and public mode."""
 
     from modes.unofficial.catalog import CATALOG
+    from server.hardcore import base_code
+    code = _canonical_mode(mode_id)
+    base = base_code(code)
+    if base != code:
+        return replace(_MODE_STRATEGIES[base], code=code)
     spec = CATALOG.get(_canonical_mode(mode_id))
     if spec is not None:
         return ModeBotStrategy(spec.code, spec.description, ModeBotPosture.BALANCED)
@@ -2160,6 +2166,12 @@ def objective_decision_for(
     if frame.fun is not None:
         from .unofficial import decision_for
         return decision_for(frame, observer)
+    from server.hardcore import base_code
+    # Hardcore changes loadouts and damage, but keeps the base objectives.
+    # Normalize the frame too: policies inspect its mode for role details.
+    base = base_code(_canonical_mode(frame.mode_id))
+    if base != frame.mode_id:
+        frame = replace(frame, mode_id=base)
     decision = _POLICIES.get(
         _canonical_mode(frame.mode_id), _FALLBACK
     ).decide(frame, observer)
@@ -2325,7 +2337,7 @@ class ModePolicyMemory:
                                      or now < previous.last_seen):
             previous = None
         if previous is not None:
-            if (_canonical_mode(frame.mode_id) == "vip"
+            if (_canonical_mode(frame.mode_id) in ("vip", "hc_vip")
                     and previous.decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
                     and decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
                     and now - previous.role_since < 8):

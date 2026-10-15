@@ -228,6 +228,11 @@ def test_production_bot_completes_route_with_native_physics(terrain: str, class_
         bot = await director.add_bot(team=TEAM1, name="Detour", class_id=int(
             C.CLASS_ENGINEER if flying else class_id))
         assert bot is not None
+        if not flying and bot.class_id != class_id:
+            # Exercise every native body, including server-only VIP/zombie
+            # variants which ordinary TDM admission intentionally rejects.
+            from server.class_selection import normalize_class_selection
+            bot.apply_class_selection(normalize_class_selection(class_id))
         assert bot.class_id == (int(C.CLASS_ENGINEER) if flying else class_id)
         if flying:
             bot.jetpack_id = int(C.JETPACK2 if terrain == "rocketeer_gap" else C.JETPACK_ENGINEER)

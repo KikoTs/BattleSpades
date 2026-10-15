@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import shared.constants as C
 import shared.constants_gamemode as CG
 
-from modes.vip import SUDDEN_DEATH_DAMAGE_TYPE, VIP_SCORE_ASSAULT, VIP_SCORE_ASSAULT_ENEMY, VIPPhase
+from modes.vip import SUDDEN_DEATH_DAMAGE_TYPE, VIP_SCORE_ASSAULT, VIP_SCORE_ASSAULT_ENEMY, VIP_SUDDEN_DEATH_GRACE_SECONDS, VIPPhase
 from modes.zombie import SURVIVOR_TEAM, ZOMBIE_TEAM, ZombieMode
 from server.game_constants import TEAM1, TEAM2
 from shared.bytes import ByteReader
@@ -70,10 +70,11 @@ def test_sudden_death_announces_after_delay_then_drains_one_hp_per_second(monkey
     green = [p for p in server.players.values() if p.team == TEAM2]
     server.packets.clear()
 
-    now[0] += float(CG.VIP_SUDDEN_DEATH_DELAY_AFTER_VIP_KILL) - 0.1
+    now[0] += VIP_SUDDEN_DEATH_GRACE_SECONDS - 0.1
     asyncio.run(mode.on_tick(2))
     assert not any(m.string_id == "VIP_SUDDEN_DEATH_ACTIVATED"
                    for m in _decode(server.packets, LocalisedMessage))
+    assert all(p.health == 100 for p in blue + green)
 
     now[0] += 0.2
     asyncio.run(mode.on_tick(3))
@@ -82,13 +83,7 @@ def test_sudden_death_announces_after_delay_then_drains_one_hp_per_second(monkey
     assert len(activated) == 1
     assert list(activated[0].parameters) == [server.teams[TEAM1].name]
 
-    # No damage during the VIP_SUDDEN_DEATH_TIME grace.
-    now[0] += float(CG.VIP_SUDDEN_DEATH_TIME) - 0.5
-    asyncio.run(mode.on_tick(4))
-    assert all(p.health == 100 for p in blue + green)
-
-    now[0] += 0.5
-    asyncio.run(mode.on_tick(5))
+    # The first damage step starts as the six-second grace ends.
     assert [p.health for p in blue] == [100 - int(CG.VIP_SUDDEN_DEATH_DAMAGE)] * len(blue)
     assert all(p.health == 100 for p in green)
     rows = _decode(blue[0].connection.sent, SetHP)

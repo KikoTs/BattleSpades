@@ -78,6 +78,27 @@ def test_ctf_carrier_routes_to_own_base() -> None:
     ) == own_base.position
 
 
+def test_hardcore_ctf_carrier_uses_capture_policy_instead_of_combat_fallback() -> None:
+    carrier = _player(1, 2, carried=99)
+    own_base = ObjectiveSnapshot("ctf_base", 2, (20.0, 30.0, 60.0))
+    enemy_anchor = ObjectiveSnapshot("team_anchor", 3, (400.0, 400.0, 60.0))
+    for code in ("hc_ctf", "hardcore_ctf", "hc_cctf"):
+        assert objective_goal_for(
+            _frame(code, carrier, objectives=(own_base, enemy_anchor)), carrier,
+        ) == own_base.position
+
+
+def test_hardcore_vip_keeps_guard_roles() -> None:
+    guard = _player(2, 2)
+    attacker = _player(3, 2)
+    own_vip = ObjectiveSnapshot("vip", 2, (50.0, 50.0, 60.0), carrier_id=10)
+    enemy_vip = ObjectiveSnapshot("vip", 3, (300.0, 300.0, 60.0), carrier_id=11)
+    decision = objective_decision_for(
+        _frame("hc_vip", guard, attacker, objectives=(own_vip, enemy_vip)), guard,
+    )
+    assert decision.role == "vip_guard_formation"
+
+
 def test_vip_guard_and_attacker_have_distinct_goals() -> None:
     guard = _player(2, 2)
     attacker = _player(3, 2)

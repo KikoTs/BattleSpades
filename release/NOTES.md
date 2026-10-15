@@ -17,6 +17,8 @@ hardens their player admission and round lifecycle.
   results and timers before waiting for the next ready roster.
 - Non-Zombie Hardcore variants replace forged zombie selections with a legal
   human role at the join boundary.
+- Hardcore bot strategies retain the base mode's flag, VIP and other objective
+  policies. The standalone Steam sidecar accepts all community and Hardcore codes.
 
 Thanks to DmitrySenpai for game mode development and fixes.
 

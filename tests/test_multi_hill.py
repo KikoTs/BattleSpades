@@ -265,7 +265,7 @@ def test_kills_on_the_hill_award_defend_and_assault(monkeypatch):
     assert green.score == int(CG.MH_SCORE_ASSAULT)
 
 
-def test_simultaneous_limit_is_deterministic(monkeypatch):
+def test_high_scores_continue_until_time_expires_then_resolve_deterministically(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("modes.multi_hill.time.time", lambda: now[0])
     server = _Server()
@@ -285,6 +285,10 @@ def test_simultaneous_limit_is_deterministic(monkeypatch):
     server.teams[TEAM1].score = 99
     server.teams[TEAM2].score = 99
     asyncio.run(mode._award_team_ticks(101.0))
+    assert ends == []
+    assert server.teams[TEAM1].score >= 100
+    assert server.teams[TEAM2].score == server.teams[TEAM1].score
+    asyncio.run(mode._end_by_time())
     assert ends == [None]
     assert "GAME_DRAWN" in _ids(server.packets)
 
@@ -294,13 +298,13 @@ def test_simultaneous_limit_is_deterministic(monkeypatch):
     server.teams[TEAM1].score = 99
     server.teams[TEAM2].score = 100
     asyncio.run(mode._award_team_ticks(102.0))
+    assert ends == []
+    asyncio.run(mode._end_by_time())
     assert ends == [TEAM2]
 
 
-def test_multihill_score_limit_comes_from_modes_overlay_not_a_phantom_rule():
-    """Retail has no Multi-Hill score-target rule (the lobby's mh rules are
-    only max active bases and base active time); [modes.mh] score_limit
-    sets the target and mode_data's 100 is the default."""
+def test_multihill_remains_time_only_even_with_a_legacy_score_limit_overlay():
+    """Old score-target configuration must not end the time-only match."""
     import shared.constants_matchmaking as MM
     from server.config import ServerConfig
     from server.game_rules import RULE_DEFINITIONS
@@ -312,7 +316,7 @@ def test_multihill_score_limit_comes_from_modes_overlay_not_a_phantom_rule():
     config = ServerConfig()
     server = _Server()
     server.config = config
-    assert MultiHillMode(server).score_limit == 100
+    assert MultiHillMode(server).score_limit == 0
 
     config.mode_settings = {"mh": {"score_limit": 250}}
-    assert MultiHillMode(server).score_limit == 250
+    assert MultiHillMode(server).score_limit == 0

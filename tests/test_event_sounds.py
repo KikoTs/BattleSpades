@@ -228,16 +228,16 @@ def test_zombie_pick_countdown_sound_ends_on_the_pick(monkeypatch):
     assert mode.phase is ZombiePhase.COUNTDOWN
     assert audio.SND_ZOMBIE_TIMER not in _sound_ids(server.packets)
 
-    now[0] += 51.0  # 9 s left
+    now[0] += 60.0 - audio.ZOMBIE_TIMER_SOUND_LEAD - 1.0
     asyncio.run(mode.on_tick(1))
     assert audio.SND_ZOMBIE_TIMER not in _sound_ids(server.packets)
 
-    now[0] += 1.5  # 7.5 s left
+    now[0] += 1.5  # Inside the countdown sound's lead window.
     asyncio.run(mode.on_tick(2))
     asyncio.run(mode.on_tick(3))
     assert _sound_ids(server.packets).count(audio.SND_ZOMBIE_TIMER) == 1
 
-    now[0] += 8.0
+    now[0] += audio.ZOMBIE_TIMER_SOUND_LEAD
     asyncio.run(mode.on_tick(4))
     assert mode.phase is ZombiePhase.ACTIVE
     ids = _sound_ids(server.packets)

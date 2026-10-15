@@ -232,5 +232,5 @@ def test_medpack_heals_a_boosted_vip_below_their_max():
     player = _NS(team=2, health=150, max_health=200, heal=healed.append)
     medpack = MedpackBehavior.__new__(MedpackBehavior)
     medpack.team, medpack.heal_amount, medpack.uses = 2, 50, 3
-    medpack.on_touch(None, player, None)
+    medpack.on_touch(None, player, _NS(server=_NS(config=None)))
     assert healed == [50]

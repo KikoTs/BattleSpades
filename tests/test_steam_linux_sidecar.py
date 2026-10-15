@@ -110,7 +110,7 @@ def test_canonical_regions_survive_cli_and_advertisement(region):
             == ([f"region={region}"] if region else []))
 
 
-@pytest.mark.parametrize("mode", ["tc", "vip", "cctf", "dem", "mh", "oc"])
+@pytest.mark.parametrize("mode", sidecar.PUBLIC_MODES)
 def test_mode_flags_match_main_server_advertisement(mode):
     from server.config import ServerConfig
     from server.steam_master import build_game_tags
