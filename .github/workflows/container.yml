@@ -23,7 +23,9 @@ jobs:
   test:
     name: Source and container contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The complete native map and body-physics matrix can exceed 45 minutes
+    # on shared runners. Keep the same validation budget as portable releases.
+    timeout-minutes: 150
 
     steps:
       - name: Check out source
