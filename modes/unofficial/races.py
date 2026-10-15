@@ -53,6 +53,14 @@ class CourseMode(FunMode):
             self.teleport(player, self.get_spawn_point(player))
             self.show_checkpoint(player)
 
+    async def on_player_join(self, player):
+        await super().on_player_join(player)
+        if player in self.participants:
+            self.checkpoint.setdefault(player, 0)
+            self.penalty.setdefault(player, 0.0)
+            if self.phase == "live":
+                self.show_checkpoint(player)
+
     def show_checkpoint(self, player):
         from modes.objective_zones import around, minimap_zone_packet, minimap_zone_clear_packet
         import shared.constants_gamemode as CG

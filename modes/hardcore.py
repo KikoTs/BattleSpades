@@ -31,6 +31,8 @@ class HardcoreMixin:
     def prepare_join_selection(self, team: int, selection: ClassSelection) -> ClassSelection:
         if self.mode_code == "zom":
             return super().prepare_join_selection(team, selection)
+        if selection.class_id not in HC.BY_CLASS:
+            return HC.normalize_selection(HC.CLASS_IDS[0])
         return HC.normalize_selection(selection.class_id, selection.loadout)
 
     def allows_class_selection(self, player: Player, selection: ClassSelection) -> bool:

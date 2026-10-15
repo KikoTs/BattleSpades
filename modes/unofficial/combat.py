@@ -196,6 +196,17 @@ class HotPotato(FunMode):
     async def begin_round(self):
         self.choose_holder()
 
+    async def on_player_join(self, player):
+        await super().on_player_join(player)
+        if player in self.participants:
+            self.lives.setdefault(player, 3)
+
+    async def on_player_leave(self, player):
+        if player is self.holder:
+            self.pass_to(None)
+        self.lives.pop(player, None)
+        await super().on_player_leave(player)
+
     def choose_holder(self, exclude=None):
         candidates = sorted((p for p in self.alive() if p is not exclude), key=lambda p: p.id)
         turn = getattr(self, "holder_turn", 0)

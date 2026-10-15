@@ -98,6 +98,24 @@ async def start(mode):
     await mode.on_tick(2)
 
 
+def test_restart_without_a_ready_roster_clears_previous_round_state():
+    async def scenario():
+        server, mode, blue, green, _ = make_game("block_hunt")
+        await start(mode)
+        mode.eliminated.add(blue)
+        mode.points[blue] = 2
+        await mode.finish((TEAM1,))
+        server.players.pop(green.id)
+        await mode.on_mode_start()
+        await mode.on_tick(3)
+        assert mode.phase == "waiting" and mode.round_number == 0
+        assert not mode.participants and not mode.eliminated
+        assert not mode.points and not mode.match_points and not mode.last_result
+        assert mode.deadline == 0.0
+        await mode.deactivate()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.code)
 def test_every_mode_starts_ticks_and_resets_without_killing_winners(spec):
     async def scenario():

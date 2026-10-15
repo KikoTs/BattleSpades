@@ -120,6 +120,17 @@ def test_hardcore_rules_are_live_scoped_and_do_not_mutate_normal_rules():
     assert config.game_rules.values == before
 
 
+@pytest.mark.parametrize("base", [code for code in HC.BASE_MODES if code != "zom"])
+def test_non_zombie_hardcore_join_replaces_forged_zombie_class(base):
+    server = game("hc_" + base)
+    selection = normalize_server_selection(server.config, C.CLASS_ZOMBIE)
+    joined = server.mode.prepare_join_selection(TEAM1, selection)
+    assert joined.class_id in HC.CLASS_IDS
+    assert C.ZOMBIEHAND_TOOL not in joined.loadout
+    player = human(server, C.CLASS_ZOMBIE)
+    assert player.class_id in HC.CLASS_IDS and player.health == 100
+
+
 def test_heavy_armour_only_affects_body_bullets_and_resets_stock_class_resistance():
     from server.combat_runtime import CombatSystem
     from server.weapons_retail import class_damage_multiplier, class_headshot_multiplier

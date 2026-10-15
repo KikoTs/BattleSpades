@@ -16,6 +16,46 @@ async def drain(server):
             await handler(*args)
 
 
+@pytest.mark.parametrize("code", ("crumbling_run", "red_light_raid"))
+def test_late_race_joiner_can_complete_every_checkpoint(code):
+    async def scenario():
+        server, mode, _, _, now = make_game(code)
+        await start(mode)
+        late = add_player(server, 2, TEAM1)
+        server.respawn_player(late)
+        await mode.on_player_join(late)
+        assert late in mode.participants and mode.penalty[late] == 0.0
+        for checkpoint in mode.course[1:]:
+            late.position = checkpoint
+            now[0] += .1
+            await mode.tick_live(now[0], .1)
+        assert late in mode.finished
+        assert mode.finished[late] == pytest.approx(now[0] - mode.race_start)
+    asyncio.run(scenario())
+
+
+def test_hot_potato_late_join_has_three_lives_and_departing_carrier_is_cleared():
+    async def scenario():
+        server, mode, blue, green, now = make_game("hot_potato")
+        await start(mode)
+        late = add_player(server, 2, TEAM1)
+        server.respawn_player(late)
+        await mode.on_player_join(late)
+        assert mode.lives[late] == 3
+        mode.lives[blue] = 0
+        mode.eliminated.add(blue)
+        await mode.tick_live(now[0], .1)
+        assert mode.phase == "live"  # Green and the late joiner still compete.
+        mode.pass_to(late)
+        await mode.on_player_leave(late)
+        server.players.pop(late.id)
+        assert mode.holder is None and late not in mode.lives
+        assert late.pickup_id is None
+        await mode.tick_live(now[0], .1)
+        assert mode.last_result == (green,)
+    asyncio.run(scenario())
+
+
 def test_false_wall_stash_once_and_enemy_cache_delivery():
     async def scenario():
         _, mode, blue, green, now = make_game("false_wall")

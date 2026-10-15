@@ -127,7 +127,14 @@ class FunMode(BaseMode):
         await super().on_mode_start()
         self.phase = "waiting"
         self.round_number = 0
+        self.participants.clear()
+        self.eliminated.clear()
+        self.points.clear()
         self.match_points.clear()
+        self.last_result = ()
+        self.deadline = 0.0
+        self._last_tick = self.clock()
+        self._timer_at = 0.0
         self._notified.clear()
         self._load_arena()
         from aoslib.vxl import VXL

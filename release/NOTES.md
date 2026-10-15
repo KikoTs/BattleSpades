@@ -1,5 +1,26 @@
-BattleSpades Beta 0.3 (0.3.0-beta.1) improves map hosting, Workshop browsing and
-LAN discovery, alongside the matching BattleSpades client release.
+BattleSpades Server 0.3.0-beta.2 adds the community and Hardcore playlists and
+hardens their player admission and round lifecycle.
+
+## Game modes
+
+- Thirteen curated unofficial modes, themed arenas, mode-aware bots, rules
+  messages and objective markers. See docs/UNOFFICIAL_MODES.md for the playlist.
+- Ten Hardcore variants of the standard modes, with five class roles, validated
+  equipment, shared movement rules, body armour and controlled medpack healing.
+  Hardcore requires the updated native client; ordinary and community modes
+  retain their existing retail compatibility.
+- Late race joiners can complete checkpoints and finish without a missing
+  penalty entry interrupting the round.
+- Hot Potato grants late joiners three lives and clears a departing carrier's
+  pickup and life tracking immediately.
+- Restarting a community match clears previous participants, eliminations,
+  results and timers before waiting for the next ready roster.
+- Non-Zombie Hardcore variants replace forged zombie selections with a legal
+  human role at the join boundary.
+
+Thanks to DmitrySenpai for game mode development and fixes.
+
+The following map and hosting improvements from Beta 0.3 remain included.
 
 ## Maps and Workshop
 
@@ -34,7 +55,7 @@ These are BattleSpades/retail Protocol 168 servers. Importing an original VXL
 map does not turn the server into a 0.75/0.76 protocol endpoint or execute the
 original map's Python scripts.
 
-Matching client: https://github.com/KikoTs/BattleSpadesClient/releases/tag/v0.3.0-beta.1
+Matching client: https://github.com/KikoTs/BattleSpadesClient/releases/tag/v0.3.0-beta.4
 
 Every archive must pass the complete source suite and packaged-launcher checks
 on its platform before publication. SHA256SUMS.txt covers all six archives.
