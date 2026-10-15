@@ -49,7 +49,7 @@ def _breach_for(tool_id: int, *, built: bool):
             VoxelChange(*cell, True, 0x808080, health=BUILT_BLOCK_HEALTH)
             for cell in WALL
         )))
-    observer = SimpleNamespace(can_shoot=True, loadout=(tool_id,))
+    observer = SimpleNamespace(can_shoot=True, can_dig=True, loadout=(tool_id,))
     plan = world.plan(
         (12.5, 10.5, 17.75),
         (17.5, 10.5, 17.75),
@@ -85,6 +85,14 @@ def test_removed_built_cell_forgets_its_health() -> None:
     world, _breach = _breach_for(int(C.SPADE_TOOL), built=True)
     world.apply(WorldDelta(0, 2, (VoxelChange(13, 10, 18, False),)))
     assert world.block_health(13, 10, 18) == MAP_BLOCK_HEALTH
+
+
+def test_mode_dig_restriction_removes_breach_navigation() -> None:
+    observer = SimpleNamespace(
+        can_shoot=True, can_dig=False, loadout=(int(C.SPADE_TOOL),)
+    )
+    assert _dig_profile(observer) is None
+    assert MovementAffordance.BREACH not in _movement_abilities(observer)
 
 
 def test_zombie_hand_breach_timeout_covers_every_retail_damage_roll() -> None:
