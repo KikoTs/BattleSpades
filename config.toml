@@ -464,7 +464,7 @@ round_intermission = 7.0
 time_limit = 600
 infection_delay = 60.0 # retail ZOM_TIME_BEFORE_FIRST_INFECTION
 minimum_players = 2
-zombie_respawn_time = 0.0
+zombie_respawn_time = 10.0
 
 # The five objective modes below (Multi-Hill, Territory Control, Diamond Mine,
 # Demolition, Occupation) are fully playable: each runs its objective state
