@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 import logging
 import math
 import time
+from types import SimpleNamespace
 
 import shared.constants as C
 import shared.constants_gamemode as CG
@@ -12,7 +15,12 @@ import shared.constants_gamemode as CG
 from server import achievements, mode_data
 from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL
 
-from .airstrike import trigger_airstrike
+from .airstrike import (
+    AIRSTRIKE_SPEC,
+    NO_OWNER_PLAYER_ID,
+    _sound_airstrike_flyby,
+    sound_airstrike_siren,
+)
 from .base_mode import BaseMode
 from .territory_control import CapturePointResupply
 from .objective_zones import (
@@ -28,7 +36,17 @@ logger = logging.getLogger(__name__)
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
 _NEUTRAL_COLOR = (255, 255, 255)
+_CONTESTED_COLOR = (255, 0, 0)  # Both teams present: show the hill in red.
 _FALLBACK_RADIUS = 16.0
+# Identical positions and launch speed to the working retail airstrike.
+# The difference is WHEN each shell is spawned, not its physics.
+_AIRSTRIKE_PATTERN = (
+    (0.0, 0.0),
+    (-5.0, 0.0),
+    (5.0, 0.0),
+    (0.0, -5.0),
+    (0.0, 5.0),
+)
 # Boundary flicker must not replay "Hill contested!" every capture tick; the
 # retail TC shout cooldown (TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN) is reused.
 _CONTESTED_SHOUT_COOLDOWN = float(CG.TC_NEW_TEAM_ENTERS_SHOUT_COOLDOWN)
@@ -65,7 +83,7 @@ class MultiHillMode(BaseMode):
     mode_code = "mh"
     # This is also set per-instance. Never inherit BaseMode's score target.
     score_limit = 0
-    BUILD_MARKER = "MH_TIME_ONLY_2026_10_13_V3"
+    BUILD_MARKER = "MH_AIRSTRIKE_FIXED_2026_10_16_V7"
 
     def __init__(self, server) -> None:
         super().__init__(server)
@@ -109,6 +127,20 @@ class MultiHillMode(BaseMode):
         self._next_activation_at = 0.0
         self._last_score_at = 0.0
         self.resupply = CapturePointResupply(server, self.mode_code)
+        # No per-tick polling to launch shells: the first one is spawned
+        # synchronously when the zone expires, the rest by an asyncio task.
+        overlay = getattr(getattr(server, "config", None), "mode_settings", {}).get(
+            self.mode_code, {}
+        )
+        if not isinstance(overlay, dict):
+            overlay = {}
+        self.airstrike_shell_interval = max(
+            0.15, float(overlay.get("airstrike_shell_interval", 0.65))
+        )
+        self._airstrike_shell_queue: deque[
+            tuple[tuple[float, float, float], float, float, bool]
+        ] = deque()
+        self._airstrike_task: asyncio.Task | None = None
 
     def configure_state_data(self, packet) -> None:
         """Tell stock clients this match has NO score target.
@@ -135,6 +167,7 @@ class MultiHillMode(BaseMode):
         )
 
     async def on_mode_start(self) -> None:
+        await self._cancel_airstrike_task()
         self.score_limit = 0
         await super().on_mode_start()
         # Some server wrappers reload configured limits at a round restart.
@@ -170,6 +203,7 @@ class MultiHillMode(BaseMode):
         )
 
     async def deactivate(self) -> None:
+        await self._cancel_airstrike_task()
         self._clear_active_zones()
         await super().deactivate()
 
@@ -228,7 +262,7 @@ class MultiHillMode(BaseMode):
                             self.server, zone,
                             self.zone_occupants.get(zone.index),
                         )
-                        trigger_airstrike(self.server, zone.center)
+                        self._start_airstrike(zone.center)
                     self._clear_active_zones()
                     self.zone_occupants = {}
                     self.phase = "intermission"
@@ -250,6 +284,106 @@ class MultiHillMode(BaseMode):
                 "Multi-Hill forced clock result after timeout drain delay"
             )
             await self._end_by_time()
+
+    def _start_airstrike(self, center) -> None:
+        """Start a real, five-shell objective airstrike immediately.
+
+        The first shell is launched during hill expiry (as in the working V5),
+        so no later tick is needed to make the strike visible. Remaining
+        shells are spaced in real time. Multiple expiring hills share a single
+        sequence, preventing simultaneous bursts.
+        """
+        if self.ended or getattr(self, "retiring", False):
+            return
+        center = tuple(float(value) for value in center[:3])
+        sound_airstrike_siren(self.server, center)
+        for index, (dx, dy) in enumerate(_AIRSTRIKE_PATTERN):
+            self._airstrike_shell_queue.append((center, dx, dy, index == 0))
+
+        logger.info(
+            "%s: airstrike at %s queued (%d shells)",
+            self.BUILD_MARKER, center, len(self._airstrike_shell_queue),
+        )
+        # There is never a delayed FIRST projectile: this was the main
+        # difference from the previously working immediate-launch path.
+        if self._airstrike_task is None or self._airstrike_task.done():
+            self._fire_next_airstrike_shell()
+            if self._airstrike_shell_queue:
+                self._airstrike_task = asyncio.create_task(
+                    self._drain_airstrike_shells()
+                )
+
+    def _fire_next_airstrike_shell(self) -> bool:
+        """Use the same engine, CreateEntity path, and speed as airstrike.py."""
+        if not self._airstrike_shell_queue:
+            return False
+        center, dx, dy, first_shell = self._airstrike_shell_queue.popleft()
+        if first_shell:
+            _sound_airstrike_flyby(self.server, center)
+        engine = getattr(self.server, "projectile_engine", None)
+        spawn_visual = getattr(self.server, "spawn_projectile_entity", None)
+        spawn = getattr(engine, "spawn_spec", None)
+        if not callable(spawn):
+            logger.error(
+                "%s: airstrike NOT SPAWNED: server.projectile_engine.spawn_spec missing",
+                self.BUILD_MARKER,
+            )
+            return False
+        position = (
+            center[0] + dx,
+            center[1] + dy,
+            max(1.0, center[2] - 48.0),
+        )
+        velocity = (0.0, 0.0, float(C.AIRSTRIKE_SHELL_SPEED))
+        try:
+            projectile = spawn(
+                AIRSTRIKE_SPEC, position, velocity, thrower_id=-1
+            )
+            if callable(spawn_visual):
+                owner = SimpleNamespace(
+                    id=NO_OWNER_PLAYER_ID, team=TEAM_NEUTRAL
+                )
+                spawn_visual(projectile, owner, position, velocity)
+            else:
+                logger.error(
+                    "%s: airstrike projectile spawned but CreateEntity service missing",
+                    self.BUILD_MARKER,
+                )
+            logger.debug(
+                "%s: airstrike shell at %s velocity %s", 
+                self.BUILD_MARKER, position, velocity,
+            )
+            return True
+        except Exception:
+            logger.exception("%s: airstrike shell spawn failed", self.BUILD_MARKER)
+            return False
+
+    async def _drain_airstrike_shells(self) -> None:
+        """Spread the remaining projectiles; no tick-phase checks needed."""
+        try:
+            while self._airstrike_shell_queue:
+                await asyncio.sleep(self.airstrike_shell_interval)
+                if self.ended or getattr(self, "retiring", False):
+                    break
+                self._fire_next_airstrike_shell()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("%s: airstrike sequence interrupted", self.BUILD_MARKER)
+        finally:
+            self._airstrike_shell_queue.clear()
+            self._airstrike_task = None
+
+    async def _cancel_airstrike_task(self) -> None:
+        task = self._airstrike_task
+        self._airstrike_shell_queue.clear()
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._airstrike_task = None
 
     def reveal_to(self, connection) -> None:
         super().reveal_to(connection)
@@ -405,11 +539,12 @@ class MultiHillMode(BaseMode):
 
     def _send_zone(self, zone: ObjectiveZone, connection=None) -> None:
         owner = self.zone_owner.get(zone.index)
-        color = (
-            self.server.teams[owner].color
-            if owner in _PLAYABLE_TEAMS
-            else _NEUTRAL_COLOR
-        )
+        if self.zone_contested.get(zone.index, False):
+            color = _CONTESTED_COLOR
+        elif owner in _PLAYABLE_TEAMS:
+            color = self.server.teams[owner].color
+        else:
+            color = _NEUTRAL_COLOR
         packet = minimap_zone_packet(
             zone,
             color=color,
@@ -475,6 +610,9 @@ class MultiHillMode(BaseMode):
                     retained=self.zone_owner.get(zone.index) == left,
                 )
             if contested and not was_contested:
+                # Ownership stays on the server for scoring/defence logic,
+                # but all clients must see a contested hill in red.
+                self._send_zone(zone)
                 last = self._contested_shout_at.get(zone.index)
                 if last is None or now - last >= _CONTESTED_SHOUT_COOLDOWN:
                     self._contested_shout_at[zone.index] = now
@@ -487,11 +625,25 @@ class MultiHillMode(BaseMode):
                 if holder in _PLAYABLE_TEAMS:
                     for player in occupants[holder]:
                         self.resupply.offer(player, now)
-            if contested or blue == green:
+            # A hill has no owner when nobody is holding it. Without this
+            # transition, a deserted zone keeps the previous team's colour
+            # and continues awarding team points until an enemy captures it.
+            if blue == 0 and green == 0:
+                if self.zone_owner.get(zone.index) is not None or was_contested:
+                    self.zone_owner[zone.index] = None
+                    self._send_zone(zone)
+                continue
+            # Both teams present: zone is red; team score ticks are paused.
+            # A team's previous owner id is retained solely for claim bonuses.
+            if contested:
                 continue
             claimant = TEAM1 if blue > green else TEAM2
             old_owner = self.zone_owner.get(zone.index)
             if claimant == old_owner:
+                # Contest ended, but the old owner kept the hill: resend its
+                # team colour even though the owner id did not change.
+                if was_contested:
+                    self._send_zone(zone)
                 continue
             self.zone_owner[zone.index] = claimant
             self._send_zone(zone)
