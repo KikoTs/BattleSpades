@@ -58,6 +58,17 @@ VIP_FINAL_MINUTE_SECONDS = 60.0
 # same bounded window as the generic assist (server/combat_scores.py).
 VIP_ASSAULT_ENEMY_WINDOW = 10.0
 
+# CityOfChicago: two surveyed opposite corners of each team's spawn area.
+# X/Y identify an entire rectangle, not just the two corners as spawn points.
+# The sample Z values are at player height and are used to bound the authored
+# volume; actual spawn height is resolved from the live VXL floor.
+# BLUE=TEAM1, GREEN=TEAM2. Unlike the previous generic west/east fallback,
+# CityOfChicago's blue base is southeast and its green base northwest.
+VIP_CITY_OF_CHICAGO_SPAWN_CORNERS = {
+    TEAM1: ((326.469, 485.533, 223.745), (352.547, 458.450, 233.741)),
+    TEAM2: ((53.549, 106.548, 224.742), (30.452, 66.451, 227.750)),
+}
+
 
 class VIPPhase(Enum):
     """Authoritative phase of one VIP sub-round."""
@@ -141,9 +152,9 @@ class VIPMode(BaseMode):
         self._next_roster_audit = 0.0
         self._next_vip_survival_score = float("inf")
         self._next_escort_score = float("inf")
-        # Promotion uses KillAction -> CreatePlayer so retail never receives a
-        # second live Character for the same id. These synthetic class-change
-        # deaths are ignored when their queued mode event drains later.
+        # Retained for compatibility with old queued transition callbacks.
+        # New VIP promotions replace the body with CreatePlayer directly and
+        # do not generate class-change death events or affect death counts.
         self._promotion_deaths: set[int] = set()
         self._last_man_announced: set[int] = set()
         # Sudden-death damage over time, per bereaved team (monotonic
@@ -168,6 +179,9 @@ class VIPMode(BaseMode):
         self._vip_points_awarded: set[int] = set()
         # The set contains teams whose players can see opposing enemy icons.
         self._revealed_enemy_to: set[int] = set()
+        # (map identity, team) -> (authored zone, positions that passed terrain
+        # checks at load time). Only used for the manually surveyed Chicago map.
+        self._vip_city_spawn_cache: dict[tuple[int, int], tuple[object, list[tuple[int, ...]]]] = {}
 
     async def on_mode_start(self) -> None:
         """Reset the full match and wait until both teams can choose a VIP."""
@@ -203,7 +217,14 @@ class VIPMode(BaseMode):
         await super().deactivate()
 
     def countdown_seconds_remaining(self, now: float | None = None) -> float:
-        """Provide the actual sub-round countdown to the 1-Hz HUD refresh."""
+        """Return the active clock, or a frozen zero during the intermission.
+
+        SimulationRuntime publishes this result each second.  Explicitly
+        returning zero prevents the prior, longer clock from reappearing
+        after an early sub-round finish.
+        """
+        if self.phase is VIPPhase.INTERMISSION:
+            return 0.0
         if self._subround_deadline is not None:
             return max(0.0, self._subround_deadline - time.monotonic())
         if self.time_limit <= 0:
@@ -212,7 +233,17 @@ class VIPMode(BaseMode):
             (time.time() if now is None else now) - self.start_time))
 
     def _reset_subround_clock(self) -> None:
-        """Re-arm the inherited 15-minute round clock for the next VIP draw."""
+        """Re-arm the clock and restore the gameplay bed for a new VIP round.
+
+        The previous sub-round may have forced game_ending at 1:00, before
+        BaseMode's regular whole-round timer reached its music threshold.
+        Reset the music family *before* clearing that per-round flag so the
+        next VIP draw doesn't keep playing the previous round's finale.
+        """
+        if self._timeout_music_played:
+            from server.audio import play_gameplay_music
+
+            play_gameplay_music(self.server)
         self.start_time = time.time()
         self.elapsed_time = 0.0
         self._timeout_events_remaining = None
@@ -230,9 +261,55 @@ class VIPMode(BaseMode):
         live = [t for t in _PLAYABLE_TEAMS if self.vip_alive.get(t, False)]
         await self._finish_round(live[0] if len(live) == 1 else None)
 
+    async def _tick_vip_clock(self) -> None:
+        """Run the normal shared maintenance but NOT BaseMode's map vote.
+
+        BaseMode opens the F1/F2/F3 map ballot ten seconds before its
+        ``time_limit`` expires, even when a VIP match has no winner yet.
+        VIP matches have independent sub-round timers and must present the
+        map ballot only through ``on_mode_end`` after the match is decided.
+        """
+        self.elapsed_time = time.time() - self.start_time
+        if self.escape_watch_enabled:
+            try:
+                from server import escape_watch
+
+                escape_watch.tick(self.server, self)
+            except Exception:
+                logger.exception("VIP escape watch failed")
+        if self.phase is not VIPPhase.ACTIVE:
+            self._timeout_events_remaining = None
+            return
+
+        has_clock = self.time_limit > 0 or self._subround_deadline is not None
+        if not has_clock:
+            self._timeout_events_remaining = None
+            return
+        remaining = self.countdown_seconds_remaining()
+        from server.audio import TIMEOUT_MUSIC_SECONDS, play_timeout_music
+
+        if not self._timeout_music_played and remaining <= TIMEOUT_MUSIC_SECONDS:
+            self._timeout_music_played = True
+            play_timeout_music(self.server)
+        self._announce_countdown(remaining)
+        if remaining > 0:
+            self._timeout_events_remaining = None
+            return
+
+        # Keep the shared event-drain guard: a death already accepted at
+        # the deadline must be processed before declaring the sub-round over.
+        if self._timeout_events_remaining is None:
+            self._timeout_events_remaining = len(
+                getattr(self.server, "_mode_events", ())
+            )
+        if self._timeout_events_remaining == 0:
+            await self._end_by_time()
+
     async def on_tick(self, tick: int) -> None:
-        """Advance selection and elimination checks on the gameplay tick."""
-        await super().on_tick(tick)
+        """Advance the VIP sub-round clock, roster and elimination checks."""
+        if self.ended:
+            return
+        await self._tick_vip_clock()
         if self.ended or self.phase is VIPPhase.INTERMISSION:
             return
         now = time.monotonic()
@@ -572,13 +649,84 @@ class VIPMode(BaseMode):
             return max(1, reduced) if amount > 0 else 0
         return int(amount)
 
-    def get_spawn_point(self, player: Player) -> tuple[float, float, float]:
-        """Spawn gangster teams across their base, away from campers.
+    @staticmethod
+    def _city_spawn_zone(team: int):
+        """Make a retail-style authored volume from surveyed Chicago corners.
 
-        Every life used to land on the single base anchor, which made the
-        base trivially campable; the shared threat-aware chooser keeps teams
-        at their base but spreads and protects the spawns.
+        A little vertical padding admits nearby floors; a 2D bounding box
+        alone cannot distinguish an upper roof from a street-level floor.
+        The actual Z is always validated against the live map at spawn time.
         """
+        from server.map_metadata import MapZone
+
+        corners = VIP_CITY_OF_CHICAGO_SPAWN_CORNERS[team]
+        x0, x1 = sorted((corners[0][0], corners[1][0]))
+        y0, y1 = sorted((corners[0][1], corners[1][1]))
+        # A player position is approximately 2.75 above its supporting block.
+        floor0, floor1 = sorted((corners[0][2] + 2.75, corners[1][2] + 2.75))
+        cx, cy, cz = (x0 + x1) / 2, (y0 + y1) / 2, (floor0 + floor1) / 2
+        return MapZone(
+            "spawn", team, cx, cy, cz,
+            (x0 - cx, x1 - cx, y0 - cy, y1 - cy,
+             floor0 - cz - 5.0, floor1 - cz + 5.0),
+            "vip_cityofchicago_surveyed_spawn",
+        )
+
+    def _get_city_spawn_candidates(self, world, team: int):
+        key = (id(world), team)
+        entry = self._vip_city_spawn_cache.get(key)
+        if entry is not None:
+            return entry
+        zone = self._city_spawn_zone(team)
+        candidates = list(world._zone_candidates(zone))
+        self._vip_city_spawn_cache[key] = (zone, candidates)
+        logger.info(
+            "VIP CityOfChicago surveyed spawn: team %s has %d valid candidate floors",
+            team, len(candidates),
+        )
+        return zone, candidates
+
+    def get_spawn_point(self, player: Player) -> tuple[float, float, float]:
+        """Use surveyed CityOfChicago rectangles; standard spawns elsewhere.
+
+        Use WorldManager's authored-zone safety logic to support both outdoor
+        terrain and permitted indoor floors. A cached floor can become unsafe
+        after block edits, so revalidate it on every spawn. If the entire box
+        is blocked, fall back to the standard rescue-capable spawning path.
+        """
+        world = getattr(self.server, "world_manager", None)
+        team = int(getattr(player, "team", -1))
+        name = str(getattr(world, "map_name", "") or "").lower()
+        if (name.removesuffix(".vxl") == "cityofchicago"
+                and team in VIP_CITY_OF_CHICAGO_SPAWN_CORNERS
+                and getattr(world, "map", None) is not None):
+            try:
+                zone, candidates = self._get_city_spawn_candidates(world, team)
+                # Randomise 32 choices for a distributed team spawn without
+                # repeatedly scanning the complete rectangle every tick.
+                sample = random.sample(candidates, min(32, len(candidates)))
+                for candidate in sample:
+                    position = world.spawn_candidate_position(candidate, (zone,))
+                    if position is not None:
+                        return tuple(float(value) for value in position)
+                # Handles a damaged or heavily rebuilt spawn zone; re-enumerate
+                # once before falling back to the normal safety resolver.
+                key = (id(world), team)
+                self._vip_city_spawn_cache.pop(key, None)
+                zone, candidates = self._get_city_spawn_candidates(world, team)
+                for candidate in random.sample(candidates, min(64, len(candidates))):
+                    position = world.spawn_candidate_position(candidate, (zone,))
+                    if position is not None:
+                        return tuple(float(value) for value in position)
+                logger.warning(
+                    "VIP CityOfChicago spawn zone team %s is blocked; "
+                    "using the normal safe-spawn fallback", team,
+                )
+            except Exception:
+                logger.exception(
+                    "VIP CityOfChicago custom spawn error for team %s; "
+                    "using normal spawns", team,
+                )
         return tuple(float(value) for value in super().get_spawn_point(player))
 
     def reveal_to(self, connection) -> None:
@@ -681,8 +829,11 @@ class VIPMode(BaseMode):
             ):
                 continue
             try:
-                if bool(getattr(player, "alive", False)):
-                    player.die(kill_type=KILL_CLASS_CHANGE)
+                # Round reset is NOT a combat death: do not send KillAction.
+                # RoundLifecycle.respawn_player safely replaces even a live
+                # body (the same transition is used by unofficial round modes)
+                # and puts it at its team's spawn with replenished equipment.
+                # A player already killed during combat keeps that real death.
                 player.apply_class_selection(self._ordinary_selection(player))
                 self.server.respawn_player(player)
             except Exception:
@@ -748,8 +899,8 @@ class VIPMode(BaseMode):
 
         selected = {team: random.choice(candidates[team]) for team in _PLAYABLE_TEAMS}
         self.vips = selected
-        # Keep promotions outside ACTIVE until both old Characters have been
-        # retired and recreated with their boss class.
+        # Keep promotions outside ACTIVE while both live Characters receive
+        # the in-place boss class/loadout change.
         self.vip_alive = {TEAM1: False, TEAM2: False}
         self.respawn_enabled = {TEAM1: True, TEAM2: True}
         self.selection_deadline = None
@@ -771,19 +922,45 @@ class VIPMode(BaseMode):
         await self.broadcast_localised_message("VIP_START", override_previous=True)
 
     def _promote_vip(self, team: int, vip: Player) -> None:
-        """Turn one team member into that team's boss and publish it.
+        """Promote a living gangster to VIP without moving or killing them.
 
-        The caller keeps ``vip_alive[team]`` False until this returns, so the
-        synthetic class-change death is not mistaken for a VIP kill.
+        The native GameScene accepts SetClassLoadout(13) with instant=1 as a
+        live class/equipment change, just as the built-in Tutorial does.  A
+        normal respawn here incorrectly sends the chosen VIP back to base.
+        Retain the exact position, direction and current live Character.
+        Only a teammate who was already dead needs an ordinary respawn.
         """
-        vip_class = int(C.MAFIA_VIPS[team])
-        if bool(getattr(vip, "alive", False)):
-            self._promotion_deaths.add(int(vip.id))
-            vip.die(kill_type=KILL_CLASS_CHANGE)
-        vip.apply_class_selection(normalize_class_selection(vip_class))
-        self.server.respawn_player(vip)
         from server.game_constants import MAX_HEALTH
-        from shared.packet import SetHP
+        from shared.packet import SetClassLoadout, SetHP
+
+        vip_class = int(C.MAFIA_VIPS[team])
+        vip.apply_class_selection(normalize_class_selection(vip_class))
+        vip.pending_selection = None
+        vip.pending_class_id = None
+        vip.pending_loadout = None
+
+        if bool(getattr(vip, "alive", False)) and bool(getattr(vip, "spawned", False)):
+            # A class_id assignment refreshes the authoritative movement
+            # profile in Player.class_id's setter; notify every client of the
+            # active boss model and inventory without CreatePlayer/KillAction.
+            payload = SetClassLoadout()
+            payload.player_id = int(vip.id)
+            payload.class_id = vip_class
+            payload.instant = 1
+            payload.loadout = list(vip.loadout)
+            payload.prefabs = list(vip.prefabs)
+            payload.ugc_tools = list(getattr(vip, "ugc_tools", ()) or ())
+            self.server.broadcast(bytes(payload.generate()), reliable=True)
+            if vip.loadout:
+                vip.set_tool(int(vip.loadout[-1]), raw=True)
+            # Server ammo/tool counters must agree with the freshly granted
+            # client inventory, without resetting location or death history.
+            vip._reset_ammo()
+            vip._reset_equipment_state()
+        else:
+            # Rare case: the selected player was killed before the VIP draw
+            # completed.  There is no live Character to update in place.
+            self.server.respawn_player(vip)
 
         # SetHP carries one unsigned byte. The boss's maximum is stored on
         # the body so health crates / medpacks heal to it (not to 100).
@@ -1106,21 +1283,42 @@ class VIPMode(BaseMode):
             self._set_enemy_map_visibility(team, True)
 
     def _cap_round_time_to_one_minute(self) -> None:
-        """Apply only to this sub-round. Do not touch BaseMode.time_limit."""
+        """Cap this sub-round and immediately switch to the ending music.
+
+        BaseMode looks at time_limit - elapsed_time; VIP's one-minute cap
+        uses _subround_deadline instead, so its generic music threshold can
+        still be many minutes away when the HUD switches to 1:00.
+        """
         remaining = self.countdown_seconds_remaining()
         if self.time_limit <= 0 and self._subround_deadline is None:
             remaining = float("inf")
-        if remaining <= VIP_FINAL_MINUTE_SECONDS:
-            return
-        self._subround_deadline = time.monotonic() + VIP_FINAL_MINUTE_SECONDS
-        from server.scoreboard import send_round_timer
-        send_round_timer(self.server, VIP_FINAL_MINUTE_SECONDS, reliable=True)
+        if remaining > VIP_FINAL_MINUTE_SECONDS:
+            self._subround_deadline = time.monotonic() + VIP_FINAL_MINUTE_SECONDS
+            from server.scoreboard import send_round_timer
 
-    def _clear_sudden_death(self) -> None:
+            send_round_timer(self.server, VIP_FINAL_MINUTE_SECONDS, reliable=True)
+        # A one-minute clock (whether freshly capped or already shorter)
+        # always gets exactly one game_ending track.  The same flag feeds
+        # BaseMode.join_music_track for late joiners and prevents duplicate
+        # playback from the normal BaseMode timeout check.
+        if not self._timeout_music_played:
+            from server.audio import play_timeout_music
+
+            self._timeout_music_played = True
+            play_timeout_music(self.server)
+
+    def _clear_sudden_death(self, *, clear_enemy_visibility: bool = True) -> None:
+        """Stop VIP bleed/timing; optionally retain enemy radar for the pause.
+
+        The losing VIP's team must remain visible to its opponents until the
+        next sub-round starts, including when the 60-second deadline expires.
+        Only _begin_round or a mode retirement revokes the visibility flags.
+        """
         self._subround_deadline = None
-        for team in sorted(self._revealed_enemy_to):
-            self._set_enemy_map_visibility(team, False)
-        self._revealed_enemy_to.clear()
+        if clear_enemy_visibility:
+            for team in sorted(self._revealed_enemy_to):
+                self._set_enemy_map_visibility(team, False)
+            self._revealed_enemy_to.clear()
         self._sudden_death_activate_at = {TEAM1: None, TEAM2: None}
         self._sudden_death_damage_at = {TEAM1: None, TEAM2: None}
         self._vip_attackers = {TEAM1: {}, TEAM2: {}}
@@ -1128,8 +1326,8 @@ class VIPMode(BaseMode):
     async def _advance_sudden_death(self, now: float) -> None:
         """After 6 s, cap the clock and bleed the VIP-less team once per s."""
         if self._subround_deadline is not None and now >= self._subround_deadline:
-            live = [t for t in _PLAYABLE_TEAMS if self.vip_alive.get(t, False)]
-            await self._finish_round(live[0] if len(live) == 1 else None)
+            # _tick_vip_clock owns expiration, including the accepted-death
+            # drain.  Do not inflict another damage tick after the buzzer.
             return
         for team in _PLAYABLE_TEAMS:
             if self.ended or self.phase is not VIPPhase.ACTIVE:
@@ -1260,7 +1458,16 @@ class VIPMode(BaseMode):
 
         achievements.vip_round_finished(self.server, self)
         self.phase = VIPPhase.INTERMISSION
-        self._clear_sudden_death()
+        # Zero the displayed countdown immediately. The once-per-second
+        # SimulationRuntime refresh now reads zero too; it cannot resurrect
+        # the old 15-minute timer when the 60-second VIP round ends early.
+        from server.scoreboard import send_round_timer
+
+        send_round_timer(self.server, 0.0, reliable=True)
+        # Do not clear TeamMapVisibility here: revealing opponents is part of
+        # the defeated VIP's end-of-round state. Keep it for intermission,
+        # including after a timed expiration, then clear in _begin_round.
+        self._clear_sudden_death(clear_enemy_visibility=False)
         self._clear_vip_markers()
         self._last_man_announced.clear()
         self.rounds_played += 1
