@@ -2,6 +2,11 @@ name: Build portable beta release
 
 on:
   workflow_dispatch:
+    inputs:
+      retry_macos_release:
+        description: "Recheck the two timing failures from beta.3's complete Intel Mac suite and package the unchanged tag"
+        type: boolean
+        default: false
   push:
     tags:
       - "v*-beta.*"
@@ -16,6 +21,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ !inputs.retry_macos_release }}
     name: Build ${{ matrix.platform }} ${{ matrix.architecture }}
     strategy:
       fail-fast: false
@@ -219,3 +225,99 @@ jobs:
             --prerelease \
             --title "$title (${GITHUB_REF_NAME#v})" \
             --notes-file release/NOTES.md
+
+  recheck-macos:
+    name: Recheck beta.3 Intel Mac timing and package
+    if: inputs.retry_macos_release
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out the immutable release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: v0.3.0-beta.3
+          persist-credentials: false
+
+      - name: Verify source and previous complete-suite evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(git rev-parse HEAD)" = 39a5b6ad183e13a51ac316afdf8ca0d2990bf761
+          test "$(cat VERSION)" = 0.3.0-beta.3
+          gh run view 39950504514 --attempt 2 --json headSha,jobs > previous-run.json
+          gh run view 39950504514 --attempt 2 --log-failed > previous-failures.log
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          run = json.loads(Path('previous-run.json').read_text())
+          assert run['headSha'] == '39a5b6ad183e13a51ac316afdf8ca0d2990bf761'
+          builds = [job for job in run['jobs'] if job['name'].startswith('Build ')]
+          assert len(builds) == 6
+          assert all(job['conclusion'] == ('failure' if job['name'] == 'Build macos x86_64' else 'success') for job in builds)
+          log = Path('previous-failures.log').read_text()
+          failed = set(re.findall(r'FAILED (tests/\S+)', log))
+          assert failed == {
+              'tests/test_map_load_stall.py::test_background_map_load_keeps_main_thread_responsive[MayanJungle]',
+              'tests/test_map_load_stall.py::test_background_map_load_keeps_main_thread_responsive[ClassicImport]',
+          }, failed
+          assert '2 failed, 11832 passed, 16 skipped' in log
+          print('Confirmed complete-suite evidence: 11832 passed; only two timing assertions need rechecking.')
+          PY
+
+      - name: Set up the same Python toolchain
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-release.txt
+
+      - name: Install pinned dependencies and compile native extensions
+        run: |
+          python -m pip install -r requirements-release.txt
+          python setup.py build_ext --inplace
+
+      - name: Recheck timing controls and release contracts without changing assertions
+        run: >-
+          python -m pytest tests/test_map_load_stall.py tests/test_bot_architecture.py
+          tests/test_package_release.py tests/test_launcher.py tests/test_runtime_paths.py
+          -q -s --junitxml=recheck-results.xml
+
+      - name: Freeze and package the tagged server
+        run: |
+          python -m PyInstaller --noconfirm --clean BattleSpades.spec
+          python scripts/package_release.py --frozen-dir dist/BattleSpades --output-root release-dist --platform macos --architecture x86_64
+
+      - name: Verify every packaged launcher outside the archive
+        run: |
+          bundle="$GITHUB_WORKSPACE/release-dist/BattleSpades-0.3.0-beta.3-macos-x86_64"
+          cd "$RUNNER_TEMP"
+          cp "$bundle/config.toml" "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpades" --version
+          "$bundle/BattleSpades" --check --config "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpadesTutorial" --version
+          "$bundle/BattleSpadesTutorial" --check --config "$RUNNER_TEMP/battlespades-session.toml"
+          "$bundle/BattleSpadesMapCreator" --version
+          "$bundle/BattleSpadesServer" --self-check
+
+      - name: Upload the verified Intel Mac archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-macos-x86_64-recheck
+          path: release-dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Retain complete-suite evidence and timing recheck results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: intel-mac-release-validation
+          path: |
+            previous-run.json
+            previous-failures.log
+            recheck-results.xml
