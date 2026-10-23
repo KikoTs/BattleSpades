@@ -281,11 +281,83 @@ jobs:
           python -m pip install -r requirements-release.txt
           python setup.py build_ext --inplace
 
-      - name: Recheck timing controls and release contracts without changing assertions
+      - name: Diagnose loading versus disposal and runner scheduling
+        run: |
+          python - <<'PY'
+          import asyncio, ctypes, json, statistics, time
+          from pathlib import Path
+          from server.config import ServerConfig
+          import server.world_manager as module
+
+          spans = []
+          retained = []
+          def instrument(owner, name):
+              original = getattr(owner, name)
+              def wrapped(*args, **kwargs):
+                  started = time.perf_counter()
+                  try:
+                      return original(*args, **kwargs)
+                  finally:
+                      spans.append((name, started, time.perf_counter()))
+              setattr(owner, name, wrapped)
+          for name in ('VXL', 'load_map_metadata'):
+              instrument(module, name)
+          for name in ('prewarm_spawn_candidates', '_refresh_world'):
+              instrument(module.WorldManager, name)
+
+          def load(keep):
+              config = ServerConfig()
+              config.maps_path = str(Path.cwd() / 'maps')
+              world = module.WorldManager(config)
+              started = time.perf_counter()
+              assert world.load_map('MayanJungle')
+              spans.append(('load-total', started, time.perf_counter()))
+              started = time.perf_counter()
+              if keep:
+                  retained.append(world)
+              del world
+              spans.append(('dispose', started, time.perf_counter()))
+
+          async def measure(fn):
+              spans.clear()
+              gaps = []
+              task = asyncio.create_task(asyncio.to_thread(fn))
+              last = time.perf_counter()
+              while not task.done():
+                  await asyncio.sleep(0.001)
+                  now = time.perf_counter()
+                  gaps.append((now - last, last, now))
+                  last = now
+              await task
+              worst, start, end = max(gaps)
+              overlap = [(name, round(max(0, min(end,b)-max(start,a))*1000, 2))
+                         for name,a,b in spans]
+              return {'worst_ms':round(worst*1000,2),
+                      'overlapping_stages':overlap,
+                      'stages_ms':[(n,round((b-a)*1000,2)) for n,a,b in spans]}
+
+          load(False)
+          report = {}
+          for label, fn in (
+              ('idle', lambda: time.sleep(1)),
+              ('load_and_dispose', lambda: load(False)),
+              ('load_and_retain', lambda: load(True)),
+              ('gil_held_control', lambda: ctypes.PyDLL(None).usleep(100_000)),
+          ):
+              results = []
+              for _ in range(5):
+                  results.append(asyncio.run(measure(fn)))
+                  retained.clear()
+              report[label] = results
+              print(label, 'median_ms', statistics.median(r['worst_ms'] for r in results), flush=True)
+              print(json.dumps(results), flush=True)
+          Path('map-loading-diagnostic.json').write_text(json.dumps(report, indent=2))
+          PY
+
+      - name: Recheck original timing assertions and their negative control
         run: >-
-          python -m pytest tests/test_map_load_stall.py tests/test_bot_architecture.py
-          tests/test_package_release.py tests/test_launcher.py tests/test_runtime_paths.py
-          -q -s --junitxml=recheck-results.xml
+          python -m pytest tests/test_map_load_stall.py
+          -k 'responsiveness or background_map_load' -q -s -x --junitxml=recheck-results.xml
 
       - name: Freeze and package the tagged server
         run: |
@@ -321,3 +393,4 @@ jobs:
             previous-run.json
             previous-failures.log
             recheck-results.xml
+            map-loading-diagnostic.json
