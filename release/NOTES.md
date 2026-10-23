@@ -7,7 +7,7 @@ BattleSpades Server 0.3.0-beta.3 is the companion server for BattleSpades Client
 - Fixes portable archives omitting the nested community arenas, objective
   metadata, and Hardcore/community presets. These modes now load their
   intended maps instead of silently falling back to a flat world.
-- Includes the latest Multi-Hill, VIP, and Zombie mode updates from main.
+- Retains the tested Beta.2 gameplay rules while fixing packaged mode content.
 - Supports local matches without a login or available master server through
   --offline. The matching client bundles the server for offline hosting.
 - Keeps Protocol 168, existing configurations, and component update support.
