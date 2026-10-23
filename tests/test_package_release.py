@@ -89,6 +89,19 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert (staged / "config.toml").is_file()
     assert (staged / "fleet.toml").is_file()
     assert (staged / "configs" / "official-tdm.toml").is_file()
+    # Community arena metadata and nested mode presets used to be omitted.
+    # Without the .vxl the server silently hosted a flat fallback world;
+    # without the .txt it lost the authored objectives and spawn points.
+    from modes.unofficial.catalog import SPECS
+    from server.hardcore import MODE_CODES
+
+    for mode in SPECS:
+        for suffix in (".vxl", ".txt"):
+            relative = Path("maps/unofficial") / f"{mode.map_name}{suffix}"
+            assert (staged / relative).read_bytes() == (PROJECT_ROOT / relative).read_bytes()
+        assert (staged / "configs/unofficial" / f"{mode.code}.toml").is_file()
+    for mode in MODE_CODES:
+        assert (staged / "configs/hardcore" / f"{mode}.toml").is_file()
     assert (staged / "LICENSE").is_file()
     assert (staged / "VERSION").read_text(encoding="utf-8").strip() == target.version
     assert sorted(path.name for path in (staged / "maps").glob("*.vxl")) == TRACKED_MAPS

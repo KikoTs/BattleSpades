@@ -72,7 +72,9 @@ def _copy_files(source: Path, destination: Path, pattern: str) -> int:
     for path in files:
         if path.is_symlink():
             raise ValueError(f"release assets may not be symlinks: {path}")
-        shutil.copy2(path, destination / path.name)
+        target = destination / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
     return len(files)
 
 
@@ -160,9 +162,9 @@ def stage_release(
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target_path)
 
-        map_count = _copy_files(root / "maps", destination / "maps", "*.vxl")
-        _copy_files(root / "maps", destination / "maps", "*.json")
-        _copy_files(root / "maps", destination / "maps", "*.botnav")
+        map_count = _copy_files(root / "maps", destination / "maps", "**/*.vxl")
+        for pattern in ("**/*.json", "**/*.txt", "**/*.ugc", "**/*.botnav"):
+            _copy_files(root / "maps", destination / "maps", pattern)
         prefab_count = _copy_files(
             root / "prefabs",
             destination / "prefabs",
@@ -171,7 +173,7 @@ def stage_release(
         fleet_config_count = _copy_files(
             root / "configs",
             destination / "configs",
-            "*.toml",
+            "**/*.toml",
         )
         _copy_files(
             root / "release" / "plugins",
