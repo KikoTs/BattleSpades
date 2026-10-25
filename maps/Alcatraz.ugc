@@ -1,0 +1,24 @@
+{
+    "title": "Alcatraz",
+    "description": "Alcatraz",
+    "ugc_entities": [
+        {
+            "position": [
+                433,
+                266,
+                184
+            ],
+            "mode": "vip",
+            "item": "ugc_spawnblue_med"
+        },
+        {
+            "position": [
+                157,
+                272,
+                181
+            ],
+            "mode": "vip",
+            "item": "ugc_spawngreen_med"
+        }
+    ]
+}

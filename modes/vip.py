@@ -58,17 +58,6 @@ VIP_FINAL_MINUTE_SECONDS = 60.0
 # same bounded window as the generic assist (server/combat_scores.py).
 VIP_ASSAULT_ENEMY_WINDOW = 10.0
 
-# CityOfChicago: two surveyed opposite corners of each team's spawn area.
-# X/Y identify an entire rectangle, not just the two corners as spawn points.
-# The sample Z values are at player height and are used to bound the authored
-# volume; actual spawn height is resolved from the live VXL floor.
-# BLUE=TEAM1, GREEN=TEAM2. Unlike the previous generic west/east fallback,
-# CityOfChicago's blue base is southeast and its green base northwest.
-VIP_CITY_OF_CHICAGO_SPAWN_CORNERS = {
-    TEAM1: ((326.469, 485.533, 223.745), (352.547, 458.450, 233.741)),
-    TEAM2: ((53.549, 106.548, 224.742), (30.452, 66.451, 227.750)),
-}
-
 
 class VIPPhase(Enum):
     """Authoritative phase of one VIP sub-round."""
@@ -179,10 +168,6 @@ class VIPMode(BaseMode):
         self._vip_points_awarded: set[int] = set()
         # The set contains teams whose players can see opposing enemy icons.
         self._revealed_enemy_to: set[int] = set()
-        # (map identity, team) -> (authored zone, positions that passed terrain
-        # checks at load time). Only used for the manually surveyed Chicago map.
-        self._vip_city_spawn_cache: dict[tuple[int, int], tuple[object, list[tuple[int, ...]]]] = {}
-
     async def on_mode_start(self) -> None:
         """Reset the full match and wait until both teams can choose a VIP."""
         await self._cancel_round_task()
@@ -648,86 +633,6 @@ class VIPMode(BaseMode):
             reduced = int(round(float(amount) * float(C.VIP_DAMAGE_MULTIPLIER)))
             return max(1, reduced) if amount > 0 else 0
         return int(amount)
-
-    @staticmethod
-    def _city_spawn_zone(team: int):
-        """Make a retail-style authored volume from surveyed Chicago corners.
-
-        A little vertical padding admits nearby floors; a 2D bounding box
-        alone cannot distinguish an upper roof from a street-level floor.
-        The actual Z is always validated against the live map at spawn time.
-        """
-        from server.map_metadata import MapZone
-
-        corners = VIP_CITY_OF_CHICAGO_SPAWN_CORNERS[team]
-        x0, x1 = sorted((corners[0][0], corners[1][0]))
-        y0, y1 = sorted((corners[0][1], corners[1][1]))
-        # A player position is approximately 2.75 above its supporting block.
-        floor0, floor1 = sorted((corners[0][2] + 2.75, corners[1][2] + 2.75))
-        cx, cy, cz = (x0 + x1) / 2, (y0 + y1) / 2, (floor0 + floor1) / 2
-        return MapZone(
-            "spawn", team, cx, cy, cz,
-            (x0 - cx, x1 - cx, y0 - cy, y1 - cy,
-             floor0 - cz - 5.0, floor1 - cz + 5.0),
-            "vip_cityofchicago_surveyed_spawn",
-        )
-
-    def _get_city_spawn_candidates(self, world, team: int):
-        key = (id(world), team)
-        entry = self._vip_city_spawn_cache.get(key)
-        if entry is not None:
-            return entry
-        zone = self._city_spawn_zone(team)
-        candidates = list(world._zone_candidates(zone))
-        self._vip_city_spawn_cache[key] = (zone, candidates)
-        logger.info(
-            "VIP CityOfChicago surveyed spawn: team %s has %d valid candidate floors",
-            team, len(candidates),
-        )
-        return zone, candidates
-
-    def get_spawn_point(self, player: Player) -> tuple[float, float, float]:
-        """Use surveyed CityOfChicago rectangles; standard spawns elsewhere.
-
-        Use WorldManager's authored-zone safety logic to support both outdoor
-        terrain and permitted indoor floors. A cached floor can become unsafe
-        after block edits, so revalidate it on every spawn. If the entire box
-        is blocked, fall back to the standard rescue-capable spawning path.
-        """
-        world = getattr(self.server, "world_manager", None)
-        team = int(getattr(player, "team", -1))
-        name = str(getattr(world, "map_name", "") or "").lower()
-        if (name.removesuffix(".vxl") == "cityofchicago"
-                and team in VIP_CITY_OF_CHICAGO_SPAWN_CORNERS
-                and getattr(world, "map", None) is not None):
-            try:
-                zone, candidates = self._get_city_spawn_candidates(world, team)
-                # Randomise 32 choices for a distributed team spawn without
-                # repeatedly scanning the complete rectangle every tick.
-                sample = random.sample(candidates, min(32, len(candidates)))
-                for candidate in sample:
-                    position = world.spawn_candidate_position(candidate, (zone,))
-                    if position is not None:
-                        return tuple(float(value) for value in position)
-                # Handles a damaged or heavily rebuilt spawn zone; re-enumerate
-                # once before falling back to the normal safety resolver.
-                key = (id(world), team)
-                self._vip_city_spawn_cache.pop(key, None)
-                zone, candidates = self._get_city_spawn_candidates(world, team)
-                for candidate in random.sample(candidates, min(64, len(candidates))):
-                    position = world.spawn_candidate_position(candidate, (zone,))
-                    if position is not None:
-                        return tuple(float(value) for value in position)
-                logger.warning(
-                    "VIP CityOfChicago spawn zone team %s is blocked; "
-                    "using the normal safe-spawn fallback", team,
-                )
-            except Exception:
-                logger.exception(
-                    "VIP CityOfChicago custom spawn error for team %s; "
-                    "using normal spawns", team,
-                )
-        return tuple(float(value) for value in super().get_spawn_point(player))
 
     def reveal_to(self, connection) -> None:
         """Replay live VIP crown markers to a joining GameScene."""

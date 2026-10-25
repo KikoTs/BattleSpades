@@ -1,0 +1,34 @@
+{
+    "title": "CityOfChicago",
+    "description": "CityOfChicago",
+    "ugc_entities": [
+        {
+            "position": [
+                340,
+                472,
+                238
+            ],
+            "mode": "vip",
+            "item": "ugc_spawnblue_med"
+        },
+        {
+            "position": [
+                42,
+                78,
+                232
+            ],
+            "mode": "vip",
+            "item": "ugc_spawngreen_med"
+        },
+        {
+            "position": [
+                42,
+                94,
+                232
+            ],
+            "mode": "vip",
+            "item": "ugc_spawngreen_med"
+        }
+    ],
+    "skybox_name": "Chicago.txt"
+}
