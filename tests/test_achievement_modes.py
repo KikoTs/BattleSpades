@@ -106,7 +106,7 @@ def test_survivors_alive_at_the_final_whistle_get_apocalypse_later():
     assert names == ["Apocalypse Later", "Apocalypse Later", "Stone Cold Killer"]
 
 
-def test_the_modes_last_survivor_marker_feeds_the_last_man_clock():
+def test_the_modes_last_survivor_tracker_feeds_the_last_man_clock():
     server, mode, (zombie,), (survivor,) = _zombie(2)
     assert mode.last_survivor_id == survivor.id
     for _ in range(55):
@@ -115,7 +115,7 @@ def test_the_modes_last_survivor_marker_feeds_the_last_man_clock():
     achievements.tick(server, 0.5)
     assert "zombie_lms_one_round" in unlocked(server, survivor)
     assert progress(server, survivor, "zombie_seconds_as_lms_count") == 28
-    # The last man's zombie kills are read off the same marker.
+    # The last man's zombie kills are read off the same internal tracker.
     for _ in range(5):
         survivor.kill_streak = 0
         achievements.died(server, zombie, survivor, WEAPON, False)

@@ -53,7 +53,10 @@ def _ctx(now, world, players=()):
     return ctx
 
 
-def _dropping_crate(world, *, start_z=1.0, cue=None, ground=215):
+def _dropping_crate(
+    world, *, start_z=1.0, cue=None, ground=215,
+    x=128.5, y=252.5,
+):
     registry = EntityRegistry()
     behavior = PickupCrateBehavior(
         lambda player: setattr(player, "refills", player.refills + 1),
@@ -63,7 +66,7 @@ def _dropping_crate(world, *, start_z=1.0, cue=None, ground=215):
         drop_cue=cue,
     )
     crate = registry.place(
-        int(C.AMMO_CRATE), 128.5, 252.5, float(ground), behavior=behavior,
+        int(C.AMMO_CRATE), float(x), float(y), float(ground), behavior=behavior,
     )
     crate.alive = False
     crate.respawn_at = 1000.0
@@ -151,7 +154,34 @@ def test_drop_point_under_a_roof_starts_just_below_it():
     assert crate.z == 182.0
     assert crate.falling is True
     _run_until_landed(registry, crate, world, start=1000.0)
-    assert crate.z == 215.0
+    assert crate.z == 180.0
+
+
+def test_player_built_platform_existing_before_respawn_catches_the_crate():
+    class PlayerPlatform(_Column):
+        def __init__(self):
+            super().__init__(215)
+            self.extra = {190}
+            self.runtime_solid_cells = {(128, 252, 190)}
+
+        def get_solid(self, x, y, z):
+            return int(z) in self.extra or super().get_solid(x, y, z)
+
+    world = PlayerPlatform()
+    registry, crate = _dropping_crate(
+        world, x=128.375, y=252.625,
+    )
+
+    registry.tick(_ctx(1000.0, world))
+
+    # Unlike an authored roof, a runtime platform must remain below the sky
+    # start so both client and server can collide with it during the fall.
+    assert crate.z == 1.0
+    assert (crate.x, crate.y) == (128.375, 252.625)
+    _run_until_landed(registry, crate, world, start=1000.0)
+    assert crate.z == 190.0
+    assert crate.terrain_support_z == 190
+    assert crate.home == (128.375, 252.625, 215.0)
 
 
 def test_a_falling_crate_is_joined_with_its_live_fall_speed():
@@ -319,3 +349,176 @@ def test_blocks_built_on_the_drop_point_become_the_landing_surface():
 
     assert crate.z == 211.0
     assert crate.terrain_support_z == 211
+
+
+def test_water_drop_keeps_exact_xy_and_uses_the_water_surface():
+    class WaterColumn:
+        def __init__(self):
+            self.extra = set()
+
+        def get_solid(self, x, y, z):
+            return (
+                int(z) == int(C.Z_ABOVE_WATERPLANE) + 1
+                or int(z) in self.extra
+            )
+
+        def dry_surface_anchor(self, *args, **kwargs):
+            raise AssertionError("a water crate must not search sideways for land")
+
+    world = WaterColumn()
+    expected_xy = (128.375, 252.625)
+    registry, crate = _dropping_crate(
+        world, x=expected_xy[0], y=expected_xy[1], ground=215,
+    )
+
+    landed_after, _track = _run_until_landed(registry, crate, world)
+
+    assert (crate.x, crate.y) == expected_xy
+    assert crate.home[:2] == expected_xy
+    assert crate.z == float(C.Z_ABOVE_WATERPLANE) + 1.0
+    assert crate.terrain_support_z == int(C.Z_ABOVE_WATERPLANE) + 1
+
+    # Blocks built directly into a water crate lift it out of the entire
+    # connected stack while preserving the exact authored horizontal point.
+    world.extra.update({236, 237, 238})
+    lift_ctx = _ctx(1000.0 + landed_after + 0.11, world)
+    moved = []
+    lift_ctx.move = moved.append
+    registry.tick(lift_ctx)
+    assert (crate.x, crate.y, crate.z) == (*expected_xy, 236.0)
+    assert crate.home[:2] == expected_xy
+    assert moved == [crate]
+
+
+def test_platform_built_during_fall_catches_the_crate():
+    class MutableColumn(_Column):
+        def __init__(self, ground):
+            super().__init__(ground)
+            self.extra = set()
+
+        def get_solid(self, x, y, z):
+            return int(z) in self.extra or super().get_solid(x, y, z)
+
+    world = MutableColumn(215)
+    registry, crate = _dropping_crate(world)
+    registry.tick(_ctx(1000.0, world))
+    assert crate.terrain_support_z == 215
+
+    now = 1000.0
+    for _ in range(60):
+        now += 1 / 60
+        registry.tick(_ctx(now, world))
+    assert 1.0 < crate.z < 190.0
+
+    # The platform appears after CreateEntity, while the crate is in motion.
+    world.extra.add(190)
+    moved = []
+    positions = []
+    while crate.falling and now < 1030.0:
+        now += 1 / 60
+        tick_ctx = _ctx(now, world)
+        tick_ctx.move = moved.append
+        registry.tick(tick_ctx)
+        positions.append(crate.z)
+
+    assert crate.falling is False
+    assert max(positions) == 190.0
+    assert crate.z == 190.0
+    assert crate.terrain_support_z == 190
+    assert (crate.x, crate.y) == crate.home[:2]
+    assert moved == [crate]
+
+
+def test_stack_built_during_fall_cannot_entomb_the_crate():
+    class MutableColumn(_Column):
+        def __init__(self, ground):
+            super().__init__(ground)
+            self.extra = set()
+
+        def get_solid(self, x, y, z):
+            return int(z) in self.extra or super().get_solid(x, y, z)
+
+    world = MutableColumn(215)
+    registry, crate = _dropping_crate(world)
+    registry.tick(_ctx(1000.0, world))
+    assert crate.terrain_support_z == 215
+    world.extra.update(range(211, 215))
+
+    now = 1000.0
+    moved = []
+    positions = []
+    while crate.falling and now < 1030.0:
+        now += 1 / 60
+        tick_ctx = _ctx(now, world)
+        tick_ctx.move = moved.append
+        registry.tick(tick_ctx)
+        positions.append(crate.z)
+
+    assert crate.falling is False
+    assert max(positions) == 211.0
+    assert (crate.x, crate.y) == crate.home[:2]
+    assert crate.z == 211.0
+    assert crate.terrain_support_z == 211
+    assert moved == [crate]
+
+
+def test_block_behind_falling_crate_lifts_it_as_soon_as_it_lands():
+    class MutableColumn(_Column):
+        def __init__(self):
+            super().__init__(215)
+            self.extra = set()
+
+        def get_solid(self, x, y, z):
+            return int(z) in self.extra or super().get_solid(x, y, z)
+
+    world = MutableColumn()
+    registry, crate = _dropping_crate(world)
+    now = 1000.0
+    registry.tick(_ctx(now, world))
+    while crate.z <= 150.0:
+        now += 1 / 60
+        registry.tick(_ctx(now, world))
+
+    world.extra.add(100)  # already behind the +Z-down direction of travel
+    before = crate.z
+    now += 1 / 60
+    registry.tick(_ctx(now, world))
+    assert crate.falling is True
+    assert crate.z > before  # the airborne crate does not reverse its fall
+    _run_until_landed(registry, crate, world, start=now)
+
+    assert crate.z == 100.0
+    assert crate.terrain_support_z == 100
+
+
+def test_next_respawn_recalculates_z_after_the_crate_is_picked_up():
+    class MutableColumn(_Column):
+        def __init__(self, ground):
+            super().__init__(ground)
+            self.extra = set()
+
+        def get_solid(self, x, y, z):
+            return int(z) in self.extra or super().get_solid(x, y, z)
+
+    world = MutableColumn(215)
+    registry, crate = _dropping_crate(world)
+    first_fall, _track = _run_until_landed(registry, crate, world)
+    assert crate.z == 215.0
+
+    pickup_at = 1000.0 + first_fall + 1 / 60
+    player = _Player(crate.x, crate.y, crate.z)
+    registry.tick(_ctx(pickup_at, world, players=[player]))
+    assert crate.alive is False
+    assert player.refills == 1
+
+    # Terrain changed after pickup may affect the next life, but only its Z.
+    world.extra.update(range(210, 215))
+    respawn_at = crate.respawn_at
+    registry.tick(_ctx(respawn_at, world))
+    assert crate.falling is True
+    assert crate.terrain_support_z == 210
+    assert (crate.x, crate.y) == crate.home[:2]
+
+    _run_until_landed(registry, crate, world, start=respawn_at)
+    assert (crate.x, crate.y) == crate.home[:2]
+    assert crate.z == 210.0

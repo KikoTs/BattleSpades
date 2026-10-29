@@ -141,4 +141,7 @@ def test_spawn_safety_rejects_clear_but_unsupported_under_map_anchor():
     assert world._player_body_is_clear(*unsupported)
     assert not world.spawn_position_is_safe(unsupported)
     assert world.spawn_position_is_safe(grounded)
-    assert world.sanitize_spawn_point(unsupported, TEAM1) != unsupported
+    resolved = world.sanitize_spawn_point(unsupported, TEAM1)
+    assert resolved[:2] == unsupported[:2]
+    assert resolved[2] != unsupported[2]
+    assert world._player_body_is_clear(*resolved)

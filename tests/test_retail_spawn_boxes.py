@@ -218,7 +218,7 @@ def test_zombie_sea_spawn_survives_the_life_resolver():
         if wm.is_water_column(int(position[0]), int(position[1])):
             water_lives += 1
     assert water_lives > 10
-    # A survivor proposal in the same water is still rescued onto land.
+    # Any authored proposal now owns its horizontal column, even in water.
     survivor = SimpleNamespace(team=TEAM2, name="s")
     wet = next(
         wm.spawn_candidate_position(c, wm.map_metadata.spawn_zones[TEAM1])
@@ -226,7 +226,9 @@ def test_zombie_sea_spawn_survives_the_life_resolver():
     )
     server.mode = SimpleNamespace(get_spawn_point=lambda player: wet)
     rescued = resolve_player_spawn(server, survivor)
-    assert not wm.is_water_column(int(rescued[0]), int(rescued[1]))
+    assert rescued[:2] == wet[:2]
+    assert wm.is_water_column(int(rescued[0]), int(rescued[1]))
+    assert wm._player_body_is_clear(*rescued)
 
 
 def test_water_spawns_stay_rejected_outside_zombie_areas():

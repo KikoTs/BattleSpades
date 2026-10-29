@@ -233,12 +233,12 @@ behind them:
 | `misc_fifteen_in_a_row` | OMG Hax! | Get fifteen kills in a row without dying | one-shot | implemented | Your kill streak reaches 15 in one life. |
 | `sniper_kill_hard` | Hey, is that a sni- | 50 headshots with the sniper rifle | `sniper_kill_count` >= 50 | implemented | The same counter as Head Hunter. |
 | `low_health_killing` | Riskbreaker | Kill ten players when your health is below 10% over multiple rounds | `low_health_kills` >= 10 | implemented | An enemy kill while you are alive with less than 10% of your maximum health. |
-| `lastman_kills_zombies_easy` | Groovy! | As last man standing take out at least 5 zombies in one round | one-shot | implemented | Zombie. 5 zombie kills in one round while you are the marked last survivor. |
+| `lastman_kills_zombies_easy` | Groovy! | As last man standing take out at least 5 zombies in one round | one-shot | implemented | Zombie. 5 zombie kills in one round while you are the tracked last survivor. |
 | `lastman_kills_zombies_hard` | Come get some! | As last man standing take out at least 10 zombies in one round | one-shot | implemented | Zombie. 10 such kills in one round. |
 | `zombie_kills_in_water_ach` | Water on the Brainnnns | Kill 5 players as a zombie in the water | `zombie_kills_in_water` >= 5 | implemented | Zombie. A survivor kill as a zombie while you are wading. |
 | `blocks_as_zombie` | Dead Can Dig | Destroy 666 blocks as a zombie | `block_as_zombie_count` >= 666 | implemented | Zombie. Blocks destroyed while a zombie, collapses you cause included. |
-| `zombie_lms_one_round` | 28 Seconds Later | Survive for 28 seconds as last man standing in one zombie round | one-shot | implemented | Zombie. 28 s alive as the marked last survivor in one round. |
-| `zombie_lms_multi_round` | Survivalist | Survive as last man for 10 minutes total over multiple zombie rounds | `zombie_seconds_as_lms_count` >= 600 | implemented | Zombie. Seconds alive as the marked last survivor, added up for life. |
+| `zombie_lms_one_round` | 28 Seconds Later | Survive for 28 seconds as last man standing in one zombie round | one-shot | implemented | Zombie. 28 s alive as the tracked last survivor in one round. |
+| `zombie_lms_multi_round` | Survivalist | Survive as last man for 10 minutes total over multiple zombie rounds | `zombie_seconds_as_lms_count` >= 600 | implemented | Zombie. Seconds alive as the tracked last survivor, added up for life. |
 | `airborne_for_hour` | Time Flies | Spend a total of an hour in the air | `airborne_seconds_count` >= 3600 | implemented | Seconds alive and airborne. |
 | `sniper2_rapid_kill` | The Quick and the Dead | Kill 3 enemies in 20 seconds with the semi-auto sniper rifle | one-shot | implemented | 3 kills with the semi-auto sniper rifle within 20.0 s (stock `SNIPER2_RAPID_KILL_ACHIEVE_COUNT` / `_TIME`). |
 | `sniper_accuracy_hard` | Wisely Snipes | 6 kills with sniper rifle without missing a shot | one-shot | implemented | 6 such kills in a row. |

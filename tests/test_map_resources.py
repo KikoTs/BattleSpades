@@ -8,10 +8,12 @@ from types import SimpleNamespace
 
 import shared.constants as C
 
+from server.config import ServerConfig
 from server.entities.registry import EntityRegistry
 from server.game_constants import MAX_HEALTH, TEAM_NEUTRAL
 from server.map_metadata import MapEntitySpec, MapMetadata, load_map_metadata
 from server.map_resources import MapResourceService
+from server.world_manager import WorldManager
 
 
 class _Map:
@@ -102,6 +104,29 @@ def test_fallback_resources_exist_for_every_mode_boundary():
     assert len(server.created) == 9
 
 
+def test_fallback_pickups_keep_requested_xy_even_when_anchor_moves_sideways():
+    class SidewaysWorld(_World):
+        def dry_surface_anchor(self, x: float, y: float, search=24):
+            raise AssertionError("fallback crates must not search for dry land")
+
+    server = _Server()
+    server.world_manager = SidewaysWorld()
+    service = MapResourceService(server)
+    expected = service._fallback_pickups()
+
+    service.rebuild()
+
+    actual = [
+        (entity.x, entity.y, entity.z, entity.type)
+        for entity in server.entity_registry.all()
+        if entity.kind.startswith("map_")
+    ]
+    assert actual == [
+        (float(x), float(y), 239.0, entity_type)
+        for x, y, entity_type in expected
+    ]
+
+
 def test_each_pickup_refills_only_its_own_resource():
     behaviors = MapResourceService._behaviors()
     player = _Player()
@@ -154,6 +179,78 @@ def test_authored_pickups_and_chroma_lights_replicate_with_map_values(caplog):
     assert server.world_manager.map.points[(11, 21, 33)] == 0x80010203
     assert server.world_manager.map.points[(40, 50, 60)] == 0x80E0AC1D
     assert "family counts: 1=1" in caplog.text
+
+
+def test_ugc_pickups_keep_runtime_z_while_legacy_points_receive_vxl_shift():
+    metadata = MapMetadata(entities=[
+        MapEntitySpec(
+            int(C.AMMO_CRATE), "ammo", 10, 20, 30, "ugc_ammo_drop"
+        ),
+        MapEntitySpec(
+            int(C.HEALTH_CRATE), "health", 11, 21, 31,
+            "legacy_health_drop",
+        ),
+    ])
+    server = _Server(metadata)
+
+    MapResourceService(server).rebuild()
+
+    positions = {
+        entity.kind: (entity.x, entity.y, entity.z)
+        for entity in server.entity_registry.all()
+        if entity.kind in {"map_ammo", "map_health"}
+    }
+    assert positions == {
+        "map_ammo": (10.0, 20.0, 30.0),
+        "map_health": (11.0, 21.0, 33.0),
+    }
+
+
+def test_alcatraz_places_every_ugc_crate_at_its_exact_authored_position():
+    config = ServerConfig(default_mode="vip", maps_path="maps")
+    world = WorldManager(config)
+    assert world.load_map("Alcatraz")
+    assert world.map.source_z_shift == 39
+
+    created = []
+    server = SimpleNamespace(
+        config=config,
+        world_manager=world,
+        entity_registry=EntityRegistry(),
+        mode=SimpleNamespace(map_pickups_enabled=True),
+        broadcast_create_entity=created.append,
+        broadcast_destroy_entity=lambda _entity_id: None,
+    )
+    MapResourceService(server).rebuild()
+
+    pickup_types = {
+        int(C.AMMO_CRATE), int(C.HEALTH_CRATE), int(C.BLOCK_CRATE),
+    }
+    expected = Counter(
+        (int(spec.entity_type), float(spec.x), float(spec.y), float(spec.z))
+        for spec in world.map_metadata.entities
+        if int(spec.entity_type) in pickup_types
+    )
+    actual = Counter(
+        (int(entity.type), entity.x, entity.y, entity.z)
+        for entity in server.entity_registry.all()
+        if int(entity.type) in pickup_types
+    )
+
+    assert len(expected) == 18
+    corrected_ammo = (
+        int(C.AMMO_CRATE), 378.451, 116.456, 191.742,
+    )
+    assert expected[corrected_ammo] == 1
+    assert expected[
+        (int(C.AMMO_CRATE), 380.455, 188.55, 192.749)
+    ] == 0
+    assert actual == expected
+    assert Counter(entity.kind for entity in server.entity_registry.all()) == {
+        "map_health": 5,
+        "map_ammo": 10,
+        "map_block": 3,
+    }
 
 
 def test_both_chroma_marker_families_keep_their_distinct_palette_colors():

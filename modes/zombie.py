@@ -21,7 +21,6 @@ from server import mode_data
 from server.class_data import BATTLESPADES_TEAM_CLASSES
 from server.class_selection import ClassSelection, normalize_class_selection
 from server.game_constants import (
-    KILL_CLASS_CHANGE,
     KILL_TEAM_CHANGE,
     TEAM1,
     TEAM2,
@@ -104,9 +103,8 @@ class ZombieMode(BaseMode):
         self.zombie_respawn_time = max(0.0, float(overlay.get(
             "zombie_respawn_time", 10.0
         )))
-        # The normal Zombie death creates a grave. Only the instantaneous
-        # infection transition uses the existing classic-corpse cleanup path,
-        # avoiding any grave entity without changing global corpse rules.
+        # Normal combat deaths create graves. Infection and administrative
+        # team/class transitions use the grave-free corpse cleanup path.
         self.death_representation = "grave"
 
         self.phase = ZombiePhase.WAITING
@@ -436,18 +434,24 @@ class ZombieMode(BaseMode):
         return float(self.server.config.respawn_time)
 
     def death_kill_type_for(self, player: Player, killer, kill_type: int) -> int:
-        """Avoid graves for humans converting to zombies only.
+        """Avoid graves for infection and administrative model transitions.
 
         Player.die calls this synchronous hook before corpse_lifecycle. A
         conversion must use KillAction so the stock client replaces its
         character model, but classic-corpse handling skips entity-11 graves.
-        The instant follow-up CreatePlayer clears the temporary corpse.
+        Administrative transitions outside the round-reset respawn path use
+        the same grave-free representation.  The round reset itself replaces
+        each live Character directly and therefore sends no KillAction at all.
         """
+        suppress_grave = (
+            int(kill_type) in _TRANSITION_KILLS
+            or (
+                self.phase is ZombiePhase.ACTIVE
+                and int(getattr(player, "team", -1)) == SURVIVOR_TEAM
+            )
+        )
         self.death_representation = (
-            "classic_corpse"
-            if self.phase is ZombiePhase.ACTIVE
-            and int(getattr(player, "team", -1)) == SURVIVOR_TEAM
-            else "grave"
+            "classic_corpse" if suppress_grave else "grave"
         )
         return int(kill_type)
 
@@ -524,15 +528,11 @@ class ZombieMode(BaseMode):
     def reveal_to(self, connection) -> None:
         super().reveal_to(connection)
         self._set_team_map_visibility(connection=connection)
-        # Late joiners must not inherit an old marked-zombie state either.
+        # Late joiners must not inherit an old marked-zombie state. The last
+        # survivor is deliberately ordinary and receives no VIP-style marker.
         for zombie in self._zombies():
             self._set_high_minimap_visibility(zombie, False, connection=connection)
         self.send_start_cue_to(connection)
-        if self.last_survivor_id is None:
-            return
-        player = self.server.players.get(self.last_survivor_id)
-        if player is not None:
-            self._set_high_minimap_visibility(player, True, connection=connection)
 
     def countdown_seconds_remaining(self, now: float) -> float:
 
@@ -792,14 +792,18 @@ class ZombieMode(BaseMode):
         for player in remaining:
             if int(player.team) == SURVIVOR_TEAM:
                 continue
-            if bool(getattr(player, "alive", False)):
-                player.die(kill_type=KILL_TEAM_CHANGE)
-            self._assign_survivor(player)
+            try:
+                if bool(getattr(player, "alive", False)):
+                    player.die(kill_type=KILL_TEAM_CHANGE)
+                self._assign_survivor(player)
+            finally:
+                self.death_representation = "grave"
         return True
 
     async def _refresh_last_survivor_marker(
         self, *, exclude: Player | None = None
     ) -> None:
+        """Track last-man rules without granting a VIP/minimap marker."""
         survivors = self._survivors(exclude=exclude)
         new_id = int(survivors[0].id) if len(survivors) == 1 else None
         if new_id == self.last_survivor_id:
@@ -811,7 +815,6 @@ class ZombieMode(BaseMode):
         if player is None:
             return
         self.last_survivor_id = new_id
-        self._set_high_minimap_visibility(player, True)
         self._next_last_man_score_at = time.time() + float(
             CG.ZOM_SCORE_LASTMAN_INTERVAL
         )
@@ -825,19 +828,13 @@ class ZombieMode(BaseMode):
             self._round_music_changed = True
 
     def _clear_last_survivor_marker(self) -> None:
-        player_id = self.last_survivor_id
+        # Zombie owns no high-minimap marker. Clear only last-man scoring,
+        # achievement and bot state; escape_watch may independently own a
+        # marker for a genuinely sealed survivor.
         self.last_survivor_id = None
-        if player_id is None:
-            return
-        player = self.server.players.get(player_id)
-        if player is not None:
-            self._set_high_minimap_visibility(player, False)
 
     def mode_marks_player(self, player) -> bool:
-        return (
-            self.last_survivor_id is not None
-            and int(getattr(player, "id", -1)) == self.last_survivor_id
-        )
+        return False
 
     def escape_watch_objective_player(self, player) -> bool:
         return (
@@ -1069,6 +1066,14 @@ class ZombieMode(BaseMode):
         await self._arm_countdown_if_ready(time.time())
 
     async def _drain_round_reset(self, now: float) -> None:
+        """Silently replace a bounded slice with ordinary survivor lives.
+
+        A round boundary is not a death.  Calling ``Player.die`` here would
+        publish KillAction, which makes the retail client play the death cue
+        and list every TEAM_CHANGE/CLASS_CHANGE on its HUD.  As in VIP's
+        sub-round reset, ``respawn_player`` safely replaces a live Character
+        with CreatePlayer and publishes the new team/class without that noise.
+        """
         budget = self.round_respawns_per_tick
         respawn = getattr(self.server, "respawn_player", None)
         while budget > 0 and self._round_reset_queue:
@@ -1080,12 +1085,6 @@ class ZombieMode(BaseMode):
             ):
                 continue
             try:
-                if bool(getattr(player, "alive", False)):
-                    player.die(
-                        kill_type=KILL_TEAM_CHANGE
-                        if int(player.team) == ZOMBIE_TEAM
-                        else KILL_CLASS_CHANGE
-                    )
                 self._assign_survivor(player)
                 if callable(respawn):
                     respawn(player)

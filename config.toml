@@ -628,7 +628,7 @@ sustained_per_minute = 3.0
 # start and for joiners. A DELIBERATE DEVIATION kept on request: retail rounds
 # were silent (map ambience only) until the final 61 s (game_ending_00N), and
 # last_man_standing played only for the Zombie last survivor. false = retail.
-mode_start_music = true
+mode_start_music = false
 
 [updates]
 # Read the shared update manifest at startup and log "new server version X

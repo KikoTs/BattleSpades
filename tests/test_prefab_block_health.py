@@ -68,19 +68,25 @@ def test_partial_damage_is_reported_as_remaining_health(world):
 def test_recolour_keeps_health_but_new_topology_clears_it(world):
     cell = _cell(world)
     world.set_block(*cell, True, 0x808080, health=PREFAB_HEALTH)
+    assert world.is_runtime_solid(*cell)
     # Paint path: solid -> solid without a health argument.
     world.set_block(*cell, True, 0x102030)
     assert world.initial_block_health(*cell) == PREFAB_HEALTH
+    assert world.is_runtime_solid(*cell)
 
     world.destroy_blocks([cell])
     assert cell not in world.block_health
+    assert not world.is_runtime_solid(*cell)
     # An ordinary block rebuilt in the same place is ordinary again.
     world.set_block(*cell, True, 0x808080)
     assert world.initial_block_health(*cell) == DEFAULT_BLOCK_HEALTH
+    assert world.is_runtime_solid(*cell)
 
     world.set_block(*cell, True, 0x808080, health=PREFAB_HEALTH)
+    assert world.is_runtime_solid(*cell)
     world.set_block(*cell, False)
     assert cell not in world.block_health
+    assert not world.is_runtime_solid(*cell)
 
 
 def test_prefab_over_existing_solid_resets_damage_and_health(world):
@@ -116,3 +122,26 @@ def test_new_map_forgets_prefab_health(world):
     world.apply_block_damage(*cell, 1.0)
     world.generate_flat_map()
     assert world.block_health == {} and world.block_damage == {}
+    assert world.runtime_solid_cells == set()
+
+
+def test_ugc_build_remains_runtime_terrain_without_a_health_row(world):
+    world.config.ugc_runtime = True
+    cell = _cell(world)
+
+    assert world.set_block(*cell, True, 0x808080, health=PREFAB_HEALTH)
+
+    # Map Creator deliberately omits BlockManager.user_blocks health, but the
+    # crate drop still needs to distinguish this live build from a map roof.
+    assert cell not in world.block_health
+    assert world.is_runtime_solid(*cell)
+
+
+def test_repainting_authored_map_solid_does_not_make_it_runtime_terrain(world):
+    cell = (40, 40, int(world.get_height(40, 40)))
+    assert world.get_solid(*cell)
+    assert not world.is_runtime_solid(*cell)
+
+    assert world.set_block(*cell, True, 0x102030)
+
+    assert not world.is_runtime_solid(*cell)

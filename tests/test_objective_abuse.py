@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import shared.constants as C
+from modes.classic_ctf import ClassicCTFMode
 from modes.ctf import CTFMode
 from modes.diamond_mine import DiamondMineMode
 from modes.occupation import OccupationMode
@@ -116,7 +117,7 @@ def test_ctf_buried_home_intel_resurfaces_on_top_of_the_tomb(loop):
     assert entity is not None and entity.z == pytest.approx(GROUND - 4)
 
 
-def test_ctf_buried_dropped_intel_returns_home(loop):
+def test_ctf_buried_dropped_intel_rises_in_place(loop):
     server, director = _server(loop, CTFMode)
     mode = server.mode
     world = server.world_manager
@@ -127,8 +128,11 @@ def test_ctf_buried_dropped_intel_returns_home(loop):
     _wall(world, 200, 200, GROUND - 2, GROUND - 1)
     mode._guard_next_at = 0.0
     loop.run_until_complete(mode.on_tick(1))
-    assert mode.intel_positions[TEAM1] == home
-    assert mode.intel_drop_time[TEAM1] == 0.0
+    assert mode.intel_positions[TEAM1] == pytest.approx(
+        (dropped[0], dropped[1], GROUND - 2 - STANDING)
+    )
+    assert mode.intel_home_positions[TEAM1] == home
+    assert mode.intel_drop_time[TEAM1] > 0.0
 
 
 def test_ctf_open_intel_is_left_alone(loop):
@@ -138,6 +142,193 @@ def test_ctf_open_intel_is_left_alone(loop):
     mode._guard_next_at = 0.0
     loop.run_until_complete(mode.on_tick(1))
     assert mode.intel_positions == before
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+@pytest.mark.parametrize(
+    ("drop_z", "support_z"),
+    (
+        (GROUND - STANDING, GROUND),
+        (40.0, 50),
+    ),
+)
+def test_ctf_drop_falls_to_same_column_support_below_not_roof(
+    loop,
+    mode_cls,
+    drop_z,
+    support_z,
+):
+    server, director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    carrier = _bot(loop, director, TEAM1)
+    drop_x, drop_y = 200.25, 200.75
+    cell_x, cell_y = int(drop_x), int(drop_y)
+
+    # A roof well above the drop used to win the whole-column surface lookup.
+    assert world.set_block(cell_x, cell_y, 10, True, WALL)
+    if support_z != GROUND:
+        assert world.set_block(cell_x, cell_y, support_z, True, WALL)
+
+    carrier.set_position(drop_x, drop_y, drop_z)
+    loop.run_until_complete(mode._pickup_intel(carrier, TEAM2))
+    loop.run_until_complete(
+        mode._drop_intel(
+            carrier,
+            TEAM2,
+            position=(drop_x, drop_y, drop_z),
+            velocity=(0.0, 0.0, 0.0),
+        )
+    )
+
+    expected = (drop_x, drop_y, float(support_z) - STANDING)
+    assert mode.intel_positions[TEAM2] == pytest.approx(expected)
+    entity = server.entity_registry.get(mode._intel_entities[TEAM2])
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (drop_x, drop_y, float(support_z))
+    )
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_home_trigger_and_entity_move_together_to_top_of_home_column(
+    loop,
+    mode_cls,
+):
+    server, _director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    home = mode.intel_home_positions[TEAM2]
+    cell_x, cell_y = int(home[0]), int(home[1])
+    assert world.set_block(cell_x, cell_y, 10, True, WALL)
+
+    mode.intel_drop_time[TEAM2] = 1.0
+    loop.run_until_complete(mode._return_intel(TEAM2))
+
+    expected = (home[0], home[1], 10.0 - STANDING)
+    assert mode.intel_positions[TEAM2] == pytest.approx(expected)
+    assert mode.intel_home_positions[TEAM2] == pytest.approx(expected)
+    assert server.teams[TEAM2].intel_position == pytest.approx(expected)
+    entity = server.entity_registry.get(mode._intel_entities[TEAM2])
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (home[0], home[1], 10.0)
+    )
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_committed_build_immediately_raises_dropped_intel_connected_stack(
+    loop,
+    mode_cls,
+):
+    server, director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    carrier = _bot(loop, director, TEAM1)
+    drop_x, drop_y = 200.25, 200.75
+    cell_x, cell_y = int(drop_x), int(drop_y)
+    assert world.set_block(cell_x, cell_y, 10, True, WALL)
+
+    carrier.set_position(drop_x, drop_y, GROUND - STANDING)
+    loop.run_until_complete(mode._pickup_intel(carrier, TEAM2))
+    loop.run_until_complete(
+        mode._drop_intel(
+            carrier,
+            TEAM2,
+            position=carrier.position,
+            velocity=(0.0, 0.0, 0.0),
+        )
+    )
+    dropped_at = mode.intel_drop_time[TEAM2]
+    home = mode.intel_home_positions[TEAM2]
+
+    stack = tuple((cell_x, cell_y, z) for z in (GROUND - 1, GROUND - 2, GROUND - 3))
+    for x, y, z in stack:
+        assert world.set_block(x, y, z, True, WALL)
+    loop.run_until_complete(mode.on_blocks_built(carrier, stack))
+
+    expected_surface = float(GROUND - 3)
+    expected = (drop_x, drop_y, expected_surface - STANDING)
+    assert mode.intel_positions[TEAM2] == pytest.approx(expected)
+    assert mode.intel_home_positions[TEAM2] == pytest.approx(home)
+    assert mode.intel_drop_time[TEAM2] == dropped_at
+    assert server.teams[TEAM2].intel_position == pytest.approx(expected)
+    entity = server.entity_registry.get(mode._intel_entities[TEAM2])
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (drop_x, drop_y, expected_surface)
+    )
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_guard_raises_direct_and_repeated_builds_without_event(loop, mode_cls):
+    server, director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    carrier = _bot(loop, director, TEAM1)
+    drop_x, drop_y = 200.25, 200.75
+    cell_x, cell_y = int(drop_x), int(drop_y)
+
+    carrier.set_position(drop_x, drop_y, GROUND - STANDING)
+    loop.run_until_complete(mode._pickup_intel(carrier, TEAM2))
+    loop.run_until_complete(
+        mode._drop_intel(
+            carrier,
+            TEAM2,
+            position=carrier.position,
+            velocity=(0.0, 0.0, 0.0),
+        )
+    )
+    dropped_at = mode.intel_drop_time[TEAM2]
+    home = mode.intel_home_positions[TEAM2]
+
+    # Simulate terrain sources that commit directly and never dispatch the
+    # mode's post-build event. The fast guard must also bypass its 1 Hz work
+    # throttle on the second, immediately consecutive build.
+    mode._guard_next_at = float("inf")
+    for built_z in (GROUND - 1, GROUND - 2):
+        assert world.set_block(cell_x, cell_y, built_z, True, WALL)
+        loop.run_until_complete(mode._guard_ground_intel())
+        expected = (drop_x, drop_y, float(built_z) - STANDING)
+        assert mode.intel_positions[TEAM2] == pytest.approx(expected)
+        entity = server.entity_registry.get(mode._intel_entities[TEAM2])
+        assert entity is not None
+        assert (entity.x, entity.y, entity.z) == pytest.approx(
+            (drop_x, drop_y, float(built_z))
+        )
+
+    assert mode.intel_home_positions[TEAM2] == pytest.approx(home)
+    assert mode.intel_drop_time[TEAM2] == dropped_at
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_detached_roof_build_event_does_not_raise_dropped_intel(loop, mode_cls):
+    server, director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    carrier = _bot(loop, director, TEAM1)
+    drop_x, drop_y = 200.25, 200.75
+    cell_x, cell_y = int(drop_x), int(drop_y)
+
+    carrier.set_position(drop_x, drop_y, GROUND - STANDING)
+    loop.run_until_complete(mode._pickup_intel(carrier, TEAM2))
+    loop.run_until_complete(
+        mode._drop_intel(
+            carrier,
+            TEAM2,
+            position=carrier.position,
+            velocity=(0.0, 0.0, 0.0),
+        )
+    )
+    before = mode.intel_positions[TEAM2]
+    entity_id = mode._intel_entities[TEAM2]
+
+    roof = (cell_x, cell_y, 10)
+    assert world.set_block(*roof, True, WALL)
+    loop.run_until_complete(mode.on_blocks_built(carrier, (roof,)))
+
+    assert mode.intel_positions[TEAM2] == before
+    assert mode._intel_entities[TEAM2] == entity_id
 
 
 def test_ctf_capture_counts_in_a_dug_out_base_pit_but_not_a_tunnel(loop):

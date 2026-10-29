@@ -84,8 +84,8 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 13 | SetClassLoadout | both | Handled+Sent | Normalized server-side; an unchanged selection is ignored, and a changed one is staged and applied at the next life (a live Character dies with KILL_CLASS_CHANGE). Only the Map Creator's live UGC backpack edit is committed in place and acknowledged with a reliable SetClassLoadout (instant=1). Retail may omit the trailing zero UGC-count byte; the bounded decoder accepts only that optional empty tail. UGC preserves one shared five-item prefab/Game Data backpack. |
 | 14 | ExistingPlayer | — | Reversed/unused | Roster entry (id, demo, team, class, tool, pickup, dead, score, forced_team, language, colour, name, loadout, prefabs). Not sent: the roster goes out as CreatePlayer(28). Live 2026-09-26: the client reads `pickup` **signed**, so 0xFF arrives as -1 and the created player gets `pickup_id=None`; 0 gives `pickup_id=0` (the minimap `PICKUPS[0]` KeyError case). The earlier "no 0xFF sentinel" note was wrong; switching the roster to 14 would be a roster-lifecycle change, not needed for parity today. |
 | 15 | NewPlayerConnection | C→S | Handled | Client's join announcement (name/team/class), parsed in handshake. Accepted only after this connection's InitialInfo → MapSync → StateData completed (every stock client, Steam or ticket-less legacy, sends SteamSessionTicket(105) first); earlier or duplicate in-flight packets are ignored. Before CreatePlayer, names are normalized to a case-insensitively unique 15-byte wire value; duplicate names can steal the native client's local-player association. |
-| 16 | ChangeEntity | S→C | Sent | Server-owned turret/MG target, carrier, ammo, state, and map-pickup position. Action 1 (`SET_POSITION`) reliably settles a pickup after its supporting structure breaks. |
-| 17 | ChangePlayer | S→C | Sent | Existing-player state changes. Action `SET_HIGH_MINIMAP_VISIBILITY` (8) exposes the CTF intel carrier, both VIP bosses, or ZOM's final survivor through terrain; each mode owns marker cleanup and late-join replay. |
+| 16 | ChangeEntity | S→C | Sent | Server-owned turret/MG target, carrier, ammo, state, and map-pickup position. Action 1 (`SET_POSITION`) reliably confirms a supply crate's landing position and lifts a crate out of blocks placed directly on it. |
+| 17 | ChangePlayer | S→C | Sent | Existing-player state changes. Action `SET_HIGH_MINIMAP_VISIBILITY` (8) exposes CTF intel carriers and VIP bosses through terrain; each objective mode owns marker cleanup and late-join replay. Zombie's final survivor remains an ordinary unmarked player. |
 | 18 | POIFocus | S→C | Sent | Handler reads only `target_x/y/z` and (with a local player) activates the GameScene `LookAtController` aimed at that point. No timeout and no release packet: live 2026-09-26 the lock held until the local player died (ChaseController) or was spawned (server `respawn_player` of a living player cleared it) or the map changed. Demolition sends it to every non-spectator team player when the objective airstrike launches, aimed at the base being struck (on a double destruction each team watches the base it destroyed); the round restart respawns them. `server.hud_packets.poi_focus`. |
 | 19 | DestroyEntity | S→C | Sent | Removes an entity previously announced to that GameScene. Server-only objective markers must never receive a destroy packet. For Snowball it removes the visual/effect only; it does not apply blast impulse. |
 | 20 | HitEntity | S→C | Sent | Visual impact callback for server-authoritative damageable-entity hits. |
@@ -139,7 +139,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 68 | UGCObjectives | S→C | Sent | Exact current/min/max/priority rows for shared and target-mode Map Creator requirements. |
 | 69 | Restock | S→C | Sent | Resource-specific refill. Type 0 is the full-life spawn/general restock; a physical ammo crate must send type 3. Health (4), block (5), and jetpack (6) crates use their own paths. Sending type 0 for an ammo crate also restores client health. |
 | 70 | PickPickup | S→C | Sent | Authoritative objective pickup; initializes carried tool and burden state. CTF removes the type-16 ground entity and enables the carrier's high-visibility minimap marker. |
-| 71 | DropPickup | both | Handled+Sent | Client drop request validated against sender/current pickup, then relayed with authoritative identity, type, position, and capped throw velocity. DropPickup clears the carried tool but does not persist ground intel, so CTF follows it with a type-16 CreateEntity at the settled dry-ground position. |
+| 71 | DropPickup | both | Handled+Sent | Client drop request validated against sender/current pickup, then relayed with authoritative identity, type, position, and capped throw velocity. DropPickup clears the carried tool but does not persist ground intel, so CTF follows it with a type-16 CreateEntity on the first same-column support below the drop height. |
 | 72 | ForceShowScores | S→C | Sent | IDA (stock gameScene.pyd, body 0x101A0300 -> GameScene.force_show_scores): forced=1 opens the ViewScores menu through manager.set_menu, stops movement and locks the menu to the scene; forced=0 (clear_force_show_scores) returns control. LIVE 2026-09-24 (tracer client): the client shows its scores scene (frontend MenuScene host) while staying connected, and the in-place restart's forced=0 drops it straight back into the same GameScene. Sent at every round end and released by the restart (`lobby.end_round_scoreboard`, default true). |
 | 73 | ShowTextMessage | S→C | Sent | IDA (body 0x101A0490 -> GameScene.show_text_message(message_id, duration)): only when the active menu is ViewGameStats does it call set_message, i.e. it is the headline of the terminal statistics screen. The nine ids (NEXT_MAP_MESSAGE..TEAM_SCORES_DRAW) select HUD-local strings (END_OF_MAP, TEAM_DEFEAT, BASE_DESTROYED, ZOMBIE_WIN, SURVIVOR_WIN, GAME_DRAWN). Sent right after ShowGameStats(53) on a map rollover (`lobby.end_round_headline`, default true); inert and therefore not sent on same-map restarts. Not a free-text overlay. |
 | 74 | FogColor | S→C | Sent | Live fog override from the admin command. Initial fog comes from the active map sidecar in StateData; the runtime override also persists into later spawn/rejoin snapshots. Map Creator: a host skydome choice that is a `FOG_COLORS` key also sends 74 to every editor, host included (retail `set_skybox_name` 0x1012d4c0). Wire: one int32 LE `(r<<24)|(g<<16)|(b<<8)`, i.e. bytes `00 B G R`. |
@@ -537,22 +537,27 @@ numeric global ceiling is BattleSpades operational hardening.
 Zombie uses the retail mode id 2 and existing role packets; it introduces no
 custom wire format:
 
-- Before outbreak, `StateData(45)` exposes the stock survivor classes
-  (`DEFAULT_TEAM_CLASSES`, stock order, no Rocketeer) on team 2 and locks
-  team 3. HeadCount type 0 shows the two teams' player counts.
+- Before outbreak, `StateData(45)` exposes the configured BattleSpades
+  survivor classes on team 2 and locks team 3. HeadCount type 0 shows the two
+  teams' player counts.
 - At outbreak, `KillAction(19)` provides the native-safe model transition and
   the following `CreatePlayer(28)` respawns Patient Zero as class 4 on team 3.
 - Team 3 is class-locked to base Zombie. Fast/Jump Zombie remain disabled
   because this client has no stable ordinary picker icons for those classes.
-- `InitialInfo.exposed_teams_always_on_minimap` is set for Zombie mode. The
-  native `Player.display_map_icon_out_of_bounds` routine uses this boolean for
-  ordinary opposing-role map visibility; it does **not** apply the VIP icon.
-- `ChangePlayer(17)` action 8 marks the sole remaining living survivor and is
-  replayed to late joiners. This is a separate
-  `high_minimap_visibility` path which does apply the special/VIP marker, so it
-  must not be broadcast for every survivor.
+- `InitialInfo.exposed_teams_always_on_minimap` remains unset so enemy icons
+  are not edge-pinned. Asymmetric `StateData(45)` and `TeamMapVisibility(83)`
+  flags let zombies see survivors without applying the VIP icon.
+- The sole remaining living survivor remains an ordinary player. Zombie does
+  not send or replay `ChangePlayer(17)` action 8 for that state because the
+  client renders it as the special/VIP marker. Last-man scoring, announcements
+  and music are tracked separately from visual marker ownership.
+- The next-round role reset directly replaces every body with
+  `CreatePlayer(28)` carrying the survivor team/class. It sends no
+  `KillAction(46)`, `ChangeTeam(77)` or corpse packet, so the reset is silent:
+  no death cue, HUD team-change list or entity-11 gravestones.
 - A client joining after outbreak is normalized to team 3/class 4 regardless
-  of its requested team, class, or loadout. Zombie respawn delay is zero.
+  of its requested team, class, or loadout. Infection respawns immediately;
+  an ordinary killed zombie uses the configured Zombie respawn delay.
 
 The 600-second survival clock starts when Patient Zero is selected. Time spent
 waiting for enough players is not round time.
@@ -733,12 +738,31 @@ PickPickup (70) is server-to-client only. DropPickup (71) is handled and
 relayed; objective pickup state is also carried by WorldUpdate and replayed to
 late joiners.
 
-Map crates remember their authored vertical offset from the first solid voxel
-beneath them. At 10 Hz they verify only that remembered support cell. If it is
-destroyed, the server finds the next support in AoS's +Z-down column, updates
-the authoritative entity/home position, and reliably emits ChangeEntity (16)
-action 1. A fall into a water-only column is redirected to the nearest dry
-surface so a permanent map resource cannot become unreachable.
+CTF and Classic CTF preserve the dropped intel's exact X/Y. Its landing scan
+starts at the submitted Z and proceeds only downward, so a ceiling or a block
+high above it cannot pull it upward; an airborne intel lands on the first
+same-column block below it. The persistent type-16 entity uses that already
+resolved height instead of running a second whole-column surface lookup, so
+its model and pickup trigger stay together. A committed block that occupies
+the resting intel model raises both immediately to the top of that connected
+vertical stack; a detached ceiling does not move them. When intel returns to
+base, both its trigger and model instead resolve to the topmost voxel in the
+exact authored home column, so construction over the spawn cannot split them.
+
+Map crates preserve their exact authored X/Y, including water columns. At each
+respawn the server resolves only Z in that column (the water surface is a valid
+target), then starts the local air-drop simulation. While airborne, the server
+rechecks only terrain still below the crate, so a player-built platform present
+before or added during the fall catches it without changing X/Y; a block the
+crate already passed does not reverse its active fall. On landing and every
+subsequent gameplay tick, any block above the crate moves it immediately to the
+topmost surface in that exact column; loss of support never changes X/Y or
+makes a landed crate fall. The server reliably emits ChangeEntity (16) action 1
+for the final landing or an overhead-block move. The next respawn begins again
+at the original X/Y. Map
+Creator ``ugc_*_drop`` coordinates are already in the normalized runtime
+coordinate space; only legacy ``*_crate_drop_points`` apply the VXL source-Z
+shift.
 
 ### Classic CTF scene contract
 

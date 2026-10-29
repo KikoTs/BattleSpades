@@ -135,7 +135,7 @@ def test_firing_a_gun_ends_protection_but_digging_does_not():
     assert rifle.spawn_protection_remaining() > 0.0
 
 
-def test_a_fully_camped_base_moves_spawns_to_a_safer_part_of_the_side():
+def test_a_fully_camped_base_stays_inside_its_spawn_pool():
     async def scenario():
         server, director = await _server("ArcticBase")
         spawner = await director.add_bot(team=TEAM1, class_id=int(C.CLASS_SOLDIER))
@@ -154,8 +154,9 @@ def test_a_fully_camped_base_moves_spawns_to_a_safer_part_of_the_side():
                 campers.append(camper)
         spot = choose_team_spawn(server, spawner, rng=random.Random(2))
         assert spot is not None
-        nearest = min(math.hypot(spot[0] - c.x, spot[1] - c.y) for c in campers)
-        assert nearest >= DANGER_RADIUS
+        assert spot[:2] in {
+            (float(x) + 0.5, float(y) + 0.5) for x, y in columns
+        }
     asyncio.run(scenario())
 
 

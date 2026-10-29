@@ -76,9 +76,10 @@ class MapEntity:
     # markers in the registry for mode logic, but never serialize them as a
     # runtime CreateEntity.
     wire_visible: bool = True
-    # Runtime-only terrain attachment for map pickups. Official sidecars may
-    # place a crate one to three voxels above (or at) its support voxel, so we
-    # retain that authored offset when a broken structure makes it fall.
+    # Runtime-only terrain target for map pickups. During an air drop it tracks
+    # the first same-column surface still below the crate, including new player
+    # blocks. After landing it remains fixed unless a block occupies the crate
+    # itself, in which case the crate rises without changing its authored home.
     terrain_support_z: Optional[int] = None
     terrain_offset_z: float = 0.0
     terrain_check_at: float = 0.0

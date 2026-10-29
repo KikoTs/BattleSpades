@@ -8,24 +8,39 @@
                 472,
                 238
             ],
+            "bounds": {
+                "min": [
+                    326.469,
+                    458.45,
+                    223.745
+                ],
+                "max": [
+                    352.547,
+                    485.533,
+                    233.741
+                ]
+            },
             "mode": "vip",
             "item": "ugc_spawnblue_med"
         },
         {
             "position": [
                 42,
-                78,
+                86,
                 232
             ],
-            "mode": "vip",
-            "item": "ugc_spawngreen_med"
-        },
-        {
-            "position": [
-                42,
-                94,
-                232
-            ],
+            "bounds": {
+                "min": [
+                    30.452,
+                    66.451,
+                    224.742
+                ],
+                "max": [
+                    53.549,
+                    106.548,
+                    227.75
+                ]
+            },
             "mode": "vip",
             "item": "ugc_spawngreen_med"
         }

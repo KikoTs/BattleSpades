@@ -4,8 +4,8 @@ Live report: once the whole team spawn area was dug down to the water, nobody
 could spawn. The old fallback walked the whole team region cell by cell
 (seconds per life on the gameplay thread, for every respawn) and then handed
 back a water column. These tests dig ArcticBase's real TEAM1 side down to the
-water plane and require a fast, valid, dry spawn - or, when the whole map is
-water, a spawn in the water at the base that is never inside solid blocks.
+water plane and require a fast spawn in the same cached team columns, never a
+horizontal move to dry land elsewhere on the map.
 """
 
 import asyncio
@@ -76,8 +76,12 @@ def test_region_is_really_dug_to_water(dug):
         assert world.is_water_column(x, y)
 
 
-def test_dug_out_base_still_spawns_fast_on_dry_ground(dug):
+def test_dug_out_base_still_spawns_fast_in_its_original_columns(dug):
     world = dug.server.world_manager
+    original_columns = {
+        (int(candidate[0]), int(candidate[1]))
+        for candidate in world._get_spawn_candidates(TEAM1)
+    }
     player = _team1_player(dug)  # add_bot itself spawns through resolve
     assert player.alive
     timings = []
@@ -85,8 +89,10 @@ def test_dug_out_base_still_spawns_fast_on_dry_ground(dug):
         started = time.perf_counter()
         position = resolve_player_spawn(dug.server, player)
         timings.append(time.perf_counter() - started)
-        assert world.spawn_position_is_safe(position), position
-        assert not world.is_water_column(int(position[0]), int(position[1]))
+        cell = int(position[0]), int(position[1])
+        assert cell in original_columns
+        assert world.is_water_column(*cell)
+        assert world._player_body_is_clear(*position)
     # The old path took ~3 s per life here.
     assert max(timings) < 0.5, timings
     assert sum(timings) / len(timings) < 0.1, timings
@@ -102,8 +108,12 @@ def test_emergency_spawn_prefers_dry_land_nearest_the_team(dug):
     assert math.hypot(x - t1[0], y - t1[1]) < math.hypot(x - t2[0], y - t2[1])
 
 
-def test_all_water_map_spawns_in_the_water_at_the_base_never_in_blocks(dug, monkeypatch):
+def test_all_water_map_keeps_a_cached_spawn_column_never_in_blocks(dug, monkeypatch):
     world = dug.server.world_manager
+    original_columns = {
+        (int(candidate[0]), int(candidate[1]))
+        for candidate in world._get_spawn_candidates(TEAM1)
+    }
     monkeypatch.setattr(spawn_selection, "_dry_grid", lambda server, world: [])
     monkeypatch.setattr(world, "_nearest_safe_spawn_point", lambda *a, **k: None)
     player = SimpleNamespace(team=TEAM1, id=99, name="probe", position=(0, 0, 0))
@@ -113,8 +123,7 @@ def test_all_water_map_spawns_in_the_water_at_the_base_never_in_blocks(dug, monk
     assert all(math.isfinite(v) for v in (x, y, z))
     assert world.is_water_column(int(x), int(y))
     assert world._player_body_is_clear(x, y, z)
-    base = world.team_base_anchor(TEAM1)
-    assert math.hypot(x - base[0], y - base[1]) < 2.0
+    assert (int(x), int(y)) in original_columns
 
 
 def test_water_fallback_lifts_the_body_out_of_solid_blocks(dug):
@@ -145,7 +154,9 @@ def test_dead_players_respawn_on_a_dug_out_base(dug):
     player.death_time = time.time() - 60.0
     dug.loop.run_until_complete(server.round_lifecycle.process_respawns())
     assert player.alive
-    assert server.world_manager.spawn_position_is_safe(player.position)
+    world = server.world_manager
+    assert world.is_water_column(int(player.x), int(player.y))
+    assert world._player_body_is_clear(*player.position)
 
 
 def test_a_failing_respawn_backs_off_instead_of_stalling_every_tick(dug, monkeypatch):

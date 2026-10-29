@@ -114,8 +114,6 @@ class PickupCrateBehavior(EntityBehavior):
     # radius + closely spaced crates let one walk-through consume BOTH the
     # ammo and health crate at once ("everything replenishes everything").
     touch_radius = 2.5
-    support_check_interval = 0.10
-
     # Retail ``Crate`` (client crate.py, gameScene.pyd) air-drop physics,
     # measured on the live client 2026-09-26: a crate created in the air
     # free-falls at 30 blocks/s^2 (0.5 per 1/60 s frame).  Once the ground
@@ -166,19 +164,9 @@ class PickupCrateBehavior(EntityBehavior):
         landing = self._find_support(world, x, y, int(math.floor(home_z)))
         water_limit = int(getattr(C, "Z_ABOVE_WATERPLANE", 238))
         if landing is None or landing > water_limit:
-            anchor = getattr(world, "dry_surface_anchor", None)
-            if not callable(anchor):
-                return
-            try:
-                ax, ay, az = anchor(home_x, home_y, search=64)
-            except TypeError:
-                ax, ay, az = anchor(home_x, home_y)
-            home_x, home_y = float(ax), float(ay)
-            x = int(math.floor(home_x))
-            y = int(math.floor(home_y))
-            landing = self._find_support(world, x, y, int(math.floor(az)))
-            if landing is None or landing > water_limit:
-                return
+            # Water is a valid drop point.  Never search neighbouring columns:
+            # map-authored X/Y belong to the mode and must remain exact.
+            landing = min(int(C.MAP_Z) - 1, water_limit + 1)
         # Blocks built on the drop point: the crate lands on top of them.
         landing = int(landing)
         while landing > 0 and world.get_solid(x, y, landing - 1):
@@ -191,11 +179,14 @@ class PickupCrateBehavior(EntityBehavior):
         ent.fall_clock = float(getattr(ctx, "now", 0.0))
         ent.parachute_deployed = False
         ent.parachute_removed = False
-        ent.terrain_support_z = None
+        # This is the initial target sent into the fall simulation.  While the
+        # crate is airborne it rechecks the same column so newly built blocks
+        # can catch it; X/Y are never changed. Once landed, any block above it
+        # in this exact column lifts it vertically on the next gameplay tick.
+        ent.terrain_support_z = int(landing)
         ent.terrain_offset_z = 0.0
         if not ent.falling:
             ent.z = float(landing)
-            ent.terrain_support_z = int(landing)
             return
         if self.drop_cue is not None:
             try:
@@ -204,11 +195,17 @@ class PickupCrateBehavior(EntityBehavior):
                 pass
 
     def _drop_start(self, world, x: int, y: int, landing: int) -> float:
-        """Highest free z over ``landing``: the sky, or just under a roof."""
+        """Start in the sky, or below an authored roof over an indoor drop."""
 
         top = int(math.floor(self.drop_start_z))
         for z in range(int(landing) - 1, max(-1, top - 1), -1):
             if world.get_solid(x, y, z):
+                # A runtime bridge/platform is a landing surface, not an
+                # authored ceiling.  Start above it so normal fall collision
+                # can catch the crate.  Real map roofs keep indoor drops below
+                # their ceiling as before.
+                if self._is_runtime_solid(world, x, y, z):
+                    continue
                 # The crate model spans about one voxel above its origin, so
                 # keep one clear cell between it and the overhang.
                 return float(min(landing, z + 2))
@@ -222,11 +219,17 @@ class PickupCrateBehavior(EntityBehavior):
         y = int(math.floor(ent.y))
         landing = None
         if world is not None and callable(getattr(world, "get_solid", None)):
+            # Re-evaluate only terrain still ahead of the falling crate.  This
+            # catches platforms built before or during the drop without ever
+            # teleporting back to a block that the crate already passed.
             landing = self._find_support(
                 world, x, y, max(0, int(math.floor(ent.z)))
             )
-        if landing is None:
-            landing = int(C.MAP_Z) - 1
+        water_limit = int(getattr(C, "Z_ABOVE_WATERPLANE", 238))
+        if landing is None or int(landing) > water_limit:
+            landing = min(int(C.MAP_Z) - 1, water_limit + 1)
+        landing = int(landing)
+        ent.terrain_support_z = landing
         deploy = float(getattr(C, "CRATE_PARACHUTE_DEPLOYMENT_HEIGHT", 10))
         removal = float(getattr(C, "CRATE_PARACHUTE_REMOVAL_HEIGHT", 2))
         slowdown = float(getattr(C, "CRATE_PARACHUTE_SLOWDOWN", 0.75))
@@ -265,6 +268,10 @@ class PickupCrateBehavior(EntityBehavior):
             ent.fall_accumulator = 0.0
         if landed:
             ent.z = float(landing)
+            raised_z = self._overhead_surface_z(world, x, y, ent.z)
+            if raised_z is not None:
+                ent.z = raised_z
+                landing = int(math.floor(raised_z))
             ent.vel = (0.0, 0.0, 0.0)
             ent.falling = False
             ent.fall_accumulator = 0.0
@@ -273,18 +280,22 @@ class PickupCrateBehavior(EntityBehavior):
             ent.terrain_support_z = int(landing)
             ent.terrain_offset_z = 0.0
             ent.terrain_check_at = float(getattr(ctx, "now", 0.0))
+            if ctx.move is not None:
+                # The retail client simulates the fall locally and may have
+                # collided with terrain built during the drop.  Confirm the
+                # same-column landing height once, reliably.
+                ctx.move(ent)
             return
         ent.z = z
         ent.vel = (0.0, 0.0, vz)
 
     def on_tick(self, ent, dt, ctx) -> None:
-        """Keep a map pickup attached to the live voxel column beneath it.
+        """Advance an air drop and keep a landed crate accessible.
 
-        The retail entity is static after packet 21 creation.  When players
-        remove its supporting structure the authoritative server therefore
-        has to settle it and emit ``ChangeEntity.SET_POSITION``.  Checks are
-        throttled to 10 Hz and only scan a column after the remembered support
-        voxel actually disappears.
+        Once landed, a live crate keeps its exact X/Y and never falls after
+        support loss. If any block is above it in that same column, it rises
+        immediately to the column's topmost surface. Its next respawn starts
+        again at the original map-authored X/Y.
         """
 
         if getattr(ent, "falling", False):
@@ -296,56 +307,62 @@ class PickupCrateBehavior(EntityBehavior):
         world = getattr(ctx, "world", None)
         if world is None or not callable(getattr(world, "get_solid", None)):
             return
-        if ctx.now < float(getattr(ent, "terrain_check_at", 0.0)):
-            return
-        ent.terrain_check_at = ctx.now + self.support_check_interval
-
         x = int(math.floor(ent.x))
         y = int(math.floor(ent.y))
         if not (0 <= x < int(C.MAP_X) and 0 <= y < int(C.MAP_Y)):
             return
-
-        support_z = ent.terrain_support_z
-        if support_z is None:
-            support_z = self._find_support(world, x, y, int(math.floor(ent.z)))
-            if support_z is None:
-                return
-            ent.terrain_support_z = support_z
-            ent.terrain_offset_z = float(ent.z) - float(support_z)
-            return
-        if world.get_solid(x, y, int(support_z)):
+        raised_z = self._overhead_surface_z(world, x, y, ent.z)
+        if raised_z is None:
             return
 
-        new_support = self._find_support(world, x, y, int(support_z) + 1)
-        water_limit = int(getattr(C, "Z_ABOVE_WATERPLANE", 238))
-        if new_support is not None and new_support <= water_limit:
-            new_position = (
-                float(ent.x),
-                float(ent.y),
-                float(new_support) + float(ent.terrain_offset_z),
-            )
-        else:
-            # A collapsed bridge can leave no dry support in this column. Move
-            # the pickup to the nearest dry surface instead of marooning a
-            # permanent objective below the water plane.
-            anchor = getattr(world, "dry_surface_anchor", None)
-            if not callable(anchor):
-                return
-            try:
-                new_position = anchor(ent.x, ent.y, search=64)
-            except TypeError:
-                new_position = anchor(ent.x, ent.y)
-            new_support = int(math.floor(new_position[2]))
-            if new_support > water_limit:
-                return
-            ent.terrain_offset_z = float(new_position[2]) - float(new_support)
-
-        old_position = (float(ent.x), float(ent.y), float(ent.z))
-        ent.x, ent.y, ent.z = (float(value) for value in new_position)
-        ent.terrain_support_z = int(new_support)
-        ent.home = (ent.x, ent.y, ent.z)
-        if old_position != ent.home and ctx.move is not None:
+        ent.z = raised_z
+        ent.terrain_support_z = int(math.floor(raised_z))
+        ent.terrain_offset_z = 0.0
+        if ctx.move is not None:
             ctx.move(ent)
+
+    @staticmethod
+    def _overhead_surface_z(world, x: int, y: int, current_z: float):
+        """Return the topmost same-column block above a crate, if one exists."""
+        if world is None or not callable(getattr(world, "get_solid", None)):
+            return None
+        try:
+            crate_z = float(current_z)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(crate_z):
+            return None
+
+        # Production worlds cache this exact-column query and invalidate it on
+        # every terrain mutation, so all live crates can check at 60 Hz without
+        # scanning the map. Keep a bounded scan for lightweight plugin worlds.
+        get_height = getattr(world, "get_height", None)
+        if callable(get_height):
+            try:
+                top_z = float(get_height(x, y))
+            except (TypeError, ValueError, RuntimeError):
+                top_z = None
+            if top_z is not None and math.isfinite(top_z):
+                return top_z if 0.0 <= top_z < crate_z else None
+
+        from shared import constants as C
+
+        limit = max(0, min(int(C.MAP_Z), int(math.ceil(crate_z))))
+        try:
+            for block_z in range(limit):
+                if world.get_solid(x, y, block_z):
+                    return float(block_z)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _is_runtime_solid(world, x: int, y: int, z: int) -> bool:
+        checker = getattr(world, "is_runtime_solid", None)
+        if callable(checker):
+            return bool(checker(x, y, z))
+        cells = getattr(world, "runtime_solid_cells", ())
+        return (int(x), int(y), int(z)) in cells
 
     @staticmethod
     def _find_support(world, x: int, y: int, start_z: int):

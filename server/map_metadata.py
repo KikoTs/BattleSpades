@@ -714,6 +714,44 @@ def _centered_extents(
     return (-half_x, half_x, -half_y, half_y, -half_z, half_z)
 
 
+def _absolute_zone_geometry(
+    bounds: object,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float, float, float, float],
+] | None:
+    """Translate an optional exact UGC zone box into centre and extents.
+
+    Retail UGC exposes only square small/medium/large presets.  A sidecar may
+    additionally provide ``{"min": [x, y, z], "max": [x, y, z]}`` when an
+    authored rectangular spawn cannot be represented without overlapping
+    presets.  The absolute box remains mode-scoped by its ordinary UGC row.
+    """
+    if not isinstance(bounds, dict):
+        return None
+    minimum = _point3(bounds.get("min"))
+    maximum = _point3(bounds.get("max"))
+    if minimum is None or maximum is None:
+        return None
+    if not all(math.isfinite(value) for value in (*minimum, *maximum)):
+        return None
+    if any(low >= high for low, high in zip(minimum, maximum)):
+        return None
+
+    center = tuple(
+        (low + high) / 2.0 for low, high in zip(minimum, maximum)
+    )
+    extents = (
+        minimum[0] - center[0],
+        maximum[0] - center[0],
+        minimum[1] - center[1],
+        maximum[1] - center[1],
+        minimum[2] - center[2],
+        maximum[2] - center[2],
+    )
+    return center, extents
+
+
 def _spawn_area_zones(areas: object, team: int, item: str) -> list[MapZone]:
     """Translate retail ``[(centre, (w, h, d)), ...]`` spawn rows.
 
@@ -1313,13 +1351,25 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
         kind = "spawn" if "_spawn" in item else "base" if "_base" in item else ""
         if not kind:
             continue
+        exact_geometry = None
+        if "bounds" in row:
+            exact_geometry = _absolute_zone_geometry(row.get("bounds"))
+            if exact_geometry is None:
+                logger.warning(
+                    "Falling back from malformed UGC zone bounds in %s",
+                    sidecar,
+                )
+        if exact_geometry is not None:
+            (x, y, z), extents = exact_geometry
+        else:
+            extents = tuple(int(v) for v in C.UGC_ZONE_SIZES[item_id])
         zone = MapZone(
             kind=kind,
             team=team,
             x=x,
             y=y,
             z=z,
-            extents=tuple(int(v) for v in C.UGC_ZONE_SIZES[item_id]),
+            extents=extents,
             item=item,
         )
         if team in (TEAM1, TEAM2):

@@ -562,7 +562,7 @@ class BaseMode(ABC):
         """Whether this mode currently owns ``player``'s high-minimap marker.
 
         The escape watch never clears a marker the mode set (CTF carrier,
-        VIP crown, last Zombie survivor).
+        VIP crown).
         """
         return False
 

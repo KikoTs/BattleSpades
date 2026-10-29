@@ -54,6 +54,7 @@ def _active_mode(player_count=3, *, rounds=3):
     asyncio.run(mode.on_mode_start())
     asyncio.run(mode.on_tick(1))
     assert mode.phase is ZombiePhase.ACTIVE
+    respawned.clear()
     return server, mode
 
 

@@ -249,6 +249,11 @@ class WorldManager:
         # break at the caller's threshold.  Cleared whenever the cell changes
         # topology; a recolour of an existing solid keeps it.
         self.block_health: dict[tuple[int, int, int], float] = {}
+        # Live-created solid cells. This remains separate from block_health:
+        # UGC and some server/editor builds intentionally omit the client's
+        # user-block health row, but are still runtime terrain (important for
+        # crate collision versus authored map roofs).
+        self.runtime_solid_cells: set[tuple[int, int, int]] = set()
         # Retail FlareBlockEntity restores of stripped marker cells -> RGB.
         self.static_light_cells: dict[tuple[int, int, int], int] = {}
         # What live clients DISPLAY for a damaged cell.  The stock
@@ -360,6 +365,7 @@ class WorldManager:
             self._air_override_masks = {}
             self.block_damage = {}
             self.block_health = {}
+            self.runtime_solid_cells = set()
             self.static_light_cells = {}
             self.block_shade = {}
             self.block_hits = {}
@@ -410,6 +416,7 @@ class WorldManager:
         self._air_override_masks = {}
         self.block_damage = {}
         self.block_health = {}
+        self.runtime_solid_cells = set()
         self.static_light_cells = {}
         self.block_shade = {}
         self.block_hits = {}
@@ -510,6 +517,7 @@ class WorldManager:
         if self.map is None or not self._valid_block_position(x, y, z):
             return False
         position = (x, y, z)
+        was_solid = self.get_solid(x, y, z)
         user_block = health is not None
         if user_block:
             health = self.user_block_health(health)
@@ -518,7 +526,11 @@ class WorldManager:
         # (live 2026-09-26: PaintBlock on a damaged cell left
         # DamagedBlock.health unchanged).  Anything that creates or replaces a
         # voxel starts it undamaged.
-        recolour = bool(solid) and not user_block and self.get_solid(x, y, z)
+        recolour = bool(solid) and not user_block and was_solid
+        if bool(solid) and (user_block or not was_solid):
+            self.runtime_solid_cells.add(position)
+        elif not bool(solid):
+            self.runtime_solid_cells.discard(position)
         if health is not None and float(health) > 0.0:
             self.block_health[position] = float(health)
         elif not recolour:
@@ -613,7 +625,14 @@ class WorldManager:
                 logger.debug("static light listener failed", exc_info=True)
         self.clear_block_damage(x, y, z)
         self.block_health.pop((x, y, z), None)
+        self.runtime_solid_cells.discard((x, y, z))
         return True
+
+    def is_runtime_solid(self, x: int, y: int, z: int) -> bool:
+        """Return whether this solid cell was created in the live world."""
+
+        position = (int(x), int(y), int(z))
+        return position in self.runtime_solid_cells and self.get_solid(*position)
 
     def _set_air_override(self, x: int, y: int, z: int, air: bool) -> None:
         """Update the compact reconnect repair index for one committed cell.
@@ -854,6 +873,44 @@ class WorldManager:
                 )
         return None
 
+    def same_column_spawn_point(
+        self, position: Tuple[float, float, float]
+    ) -> Tuple[float, float, float] | None:
+        """Resolve a player spawn vertically without changing its column.
+
+        The mode owns the horizontal location.  Stand above the top block in
+        that exact column and lift only the vertical coordinate until the
+        complete player capsule is clear.  A column with no dry terrain uses
+        the water surface, so authored water spawns remain at their requested
+        coordinates instead of walking sideways to nearby land.
+        """
+        try:
+            x, y = float(position[0]), float(position[1])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x, y)):
+            return None
+        if self.map is None or not (0.0 <= x < MAP_X and 0.0 <= y < MAP_Y):
+            return None
+
+        cell_x, cell_y = int(math.floor(x)), int(math.floor(y))
+        surface_z = int(self._get_surface_z(cell_x, cell_y))
+        if (
+            surface_z > int(C.Z_ABOVE_WATERPLANE)
+            or not self.get_solid(cell_x, cell_y, surface_z)
+        ):
+            surface_z = int(C.Z_ABOVE_WATERPLANE) + 1
+        spawn_z = (
+            float(surface_z)
+            - PLAYER_STANDING_POS_ABOVE_GROUND
+            - 0.5
+        )
+        for _ in range(MAP_Z):
+            if self._player_body_is_clear(x, y, spawn_z):
+                return x, y, spawn_z
+            spawn_z -= 1.0
+        return None
+
     def sanitize_spawn_point(
         self,
         position: Tuple[float, float, float],
@@ -861,29 +918,21 @@ class WorldManager:
         *,
         local_search: int = 64,
     ) -> Tuple[float, float, float]:
-        """Return a dry final life anchor for a mode-proposed spawn.
+        """Return a final life anchor without moving a valid map column.
 
-        Every life-creation path calls this after its mode resolver. Valid
-        authored interiors remain untouched. Invalid or water positions move
-        to nearby safe terrain when possible, then fall back to the team's
-        prewarmed production spawn pool.
+        Valid authored interiors remain untouched.  Invalid height, terrain,
+        or water is repaired only along the vertical axis; malformed or
+        out-of-world horizontal coordinates still use the team's production
+        fallback. ``local_search`` remains accepted for plugin compatibility.
         """
         if self.spawn_position_is_safe(position, team=team):
             return tuple(float(position[index]) for index in range(3))
 
-        try:
-            x, y = float(position[0]), float(position[1])
-        except (IndexError, TypeError, ValueError):
-            x = y = math.nan
-        resolved = (
-            self._nearest_safe_spawn_point(x, y, search=local_search)
-            if math.isfinite(x) and math.isfinite(y)
-            else None
-        )
+        resolved = self.same_column_spawn_point(position)
         if resolved is None:
             resolved = self.get_spawn_point(int(team))
         logger.warning(
-            "Relocated invalid spawn on %s for team %s: %r -> %r",
+            "Adjusted invalid spawn on %s for team %s: %r -> %r",
             self.map_name or "<unloaded>",
             team,
             position,
@@ -941,6 +990,31 @@ class WorldManager:
                         return float(cx) + 0.5, float(cy) + 0.5, float(surface_z)
         surface_z = self._get_surface_z(bx, by)
         return float(x), float(y), float(surface_z)
+
+    def falling_surface_anchor(
+        self, x: float, y: float, start_z: float
+    ) -> Tuple[float, float, float]:
+        """Return the first same-column voxel at or below a falling entity.
+
+        AoS coordinates increase downward.  ``dry_surface_anchor`` deliberately
+        selects the topmost voxel in a column, which is correct for map
+        entities but lets a roof far above a corpse capture a grave's delayed
+        blast.  A falling grave can only settle on terrain below its current
+        position, so scan in its direction of travel instead.
+        """
+        fx, fy, fz = float(x), float(y), float(start_z)
+        if not all(math.isfinite(value) for value in (fx, fy, fz)):
+            return fx, fy, fz
+
+        bx, by = int(math.floor(fx)), int(math.floor(fy))
+        if self.map is None or not (0 <= bx < MAP_X and 0 <= by < MAP_Y):
+            return fx, fy, fz
+
+        first_z = max(0, int(math.ceil(fz)))
+        for surface_z in range(first_z, MAP_Z):
+            if self.get_solid(bx, by, surface_z):
+                return float(bx) + 0.5, float(by) + 0.5, float(surface_z)
+        return fx, fy, fz
 
     def clipbox(self, x: float, y: float, z: float) -> bool:
         """Reference-style player collision probe."""
@@ -1185,6 +1259,7 @@ class WorldManager:
             max(1, x0), min(MAP_X - 2, x1) + 1,
             max(1, y0), min(MAP_Y - 2, y1) + 1,
         ):
+            column_start = len(candidates)
             surface_ok = self._safe_spawn_column(
                 x, y, authored_zone=zone, reject_roofs=False
             )
@@ -1201,6 +1276,11 @@ class WorldManager:
                     continue
                 if self._safe_spawn_floor(x, y, floor_z, zone):
                     candidates.append((x, y, floor_z))
+            if len(candidates) == column_start:
+                # The authored horizontal coordinate remains a spawn even if
+                # its floor is absent, underwater, or later destroyed. Its
+                # height is resolved live without walking to another column.
+                candidates.append((x, y))
         return candidates
 
     def _zone_spawn_candidates(self, team: int) -> list[tuple[int, ...]]:
@@ -1230,12 +1310,10 @@ class WorldManager:
     ) -> Tuple[float, float, float] | None:
         """Revalidate one spawn candidate against the live world.
 
-        Returns the standing position (half a block above equilibrium, as
-        every spawn does) or None when the candidate is no longer safe. A
-        top-surface ``(x, y)`` candidate inside an authored zone skips roof
-        rejection (authored boxes may be on raised ground); outside one it
-        gets the full terrain checks. A ``(x, y, floor_z)`` candidate is only
-        valid inside an authored zone that admits that floor.
+        Valid floors retain their authored indoor height. If terrain changed
+        or a column is water/empty, preserve its horizontal coordinate and
+        resolve only the live vertical anchor instead of rejecting it and
+        making the spawn chooser move elsewhere.
         """
         x, y = int(candidate[0]), int(candidate[1])
         if len(candidate) >= 3:
@@ -1244,7 +1322,9 @@ class WorldManager:
                 self._safe_spawn_floor(x, y, floor_z, zone)
                 for zone in self._zones_containing(authored_zones, x, y)
             ):
-                return None
+                return self.same_column_spawn_point(
+                    (float(x) + 0.5, float(y) + 0.5, float(floor_z))
+                )
         else:
             authored_zone = (
                 self._zone_at(authored_zones, x, y) if authored_zones else None
@@ -1254,7 +1334,9 @@ class WorldManager:
                 authored_zone=authored_zone,
                 reject_roofs=authored_zone is None,
             ):
-                return None
+                return self.same_column_spawn_point(
+                    (float(x) + 0.5, float(y) + 0.5, 0.0)
+                )
             floor_z = self._get_surface_z(x, y)
         return (
             float(x) + 0.5,
@@ -1273,11 +1355,16 @@ class WorldManager:
             return strict
         # Steep maps may have no 3x3-flat cells.  A dry team-region fallback
         # is still safer than the native random surface (which selects roofs).
-        return [
+        dry = [
             (x, y)
             for x, y in _spawn_scan_columns(x0, x1 + 1, y0, y1 + 1, 4)
             if self._get_surface_z(x, y) <= int(C.Z_ABOVE_WATERPLANE)
         ]
+        if dry:
+            return dry
+        # An all-water/empty region still owns its horizontal coordinates.
+        # Live vertical resolution will place the player at the waterplane.
+        return list(_spawn_scan_columns(x0, x1 + 1, y0, y1 + 1, 4))
 
     def _get_spawn_candidates(self, team: int) -> list[tuple[int, ...]]:
         cached = self._spawn_candidates.get(team)
@@ -1812,6 +1899,7 @@ class WorldManager:
             if not self.get_solid(x, y, z):
                 self.clear_block_damage(x, y, z)
                 self.block_health.pop(pos, None)
+                self.runtime_solid_cells.discard(pos)
                 continue
 
             self.map.remove_point_nochecks(x, y, z)
@@ -1820,6 +1908,7 @@ class WorldManager:
             self.dirty_columns.add((x, y))
             self.clear_block_damage(x, y, z)
             self.block_health.pop(pos, None)
+            self.runtime_solid_cells.discard(pos)
             destroyed.append(pos)
         self._materialize_exposed_surfaces(destroyed)
         self._publish_mutations(
@@ -1942,6 +2031,7 @@ class WorldManager:
         if not self._valid_block_position(x, y, z) or not self.get_solid(x, y, z):
             self.clear_block_damage(x, y, z)
             self.block_health.pop((x, y, z), None)
+            self.runtime_solid_cells.discard((x, y, z))
             return 0.0, False
 
         pos = (x, y, z)

@@ -364,6 +364,11 @@ def play_music_to(connection, track: str) -> None:
     _switch_music(connection.send, track)
 
 
+def stop_music_to(connection) -> None:
+    """Stop music on one client without changing the server's global family."""
+    connection.send(_stop_music_bytes())
+
+
 def mode_start_music_enabled(server) -> bool:
     """``[audio] mode_start_music`` (default on).
 

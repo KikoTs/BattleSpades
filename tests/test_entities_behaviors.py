@@ -254,7 +254,7 @@ def test_block_crate_refills_blocks_only():
     assert p.healed == 0             # health untouched
 
 
-def test_pickup_follows_its_support_when_a_structure_breaks():
+def test_live_pickup_immediately_rises_to_a_distant_overhead_block():
     class VoxelColumn:
         def __init__(self):
             self.solid = {(100, 100, 61), (100, 100, 70)}
@@ -265,21 +265,75 @@ def test_pickup_follows_its_support_when_a_structure_breaks():
     world = VoxelColumn()
     reg = EntityRegistry()
     pickup = ammo_crate(reg, 100.5, 100.5, 60.0)
+    pickup.terrain_support_z = 61
+    original_home = pickup.home
 
-    # First check remembers the official-map one-voxel model offset.
-    first = ctx([], now=1000.0, world=world)
-    reg.tick(first)
-    assert pickup.terrain_support_z == 61
-    assert first._moved == []
-
+    # A detached roof now wins immediately even if the old support vanished.
+    # A future legacy throttle value must not delay the next-tick move.
+    world.solid.add((100, 100, 58))
     world.solid.remove((100, 100, 61))
-    fallen = ctx([], now=1000.11, world=world)
-    reg.tick(fallen)
+    pickup.terrain_check_at = 2000.0
+    changed = ctx([], now=1000.11, world=world)
+    reg.tick(changed)
 
-    assert pickup.terrain_support_z == 70
-    assert pickup.z == 69.0
-    assert pickup.home == (100.5, 100.5, 69.0)
-    assert fallen._moved == [pickup]
+    assert (pickup.x, pickup.y, pickup.z) == (100.5, 100.5, 58.0)
+    assert pickup.terrain_support_z == 58
+    assert pickup.home == original_home
+    assert changed._moved == [pickup]
+
+
+def test_live_pickup_rises_above_blocks_placed_directly_on_it():
+    class VoxelColumn:
+        def __init__(self):
+            self.solid = {(100, 100, 61)}
+
+        def get_solid(self, x, y, z):
+            return (x, y, z) in self.solid
+
+    world = VoxelColumn()
+    reg = EntityRegistry()
+    pickup = ammo_crate(reg, 100.375, 100.625, 60.0)
+    pickup.terrain_support_z = 61
+    original_home = pickup.home
+
+    # The block at 59 occupies the crate's model; the connected stack reaches
+    # 57, so the crate must emerge on top at z=57 without moving horizontally.
+    world.solid.update({(100, 100, 59), (100, 100, 58), (100, 100, 57)})
+    changed = ctx([], now=1000.0, world=world)
+    reg.tick(changed)
+
+    assert (pickup.x, pickup.y, pickup.z) == (100.375, 100.625, 57.0)
+    assert pickup.terrain_support_z == 57
+    assert pickup.home == original_home
+    assert changed._moved == [pickup]
+
+    # Once clear, later checks do not keep moving or rebroadcasting it.
+    unchanged = ctx([], now=1000.11, world=world)
+    reg.tick(unchanged)
+    assert (pickup.x, pickup.y, pickup.z) == (100.375, 100.625, 57.0)
+    assert unchanged._moved == []
+
+
+def test_fractional_pickup_height_checks_the_immediately_occupied_voxel():
+    class VoxelColumn:
+        solid = {(100, 100, 61), (100, 100, 60), (100, 100, 59)}
+
+        def get_solid(self, x, y, z):
+            return (x, y, z) in self.solid
+
+    world = VoxelColumn()
+    reg = EntityRegistry()
+    pickup = ammo_crate(reg, 100.25, 100.75, 60.75)
+    original_home = pickup.home
+    changed = ctx([], now=1000.0, world=world)
+
+    reg.tick(changed)
+
+    # ceil(60.75) - 1 == 60: that voxel intersects the crate, and the
+    # connected stack reaches z=59.
+    assert (pickup.x, pickup.y, pickup.z) == (100.25, 100.75, 59.0)
+    assert pickup.home == original_home
+    assert changed._moved == [pickup]
 
 
 def test_pickup_position_change_uses_reliable_change_entity_shape():

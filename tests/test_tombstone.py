@@ -74,11 +74,54 @@ def test_normal_death_explodes_corpse_then_spawns_falling_team_grave(
     assert (grave.x, grave.y, grave.z) == (100.5, 100.5, 59.75)
     assert grave.vel == (0.25, -0.5, 0.125)
     assert grave.behavior.get_explosion_center(grave) == (
-        server.world_manager.dry_surface_anchor(100.5, 100.5, search=0)
+        server.world_manager.falling_surface_anchor(100.5, 100.5, 59.75)
     )
     assert grave.behavior.fuse == C.GRAVE_EXPLOSION_FUSE
     assert grave.behavior.damage == C.GRAVE_EXPLOSION_DAMAGE
     assert grave.behavior.blast_radius == C.GRAVE_EXPLOSION_RADIUS
+
+
+def test_grave_blast_ignores_a_high_block_above_the_corpse(monkeypatch):
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    world = server.world_manager
+    assert world.set_block(100, 100, 10, True, 0x123456)
+    # The ordinary map-entity anchor sees the roof as the column surface.
+    assert world.dry_surface_anchor(100.5, 100.5, search=0) == (
+        100.5,
+        100.5,
+        10.0,
+    )
+
+    player = _player(server)
+    blasts = []
+    monkeypatch.setattr(server, "broadcast", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_apply_blast",
+        lambda *args, **kwargs: blasts.append((args, kwargs)),
+    )
+
+    player.die(killer=None, kill_type=int(C.KILL.FALL_KILL))
+
+    grave = server.entity_registry.get(player._grave_entity_id)
+    assert grave is not None
+    # Packet 21 remains at the airborne corpse, while the authoritative blast
+    # settles on the floor below it rather than snapping to the distant roof.
+    assert (grave.x, grave.y, grave.z) == (100.5, 100.5, 59.75)
+    assert grave.behavior.get_explosion_center(grave) == (100.5, 100.5, 62.0)
+
+    # Ignore the separate zero-damage corpse effect emitted during death; the
+    # assertion below is specifically about the grave's delayed explosion.
+    blasts.clear()
+    ctx = server._build_entity_ctx()
+    ctx.now = 1000.0
+    grave.behavior.on_tick(grave, 0.0, ctx)
+    ctx.now += float(C.GRAVE_EXPLOSION_FUSE)
+    grave.behavior.on_tick(grave, 0.0, ctx)
+
+    assert len(blasts) == 1
+    assert blasts[0][0][:3] == (100.5, 100.5, 62.0)
 
 
 def test_jetpack_death_flies_for_retail_fuse_before_explosion_and_grave(

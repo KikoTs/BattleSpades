@@ -12,18 +12,16 @@ module samples safe columns from the team's spawn candidates and scores them:
 * random jitter, then a weighted pick among the best few, so spawns stay
   unpredictable.
 
-When every base spot is hot (enemies on top of or watching the base) it also
-scores columns across the team's whole side of the map and uses one if it is
-clearly safer. Everything is bounded (a few dozen samples, a handful of
-enemies, cached region candidates) because it runs on the gameplay thread.
+The chooser never leaves the map-authored/base candidate pool. Even when the
+base is camped or dug down to water, changing to a different part of the map
+would violate the authored spawn location. Everything is bounded (a few dozen
+samples and a handful of enemies) because it runs on the gameplay thread.
 
-Availability: a life can always be created. When the base and the team's
-side are dug away (e.g. down to the water plane) ``emergency_spawn`` picks
-dry land nearest the team (team side first, then anywhere) from a cached
-coarse grid of dry columns, and only as the last resort stands the player in
-the water at the base, lifted clear of any solid voxel. ``rescue_spawn`` is
-the bounded replacement for invalid mode proposals used by
-``round_lifecycle.resolve_player_spawn``.
+Availability: a life can always be created. Cached/authored candidates remain
+usable after terrain beneath them is destroyed and resolve vertically at the
+waterplane. ``emergency_spawn`` is reserved for a missing or physically
+impossible candidate, while ``rescue_spawn`` repairs explicit mode proposals
+without changing a valid horizontal column.
 """
 
 from __future__ import annotations
@@ -49,8 +47,6 @@ SPAWN_MEMORY_SECONDS = 6.0
 STACK_RADIUS = 3.0
 SUPPORT_RADIUS = 24.0
 TOP_CHOICES = 3
-# A best base score below this means the base is being camped.
-HOT_BASE_SCORE = -3.0
 
 
 @dataclass
@@ -60,7 +56,6 @@ class SpawnIntel:
     key: tuple
     deaths: deque = field(default_factory=lambda: deque(maxlen=128))
     spawns: deque = field(default_factory=lambda: deque(maxlen=64))
-    region_candidates: dict = field(default_factory=dict)
 
 
 def _intel(server) -> SpawnIntel:
@@ -183,12 +178,11 @@ def _pick(scored, rng):
 def choose_team_spawn(server, player, *, rng: random.Random | None = None):
     """A threat-aware spawn for ``player`` or None to use the plain resolver.
 
-    Once a map is loaded this never gives up on a playable team: when the
-    whole base (and the team's side) has been dug away it returns
-    :func:`emergency_spawn` instead of None.  None made the caller fall into
-    ``WorldManager.get_spawn_point``'s exhaustive region spiral, which took
-    seconds per life on a dug-out base and stalled the gameplay thread for
-    every respawn (the live "nobody can spawn" hard lock).
+    Once a map is loaded this never gives up on a playable team. Cached spawn
+    columns remain usable when dug down to water; :func:`emergency_spawn` is
+    reserved for a missing or physically impossible pool. Returning None for
+    those cases used to send the caller into an exhaustive region spiral and
+    stall every respawn tick.
     """
 
     rng = rng or random
@@ -217,23 +211,10 @@ def choose_team_spawn(server, player, *, rng: random.Random | None = None):
 
     scored = _best(world, columns, authored_zones, team, enemies, allies, intel, now, rng)
     if not scored and len(columns) > SAMPLE_COUNT:
-        # A heavily dug base can still hold a few intact columns; one more
-        # bounded sample before leaving the base entirely.
+        # A boundary-clipped or otherwise impossible column can still occur;
+        # try another bounded sample but never leave the original pool.
         scored = _best(world, columns, authored_zones, team, enemies, allies, intel, now, rng)
     choice = _pick(scored, rng)
-    if choice is None or (enemies and choice[0] < HOT_BASE_SCORE):
-        # The base is camped (or dug away): look across the team's side.
-        region = intel.region_candidates.get(team)
-        if region is None:
-            try:
-                region = list(world._fallback_spawn_candidates(team))
-            except Exception:
-                region = []
-            intel.region_candidates[team] = region
-        if region:
-            wider = _pick(_best(world, region, (), team, enemies, allies, intel, now, rng), rng)
-            if wider is not None and (choice is None or wider[0] > choice[0] + 1.0):
-                choice = wider
     if choice is None:
         position = emergency_spawn(server, team)
     else:
@@ -424,12 +405,11 @@ def emergency_spawn(server, team: int, near=None) -> tuple[float, float, float]:
 
 
 def rescue_spawn(server, player, candidate) -> tuple[float, float, float]:
-    """Replace an unusable mode spawn with a bounded, always-valid one.
+    """Repair an unusable mode spawn without changing its map column.
 
-    First a small local search around the proposal (authored mode spawns stay
-    close to where the mode wanted them), then :func:`emergency_spawn`.
-    Unlike ``WorldManager.sanitize_spawn_point`` this never walks a whole
-    team region cell by cell, so a dug-out map cannot stall respawns.
+    Finite in-world proposals keep their exact horizontal coordinates and
+    adjust only height, including over water.  ``emergency_spawn`` remains the
+    bounded fallback for malformed, out-of-world, or impossible proposals.
     """
 
     world = getattr(server, "world_manager", None)
@@ -450,12 +430,23 @@ def rescue_spawn(server, player, candidate) -> tuple[float, float, float]:
     except (TypeError, ValueError, IndexError):
         finite = False
     if finite and world is not None:
-        local = getattr(world, "_nearest_safe_spawn_point", None)
-        if callable(local):
+        vertical = getattr(world, "same_column_spawn_point", None)
+        if callable(vertical):
             try:
-                found = local(x, y, search=6)
+                found = vertical(candidate)
             except Exception:
                 found = None
             if found is not None:
                 return tuple(float(v) for v in found)
+        else:
+            # Compatibility for lightweight plugin worlds that have not yet
+            # implemented the column-preserving resolver.
+            local = getattr(world, "_nearest_safe_spawn_point", None)
+            if callable(local):
+                try:
+                    found = local(x, y, search=6)
+                except Exception:
+                    found = None
+                if found is not None:
+                    return tuple(float(v) for v in found)
     return emergency_spawn(server, team, near=candidate if finite else None)

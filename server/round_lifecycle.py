@@ -25,9 +25,9 @@ def resolve_player_spawn(server, player) -> tuple[float, float, float]:
     This must always produce a position: a raising mode resolver or a map
     whose spawn area was dug down to the water would otherwise leave the
     player dead forever (process_respawns retries every tick).  Invalid
-    proposals go through ``spawn_selection.rescue_spawn`` (bounded: team-side
-    dry ground, any dry ground, then the water at the base), never through
-    the exhaustive region spiral that stalled the gameplay thread.
+    proposals go through ``spawn_selection.rescue_spawn``: valid horizontal
+    coordinates stay in their original column while only height is repaired;
+    malformed/out-of-world proposals use the bounded emergency fallback.
     """
     from server.spawn_selection import emergency_spawn, rescue_spawn
 

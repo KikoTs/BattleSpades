@@ -20,7 +20,11 @@ class _World:
         return (64.0, 100.0, 50.0) if team == TEAM1 else (448.0, 400.0, 50.0)
 
     def dry_ground_anchor(self, x, y):
-        return (float(x), float(y), 50.0)
+        return (
+            float(x),
+            float(y),
+            60.0 - float(C.PLAYER_STANDING_POS_ABOVE_GROUND),
+        )
 
     def dry_surface_anchor(self, x, y):
         return (float(x), float(y), 60.0)

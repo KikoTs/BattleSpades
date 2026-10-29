@@ -19,6 +19,168 @@
             ],
             "mode": "vip",
             "item": "ugc_spawngreen_med"
+        },
+        {
+            "position": [
+                121.974,
+                254.136,
+                176.747
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                152.548,
+                472.549,
+                235.749
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                428.55,
+                293.548,
+                179.749
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                406.454,
+                116.454,
+                193.744
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                274.468,
+                273.55,
+                174.743
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                121.471,
+                245.452,
+                176.742
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                68.45,
+                317.451,
+                214.749
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                124.454,
+                472.479,
+                235.744
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                488.45,
+                320.456,
+                235.743
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                418.45,
+                293.55,
+                170.748
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                378.451,
+                116.456,
+                191.742
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                260.548,
+                273.549,
+                174.743
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                305.549,
+                273.548,
+                174.743
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                243.543,
+                314.45,
+                145.747
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                398.549,
+                252.511,
+                154.746
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                400.549,
+                403.451,
+                234.744
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
+        },
+        {
+            "position": [
+                425.541,
+                199.51,
+                185.746
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
+        },
+        {
+            "position": [
+                125.451,
+                135.452,
+                205.749
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
         }
     ]
 }

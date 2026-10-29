@@ -10,6 +10,7 @@ file I/O or whole-map scans. VXL marker discovery already happened at load time.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import shared.constants as C
@@ -30,6 +31,9 @@ _MANAGED_KINDS = frozenset((
 _PICKUP_TYPES = frozenset((
     int(C.AMMO_CRATE), int(C.HEALTH_CRATE), int(C.BLOCK_CRATE),
     int(C.JETPACK_CRATE),
+))
+_UGC_DROP_ITEMS = frozenset((
+    "ugc_ammo_drop", "ugc_health_drop", "ugc_block_drop",
 ))
 _MAX_STATIC_LIGHTS = 2048
 
@@ -203,8 +207,35 @@ class MapResourceService:
             for index, (x, y) in enumerate(spots)
         ]
 
+    @staticmethod
+    def _same_column_pickup_z(world, x: float, y: float) -> float:
+        """Return the top surface Z without ever searching another column."""
+        cell_x = int(math.floor(float(x)))
+        cell_y = int(math.floor(float(y)))
+        height = getattr(world, "get_height", None)
+        if callable(height):
+            return float(height(cell_x, cell_y))
+
+        solid = getattr(world, "get_solid", None)
+        if not callable(solid):
+            solid = getattr(getattr(world, "map", None), "get_solid", None)
+        if callable(solid):
+            for z in range(int(C.MAP_Z)):
+                if solid(cell_x, cell_y, z):
+                    return float(z)
+        return float(int(C.MAP_Z) - 1)
+
     def _authored_position(self, spec: "MapEntitySpec") -> tuple[float, float, float]:
-        """Translate legacy sidecar Z alongside a vertically normalized VXL."""
+        """Return an entity position in the normalized runtime coordinate space.
+
+        Map Creator writes ``ugc_*_drop`` positions from the live world, after
+        a compact VXL has already received its vertical normalization. Legacy
+        ``*_crate_drop_points`` were authored beside the unnormalized VXL and
+        still need the source shift. Applying it to both made Alcatraz's UGC
+        crates move down by 39 blocks, with six falling outside MAP_Z entirely.
+        """
+        if str(spec.item).strip().lower() in _UGC_DROP_ITEMS:
+            return float(spec.x), float(spec.y), float(spec.z)
         shift = int(getattr(self.server.world_manager.map, "source_z_shift", 0))
         return float(spec.x), float(spec.y), float(spec.z) + shift
 
@@ -232,8 +263,10 @@ class MapResourceService:
         else:
             placements = []
             for x, y, entity_type in self._fallback_pickups():
-                anchor_x, anchor_y, anchor_z = world.dry_surface_anchor(x, y)
-                placements.append((anchor_x, anchor_y, anchor_z, entity_type))
+                # Resolve only height in the requested column.  In particular,
+                # a water column must not search sideways for dry terrain.
+                z = self._same_column_pickup_z(world, x, y)
+                placements.append((float(x), float(y), z, entity_type))
 
         count = 0
         for x, y, z, entity_type in placements:

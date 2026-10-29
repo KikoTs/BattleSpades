@@ -47,6 +47,161 @@ def _ground_anchor(
         return (x, y, fallback_z)
 
 
+def _falling_ground_anchor(
+    server,
+    x: float,
+    y: float,
+    start_z: float,
+) -> tuple[float, float, float]:
+    """Settle a dropped intel on the first support below it.
+
+    AoS Z grows downward. A normal dry-ground lookup starts at the sky and
+    therefore mistakes any roof above the carrier for the landing surface.
+    Drop physics must instead scan from the submitted drop height downward,
+    while preserving the exact horizontal coordinates (including water).
+    The returned Z is in the player-space used by ``intel_positions``.
+    """
+    try:
+        drop_x, drop_y, drop_z = float(x), float(y), float(start_z)
+    except (TypeError, ValueError):
+        return _ground_anchor(server, x, y)
+    if not all(math.isfinite(value) for value in (drop_x, drop_y, drop_z)):
+        return _ground_anchor(server, drop_x, drop_y)
+
+    world = getattr(server, "world_manager", None)
+    if world is None:
+        return drop_x, drop_y, drop_z
+
+    surface_z = None
+    falling_anchor = getattr(world, "falling_surface_anchor", None)
+    if callable(falling_anchor):
+        try:
+            candidate = falling_anchor(drop_x, drop_y, drop_z)
+            candidate_z = float(candidate[2])
+            candidate_is_support = True
+            if math.isclose(candidate_z, drop_z, abs_tol=1e-9):
+                # WorldManager returns the unchanged input when no voxel can
+                # be found. An integer-height solid at the exact start is the
+                # only legitimate same-Z landing.
+                get_solid = getattr(world, "get_solid", None)
+                cell_x, cell_y = int(math.floor(drop_x)), int(math.floor(drop_y))
+                cell_z = int(math.floor(candidate_z))
+                if callable(get_solid):
+                    candidate_is_support = (
+                        0 <= cell_x < int(C.MAP_X)
+                        and 0 <= cell_y < int(C.MAP_Y)
+                        and 0 <= cell_z < int(C.MAP_Z)
+                        and math.isclose(candidate_z, float(cell_z), abs_tol=1e-9)
+                        and bool(get_solid(cell_x, cell_y, cell_z))
+                    )
+            if (
+                candidate_is_support
+                and math.isfinite(candidate_z)
+                and candidate_z >= drop_z
+            ):
+                surface_z = candidate_z
+        except Exception:
+            surface_z = None
+
+    if surface_z is None:
+        get_solid = getattr(world, "get_solid", None)
+        cell_x, cell_y = int(math.floor(drop_x)), int(math.floor(drop_y))
+        if (
+            callable(get_solid)
+            and 0 <= cell_x < int(C.MAP_X)
+            and 0 <= cell_y < int(C.MAP_Y)
+        ):
+            for cell_z in range(
+                max(0, int(math.ceil(drop_z))),
+                int(C.MAP_Z),
+            ):
+                try:
+                    solid = bool(get_solid(cell_x, cell_y, cell_z))
+                except Exception:
+                    break
+                if solid:
+                    surface_z = float(cell_z)
+                    break
+
+    # Compatibility for lightweight worlds and older plugin world managers.
+    # Accept a legacy top-surface result only when it is actually below the
+    # drop; a roof above must never pull the intel upward.
+    if surface_z is None:
+        surface_anchor = getattr(world, "dry_surface_anchor", None)
+        if callable(surface_anchor):
+            try:
+                candidate = surface_anchor(drop_x, drop_y, search=0)
+            except TypeError:
+                try:
+                    candidate = surface_anchor(drop_x, drop_y)
+                except Exception:
+                    candidate = None
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                try:
+                    candidate_z = float(candidate[2])
+                    if math.isfinite(candidate_z) and candidate_z >= drop_z:
+                        surface_z = candidate_z
+                except (TypeError, ValueError, IndexError):
+                    pass
+
+    if surface_z is None:
+        # Without a same-column terrain oracle it is safer to leave a drop at
+        # its submitted height than to teleport it onto an overhead roof.
+        return drop_x, drop_y, drop_z
+    return (
+        drop_x,
+        drop_y,
+        surface_z - PLAYER_STANDING_POS_ABOVE_GROUND,
+    )
+
+
+def _intel_entity_anchor(position) -> tuple[float, float, float]:
+    """Convert an authoritative player-space intel anchor to entity space."""
+    x, y, z = (float(value) for value in position)
+    return x, y, z + PLAYER_STANDING_POS_ABOVE_GROUND
+
+
+def _unburied_intel_anchor(world, position):
+    """Lift intel only through the connected stack occupying its model.
+
+    A settled intel rests at ``logical Z + STANDING`` and occupies roughly the
+    voxel immediately above that surface. A detached ceiling is harmless; a
+    solid in the occupied voxel raises the intel to the top of that connected
+    vertical stack. Returns a new logical anchor, or ``None`` when unobstructed.
+    """
+    try:
+        x, y, logical_z = (float(value) for value in position)
+    except (TypeError, ValueError):
+        return None
+    get_solid = getattr(world, "get_solid", None)
+    if not callable(get_solid):
+        return None
+    cell_x, cell_y = int(math.floor(x)), int(math.floor(y))
+    if not (
+        0 <= cell_x < int(C.MAP_X)
+        and 0 <= cell_y < int(C.MAP_Y)
+    ):
+        return None
+    surface_z = logical_z + PLAYER_STANDING_POS_ABOVE_GROUND
+    occupied_z = int(math.ceil(surface_z)) - 1
+    if occupied_z < 0 or occupied_z >= int(C.MAP_Z):
+        return None
+    try:
+        if not get_solid(cell_x, cell_y, occupied_z):
+            return None
+        while occupied_z > 0 and get_solid(cell_x, cell_y, occupied_z - 1):
+            occupied_z -= 1
+    except Exception:
+        return None
+    return (
+        x,
+        y,
+        float(occupied_z) - PLAYER_STANDING_POS_ABOVE_GROUND,
+    )
+
+
 def _intel_near(server, base_pos, dx: float) -> tuple[float, float, float]:
     """Place the intel `dx` blocks along +x from the base, re-anchored to dry
     ground (keeps it out of the water near shoreline bases)."""
@@ -332,18 +487,23 @@ class CTFMode(BaseMode):
             )
             self._base_entities[team] = base.entity_id
 
-            ix, iy, _iz = self.intel_positions[team]
-            x, y, z = wm.dry_surface_anchor(ix, iy)
+            x, y, z = _intel_entity_anchor(self.intel_positions[team])
             flag = reg.place(int(C.INTEL_PICKUP), x, y, z, state=team, kind="intel")
             self._intel_entities[team] = flag.entity_id
 
             if getattr(self.server.config, "entities_wire_ready", False):
                 self.server.broadcast_create_entity(flag)
 
-    def _set_intel_entity(self, team: int, visible: bool, *, broadcast: bool = True):
+    def _set_intel_entity(
+        self,
+        team: int,
+        visible: bool,
+        *,
+        broadcast: bool = True,
+        entity_position=None,
+    ):
         reg = getattr(self.server, "entity_registry", None)
-        wm = getattr(self.server, "world_manager", None)
-        if reg is None or wm is None:
+        if reg is None:
             return
         old_id = self._intel_entities.get(team)
         if old_id is not None:
@@ -352,12 +512,101 @@ class CTFMode(BaseMode):
             self._intel_entities[team] = None
         if not visible:
             return
-        px, py, _pz = self.intel_positions[team]
-        x, y, z = wm.dry_surface_anchor(px, py)
+        if entity_position is None:
+            entity_position = _intel_entity_anchor(self.intel_positions[team])
+        x, y, z = (float(value) for value in entity_position)
         flag = reg.place(int(C.INTEL_PICKUP), x, y, z, state=team, kind="intel")
         self._intel_entities[team] = flag.entity_id
         if broadcast and getattr(self.server.config, "entities_wire_ready", False):
             self.server.broadcast_create_entity(flag)
+
+    def _move_ground_intel(self, team: int, position) -> None:
+        """Move trigger, team state and visible model as one transaction."""
+        settled = tuple(float(value) for value in position)
+        dropped = self.intel_drop_time[team] > 0.0
+        self.intel_positions[team] = settled
+        if dropped:
+            self.server.teams[team].drop_intel(*settled)
+        else:
+            self.intel_home_positions[team] = settled
+            self.server.teams[team].return_intel(settled)
+        self._set_intel_entity(
+            team,
+            True,
+            entity_position=_intel_entity_anchor(settled),
+        )
+        timer = getattr(self, "_intel_trap", None)
+        if timer is not None:
+            timer.due(team, False, time.monotonic(), 0.0)
+
+    def _raise_buried_intel(self, team: int) -> bool:
+        """Immediately lift one ground intel out of its occupied model cell."""
+        if self.intel_holder.get(team) is not None:
+            return False
+        world = getattr(self.server, "world_manager", None)
+        if world is None:
+            return False
+        raised = _unburied_intel_anchor(world, self.intel_positions[team])
+        if raised is None:
+            return False
+        self._move_ground_intel(team, raised)
+        return True
+
+    def _accessible_home_anchor(self, team: int):
+        """Return-home anchor on top of the intel's exact home column.
+
+        Returning intel is different from dropped intel: builders may have
+        covered its base while it was being carried.  Resolve the current
+        topmost voxel so the pickup trigger and visible model both reappear
+        above that construction, while preserving the authored X/Y exactly.
+        """
+        home = self.intel_home_positions[team]
+        world = getattr(self.server, "world_manager", None)
+        if world is None:
+            return home
+        try:
+            home_x, home_y, _home_z = (float(value) for value in home)
+        except (TypeError, ValueError):
+            return home
+
+        surface_z = None
+        get_height = getattr(world, "get_height", None)
+        if callable(get_height):
+            try:
+                surface_z = float(
+                    get_height(int(math.floor(home_x)), int(math.floor(home_y)))
+                )
+            except (TypeError, ValueError, RuntimeError):
+                surface_z = None
+
+        # Compatibility with lightweight plugin/test worlds that expose only
+        # the entity-space surface helper. ``search=0`` is essential: a return
+        # must never move the authored home X/Y to a neighbouring column.
+        if surface_z is None:
+            surface_anchor = getattr(world, "dry_surface_anchor", None)
+            if callable(surface_anchor):
+                try:
+                    candidate = surface_anchor(home_x, home_y, search=0)
+                except TypeError:
+                    try:
+                        candidate = surface_anchor(home_x, home_y)
+                    except Exception:
+                        candidate = None
+                except Exception:
+                    candidate = None
+                if candidate is not None:
+                    try:
+                        surface_z = float(candidate[2])
+                    except (TypeError, ValueError, IndexError):
+                        surface_z = None
+
+        if surface_z is None or not math.isfinite(surface_z):
+            return _unburied_intel_anchor(world, home) or home
+        return (
+            home_x,
+            home_y,
+            surface_z - PLAYER_STANDING_POS_ABOVE_GROUND,
+        )
 
     def _base_zone_bounds(self, team: int) -> tuple[int, int, int, int, int, int]:
         """Return the native minimap/capture bounds for one team's base.
@@ -742,11 +991,9 @@ class CTFMode(BaseMode):
         self.intel_holder[intel_team] = None
         
         # Reset intel to base
-        home_pos = self.intel_home_positions[intel_team]
-        self.intel_positions[intel_team] = home_pos
+        home_pos = self._accessible_home_anchor(intel_team)
         self.intel_drop_time[intel_team] = 0.0
-        self.server.teams[intel_team].return_intel(home_pos)
-        self._set_intel_entity(intel_team, True)
+        self._move_ground_intel(intel_team, home_pos)
         
         # Add score
         player.captures += 1
@@ -831,16 +1078,24 @@ class CTFMode(BaseMode):
             if connected else None
         )
         if dropped is not None:
-            drop_x, drop_y = dropped[2][0], dropped[2][1]
+            drop_x, drop_y, drop_z = dropped[2]
         elif not forced:
             return
         else:
             # Departed (or desynced) carrier: settle the objective without any
             # packet naming its stale, possibly already reused, player id.
             try:
-                drop_x, drop_y = float(position[0]), float(position[1])
+                drop_x, drop_y, drop_z = (
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                )
             except (TypeError, ValueError, IndexError):
-                drop_x, drop_y = float(player.x), float(player.y)
+                drop_x, drop_y, drop_z = (
+                    float(player.x),
+                    float(player.y),
+                    float(player.z),
+                )
             player.pickup_id = None
             player.pickup_burdensome = False
             player.pickup_state = None
@@ -850,13 +1105,24 @@ class CTFMode(BaseMode):
         
         # DropPickup removes the carried native tool but does not create a
         # persistent entity. Settle the authoritative type-16 objective on the
-        # nearest dry surface and explicitly CreateEntity it for every client.
-        drop_pos = _ground_anchor(self.server, drop_x, drop_y)
+        # first support BELOW the submitted height and explicitly CreateEntity
+        # it for every client. A roof above the carrier is not a landing point.
+        drop_pos = _falling_ground_anchor(
+            self.server,
+            drop_x,
+            drop_y,
+            drop_z,
+        )
         self.intel_positions[intel_team] = drop_pos
         self.intel_drop_time[intel_team] = time.time()
         
         self.server.teams[intel_team].drop_intel(*drop_pos)
-        self._set_intel_entity(intel_team, True, broadcast=True)
+        self._set_intel_entity(
+            intel_team,
+            True,
+            broadcast=True,
+            entity_position=_intel_entity_anchor(drop_pos),
+        )
         
         team_name = self.server.teams[intel_team].name
         # Retail has no drop announcement; the intel entity reappearing is the cue.
@@ -867,11 +1133,9 @@ class CTFMode(BaseMode):
 
     async def _return_intel(self, intel_team: int, returned_by=None) -> None:
         """Return ground intel and award the recovered touch-return point."""
-        home_pos = self.intel_home_positions[intel_team]
-        self.intel_positions[intel_team] = home_pos
+        home_pos = self._accessible_home_anchor(intel_team)
         self.intel_drop_time[intel_team] = 0.0
-        self.server.teams[intel_team].return_intel(home_pos)
-        self._set_intel_entity(intel_team, True)
+        self._move_ground_intel(intel_team, home_pos)
         from server import achievements
 
         achievements.intel_returned(self.server, intel_team)
@@ -933,6 +1197,30 @@ class CTFMode(BaseMode):
             if self.intel_holder[team_id] is player:
                 await self._drop_intel(player, team_id)
                 break
+
+    async def on_blocks_built(self, player, positions) -> None:
+        """Lift an intel immediately when a committed block entombs it."""
+        if self.ended:
+            return
+        columns = set()
+        for position in positions:
+            try:
+                columns.add((int(position[0]), int(position[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not columns:
+            return
+        for team in (TEAM1, TEAM2):
+            if self.intel_holder[team] is not None:
+                continue
+            x, y, _z = self.intel_positions[team]
+            if (int(math.floor(x)), int(math.floor(y))) not in columns:
+                continue
+            if self._raise_buried_intel(team):
+                logger.info(
+                    "%s intel raised out of a built block",
+                    self.server.teams[team].name,
+                )
     
     def _is_near(self, player: 'Player', pos: Tuple[float, float, float], radius: float) -> bool:
         """Check if player is within radius of a position."""
@@ -1002,15 +1290,28 @@ class CTFMode(BaseMode):
         return any(holder is player for holder in self.intel_holder.values())
 
     async def _guard_ground_intel(self) -> None:
-        """Keep ground intel obtainable (1 Hz).
+        """Keep ground intel obtainable.
 
-        An intel buried under placed blocks, sealed in a tiny pocket or left
-        hovering after its support was dug away for ``objective_entomb_seconds``
-        (default 5) is recovered: a dropped intel returns home when auto
-        return is on; otherwise (and for the home intel) it resettles onto
-        the column's current surface. A resettled home intel moves its home
-        with it so every later return is not buried again.
+        The cheap occupied-cell check runs every game tick so blocks placed by
+        any mutation path raise the intel through their connected stack. The
+        heavier sealed/floating checks stay at 1 Hz and recover after
+        ``objective_entomb_seconds`` (default 5): a dropped intel returns home
+        when auto return is on; otherwise it resettles.
         """
+        wm = getattr(self.server, "world_manager", None)
+        if wm is None or getattr(wm, "map", None) is None:
+            return
+
+        # Not every construction source emits ``on_blocks_built`` (prefabs and
+        # other direct terrain mutations are examples). Keep this before the
+        # 1 Hz throttle so they cannot leave an intel embedded in a new block.
+        for team in (TEAM1, TEAM2):
+            if self._raise_buried_intel(team):
+                logger.info(
+                    "%s intel buried; raised through connected stack",
+                    self.server.teams[team].name,
+                )
+
         now = time.monotonic()
         if now < getattr(self, "_guard_next_at", 0.0):
             return
@@ -1018,9 +1319,6 @@ class CTFMode(BaseMode):
         timer = getattr(self, "_intel_trap", None)
         if timer is None:
             timer = self._intel_trap = objective_guard.TrapTimer()
-        wm = getattr(self.server, "world_manager", None)
-        if wm is None or getattr(wm, "map", None) is None:
-            return
         grace = objective_guard.entomb_seconds(self.server)
         for team in (TEAM1, TEAM2):
             if self.intel_holder[team] is not None:
@@ -1030,6 +1328,12 @@ class CTFMode(BaseMode):
             reason = objective_guard.ground_objective_trapped(
                 wm, position, player_space=True
             )
+            if reason == "buried" and self._raise_buried_intel(team):
+                logger.info(
+                    "%s intel buried; raised through connected stack",
+                    self.server.teams[team].name,
+                )
+                continue
             if not timer.due(team, reason is not None, now, grace):
                 continue
             dropped = self.intel_drop_time[team] > 0.0
@@ -1044,10 +1348,4 @@ class CTFMode(BaseMode):
             except Exception:
                 logger.exception("intel resettle failed")
                 continue
-            self.intel_positions[team] = settled
-            if not dropped:
-                self.intel_home_positions[team] = settled
-                self.server.teams[team].return_intel(settled)
-            else:
-                self.server.teams[team].drop_intel(*settled)
-            self._set_intel_entity(team, True)
+            self._move_ground_intel(team, settled)

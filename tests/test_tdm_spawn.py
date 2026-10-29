@@ -15,7 +15,9 @@ from server.game_constants import (  # noqa: E402
     TEAM1,
     TEAM2,
 )
+from server.map_metadata import MapMetadata, MapZone  # noqa: E402
 from server.round_lifecycle import resolve_player_spawn  # noqa: E402
+from server.spawn_selection import choose_team_spawn  # noqa: E402
 from server.world_manager import MAP_X, MAP_Y, WorldManager  # noqa: E402
 
 
@@ -51,6 +53,16 @@ class ShoulderWallMap:
         return 0
 
 
+class EmptyWaterMap:
+    """An empty VXL column still represents open water at the waterplane."""
+
+    def get_solid(self, _x, _y, _z):
+        return False
+
+    def get_color(self, _x, _y, _z):
+        return 0
+
+
 def test_spawn_rejects_small_player_built_platform_with_air_below():
     wm = WorldManager(ServerConfig())
     wm.map = RoofMap(1)
@@ -71,6 +83,61 @@ def test_spawn_rejects_wall_intersecting_only_the_player_radius() -> None:
     assert not wm.clipbox(position[0], position[1], position[2])
     assert not wm.clipbox(position[0], position[1], position[2] + 1.0)
     assert wm.spawn_position_is_safe(position) is False
+
+
+def test_mode_spawn_keeps_horizontal_coordinates_and_only_adjusts_height():
+    wm = WorldManager(ServerConfig())
+    wm.generate_flat_map()
+    assert wm.set_block(100, 100, 50, True, 0x123456)
+    candidate = (100.25, 100.75, 50.0)
+    server = SimpleNamespace(
+        world_manager=wm,
+        mode=SimpleNamespace(get_spawn_point=lambda _player: candidate),
+        players={},
+    )
+    player = SimpleNamespace(team=TEAM1, name="same-column")
+
+    resolved = resolve_player_spawn(server, player)
+
+    assert resolved == (100.25, 100.75, 47.25)
+    assert wm._player_body_is_clear(*resolved)
+
+
+def test_authored_spawn_zone_keeps_an_empty_water_column():
+    wm = WorldManager(ServerConfig())
+    wm.map = EmptyWaterMap()
+    zone = MapZone(
+        "spawn",
+        TEAM1,
+        100.0,
+        110.0,
+        230.0,
+        (-1.0, 1.0, -1.0, 1.0, -8.0, 2.0),
+        "team_one_spawn_area",
+    )
+
+    candidates = wm._zone_candidates(zone)
+    resolved = wm.spawn_candidate_position((100, 110), [zone])
+
+    assert (100, 110) in candidates
+    assert resolved == (100.5, 110.5, 236.25)
+    assert wm.is_water_column(100, 110)
+    assert wm._player_body_is_clear(*resolved)
+
+
+def test_smart_spawn_keeps_a_cached_water_column_in_every_mode():
+    wm = WorldManager(ServerConfig())
+    wm.map = EmptyWaterMap()
+    wm.map_metadata = MapMetadata()
+    wm._spawn_candidates[TEAM1] = [(100, 110)]
+    server = SimpleNamespace(world_manager=wm, players={}, mode=object())
+    player = SimpleNamespace(team=TEAM1)
+
+    resolved = choose_team_spawn(server, player, rng=random.Random(1))
+
+    assert resolved == (100.5, 110.5, 236.25)
+    assert wm.is_water_column(100, 110)
+    assert wm._player_body_is_clear(*resolved)
 
 
 def test_team_base_anchor_is_resolved_once_per_loaded_map():
@@ -144,7 +211,7 @@ def test_stock_maps_have_safe_spawn_candidates_for_both_teams():
                 assert wm.spawn_position_is_safe((x, y, z))
 
 
-def test_double_dragon_water_life_candidates_relocate_nearby_to_dry_ground():
+def test_double_dragon_water_life_candidates_keep_their_horizontal_column():
     wm = _wm(Path("maps/DoubleDragon.vxl"))
 
     for team, water_spawn in (
@@ -154,9 +221,10 @@ def test_double_dragon_water_life_candidates_relocate_nearby_to_dry_ground():
         assert wm.is_water_column(int(water_spawn[0]), int(water_spawn[1]))
         resolved = wm.sanitize_spawn_point(water_spawn, team)
 
-        assert wm.spawn_position_is_safe(resolved)
-        assert not wm.is_water_column(int(resolved[0]), int(resolved[1]))
-        assert math.dist(resolved[:2], water_spawn[:2]) <= 64.0
+        assert resolved[:2] == water_spawn[:2]
+        assert resolved[2] == 236.25
+        assert wm.is_water_column(int(resolved[0]), int(resolved[1]))
+        assert wm._player_body_is_clear(*resolved)
 
 
 def test_double_dragon_fallback_base_keeps_safe_spawn_diversity():

@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
@@ -38,6 +40,91 @@ def test_loads_ugc_spawn_base_and_drop_points(tmp_path: Path):
     assert [(e.entity_type, e.kind) for e in metadata.entities] == [
         (int(C.HEALTH_CRATE), "health")
     ]
+
+
+def test_malformed_custom_ugc_bounds_fall_back_to_retail_zone_size(
+    tmp_path: Path,
+):
+    vxl = tmp_path / "arena.vxl"
+    vxl.write_bytes(b"")
+    vxl.with_suffix(".ugc").write_text(
+        json.dumps({"ugc_entities": [{
+            "position": [100, 110, 230],
+            "bounds": {"min": [90, 100], "max": [110, 120, 235]},
+            "mode": "vip",
+            "item": "ugc_spawnblue_small",
+        }]}),
+        encoding="utf-8",
+    )
+
+    metadata = load_map_metadata(vxl, "vip")
+
+    assert len(metadata.spawn_zones[TEAM1]) == 1
+    zone = metadata.spawn_zones[TEAM1][0]
+    assert (zone.x, zone.y, zone.z) == (100.0, 110.0, 230.0)
+    assert zone.xy_bounds() == (95, 105, 105, 115)
+
+
+def test_city_of_chicago_vip_spawns_are_owned_by_ugc_sidecar():
+    map_path = Path("maps") / "CityOfChicago.vxl"
+
+    vip = load_map_metadata(map_path, "vip")
+    assert len(vip.spawn_zones[TEAM1]) == 1
+    assert len(vip.spawn_zones[TEAM2]) == 1
+
+    blue = vip.spawn_zones[TEAM1][0]
+    green = vip.spawn_zones[TEAM2][0]
+    assert blue.item == "ugc_spawnblue_med"
+    assert green.item == "ugc_spawngreen_med"
+    assert (blue.x, blue.y, blue.z) == pytest.approx(
+        (339.508, 471.9915, 228.743)
+    )
+    assert (green.x, green.y, green.z) == pytest.approx(
+        (42.0005, 86.4995, 226.246)
+    )
+    assert blue.xy_bounds() == (326, 352, 458, 485)
+    assert green.xy_bounds() == (30, 53, 66, 106)
+    assert tuple(
+        coordinate + offset
+        for coordinate, offset in zip(
+            (blue.x, blue.x, blue.y, blue.y, blue.z, blue.z),
+            blue.extents,
+        )
+    ) == pytest.approx(
+        (326.469, 352.547, 458.45, 485.533, 223.745, 233.741)
+    )
+    assert tuple(
+        coordinate + offset
+        for coordinate, offset in zip(
+            (green.x, green.x, green.y, green.y, green.z, green.z),
+            green.extents,
+        )
+    ) == pytest.approx(
+        (30.452, 53.549, 66.451, 106.548, 224.742, 227.75)
+    )
+
+    # The sidecar rows are mode-scoped and must not alter other Chicago modes.
+    tdm = load_map_metadata(map_path, "tdm")
+    assert tdm.spawn_zones == {TEAM1: [], TEAM2: []}
+
+
+def test_alcatraz_vip_spawns_are_owned_by_ugc_sidecar():
+    map_path = Path("maps") / "Alcatraz.vxl"
+
+    vip = load_map_metadata(map_path, "vip")
+    assert [
+        (zone.x, zone.y, zone.z, zone.item)
+        for zone in vip.spawn_zones[TEAM1]
+    ] == [(433.0, 266.0, 184.0, "ugc_spawnblue_med")]
+    assert [
+        (zone.x, zone.y, zone.z, zone.item)
+        for zone in vip.spawn_zones[TEAM2]
+    ] == [(157.0, 272.0, 181.0, "ugc_spawngreen_med")]
+    assert vip.skybox_name == "Alcatraz.txt"
+
+    # Alcatraz's new authored zones belong only to VIP.
+    tdm = load_map_metadata(map_path, "tdm")
+    assert tdm.spawn_zones == {TEAM1: [], TEAM2: []}
 
 
 def test_loads_skybox_from_original_and_ugc_metadata_keys(tmp_path: Path):

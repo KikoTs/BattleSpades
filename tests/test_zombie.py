@@ -20,15 +20,30 @@ from server.builders.state_data import build_state_data  # noqa: E402
 from server.class_data import BATTLESPADES_TEAM_CLASSES  # noqa: E402
 from server.class_selection import normalize_class_selection  # noqa: E402
 from server.config import ServerConfig  # noqa: E402
+from server.connection import internal_team_to_wire  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer, DisplayCountdown, SetScore, StateData  # noqa: E402
+from shared.packet import (  # noqa: E402
+    ChangePlayer,
+    ChangeTeam,
+    CreatePlayer,
+    DisplayCountdown,
+    ExplodeCorpse,
+    KillAction,
+    SetScore,
+    StateData,
+)
 from server.game_constants import TEAM1, TEAM2  # noqa: E402
+from server.main import BattleSpadesServer  # noqa: E402
+from server.player import Player  # noqa: E402
 
 
 class _Connection:
-    def __init__(self):
+    def __init__(self, server=None):
+        self.server = server
+        self.player = None
+        self.in_game = True
         self.sent = []
 
     def send(self, data, **_kwargs):
@@ -61,10 +76,18 @@ class _Server:
         }
         self.players = {}
         self.packets = []
+        self.respawned = []
         self.mode = None
 
     def broadcast(self, data, **_kwargs):
         self.packets.append(bytes(data))
+
+    def respawn_player(self, player):
+        spawn = self.mode.get_spawn_point(player)
+        player.position = spawn
+        player.alive = player.spawned = True
+        player.death_time = 0.0
+        self.respawned.append(player.id)
 
 
 def _player(server, player_id, team=SURVIVOR_TEAM, class_id=C.CLASS_SOLDIER):
@@ -143,7 +166,7 @@ def test_zombie_mode_is_registered_with_asymmetric_native_snapshot():
     assert state.team1_locked_class is True
     assert state.lock_team_swap is True
     assert info.friendly_fire == 0
-    assert info.exposed_teams_always_on_minimap == 1
+    assert info.exposed_teams_always_on_minimap == 0
     assert int(C.CLASS_ROCKETEER) not in info.disabled_classes
     assert int(C.CLASS_ZOMBIE) not in info.disabled_classes
     assert int(C.CLASS_FAST_ZOMBIE) in info.disabled_classes
@@ -218,8 +241,8 @@ def test_outbreak_keeps_one_survivor_and_assigns_melee_only_patient_zero():
         "prefab_zombiehead",
     }
     assert int(C.RIFLE_TOOL) not in patient_zero.loadout
-    assert patient_zero.alive is False
-    assert mode.respawn_time_for(patient_zero) == 0.0
+    assert patient_zero.alive is True
+    assert mode.respawn_time_for(patient_zero) == mode.zombie_respawn_time
 
 
 def test_round_clock_starts_at_outbreak_not_idle_server_uptime():
@@ -243,7 +266,7 @@ def test_round_clock_starts_at_outbreak_not_idle_server_uptime():
     assert time.time() - mode.start_time < 1.0
 
 
-def test_survivor_death_converts_before_respawn_and_reveals_last_man():
+def test_survivor_death_converts_without_vip_marking_the_last_man():
     server, mode = _new_mode(player_count=3)
     asyncio.run(mode.on_tick(1))
     zombie = next(p for p in server.players.values() if p.team == ZOMBIE_TEAM)
@@ -266,22 +289,133 @@ def test_survivor_death_converts_before_respawn_and_reveals_last_man():
         C.ZOM_KILLSURVIVOR_SCORE_REASON
     )
     visible = _visibility_packets(server.packets)
-    assert (survivor.id, 1) in {
+    assert (survivor.id, 1) not in {
+        (packet.player_id, packet.high_minimap_visibility)
+        for packet in visible
+    }
+    assert mode.mode_marks_player(survivor) is False
+
+
+def test_late_joiner_does_not_receive_a_vip_marker_for_the_last_survivor():
+    server, mode = _new_mode(player_count=2)
+    asyncio.run(mode.on_tick(1))
+    survivor = next(p for p in server.players.values() if p.team == SURVIVOR_TEAM)
+    assert mode.last_survivor_id == survivor.id
+
+    connection = _Connection()
+    mode.reveal_to(connection)
+
+    visible = _visibility_packets(connection.sent)
+    assert (survivor.id, 1) not in {
         (packet.player_id, packet.high_minimap_visibility)
         for packet in visible
     }
 
 
+def _real_player(server, player_id, team):
+    connection = _Connection(server)
+    player = Player(
+        player_id,
+        f"RealP{player_id}",
+        team,
+        int(C.RIFLE_TOOL),
+        connection,
+    )
+    connection.player = player
+    player.spawn(100.5 + player_id, 100.5, 59.75)
+    server.players[player_id] = player
+    server.teams[team].add_player(player)
+    return player
+
+
+def test_round_reset_is_silent_and_grave_free_but_zombie_death_is_not(
+    monkeypatch,
+):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 0.0,
+        "first_infected": 1,
+        "minimum_players": 2,
+        "round_intermission": 0.0,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    players = [
+        _real_player(server, 1, SURVIVOR_TEAM),
+        _real_player(server, 2, SURVIVOR_TEAM),
+    ]
+    asyncio.run(mode.on_mode_start())
+
+    # A live zombie and survivor both need a new ordinary survivor Character.
+    # The reset must publish only that replacement, not a death/team-change
+    # event that the client renders in its kill display and accompanies with
+    # the death sound.
+    mode._assign_zombie(players[0])
+    mode.phase = ZombiePhase.INTERMISSION
+    broadcasts = []
+    monkeypatch.setattr(
+        server,
+        "broadcast",
+        lambda data, *args, **kwargs: broadcasts.append(bytes(data)),
+    )
+    asyncio.run(mode._begin_next_round())
+    while mode.phase is ZombiePhase.RESETTING:
+        asyncio.run(mode._drain_round_reset(time.time()))
+
+    packet_ids = [data[0] for data in broadcasts]
+    # The native client derives both the death cue and the change-team/class
+    # HUD row from KillAction, so no separate death PlaySound is expected.
+    assert KillAction.id not in packet_ids
+    assert ChangeTeam.id not in packet_ids
+    assert ExplodeCorpse.id not in packet_ids
+    create_players = [
+        CreatePlayer(ByteReader(data[1:]))
+        for data in broadcasts
+        if data[0] == CreatePlayer.id
+    ]
+    assert sorted(packet.player_id for packet in create_players) == [1, 2]
+    assert all(
+        packet.team == internal_team_to_wire(SURVIVOR_TEAM)
+        and packet.dead == 0
+        and packet.class_id != int(C.CLASS_ZOMBIE)
+        for packet in create_players
+    )
+    assert all(player.last_kill_action_data is None for player in players)
+    assert all(player.alive for player in players)
+    assert all(player.team == SURVIVOR_TEAM for player in players)
+    assert not any(
+        int(entity.type) == int(C.GRAVE_ENTITY)
+        for entity in server.entity_registry.all()
+    )
+
+    # Normal combat/environmental deaths retain the ordinary Zombie grave.
+    zombie = players[0]
+    mode._assign_zombie(zombie)
+    mode.phase = ZombiePhase.ACTIVE
+    broadcasts.clear()
+    zombie.die(killer=None, kill_type=int(C.KILL.FALL_KILL))
+
+    assert KillAction.id in [data[0] for data in broadcasts]
+    grave = server.entity_registry.get(zombie._grave_entity_id)
+    assert grave is not None
+    assert int(grave.type) == int(C.GRAVE_ENTITY)
+
+
 def test_newly_infected_respawns_once_at_the_death_site():
     server, mode = _new_mode(player_count=3)
     asyncio.run(mode.on_tick(1))
+    server.respawned.clear()
     victim = next(p for p in server.players.values() if p.team == SURVIVOR_TEAM)
     death_site = victim.position
     victim.alive = victim.spawned = False
 
     asyncio.run(mode.on_player_death(victim, None, 0))
 
-    assert mode.get_spawn_point(victim) == death_site
+    assert victim.alive is True
+    assert victim.position == death_site
+    assert server.respawned == [victim.id]
     assert mode.get_spawn_point(victim) != death_site
 
 

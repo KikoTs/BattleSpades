@@ -2276,11 +2276,13 @@ class Player:
             world = getattr(server, "world_manager", None)
             explosion_center = (grave_x, grave_y, grave_z)
             if world is not None:
-                explosion_center = world.dry_surface_anchor(
-                    grave_x,
-                    grave_y,
-                    search=0,
-                )
+                falling_anchor = getattr(world, "falling_surface_anchor", None)
+                if callable(falling_anchor):
+                    explosion_center = falling_anchor(
+                        grave_x,
+                        grave_y,
+                        grave_z,
+                    )
             team = server.teams.get(self.team)
             grave_color = tuple(team.color) if team is not None else None
             corpse_explosion = get_rules(server.config).enabled(
