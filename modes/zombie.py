@@ -434,26 +434,31 @@ class ZombieMode(BaseMode):
         return float(self.server.config.respawn_time)
 
     def death_kill_type_for(self, player: Player, killer, kill_type: int) -> int:
-        """Avoid graves for infection and administrative model transitions.
+        """Keep infection grave-free without hiding class-change graves.
 
         Player.die calls this synchronous hook before corpse_lifecycle. A
         conversion must use KillAction so the stock client replaces its
         character model, but classic-corpse handling skips entity-11 graves.
-        Administrative transitions outside the round-reset respawn path use
-        the same grave-free representation.  The round reset itself replaces
-        each live Character directly and therefore sends no KillAction at all.
+        Team transitions used by infection remain grave-free. A manual class
+        or loadout change is an ordinary retired life and must still create a
+        grave. The round reset itself replaces each live Character directly
+        and therefore sends no KillAction at all.
         """
+        kill_type = int(kill_type)
         suppress_grave = (
-            int(kill_type) in _TRANSITION_KILLS
-            or (
-                self.phase is ZombiePhase.ACTIVE
-                and int(getattr(player, "team", -1)) == SURVIVOR_TEAM
+            kill_type != int(C.KILL.CLASS_CHANGE_KILL)
+            and (
+                kill_type in _TRANSITION_KILLS
+                or (
+                    self.phase is ZombiePhase.ACTIVE
+                    and int(getattr(player, "team", -1)) == SURVIVOR_TEAM
+                )
             )
         )
         self.death_representation = (
             "classic_corpse" if suppress_grave else "grave"
         )
-        return int(kill_type)
+        return kill_type
 
     def modify_incoming_damage(
         self,
