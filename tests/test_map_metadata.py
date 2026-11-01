@@ -127,6 +127,75 @@ def test_alcatraz_vip_spawns_are_owned_by_ugc_sidecar():
     assert tdm.spawn_zones == {TEAM1: [], TEAM2: []}
 
 
+def test_ancient_egypt_ugc_owns_vip_spawns_and_all_nine_crates():
+    map_path = Path("maps") / "AncientEgypt.vxl"
+    sidecar = json.loads(map_path.with_suffix(".ugc").read_text(encoding="utf-8"))
+    assert sidecar["ugc_entities"][0]["position"] == pytest.approx(
+        (48.5315, 226.4515, 233.744)
+    )
+
+    vip = load_map_metadata(map_path, "vip")
+    assert len(vip.spawn_zones[TEAM1]) == 1
+    assert len(vip.spawn_zones[TEAM2]) == 1
+
+    blue = vip.spawn_zones[TEAM1][0]
+    green = vip.spawn_zones[TEAM2][0]
+    assert blue.item == "ugc_spawnblue_med"
+    assert green.item == "ugc_spawngreen_med"
+
+    def absolute_bounds(zone):
+        return tuple(
+            coordinate + offset
+            for coordinate, offset in zip(
+                (zone.x, zone.x, zone.y, zone.y, zone.z, zone.z),
+                zone.extents,
+            )
+        )
+
+    assert absolute_bounds(blue) == pytest.approx(
+        (43.531, 53.532, 199.453, 253.45, 233.743, 233.745)
+    )
+    assert absolute_bounds(green) == pytest.approx(
+        (262.45, 310.453, 61.451, 109.471, 203.742, 204.749)
+    )
+
+    assert [(entity.entity_type, entity.kind) for entity in vip.entities] == [
+        (int(C.AMMO_CRATE), "ammo"),
+        (int(C.AMMO_CRATE), "ammo"),
+        (int(C.AMMO_CRATE), "ammo"),
+        (int(C.BLOCK_CRATE), "block"),
+        (int(C.BLOCK_CRATE), "block"),
+        (int(C.BLOCK_CRATE), "block"),
+        (int(C.HEALTH_CRATE), "health"),
+        (int(C.HEALTH_CRATE), "health"),
+        (int(C.HEALTH_CRATE), "health"),
+    ]
+    assert [(entity.x, entity.y, entity.z) for entity in vip.entities] == pytest.approx([
+        (288.457, 264.452, 217.75),
+        (139.45, 261.548, 229.749),
+        (15.519, 258.545, 233.742),
+        (293.452, 233.45, 215.749),
+        (139.451, 223.45, 228.741),
+        (15.45, 234.452, 233.747),
+        (293.453, 201.452, 214.742),
+        (139.45, 199.452, 228.741),
+        (15.478, 201.536, 233.748),
+    ])
+
+    # AncientEgypt currently runs in TDM, so it needs the same authored zones
+    # there as in VIP. Crates remain common to all modes.
+    tdm = load_map_metadata(map_path, "tdm")
+    assert len(tdm.spawn_zones[TEAM1]) == 1
+    assert len(tdm.spawn_zones[TEAM2]) == 1
+    assert absolute_bounds(tdm.spawn_zones[TEAM1][0]) == pytest.approx(
+        (43.531, 53.532, 199.453, 253.45, 233.743, 233.745)
+    )
+    assert absolute_bounds(tdm.spawn_zones[TEAM2][0]) == pytest.approx(
+        (262.45, 310.453, 61.451, 109.471, 203.742, 204.749)
+    )
+    assert len(tdm.entities) == 9
+
+
 def test_loads_skybox_from_original_and_ugc_metadata_keys(tmp_path: Path):
     """Map sidecars, not the connection handler, own the skybox resource."""
     vxl = tmp_path / "arena.vxl"

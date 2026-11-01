@@ -126,7 +126,17 @@ def test_join_dispatch_waits_for_world_reveal_and_never_repeats(monkeypatch):
     assert all(packet.player_id == 255 and packet.chat_type == CHAT_SYSTEM
                and flags["reliable"] for packet, flags in chats)
     assert chats[0][0].value.startswith("Welcome, Builder! BattleSpades Beta 0.3")
-    assert not any(data[0] == ChatMessage.id for data in server.broadcast_packets)
+    broadcast_chats = [
+        ChatMessage(ByteReader(data[1:]))
+        for data in server.broadcast_packets
+        if data[0] == ChatMessage.id
+    ]
+    assert [packet.value for packet in broadcast_chats] == [
+        "Builder has joined Blue"
+    ]
+    assert all(packet.player_id == 255 and packet.chat_type == CHAT_SYSTEM
+               for packet in broadcast_chats)
+    assert all("Welcome" not in packet.value for packet in broadcast_chats)
     assert len(handled) == 3
 
 

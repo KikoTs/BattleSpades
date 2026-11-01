@@ -1,4 +1,4 @@
-"""Retail-safe top-screen server announcements.
+"""Retail-safe server announcements and system-chat messages.
 
 The stock client routes chat/localised packets by ``chat_type``.  Type 3
 (``CHAT_BIG``) is the shared top-of-screen announcement lane; packet 73 is
@@ -14,16 +14,18 @@ import re
 
 from shared.packet import ChatMessage, LocalisedMessage
 
-from server.game_constants import CHAT_BIG
+from server.game_constants import CHAT_BIG, CHAT_SYSTEM
 
 _MAX_ANNOUNCEMENT_LENGTH = 256
+_MAX_CHAT_MESSAGE_LENGTH = 200
 _MAX_LOCALISED_PARAMETERS = 16
 
 # Team names are localization IDs on the wire because StateData lets the
 # retail client resolve them for its own UI.  Packet 49 does not run that
 # lookup, however, so interpolating ``team.name`` into free-form prose would
-# leak identifiers such as "TEAM1_COLOR" onto the HUD.  Keep this fallback at
-# the packet-49 boundary so every mode/admin/plugin caller gets safe text.
+# leak identifiers such as "TEAM1_COLOR". Overlay prose resolves the complete
+# message here; mixed text such as join notices resolves only its trusted team
+# value first, so a player whose literal name is TEAM1_COLOR stays unchanged.
 _FREEFORM_VARIABLES = {
     "TEAM_NEUTRAL": "Neutral",
     "TEAM1_COLOR": "Blue",
@@ -37,16 +39,19 @@ _FREEFORM_VARIABLE_PATTERN = re.compile(
 )
 
 
-def _bounded_text(value: object, *, field: str) -> str:
+def _bounded_text(
+    value: object,
+    *,
+    field: str,
+    max_length: int = _MAX_ANNOUNCEMENT_LENGTH,
+) -> str:
     """Return one protocol-safe string or raise before packet construction."""
 
     text = str(value)
     if not text:
         raise ValueError(f"{field} must not be empty")
-    if len(text) > _MAX_ANNOUNCEMENT_LENGTH:
-        raise ValueError(
-            f"{field} exceeds {_MAX_ANNOUNCEMENT_LENGTH} characters"
-        )
+    if len(text) > max_length:
+        raise ValueError(f"{field} exceeds {max_length} characters")
     return text
 
 
@@ -72,6 +77,21 @@ def build_overlay_message(message: object) -> bytes:
     packet.chat_type = CHAT_BIG
     packet.value = _bounded_text(
         resolve_freeform_variables(message), field="message"
+    )
+    return bytes(packet.generate())
+
+
+def build_system_chat_message(message: object) -> bytes:
+    """Build one server-authored line in the ordinary in-game chat."""
+
+    packet = ChatMessage()
+    packet.player_id = 0xFF
+    packet.chat_type = CHAT_SYSTEM
+    # Do not resolve localization-looking tokens here: unlike an overlay,
+    # this text can contain a player name such as ``TEAM1_COLOR``. Callers
+    # that interpolate a team id must resolve that value before formatting.
+    packet.value = _bounded_text(
+        message, field="message", max_length=_MAX_CHAT_MESSAGE_LENGTH
     )
     return bytes(packet.generate())
 
@@ -132,6 +152,12 @@ def broadcast_overlay(server, message: object) -> None:
     server.broadcast(build_overlay_message(message))
 
 
+def broadcast_system_chat(server, message: object) -> None:
+    """Broadcast one system line to settled clients' ordinary chat."""
+
+    server.broadcast(build_system_chat_message(message))
+
+
 def broadcast_localised_overlay(
     server,
     string_id: str,
@@ -155,8 +181,10 @@ def broadcast_localised_overlay(
 __all__ = [
     "broadcast_localised_overlay",
     "broadcast_overlay",
+    "broadcast_system_chat",
     "build_localised_overlay",
     "build_overlay_message",
+    "build_system_chat_message",
     "localisation_safe_name",
     "resolve_freeform_variables",
 ]

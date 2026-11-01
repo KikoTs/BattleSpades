@@ -8,8 +8,11 @@ with a stale Medic movement profile or equipment list.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import TYPE_CHECKING
+
+import shared.constants as C
 
 from .game_constants import TEAM1, TEAM2
 
@@ -32,6 +35,39 @@ def resolve_player_spawn(server, player) -> tuple[float, float, float]:
     from server.spawn_selection import emergency_spawn, rescue_spawn
 
     world = getattr(server, "world_manager", None)
+    # Some mode transitions replace the current Character in-place (Zombie
+    # infection) rather than starting a geographically new life. The source
+    # position is server-authoritative and must not be projected onto the
+    # column's topmost surface: a roof would move it up, while an airborne
+    # victim would be moved down. This one-shot hook is deliberately consumed
+    # before the ordinary spawn resolver; all later respawns remain validated.
+    take_transition_spawn = getattr(
+        server.mode, "take_transition_spawn_point", None
+    )
+    if callable(take_transition_spawn):
+        try:
+            transition = take_transition_spawn(player)
+            if transition is not None:
+                transition = tuple(float(transition[index]) for index in range(3))
+                x, y, z = transition
+                if (
+                    all(math.isfinite(value) for value in transition)
+                    and 0.0 <= x < float(C.MAP_X)
+                    and 0.0 <= y < float(C.MAP_Y)
+                    and -float(C.MAP_Z) <= z < float(C.MAP_Z)
+                ):
+                    return transition
+                logger.warning(
+                    "ignored invalid authoritative transition spawn for %r: %r",
+                    getattr(player, "name", player),
+                    transition,
+                )
+        except Exception:
+            logger.exception(
+                "transition spawn resolver failed for %r; using normal spawn",
+                getattr(player, "name", player),
+            )
+
     spawn_resolver = getattr(server.mode, "get_spawn_point", None)
     try:
         candidate = (

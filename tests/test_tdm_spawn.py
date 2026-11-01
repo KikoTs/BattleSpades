@@ -263,6 +263,31 @@ def test_mode_spawn_candidate_passes_through_final_world_sanitizer():
     assert calls == [(candidate, TEAM2)]
 
 
+def test_transition_spawn_bypasses_surface_sanitizer_only_once():
+    calls = []
+    transition_points = [(101.5, 202.5, 42.25), None]
+    ordinary_candidate = (100.0, 200.0, 236.75)
+
+    class SpawnWorld:
+        def sanitize_spawn_point(self, candidate, team):
+            calls.append((candidate, team))
+            return (10.5, 20.5, 30.5)
+
+    player = SimpleNamespace(team=TEAM2)
+    server = SimpleNamespace(
+        mode=SimpleNamespace(
+            take_transition_spawn_point=lambda _player: transition_points.pop(0),
+            get_spawn_point=lambda _player: ordinary_candidate,
+        ),
+        world_manager=SpawnWorld(),
+    )
+
+    assert resolve_player_spawn(server, player) == (101.5, 202.5, 42.25)
+    assert calls == []
+    assert resolve_player_spawn(server, player) == (10.5, 20.5, 30.5)
+    assert calls == [(ordinary_candidate, TEAM2)]
+
+
 def test_exposed_retail_chroma_voxel_is_removed_without_dirtying_map():
     arctic = Path("maps/ArcticBase.vxl")
     if not arctic.exists():

@@ -3858,7 +3858,7 @@ class Player:
         # consumed directly each tick in update() (client-pipeline mirror).
 
     def _award_teabag_point(self) -> None:
-        """Crouch edge: retail teabag rule (server/combat_scores.py)."""
+        """Crouch edge: grave interaction / Classic teabag scoring."""
 
         server = self.connection.server if self.connection else None
         if server is None or not self.alive:

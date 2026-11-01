@@ -682,6 +682,17 @@ class BaseMode(ABC):
     # camping. Modes with authored per-player spawns turn this off.
     smart_spawns = True
 
+    def take_transition_spawn_point(
+        self, player: 'Player'
+    ) -> Optional[Tuple[float, float, float]]:
+        """Consume an exact position for an in-place Character replacement.
+
+        Ordinary lives return ``None`` and pass through terrain validation.
+        A mode may override this only when the server already owns the
+        position of the same live/dead body being replaced.
+        """
+        return None
+
     def get_spawn_point(self, player: 'Player') -> Tuple[float, float, float]:
         """
         Get spawn point for a player.

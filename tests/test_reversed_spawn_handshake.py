@@ -101,6 +101,7 @@ def test_scene_reload_reset_preserves_authentication_and_clears_old_epoch() -> N
         connection.pending_ugc_tools = [9]
         connection.map_mutation_watermark = 12
         connection.map_mutation_overflow = True
+        connection._join_announced = True
         connection.known_player_lives[4] = (10, 20)
         waiter = asyncio.get_running_loop().create_future()
         connection._waiters[60] = waiter
@@ -123,6 +124,7 @@ def test_scene_reload_reset_preserves_authentication_and_clears_old_epoch() -> N
     assert connection.pending_ugc_tools == []
     assert connection.map_mutation_watermark is None
     assert connection.map_mutation_overflow is False
+    assert connection._join_announced is True
     assert connection.known_player_lives == {}
 
 

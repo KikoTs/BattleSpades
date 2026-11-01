@@ -1,7 +1,6 @@
-"""Server-driven retail HUD lines (audit3 server findings, 2026-09-28).
+"""Server-driven retail HUD/chat lines.
 
-* PLAYER_LEFT "{0} has disconnected" is sent (packet 50) before PlayerLeft.
-* PLAYER_JOINED never lets the client translate a player NAME.
+* PLAYER_JOINED/PLAYER_LEFT prose uses system chat, not the HUD overlay.
 * A joiner moved by the join balance gets TEAM_FULL once in the GameScene.
 * /me does not repeat the sender name; command replies show team names.
 * Over-long server names are capped at MAX_SERVER_NAME_SIZE (31) on the wire.
@@ -16,19 +15,34 @@ from types import SimpleNamespace
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChatMessage, LocalisedMessage  # noqa: E402
+from shared.packet import (  # noqa: E402
+    ChatMessage,
+    LocalisedMessage,
+    NewPlayerConnection,
+)
 
 from server.announcements import (  # noqa: E402
     localisation_safe_name,
     resolve_freeform_variables,
 )
-from server.game_constants import TEAM1, TEAM2, TEAM_SPECTATOR  # noqa: E402
+from server.game_constants import (  # noqa: E402
+    CHAT_BIG,
+    CHAT_SYSTEM,
+    TEAM1,
+    TEAM2,
+    TEAM_SPECTATOR,
+)
 from server.main import BattleSpadesServer  # noqa: E402
 
 
 def _localised(data: bytes) -> LocalisedMessage:
     assert data[0] == LocalisedMessage.id
     return LocalisedMessage(ByteReader(data[1:]))
+
+
+def _chat(data: bytes) -> ChatMessage:
+    assert data[0] == ChatMessage.id
+    return ChatMessage(ByteReader(data[1:]))
 
 
 def _server():
@@ -42,9 +56,51 @@ def test_player_left_is_announced_for_departing_players():
     connection = SimpleNamespace(in_game=True)
     player = SimpleNamespace(name="OK", team=TEAM1, is_bot=False)
     BattleSpadesServer._announce_player_left(server, connection, player)
-    packet = _localised(server.sent[-1])
-    assert packet.string_id == "PLAYER_LEFT"
-    assert packet.parameters == ["OK"] and packet.localise_parameters == 0
+    assert len(server.sent) == 1
+    assert not any(data[0] == LocalisedMessage.id for data in server.sent)
+    packet = _chat(server.sent[0])
+    assert packet.player_id == 255
+    assert packet.chat_type == CHAT_SYSTEM
+    assert packet.chat_type != CHAT_BIG
+    assert packet.value == "OK has disconnected"
+
+
+def test_player_join_is_announced_as_system_chat_not_overlay():
+    from tests.test_reversed_spawn_handshake import DummyServer, make_connection
+
+    server = DummyServer()
+    connection = make_connection(server)
+    direct = []
+    connection.send = lambda data, **_kwargs: direct.append(bytes(data))
+
+    join = NewPlayerConnection()
+    join.team = TEAM1
+    join.class_id = 0
+    join.forced_team = 0
+    join.local_language = 0
+    # This is also a real client localization id. Packet 49 must preserve it
+    # as a player name while resolving only the team's TEAM1_COLOR id.
+    join.name = "TEAM1_COLOR"
+
+    asyncio.run(connection._on_new_player(join))
+    connection._announce_player_joined(connection.player)
+
+    chats = [
+        _chat(data)
+        for data in server.broadcast_packets
+        if data[0] == ChatMessage.id
+    ]
+    assert len(chats) == 1
+    assert chats[0].player_id == 255
+    assert chats[0].chat_type == CHAT_SYSTEM
+    assert chats[0].chat_type != CHAT_BIG
+    assert chats[0].value == "TEAM1_COLOR has joined Blue"
+    assert not any(
+        data[0] == LocalisedMessage.id
+        for data in (*server.broadcast_packets, *direct)
+    )
+    # Gameplay broadcasts remain gated while the joiner builds its GameScene.
+    assert not any(data[0] == ChatMessage.id for data in direct)
 
 
 def test_player_left_skips_bots_spectators_rollovers_and_shutdown():

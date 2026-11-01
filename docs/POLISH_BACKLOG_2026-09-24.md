@@ -61,7 +61,9 @@ measurement).
   are server-sent, so Zombie/VIP/CTF/Diamond/Occupation/TDM events, the round
   clock, the time-limit draw and PLAYER_JOINED now go out as LocalisedMessage(50)
   with the retail ids (team-relative where retail is); invented TDM lead spam
-  removed. Tests: tests/test_retail_announcements.py.
+  removed. Tests: tests/test_retail_announcements.py. Superseded for connection
+  notices on 2026-10-30: join/leave now use packet 49 `CHAT_SYSTEM`, so they
+  appear in ordinary chat; localized mode announcements remain unchanged.
 
 ## C. Unimplemented packets and features (docs/PROTOCOL.md "Planned")
 

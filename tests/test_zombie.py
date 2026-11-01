@@ -403,6 +403,294 @@ def test_round_reset_is_silent_and_grave_free_but_zombie_death_is_not(
     assert int(grave.type) == int(C.GRAVE_ENTITY)
 
 
+def test_manual_class_change_has_a_grave_but_infection_stays_grave_free(
+    monkeypatch,
+):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 30.0,
+        "first_infected": 1,
+        "minimum_players": 2,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    class_changer = _real_player(server, 1, SURVIVOR_TEAM)
+    infection_target = _real_player(server, 2, SURVIVOR_TEAM)
+    asyncio.run(mode.on_mode_start())
+    monkeypatch.setattr(server, "broadcast", lambda *args, **kwargs: None)
+
+    class_changer.die(
+        killer=None,
+        kill_type=int(C.KILL.CLASS_CHANGE_KILL),
+    )
+
+    grave = server.entity_registry.get(class_changer._grave_entity_id)
+    assert grave is not None
+    assert int(grave.type) == int(C.GRAVE_ENTITY)
+
+    # Survivor -> Zombie uses TEAM_CHANGE only to replace the native model;
+    # that infection transition must not manufacture a second grave.
+    mode.phase = ZombiePhase.ACTIVE
+    asyncio.run(mode._infect(infection_target, patient_zero=True))
+
+    assert infection_target._grave_entity_id is None
+    assert sum(
+        int(entity.type) == int(C.GRAVE_ENTITY)
+        for entity in server.entity_registry.all()
+    ) == 1
+
+
+def test_defeated_survivor_explodes_once_then_respawns_as_zombie_without_grave(
+    monkeypatch,
+):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 30.0,
+        "first_infected": 1,
+        "minimum_players": 2,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    zombie = _real_player(server, 1, SURVIVOR_TEAM)
+    victim = _real_player(server, 2, SURVIVOR_TEAM)
+    _real_player(server, 3, SURVIVOR_TEAM)
+    asyncio.run(mode.on_mode_start())
+    mode._assign_zombie(zombie)
+    mode.phase = ZombiePhase.ACTIVE
+
+    broadcasts = []
+    blasts = []
+    monkeypatch.setattr(
+        server,
+        "broadcast",
+        lambda data, *args, **kwargs: broadcasts.append(bytes(data)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_apply_blast",
+        lambda *args, **kwargs: blasts.append((args, kwargs)),
+    )
+
+    death_site = tuple(victim.position)
+    victim.die(killer=zombie, kill_type=int(C.KILL.WEAPON_KILL))
+
+    async def drain_mode_events():
+        while server._mode_events:
+            name, args = server._mode_events.popleft()
+            handler = getattr(mode, name, None)
+            if handler is not None:
+                await handler(*args)
+
+    asyncio.run(drain_mode_events())
+
+    packet_ids = [data[0] for data in broadcasts]
+    explosion_indices = [
+        index
+        for index, packet_id in enumerate(packet_ids)
+        if packet_id == ExplodeCorpse.id
+    ]
+    assert len(explosion_indices) == 1
+    explosion = ExplodeCorpse(ByteReader(broadcasts[explosion_indices[0]][1:]))
+    assert explosion.player_id == victim.id
+    assert explosion.show_explosion_effect == 1
+    assert packet_ids.index(KillAction.id) < explosion_indices[0]
+    assert explosion_indices[0] < packet_ids.index(CreatePlayer.id)
+
+    assert len(blasts) == 1
+    blast_args, blast_kwargs = blasts[0]
+    assert blast_args[:3] == death_site
+    assert blast_args[3:6] == (
+        float(C.CORPSE_EXPLOSION_DAMAGE),
+        float(C.CORPSE_EXPLOSION_BLOCK_DAMAGE),
+        int(C.KILL.CORPSE_KILL),
+    )
+    assert blast_args[6] is victim
+    assert blast_kwargs == {
+        "crater_radius": 1,
+        "force_destroy": False,
+        "blast_radius": float(C.CORPSE_EXPLOSION_RADIUS),
+        "knockback_min": float(C.CORPSE_EXPLOSION_KNOCKBACK_MIN),
+        "knockback_max": float(C.CORPSE_EXPLOSION_KNOCKBACK_MAX),
+    }
+
+    assert victim.alive is True
+    assert victim.team == ZOMBIE_TEAM
+    assert victim.class_id == int(C.CLASS_ZOMBIE)
+    assert victim._grave_entity_id is None
+    assert not any(
+        int(entity.type) == int(C.GRAVE_ENTITY)
+        and int(getattr(entity, "player_id", -1)) == victim.id
+        for entity in server.entity_registry.all()
+    )
+
+
+def test_two_random_initial_infections_each_have_visible_corpse_blast(monkeypatch):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 30.0,
+        "first_infected": 2,
+        "minimum_players": 2,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    for player_id in range(1, 5):
+        _real_player(server, player_id, SURVIVOR_TEAM)
+    asyncio.run(mode.on_mode_start())
+
+    broadcasts = []
+    blasts = []
+    monkeypatch.setattr(
+        server,
+        "broadcast",
+        lambda data, *args, **kwargs: broadcasts.append(bytes(data)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_apply_blast",
+        lambda *args, **kwargs: blasts.append((args, kwargs)),
+    )
+
+    asyncio.run(mode._start_outbreak(time.time()))
+
+    corpse_packets = [
+        ExplodeCorpse(ByteReader(data[1:]))
+        for data in broadcasts
+        if data[0] == ExplodeCorpse.id
+    ]
+    zombies = [
+        player
+        for player in server.players.values()
+        if player.team == ZOMBIE_TEAM
+    ]
+    zombie_ids = {player.id for player in zombies}
+    assert len(zombies) == 2
+    assert zombie_ids == mode.patient_zero_ids
+    assert len(corpse_packets) == 2
+    assert {packet.player_id for packet in corpse_packets} == zombie_ids
+    assert all(packet.show_explosion_effect == 1 for packet in corpse_packets)
+    for zombie_id in zombie_ids:
+        kill_index = next(
+            index
+            for index, data in enumerate(broadcasts)
+            if data[0] == KillAction.id
+            and KillAction(ByteReader(data[1:])).player_id == zombie_id
+        )
+        explosion_index = next(
+            index
+            for index, data in enumerate(broadcasts)
+            if data[0] == ExplodeCorpse.id
+            and ExplodeCorpse(ByteReader(data[1:])).player_id == zombie_id
+        )
+        spawn_index = next(
+            index
+            for index, data in enumerate(broadcasts)
+            if data[0] == CreatePlayer.id
+            and CreatePlayer(ByteReader(data[1:])).player_id == zombie_id
+        )
+        assert kill_index < explosion_index < spawn_index
+    assert len(blasts) == 2
+    assert {args[6].id for args, _kwargs in blasts} == zombie_ids
+    assert all(player.alive for player in zombies)
+    assert all(player.class_id == int(C.CLASS_ZOMBIE) for player in zombies)
+    assert all(player._grave_entity_id is None for player in zombies)
+    assert not any(
+        int(entity.type) == int(C.GRAVE_ENTITY)
+        for entity in server.entity_registry.all()
+    )
+
+
+def test_random_initial_infection_keeps_exact_xyz_below_an_overhead_block(
+    monkeypatch,
+):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 30.0,
+        "first_infected": 1,
+        "minimum_players": 2,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    target = _real_player(server, 1, SURVIVOR_TEAM)
+    _real_player(server, 2, SURVIVOR_TEAM)
+    _real_player(server, 3, SURVIVOR_TEAM)
+    asyncio.run(mode.on_mode_start())
+
+    infection_site = (102.5, 100.5, 58.0)
+    target.position = infection_site
+    world = server.world_manager
+    assert world.set_block(102, 100, 40, True, 0x112233)
+    world._surface_cache.pop((102, 100), None)
+    assert world.spawn_position_is_safe(infection_site) is False
+    assert world.same_column_spawn_point(infection_site)[2] < infection_site[2]
+
+    monkeypatch.setattr(
+        "modes.zombie.random.sample",
+        lambda population, count: [target],
+    )
+    monkeypatch.setattr(server, "_apply_blast", lambda *args, **kwargs: None)
+
+    asyncio.run(mode._start_outbreak(time.time()))
+
+    assert target.alive is True
+    assert target.team == ZOMBIE_TEAM
+    assert target.class_id == int(C.CLASS_ZOMBIE)
+    assert target.position == infection_site
+    assert mode.take_transition_spawn_point(target) is None
+
+
+def test_combat_infection_keeps_exact_airborne_xyz_instead_of_moving_down(
+    monkeypatch,
+):
+    config = ServerConfig(default_mode="zom")
+    config.mode_settings = {"zom": {
+        "infection_delay": 30.0,
+        "first_infected": 1,
+        "minimum_players": 2,
+    }}
+    server = BattleSpadesServer(config)
+    server.world_manager.generate_flat_map()
+    mode = ZombieMode(server)
+    server.mode = mode
+    zombie = _real_player(server, 1, SURVIVOR_TEAM)
+    victim = _real_player(server, 2, SURVIVOR_TEAM)
+    _real_player(server, 3, SURVIVOR_TEAM)
+    asyncio.run(mode.on_mode_start())
+    mode._assign_zombie(zombie)
+    mode.phase = ZombiePhase.ACTIVE
+
+    infection_site = (102.5, 100.5, 50.0)
+    victim.position = infection_site
+    world = server.world_manager
+    assert world.spawn_position_is_safe(infection_site) is False
+    assert world.same_column_spawn_point(infection_site)[2] > infection_site[2]
+    monkeypatch.setattr(server, "_apply_blast", lambda *args, **kwargs: None)
+
+    victim.die(killer=zombie, kill_type=int(C.KILL.WEAPON_KILL))
+
+    async def drain_mode_events():
+        while server._mode_events:
+            name, args = server._mode_events.popleft()
+            handler = getattr(mode, name, None)
+            if handler is not None:
+                await handler(*args)
+
+    asyncio.run(drain_mode_events())
+
+    assert victim.alive is True
+    assert victim.team == ZOMBIE_TEAM
+    assert victim.class_id == int(C.CLASS_ZOMBIE)
+    assert victim.position == infection_site
+    assert mode.take_transition_spawn_point(victim) is None
+
+
 def test_newly_infected_respawns_once_at_the_death_site():
     server, mode = _new_mode(player_count=3)
     asyncio.run(mode.on_tick(1))

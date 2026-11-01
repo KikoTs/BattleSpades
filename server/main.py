@@ -2353,14 +2353,13 @@ class BattleSpadesServer:
             relay.forget_peer(peer)
     
     def _announce_player_left(self, connection, player) -> None:
-        """Retail PLAYER_LEFT "{0} has disconnected" (packet 50).
+        """Send "{0} has disconnected" to the ordinary system chat.
 
-        EN:596 sits right after PLAYER_JOINED and no stock client binary
-        references it, so the retail server sent it; the stock PlayerLeft(64)
-        handler prints nothing.  Same lane as PLAYER_JOINED, sent before
-        PlayerLeft.  Skipped for bots, spectators, players that never
-        reached the game, map-rollover (ERROR_MATCH_ENDED) reloads and
-        server shutdown.
+        The stock PlayerLeft(64) handler prints nothing.  This line is sent
+        before PlayerLeft and uses the system sender id, so it is safe even
+        for recipients that never learned the departing player's id. Skipped
+        for bots, spectators, players that never reached the game, map-
+        rollover (ERROR_MATCH_ENDED) reloads and server shutdown.
         """
 
         if getattr(self, "_stopping", False) or bool(getattr(player, "is_bot", False)):
@@ -2375,13 +2374,10 @@ class BattleSpadesServer:
             return
         if not getattr(connection, "in_game", True):
             return
-        from server.announcements import broadcast_localised_overlay
+        from server.announcements import broadcast_system_chat
 
         try:
-            broadcast_localised_overlay(
-                self, "PLAYER_LEFT", (str(player.name),),
-                localise_parameters=False,
-            )
+            broadcast_system_chat(self, f"{player.name} has disconnected")
         except ValueError:
             logger.debug("PLAYER_LEFT skipped for %r", player.name)
 

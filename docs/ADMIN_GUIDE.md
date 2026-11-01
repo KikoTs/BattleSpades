@@ -726,7 +726,7 @@ Retail parity note: only the disconnect code is retail. The stock client has
 warning text or kick broadcast was recovered (the shared constants hold no
 idle threshold). The 540/600/1800 s defaults, the English warning and the
 "was kicked for being AFK" top-screen line are this server's own choices;
-every other player also sees the retail `PLAYER_LEFT` line when the idle
+every other player also sees a system-chat disconnect line when the idle
 player is disconnected.
 
 **Names** (`server/player_names.py`, always on). Names are NFKC-normalized,

@@ -3,7 +3,7 @@
 import shared.constants as C
 from server.class_selection import normalize_class_selection
 from server.config import ServerConfig
-from server.game_constants import TEAM1
+from server.game_constants import TEAM1, TEAM2
 from server.main import BattleSpadesServer
 from server.player import Player
 from shared.bytes import ByteReader
@@ -25,18 +25,56 @@ def _player(
     player_id=0,
     name="GraveTest",
     weapon=C.RIFLE_TOOL,
+    team=TEAM1,
+    position=(100.5, 100.5, 59.75),
 ):
     connection = _Connection(server)
-    player = Player(player_id, name, TEAM1, weapon, connection)
-    player.spawn(100.5, 100.5, 59.75)
+    player = Player(player_id, name, team, weapon, connection)
+    player.spawn(*position)
     server.players[player.id] = player
-    server.teams[TEAM1].add_player(player)
+    server.teams[team].add_player(player)
     return player
 
 
 def _packet(data: bytes, packet_type):
     assert data[0] == packet_type.id
     return packet_type(ByteReader(data[1:]))
+
+
+def _press_crouch(player) -> None:
+    player.update_input(False, False, False, False, False, True, False, False)
+    player.update_input(False, False, False, False, False, False, False, False)
+
+
+def test_real_enemy_grave_pays_two_separate_crouches_then_stops(monkeypatch):
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    croucher = _player(
+        server,
+        player_id=0,
+        name="Croucher",
+        team=TEAM1,
+        position=(100.5, 100.5, 59.75),
+    )
+    victim = _player(
+        server,
+        player_id=1,
+        name="Victim",
+        team=TEAM2,
+        position=(101.5, 100.5, 59.75),
+    )
+    monkeypatch.setattr(server, "broadcast", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_apply_blast", lambda *args, **kwargs: None)
+
+    victim.die(killer=croucher, kill_type=int(C.KILL.WEAPON_KILL))
+    assert server.entity_registry.get(victim._grave_entity_id) is not None
+
+    _press_crouch(croucher)
+    assert croucher.score == 1
+    _press_crouch(croucher)
+    assert croucher.score == 2
+    _press_crouch(croucher)
+    assert croucher.score == 2
 
 
 def test_normal_death_explodes_corpse_then_spawns_falling_team_grave(

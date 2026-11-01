@@ -538,12 +538,27 @@ def test_player_left_for_dead_joiner_reaches_only_peers_that_knew_it():
         "leaver": leaver_conn, "unaware": unaware, "aware": aware, "loading": loading,
     }
     server._on_disconnect_sync("leaver")
+    for recipient in (unaware, aware):
+        (raw_chat,) = _ids(recipient, ChatMessage.id)
+        chat = ChatMessage(ByteReader(raw_chat[1:]))
+        assert chat.player_id == 255
+        assert chat.chat_type == int(C.CHAT_SYSTEM)
+        assert chat.value == "DeadJoiner has disconnected"
+    assert _ids(leaver_conn, ChatMessage.id) == []
+    assert _ids(loading, ChatMessage.id) == []
     assert _ids(unaware, PlayerLeft.id) == []
     assert len(_ids(aware, PlayerLeft.id)) == 1
+    packet_ids = [data[0] for data in aware.sent]
+    assert packet_ids.index(ChatMessage.id) < packet_ids.index(PlayerLeft.id)
     assert 4 not in aware.known_player_lives
     # Loading peers are repaired by catch_up_roster (stale id still known).
     assert _ids(loading, PlayerLeft.id) == []
     assert 4 in loading.known_player_lives
+
+    # A repeated transport callback for the same peer is a no-op.
+    sent_counts = tuple(len(conn.sent) for conn in (unaware, aware, loading))
+    server._on_disconnect_sync("leaver")
+    assert tuple(len(conn.sent) for conn in (unaware, aware, loading)) == sent_counts
 
 
 # ---------------------------------------------------------------------------

@@ -415,6 +415,11 @@ class GraveBehavior(EntityBehavior):
         import shared.constants as C
         self.knockback_min = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MIN", 0.5))
         self.knockback_max = float(getattr(C, "GRAVE_EXPLOSION_KNOCKBACK_MAX", 1.0))
+        # Per concrete grave, not per victim id: every player may score its
+        # first two crouch press-edges independently. Holding the player
+        # object beside its identity key prevents compact-id reuse from
+        # inheriting somebody else's limit while this grave is alive.
+        self.crouch_scores: dict[int, tuple[object, int]] = {}
         self._detonate_at = None
 
     def get_explosion_center(self, ent):

@@ -14,6 +14,7 @@ from modes.ctf import CTFMode
 from modes.diamond_mine import DiamondMineMode
 from modes.occupation import OccupationMode
 from server import combat_scores as cs
+from server.entities.behaviors import GraveBehavior
 from server.game_constants import TEAM1, TEAM2, TEAM_NEUTRAL
 from shared.packet import ChangePlayer, SetScore
 from tests.test_recovered_objective_modes import _decode, _Player, _Server, _zone
@@ -548,9 +549,82 @@ def _rules(monkeypatch, enabled: bool):
     monkeypatch.setattr(cs, "_teabag_points_enabled", lambda _server: enabled)
 
 
-def test_teabag_three_quick_crouches_over_fresh_enemy_corpse(monkeypatch):
+def _grave(server, victim, position=None):
+    position = victim.position if position is None else position
+    behavior = GraveBehavior(
+        victim.id,
+        explosion_center=position,
+    )
+    return server.entity_registry.place(
+        int(C.GRAVE_ENTITY),
+        *position,
+        state=int(victim.team),
+        kind="grave",
+        player_id=int(victim.id),
+        behavior=behavior,
+    )
+
+
+def test_enemy_grave_pays_first_two_crouches_per_player_and_new_grave():
+    server = _teabag_server(False)  # the explicit grave interaction is always paid
+    first = _add(server, 1, TEAM1, (100.0, 100.0, 58.0))
+    second = _add(server, 2, TEAM1, (100.0, 100.0, 58.0))
+    victim = _add(server, 3, TEAM2, (100.5, 100.0, 60.0))
+    old_grave = _grave(server, victim)
+
+    assert cs.record_teabag_crouch(server, first, now=1.0)
+    assert cs.record_teabag_crouch(server, first, now=2.0)
+    assert not cs.record_teabag_crouch(server, first, now=3.0)
+    assert first.score == 2
+    assert _reasons(server, first) == [
+        (int(C.TEABAG_SCORE_REASON), 1),
+        (int(C.TEABAG_SCORE_REASON), 2),
+    ]
+    assert cs.round_stats(first).awards[C.MOST_TEABAGS] == 2
+
+    # The limit belongs to this player+grave pair, not to the grave globally.
+    assert cs.record_teabag_crouch(server, second, now=4.0)
+    assert cs.record_teabag_crouch(server, second, now=5.0)
+    assert not cs.record_teabag_crouch(server, second, now=6.0)
+    assert second.score == 2
+
+    # A later death of the same opponent owns a fresh GraveBehavior/counter.
+    server.entity_registry.remove(old_grave.entity_id)
+    new_grave = _grave(server, victim)
+    assert new_grave.entity_id != old_grave.entity_id
+    assert cs.record_teabag_crouch(server, first, now=7.0)
+    assert cs.record_teabag_crouch(server, first, now=8.0)
+    assert not cs.record_teabag_crouch(server, first, now=9.0)
+    assert first.score == 4
+
+
+def test_grave_crouch_rejects_friendly_far_destroyed_and_missing_graves():
+    server = _teabag_server(False)
+    player = _add(server, 1, TEAM1, (100.0, 100.0, 58.0))
+    friendly = _add(server, 2, TEAM1, (100.5, 100.0, 60.0))
+    enemy = _add(server, 3, TEAM2, (100.0, 100.0, 60.0))
+
+    _grave(server, friendly)
+    far_grave = _grave(
+        server,
+        enemy,
+        (100.0 + C.TEABAG_MAX_DISTANCE + 0.5, 100.0, 60.0),
+    )
+    assert not cs.record_teabag_crouch(server, player, now=1.0)
+    assert player.score == 0
+
+    # A dead enemy without a live grave entity is not an interaction target.
+    server.entity_registry.remove(far_grave.entity_id)
+    enemy.alive = False
+    enemy.death_time = 50.0
+    assert not cs.record_teabag_crouch(server, player, now=2.0)
+    assert player.score == 0
+
+
+def test_classic_teabag_three_quick_crouches_over_fresh_enemy_corpse(monkeypatch):
     _rules(monkeypatch, True)
     server = _teabag_server(True)
+    server.mode.death_representation = "classic_corpse"
     player = _add(server, 1, TEAM1, (100.0, 100.0, 58.0))
     victim = _add(server, 2, TEAM2, (101.0, 100.0, 60.0))
     victim.alive, victim.death_time = False, 50.0
@@ -558,7 +632,7 @@ def test_teabag_three_quick_crouches_over_fresh_enemy_corpse(monkeypatch):
     assert not cs.record_teabag_crouch(server, player, now=10.0)
     assert not cs.record_teabag_crouch(server, player, now=10.3)
     assert cs.record_teabag_crouch(server, player, now=10.6)
-    assert player.score == int(CG.NORMAL_SCORE_TEABAG)
+    assert player.score == int(CG.CLASSIC_SCORE_TEABAG)
     assert _reasons(server, player) == [(int(C.TEABAG_SCORE_REASON), 2)]
     assert cs.round_stats(player).awards[C.MOST_TEABAGS] == 1
     # The same corpse only counts once.
@@ -570,6 +644,7 @@ def test_teabag_three_quick_crouches_over_fresh_enemy_corpse(monkeypatch):
 def test_teabag_rejects_slow_far_friendly_and_living(monkeypatch):
     _rules(monkeypatch, True)
     server = _teabag_server(True)
+    server.mode.death_representation = "classic_corpse"
     player = _add(server, 1, TEAM1, (100.0, 100.0, 58.0))
     far = _add(server, 2, TEAM2, (100.0 + C.TEABAG_MAX_DISTANCE + 0.5, 100.0, 60.0))
     far.alive, far.death_time = False, 50.0
@@ -593,6 +668,7 @@ def test_teabag_rejects_slow_far_friendly_and_living(monkeypatch):
 def test_teabag_counts_award_but_no_points_when_rule_off(monkeypatch):
     _rules(monkeypatch, False)
     server = _teabag_server(False)
+    server.mode.death_representation = "classic_corpse"
     player = _add(server, 1, TEAM1, (100.0, 100.0, 58.0))
     victim = _add(server, 2, TEAM2, (100.5, 100.0, 60.0))
     victim.alive, victim.death_time = False, 50.0

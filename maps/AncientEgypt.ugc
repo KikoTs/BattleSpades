@@ -1,0 +1,171 @@
+{
+    "title": "AncientEgypt",
+    "description": "AncientEgypt",
+    "ugc_entities": [
+        {
+            "position": [
+                48.5315,
+                226.4515,
+                233.744
+            ],
+            "bounds": {
+                "min": [
+                    43.531,
+                    199.453,
+                    233.743
+                ],
+                "max": [
+                    53.532,
+                    253.45,
+                    233.745
+                ]
+            },
+            "mode": "vip",
+            "item": "ugc_spawnblue_med"
+        },
+        {
+            "position": [
+                286.4515,
+                85.461,
+                204.2455
+            ],
+            "bounds": {
+                "min": [
+                    262.45,
+                    61.451,
+                    203.742
+                ],
+                "max": [
+                    310.453,
+                    109.471,
+                    204.749
+                ]
+            },
+            "mode": "vip",
+            "item": "ugc_spawngreen_med"
+        },
+        {
+            "position": [
+                48.5315,
+                226.4515,
+                233.744
+            ],
+            "bounds": {
+                "min": [
+                    43.531,
+                    199.453,
+                    233.743
+                ],
+                "max": [
+                    53.532,
+                    253.45,
+                    233.745
+                ]
+            },
+            "mode": "tdm",
+            "item": "ugc_spawnblue_med"
+        },
+        {
+            "position": [
+                286.4515,
+                85.461,
+                204.2455
+            ],
+            "bounds": {
+                "min": [
+                    262.45,
+                    61.451,
+                    203.742
+                ],
+                "max": [
+                    310.453,
+                    109.471,
+                    204.749
+                ]
+            },
+            "mode": "tdm",
+            "item": "ugc_spawngreen_med"
+        },
+        {
+            "position": [
+                288.457,
+                264.452,
+                217.75
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                139.45,
+                261.548,
+                229.749
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                15.519,
+                258.545,
+                233.742
+            ],
+            "mode": "nor",
+            "item": "ugc_ammo_drop"
+        },
+        {
+            "position": [
+                293.452,
+                233.45,
+                215.749
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
+        },
+        {
+            "position": [
+                139.451,
+                223.45,
+                228.741
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
+        },
+        {
+            "position": [
+                15.45,
+                234.452,
+                233.747
+            ],
+            "mode": "nor",
+            "item": "ugc_block_drop"
+        },
+        {
+            "position": [
+                293.453,
+                201.452,
+                214.742
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                139.45,
+                199.452,
+                228.741
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        },
+        {
+            "position": [
+                15.478,
+                201.536,
+                233.748
+            ],
+            "mode": "nor",
+            "item": "ugc_health_drop"
+        }
+    ]
+}

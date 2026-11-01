@@ -261,6 +261,10 @@ class Connection:
         # build / GameScene transition crashes the compiled client natively.
         self.in_game = False
         self._join_greeting_sent = False
+        # Scene reloads reuse this Connection and run NewPlayerConnection
+        # again. A chat join line describes the network connection, not each
+        # replacement Player object, so it survives reset_for_scene_reload().
+        self._join_announced = False
         # Terrain sequence serialized into this connection's MapSync. Native
         # block packets after this watermark are replayed at first ClientData.
         self.map_mutation_watermark: Optional[int] = None
@@ -1620,6 +1624,32 @@ class Connection:
         logger.info(f"Map data sent to {self.peer.address} ({total_chunks} chunks)")
         return True
     
+    def _announce_player_joined(self, player: 'Player') -> None:
+        """Broadcast this connection's join once, across scene reloads."""
+
+        if self._join_announced:
+            return
+        team = getattr(self.server, "teams", {}).get(
+            int(getattr(player, "team", -1))
+        )
+        if team is None:
+            return
+
+        from server.announcements import (
+            broadcast_system_chat,
+            resolve_freeform_variables,
+        )
+
+        try:
+            team_name = resolve_freeform_variables(str(team.name))
+            broadcast_system_chat(
+                self.server, f"{player.name} has joined {team_name}"
+            )
+        except ValueError:
+            logger.debug("PLAYER_JOINED skipped for %r", player.name)
+            return
+        self._join_announced = True
+
     async def _on_new_player(self, packet: NewPlayerConnection):
         """Handle new player joining."""
         from server.player import Player
@@ -1925,30 +1955,10 @@ class Connection:
         if self.server.mode and not is_spectator:
             await self.server.mode.on_player_join(player)
         if not is_spectator:
-            # Retail PLAYER_JOINED ("{0} has joined {1}"): the string exists
-            # only in the client's table, so the original server sent it as
-            # a localised overlay. broadcast() is gameplay-gated, so the
-            # joiner (not yet settled) never receives its own line.
-            team = getattr(self.server, "teams", {}).get(int(getattr(player, "team", -1)))
-            if team is not None:
-                from server.announcements import broadcast_localised_overlay
-
-                try:
-                    # localise_parameters is needed for the team id, but the
-                    # client would also look the NAME up (strings.get_by_id
-                    # = globals()[id]): a player called "OK" or "MAP" would
-                    # show the translated word.  A trailing space can never
-                    # be a string-table key and is invisible on screen.
-                    from server.announcements import localisation_safe_name
-
-                    broadcast_localised_overlay(
-                        self.server,
-                        "PLAYER_JOINED",
-                        (localisation_safe_name(player.name), str(team.name)),
-                        localise_parameters=True,
-                    )
-                except ValueError:
-                    logger.debug("PLAYER_JOINED skipped for %r", player.name)
+            # Keep connection notices in the ordinary chat. broadcast() is
+            # gameplay-gated, so the joiner (not yet settled) and any other
+            # loading peer do not receive gameplay packets prematurely.
+            self._announce_player_joined(player)
 
         # NB: the live roster + map entities are revealed to this client on its
         # FIRST ClientData (server.reveal_world_to), i.e. once it's actually in

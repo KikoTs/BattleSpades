@@ -325,8 +325,41 @@ class ZombieMode(BaseMode):
                 int(CG.ZOM_SCORE_KILL_SURVIVOR),
                 reason=int(C.ZOM_KILLSURVIVOR_SCORE_REASON),
             )
+        self._explode_infection_corpse(player)
         await self._infect(player, patient_zero=False)
         await self._check_population()
+
+    def _explode_infection_corpse(self, player: Player) -> None:
+        """Play the ordinary light corpse blast without creating a grave.
+
+        A defeated survivor is recorded as a Classic corpse solely so the
+        immediate Zombie model swap cannot manufacture a gravestone. Explode
+        that temporary corpse before respawning it: the shared lifecycle uses
+        the normal corpse constants (zero player damage, weak knockback and
+        one block damage), while ``before_player_spawn`` then only retires the
+        already-exploded state. A randomly selected initial infection calls
+        this helper after its model-replacement death as well; administrative
+        round transitions use a separate path and therefore stay quiet.
+        """
+        lifecycle = getattr(self.server, "corpse_lifecycle", None)
+        get_corpse = getattr(lifecycle, "get", None)
+        explode = getattr(lifecycle, "explode", None)
+        if not callable(get_corpse) or not callable(explode):
+            return
+        corpse = get_corpse(player)
+        if corpse is None:
+            return
+
+        from server.game_rules import get_rules
+
+        show_effect = get_rules(self.server.config).enabled(
+            "RULE_ENABLE_CORPSE_EXPLOSION"
+        )
+        explode(
+            corpse,
+            player,
+            show_explosion_effect=show_effect,
+        )
 
     async def on_player_kill(
         self,
@@ -471,10 +504,16 @@ class ZombieMode(BaseMode):
             return 0
         return int(amount)
 
+    def take_transition_spawn_point(
+        self, player: Player
+    ) -> tuple[float, float, float] | None:
+        """Keep a Zombie transformation at the body's exact current XYZ."""
+        return self._infection_spawn_by_player.pop(int(player.id), None)
+
     def get_spawn_point(self, player: Player) -> tuple[float, float, float]:
-        infection_spawn = self._infection_spawn_by_player.pop(
-            int(player.id), None
-        )
+        # Lightweight plugin/test servers may call the mode resolver directly
+        # instead of RoundLifecycle, so retain the same one-shot fallback.
+        infection_spawn = self.take_transition_spawn_point(player)
         if infection_spawn is not None:
             return infection_spawn
         return tuple(float(value) for value in super().get_spawn_point(player))
@@ -658,6 +697,8 @@ class ZombieMode(BaseMode):
         # earlier death was marked classic_corpse by death_kill_type_for.
         if getattr(player, "alive", False):
             player.die(kill_type=KILL_TEAM_CHANGE)
+            if patient_zero:
+                self._explode_infection_corpse(player)
         self._move_to_team(player, ZOMBIE_TEAM)
         selection = self._zombie_selection(self._zombie_class_for(player))
         player.apply_class_selection(selection)

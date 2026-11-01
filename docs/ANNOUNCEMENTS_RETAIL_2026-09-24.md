@@ -131,7 +131,8 @@ at the win, 72(0) on restart, no 53). Test:
 
 | Event | Before | Now (packet 50 unless noted) |
 |---|---|---|
-| Player finished joining | nothing | `PLAYER_JOINED` (name, team id) to everyone already in game |
+| Player finished joining | nothing | system chat packet 49, `"{name} has joined {team}"`, once per network connection to everyone already in game |
+| Player disconnected | nothing from `PlayerLeft(64)` | system chat packet 49, `"{name} has disconnected"`, before `PlayerLeft` |
 | Round clock | nothing | `COUNTDOWN_MINUTES` 5/2, `ONE_MINUTE_LEFT`, `COUNTDOWN_SECONDS` 30/10, each once inside a 5 s window |
 | Time-limit draw | free text | `GAME_DRAWN` |
 | TDM | "X leads by N" every 60 s (invented) | removed; `TEAM_DEATHMATCH_START` on reveal |

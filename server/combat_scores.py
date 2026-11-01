@@ -562,6 +562,8 @@ def record_profile_total(player, stat: int, count: int = 1) -> None:
 # The grave/corpse sits on the ground under the dead body's recorded
 # position; allow a standing player's height difference.
 TEABAG_VERTICAL_TOLERANCE = 3.0
+GRAVE_CROUCH_SCORE = 1
+GRAVE_CROUCH_LIMIT = 2
 
 
 def _classic_corpses(server) -> bool:
@@ -583,21 +585,119 @@ def _teabag_points_enabled(server) -> bool:
         return False
 
 
-def record_teabag_crouch(server, player, *, now: float | None = None) -> bool:
-    """Feed one crouch PRESS edge; True when it completed a teabag.
+def _grave_crouch_position(grave) -> tuple[float, float, float] | None:
+    """Return the settled visual position of one live grave entity."""
 
-    Retail: TEABAG_CROUCH_COUNT (3) crouches, each within
-    TEABAG_TIME_THRESHOLD (0.5 s) of the previous one, within
-    TEABAG_MAX_DISTANCE (1.75 blocks, horizontal) of a dead enemy's
-    grave/corpse. Each enemy death is teabagged once per player. The profile
-    stat (COMBAT_TEABAG_TOTAL, COMBAT_TEABAG_CLASSIC_TOTAL under Classic
-    corpses) and the MOST_TEABAGS round award always count; the
-    NORMAL/CLASSIC_SCORE_TEABAG points (2, TEABAG_SCORE_REASON) are paid
-    only when RULE_POINTS_FROM_TEABAGGING is on (retail default off).
+    behavior = getattr(grave, "behavior", None)
+    resolver = getattr(behavior, "get_explosion_center", None)
+    try:
+        point = (
+            resolver(grave)
+            if callable(resolver)
+            else (grave.x, grave.y, grave.z)
+        )
+        return tuple(float(value) for value in point[:3])
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _record_grave_crouch(server, player, origin) -> bool:
+    """Pay one of two per-player crouch points on the nearest enemy grave."""
+
+    registry = getattr(server, "entity_registry", None)
+    all_entities = getattr(registry, "all", None)
+    if not callable(all_entities):
+        return False
+
+    candidates = []
+    player_team = int(getattr(player, "team", -1))
+    player_key = id(player)
+    for grave in tuple(all_entities()):
+        if (
+            not bool(getattr(grave, "alive", False))
+            or str(getattr(grave, "kind", "")) != "grave"
+            or int(getattr(grave, "type", -1)) != int(C.GRAVE_ENTITY)
+        ):
+            continue
+        grave_team = int(getattr(grave, "state", -1))
+        if grave_team not in (TEAM1, TEAM2) or grave_team == player_team:
+            continue
+        behavior = getattr(grave, "behavior", None)
+        scores = getattr(behavior, "crouch_scores", None)
+        if not isinstance(scores, dict):
+            continue
+        entry = scores.get(player_key)
+        count = (
+            int(entry[1])
+            if isinstance(entry, tuple)
+            and len(entry) == 2
+            and entry[0] is player
+            else 0
+        )
+        if count >= GRAVE_CROUCH_LIMIT:
+            continue
+        spot = _grave_crouch_position(grave)
+        if spot is None:
+            continue
+        dx, dy, dz = (
+            float(spot[0]) - float(origin[0]),
+            float(spot[1]) - float(origin[1]),
+            float(spot[2]) - float(origin[2]),
+        )
+        horizontal_sq = dx * dx + dy * dy
+        if (
+            horizontal_sq > float(C.TEABAG_MAX_DISTANCE) ** 2
+            or abs(dz) > TEABAG_VERTICAL_TOLERANCE
+        ):
+            continue
+        candidates.append(
+            (horizontal_sq + dz * dz, int(grave.entity_id), grave, count)
+        )
+
+    if not candidates:
+        return False
+    _distance, _entity_id, grave, count = min(
+        candidates, key=lambda item: (item[0], item[1])
+    )
+    if not award_score_event(
+        server,
+        player,
+        GRAVE_CROUCH_SCORE,
+        int(C.TEABAG_SCORE_REASON),
+    ):
+        return False
+    grave.behavior.crouch_scores[player_key] = (player, count + 1)
+    from server import profile_stats
+
+    profile_stats.add(player, C.COMBAT_TEABAG_TOTAL)
+    round_stats(player).increment(C.MOST_TEABAGS)
+    return True
+
+
+def record_teabag_crouch(server, player, *, now: float | None = None) -> bool:
+    """Feed one crouch PRESS edge near a grave or Classic corpse.
+
+    A live enemy grave pays +1 on the first two distinct crouch presses by
+    each player. The concrete GraveBehavior owns those independent counters,
+    so another player has their own two presses and a new death starts fresh.
+
+    Classic modes have no grave entity. They retain the retail fallback:
+    three quick crouches over a fresh enemy corpse complete one teabag, with
+    its +2 score still controlled by RULE_POINTS_FROM_TEABAGGING.
     """
     if (server is None or player is None or not bool(getattr(player, "alive", False))
             or not _playable(player) or not objective_scoring_open(server)):
         return False
+    origin = position_of(player)
+    if origin is None:
+        return False
+    if _record_grave_crouch(server, player, origin):
+        player._teabag_crouch_times = []
+        return True
+    if not _classic_corpses(server):
+        player._teabag_crouch_times = []
+        return False
+
     current = time.monotonic() if now is None else float(now)
     presses = list(getattr(player, "_teabag_crouch_times", ()) or ())
     if presses and current - presses[-1] > float(C.TEABAG_TIME_THRESHOLD):
@@ -606,9 +706,6 @@ def record_teabag_crouch(server, player, *, now: float | None = None) -> bool:
     presses = presses[-int(C.TEABAG_CROUCH_COUNT):]
     player._teabag_crouch_times = presses
     if len(presses) < int(C.TEABAG_CROUCH_COUNT):
-        return False
-    origin = position_of(player)
-    if origin is None:
         return False
     done = getattr(player, "_teabagged_deaths", None)
     if not isinstance(done, set):
