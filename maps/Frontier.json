@@ -1,0 +1,96 @@
+{
+  "health_crate_drop_points": [
+    [
+      208.5,
+      365.5,
+      189
+    ],
+    [
+      263.5,
+      377.5,
+      207
+    ],
+    [
+      280.5,
+      237.5,
+      209
+    ],
+    [
+      324.5,
+      138.5,
+      209
+    ],
+    [
+      319.5,
+      319.5,
+      209
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      197.5,
+      365.5,
+      189
+    ],
+    [
+      263.5,
+      365.5,
+      207
+    ],
+    [
+      302.5,
+      237.5,
+      209
+    ],
+    [
+      302.5,
+      150.5,
+      209
+    ],
+    [
+      319.5,
+      307.5,
+      208
+    ],
+    [
+      263.5,
+      202.5,
+      209
+    ],
+    [
+      374.5,
+      249.5,
+      149
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      131.5,
+      144.5,
+      193
+    ],
+    [
+      219.5,
+      336.5,
+      196
+    ],
+    [
+      291.5,
+      249.5,
+      209
+    ],
+    [
+      368.5,
+      138.5,
+      209
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Frontier",
+    "page_sha256": "efaad19d9906312e8f62ef051912637126e4f04f8de915bd61d4a141235db3e7",
+    "vxl_sha256": "48f168271d87cdd77623e88a5138fd8f3e91880e75a802060ef34a2034a27a83",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

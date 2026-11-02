@@ -37,11 +37,12 @@ SHARED_TIERS = {
     "intel_defence_count": [(5, "intel_defence_easy"), (10, "intel_defence_hard")],
 }
 
-# The six map achievements whose volumes were not recovered.
-NOT_IMPLEMENTED = {
+# Reconstructed masks supplement the four recovered retail map rules.
+RECONSTRUCTED = {
     "map_greatwall_destroy", "map_moon_destroy", "map_london_destroy",
     "map_concrete_destroy", "map_egypt_destroy", "map_colosseum_kill",
 }
+NOT_IMPLEMENTED = set()
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +101,7 @@ def test_every_name_the_code_awards_exists_in_the_catalog():
     assert stats and stats <= set(TIERS), stats - set(TIERS)
     assert names and names <= set(BY_NAME), names - set(BY_NAME)
     assert conditions <= set(BY_NAME), conditions - set(BY_NAME)
-    # Every statistic is fed by some hook, and everything but the six
-    # documented map achievements can be unlocked.
+    # Every statistic is fed by a hook and every map achievement has a target.
     assert stats == set(TIERS)
     recovered = set()  # map achievements are named by the maps' own ac_ids
     for path in (ROOT / "maps").glob("*.json"):
@@ -109,7 +109,7 @@ def test_every_name_the_code_awards_exists_in_the_catalog():
     assert recovered == {
         "map_isleofdoom_destroy", "map_maya_kill",
         "map_zombieisland_destroy", "map_zombieisland_zombie_kill",
-    }
+    } | RECONSTRUCTED
     awarded = names | recovered | {name for stat in stats for _t, name in TIERS[stat]}
     assert set(BY_NAME) - awarded == NOT_IMPLEMENTED
 

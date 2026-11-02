@@ -1,0 +1,41 @@
+{
+  "ac_ids": [
+    "map_egypt_destroy"
+  ],
+  "ac_types": [
+    2
+  ],
+  "ac_centres": [
+    [
+      260.0,
+      250.0,
+      195.5
+    ]
+  ],
+  "ac_w_h_d": [
+    [
+      0.5,
+      0.5,
+      1
+    ]
+  ],
+  "ac_teams": [
+    0
+  ],
+  "ac_kills": [
+    0
+  ],
+  "ac_cells": [
+    [
+      [260, 250, 195],
+      [260, 250, 196]
+    ]
+  ],
+  "_achievement_source": {
+    "kind": "Screenshot-guided reconstruction against native VXL geometry; not recovered retail volumes",
+    "guide": "https://steamcommunity.com/sharedfiles/filedetails/?id=135523055",
+    "vxl_sha256": "9c9e3d6d5c67ce4108a465873e7a709ab34fe3d465b0db24c66231cdf8a54536",
+    "coordinate_space": "source VXL; achievement engine applies source_z_shift once",
+    "generator": "tools/map_metadata/author_achievement_regions.py"
+  }
+}

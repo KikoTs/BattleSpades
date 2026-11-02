@@ -1,0 +1,91 @@
+{
+  "health_crate_drop_points": [
+    [
+      396.5,
+      243.5,
+      229
+    ],
+    [
+      280.5,
+      437.5,
+      225
+    ],
+    [
+      252.5,
+      287.5,
+      225
+    ],
+    [
+      236.5,
+      99.5,
+      225
+    ],
+    [
+      104.5,
+      243.5,
+      227
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      396.5,
+      255.5,
+      228
+    ],
+    [
+      269.5,
+      437.5,
+      225
+    ],
+    [
+      263.5,
+      287.5,
+      225
+    ],
+    [
+      225.5,
+      100.5,
+      225
+    ],
+    [
+      103.5,
+      231.5,
+      227
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      396.5,
+      231.5,
+      229
+    ],
+    [
+      291.5,
+      437.5,
+      225
+    ],
+    [
+      241.5,
+      289.5,
+      225
+    ],
+    [
+      214.5,
+      100.5,
+      225
+    ],
+    [
+      103.5,
+      255.5,
+      227
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Hiesville",
+    "page_sha256": "36597d25af80d1b203c69c182d249f61fe7d56d9a14702bcbd7b8713dfabc46f",
+    "vxl_sha256": "8cc8ea68ace54ff99e66eb819cce0f714cb8284f3e6307cdb7ecc3428c04e04b",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

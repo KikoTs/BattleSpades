@@ -179,6 +179,7 @@ class PickupCrateBehavior(EntityBehavior):
         ent.fall_clock = float(getattr(ctx, "now", 0.0))
         ent.parachute_deployed = False
         ent.parachute_removed = False
+        ent.terrain_revision = None
         # This is the initial target sent into the fall simulation.  While the
         # crate is airborne it rechecks the same column so newly built blocks
         # can catch it; X/Y are never changed. Once landed, any block above it
@@ -293,9 +294,9 @@ class PickupCrateBehavior(EntityBehavior):
         """Advance an air drop and keep a landed crate accessible.
 
         Once landed, a live crate keeps its exact X/Y and never falls after
-        support loss. If any block is above it in that same column, it rises
-        immediately to the column's topmost surface. Its next respawn starts
-        again at the original map-authored X/Y.
+        support loss. Player-built blocks can lift it in the same column, but
+        an original ceiling must not pull an indoor drop onto the roof. Its
+        next respawn starts again at the original map-authored X/Y.
         """
 
         if getattr(ent, "falling", False):
@@ -311,6 +312,12 @@ class PickupCrateBehavior(EntityBehavior):
         y = int(math.floor(ent.y))
         if not (0 <= x < int(C.MAP_X) and 0 <= y < int(C.MAP_Y)):
             return
+        revision = getattr(world, "topology_version", None)
+        if isinstance(revision, int):
+            token = (id(getattr(world, "map", world)), revision)
+            if ent.terrain_revision == token:
+                return
+            ent.terrain_revision = token
         raised_z = self._overhead_surface_z(world, x, y, ent.z)
         if raised_z is None:
             return
@@ -323,7 +330,7 @@ class PickupCrateBehavior(EntityBehavior):
 
     @staticmethod
     def _overhead_surface_z(world, x: int, y: int, current_z: float):
-        """Return the topmost same-column block above a crate, if one exists."""
+        """Find new overhead builds without crossing an authored ceiling."""
         if world is None or not callable(getattr(world, "get_solid", None)):
             return None
         try:
@@ -333,28 +340,47 @@ class PickupCrateBehavior(EntityBehavior):
         if not math.isfinite(crate_z):
             return None
 
-        # Production worlds cache this exact-column query and invalidate it on
-        # every terrain mutation, so all live crates can check at 60 Hz without
-        # scanning the map. Keep a bounded scan for lightweight plugin worlds.
+        # Production worlds cache this exact-column query. Settled crates
+        # recheck only after a topology change; lightweight plugin worlds use
+        # a bounded scan when no surface query exists.
         get_height = getattr(world, "get_height", None)
+        top_z = None
         if callable(get_height):
             try:
                 top_z = float(get_height(x, y))
             except (TypeError, ValueError, RuntimeError):
                 top_z = None
             if top_z is not None and math.isfinite(top_z):
-                return top_z if 0.0 <= top_z < crate_z else None
+                if not 0.0 <= top_z < crate_z:
+                    return None
 
-        from shared import constants as C
+        if top_z is None or not math.isfinite(top_z):
+            from shared import constants as C
 
-        limit = max(0, min(int(C.MAP_Z), int(math.ceil(crate_z))))
-        try:
-            for block_z in range(limit):
-                if world.get_solid(x, y, block_z):
-                    return float(block_z)
-        except Exception:
+            limit = max(0, min(int(C.MAP_Z), int(math.ceil(crate_z))))
+            top_z = next((float(z) for z in range(limit)
+                          if world.get_solid(x, y, z)), None)
+        if top_z is None:
             return None
-        return None
+        runtime = getattr(world, "is_runtime_solid", None)
+        if not callable(runtime):
+            return top_z
+        cells = getattr(world, "runtime_solid_cells", None)
+        if cells is not None and not cells:
+            return None
+        # Look only in this room: a new platform below its ceiling can lift
+        # the crate, while the ceiling and builds above the roof cannot.
+        # UGC origins may lie fractionally inside their supporting voxel.
+        # That same cell is a floor, not an overhead authored ceiling.
+        cell_z = int(math.floor(crate_z))
+        raised = float(cell_z) if runtime(x, y, cell_z) else None
+        for z in range(cell_z - 1, int(top_z) - 1, -1):
+            if not world.get_solid(x, y, z):
+                continue
+            if not runtime(x, y, z):
+                break
+            raised = float(z)
+        return raised if raised is not None and raised < crate_z else None
 
     @staticmethod
     def _is_runtime_solid(world, x: int, y: int, z: int) -> bool:

@@ -21,7 +21,10 @@ the map's static-light colour. On the client that entity puts the voxel back
 with that colour and adds a point light. `WorldManager.restore_static_light_block`
 makes the same cell solid again on the server. MapSync still sends the raw
 spans, so the map CRC does not change and each client does its own cleanup.
-Stock palette fallback: slot 0 `(255,255,82)`, slot 1 `(250,250,200)`.
+A marker needs its own map palette; missing slots are not filled with another
+map's editor defaults. Reviewed brown-post/candelabra light tops supplement
+Spooky Mansion's surviving marker; broad colour-cluster guesses remain disabled. See
+[MAP_LIGHTING_RECOVERY.md](MAP_LIGHTING_RECOVERY.md).
 
 | Map | marker words | removed (exposed) |
 |---|---|---|
@@ -55,10 +58,8 @@ retail.
 `tests/test_vxl_markers.py` pins the colour table, the marker inventory, the
 green-marker removal and the Atlantis team posts.
 
-## Known gap
+## Navigation and loading
 
-The bot worker's `CompactVoxelMap` repeats the removal half but not the
-flare restore, because restores are not published as navigation deltas. On
-stock maps, bots therefore treat each restored flare cell as air (a
-one-voxel bump or lamp top). The server and clients agree that the cell is
-solid.
+Restored marker cells are published to bot workers through static-light world
+changes. Client entity snapshots wait until the world exists, so loading does
+not discard marker or fixture lights.

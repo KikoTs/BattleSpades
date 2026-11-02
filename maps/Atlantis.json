@@ -1,0 +1,86 @@
+{
+  "health_crate_drop_points": [
+    [
+      302.5,
+      249.5,
+      193
+    ],
+    [
+      137.5,
+      261.5,
+      200
+    ],
+    [
+      142.5,
+      348.5,
+      215
+    ],
+    [
+      280.5,
+      260.5,
+      186
+    ],
+    [
+      374.5,
+      191.5,
+      215
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      197.5,
+      377.5,
+      217
+    ],
+    [
+      302.5,
+      278.5,
+      196
+    ],
+    [
+      252.5,
+      144.5,
+      199
+    ],
+    [
+      170.5,
+      261.5,
+      200
+    ],
+    [
+      247.5,
+      231.5,
+      186
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      175.5,
+      377.5,
+      217
+    ],
+    [
+      192.5,
+      260.5,
+      196
+    ],
+    [
+      247.5,
+      290.5,
+      186
+    ],
+    [
+      357.5,
+      173.5,
+      210
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Atlantis",
+    "page_sha256": "85969605e695355999b62d080da455300fc08685c628274de67430a050b0291d",
+    "vxl_sha256": "acbbebebb4cb0eecab2739b1ef34d9b4353e6173d0ccfde7be3bc7878bf9f29c",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

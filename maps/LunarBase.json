@@ -1,0 +1,149 @@
+{
+  "health_crate_drop_points": [
+    [
+      263.5,
+      377.5,
+      215
+    ],
+    [
+      313.5,
+      295.5,
+      214
+    ],
+    [
+      241.5,
+      237.5,
+      215
+    ],
+    [
+      142.5,
+      307.5,
+      215
+    ],
+    [
+      131.5,
+      220.5,
+      215
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      275.5,
+      377.5,
+      216
+    ],
+    [
+      313.5,
+      284.5,
+      214
+    ],
+    [
+      247.5,
+      243.5,
+      214
+    ],
+    [
+      142.5,
+      295.5,
+      213
+    ],
+    [
+      131.5,
+      231.5,
+      210
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      308.5,
+      354.5,
+      214
+    ],
+    [
+      192.5,
+      284.5,
+      213
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Lunar_Base",
+    "page_sha256": "07f72395980b0a10a4e311c218702c5cfbd91b5c5a546b593af8d0f55d5bbf19",
+    "vxl_sha256": "07bc5cc2878879a59d2b82fe0dacb70e64748c686bf38bc97b6e44b304266631",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  },
+  "ac_ids": [
+    "map_moon_destroy"
+  ],
+  "ac_types": [
+    2
+  ],
+  "ac_centres": [
+    [
+      305.5,
+      458.0,
+      215.0
+    ]
+  ],
+  "ac_w_h_d": [
+    [
+      3,
+      0.5,
+      8
+    ]
+  ],
+  "ac_teams": [
+    0
+  ],
+  "ac_kills": [
+    0
+  ],
+  "ac_cells": [
+    [
+      [304, 458, 211],
+      [304, 458, 212],
+      [304, 458, 213],
+      [304, 458, 214],
+      [304, 458, 215],
+      [304, 458, 216],
+      [304, 458, 217],
+      [304, 458, 218],
+      [304, 458, 219],
+      [305, 458, 211],
+      [305, 458, 212],
+      [305, 458, 213],
+      [305, 458, 214],
+      [305, 458, 215],
+      [305, 458, 216],
+      [305, 458, 217],
+      [305, 458, 218],
+      [305, 458, 219],
+      [306, 458, 211],
+      [306, 458, 212],
+      [306, 458, 213],
+      [306, 458, 214],
+      [306, 458, 215],
+      [306, 458, 216],
+      [306, 458, 217],
+      [306, 458, 218],
+      [306, 458, 219],
+      [307, 458, 211],
+      [307, 458, 212],
+      [307, 458, 213],
+      [307, 458, 214],
+      [307, 458, 215],
+      [307, 458, 216],
+      [307, 458, 217],
+      [307, 458, 218],
+      [307, 458, 219]
+    ]
+  ],
+  "_achievement_source": {
+    "kind": "Screenshot-guided reconstruction against native VXL geometry; not recovered retail volumes",
+    "guide": "https://steamcommunity.com/sharedfiles/filedetails/?id=135523055",
+    "vxl_sha256": "07bc5cc2878879a59d2b82fe0dacb70e64748c686bf38bc97b6e44b304266631",
+    "coordinate_space": "source VXL; achievement engine applies source_z_shift once",
+    "generator": "tools/map_metadata/author_achievement_regions.py"
+  }
+}

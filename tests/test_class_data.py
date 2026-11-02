@@ -17,7 +17,7 @@ _CLASS_STATS = {
     1:  (1.45, 1.5, 1.43,   1.5),   # SCOUT
     2:  (1.1,  1.0, 1.43,   1.5),   # ROCKETEER
     3:  (1.4,  1.2, 1.1765, 0.5),   # MINER
-    4:  (1.65, 1.5, 0.6,    1.0),   # ZOMBIE
+    4:  (1.65, 1.5, 0.5,    1.0),   # ZOMBIE: wiki-aligned durability
     5:  (1.33, 1.0, 1.0,    1.0),   # CLASSIC_SOLDIER
     6:  (1.5,  1.2, 1.0,    1.2),   # GANGSTER_1
     12: (1.25, 1.0, 1.1765, 1.5),   # ENGINEER

@@ -9,6 +9,9 @@ scene id leaves this retail build without a compatible game scene.
 
 from __future__ import annotations
 
+import math
+import time
+
 import shared.constants as C
 import shared.constants_gamemode as CG
 
@@ -17,7 +20,7 @@ from server.class_selection import (
     ClassSelection,
     normalize_class_selection,
 )
-from server.game_constants import TEAM1, TEAM2
+from server.game_constants import PLAYER_STANDING_POS_ABOVE_GROUND, TEAM1, TEAM2
 from server.corpse_lifecycle import CLASSIC_CORPSE_REPRESENTATION
 
 from .ctf import CTFMode
@@ -51,6 +54,11 @@ class ClassicCTFMode(CTFMode):
     name = "Classic+"
     description = "Classic+ CTF: capture the enemy intel!"
     mode_code = "cctf"
+    map_pickups_enabled = False
+    # BASE(1) is absent from the stock retail scene's entity table. The
+    # supported CapturePoint(25) uses CP_MODEL: the green medical tent.
+    base_entity_type = int(C.CAPTURE_POINT_ENTITY)
+    base_wire_visible = True
     death_representation = CLASSIC_CORPSE_REPRESENTATION
     # Keep the dropped-intel contract consistent with ordinary CTF: one exact
     # 60-second fuse and then a return to base.
@@ -74,6 +82,7 @@ class ClassicCTFMode(CTFMode):
 
     def __init__(self, server) -> None:
         super().__init__(server)
+        self._command_post_refills: dict[int, tuple[object, int, float]] = {}
         # BattleSpades historically used ten captures when no TOML was loaded,
         # while the retail Match Lobby and Classic playlist use five. Preserve
         # an explicit operator rule/overlay, otherwise recover the stock value.
@@ -93,6 +102,46 @@ class ClassicCTFMode(CTFMode):
             and "RULE_CTF_SCORE_TARGET" not in getattr(rules, "explicit", set())
         ):
             self.score_limit = 5
+
+    async def on_mode_start(self) -> None:
+        self._command_post_refills.clear()
+        await super().on_mode_start()
+
+    async def on_tick(self, tick: int) -> None:
+        await super().on_tick(tick)
+        if self.ended:
+            return
+        now = time.time()
+        registry = getattr(self.server, "entity_registry", None)
+        if registry is None:
+            return
+        for player in list(self.server.players.values()):
+            if not player.alive or player.team not in (TEAM1, TEAM2):
+                continue
+            post = registry.get(self._base_entities[player.team])
+            if post is None:
+                continue
+            feet_z = float(player.z) + PLAYER_STANDING_POS_ABOVE_GROUND
+            if (math.hypot(float(player.x) - post.x, float(player.y) - post.y) > 3.0
+                    or abs(feet_z - post.z) > 2.0):
+                continue
+            logical_post = (post.x, post.y, post.z - PLAYER_STANDING_POS_ABOVE_GROUND)
+            if not self._sees(player, logical_post):
+                continue
+            previous = self._command_post_refills.get(player.id)
+            if (previous is not None and previous[0] is player
+                    and previous[1] == player.team and now - previous[2] < 3.0):
+                continue
+            player.restock_command_post()
+            self._command_post_refills[player.id] = (player, player.team, now)
+
+    async def on_player_leave(self, player) -> None:
+        self._command_post_refills.pop(player.id, None)
+        await super().on_player_leave(player)
+
+    async def on_player_team_change(self, player, old_team: int, new_team: int) -> None:
+        self._command_post_refills.pop(player.id, None)
+        await super().on_player_team_change(player, old_team, new_team)
 
     def _disabled_tools(self) -> tuple[int, ...]:
         """Classic's fixed exclusions plus every tool the game rules turn off."""

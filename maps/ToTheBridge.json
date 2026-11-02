@@ -1,0 +1,76 @@
+{
+  "health_crate_drop_points": [
+    [
+      418.5,
+      115.5,
+      182
+    ],
+    [
+      275.5,
+      173.5,
+      186
+    ],
+    [
+      302.5,
+      348.5,
+      186
+    ],
+    [
+      175.5,
+      417.5,
+      192
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      407.5,
+      115.5,
+      182
+    ],
+    [
+      263.5,
+      173.5,
+      186
+    ],
+    [
+      291.5,
+      348.5,
+      186
+    ],
+    [
+      164.5,
+      417.5,
+      192
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      418.5,
+      127.5,
+      182
+    ],
+    [
+      275.5,
+      185.5,
+      186
+    ],
+    [
+      302.5,
+      359.5,
+      186
+    ],
+    [
+      175.5,
+      429.5,
+      192
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/To_The_Bridge",
+    "page_sha256": "df7896a7f7b7ef81f014840e1ba50fd0a84292a600944adbf8e43651e80a0d94",
+    "vxl_sha256": "ebdeea73bf9ba37889cfbfcb8941227bdf4bc32dcbf4eb3c9592dff584147789",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

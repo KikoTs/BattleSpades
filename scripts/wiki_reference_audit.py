@@ -166,7 +166,7 @@ def gameplay_checks(contents: dict) -> list[dict]:
         ("Territory_Control", "TC_DEFAULT_BASE_COUNT_TO_USE", 5),
     ):
         add(title, name, value, getattr(CG, name),
-            note="Multi-Hill says approximately five minutes; server retail constant is four minutes." if name == "MH_DEFAULT_BASE_AUTO_TIMEOUT" else "")
+            note="Owner-approved five-minute default; older recovered constant was four minutes." if name == "MH_DEFAULT_BASE_AUTO_TIMEOUT" else "")
     from shared import packet
     packet_names = {
         "Server Details": "InitialInfo", "Ping Pong": "ClockSync",

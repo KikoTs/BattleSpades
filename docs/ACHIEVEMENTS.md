@@ -6,8 +6,8 @@ any of them: the retail server evaluated them, and that server is not
 available. `server/achievements.py` rebuilds the rules from the achievement
 descriptions, which are the only specification left.
 
-71 of the 77 are implemented. The other six are map achievements
-whose volumes were never recovered ([Not implemented](#not-implemented)).
+77 of the 77 are implemented. Six map achievements use screenshot-guided
+reconstructions of the bundled terrain, documented in [MAP_ACHIEVEMENTS.md](MAP_ACHIEVEMENTS.md); their original server volumes remain unrecovered.
 
 They are evaluated on **every** server. The engine reads no official, ranked,
 identity or write-token setting, so a player's own Create Match server
@@ -210,13 +210,13 @@ behind them:
 | `turret_evasion` | Collateral Damage | Destroy 100 blocks by evading an enemy turret | one-shot | implemented | In one match, 100 blocks destroyed by enemy turret rockets that were fired at you and did not damage you. |
 | `ammo_drop_greedy` | Loaded | Collect a full resupply of ammunition in one game | one-shot | implemented | In one match, ammo crates add to one weapon's reserve at least that weapon's full reserve capacity. |
 | `health_drop_greedy` | Well Heeled | Repair 150 health in one game using health drops | one-shot | implemented | In one match, health crates restore 150 HP to you in total. |
-| `map_greatwall_destroy` | The War on Terracotta | Destroy the Terracotta Army | one-shot | not yet | no retail volume survives for this map |
-| `map_moon_destroy` | Kubrick Equation | Lunar Base: Destroy the monolith with the rocket launcher | one-shot | not yet | no retail volume survives for this map |
-| `map_london_destroy` | Death Toll | Destroy the large bell at the top of Big Ben | one-shot | not yet | no retail volume survives for this map |
+| `map_greatwall_destroy` | The War on Terracotta | Destroy the Terracotta Army | one-shot | implemented | All nine native terracotta figures; reconstructed exact masks |
+| `map_moon_destroy` | Kubrick Equation | Lunar Base: Destroy the monolith with the rocket launcher | one-shot | implemented | Native monolith mask; rocket contribution required |
+| `map_london_destroy` | Death Toll | Destroy the large bell at the top of Big Ben | one-shot | implemented | Native bell mask; direct destruction or collapse |
 | `map_maya_kill` | Personal Sacrifice | Melee kill an enemy while standing near the temple altar | one-shot | implemented | MayanJungle. A melee kill while you stand in the recovered altar volume. |
-| `map_concrete_destroy` | Pillar Assault | In demolition mode, destroy all the pillars in the enemy building lobby | one-shot | not yet | no retail volume survives for this map; which map "concrete" is was not recovered either |
-| `map_egypt_destroy` | Nose Job | Destroy the nose of the Sphinx | one-shot | not yet | no retail volume survives for this map |
-| `map_colosseum_kill` | The Undertaker | Kill 10 enemies while hiding in the tunnel under the arena | one-shot | not yet | no retail volume survives for this map |
+| `map_concrete_destroy` | Pillar Assault | In demolition mode, destroy all the pillars in the enemy building lobby | one-shot | implemented | Castle Wars enemy wooden supports; Demolition only; independent team groups |
+| `map_egypt_destroy` | Nose Job | Destroy the nose of the Sphinx | one-shot | implemented | The two native Sphinx nose voxels |
+| `map_colosseum_kill` | The Undertaker | Kill 10 enemies while hiding in the tunnel under the arena | one-shot | implemented | Ten enemy kills per round from the reconstructed covered tunnel mask |
 | `map_zombieisland_zombie_kill` | Brain Drain | Kill 5 zombies while hiding in the basement | one-shot | implemented | SpookyMansion, Zombie. 5 zombie kills in one round as a survivor standing in the recovered basement volume. |
 | `map_zombieisland_destroy` | Tower Offense | Playing as a zombie, demolish the mansion's towers | one-shot | implemented | SpookyMansion, Zombie. Every block the two recovered tower volumes held at match start is gone, and you destroyed blocks of both while a zombie. |
 | `misc_half_marathon` | Half Marathon | Run 21 kilometers | `distance_run` >= 21000 | implemented | Blocks moved on the ground while alive (1 block = 1 m). Airborne movement and steps over 2 blocks (teleports, respawns) do not count. |
@@ -298,22 +298,9 @@ most literal reading the server can measure was chosen:
 
 ## Not implemented
 
-| API name | Description | Needs |
-|---|---|---|
-| `map_greatwall_destroy` | Destroy the Terracotta Army | a destroy volume on GreatWall |
-| `map_moon_destroy` | Lunar Base: Destroy the monolith with the rocket launcher | a destroy volume on LunarBase |
-| `map_london_destroy` | Destroy the large bell at the top of Big Ben | a destroy volume on London |
-| `map_concrete_destroy` | In demolition mode, destroy all the pillars in the enemy building lobby | the map this is on, and its destroy volumes |
-| `map_egypt_destroy` | Destroy the nose of the Sphinx | a destroy volume on AncientEgypt |
-| `map_colosseum_kill` | Kill 10 enemies while hiding in the tunnel under the arena | a kill volume on TheColosseum with `ac_kills = 10` |
-
-Retail shipped these volumes in each map's metadata. Only DragonIsland,
-MayanJungle and SpookyMansion were recovered with theirs, so the server has
-nothing to test a position or a destroyed block against. The engine already
-evaluates any volume a stock map's JSON names (see below), with the rocket
-launcher condition for `map_moon_destroy` and the Demolition condition for
-`map_concrete_destroy`. Authoring the volume is the missing part, and an
-authored volume is a guess at retail's until one is recovered.
+None. The six reconstructed targets and their evidence limits are described in
+[MAP_ACHIEVEMENTS.md](MAP_ACHIEVEMENTS.md). Original hidden volume boundaries
+are still unavailable; implementation does not certify historical identity.
 
 ## Map volumes (`ac_*`)
 
@@ -327,10 +314,12 @@ authored volume is a guess at retail's until one is recovered.
 | `ac_centres`, `ac_w_h_d` | centre and size of the box |
 | `ac_teams` | optional: `0` either team, `1` Blue, `2` Green |
 | `ac_kills` | optional: kills needed in one round (default 1) |
+| `ac_cells` | optional exact source-VXL cell mask; absent means the entire box, empty disables the region |
 | `ac_weapons` | optional: kept, not evaluated. Its one recovered value (`1` on the MayanJungle altar) does not identify a weapon by itself; the melee condition comes from the description. |
 
 - A **kill volume** counts the kills a player of the right team makes while
-  standing inside the box.
+  standing inside the box and optional exact cell mask. Overlapping regions for
+  one achievement count an enemy only once.
 - A **destroy volume** remembers the blocks it holds when the match starts.
 - Volumes are only honoured on stock maps, so a custom map cannot hand out a
   retail achievement.
@@ -356,7 +345,7 @@ event is built and nothing is marked as reported.
 ## Known limits
 
 - Multi-Hill ends at 100 team points, one per second of uncontested
-  ownership, and a hill times out after 240 s. Under the default settings a
+  ownership, and a hill times out after 300 s. Under the default settings a
   hill held by one team ends the match before it times out, so the four rules
   tied to a timeout (`hill_greedy`, both airstrike rules) are only reachable
   on hills that are fought over or left alone for most of their window.

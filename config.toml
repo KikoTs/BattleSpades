@@ -383,7 +383,7 @@ RULE_VIP_NOOF_ROUNDS = 3
 RULE_VIP_HEALTH = "100%"
 RULE_ENABLE_SUDDEN_DEATH = true
 RULE_MULTIHILL_MAX_ACTIVE_BASES = 1
-RULE_BASE_ACTIVE_TIME = 240
+RULE_BASE_ACTIVE_TIME = 300
 RULE_TC_MAX_ACTIVE_BASES = 5
 RULE_CAPTURE_RATE = "100%"
 RULE_DIAMOND_MAX_ACTIVE_BASES = 1
@@ -463,7 +463,7 @@ round_intermission = 7.0
 
 [modes.zom]
 time_limit = 600
-infection_delay = 60.0 # retail ZOM_TIME_BEFORE_FIRST_INFECTION
+infection_delay = 50.0 # owner-approved wiki-aligned preparation time
 minimum_players = 2
 zombie_respawn_time = 10.0
 # Killed BOT zombies come back at a street-level spot 40-56 blocks from the

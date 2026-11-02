@@ -3,7 +3,7 @@
 Steam marks all 77 achievements game-server-set: the retail server evaluated
 them and no client binary holds a rule. The rules here are rebuilt from the
 descriptions in ``shared/achievement_table.py``; docs/ACHIEVEMENTS.md lists
-the reading chosen for each one and the six that have no usable signal.
+the reading chosen for each one and the reconstructed map targets.
 
 They run on every server. There is no official, ranked or write-token gate,
 so a player's own Create Match server with bots unlocks them too.
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import functools
 import logging
 import math
@@ -279,6 +279,7 @@ class BlastScope:
 class _RegionState:
     region: object
     remaining: set = field(default_factory=set)
+    allowed_cells: frozenset | None = None
     contributors: dict = field(default_factory=dict)
     done: bool = False
 
@@ -786,16 +787,22 @@ class AchievementEngine:
 
         position = _position(killer)
         if position is not None:
+            counted_regions = set()
             for entry in self._regions:
                 region = entry.region
                 if (region.kind != int(C.ACH_KILL_REGION)
                         or region.team not in (None, killer_team)
                         or not _contains(region.bounds, position)):
                     continue
+                if entry.allowed_cells is not None and tuple(map(math.floor, position)) not in entry.allowed_cells:
+                    continue
                 if region.api_name in _MELEE_KILL_REGIONS and not melee:
                     continue
                 if region.api_name in _ZOMBIE_VICTIM_KILL_REGIONS and not victim_zombie:
                     continue
+                if region.api_name in counted_regions:
+                    continue
+                counted_regions.add(region.api_name)
                 kills = self._count(killer, "round", "region:" + region.api_name)
                 if kills == max(1, int(region.kills)):
                     self.unlock(killer, region.api_name)
@@ -863,24 +870,34 @@ class AchievementEngine:
         if metadata is None or not bool(getattr(metadata, "official_map", False)):
             return
         solid = getattr(world, "get_solid", None)
+        shift = int(getattr(getattr(world, "map", None), "source_z_shift", 0))
         already_razed = set()
         for region in getattr(metadata, "achievement_regions", ()) or ():
             if region.api_name not in BY_NAME:
                 continue
+            if shift:
+                x0, x1, y0, y1, z0, z1 = region.bounds
+                region = replace(
+                    region, bounds=(x0, x1, y0, y1, z0 + shift, z1 + shift),
+                    cells=None if region.cells is None else tuple(
+                        (x, y, z + shift) for x, y, z in region.cells),
+                )
             entry = _RegionState(region)
+            if region.cells is not None:
+                entry.allowed_cells = frozenset(region.cells)
             if region.kind == int(C.ACH_BLOCK_DESTROY_REGION):
                 if not callable(solid):
                     continue
                 x0, x1, y0, y1, z0, z1 = (math.floor(value) for value in region.bounds)
-                entry.remaining = {
+                candidates = entry.allowed_cells if entry.allowed_cells is not None else (
                     (x, y, z)
                     for x in range(x0, x1 + 1)
                     for y in range(y0, y1 + 1)
                     for z in range(z0, z1 + 1)
-                    if solid(x, y, z)
-                }
+                )
+                entry.remaining = {cell for cell in candidates if solid(*cell)}
                 if not entry.remaining:
-                    already_razed.add(region.api_name)
+                    already_razed.add((region.api_name, region.team))
             elif region.kind != int(C.ACH_KILL_REGION):
                 continue
             self._regions.append(entry)
@@ -889,15 +906,16 @@ class AchievementEngine:
         self._regions = [
             entry for entry in self._regions
             if entry.region.kind != int(C.ACH_BLOCK_DESTROY_REGION)
-            or entry.region.api_name not in already_razed
+            or (entry.region.api_name, entry.region.team) not in already_razed
         ]
 
-    def _finish_regions(self, api_name: str) -> None:
+    def _finish_regions(self, api_name: str, team: int | None) -> None:
         """Every volume of one achievement is rubble: credit whoever took
         part in each of them."""
         entries = [
             entry for entry in self._regions
             if entry.region.api_name == api_name
+            and entry.region.team == team
             and entry.region.kind == int(C.ACH_BLOCK_DESTROY_REGION)
         ]
         if not entries or any(entry.remaining or entry.done for entry in entries):
@@ -936,7 +954,7 @@ class AchievementEngine:
             if credited:
                 entry.contributors[id(player)] = player
             if not entry.remaining:
-                self._finish_regions(region.api_name)
+                self._finish_regions(region.api_name, region.team)
 
     def _resync_regions(self) -> None:
         """Cells removed outside the combat path (fire, goo) still count as
@@ -949,7 +967,7 @@ class AchievementEngine:
                 continue
             entry.remaining = {cell for cell in entry.remaining if solid(*cell)}
             if not entry.remaining:
-                self._finish_regions(entry.region.api_name)
+                self._finish_regions(entry.region.api_name, entry.region.team)
 
     def blocks_destroyed(self, player, removed, collapsed, chunks, shot_tool=None) -> None:
         cells = [tuple(int(value) for value in cell) for cell in removed]

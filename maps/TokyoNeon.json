@@ -1,0 +1,91 @@
+{
+  "health_crate_drop_points": [
+    [
+      70.5,
+      278.5,
+      217
+    ],
+    [
+      236.5,
+      260.5,
+      200
+    ],
+    [
+      159.5,
+      127.5,
+      200
+    ],
+    [
+      340.5,
+      399.5,
+      200
+    ],
+    [
+      401.5,
+      284.5,
+      217
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      70.5,
+      255.5,
+      217
+    ],
+    [
+      269.5,
+      260.5,
+      200
+    ],
+    [
+      170.5,
+      138.5,
+      200
+    ],
+    [
+      330.5,
+      388.5,
+      200
+    ],
+    [
+      401.5,
+      260.5,
+      209
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      70.5,
+      266.5,
+      217
+    ],
+    [
+      252.5,
+      260.5,
+      200
+    ],
+    [
+      164.5,
+      133.5,
+      200
+    ],
+    [
+      335.5,
+      394.5,
+      200
+    ],
+    [
+      401.5,
+      272.5,
+      209
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Tokyo_Neon",
+    "page_sha256": "1555eaa2ab0417a371e9f11502eecb20ce2fea7394d53f13a5b91ee769de10cb",
+    "vxl_sha256": "0fd7282feebab19325555e4eb4897d555ff2b70753a697e4e6db21bcecde6a0f",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

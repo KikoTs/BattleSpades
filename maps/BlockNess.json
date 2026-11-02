@@ -1,0 +1,76 @@
+{
+  "health_crate_drop_points": [
+    [
+      264,
+      127.266,
+      239
+    ],
+    [
+      308.5,
+      202.5,
+      226
+    ],
+    [
+      291.5,
+      231.5,
+      208
+    ],
+    [
+      208.5,
+      319.5,
+      237
+    ],
+    [
+      302.625,
+      406.344,
+      239
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      357.5,
+      138.5,
+      222
+    ],
+    [
+      341.5,
+      202.5,
+      232
+    ],
+    [
+      263.5,
+      272.5,
+      237
+    ],
+    [
+      164.5,
+      231.5,
+      227
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      302.5,
+      138.5,
+      233
+    ],
+    [
+      263.5,
+      295.5,
+      237
+    ],
+    [
+      219.5,
+      365.5,
+      225
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Block_Ness",
+    "page_sha256": "59c74653ee1ef413d27eeb535a2cae3ede75b7cd0891b96bdf59178ae3e7848e",
+    "vxl_sha256": "b1c7fa815e8a841d7efe066d89ab296ba95e4e7e38c28eff241c70b582af81d3",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

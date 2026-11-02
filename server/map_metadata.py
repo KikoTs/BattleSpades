@@ -12,6 +12,7 @@ mistaken for metadata.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import math
@@ -61,6 +62,7 @@ class MapEntitySpec:
     z: float
     item: str
     color: tuple[int, int, int] | None = None
+    source_color: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,8 @@ class AchievementRegion:
     ``kind`` is ``ACH_KILL_REGION`` (kills made from inside the box) or
     ``ACH_BLOCK_DESTROY_REGION`` (the structure inside it is razed); one
     achievement may own several rows. ``bounds`` are absolute inclusive
-    ``(x0, x1, y0, y1, z0, z1)``. ``team`` is the team that can earn it,
+    ``(x0, x1, y0, y1, z0, z1)`` in source-VXL coordinates. The engine applies
+    the map's height normalization once. ``team`` is the team that can earn it,
     ``None`` for either. server/achievements.py evaluates them.
     """
 
@@ -96,6 +99,9 @@ class AchievementRegion:
     team: int | None = None
     kills: int = 0
     weapon: int = 0
+    # Optional exact source-VXL cells. An empty mask disables the region;
+    # absence retains the recovered retail bounding-box behavior.
+    cells: tuple[tuple[int, int, int], ...] | None = None
 
 
 @dataclass
@@ -851,7 +857,8 @@ def _append_achievement_regions(
     kinds = payload.get("ac_types", ())
     centres = payload.get("ac_centres", ())
     sizes = payload.get("ac_w_h_d", ())
-    if not all(isinstance(rows, (list, tuple)) for rows in (ids, kinds, centres, sizes)):
+    masks = payload.get("ac_cells", ())
+    if not all(isinstance(rows, (list, tuple)) for rows in (ids, kinds, centres, sizes, masks)):
         return
 
     def optional(key: str, index: int) -> int:
@@ -873,17 +880,36 @@ def _append_achievement_regions(
         except (TypeError, ValueError):
             continue
         x0, x1, y0, y1, z0, z1 = extents
+        bounds = (
+            center[0] + x0, center[0] + x1,
+            center[1] + y0, center[1] + y1,
+            center[2] + z0, center[2] + z1,
+        )
+        cells = None
+        if index < len(masks) and masks[index] is not None:
+            mask = masks[index]
+            if not isinstance(mask, (list, tuple)) or len(mask) > 65536:
+                continue
+            parsed = []
+            for cell in mask:
+                if (not isinstance(cell, (list, tuple)) or len(cell) != 3
+                        or any(type(value) is not int for value in cell)
+                        or not all(bounds[axis * 2] <= value <= bounds[axis * 2 + 1]
+                                   for axis, value in enumerate(cell))):
+                    break
+                parsed.append(tuple(cell))
+            else:
+                cells = tuple(sorted(set(parsed)))
+            if cells is None:
+                continue
         result.achievement_regions.append(AchievementRegion(
             api_name=api_name,
             kind=kind,
-            bounds=(
-                center[0] + x0, center[0] + x1,
-                center[1] + y0, center[1] + y1,
-                center[2] + z0, center[2] + z1,
-            ),
+            bounds=bounds,
             team={1: TEAM1, 2: TEAM2}.get(optional("ac_teams", index)),
             kills=max(0, optional("ac_kills", index)),
             weapon=optional("ac_weapons", index),
+            cells=cells,
         ))
 
 
@@ -1265,6 +1291,42 @@ def load_map_metadata(map_path: str | Path, active_mode: str) -> MapMetadata:
     _append_legacy_occupation(result, payload)
     _append_legacy_diamond_zones(result, payload)
     _append_achievement_regions(result, payload)
+    # Explicit reviewed light-top locations, separate from the recovered map
+    # description. No terrain-colour scan or renderer change happens at runtime.
+    fixture_path = map_path.with_suffix(".lights.json")
+    if fixture_path.is_file():
+        fixtures = _read_sidecar(fixture_path)
+        try:
+            valid = (fixtures is not None and fixtures.get("coordinate_space") == "source VXL"
+                     and fixtures.get("vxl_sha256") == hashlib.sha256(map_path.read_bytes()).hexdigest())
+        except OSError:
+            valid = False
+        if valid:
+            source_color = normalize_rgb(fixtures.get("light_color"))
+            try:
+                gain = float(fixtures.get("light_gain", 1.0))
+            except (TypeError, ValueError):
+                gain = 0.0
+            color = tuple(round(channel * gain) for channel in source_color) if (
+                source_color is not None and math.isfinite(gain) and 0 < gain <= 1
+            ) else None
+            rows = fixtures.get("points", ())
+            if color is not None and source_color in result.static_light_colors.values() and isinstance(rows, (list, tuple)):
+                seen = set()
+                for row in rows:
+                    if (not isinstance(row, list) or len(row) != 3
+                            or any(type(value) is not int for value in row)
+                            or not 0 <= row[0] < 512 or not 0 <= row[1] < 512 or not 0 <= row[2] < 239):
+                        continue
+                    cell = tuple(row)
+                    if cell in seen:
+                        continue
+                    seen.add(cell)
+                    result.entities.append(MapEntitySpec(
+                        int(C.FLARE_BLOCK), "map_fixture_light", *cell, "retail_fixture_light", color, source_color,
+                    ))
+        else:
+            logger.warning("Ignoring fixture lights with mismatched terrain: %s", fixture_path)
     for team, prefix in ((TEAM1, "team_one"), (TEAM2, "team_two")):
         if result.spawn_zones[team]:
             result.layout_sources[f"spawn{team}"] = f"{prefix}_spawn_area"

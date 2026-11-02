@@ -34,6 +34,12 @@ class _Column:
             return True
         return int(z) >= self.ground
 
+    def is_runtime_solid(self, x, y, z):
+        # The roof and ground belong to the original map; subclasses add
+        # temporary build cells above ground to exercise live obstruction.
+        return (self.get_solid(x, y, z) and int(z) < self.ground
+                and int(z) != self.roof)
+
 
 class _Player:
     def __init__(self, x, y, z):
@@ -154,7 +160,11 @@ def test_drop_point_under_a_roof_starts_just_below_it():
     assert crate.z == 182.0
     assert crate.falling is True
     _run_until_landed(registry, crate, world, start=1000.0)
-    assert crate.z == 180.0
+    assert crate.z == 215.0
+    # The original ceiling must not pull this indoor drop onto the roof on
+    # landing or on the next settled tick.
+    registry.tick(_ctx(1031.0, world))
+    assert crate.z == 215.0
 
 
 def test_player_built_platform_existing_before_respawn_catches_the_crate():

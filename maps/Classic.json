@@ -1,0 +1,76 @@
+{
+  "health_crate_drop_points": [
+    [
+      109.438,
+      330.766,
+      80
+    ],
+    [
+      346.5,
+      290.5,
+      37
+    ],
+    [
+      247.5,
+      260.5,
+      58
+    ],
+    [
+      98.5,
+      272.5,
+      48
+    ],
+    [
+      319.5,
+      231.5,
+      39
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      137.5,
+      348.5,
+      79
+    ],
+    [
+      346.5,
+      319.5,
+      59
+    ],
+    [
+      219.5,
+      260.5,
+      37
+    ],
+    [
+      98.5,
+      260.5,
+      50
+    ],
+    [
+      319.5,
+      208.5,
+      45
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      302.625,
+      371.453,
+      80
+    ],
+    [
+      181.5,
+      290.5,
+      39
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Classic",
+    "page_sha256": "867ed28a4e2528a1e4dace4808d439efc762728d80b2d284c03f86e53ad50eed",
+    "vxl_sha256": "4399f4e1cd7970cb478384e904f52fcbcef5e400bd3dadf861df5811d317b78d",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

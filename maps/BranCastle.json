@@ -1,0 +1,56 @@
+{
+  "health_crate_drop_points": [
+    [
+      357.5,
+      348.5,
+      194
+    ],
+    [
+      279.5,
+      247.5,
+      179
+    ],
+    [
+      170.5,
+      127.5,
+      228
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      346.5,
+      348.5,
+      196
+    ],
+    [
+      269.5,
+      237.5,
+      179
+    ],
+    [
+      153.5,
+      144.5,
+      228
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      368.5,
+      348.5,
+      193
+    ],
+    [
+      291.5,
+      260.5,
+      179
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Bran_Castle",
+    "page_sha256": "8a0354037b9a291db1f753b7d26d3a08f55b02da4d574137f70a0680a18ea6fe",
+    "vxl_sha256": "8f9a43a52c4275956a1ef5d8faa846bf6f4650030d756c493fa2d1bbc10a0956",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

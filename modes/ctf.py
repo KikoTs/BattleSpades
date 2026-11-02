@@ -270,6 +270,8 @@ class CTFMode(BaseMode):
     score_limit = 10
     time_limit = 1200  # 20 minutes
     mode_code = "ctf"
+    base_entity_type = int(C.BASE)
+    base_wire_visible = False
     intel_auto_return_default = True
     intel_return_time = float(CG.CTF_INTEL_RETURN_TIME)
     shoot_with_intel_default = False
@@ -453,8 +455,8 @@ class CTFMode(BaseMode):
         The retail ``GameScene.ENTITIES`` mapping has ``INTEL_PICKUP`` (16),
         but not the legacy ``BASE`` type (1).  A BASE sent through packet 21
         crashes/freeze-loops the client during CTF join.  We retain a private
-        base marker for authoritative capture logic and expose only the intel;
-        the base itself is represented by the map's authored base/tent area.
+        base marker for ordinary CTF. Classic CTF overrides the base with the
+        supported CAPTURE_POINT entity, which draws the medical tent.
         """
         reg = getattr(self.server, "entity_registry", None)
         wm = getattr(self.server, "world_manager", None)
@@ -483,8 +485,8 @@ class CTFMode(BaseMode):
             bx, by, _bz = self.base_positions[team]
             x, y, z = wm.dry_surface_anchor(bx, by)
             base = reg.place(
-                int(C.BASE), x, y, z, state=team, kind="base",
-                wire_visible=False,
+                self.base_entity_type, x, y, z, state=team, kind="base",
+                wire_visible=self.base_wire_visible,
             )
             self._base_entities[team] = base.entity_id
 
@@ -493,6 +495,8 @@ class CTFMode(BaseMode):
             self._intel_entities[team] = flag.entity_id
 
             if getattr(self.server.config, "entities_wire_ready", False):
+                if base.wire_visible:
+                    self.server.broadcast_create_entity(base)
                 self.server.broadcast_create_entity(flag)
 
     def _set_intel_entity(

@@ -11,6 +11,13 @@ Code: `server/map_metadata.py` (parser), `tools/map_metadata/` (recovery
 tooling), `maps/*.json` and `maps/retail_map_info.json` (generated data),
 `tests/test_map_metadata_retail.py` and `tests/test_map_metadata.py`.
 
+Crate-only recovery for the supplied wiki is documented in
+[MAP_PICKUPS.md](MAP_PICKUPS.md). Twenty additional sidecars now contain
+313 terrain-reviewed wiki placements. The four recovered retail crate tables
+and AncientEgypt/Alcatraz UGC placements retain their existing coordinates;
+spawn and objective coverage below is unchanged. Wiki markers are rounded
+percentages and are not exact recovered retail XYZ tables.
+
 ## Retail sources that exist
 
 | Source | Where | What it gives |
@@ -408,6 +415,10 @@ objective too), 57 with evidence-oriented spawns, 104 generic.
 | WW1 | zom | evidence (team colours) | - |
 
 ## Open items for other owners
+
+Reconstructed map achievement masks are documented in
+[MAP_ACHIEVEMENTS.md](MAP_ACHIEVEMENTS.md). The original-game light-block investigation is documented in [MAP_LIGHTING_RECOVERY.md](MAP_LIGHTING_RECOVERY.md).
+Recovered spawn, objective and environment metadata remain unchanged.
 
 * **Indoor retail spawn boxes** (`server/world_manager.py`): the world
   manager only considers each column's topmost surface. Retail boxes inside

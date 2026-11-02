@@ -4,6 +4,13 @@ Audited 2026-09-26. This compares every gameplay tunable the server uses with
 the retail Ace of Spades 1.x value, and records each place where BattleSpades
 differs on purpose.
 
+Update 2026-11-02: the owner requested wiki-aligned Zombie health (200
+effective HP), blocks (2500/2500), preparation (50 s), and hill lifetime
+(300 s). Those deliberate changes supersede the historical rows below;
+see [WIKI_REFERENCE_AUDIT.md](WIKI_REFERENCE_AUDIT.md). Classic+ retains SMG
+and shotgun. This is a historical comparison, not a claim that current
+defaults still equal every recovered retail value.
+
 ## Sources
 
 - **GAME_RULES_LIST**: Match Lobby rule defaults and allowed values, from

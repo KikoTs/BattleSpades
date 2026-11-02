@@ -83,6 +83,8 @@ class MapEntity:
     terrain_support_z: Optional[int] = None
     terrain_offset_z: float = 0.0
     terrain_check_at: float = 0.0
+    # Skip unchanged native-map collision checks for settled supply crates.
+    terrain_revision: Optional[Tuple[int, int]] = None
     # Runtime-only voxel which physically supports an attached/placed gadget.
     # Placement packets name this solid cell (medpacks use half-cell X/Y and
     # are normalised by the placement service).  The registry indexes it so a
@@ -103,6 +105,8 @@ class MapEntity:
     # other entity keeps the historical all-zero wire tail.
     ugc_mode: int = 0
     int_properties: Tuple[int, ...] = ()
+    # Optional BattleSpades-only annotation; ordinary retail wire is unchanged.
+    map_light_source_color: Optional[Tuple[int, int, int]] = None
 
     def to_wire_entity(self) -> Entity:
         ent = Entity()
@@ -147,7 +151,14 @@ def send_create_entity_to(connection, map_entity: MapEntity) -> bool:
     from shared.packet import CreateEntity
 
     packet = CreateEntity()
-    packet.set_entity(map_entity.to_wire_entity())
+    wire = map_entity.to_wire_entity()
+    if (getattr(connection, "flight_profile_capable", False)
+            and map_entity.kind == "map_flare"
+            and map_entity.map_light_source_color is not None):
+        from server.entity_extensions import MAP_LIGHT_TAG
+        r, g, b = map_entity.map_light_source_color
+        wire.int_properties = [MAP_LIGHT_TAG, (r << 16) | (g << 8) | b]
+    packet.set_entity(wire)
     connection.send(bytes(packet.generate()), reliable=True)
     known.add(entity_id)
     return True

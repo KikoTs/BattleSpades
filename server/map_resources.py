@@ -292,12 +292,21 @@ class MapResourceService:
         registry = server.entity_registry
         metadata = world.map_metadata
         placements: list[tuple[float, float, float, tuple[int, int, int]]] = []
+        existing_fixtures = {}
         missing_marker_families: dict[int, int] = {}
 
         for spec in metadata.entities:
             if int(spec.entity_type) != int(C.FLARE_BLOCK) or spec.color is None:
                 continue
             x, y, z = self._authored_position(spec)
+            if spec.kind == "map_fixture_light":
+                cell = (int(x), int(y), int(z))
+                packed = (spec.color[0] << 16) | (spec.color[1] << 8) | spec.color[2]
+                source = spec.source_color or spec.color
+                source_packed = (source[0] << 16) | (source[1] << 8) | source[2]
+                if not world.get_solid(*cell) or world.get_color(*cell) & 0xFFFFFF not in (packed, source_packed):
+                    continue
+                existing_fixtures[cell] = source
             placements.append((x, y, z, spec.color))
 
         # vxl.pyd removes these chroma voxels from client terrain. Re-create
@@ -334,18 +343,27 @@ class MapResourceService:
 
         placed_count = 0
         for x, y, z, color in placements:
+            fixture = (int(x), int(y), int(z)) in existing_fixtures
             # Native FlareBlockEntity adds a coloured user block as well as a
             # point light. Restore the same cell in authoritative collision;
             # otherwise the retail client stops on a block the server calls
             # air and movement reconciliation pulls the player through it.
             restore_block = getattr(world, "restore_static_light_block", None)
-            if callable(restore_block) and not restore_block(x, y, z, color):
+            recolor_fixture = fixture and (
+                world.get_color(int(x), int(y), int(z)) & 0xFFFFFF
+                != (color[0] << 16) | (color[1] << 8) | color[2]
+            )
+            if (not fixture or recolor_fixture) and callable(restore_block) and not restore_block(x, y, z, color):
                 logger.warning(
                     "Ignoring out-of-world static light at %s on %s",
                     (x, y, z),
                     getattr(world, "map_name", "unknown"),
                 )
                 continue
+            behavior = None
+            if fixture:
+                from server.entities.flare_block import MapFixtureLightBehavior
+                behavior = MapFixtureLightBehavior()
             entity = registry.place(
                 int(C.FLARE_BLOCK), x, y, z,
                 state=TEAM_NEUTRAL,
@@ -354,8 +372,9 @@ class MapResourceService:
                 player_id=0,
                 # Static map ownership: player deployable support/damage rules
                 # do not delete authored atmosphere during a round.
-                behavior=None,
+                behavior=behavior,
             )
+            entity.map_light_source_color = existing_fixtures.get((int(x), int(y), int(z)), color)
             if getattr(server.config, "entities_wire_ready", False):
                 server.broadcast_create_entity(entity)
             placed_count += 1

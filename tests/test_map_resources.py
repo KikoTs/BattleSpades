@@ -46,6 +46,12 @@ class _World:
     def dry_surface_anchor(self, x: float, y: float):
         return (float(x), float(y), 55.0)
 
+    def get_solid(self, x, y, z):
+        return self.map.get_solid(x, y, z)
+
+    def get_color(self, x, y, z):
+        return self.map.points.get((int(x), int(y), int(z)), 0)
+
     def restore_static_light_block(self, x, y, z, color):
         if not (0 <= int(x) < int(C.MAP_X)
                 and 0 <= int(y) < int(C.MAP_Y)

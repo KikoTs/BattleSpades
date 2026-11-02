@@ -236,7 +236,7 @@ def _build_catalog() -> dict[str, RuleDefinition]:
         _choice("RULE_VIP_HEALTH", "vip", 1.0, (0.5, 1.0, 2.0), modes=("vip",)),
         _toggle("RULE_ENABLE_SUDDEN_DEATH", "vip", modes=("vip",)),
         _choice("RULE_MULTIHILL_MAX_ACTIVE_BASES", "mh", 1, range(1, 6), modes=("mh",)),
-        _choice("RULE_BASE_ACTIVE_TIME", "mh", 240,
+        _choice("RULE_BASE_ACTIVE_TIME", "mh", 300,
                 (30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600),
                 modes=("mh",)),
         _choice("RULE_TC_MAX_ACTIVE_BASES", "tc", 5, range(2, 6), modes=("tc",)),

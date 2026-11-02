@@ -2545,6 +2545,8 @@ class Player:
             # Retail Weapon.restock(AMMO_CRATE): reserve += restock amount
             # (capped at the stock max); the magazine is kept.
             self._restock_ammo_crate()
+            if self.jetpack_id in _JETPACK_PROPERTIES:
+                self.jetpack_fuel = float(_JETPACK_PROPERTIES[self.jetpack_id].get(1, 100.0))
         else:
             self._reset_ammo()
         self.rocket_turret_stock = min(
@@ -2575,6 +2577,32 @@ class Player:
             pkt.player_id = self.id
             pkt.type = int(restock_type)
             self.connection.send(bytes(pkt.generate()))
+
+    def restock_command_post(self) -> None:
+        """Fill a Classic tent's resources without resetting clip or reload.
+
+        Restock type zero is a new-life wallet, not a full reserve refill.
+        Repeat the supported ammo refill as needed (Classic shotgun: +20,
+        cap 45), keeping the stock client and server on the same counters.
+        """
+        if not self.alive:
+            return
+        passes = 1  # Equipment also needs replenishing when guns are full.
+        for tool in self.loadout:
+            profile = WEAPON_PROFILES.get(int(tool))
+            if profile is None:
+                continue
+            reserve = (self.ammo_reserve if int(tool) == self.weapon else
+                       self._weapon_ammo.get(int(tool), (0, 0))[1])
+            amount = int(getattr(profile, "restock_amount", -1))
+            if amount < 0:
+                amount = int(profile.reserve_ammo)
+            if amount > 0:
+                passes = max(passes, math.ceil(max(0, profile.reserve_ammo - reserve) / amount))
+        for _ in range(passes):
+            self.restock_ammo(int(C.AMMO_CRATE))
+        self.heal(int(getattr(self, "max_health", MAX_HEALTH)))
+        self.restock_blocks()
 
     def add_blocks(self, count: int = 1):
         self.blocks = min(self._block_wallet_max(), self.blocks + count)

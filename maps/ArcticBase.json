@@ -1,3 +1,77 @@
 {
-  "skybox_texture": "ArcticBase.txt"
+  "skybox_texture": "ArcticBase.txt",
+  "health_crate_drop_points": [
+    [
+      289.5,
+      336.5,
+      210
+    ],
+    [
+      286.5,
+      313.5,
+      212
+    ],
+    [
+      313.5,
+      202.5,
+      228
+    ],
+    [
+      263.5,
+      202.5,
+      236
+    ],
+    [
+      263.5,
+      295.5,
+      215
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      280.5,
+      348.5,
+      210
+    ],
+    [
+      335.5,
+      202.5,
+      231
+    ],
+    [
+      247.5,
+      202.5,
+      237
+    ],
+    [
+      263.5,
+      290.5,
+      215
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      335.5,
+      388.5,
+      182
+    ],
+    [
+      275.5,
+      313.5,
+      193
+    ],
+    [
+      230.5,
+      208.5,
+      224
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Arctic_Base",
+    "page_sha256": "6d49bb12a0c310991164f334e6f9cacd50bc409839c12030b23246fec5b904f1",
+    "vxl_sha256": "657fe816f93609eaeb8ddebab7ae3b3fa2053979604b51a05dbe06d5f776fe8b",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
 }

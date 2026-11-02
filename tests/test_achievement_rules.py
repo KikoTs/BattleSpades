@@ -1608,8 +1608,9 @@ def test_recovered_retail_regions_are_parsed():
             (272.0, 290.0, 196.5, 231.5, 193.0, 227.0), team=TEAM1,
         ),
     ]
-    # The other stock maps have no recovered volume.
-    assert _regions("London") == [] == _regions("LunarBase")
+    # These are newly reconstructed masks, separate from the recovered boxes.
+    assert _regions("London")[0].cells
+    assert len(_regions("LunarBase")[0].cells) == 36
 
 
 @pytest.mark.parametrize("map_name", ["DragonIsland", "MayanJungle", "SpookyMansion"])

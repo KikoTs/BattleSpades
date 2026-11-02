@@ -1,0 +1,121 @@
+{
+  "health_crate_drop_points": [
+    [
+      346.5,
+      40.5,
+      199
+    ],
+    [
+      363.5,
+      185.5,
+      193
+    ],
+    [
+      264.5,
+      173.5,
+      195
+    ],
+    [
+      335.5,
+      272.5,
+      199
+    ],
+    [
+      208.5,
+      260.5,
+      199
+    ],
+    [
+      280.5,
+      377.5,
+      207
+    ],
+    [
+      192.5,
+      365.5,
+      206
+    ],
+    [
+      192.5,
+      476.5,
+      199
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      363.5,
+      40.5,
+      199
+    ],
+    [
+      374.5,
+      173.5,
+      190
+    ],
+    [
+      263.5,
+      162.5,
+      195
+    ],
+    [
+      335.5,
+      260.5,
+      199
+    ],
+    [
+      208.5,
+      272.5,
+      199
+    ],
+    [
+      280.5,
+      365.5,
+      195
+    ],
+    [
+      192.5,
+      348.5,
+      190
+    ],
+    [
+      181.5,
+      476.5,
+      199
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      357.5,
+      156.5,
+      206
+    ],
+    [
+      275.5,
+      185.5,
+      199
+    ],
+    [
+      263.5,
+      260.5,
+      199
+    ],
+    [
+      269.5,
+      348.5,
+      194
+    ],
+    [
+      181.5,
+      359.5,
+      206
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Double_Dragon",
+    "page_sha256": "2e1b80127813449b5a910604f8c89b8a175a65b2182b4ac1942cbd92ea18b628",
+    "vxl_sha256": "2a0a347d2d54802d3c475ab6162f50794d26150e257278c2e3deb93d53045ec0",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

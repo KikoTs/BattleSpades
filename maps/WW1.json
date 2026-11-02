@@ -1,0 +1,56 @@
+{
+  "health_crate_drop_points": [
+    [
+      170.5,
+      16.5,
+      219
+    ],
+    [
+      170.5,
+      231.5,
+      230
+    ],
+    [
+      120.5,
+      342.5,
+      225
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      181.5,
+      109.5,
+      228
+    ],
+    [
+      197.5,
+      231.5,
+      231
+    ],
+    [
+      236.5,
+      447.5,
+      226
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      390.5,
+      34.5,
+      218
+    ],
+    [
+      346.5,
+      348.5,
+      229
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/WW1",
+    "page_sha256": "fd82789dd943676b48dbe325aa218b5f718fdc0aff371017cb592a9f10b921c9",
+    "vxl_sha256": "19bef4593f1d0ac7e05372916ec07d5700881312b0874455d891a0c06d54a251",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

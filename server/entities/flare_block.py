@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import shared.constants as C
 
-from server.entities.behaviors import DamageableEntityBehavior
+from server.entities.behaviors import DamageableEntityBehavior, EntityBehavior, _remove_entity
 
 
 _NEIGHBORS = (
@@ -11,6 +11,19 @@ _NEIGHBORS = (
     (0, -1, 0), (0, 1, 0),
     (0, 0, -1), (0, 0, 1),
 )
+
+
+class MapFixtureLightBehavior(EntityBehavior):
+    """The light follows its existing voxel; never reconstruct destroyed props."""
+
+    def on_tick(self, ent, dt, ctx) -> None:
+        if ctx.world is not None and not ctx.world.get_solid(int(ent.x), int(ent.y), int(ent.z)):
+            cells = getattr(ctx.world, "static_light_cells", None)
+            if isinstance(cells, dict):
+                cells.pop((int(ent.x), int(ent.y), int(ent.z)), None)
+            # Original FlareBlockEntity.delete removes the light. The normal
+            # terrain mutation already removed the voxel independently.
+            _remove_entity(ent, ctx)
 
 
 def flare_cell(ent):

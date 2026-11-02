@@ -1,0 +1,96 @@
+{
+  "health_crate_drop_points": [
+    [
+      192.5,
+      400.5,
+      223
+    ],
+    [
+      98.5,
+      371.5,
+      227
+    ],
+    [
+      346.5,
+      290.5,
+      226
+    ],
+    [
+      214.5,
+      249.5,
+      233
+    ],
+    [
+      87.5,
+      144.5,
+      232
+    ],
+    [
+      192.5,
+      144.5,
+      230
+    ],
+    [
+      148.5,
+      115.5,
+      227
+    ]
+  ],
+  "ammo_crate_drop_points": [
+    [
+      208.5,
+      406.5,
+      223
+    ],
+    [
+      103.5,
+      377.5,
+      227
+    ],
+    [
+      335.5,
+      278.5,
+      226
+    ],
+    [
+      214.5,
+      261.5,
+      234
+    ],
+    [
+      98.5,
+      157.5,
+      230
+    ],
+    [
+      181.5,
+      133.5,
+      226
+    ],
+    [
+      164.5,
+      115.5,
+      227
+    ]
+  ],
+  "block_crate_drop_points": [
+    [
+      302.5,
+      98.5,
+      214
+    ],
+    [
+      236.5,
+      348.5,
+      223
+    ]
+  ],
+  "_wiki_pickup_source": {
+    "page": "https://aceofspadeswiki.info/wiki/Winter_Valley",
+    "page_sha256": "38e4b3ecf2ac5639175e1bbf99edfdbb810a3652af03996a891e905f11e07c49",
+    "vxl_sha256": "39fa153370459441636a9dc2ee54fccdcd3e8697693ca3a5f732223a3a5e5ba5",
+    "coordinate_space": "source VXL; loader applies source_z_shift once",
+    "accuracy": "Rounded wiki icon footprints; terrain-reviewed floor heights. Not exact retail coordinates.",
+    "manifest": "tools/map_metadata/wiki_pickups.json"
+  }
+}

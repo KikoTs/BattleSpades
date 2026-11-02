@@ -82,7 +82,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=32895)
     parser.add_argument("--map", default="London")
     parser.add_argument("--infection-delay", type=float, default=8.0,
-                        help="[modes.zom] infection_delay for the temp config (retail 60)")
+                        help="[modes.zom] infection_delay for the temp config (server default 50)")
     parser.add_argument("--no-infect", action="store_true",
                         help="leave the bot survivors alone instead of infecting them at the start")
     parser.add_argument("--seed", type=int, default=7)
