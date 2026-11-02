@@ -101,7 +101,7 @@ has ended.
 | Intel auto-return | ON; `CG.CTF_INTEL_RETURN_TIME` = 60 s | ON, 60 s | retail |
 | Return on touch, score with own intel home | OFF, OFF | OFF, OFF | retail |
 | Shoot while carrying | OFF | OFF | retail |
-| Classic CTF playlist | 5 captures, carrier may shoot, no auto-return | same (class defaults and `[modes.cctf]`) | retail |
+| Classic CTF playlist | 5 captures, carrier may shoot, no auto-return | 5 captures, carrier may shoot, visible 60 s auto-return | intentional server override |
 | Re-pickup after drop | 2.5 s (`C.NO_PICKUP_AFTER_DROP_TIME`) | 2.5 s | retail |
 | Classic base capture radius | 5 (`CG.CLASSIC_CTF_BASE_CAPTURE_DISTANCE`) | 5 | retail |
 | Carrier minimap exposure | 30 s (`C.INTEL_MINIMAP_EXPOSURE_TIME`) | carrier shown for the whole carry | (superseded: implemented, see PARITY_CHANGES_2026-09) |

@@ -772,9 +772,11 @@ selects the Deuce/classic behavior inside `GameScene`. The same snapshot sends
 `enable_minimap=0`, `allow_shooting_holding_intel=1`, one Classic Soldier class
 for both teams, and disables tools 37/38 (Classic Shotgun/SMG). Sending enum 11
 instead is unsupported by this retail scene table. The shipped Classic playlist
-also disables CTF intel auto-return; that is a server rule and emits no new
-packet. Ground intel remains entity type 16, and carried intel continues to use
-the ordinary pickup/WorldUpdate representation.
+also disables CTF intel auto-return. This server intentionally enables the same
+60-second return used by ordinary CTF and sends that remaining lifetime in the
+ground intel's packet-21 `fuse`, producing the same 3D countdown as a diamond.
+Ground intel remains entity type 16, and carried intel continues to use the
+ordinary pickup/WorldUpdate representation.
 
 The shipped playlist contains Crossroads, Hiesville, ToTheBridge, Trenches,
 WinterValley, WW1, and Classic. With no explicit operator rotation, voting is

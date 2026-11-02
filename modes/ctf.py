@@ -271,6 +271,7 @@ class CTFMode(BaseMode):
     time_limit = 1200  # 20 minutes
     mode_code = "ctf"
     intel_auto_return_default = True
+    intel_return_time = float(CG.CTF_INTEL_RETURN_TIME)
     shoot_with_intel_default = False
     # Retail CTF: the intel sits on the team's base point (the centre of the
     # authored ``ctf_base_points`` box). The retail tables have no CTF intel
@@ -501,6 +502,7 @@ class CTFMode(BaseMode):
         *,
         broadcast: bool = True,
         entity_position=None,
+        fuse: float | None = None,
     ):
         reg = getattr(self.server, "entity_registry", None)
         if reg is None:
@@ -515,10 +517,59 @@ class CTFMode(BaseMode):
         if entity_position is None:
             entity_position = _intel_entity_anchor(self.intel_positions[team])
         x, y, z = (float(value) for value in entity_position)
-        flag = reg.place(int(C.INTEL_PICKUP), x, y, z, state=team, kind="intel")
+        flag = reg.place(
+            int(C.INTEL_PICKUP),
+            x,
+            y,
+            z,
+            state=team,
+            kind="intel",
+            # Packet 21's fuse drives the same 3D countdown label that the
+            # client renders for a dropped diamond. Recreated intel receives
+            # the remaining lifetime, never a fresh 60-second timer.
+            fuse=(
+                self._intel_fuse_remaining(team)
+                if fuse is None
+                else max(0.0, float(fuse))
+            ),
+        )
         self._intel_entities[team] = flag.entity_id
         if broadcast and getattr(self.server.config, "entities_wire_ready", False):
             self.server.broadcast_create_entity(flag)
+
+    def _intel_fuse_remaining(self, team: int, now: float | None = None) -> float:
+        """Return the exact remaining auto-return time for one ground intel."""
+        dropped_at = float(self.intel_drop_time.get(team, 0.0) or 0.0)
+        if (
+            not self.intel_auto_return
+            or dropped_at <= 0.0
+            or self.intel_holder.get(team) is not None
+        ):
+            return 0.0
+        if now is None:
+            now = time.time()
+        elapsed = max(0.0, float(now) - dropped_at)
+        return max(0.0, float(self.intel_return_time) - elapsed)
+
+    def _set_intel_fuse(
+        self,
+        team: int,
+        fuse: float,
+        *,
+        broadcast: bool = False,
+    ) -> None:
+        """Update snapshot state and optionally reset the live client timer."""
+        reg = getattr(self.server, "entity_registry", None)
+        entity_id = self._intel_entities.get(team)
+        flag = reg.get(entity_id) if reg is not None and entity_id is not None else None
+        if flag is None or not bool(getattr(flag, "alive", False)):
+            return
+        flag.fuse = max(0.0, float(fuse))
+        if not broadcast or not getattr(self.server.config, "entities_wire_ready", False):
+            return
+        send = getattr(self.server, "broadcast_change_entity_fuse", None)
+        if callable(send):
+            send(flag)
 
     def _move_ground_intel(self, team: int, position) -> None:
         """Move trigger, team state and visible model as one transaction."""
@@ -530,14 +581,59 @@ class CTFMode(BaseMode):
         else:
             self.intel_home_positions[team] = settled
             self.server.teams[team].return_intel(settled)
-        self._set_intel_entity(
-            team,
-            True,
-            entity_position=_intel_entity_anchor(settled),
-        )
+        self._move_intel_entity(team, _intel_entity_anchor(settled))
         timer = getattr(self, "_intel_trap", None)
         if timer is not None:
             timer.due(team, False, time.monotonic(), 0.0)
+
+    def _move_intel_entity(self, team: int, entity_position) -> None:
+        """Reliably move an existing intel model without recreating it.
+
+        Repeated DestroyEntity/CreateEntity cycles can leave the retail client
+        rendering an older intel model while the server-side pickup trigger
+        has already moved. Ground movement therefore keeps the same entity id
+        and publishes ChangeEntity.SET_POSITION every time. A missing or stale
+        entity slot (normally after a carrier held the intel) still falls back
+        to the ordinary create path.
+        """
+        reg = getattr(self.server, "entity_registry", None)
+        if reg is None:
+            return
+        entity_id = self._intel_entities.get(team)
+        flag = reg.get(entity_id) if entity_id is not None else None
+        if (
+            flag is None
+            or not bool(getattr(flag, "alive", False))
+            or str(getattr(flag, "kind", "")) != "intel"
+            or int(getattr(flag, "type", -1)) != int(C.INTEL_PICKUP)
+        ):
+            # Never remove an unrelated entity if a stale remembered id was
+            # reused by the registry between round transitions.
+            self._intel_entities[team] = None
+            self._set_intel_entity(
+                team,
+                True,
+                entity_position=entity_position,
+            )
+            return
+
+        x, y, z = (float(value) for value in entity_position)
+        flag.x, flag.y, flag.z = x, y, z
+        flag.home = (x, y, z)
+        flag.state = int(team)
+        if not getattr(self.server.config, "entities_wire_ready", False):
+            return
+        move = getattr(self.server, "broadcast_change_entity_position", None)
+        if callable(move):
+            move(flag)
+            return
+
+        # Compatibility for older embedding servers without ChangeEntity.
+        self._set_intel_entity(
+            team,
+            True,
+            entity_position=entity_position,
+        )
 
     def _raise_buried_intel(self, team: int) -> bool:
         """Immediately lift one ground intel out of its occupied model cell."""
@@ -737,6 +833,15 @@ class CTFMode(BaseMode):
 
         current_time = time.time()
 
+        # Clients count down locally from the CreateEntity fuse. Refreshing
+        # only the authoritative DTO makes a late joiner's snapshot start at
+        # the true remaining value without restarting existing clients.
+        for team in (TEAM1, TEAM2):
+            self._set_intel_fuse(
+                team,
+                self._intel_fuse_remaining(team, current_time),
+            )
+
         await self._guard_ground_intel()
         if self.ended:
             return
@@ -748,7 +853,7 @@ class CTFMode(BaseMode):
                     self.intel_holder[team] is None
                     and dropped_at > 0.0
                     and current_time - dropped_at
-                    >= float(CG.CTF_INTEL_RETURN_TIME)
+                    >= float(self.intel_return_time)
                 ):
                     await self._return_intel(team)
         
@@ -1122,6 +1227,9 @@ class CTFMode(BaseMode):
             True,
             broadcast=True,
             entity_position=_intel_entity_anchor(drop_pos),
+            # Do not lose the first displayed second to the few microseconds
+            # spent settling and constructing the entity.
+            fuse=float(self.intel_return_time) if self.intel_auto_return else 0.0,
         )
         
         team_name = self.server.teams[intel_team].name
@@ -1136,6 +1244,10 @@ class CTFMode(BaseMode):
         home_pos = self._accessible_home_anchor(intel_team)
         self.intel_drop_time[intel_team] = 0.0
         self._move_ground_intel(intel_team, home_pos)
+        # _move_ground_intel deliberately preserves the entity id so its
+        # texture and trigger cannot diverge. Explicitly stop the old dropped
+        # countdown now that this same entity is back at home.
+        self._set_intel_fuse(intel_team, 0.0, broadcast=True)
         from server import achievements
 
         achievements.intel_returned(self.server, intel_team)
@@ -1336,11 +1448,7 @@ class CTFMode(BaseMode):
                 continue
             if not timer.due(team, reason is not None, now, grace):
                 continue
-            dropped = self.intel_drop_time[team] > 0.0
             logger.info("%s intel %s; recovering", self.server.teams[team].name, reason)
-            if dropped and self.intel_auto_return:
-                await self._return_intel(team)
-                continue
             try:
                 settled = objective_guard.resettle_surface(
                     wm, position, player_space=True

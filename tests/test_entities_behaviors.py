@@ -317,7 +317,6 @@ def test_live_pickup_rises_above_blocks_placed_directly_on_it():
 def test_fractional_pickup_height_checks_the_immediately_occupied_voxel():
     class VoxelColumn:
         solid = {(100, 100, 61), (100, 100, 60), (100, 100, 59)}
-
         def get_solid(self, x, y, z):
             return (x, y, z) in self.solid
 
@@ -351,6 +350,26 @@ def test_pickup_position_change_uses_reliable_change_entity_shape():
     assert packet.entity_id == 42
     assert packet.action == 1
     assert (packet.pos_x, packet.pos_y, packet.pos_z) == (11.5, 22.5, 70.0)
+    assert kwargs == {"reliable": True}
+
+
+def test_pickup_fuse_change_uses_reliable_change_entity_shape():
+    from server.main import BattleSpadesServer
+
+    server = BattleSpadesServer.__new__(BattleSpadesServer)
+    sent = []
+    server.broadcast_known_entity_packet = lambda data, entity_id, **kwargs: sent.append(
+        (bytes(data), entity_id, kwargs)
+    )
+    pickup = SimpleNamespace(entity_id=42, fuse=0.0)
+
+    server.broadcast_change_entity_fuse(pickup)
+
+    raw, entity_id, kwargs = sent[0]
+    packet = ChangeEntity(ByteReader(raw[1:]))
+    assert entity_id == packet.entity_id == 42
+    assert packet.action == C.SET_FUSE
+    assert packet.fuse == 0.0
     assert kwargs == {"reliable": True}
 
 

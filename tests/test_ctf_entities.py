@@ -2,6 +2,8 @@ import asyncio
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
@@ -43,6 +45,8 @@ class _Server:
         self.packets = []
         self.created = []
         self.destroyed = []
+        self.moved = []
+        self.fuses = []
 
     def broadcast(self, data, **_kwargs):
         self.packets.append(data)
@@ -52,6 +56,14 @@ class _Server:
 
     def broadcast_destroy_entity(self, entity_id):
         self.destroyed.append(entity_id)
+
+    def broadcast_change_entity_position(self, entity):
+        self.moved.append(
+            (entity.entity_id, entity.x, entity.y, entity.z)
+        )
+
+    def broadcast_change_entity_fuse(self, entity):
+        self.fuses.append((entity.entity_id, entity.fuse))
 
     def broadcast_set_score(self, _team, reason=None):
         pass
@@ -184,17 +196,50 @@ def test_ctf_dropped_intel_auto_returns_after_retail_timeout(monkeypatch):
         _world_object=None,
     )
     server.players[player.id] = player
-    times = iter((100.0, 100.0, 161.0))
-    monkeypatch.setattr("modes.ctf.time.time", lambda: next(times))
+    now = [100.0]
+    monkeypatch.setattr("modes.ctf.time.time", lambda: now[0])
     asyncio.run(mode._pickup_intel(player, TEAM2))
     asyncio.run(mode._drop_intel(player, TEAM2))
     dropped_id = mode._intel_entities[TEAM2]
+    dropped = server.entity_registry.get(dropped_id)
 
+    # CreateEntity uses the same packet-21 fuse as Diamond Mine, so the client
+    # renders an exact 60-second countdown on the suitcase.
+    assert dropped.to_wire_entity().fuse == float(CG.CTF_INTEL_RETURN_TIME)
+
+    # Keep the test player from immediately picking the ground intel back up.
+    player.alive = False
+    now[0] = 159.9
+    asyncio.run(mode.on_tick(1))
+    assert mode.intel_drop_time[TEAM2] == 100.0
+    assert dropped.to_wire_entity().fuse == pytest.approx(0.1)
+
+    now[0] = 160.0
     asyncio.run(mode.on_tick(1))
 
     assert mode.intel_positions[TEAM2] == mode.intel_home_positions[TEAM2]
-    assert mode._intel_entities[TEAM2] != dropped_id
+    assert mode._intel_entities[TEAM2] == dropped_id
+    assert server.moved[-1][0] == dropped_id
     assert mode.intel_drop_time[TEAM2] == 0.0
+    assert dropped.to_wire_entity().fuse == 0.0
+    assert server.fuses[-1] == (dropped_id, 0.0)
+
+
+def test_ctf_recreated_dropped_intel_keeps_remaining_fuse(monkeypatch):
+    server = _Server()
+    mode = CTFMode(server)
+    asyncio.run(mode.on_mode_start())
+    mode.intel_drop_time[TEAM2] = 100.0
+    now = [120.0]
+    monkeypatch.setattr("modes.ctf.time.time", lambda: now[0])
+
+    stale_id = mode._intel_entities[TEAM2]
+    server.entity_registry.remove(stale_id)
+    mode._move_intel_entity(TEAM2, (200.0, 210.0, 60.0))
+
+    replacement = server.entity_registry.get(mode._intel_entities[TEAM2])
+    assert replacement.entity_id != stale_id
+    assert replacement.to_wire_entity().fuse == pytest.approx(40.0)
 
 
 def test_ctf_capture_uses_visible_five_block_base_zone():

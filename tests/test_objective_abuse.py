@@ -135,6 +135,46 @@ def test_ctf_buried_dropped_intel_rises_in_place(loop):
     assert mode.intel_drop_time[TEAM1] > 0.0
 
 
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_trap_recovery_never_shortens_dropped_intel_fuse(
+    loop,
+    mode_cls,
+    monkeypatch,
+):
+    server, _director = _server(loop, mode_cls)
+    mode = server.mode
+    intel_team = TEAM2
+    dropped = (200.5, 200.5, GROUND - STANDING)
+    recovered = (dropped[0], dropped[1], dropped[2] - 2.0)
+    dropped_at = time.time()
+    mode.intel_positions[intel_team] = dropped
+    mode.intel_drop_time[intel_team] = dropped_at
+    mode.server.teams[intel_team].drop_intel(*dropped)
+    mode._intel_trap = SimpleNamespace(
+        due=lambda key, trapped, now, grace: bool(trapped)
+    )
+    mode._guard_next_at = 0.0
+
+    monkeypatch.setattr(
+        objective_guard,
+        "ground_objective_trapped",
+        lambda world, position, **kwargs: (
+            "sealed" if tuple(position) == dropped else None
+        ),
+    )
+    monkeypatch.setattr(
+        objective_guard,
+        "resettle_surface",
+        lambda world, position, **kwargs: recovered,
+    )
+
+    loop.run_until_complete(mode._guard_ground_intel())
+
+    assert mode.intel_positions[intel_team] == recovered
+    assert mode.intel_drop_time[intel_team] == dropped_at
+    assert mode.intel_positions[intel_team] != mode.intel_home_positions[intel_team]
+
+
 def test_ctf_open_intel_is_left_alone(loop):
     server, director = _server(loop, CTFMode)
     mode = server.mode
@@ -299,6 +339,92 @@ def test_ctf_guard_raises_direct_and_repeated_builds_without_event(loop, mode_cl
 
     assert mode.intel_home_positions[TEAM2] == pytest.approx(home)
     assert mode.intel_drop_time[TEAM2] == dropped_at
+
+
+@pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))
+def test_ctf_rebuild_after_removal_repeats_visual_set_position(
+    loop,
+    mode_cls,
+    monkeypatch,
+):
+    server, director = _server(loop, mode_cls)
+    mode = server.mode
+    world = server.world_manager
+    builder = _bot(loop, director, TEAM1)
+    intel_team = TEAM2
+    start = mode.intel_positions[intel_team]
+    cell_x, cell_y = int(start[0]), int(start[1])
+    entity_id = mode._intel_entities[intel_team]
+
+    moves = []
+    creates = []
+    destroys = []
+    monkeypatch.setattr(
+        server,
+        "broadcast_change_entity_position",
+        lambda entity: moves.append(
+            (entity.entity_id, entity.x, entity.y, entity.z)
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "broadcast_create_entity",
+        lambda entity: creates.append(entity.entity_id),
+    )
+    monkeypatch.setattr(
+        server,
+        "broadcast_destroy_entity",
+        lambda current_id: destroys.append(current_id),
+    )
+
+    stack = (
+        (cell_x, cell_y, GROUND - 1),
+        (cell_x, cell_y, GROUND - 2),
+    )
+    for position in stack:
+        assert world.set_block(*position, True, WALL)
+    loop.run_until_complete(mode.on_blocks_built(builder, stack))
+
+    raised = (start[0], start[1], float(GROUND - 2) - STANDING)
+    assert mode.intel_positions[intel_team] == pytest.approx(raised)
+    entity = server.entity_registry.get(entity_id)
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (raised[0], raised[1], float(GROUND - 2))
+    )
+
+    for position in stack:
+        assert world.set_block(*position, False)
+    mode._guard_next_at = 0.0
+    loop.run_until_complete(mode._guard_ground_intel())
+
+    settled = (start[0], start[1], float(GROUND) - STANDING)
+    assert mode.intel_positions[intel_team] == pytest.approx(settled)
+    entity = server.entity_registry.get(entity_id)
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (settled[0], settled[1], float(GROUND))
+    )
+
+    for position in stack:
+        assert world.set_block(*position, True, WALL)
+    loop.run_until_complete(mode.on_blocks_built(builder, stack))
+
+    assert mode._intel_entities[intel_team] == entity_id
+    assert mode.intel_positions[intel_team] == pytest.approx(raised)
+    assert server.teams[intel_team].intel_position == pytest.approx(raised)
+    entity = server.entity_registry.get(entity_id)
+    assert entity is not None
+    assert (entity.x, entity.y, entity.z) == pytest.approx(
+        (raised[0], raised[1], float(GROUND - 2))
+    )
+    assert moves == pytest.approx([
+        (entity_id, raised[0], raised[1], float(GROUND - 2)),
+        (entity_id, settled[0], settled[1], float(GROUND)),
+        (entity_id, raised[0], raised[1], float(GROUND - 2)),
+    ])
+    assert creates == []
+    assert destroys == []
 
 
 @pytest.mark.parametrize("mode_cls", (CTFMode, ClassicCTFMode))

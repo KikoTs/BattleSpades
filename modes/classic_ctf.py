@@ -52,7 +52,9 @@ class ClassicCTFMode(CTFMode):
     description = "Classic+ CTF: capture the enemy intel!"
     mode_code = "cctf"
     death_representation = CLASSIC_CORPSE_REPRESENTATION
-    intel_auto_return_default = False
+    # Keep the dropped-intel contract consistent with ordinary CTF: one exact
+    # 60-second fuse and then a return to base.
+    intel_auto_return_default = True
     shoot_with_intel_default = True
     # Retail Classic CTF: the intel keeps the Classic-only
     # ``CLASSIC_CTF_INTEL_MIN_RADIUS_FROM_BASE`` (3) from the base point, which

@@ -102,13 +102,11 @@ def test_classic_mode_specific_score_target_remains_operator_configurable() -> N
     assert server.mode.score_limit == 7
 
 
-def test_classic_dropped_intel_does_not_auto_return(monkeypatch) -> None:
-    server = SimpleNamespace(
-        config=SimpleNamespace(mode_settings={}),
-        players={},
-    )
-    mode = ClassicCTFMode(server)
-    server.mode = mode
+def test_classic_dropped_intel_uses_shared_sixty_second_auto_return(monkeypatch) -> None:
+    server = _native_server()
+    server.world_manager.generate_flat_map()
+    mode = server.mode
+    asyncio.run(mode.on_mode_start())
     dropped_position = (210.0, 220.0, 50.0)
     mode.intel_positions[TEAM2] = dropped_position
     mode.intel_drop_time[TEAM2] = 100.0
@@ -117,9 +115,9 @@ def test_classic_dropped_intel_does_not_auto_return(monkeypatch) -> None:
 
     asyncio.run(mode.on_tick(1))
 
-    assert mode.intel_auto_return is False
-    assert mode.intel_positions[TEAM2] == dropped_position
-    assert mode.intel_drop_time[TEAM2] == 100.0
+    assert mode.intel_auto_return is True
+    assert mode.intel_positions[TEAM2] != dropped_position
+    assert mode.intel_drop_time[TEAM2] == 0.0
 
 
 # --- round clock -----------------------------------------------------------

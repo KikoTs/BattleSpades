@@ -191,7 +191,7 @@ def test_sample_config_mode_overlays_are_retail():
     assert modes["zom"]["zombie_respawn_time"] == 10.0
     assert modes["vip"]["selection_delay"] == CG.VIP_SELECTION_DELAY
     assert modes["tdm"]["kill_points"] == CG.TDM_TEAM_SCORE_FOR_KILL
-    # Classic CTF playlist: 5 captures, carrier may shoot, no auto-return.
+    # This server keeps both CTF variants on one visible 60-second return fuse.
     assert modes["cctf"]["score_limit"] == 5
     assert modes["cctf"]["shoot_with_intel"] is True
-    assert modes["cctf"]["intel_auto_return"] is False
+    assert modes["cctf"]["intel_auto_return"] is True

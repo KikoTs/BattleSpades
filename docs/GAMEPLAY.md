@@ -72,7 +72,8 @@ visibility, pickup/drop/capture, death/disconnect/team-change drops, optional
 touch return, optional timed return, optional own-intel-at-base scoring, and a
 carrier shooting gate shared by client and server. Classic CTF locks both teams
 to Deuce, uses the ordinary CTF scene with `classic=1`, hides its disabled
-weapons, enables carrier fire by playlist default, and disables auto-return.
+weapons, and enables carrier fire by playlist default. On this server both CTF
+variants return dropped intel after one visible 60-second countdown.
 
 Zombie owns survivor/infected phase transitions, Patient Zero selection,
 permanent conversion, role-safe classes, respawns, last-survivor visibility,

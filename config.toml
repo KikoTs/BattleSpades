@@ -453,7 +453,7 @@ time_limit = 1800      # shipped CTF clock (30 minutes)
 [modes.cctf]
 time_limit = 5400      # shipped Classic CTF clock (90 minutes)
 score_limit = 5        # shipped Match Lobby target (intel captures)
-intel_auto_return = false
+intel_auto_return = true # dropped intel returns after the shared 60-second fuse
 shoot_with_intel = true
 
 [modes.vip]

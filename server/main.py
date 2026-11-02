@@ -1669,6 +1669,23 @@ class BattleSpadesServer:
         packet.pos_z = float(map_entity.z)
         self.broadcast(bytes(packet.generate()), reliable=True)
 
+    def broadcast_change_entity_fuse(self, map_entity) -> None:
+        """Set the live countdown for peers that know this static entity."""
+        from shared.packet import ChangeEntity
+
+        packet = ChangeEntity()
+        packet.entity_id = int(map_entity.entity_id)
+        packet.action = 6  # ChangeEntity.SET_FUSE
+        packet.fuse = max(0.0, float(map_entity.fuse))
+        data = bytes(packet.generate())
+        known_broadcast = getattr(self, "broadcast_known_entity_packet", None)
+        if callable(known_broadcast):
+            known_broadcast(data, packet.entity_id, reliable=True)
+        else:
+            # Compatibility for lightweight embedding servers predating the
+            # per-connection entity ledger.
+            self.broadcast(data, reliable=True)
+
     def spawn_projectile_entity(self, projectile, owner, pos, vel) -> None:
         """Create the visible client entity for a server-owned projectile."""
         if projectile is None or not projectile.spec.entity_type:
