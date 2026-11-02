@@ -131,6 +131,7 @@ def stage_release(
         root / "LICENSE": "LICENSE",
         root / "LICENSING.md": "LICENSING.md",
         root / "VERSION": "VERSION",
+        root / "plugins" / "music.py": "plugins/music.py",
         root / "release" / "README.txt": "README.txt",
         root / "release" / "THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt",
         root / "release" / "STEAM_RUNTIME.txt": "steam-runtime/README.txt",
@@ -161,8 +162,20 @@ def stage_release(
             shutil.copy2(source, target_path)
 
         map_count = _copy_files(root / "maps", destination / "maps", "*.vxl")
-        _copy_files(root / "maps", destination / "maps", "*.json")
-        _copy_files(root / "maps", destination / "maps", "*.botnav")
+        for pattern in ("*.json", "*.ugc", "*.txt", "*.botnav"):
+            _copy_files(root / "maps", destination / "maps", pattern)
+        # Community modes use authored subdirectory arenas and presets.
+        # Copying only the retail root maps left their launchers with no map.
+        for relative, patterns in (
+            ("maps/unofficial", ("*.vxl", "*.txt", "*.json", "*.ugc", "*.botnav")),
+            ("configs/unofficial", ("*.toml",)),
+        ):
+            source = root / relative
+            if source.is_symlink():
+                raise ValueError(f"release assets may not be symlinks: {source}")
+            if source.is_dir():
+                for pattern in patterns:
+                    _copy_files(source, destination / relative, pattern)
         prefab_count = _copy_files(
             root / "prefabs",
             destination / "prefabs",

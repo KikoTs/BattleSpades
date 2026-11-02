@@ -1391,15 +1391,15 @@ class BattleSpadesServer:
             return
         try:
             from server.audio import send_map_ambient, play_music_to, \
-                gameplay_bed_track
+                gameplay_bed_track, mode_start_music_enabled
             player = getattr(connection, "player", None)
             if player is not None:
                 send_map_ambient(self, player)
             track = None
             pick = getattr(getattr(self, "mode", None), "join_music_track", None)
-            if callable(pick):
+            if mode_start_music_enabled(self) and callable(pick):
                 track = pick()
-            # [audio] mode_start_music = false: no bed, retail silence.
+            # Automatic music is opt-in; ambience is independent.
             track = track or gameplay_bed_track(self)
             if track is not None:
                 play_music_to(connection, track)
@@ -2332,6 +2332,8 @@ class BattleSpadesServer:
             
             # Remove from players
             self.players.pop(player.id, None)
+            if revival_master is not None:
+                revival_master.schedule_departure_results()
             
             # Broadcast disconnect, but only to GameScenes that were told
             # about this id. A dead joiner (or a player whose only life began

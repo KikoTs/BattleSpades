@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,11 +240,57 @@ def test_climbing_out_of_the_sea_onto_a_cliff_top():
         replay(world, plan, abilities)
 
 
+@pytest.mark.parametrize("placed_foothold", [False, True])
+def test_a_bobbing_swimmer_starts_the_climb_from_real_support(placed_foothold):
+    world = World(ground(z=WATER_SUPPORT_Z-1, xs=range(20, 30)))
+    if placed_foothold:
+        world.cells.add((19, 10, WATER_SUPPORT_Z-1))
+    body = snapshot((19.5, 10.5, WATER_SUPPORT_Z-3.25), grounded=False, wade=True)
+    driver = LocomotionSkillDriver(world)
+    slot = driver._slot(body)
+    command = driver._begin_search(slot, body, None, 100., "climb_out",
+                                   ("toward", (21.5, 10.5, WATER_SUPPORT_Z-3.25), 1.5))
+    assert command is not None and slot.skill is not None
+    plan = slot.skill.plan
+    source = plan.steps[0].source
+    assert world.solid(*source)
+    assert source[2] == WATER_SUPPORT_Z-int(placed_foothold)
+    replay(world, plan, ClimbAbilities.from_observer(body))
+
+
 def test_no_tool_and_no_blocks_means_no_plan():
     world = World(ground(z=100) | {(x, y, z) for x in range(12, 20) for y in range(0, 40)
                                    for z in range(94, 100)})
     goal = AscentGoal.toward((15.5, 10.5, 94 - 2.25), radius=1.0)
     assert plan_ascent(world, (10, 10, 100), goal, ClimbAbilities(None, 0, True)) is None
+
+
+@pytest.mark.parametrize("profile", (KNIFE, PICKAXE))
+def test_pit_recovery_targets_a_higher_rim_outside_the_main_region(profile):
+    world = World(ground(z=94, depth=16))
+    regions = [0] * (512 * 512)
+    primary = [255] * (512 * 512)
+    for x in range(40):
+        for y in range(40):
+            regions[y * 512 + x] = 2
+            primary[y * 512 + x] = 94
+    for x in range(9, 12):
+        for y in range(9, 12):
+            for z in range(94, 100):
+                world.cells.discard((x, y, z))
+            regions[y * 512 + x] = 3
+            primary[y * 512 + x] = 100
+    world._atlas = SimpleNamespace(width=512, main_region_id=1,
+        regions=regions, primary_support=primary)
+    start = (10, 10, 100)
+    assert AscentGoal.main_ground(world, start, radius=12) is None
+    goal = AscentGoal.higher_ground(world, start, radius=12)
+    assert goal is not None
+    assert not goal.is_goal(start) and not goal.is_goal((11, 10, 100))
+    abilities = ClimbAbilities(profile, 200, True)
+    plan = plan_ascent(world, start, goal, abilities, radius=12, time_budget=1.0)
+    assert plan is not None and plan.rise >= 5
+    assert goal.is_goal(replay(world, plan, abilities))
 
 
 def test_the_search_resumes_across_time_slices_to_the_same_plan():
@@ -424,6 +471,63 @@ def test_driver_requests_are_idempotent_and_report_done():
     assert not driver.active(landed)
 
 
+def test_stationary_airborne_hops_and_replacement_plans_cannot_renew_progress():
+    from dataclasses import replace
+    from server.bot_ai.recovery_skills import AscentPlan, ClimbStep
+    world = World(ground(z=100))
+    world.cells.add((11, 10, 99))
+    body = snapshot((10.5, 10.5, 97.75))
+    plan = AscentPlan((ClimbStep(StepKind.STAIR, (10, 10, 100), (11, 10, 99)),), 1., 0, 0)
+    driver = LocomotionSkillDriver(world)
+    slot = driver._slot(body)
+    driver._start(slot, body, None, plan, "climb", 100., ("main",))
+    for tick in range(34):
+        now = 100.+tick*.25
+        hopping = replace(body, grounded=False,
+            position=(10.5, 10.5, 97.75 if tick%2 else 96.))
+        if tick in (12, 24):
+            slot.failures += 1
+            driver._start(slot, hopping, None, plan, "climb", now, ("main",))
+        driver.step(hopping, None, now)
+        if not driver.active(hopping):
+            break
+    assert driver.metrics.get("climb_stalled") == 1
+    assert not driver.active(hopping)
+    assert plan.steps[0].destination in slot.avoid
+
+
+def test_actual_partial_excavation_renews_progress_but_empty_swings_do_not():
+    from server.bot_ai.recovery_skills import AscentPlan, ClimbStep
+    cells = ((11, 10, 96), (11, 10, 97), (11, 10, 98))
+    world = World(ground(z=100) | set(cells) | {(11, 10, 99)})
+    body = snapshot((10.5, 10.5, 97.75),
+                    loadout=(int(C.BLOCK_TOOL), int(C.KNIFE_TOOL)))
+    step = ClimbStep(StepKind.STAIR, (10, 10, 100), (11, 10, 99), dig_cells=cells)
+    plan = AscentPlan((step,), 1., 0, 15)
+    driver = LocomotionSkillDriver(world)
+    driver._start(driver._slot(body), body, None, plan, "climb", 100., ("main",))
+    driver.step(body, None, 100.)
+    for index, cell in enumerate(cells):
+        world.cells.remove(cell)
+        driver.step(body, None, 103.+index*3.)
+        assert driver.active(body)
+    driver.step(body, None, 114.)
+    assert not driver.active(body)
+    assert driver.metrics["climb_stalled"] == 1
+
+
+def test_a_stalled_skill_does_not_start_a_second_navigation_grace_period():
+    world = World(ground(z=100))
+    driver = LocomotionSkillDriver(world)
+    body = snapshot((10.5, 10.5, 97.75))
+    driver.request(body, None, SkillRequest("pillar_up", levels=1), 100.)
+    driver.step(body, None, 100.1)
+    driver.step(body, None, 108.)
+    assert not driver.active(body)
+    driver.consider_stuck(body, None, 109.6, (12.5, 10.5, 77.75), climb_to_goal=True)
+    assert driver.metrics["stuck_considered"] == 1
+
+
 def test_swim_estimate_ignores_beaches_cut_off_from_the_main_ground():
     class Route:
         def __init__(self, climbable, gx):
@@ -482,6 +586,16 @@ def test_dragon_island_swimmers_climb_back_onto_the_island():
     # Wall-clock guard against planner stalls. Shared CI runners are slower
     # than a desktop (428 ms observed on GitHub ubuntu-24.04), so keep headroom.
     assert result.slowest_decision_ms < 1000.0
+
+
+def test_every_class_leaves_the_isolated_arctic_pits_with_native_physics():
+    """Scout and Medic used to report completed segments here for 90 seconds."""
+    from scripts.bot_recovery_scenarios import run_scenario
+
+    result = asyncio.run(run_scenario("pit", map_name="ArcticBase", bots=8,
+                                     seconds=45.0, seed=19))
+    assert result.recovered == len(result.bots) == 8, result
+    assert all(outcome.deaths == 0 for outcome in result.bots)
 
 
 def test_a_goal_overhead_is_climbed_to_only_once_no_walk_is_known():

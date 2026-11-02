@@ -662,6 +662,7 @@ def test_round_result_carries_new_unlocks_once(monkeypatch, tmp_path):
     assert set(by_id["900000000000002"]) == {"steamid", "name", "total", "stats"}
 
     # The next round reports only what is new since.
+    service.begin_round()
     player.kills, player.score = 5, 50
     server.achievements.unlock(other, "rocket_fall")
     other.kills, other.score = 2, 20

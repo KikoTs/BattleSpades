@@ -355,6 +355,8 @@ def stop_music(server) -> None:
     server.broadcast(_stop_music_bytes())
     try:
         server.audio_music_family = None
+        # A round reset/abort need not change the mode object or start time.
+        server.audio_music_revision = int(getattr(server, "audio_music_revision", 0)) + 1
     except AttributeError:
         pass
 
@@ -370,13 +372,13 @@ def stop_music_to(connection) -> None:
 
 
 def mode_start_music_enabled(server) -> bool:
-    """``[audio] mode_start_music`` (default on).
+    """Whether legacy automatic round music is explicitly enabled.
 
-    The in-round bed is a deliberate deviation: retail rounds were silent
-    (map ambience only) until the final 61 s, and ``last_man_standing_00N``
-    was the Zombie last-survivor track only. Off = retail silence.
+    The default is personal opt-in through the Music plugin. This switch
+    covers the bed, timeout, last survivor and victory tracks, but not sound
+    effects or map ambience.
     """
-    return bool(getattr(getattr(server, "config", None), "mode_start_music", True))
+    return bool(getattr(getattr(server, "config", None), "mode_start_music", False))
 
 
 def gameplay_bed_track(server) -> str | None:
@@ -391,7 +393,7 @@ def play_gameplay_music(server) -> None:
     loops for the round. Broadcast StopMusic+PlayMusic.
 
     With ``[audio] mode_start_music = false`` this only stops the previous
-    round's music (the retail in-round silence).
+    round's music. The Music plugin restores opted-in listeners on its tick.
     """
     track = gameplay_bed_track(server)
     if track is None:
@@ -410,6 +412,8 @@ def play_last_man_music(server) -> bool:
     Returns False (and sends nothing) while a last-man track is already the
     broadcast music, e.g. the round bed, so the music never restarts.
     """
+    if not mode_start_music_enabled(server):
+        return False
     family = _music_family(LAST_MAN_TRACKS[0])
     if getattr(server, "audio_music_family", None) == family:
         return False
@@ -425,6 +429,8 @@ def play_ending_music(server) -> bool:
     cut that ending off. Returns False (nothing sent) while a game_ending
     track is already the broadcast music.
     """
+    if not mode_start_music_enabled(server):
+        return False
     if getattr(server, "audio_music_family", None) == _music_family(
         GAME_ENDING_TRACKS[0]
     ):
@@ -435,6 +441,8 @@ def play_ending_music(server) -> bool:
 
 def play_timeout_music(server) -> None:
     """The last-minute tension track (a random specific game_ending track)."""
+    if not mode_start_music_enabled(server):
+        return
     _broadcast_track(server, random.choice(GAME_ENDING_TRACKS))
 
 

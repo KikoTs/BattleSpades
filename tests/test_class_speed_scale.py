@@ -9,7 +9,7 @@ ground friction 4, 32 blocks per native unit: 8 blocks/s per class multiplier.
 import pytest
 
 import shared.constants as C
-from modes.zombie import ZombieMode
+from modes import get_mode_class
 from server import class_data
 from server.builders.initial_info import build_initial_info
 from server.config import ServerConfig
@@ -128,17 +128,18 @@ def test_character_speed_rule_is_the_whole_class_scale(label, scale):
 
 
 @pytest.mark.parametrize("character_label,character", [("100%", 1.0), ("150%", 1.5)])
+@pytest.mark.parametrize("mode", ("zom", "czom", "classic_zombie", "classic-zombie"))
 @pytest.mark.parametrize("zombie_label,zombie", [
     ("50%", 0.5), ("100%", 1.0), ("200%", 2.0),
 ])
 def test_zombie_speed_rule_reaches_prediction_and_authority_once(
-    character_label, character, zombie_label, zombie,
+    character_label, character, zombie_label, zombie, mode,
 ):
     server = _server(
-        "zom", RULE_CHARACTER_SPEED=character_label, RULE_CLASS_SPEED=zombie_label,
+        mode, RULE_CHARACTER_SPEED=character_label, RULE_CLASS_SPEED=zombie_label,
     )
     # With the mode attached, its configure_initial_info runs on the packet.
-    server.mode = ZombieMode(server)
+    server.mode = get_mode_class(mode)(server)
 
     info = _assert_prediction_matches_authority(server)
 

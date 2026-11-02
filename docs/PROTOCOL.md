@@ -94,7 +94,7 @@ Direction: **C→S** (client→server, we handle), **S→C** (server→client, w
 | 23 | PlaySound | S→C | Sent | One-shot positional/UI sound: pickups, round/kill cues, and observer-only block-tool impacts. The actor predicts its own mining sound and is excluded. LIVE-VERIFIED. |
 | 24 | PlayAmbientSound | S→C | Sent | Allocates the streaming ambient `GameSound` registered by packet 22. Global beds are unpositioned; local loops bootstrap at the listener and are moved by the native point controller. LIVE-VERIFIED. |
 | 25 | StopSound | S→C | Sent | Byte-sized loop-id teardown for server-owned PlaySound/PlayAmbientSound streams. The shared helper validates 0–255; the native receiver treats an unknown id as an idempotent no-op. |
-| 26 | PlayMusic | S→C | Sent | Music track (server/audio.py — last-minute game_ending track at 61s remaining). The in-round `last_man_standing` bed at round start/join is a deliberate deviation behind `[audio] mode_start_music` (default on; off = retail silence, StopMusic only). |
+| 26 | PlayMusic | S→C | Sent | Music track. Personal opt-in through the Music plugin (`/music`) by default. `[audio] mode_start_music = true` restores legacy automatic bed/timeout/last-survivor/victory music. |
 | 27 | StopMusic | S→C | Sent | Stop the current music track (server/audio.py). |
 | 28 | CreatePlayer | S→C | Sent | Spawns a player on clients; also carries the roster. Loadout and all three selected prefab names come from the same committed ClassSelection. Every live player name must be unique before this packet is emitted; the packet direction contains no movement-owner identity field. |
 | 29 | PrefabComplete | S→C | Sent | Sent to the builder after its prefab commits (or is refused), always after the packet-30 echo. |

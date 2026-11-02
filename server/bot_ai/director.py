@@ -63,7 +63,7 @@ def _player_life_id(player: "Player") -> int:
     return int(getattr(player, "replication_generation", getattr(player, "deaths", 0)))
 
 _PLAYABLE_TEAMS = (TEAM1, TEAM2)
-_MOTOR_PHASE_COUNT = 6
+_MOTOR_PHASE_COUNT = 2
 # A latched FIRE/MELEE/ORIENTED action may outlive its 400 ms intent TTL by
 # this grace period while the aim motor finishes converging on the target.
 _ACTION_CONVERGENCE_GRACE = 0.15
@@ -84,6 +84,11 @@ _JUMP_PULSE_TICKS = 2
 # Sustained tracking settles a human onto the target: perception lag and aim
 # noise shrink over this many seconds of continuous lock.
 _LOCK_SETTLE_TIME = 1.2
+# Looks that go through the damped purposeful gaze (dwell, hold, bounded
+# turn): steering along a route, a short exact step, watching a point and a
+# relaxed glance or scan. Combat and world-cell actions use the accurate
+# bounded controller instead.
+_PURPOSEFUL_GAZE = frozenset({"travel", "traverse", "focus", "glance"})
 # Behavioral anti-wallbang probe budget: per-bot interval and a global
 # per-tick cap so the 60 Hz gameplay thread never runs unbounded raycasts.
 _WALL_PROBE_INTERVAL = 0.10
@@ -290,6 +295,13 @@ class _AimMotor:
     gaze_yaw: float | None = None
     gaze_pitch: float | None = None
     gaze_age: float = 0.0
+    # A changed look that has not yet been adopted: the head follows a new
+    # direction once it has stayed put for a moment, not every route wobble.
+    gaze_candidate_yaw: float = 0.0
+    gaze_candidate_pitch: float = 0.0
+    gaze_candidate_age: float = 0.0
+    # Seconds left of the eased return to the route after a relaxed look.
+    gaze_ease: float = 0.0
 
 
 @dataclass(slots=True)
@@ -379,6 +391,8 @@ class BotDirector:
         self.server = server
         config = self._config
         seed = int(getattr(config, "seed", 0))
+        self._strategy_seed = seed
+        self._strategy_started_at = time.monotonic()
         if supervisor is not None:
             self.supervisor = supervisor
         else:
@@ -440,6 +454,7 @@ class BotDirector:
         self._perception_players: tuple[PlayerSnapshot, ...] = ()
         self._perception_entities: tuple[EntitySnapshot, ...] = ()
         self._perception_objectives: tuple[ObjectiveSnapshot, ...] = ()
+        self._perception_build_areas = ((), ())
         self._perception_fun = None
         self._perception_build_players: tuple[Player, ...] = ()
         self._perception_build_snapshots: list[PlayerSnapshot] = []
@@ -992,13 +1007,11 @@ class BotDirector:
             # next fixed step instead of stacking three scheduling classes.
             return
         section_started = time.perf_counter()
-        perception_refreshed = self._publish_due_perception(now)
+        self._publish_due_perception(now)
         self.server.metrics.record_subsystem(
             "bots_perception",
             (time.perf_counter() - section_started) * 1000.0,
         )
-        if perception_refreshed:
-            return
         fixed_dt = float(dt)
         self._wall_probes_this_tick = 0
         self._movement_probes_this_tick = 0
@@ -1013,10 +1026,9 @@ class BotDirector:
         for runtime in self._runtime.values():
             if runtime.was_alive != bool(runtime.player.alive):
                 self._update_class_lifetime(runtime)
-            # Player physics consumes held inputs at 60 Hz. Refresh two of 12
-            # controller motors per tick (10 Hz) and integrate the complete
-            # elapsed interval; client interpolation keeps the 30 Hz observer
-            # stream smooth while the gameplay-thread work stays bounded.
+            # Physics holds keys at 60 Hz; refresh each controller at the
+            # observer stream's 30 Hz so pans and posture changes do not arrive
+            # in visible 100 ms steps. Expensive steering probes remain cached.
             if int(runtime.player.id) % _MOTOR_PHASE_COUNT != motor_phase:
                 continue
             motor_dt = (
@@ -1046,6 +1058,12 @@ class BotDirector:
                 StimulusKind.DEATH, tuple(float(value) for value in victim.position),
                 source_id=int(killer.id), team=int(getattr(victim, "team", -1)),
             )
+        siege = getattr(self, "_zombie_siege", None)
+        if siege is not None and killer is not None and killer is not victim:
+            # A survivor who kills a zombie is dangerous: the horde comes at
+            # him out of his sight and in waves for a while.
+            siege.note_kill(int(killer.id), int(getattr(killer, "team", -1)),
+                            int(getattr(victim, "team", -1)))
         if not bool(getattr(self._config, "chatter", False)) or killer is None:
             return
         if int(getattr(victim, "team", -1)) == int(getattr(killer, "team", -2)) and victim is not killer:
@@ -1072,7 +1090,7 @@ class BotDirector:
         if not bool(getattr(self._config, "chatter", False)):
             return
         busy = frozenset(player_id for player_id, runtime in self._runtime.items()
-                         if runtime.player.alive and now - runtime.lock_confirmed_at < 3.0)
+                         if not runtime.player.alive or now - runtime.lock_confirmed_at < 3.0)
         for player_id, text in self.banter.due(now, busy=busy):
             runtime = self._runtime.get(player_id)
             if runtime is None:
@@ -1137,6 +1155,7 @@ class BotDirector:
             self._map_epoch += 1
             self._topology_version = int(getattr(world, "topology_version", 0))
             self._perception_cache_until = 0.0
+            self._strategy_started_at = time.monotonic()
             if self._started and not force:
                 self.supervisor.publish_map(self._make_map_snapshot(current=False))
                 self._publish_static_lights()
@@ -1144,6 +1163,7 @@ class BotDirector:
             self._mode_signature = mode_signature
             self._mode_epoch += 1
             self._perception_cache_until = 0.0
+            self._strategy_started_at = time.monotonic()
 
     def _make_map_snapshot(self, *, current: bool) -> MapSnapshot:
         from .prefab_policy import BOT_PREFAB_BLOCK_COUNTS, load_bot_prefab_geometry
@@ -1189,13 +1209,13 @@ class BotDirector:
         )
 
     async def _maintain_population(self, now: float) -> None:
-        if getattr(self.server.mode, "owns_bot_population", False):
-            return
         if self._reconnect_count is not None:
             return
         if now < self._next_population_at:
             return
         self._next_population_at = now + 1.0
+        if getattr(self.server.mode, "owns_bot_population", False):
+            return
         config = self._config
         mode = str(getattr(config, "population_mode", "backfill")).lower()
         humans = sum(
@@ -1314,6 +1334,9 @@ class BotDirector:
             )
             self._perception_entities = self._snapshot_entities()
             self._perception_objectives = self._snapshot_objectives()
+            construction = getattr(self.server, "construction", None)
+            areas = getattr(construction, "protected_areas", None)
+            self._perception_build_areas = areas() if callable(areas) else ((), ())
             fun_snapshot = getattr(self.server.mode, "bot_snapshot", None)
             self._perception_fun = fun_snapshot() if callable(fun_snapshot) else None
             # Awareness hook: the steps the roster took since the last refresh.
@@ -1368,8 +1391,13 @@ class BotDirector:
                     mode_phase=mode_phase,
                     behavior_version=self.server.config.bots.behavior_version,
                     friendly_mischief=self.server.config.bots.friendly_mischief,
+                    social_interactions=getattr(self.server.config.bots, "social_interactions", True),
                     local_safety_complete=len(players) <= 32,
                     fun=self._perception_fun,
+                    strategy_elapsed=max(0.0, now - self._strategy_started_at),
+                    strategy_seed=self._strategy_seed,
+                    protected_build_bounds=self._perception_build_areas[0],
+                    protected_build_circles=self._perception_build_areas[1],
                     stimuli=(
                         self.server.bot_stimuli.perceive(
                             tuple(float(value) for value in bot.position),
@@ -1503,6 +1531,9 @@ class BotDirector:
                         )
                     ),
                     reloading=bool(getattr(player, "reloading", False)),
+                    crouching=bool(getattr(getattr(player, "input", None), "crouch", False)),
+                    sneaking=bool(getattr(getattr(player, "input", None), "sneak", False)),
+                    sprinting=bool(getattr(getattr(player, "input", None), "sprint", False)),
                     last_action_kind=(
                         runtime.feedback_action_kind if runtime is not None else ""
                     ),
@@ -1906,6 +1937,7 @@ class BotDirector:
                 # Native capture bar: 0.0 is Blue's, 1.0 is Green's.
                 progress=float(getattr(territory, "progress", 0.5)),
                 attacker=attacker if attacker in _PLAYABLE_TEAMS else -1,
+                bounds=tuple(int(value) for value in zone.bounds),
             ))
         return result
 
@@ -2097,19 +2129,17 @@ class BotDirector:
         if service is None:
             from .zombie_siege import ZombieSiegeService
 
-            service = self._zombie_siege = ZombieSiegeService()
+            service = self._zombie_siege = ZombieSiegeService(seed=self._strategy_seed)
         now = time.monotonic()
 
         def working(player_id: int) -> bool:
-            # A claw swing that landed in the last moments: digging through
-            # something is work, which the stall watchdog must not punish.
+            # Only damage to canonical terrain counts. Accepted input can
+            # still miss, face a protected wall or swing into empty air.
             runtime = self._runtime.get(int(player_id))
-            return bool(
-                runtime is not None
-                and runtime.feedback_action_kind == BotActionKind.MELEE.value
-                and runtime.feedback_action_accepted
-                and now - float(runtime.feedback_action_at) <= 1.5
-            )
+            if runtime is None:
+                return False
+            at, life = getattr(runtime.player, "bot_terrain_work", (-math.inf, -1))
+            return life == _player_life_id(runtime.player) and 0 <= now-at <= 1.5
 
         return service.objectives(mode, self.server.world_manager, working=working)
 
@@ -2215,6 +2245,10 @@ class BotDirector:
                 # of letting the stale swing steal aim for its grace period.
                 self._clear_pending_action(runtime)
             runtime.intent = intent
+            if (intent.social_cue and bool(getattr(self._config, "chatter", False))
+                    and intent.priority < BotIntentPriority.COMBAT
+                    and runtime.player.alive):
+                self.banter.on_context(now, int(runtime.player.id), intent.social_cue)
             runtime.last_intent_frame = int(intent.frame_id)
             look = intent.look
             if (
@@ -2388,12 +2422,15 @@ class BotDirector:
                          if self._has_travel_target(intent) and not intent.look.glance else
                          "combat" if intent.look.visible else
                          "precise" if (intent.movement.affordance is MovementAffordance.BREACH
-                                        or intent.action.position is not None) else "focus"),
+                                        or intent.action.position is not None) else
+                         # A look over the shoulder or a slow scan is a relaxed
+                         # head movement, not a steering turn or an aim.
+                         "glance" if intent.look.glance else "focus"),
             )
         elif runtime.pending_action_look is not None:
             self._update_aim(runtime, runtime.pending_action_look, dt)
         else:
-            self._hold_aim(runtime)
+            self._settle_aim(runtime, dt)
         # Scope/secondary state must be authoritative before a converged FIRE
         # executes below; otherwise the first sniper round is sent as hip fire
         # and remote clients miss the beam for that shot.
@@ -2513,7 +2550,8 @@ class BotDirector:
         jump_requested = (
             not completed_water_movement
             and (bool(intent.movement.jump)
-                 or affordance is MovementAffordance.JUMP)
+                 or (affordance is MovementAffordance.JUMP
+                     and not intent.movement.jump_explicit))
         )
         current_loop = int(getattr(self.server, "loop_count", 0))
         wading_ascent = (
@@ -2872,6 +2910,12 @@ class BotDirector:
         bullet, never grant a hit through terrain.
         """
 
+        if distance <= 2.0:
+            # A cached blocked long ray must not silence point-blank combat
+            # after both players round its corner. The worker still needs a
+            # fresh visible target and native combat validates every shot.
+            return True
+
         if (
             distance > 2.0
             and now >= runtime.next_wall_probe_at
@@ -3071,8 +3115,10 @@ class BotDirector:
             self._commit_pending_action(runtime, action, now)
             return
         player_id = int(runtime.player.id)
-        if player_id in self._pending_gateway_actions:
-            return
+        # Refresh the validated command without moving this bot to the back
+        # of the queue. Worker refreshes replace command objects faster than
+        # a full roster can drain; retaining the old object starved actors
+        # whose turn arrived after its identity had already been retired.
         self._pending_gateway_actions[player_id] = (
             int(runtime.generation),
             action,
@@ -3084,24 +3130,31 @@ class BotDirector:
 
         if self._reconnect_count is not None:
             return 0
-        selected = tuple(self._pending_gateway_actions.items())[
-            :max(0, int(limit))
-        ]
+        budget = max(0, int(limit))
         committed = 0
-        for player_id, (generation, action, queued_at) in selected:
-            self._pending_gateway_actions.pop(player_id, None)
+        for player_id, (generation, action, queued_at) in tuple(self._pending_gateway_actions.items()):
+            if committed >= budget:
+                break
             runtime = self._runtime.get(int(player_id))
             if (
                 runtime is None
                 or int(runtime.generation) != int(generation)
                 or not self._runtime_is_live(runtime)
-                or runtime.pending_action is not action
+                or runtime.pending_action is None
                 or not runtime.player.alive
                 or not runtime.player.spawned
                 or (runtime.pending_action_life_id >= 0
                     and runtime.pending_action_life_id != _player_life_id(runtime.player))
             ):
+                self._pending_gateway_actions.pop(player_id, None)
                 continue
+            if runtime.pending_action is not action:
+                # A worker refresh may precede this actor's staggered motor
+                # tick. Keep its place until the motor validates the new
+                # action, and spend the fixed-step budget on another ready
+                # actor. Never execute the unvalidated replacement here.
+                continue
+            self._pending_gateway_actions.pop(player_id, None)
             self._commit_pending_action(
                 runtime,
                 action,
@@ -3365,6 +3418,19 @@ class BotDirector:
             if ordinary_walk and not wading
             else 0.65
         )
+        intent = getattr(runtime, "intent", None)
+        movement = getattr(intent, "movement", None)
+        if (ordinary_walk and not wading and speed < 0.1 and intent is not None
+                and BotDirector._has_travel_target(intent)
+                and float(getattr(movement, "travel_arrival_radius", 0.35)) < 0.35):
+            waypoint = movement.travel_waypoint
+            to_x, to_y = waypoint[0]-player.x, waypoint[1]-player.y
+            remaining = math.hypot(to_x, to_y)
+            if (0.0 < remaining <= 0.65 and abs(waypoint[2]-player.z) < 0.25
+                    and (to_x*dx + to_y*dy)/remaining > 0.95):
+                # Precise centring ends inside this block. Probe its actual
+                # capsule path rather than a full stride off the far edge.
+                probe_distance = min(probe_distance, max(0.01, remaining))
         walk_drop = int(getattr(runtime, "walk_drop_allowance", 1)) if ordinary_walk else 1
         probe_key = (
             int(round(float(player.x) * 8.0)),
@@ -3571,7 +3637,8 @@ class BotDirector:
         # away with a frozen vector or immediately reverse back through it.
         # A lower floor is not arrival at an elevated destination.
         at_height = float(player.z) <= float(waypoint[2]) + 1.0
-        if at_height and (remaining <= .35 or along <= 0.0 and across <= .55):
+        arrival = max(0.01, min(0.35, float(getattr(movement, "travel_arrival_radius", 0.35))))
+        if at_height and (remaining <= arrival or along <= 0.0 and across <= .55):
             return (0.0, 0.0, 0.0)
         if remaining <= 1e-6:
             return (0.0, 0.0, 0.0)
@@ -3895,6 +3962,36 @@ class BotDirector:
         runtime.motor.gaze_yaw = None
         runtime.motor.gaze_pitch = None
 
+    def _settle_aim(self, runtime: _RuntimeBot, dt: float) -> None:
+        """A live intention without a look: let an unfinished turn come to rest.
+
+        Route segments end with a frame that carries no look at all. Freezing
+        the head mid-turn there, then resuming on the next frame, read as a
+        stutter. The committed purposeful gaze is finished with the relaxed
+        dynamics and then released; nothing new is ever started here, so the
+        old planning_wait swing cannot return.
+        """
+        motor = runtime.motor
+        if (motor.gaze_yaw is None or motor.gaze_pitch is None
+                or motor.gaze_purpose not in _PURPOSEFUL_GAZE
+                or (abs(motor.yaw_velocity) < math.radians(1.)
+                    and abs(motor.pitch_velocity) < math.radians(1.))):
+            self._hold_aim(runtime)
+            return
+        speed, stiffness, acceleration = self._gaze_dynamics(runtime.profile, "glance")
+        motor.yaw, motor.yaw_velocity, motor.yaw_acceleration = self._smooth_gaze_axis(
+            motor.yaw, motor.yaw_velocity, motor.yaw_acceleration,
+            motor.gaze_yaw, speed, stiffness, dt, wrap=True, max_acceleration=acceleration)
+        motor.pitch, motor.pitch_velocity, motor.pitch_acceleration = self._smooth_gaze_axis(
+            motor.pitch, motor.pitch_velocity, motor.pitch_acceleration,
+            motor.gaze_pitch, speed * .75, stiffness, dt, wrap=False,
+            max_acceleration=acceleration * .75)
+        motor.pitch = max(-1.35, min(1.35, motor.pitch))
+        cos_pitch = math.cos(motor.pitch)
+        runtime.player.set_orientation_vector(
+            math.cos(motor.yaw) * cos_pitch, math.sin(motor.yaw) * cos_pitch,
+            math.sin(motor.pitch))
+
     def _update_aim(
         self,
         runtime: _RuntimeBot,
@@ -3933,7 +4030,7 @@ class BotDirector:
                        if planar > 1e-6 else motor.yaw)
         desired_pitch = max(-1.35, min(1.35,
             math.atan2(dz, max(planar, 1e-6)) + pitch_error))
-        if purpose in {"travel", "focus", "traverse"}:
+        if purpose in _PURPOSEFUL_GAZE:
             self._update_purposeful_gaze(runtime, desired_yaw, desired_pitch, dt, purpose)
         else:
             # A visible target, selected world cell or short traversal step
@@ -3976,42 +4073,122 @@ class BotDirector:
         head; a short exact step (``traverse``) is followed at once.
         """
         motor, profile = runtime.motor, runtime.profile
-        dwell = (0.0 if purpose == "traverse"
+        prompt = purpose in ("traverse", "glance")
+        dwell = (0.0 if prompt
                  else .16 + .10 * profile.caution + .06 * (1.0 - profile.skill))
+        # After one real turn the head is not re-aimed at every following
+        # wobble of the route: within this window a changed direction has to
+        # stay put for the dwell before it is adopted. A genuine corner from
+        # a settled walk is still followed at once.
+        hold = 0.0 if prompt else .85 + .25 * float(profile.caution)
         if motor.gaze_purpose != purpose or motor.gaze_yaw is None:
+            if motor.gaze_purpose in ("glance", "focus") and not prompt:
+                # Coming back from a look aside is a relaxed movement too,
+                # not a flick to the route; the keys never left the route.
+                motor.gaze_ease = .45
             motor.gaze_yaw, motor.gaze_pitch = motor.yaw, motor.pitch
-            motor.gaze_age = dwell
+            motor.gaze_age = max(dwell, hold)
             motor.gaze_purpose = purpose
+            motor.gaze_candidate_age = 0.0
         motor.gaze_age += max(0., dt)
+        motor.gaze_ease = max(0., motor.gaze_ease - max(0., dt))
         yaw_change = abs(self._wrap(yaw - motor.gaze_yaw))
         pitch_change = abs(pitch - motor.gaze_pitch)
-        yaw_deadzone = math.radians(2.0 if purpose == "travel" else 1.0)
-        if (max(yaw_change, pitch_change) >= math.radians(12.)
-                or (motor.gaze_age >= dwell
-                    and (yaw_change > yaw_deadzone or pitch_change > math.radians(.6)))):
-            motor.gaze_yaw, motor.gaze_pitch = yaw, pitch
-            motor.gaze_age = 0.0
-        # Temperament still shows: a casual hand is a little slower to the
-        # new heading than an expert, but nobody pans like a security camera.
-        stiffness = 9.0 + 1.6 * float(profile.turn_speed)
-        speed = 6.0 + float(profile.turn_speed)
+        yaw_deadzone = math.radians(4.0 if purpose == "travel" else
+                                    .5 if purpose == "glance" else 1.0)
+        changed = yaw_change > yaw_deadzone or pitch_change > math.radians(.6)
+        if changed:
+            big = max(yaw_change, pitch_change) >= math.radians(12.)
+            if prompt or (big and motor.gaze_age >= hold):
+                motor.gaze_yaw, motor.gaze_pitch = yaw, pitch
+                motor.gaze_age = 0.0
+                motor.gaze_candidate_age = 0.0
+            else:
+                # A direction that keeps near the same bearing is adopted as
+                # its recent average once it has lasted the dwell; one that
+                # jumps about is not adopted at all. (A longer wait for small
+                # changes was tried and dropped: the pillar skill recentres
+                # with small looks and missed its jump.)
+                blend = min(1., max(0., dt) / .25)
+                if (abs(self._wrap(yaw - motor.gaze_candidate_yaw)) <= math.radians(15.)
+                        and abs(pitch - motor.gaze_candidate_pitch) <= math.radians(8.)
+                        and motor.gaze_candidate_age > 0.0):
+                    motor.gaze_candidate_yaw = self._wrap(
+                        motor.gaze_candidate_yaw
+                        + blend * self._wrap(yaw - motor.gaze_candidate_yaw))
+                    motor.gaze_candidate_pitch += blend * (pitch - motor.gaze_candidate_pitch)
+                    motor.gaze_candidate_age += max(0., dt)
+                else:
+                    motor.gaze_candidate_yaw, motor.gaze_candidate_pitch = yaw, pitch
+                    motor.gaze_candidate_age = max(1e-9, max(0., dt))
+                if motor.gaze_candidate_age >= dwell:
+                    motor.gaze_yaw = motor.gaze_candidate_yaw
+                    motor.gaze_pitch = motor.gaze_candidate_pitch
+                    motor.gaze_age = 0.0
+                    motor.gaze_candidate_age = 0.0
+        else:
+            motor.gaze_candidate_age = 0.0
+        speed, stiffness, acceleration = self._gaze_dynamics(profile, purpose)
+        if purpose in ("focus", "glance"):
+            # Like a saccade, a bigger turn of the head is a faster one: a
+            # look over the shoulder at a shot behind is a whip, a few
+            # degrees aside while walking is a drift.
+            remaining = abs(self._wrap(motor.gaze_yaw - motor.yaw))
+            speed *= 1.0 + max(0.0, (remaining - math.radians(35.)) / math.radians(90.))
+        if motor.gaze_ease > 0.0:
+            relaxed_speed, relaxed_stiffness, _ = self._gaze_dynamics(profile, "glance")
+            speed = min(speed, relaxed_speed * 1.4)
+            stiffness = min(stiffness, relaxed_stiffness + 2.0)
         motor.yaw, motor.yaw_velocity, motor.yaw_acceleration = self._smooth_gaze_axis(
             motor.yaw, motor.yaw_velocity, motor.yaw_acceleration,
-            motor.gaze_yaw, speed, stiffness, dt, wrap=True)
+            motor.gaze_yaw, speed, stiffness, dt, wrap=True,
+            max_acceleration=acceleration)
         motor.pitch, motor.pitch_velocity, motor.pitch_acceleration = self._smooth_gaze_axis(
             motor.pitch, motor.pitch_velocity, motor.pitch_acceleration,
-            motor.gaze_pitch, speed * .75, stiffness, dt, wrap=False)
+            motor.gaze_pitch, speed * .75, stiffness, dt, wrap=False,
+            max_acceleration=acceleration * .75)
+
+    @staticmethod
+    def _gaze_dynamics(profile: BotProfile, purpose: str) -> tuple[float, float, float]:
+        """Max speed (rad/s), stiffness (1/s) and max acceleration (rad/s^2).
+
+        Steering turns (``travel``/``traverse``) stay quick because the keys
+        are relative to the view: a 90 degree corner still settles in under
+        half a second. Their speed is capped so no motor tick swings the
+        head more than about 45 degrees. Looks that are not steering
+        (``focus`` on a watched point, a ``glance`` aside or a slow scan) use
+        relaxed dynamics: a casual turn of the head at roughly 160-185
+        degrees per second for anything up to a right angle; the caller
+        scales that up for a look right round over the shoulder, which is a
+        quicker movement in life too, still well short of a steering snap.
+        Temperament shows through ``turn_speed``; nobody pans like a security
+        camera.
+        """
+        turn_speed = float(profile.turn_speed)
+        if purpose in ("focus", "glance"):
+            return (2.35 + .12 * turn_speed, 6.5 + .5 * turn_speed,
+                    40. + 1.5 * float(profile.turn_acceleration))
+        return (7.0 + .2 * turn_speed, 11.8 + .5 * turn_speed,
+                max(60., 8. * float(profile.turn_acceleration)))
 
     def _smooth_gaze_axis(self, current: float, velocity: float, acceleration: float,
                           target: float, max_speed: float, stiffness: float,
-                          dt: float, *, wrap: bool) -> tuple[float, float, float]:
-        """Critically damped turn: fastest approach that never overshoots."""
-        elapsed = max(0., min(.25, dt))
+                          dt: float, *, wrap: bool,
+                          max_acceleration: float = 120.) -> tuple[float, float, float]:
+        """Critically damped turn: fastest approach that never overshoots.
+
+        A late motor tick (a loop stall of up to 250 ms) does not make the
+        head catch up in one jump: the turn advances by at most 120 ms per
+        call and finishes on the following ticks. Only the look is delayed;
+        the keys are derived from world-space directions regardless.
+        """
+        elapsed = max(0., min(.12, dt))
         steps = max(1, int(math.ceil(elapsed * 120.)))
         step = elapsed / steps
         for _ in range(steps):
             error = self._wrap(target - current) if wrap else target - current
-            acceleration = stiffness * stiffness * error - 2.0 * stiffness * velocity
+            acceleration = max(-max_acceleration, min(max_acceleration,
+                stiffness * stiffness * error - 2.0 * stiffness * velocity))
             velocity = max(-max_speed, min(max_speed, velocity + acceleration * step))
             current += velocity * step
             if wrap:

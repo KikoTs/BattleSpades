@@ -363,6 +363,7 @@ class PrefabActionService:
         color=None,
         loop_count: int | None = None,
         snap_to_surface: bool = False,
+        enforce_player_reach: bool = False,
     ) -> bool:
         """Place one selected prefab through stock packet replication.
 
@@ -437,13 +438,13 @@ class PrefabActionService:
         # surface); only client packets need the reach bound.
         if (
             not editor_native
-            and not bool(getattr(player, "is_bot", False))
+            and (enforce_player_reach or not bool(getattr(player, "is_bot", False)))
             and not self._within_build_reach(player, in_world)
         ):
             return False
         if (
             not editor_native
-            and not bool(getattr(player, "is_bot", False))
+            and (enforce_player_reach or not bool(getattr(player, "is_bot", False)))
             and not self._footprint_visible(player, in_world)
         ):
             return False

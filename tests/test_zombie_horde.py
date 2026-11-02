@@ -291,13 +291,349 @@ def test_elevated_survivor_gets_diggers_at_the_roots_and_a_ring_not_a_pile():
     assert ring and len({(round(g[0]), round(g[1])) for g in ring}) == len(ring)
 
 
-def test_elevated_survivor_without_cut_gets_two_climbers():
+def test_elevated_survivor_without_cut_gets_most_of_the_roster_as_committed_climbers():
     survivor = SurvivorTarget(1, _stand(128.5, 128.5, 200))
     zombies = _members(*[_stand(120.5 + i, 120.5, FLOOR) for i in range(6)])
-    orders = HordeCoordinator().plan(
+    coordinator = HordeCoordinator()
+    orders = coordinator.plan(
         zombies, [survivor], {1: SiegeInfo(True, FLOOR, None, 0.0)}, 0.0)
     roles = [o.role for o in orders.values()]
-    assert roles.count("climb") == 2 and roles.count("surround") == 4
+    # Two thirds work (climb, after staging on their side: flank), a bounded
+    # third waits; nobody idles when there is nothing to dig.
+    assert roles.count("climb") + roles.count("flank") == 4 and roles.count("surround") == 2
+    # The same bots stay the crew on the next snapshot (committed crews).
+    again = coordinator.plan(zombies, [survivor], {1: SiegeInfo(True, FLOOR, None, 0.0)}, 0.5)
+    assert {z for z, o in orders.items() if o.role in ("climb", "flank")} == {
+        z for z, o in again.items() if o.role in ("climb", "flank")}
+
+
+def _roof_pillar(roof_height: int = 12, pillar: int = 8) -> tuple[set, int, int]:
+    """A 9x9 solid building, a 1x1 pillar on its roof: what a player builds."""
+
+    cells = _ground(set())
+    roof = FLOOR - roof_height
+    _block(cells, range(124, 133), range(124, 133), range(roof, FLOOR))
+    top = roof - pillar
+    for z in range(top, roof):
+        cells.add((128, 128, z))
+    return cells, roof, top
+
+
+def test_a_pillar_on_a_roof_is_cut_at_its_foot_from_the_roof():
+    cells, roof, top = _roof_pillar()
+    solid = _solid(cells)
+    survivor = _stand(128.5, 128.5, top)
+    plan = plan_collapse(solid, support_cells(solid, survivor), ground_floor_z=FLOOR)
+    assert plan is not None
+    # The cheapest cut is the voxel a zombie standing on the roof can claw,
+    # not one hanging half way up the pillar.
+    assert len(plan.cut) == 1 and plan.cut[0][2] >= roof - 3
+    assert _server_drops(cells, set(plan.cut), support_cells(solid, survivor))
+    from server.bot_ai.horde_strategy import dig_stand_spot
+    stand = dig_stand_spot(solid, plan.sites[0], FLOOR, survivor)
+    assert stand is not None and round(stand[2] + 2.25) == roof
+
+
+def test_roof_pillar_sends_climbers_to_the_roof_and_diggers_once_they_are_up():
+    cells, roof, top = _roof_pillar()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    found = approach(solid, survivor.position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, survivor.position)}
+    coordinator = HordeCoordinator()
+    # Eight zombies on the ground round the building.
+    ground = _members(*[_stand(118.5 + (i % 4) * 6, 118.5 + (i // 4) * 20, FLOOR) for i in range(8)])
+    orders = coordinator.plan(ground, [survivor], siege, 0.0, solid=solid)
+    roles = [o.role for o in orders.values()]
+    assert roles.count("dig_root") == 0, "nobody on the ground can claw a pillar foot on the roof"
+    crew = [o for o in orders.values() if o.role in ("climb", "flank")]
+    assert len(crew) >= 2
+    # Their work is the pillar's foot (the cut site); a climber already on
+    # its side is sent up to the roof beside it, the others round to a side.
+    assert all(o.aim == plan.sites[0] for o in crew)
+    climbers = [o for o in crew if o.role == "climb"]
+    assert all(round(o.goal[2] + 2.25) == roof for o in climbers)
+    assert all(math.dist(o.goal[:2], survivor.position[:2]) <= 3.0 for o in climbers)
+    staging = [o for o in crew if o.role == "flank"]
+    assert all(round(o.goal[2] + 2.25) == FLOOR for o in staging)
+    # Nobody is sent to wait under him on the ground (the roof beside the
+    # pillar's foot is where the work is, eight blocks below him or not).
+    ground_goals = [o.goal for o in orders.values() if round(o.goal[2] + 2.25) >= FLOOR - 1]
+    assert pile_count(survivor.position, ground_goals) == 0
+    # Two of them have made it up: they get the claw work, at roof level.
+    up = list(ground)
+    up[0] = HordeMember(up[0].player_id, _stand(126.5, 128.5, roof))
+    up[1] = HordeMember(up[1].player_id, _stand(130.5, 128.5, roof))
+    orders = coordinator.plan(up, [survivor], siege, 1.0, solid=solid)
+    diggers = [o for o in orders.values() if o.role == "dig_root"]
+    assert {o.zombie_id for o in diggers} <= {up[0].player_id, up[1].player_id}
+    assert diggers and all(set(o.cells) <= set(plan.cut) for o in diggers)
+    assert all(round(o.goal[2] + 2.25) == roof for o in diggers)
+
+
+def test_zombies_standing_above_the_prey_hunt_down_instead_of_climbing():
+    cells, roof, top = _roof_pillar()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    siege = {1: SiegeInfo(True, FLOOR, None, 0.0, approach(solid, survivor.position),
+                          survivor.position)}
+    # Two zombies on a neighbouring roof twelve blocks above his head, two
+    # on the ground below him.
+    high = _members(_stand(140.5, 128.5, top - 12), _stand(140.5, 130.5, top - 12))
+    low = [HordeMember(30, _stand(118.5, 128.5, FLOOR)), HordeMember(31, _stand(119.5, 134.5, FLOOR))]
+    orders = HordeCoordinator().plan(high + low, [survivor], siege, 0.0, solid=solid)
+    assert all(orders[m.player_id].role == "hunt" for m in high)
+    assert all(orders[m.player_id].role in ("climb", "flank", "surround") for m in low)
+
+
+def test_zombies_already_on_the_preys_roof_hunt_him_while_the_rest_climb():
+    cells, roof, top = _roof_pillar()
+    solid = _solid(cells)
+    # He fell to the roof; two zombies made it up there, two are below.
+    survivor = SurvivorTarget(1, _stand(129.5, 128.5, roof))
+    siege = {1: SiegeInfo(True, FLOOR, None, 0.0, approach(solid, survivor.position),
+                          survivor.position)}
+    up = _members(_stand(126.5, 128.5, roof), _stand(130.5, 131.5, roof))
+    low = [HordeMember(30, _stand(118.5, 128.5, FLOOR)), HordeMember(31, _stand(119.5, 134.5, FLOOR))]
+    coordinator = HordeCoordinator()
+    orders = coordinator.plan(up + low, [survivor], siege, 0.0, solid=solid)
+    assert all(orders[m.player_id].role == "hunt" for m in up)
+    assert all(orders[m.player_id].role in ("climb", "flank", "surround") for m in low)
+    # And with no analysis at all (he has just fallen), the same: the ones
+    # beside him are not spread into a siege.
+    orders = HordeCoordinator().plan(up + low, [survivor], {}, 0.0, solid=solid)
+    assert all(orders[m.player_id].role == "hunt" for m in up)
+
+
+def test_climbers_stage_on_distinct_sides_hidden_from_the_survivor_first():
+    from server.bot_ai.horde_strategy import visible
+
+    cells, roof, top = _roof_pillar()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    found = approach(solid, survivor.position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, survivor.position)}
+    coordinator = HordeCoordinator()
+    # Six zombies all arriving from the west.
+    zombies = _members(*[_stand(100.5, 122.5 + 2 * i, FLOOR) for i in range(6)])
+    orders = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    staging = [o for o in orders.values() if o.role == "flank"]
+    assert len(staging) >= 3, "far climbers walk round to their sides first"
+    bearings = {round(math.atan2(o.goal[1] - 128.5, o.goal[0] - 128.5) / (math.pi / 4)) % 8
+                for o in staging}
+    assert len(bearings) >= 3, "the sides are distinct"
+    # A zombie standing on its side is sent up from there.
+    side = staging[0]
+    member = next(m for m in zombies if m.player_id == side.zombie_id)
+    arrived = [HordeMember(m.player_id, side.goal if m is member else m.position) for m in zombies]
+    again = coordinator.plan(arrived, [survivor], siege, 0.5, solid=solid)
+    assert again[member.player_id].role == "climb"
+    assert round(again[member.player_id].goal[2] + 2.25) == roof
+    # Eyes: the ground against the building's far wall is hidden from a man
+    # on a pillar in the middle of the roof; the open street is not.
+    eye = (128.5, 128.5, survivor.position[2] - 0.6)
+    assert not visible(solid, eye, (134.5, 128.5, FLOOR - 2.25 - 0.9))
+    assert visible(solid, eye, (150.5, 128.5, FLOOR - 2.25 - 0.9))
+
+
+def _tree_walkway(span: int = 40) -> tuple[set, dict, tuple]:
+    """A tree (3x3 trunk, leafy crown) with a one-wide walkway built from its
+    crown ``span`` blocks east and a short pillar at the end; Kiril's case."""
+
+    cells = _ground(set(), lo=60, hi=200)
+    x, y = 100, 128
+    for cx in range(x - 1, x + 2):
+        for cy in range(y - 1, y + 2):
+            for z in range(FLOOR - 12, FLOOR):
+                cells.add((cx, cy, z))
+    centre = (x, y, FLOOR - 15)
+    for cx in range(x - 5, x + 6):
+        for cy in range(y - 5, y + 6):
+            for cz in range(FLOOR - 20, FLOOR - 9):
+                if (cx - centre[0]) ** 2 + (cy - centre[1]) ** 2 + (cz - centre[2]) ** 2 <= 25:
+                    cells.add((cx, cy, cz))
+    for k in range(4, span + 1):
+        cells.add((x + k, y, FLOOR - 18))
+    for z in range(FLOOR - 22, FLOOR - 18):
+        cells.add((x + span, y, z))
+    heights: dict = {}
+
+    def height(hx, hy):
+        key = (hx, hy)
+        if key not in heights:
+            column = [z for (cx, cy, z) in cells if cx == hx and cy == hy]
+            heights[key] = min(column) if column else 240
+        return heights[key]
+
+    return cells, height, (x + span + 0.5, y + 0.5, FLOOR - 22 - 2.25)
+
+
+def test_a_walkway_built_from_a_tree_is_cut_at_the_trunk_not_in_mid_air():
+    from server.bot_ai.structure_collapse import plan_foundation
+
+    cells, height, survivor = _tree_walkway()
+    solid = _solid(cells)
+    support = support_cells(solid, survivor)
+    exact = plan_collapse(solid, support, ground_floor_z=FLOOR)
+    # The exact planner, bounded in the crown, can only offer a walkway
+    # voxel hanging in the air (or nothing): no stand reaches it.
+    assert exact is None or all(c[2] <= FLOOR - 17 for c in exact.cut)
+    plan = plan_foundation(solid, height, support, ground_floor_z=FLOOR)
+    assert plan is not None
+    # The trunk's base, two layers (an edge joins a voxel to ground one
+    # block higher beside it); one claw cube takes both layers of a site.
+    assert set(plan.cut) == {(cx, cy, FLOOR - k) for cx in (99, 100, 101)
+                             for cy in (127, 128, 129) for k in (1, 2)}
+    assert len(plan.sites) <= 2
+    assert _server_drops(cells, set(plan.cut), support)
+
+
+def test_a_hill_has_no_foundation_to_cut():
+    from server.bot_ai.structure_collapse import plan_foundation
+
+    cells = _hill()
+    solid = _solid(cells)
+    top = min(z for (x, y, z) in cells if x == 128 and y == 128)
+
+    def height(hx, hy):
+        column = [z for (cx, cy, z) in cells if cx == hx and cy == hy]
+        return min(column) if column else 240
+
+    survivor = _stand(128.5, 128.5, top)
+    assert plan_foundation(solid, height, support_cells(solid, survivor),
+                           ground_floor_z=FLOOR) is None
+
+
+def test_the_horde_digs_the_trunk_under_a_survivor_forty_blocks_out_on_his_walkway():
+    cells, height, survivor_position = _tree_walkway()
+    world = SimpleNamespace(map_name="tree-walkway", get_solid=_solid(cells), get_height=height)
+    target = _actor(1, survivor_position, bot=False, loadout=())
+    # Eight zombies on the ground between the tree and the survivor's end.
+    zombies = [_actor(10 + i, _stand(110.5 + 3 * i, 124.5 + 8 * (i % 2), FLOOR)) for i in range(8)]
+    mode = _FakeZombieMode([target], zombies)
+    service = ZombieSiegeService(budget_clock=_Steps())
+    orders = []
+    for tick in range(600):
+        orders = service.objectives(mode, world, now=100.0 + tick * 0.1)
+        if service.stats.get("foundations_found"):
+            break
+    assert service.stats.get("foundations_found") == 1, service.stats
+    foundation = service._analyses[1].info.foundation
+    assert foundation is not None and all(c[2] in (FLOOR - 1, FLOOR - 2) for c in foundation.cut)
+    # The next orders send diggers to the trunk, on the ground, and nobody
+    # is asked to build a stack twenty blocks tall under the walkway.
+    orders = service.objectives(mode, world, now=170.0)
+    diggers = [o for o in orders if o.state == 2]
+    assert diggers, [o.state for o in orders]
+    for order in diggers:
+        assert set(order.cells) <= set(foundation.cut)
+        assert math.dist(order.position[:2], (100.5, 128.5)) <= 4.0
+        assert round(order.position[2] + 2.25) == FLOOR
+    assert not any(o.state == 3 and o.position[2] < FLOOR - 2.25 - 6 for o in orders), \
+        "no climber is sent twenty blocks up a walkway when the trunk is nine voxels"
+
+
+def test_hunters_at_the_foot_of_an_elevated_prey_wait_on_the_ring_not_under_him():
+    # A pillar six high: too low for the horde to spread into a siege before
+    # the analysis, high enough that nobody jumps up. Four hunters already
+    # under the top, one still twenty blocks out, no SiegeInfo yet.
+    cells = _ground(set())
+    cells.update((128, 128, z) for z in range(FLOOR - 6, FLOOR))
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, FLOOR - 6))
+    under = _members(*[_stand(127.5 + i % 2, 127.5 + i // 2, FLOOR) for i in range(4)])
+    far = HordeMember(40, _stand(108.5, 128.5, FLOOR))
+    orders = HordeCoordinator().plan(under + [far], [survivor], {}, 0.0, solid=solid)
+    assert orders[40].role == "hunt"
+    for member in under:
+        order = orders[member.player_id]
+        assert order.role == "flank"
+        assert math.dist(order.goal[:2], survivor.position[:2]) >= 3.5
+    assert pile_count(survivor.position, [o.goal for o in orders.values()]) == 0
+
+
+def test_the_waiting_ring_paces_round_the_foot_each_on_its_own_beat():
+    cells = _sky_platform()
+    solid = _solid(cells)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, 210))
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    found = approach(solid, survivor.position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, survivor.position)}
+    zombies = _members(*[_stand(100.5 + i, 100.5, FLOOR) for i in range(16)])
+    coordinator = HordeCoordinator()
+    first = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    waiting = [z for z, o in first.items() if o.role == "surround"]
+    assert len(waiting) >= 4
+    later = coordinator.plan(zombies, [survivor], siege, 4.0, solid=solid)
+    moved = [z for z in waiting if later[z].role == "surround"
+             and math.dist(later[z].goal[:2], first[z].goal[:2]) >= 2.0]
+    assert len(moved) >= len(waiting) // 2, "a waiting zombie moves on to the next spot"
+    # Not all at the same instant: half a beat later only some have moved.
+    half = coordinator.plan(zombies, [survivor], siege, 2.0, solid=solid)
+    changed = sum(1 for z in waiting if half[z].role == "surround"
+                  and math.dist(half[z].goal[:2], first[z].goal[:2]) >= 2.0)
+    assert 0 < changed < len(waiting)
+    for order in later.values():
+        assert pile_count(survivor.position, [order.goal]) == 0
+
+
+def test_a_climber_getting_nowhere_is_sent_to_another_destination():
+    cells = _keep()
+    solid = _solid(cells)
+    top = min(z for x, y, z in cells if x == 128 and y == 128)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    # No cut (a keep is too thick): the climb destinations are the keep's
+    # own roof cells within claw reach of him.
+    siege = {1: SiegeInfo(True, FLOOR, None, 0.0, approach(solid, survivor.position),
+                          survivor.position)}
+    zombies = _members(*[_stand(118.5, 120.5 + 2 * i, FLOOR) for i in range(4)])
+    coordinator = HordeCoordinator()
+    orders = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    crew = [o for o in orders.values() if o.role in ("climb", "flank")]
+    assert crew
+    # Everyone walks round to the side it holds; from there the climb starts.
+    staged = [HordeMember(m.player_id, orders[m.player_id].goal
+                          if orders[m.player_id].role == "flank" else m.position)
+              for m in zombies]
+    orders = coordinator.plan(staged, [survivor], siege, 1.0, solid=solid)
+    climber = next(o for o in orders.values() if o.role == "climb")
+    assert round(climber.goal[2] + 2.25) == top
+    member = next(m for m in staged if m.player_id == climber.zombie_id)
+    coordinator._escalate(climber, member, survivor, 2, solid, 10.0)
+    again = coordinator.plan(staged, [survivor], siege, 10.1, solid=solid)
+    assert again[climber.zombie_id].role == "climb"
+    assert math.dist(again[climber.zombie_id].goal, climber.goal) >= 1.0
+
+
+def test_a_digger_moves_in_on_the_last_buried_voxel_of_a_cut():
+    cells = _tower()
+    solid = _solid(cells)
+    top = min(z for x, y, z in cells if x == 128 and y == 128)
+    survivor = SurvivorTarget(1, _stand(128.5, 128.5, top))
+    plan = plan_collapse(solid, support_cells(solid, survivor.position), ground_floor_z=FLOOR)
+    assert len(plan.cut) == 9
+    coordinator = HordeCoordinator()
+    zombies = _members(_stand(124.5, 126.5, FLOOR), _stand(132.5, 130.5, FLOOR))
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0)}
+    coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    # Eight of the nine are dug; the core voxel stands.
+    core = (128, 128, FLOOR - 1)
+    for cell in plan.cut:
+        if cell != core:
+            cells.discard(cell)
+    orders = coordinator.plan(zombies, [survivor], siege, 2.0, solid=solid)
+    diggers = [o for o in orders.values() if o.role == "dig_root"]
+    assert diggers
+    for order in diggers:
+        assert order.cells == (core,)
+        # The stand is re-sited on the core (the nearest legal floor: the
+        # cells inside the footprint have the layer above for a ceiling),
+        # not left where the outer voxel used to be.
+        assert max(abs(order.goal[0] - 128.5), abs(order.goal[1] - 128.5)) <= 2.0
+        assert order.aim == core
+    assert len({o.goal for o in diggers}) == len(diggers)
 
 
 def test_dug_cut_voxels_drop_out_of_dig_orders():
@@ -384,6 +720,32 @@ def test_worker_claws_the_assigned_cut_voxel():
     assert intent.debug_role == "zombie_siege_dig"
 
 
+@pytest.mark.parametrize("height", [-8.0, 8.0])
+def test_visible_survivor_on_another_floor_does_not_interrupt_horde_work(height):
+    cut = (121, 128, 229)
+    brain = _brain({cut})
+    zombie = replace(_zombie(10, (119.5, 128.5, 227.75)),
+                     last_damage_source_id=1, last_damage_at=99.0)
+    survivor = _player(1, SURVIVOR_TEAM,
+                       (119.5, 128.5, zombie.position[2] + height))
+    order = ObjectiveSnapshot("zombie_order", ZOMBIE_TEAM, zombie.position,
+                              carrier_id=10, state=2, attacker=1, cells=(cut,))
+    frame = _frame("zom", zombie, survivor, objectives=(order,), now=100.0)
+    decision = objective_decision_for(frame, zombie)
+    assert brain._visible_target(frame, zombie, _BotState(10, 1, 1), decision) is None
+
+
+def test_horde_digger_still_fights_a_survivor_within_claw_reach():
+    brain = _brain(set())
+    zombie = _zombie(10, (119.5, 128.5, 227.75))
+    survivor = _player(1, SURVIVOR_TEAM, (121.0, 128.5, 227.75))
+    order = ObjectiveSnapshot("zombie_order", ZOMBIE_TEAM, zombie.position,
+                              carrier_id=10, state=2, attacker=1)
+    frame = _frame("zom", zombie, survivor, objectives=(order,))
+    decision = objective_decision_for(frame, zombie)
+    assert brain._visible_target(frame, zombie, _BotState(10, 1, 1), decision) is survivor
+
+
 # ------------------------------------------------------ gameplay-thread glue
 
 class _FakeZombieMode:
@@ -429,6 +791,76 @@ def test_service_publishes_siege_orders_within_budget_and_drops_the_platform():
     assert service.stats["plans_found"] >= 1
 
 
+def test_a_survivor_pacing_his_roof_is_analysed_on_the_move_and_keeps_his_analysis():
+    """A player walking about a roof top never settles; the horde must not wait."""
+
+    roof = FLOOR - 12
+    cells = _ground(set())
+    cells.update((x, y, roof) for x in range(120, 137) for y in range(120, 137))
+    cells.update((x, y, z) for cx, cy in ((120, 120), (135, 120), (120, 135), (135, 135))
+                 for x in (cx, cx + 1) for y in (cy, cy + 1) for z in range(roof + 1, FLOOR))
+    solid = lambda x, y, z: (x, y, z) in cells
+    world = SimpleNamespace(map_name="roof-walker", get_solid=solid)
+    target = _actor(1, _stand(124.5, 128.5, roof), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(118.5 + i % 4, 126.5 + i // 4, FLOOR)) for i in range(8)]
+    mode = _FakeZombieMode([target], zombies)
+    service = ZombieSiegeService(budget_clock=_Steps())
+    roles = []
+    for tick in range(120):
+        now = 100.0 + tick * 0.1
+        # Three blocks along the roof every half second: never "settled".
+        if tick % 5 == 0:
+            stride = (tick // 5) % 3
+            target.position = _stand(124.5 + 3.0 * stride, 128.5, roof)
+        orders = service.objectives(mode, world, now=now)
+        roles.append(sorted(o.state for o in orders))
+    assert service.stats["analyses"] >= 1, "an elevated survivor is analysed though he never settles"
+    # Walking along the explored roof did not restart the flood every time:
+    # the analysis followed him instead.
+    assert service.stats.get("followed", 0) >= 3
+    assert service.stats["analyses"] <= 4
+    analysis = service._analyses[1]
+    # Within a stride of him (the follow waits for the job slot).
+    assert math.dist(analysis.position, target.position) <= 3.5
+    # Over the second half of the run the horde was besieging (climbers or a
+    # ring), never a plain hunt at a prey it cannot walk to.
+    late = roles[60:]
+    assert all(any(code in (2, 3, 4) for code in codes) for codes in late if codes)
+    assert not any(all(code == 0 for code in codes) for codes in late if codes)
+
+
+def test_a_cut_in_hand_survives_a_climbers_prefab_placed_beside_it():
+    """Additions near the cut queue a fresh proof but do not idle the diggers."""
+
+    cells, roof, top = _roof_pillar()
+    world = _EditedWorld(cells)
+    target = _actor(1, _stand(128.5, 128.5, top), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(118.5 + i % 4, 126.5 + i // 4, FLOOR)) for i in range(6)]
+    mode = _FakeZombieMode([target], zombies)
+    service = ZombieSiegeService(budget_clock=_Steps())
+    tick = 0
+    while tick < 300 and not service.stats["plans_found"]:
+        service.objectives(mode, world, now=100.0 + tick * 0.1)
+        tick += 1
+    assert service.stats["plans_found"] == 1
+    cut = service._analyses[1].info.plan.cut
+    # A teammate stacks a prefab against the building beside the pillar's
+    # foot: solid voxels added within a few blocks of the cut.
+    for z in range(roof - 4, roof):
+        world.edit((131, 128, z), True)
+    with_plan = 0
+    for _ in range(60):
+        tick += 1
+        orders = service.objectives(mode, world, now=100.0 + tick * 0.1)
+        analysis = service._analyses[1]
+        with_plan += analysis.info.plan is not None
+    assert with_plan == 60, "the cut must stay in hand while the fresh proof runs"
+    assert service.stats.get("replans_on_additions", 0) >= 1
+    assert service.stats["plans"] >= 2, "a fresh proof was sought after the addition"
+    assert service._analyses[1].info.plan is not None
+    assert set(service._analyses[1].info.plan.cut) & set(cut) or service.stats["plans_found"] >= 2
+
+
 def test_service_is_silent_outside_the_outbreak_and_survives_errors():
     from modes.zombie import ZombiePhase
 
@@ -445,6 +877,71 @@ def test_service_is_silent_outside_the_outbreak_and_survives_errors():
 
     world.get_solid = broken
     assert service.objectives(mode, world, now=2.0) == []
+
+
+@pytest.mark.parametrize("height", (8, 32, 64, 128, 192))
+@pytest.mark.parametrize("population", (4, 16, 24))
+def test_high_roof_is_analysed_even_when_hunters_are_far_below(height, population):
+    roof = FLOOR - height
+    cells = _ground(set())
+    cells.update((x, y, roof) for x in range(125, 132) for y in range(125, 132))
+    cells.update((x, y, z) for cx, cy in ((125, 125), (130, 125), (125, 130), (130, 130))
+                 for x in (cx, cx + 1) for y in (cy, cy + 1)
+                 for z in range(roof + 1, FLOOR))
+    solid = lambda x, y, z: (x, y, z) in cells
+    world = SimpleNamespace(map_name="high-roof", get_solid=solid)
+    target = _actor(1, _stand(128.5, 128.5, roof), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(127.5 + i % 5, 127.5 + i // 5, FLOOR))
+               for i in range(population)]
+    mode = _FakeZombieMode([target], zombies)
+    service = ZombieSiegeService(budget_clock=_Steps())
+    first_analysis = None
+    for tick in range(250):
+        orders = service.objectives(mode, world, now=100 + tick * .1)
+        if service.stats["analyses"] and first_analysis is None:
+            first_analysis = tick
+        if service.stats["plans_found"]:
+            break
+    assert service.stats["analyses"] > 0, "height must never disable siege analysis"
+    assert len(orders) == population
+    assert first_analysis < 50, "nearby horde must begin analysing the roof within five seconds"
+    assert service.stats["plans_found"], "tall columns must not exhaust the ordinary graph limit"
+    plan = service._analyses[1].info.plan
+    assert plan is not None
+    assert _server_drops(cells, set(plan.cut), support_cells(solid, target.position))
+
+
+@pytest.mark.parametrize("span", (8, 24, 64, 128))
+@pytest.mark.parametrize("width", (1, 2, 3))
+def test_bridge_midpoint_plan_cuts_real_anchors_instead_of_digging_under_target(span, width):
+    roof = FLOOR - 64
+    start, end = 128 - span // 2, 128 + span // 2
+    # The remote foundations need actual standing ground. A 128-block span
+    # used to end outside the fixture's ground and receive fictitious dry
+    # work positions over the water plane.
+    cells = _ground(set(), lo=min(90,start-4), hi=max(170,end+4))
+    cells.update((x, y, roof) for x in range(start, end + 1) for y in range(128, 128 + width))
+    for anchor in (start, end):
+        cells.update((anchor, y, z) for y in range(128, 128 + width)
+                     for z in range(roof + 1, 240))
+    solid = lambda x, y, z: (x, y, z) in cells
+    world = SimpleNamespace(map_name="bridge-midpoint", get_solid=solid)
+    target = _actor(1, _stand(128.5, 128.5, roof), bot=False, loadout=())
+    zombies = [_actor(10 + i, _stand(125.5 + i % 4, 126.5 + i // 4, FLOOR)) for i in range(16)]
+    service = ZombieSiegeService(budget_clock=_Steps())
+    mode = _FakeZombieMode([target], zombies)
+    for tick in range(250):
+        orders = service.objectives(mode, world, now=100 + tick * .1)
+        if service.stats["plans_found"]:
+            break
+    assert service.stats["plans_found"], "a narrow bridge has legal foundation cuts"
+    diggers = [o for o in orders if o.state == 2]
+    assert diggers
+    cut = {c for order in diggers for c in order.cells}
+    # A plan is complete even if only a subset of diggers works on this tick.
+    plan = service._analyses[1].info.plan
+    assert all(c[0] in (start, end) for c in plan.cut)
+    assert _server_drops(cells, set(plan.cut), support_cells(solid, target.position))
 
 
 def test_far_stalled_hunter_never_tunnels_and_flank_spots_avoid_walls():
@@ -1029,3 +1526,188 @@ def test_a_claw_that_is_landing_is_kept_though_the_walk_looks_short_again():
     # Landed swings count as progress, which makes the walk look as short as
     # before the stall; the order must not flap back to it.
     assert set(roles[first:]) == {"tunnel"}
+
+
+# --- approach under fire -------------------------------------------------------
+
+def _roof_pillar_with_a_block_east() -> tuple[set, int, int]:
+    """The roof pillar, and a long 12-high building twenty blocks east of it:
+    the street behind that building is out of the pillar man's sight."""
+
+    cells, roof, top = _roof_pillar()
+    _ground(cells, lo=90, hi=200)
+    _block(cells, range(148, 157), range(104, 153), range(roof, FLOOR))
+    return cells, roof, top
+
+
+def test_far_zombies_rally_out_of_a_shooting_survivors_sight_and_go_as_a_wave():
+    from server.bot_ai.horde_strategy import RALLY_NEAR, WAVE_SECONDS, visible
+
+    cells, roof, top = _roof_pillar_with_a_block_east()
+    solid = _solid(cells)
+    position = _stand(128.5, 128.5, top)
+    survivor = SurvivorTarget(1, position, threat_until=1000.0)
+    plan = plan_collapse(solid, support_cells(solid, position), ground_floor_z=FLOOR)
+    found = approach(solid, position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, position)}
+    coordinator = HordeCoordinator()
+    far = [_stand(172.5, 118.5 + 4 * i, FLOOR) for i in range(5)]      # 44 blocks east
+    near = [_stand(134.5, 126.5, FLOOR), _stand(134.5, 130.5, FLOOR)]  # at the building's foot
+    on_roof = [_stand(152.5, 128.5, roof)]                             # up on the next roof
+    zombies = _members(*(far + near + on_roof))
+    orders = coordinator.plan(zombies, [survivor], siege, 0.0, solid=solid)
+    advancing = [o for o in orders.values() if o.role == "advance"]
+    assert len(advancing) == 5, "every far zombie on the street rallies first"
+    for o in orders.values():
+        if o.zombie_id in (15, 16):
+            assert o.role != "advance", "the two at his feet keep their work"
+    assert orders[17].role != "advance", "one already up a roof is not sent down to a street spot"
+    eye = (128.5, 128.5, position[2] - 0.6)
+    for o in advancing:
+        assert math.hypot(o.goal[0] - 128.5, o.goal[1] - 128.5) > RALLY_NEAR
+        body = (o.goal[0], o.goal[1], o.goal[2] - 0.9)
+        assert not visible(solid, eye, body), "a rally spot is out of his sight"
+        assert o.goal[0] > 157, "behind the eastern building, their own side"
+    assert len({tuple(int(v) for v in o.goal[:2]) for o in advancing}) >= 2
+    # Half of them standing on their spots release the wave: everyone walks in.
+    spots = {o.zombie_id: o.goal for o in advancing}
+    arrived = [HordeMember(m.player_id, spots[m.player_id] if m.player_id in (10, 11, 12) else m.position)
+               for m in zombies]
+    wave = coordinator.plan(arrived, [survivor], siege, 1.0, solid=solid)
+    assert not any(o.role == "advance" for o in wave.values())
+    assert coordinator.metrics.waves == 1
+    # Within the wave window a newcomer joins the rush; after it, it rallies.
+    newcomer = HordeMember(30, _stand(172.5, 140.5, FLOOR))
+    during = coordinator.plan(arrived + [newcomer], [survivor], siege, 1.0 + 5.0, solid=solid)
+    assert during[30].role != "advance"
+    # (The wave has walked in by then; two still standing on their spots
+    # would release the next one at once, which is the rule.)
+    walked = [HordeMember(m.player_id, _stand(136.5, 126.5 + (m.player_id % 5), FLOOR)
+                          if m.player_id in (10, 11, 12) else m.position) for m in arrived]
+    after = coordinator.plan(walked + [newcomer], [survivor], siege, 1.0 + WAVE_SECONDS + 0.5,
+                             solid=solid)
+    assert after[30].role == "advance"
+
+
+def test_a_lone_zombie_does_not_wait_for_a_wave_and_a_quiet_survivor_is_not_rallied_against():
+    cells, roof, top = _roof_pillar_with_a_block_east()
+    solid = _solid(cells)
+    position = _stand(128.5, 128.5, top)
+    plan = plan_collapse(solid, support_cells(solid, position), ground_floor_z=FLOOR)
+    found = approach(solid, position)
+    siege = {1: SiegeInfo(True, FLOOR, plan, 0.0, found, position)}
+    # Quiet: nobody has been shot. No rally, no gathering.
+    quiet = SurvivorTarget(1, position)
+    coordinator = HordeCoordinator()
+    zombies = _members(*[_stand(172.5, 118.5 + 4 * i, FLOOR) for i in range(4)])
+    assert not any(o.role == "advance"
+                   for o in coordinator.plan(zombies, [quiet], siege, 0.0, solid=solid).values())
+    # One zombie alone against a shooter: it goes via its hidden spot and on.
+    shooter = SurvivorTarget(1, position, threat_until=1000.0)
+    alone = _members(_stand(172.5, 128.5, FLOOR))
+    first = coordinator.plan(alone, [shooter], siege, 0.0, solid=solid)[10]
+    assert first.role == "advance"
+    there = [HordeMember(10, first.goal)]
+    assert coordinator.plan(there, [shooter], siege, 0.5, solid=solid)[10].role != "advance"
+
+
+def test_the_service_marks_a_survivor_dangerous_from_hits_and_kills():
+    import time as _time
+
+    from server.bot_ai.zombie_siege import THREAT_SECONDS
+
+    from modes.zombie import SURVIVOR_TEAM as REAL_SURVIVORS, ZOMBIE_TEAM as REAL_ZOMBIES
+
+    service = ZombieSiegeService(budget_seconds=0.002)
+    survivor = _actor(1, _stand(128.5, 128.5, FLOOR), bot=False, loadout=())
+    zombie = _actor(10, _stand(150.5, 128.5, FLOOR))
+    mode = _FakeZombieMode([survivor], [zombie])
+    assert service._threat_until(1, 100.0) == 0.0
+    # The kill feed: a survivor killing a zombie.
+    service.note_kill(1, REAL_SURVIVORS, REAL_ZOMBIES)
+    until = service._threat_until(1, 100.0)
+    assert 100.0 + THREAT_SECONDS - 1.0 < until <= 100.0 + THREAT_SECONDS
+    # A zombie killing a survivor marks nobody dangerous.
+    service.note_kill(10, REAL_ZOMBIES, REAL_SURVIVORS)
+    assert service._threat_until(10, 100.0) == 0.0
+    # A hit the zombie remembers (its own damage record) marks the shooter.
+    fresh = ZombieSiegeService(budget_seconds=0.002)
+    zombie._last_damage_source_id = 1
+    zombie._last_combat_damage_at = _time.monotonic() - 3.0
+    fresh._note_hits(mode)
+    assert fresh._threat_until(1, 50.0) > 50.0 + THREAT_SECONDS - 4.0
+    # An old hit does not.
+    stale = ZombieSiegeService(budget_seconds=0.002)
+    zombie._last_combat_damage_at = _time.monotonic() - THREAT_SECONDS - 1.0
+    stale._note_hits(mode)
+    assert stale._threat_until(1, 50.0) == 0.0
+
+
+def test_the_policy_walks_an_advancing_zombie_to_its_spot_and_lets_it_fight_only_up_close():
+    zombie = _zombie(10, (170.5, 128.5, FLOOR - 2.25))
+    survivor = _player(1, SURVIVOR_TEAM, (128.5, 128.5, 207.75), class_id=int(C.CLASS_SOLDIER))
+    order = ObjectiveSnapshot("zombie_order", ZOMBIE_TEAM, (160.5, 128.5, FLOOR - 2.25),
+                              carrier_id=10, state=6, attacker=1)
+    frame = _frame("zom", zombie, survivor, objectives=(order,))
+    decision = objective_decision_for(frame, zombie)
+    assert decision.role == "zombie_advance_cover"
+    assert decision.position == order.position and decision.sprint
+    assert decision.engagement_radius <= 6.0
+    assert decision.watch_position == survivor.position
+
+
+def test_a_rushing_zombie_weaves_on_a_strafe_cadence_and_hops_now_and_then():
+    """The wave's sprint across the open leans 25 degrees left and right, holding
+    each lean for half a second to nearly one, and hops every couple of seconds."""
+
+    brain = _brain(set())
+    state = _BotState(0, 0, 5)
+    body = SimpleNamespace(position=(100.5, 100.5, FLOOR - 2.25))
+    leans = []
+    hops = []
+    t = 100.0
+    while t < 112.0:
+        turned, hop = brain._rush_weave(body, state, (1.0, 0.0, 0.0), t)
+        angle = math.degrees(math.atan2(turned[1], turned[0]))
+        assert abs(abs(angle) - 25.0) < 1e-6
+        leans.append((round(t, 2), 1 if angle > 0 else -1))
+        if hop:
+            hops.append(round(t, 2))
+        t += 0.05
+    switches = [leans[i][0] for i in range(1, len(leans)) if leans[i][1] != leans[i - 1][1]]
+    assert len(switches) >= 10, "the lean changes sides on a strafe cadence"
+    gaps = [b - a for a, b in zip(switches, switches[1:])]
+    assert all(0.45 <= gap <= 0.95 for gap in gaps), gaps
+    assert 3 <= len(hops) <= 9, hops
+    assert all(1.3 <= b - a for a, b in zip(hops, hops[1:])), hops
+
+
+def test_a_bot_zombie_respawns_near_the_fight_out_of_every_survivors_sight_or_not_at_all():
+    from server.bot_ai.horde_strategy import RESPAWN_CLEAR, bot_respawn_spot, visible
+
+    cells, roof, top = _roof_pillar_with_a_block_east()
+    solid = _solid(cells)
+    heights = {}
+
+    def height(x, y):
+        if (x, y) not in heights:
+            heights[(x, y)] = next((z for z in range(0, 240) if (x, y, z) in cells), 239)
+        return heights[(x, y)]
+
+    survivor = _stand(128.5, 128.5, top)
+    picks = [bot_respawn_spot(solid, height, None, [survivor], k / 7.0) for k in range(7)]
+    found = [p for p in picks if p is not None]
+    assert found, "the street behind the eastern building hides a body"
+    eye = (128.5, 128.5, survivor[2] - 0.6)
+    for spot in found:
+        assert RESPAWN_CLEAR <= math.hypot(spot[0] - 128.5, spot[1] - 128.5) <= 57.0
+        assert round(spot[2] + 2.25) == FLOOR, "street level, never a roof"
+        assert not visible(solid, eye, (spot[0], spot[1], spot[2] - 0.9))
+        assert spot[0] > 157, "behind the building that hides it"
+    # A second survivor who can see that street takes the spots away.
+    watcher = _stand(190.5, 128.5, FLOOR)
+    assert all(bot_respawn_spot(solid, height, None, [survivor, watcher], k / 5.0) is None
+               for k in range(5))
+    # A flat plain hides nothing: no spot, the mode falls back to its spawn.
+    plain = _solid(_ground(set(), lo=60, hi=200))
+    assert bot_respawn_spot(plain, lambda x, y: FLOOR, None, [_stand(128.5, 128.5, FLOOR - 8)], 0.3) is None

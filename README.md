@@ -441,6 +441,10 @@ reports and obsolete deployment claims are not current documentation.
   reverse-engineering workflow.
 - [`docs/BOT_NAVIGATION.md`](docs/BOT_NAVIGATION.md): VXL semantic atlas,
   safe cache format, map-matrix simulation, and water/stuck recovery.
+- [`docs/BOT_GAMEPLAY_VALIDATION.md`](docs/BOT_GAMEPLAY_VALIDATION.md): full-roster
+  mode simulations, last-player challenges and behavior acceptance criteria.
+- [`docs/WIKI_REFERENCE_AUDIT.md`](docs/WIKI_REFERENCE_AUDIT.md): offline historical
+  wiki comparisons, contradictions and limits of catalog parity checks.
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): build, operate, diagnose, soak, release,
   and container deployment.
 - [`docs/MASTER_SERVER.md`](docs/MASTER_SERVER.md): open-source master, local

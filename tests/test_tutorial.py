@@ -77,6 +77,25 @@ def _new_mode() -> tuple[_Server, TutorialMode]:
     return server, mode
 
 
+@pytest.mark.parametrize("automatic_music", (False, True))
+def test_tutorial_reveal_and_delayed_replay_respect_personal_music_default(automatic_music, monkeypatch):
+    server, mode = _new_mode()
+    server.config.mode_start_music = automatic_music
+    now = [100.0]
+    monkeypatch.setattr("modes.tutorial.time.monotonic", lambda: now[0])
+    player = _Player(1)
+    player.x, player.y, player.z = mode.get_spawn_point(player)
+    try:
+        asyncio.run(mode.on_player_join(player))
+        mode.reveal_to(SimpleNamespace(player=player, send=player.send))
+        now[0] += 1.1
+        asyncio.run(mode.on_tick(1))
+        assert sum(data[0] == 26 for data in player.sent) == (2 if automatic_music else 0)
+        assert any(data[0] == 109 for data in player.sent), "lesson instructions must still appear"
+    finally:
+        asyncio.run(mode.deactivate())
+
+
 def test_normal_mode_registry_cannot_select_tutorial():
     assert get_mode_class("tut") is None
     assert get_mode_class("tutorial") is None

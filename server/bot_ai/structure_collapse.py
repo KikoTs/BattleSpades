@@ -55,8 +55,19 @@ _CARDINAL = ((1, 0), (-1, 0), (0, 1), (0, -1))
 # A zombie standing on a floor reaches cells from its feet up to ~3 blocks
 # above them with a claw swing (the hand's 3x3x3 cube adds one more).
 CLAW_REACH = 3
-# Dig cost of a voxel nobody can reach from a floor (it hangs in the air).
-UNREACHABLE_COST = 25
+# Dig cost of a voxel nobody can reach from a floor (it hangs in the air): a
+# climber stacks up to it. Dearer than a voxel reached from a roof, cheap
+# enough that a two-voxel neck holding a tower off a building is a cut and
+# not a reason to give up (it used to cost 25 each, over the 48 limit).
+UNREACHABLE_COST = 8
+# Dig cost of a voxel with no open face at all (the core of a hill, a thick
+# base): only digging everything round it gets a claw to it.
+BURIED_COST = 25
+# Dig cost of a voxel a claw reaches only from a floor of the structure itself
+# (a roof, a deck): a zombie has to climb there first. Cheaper than a voxel
+# in mid-air, dearer than one at the horde's feet, so a pillar on a roof is
+# cut at its foot (from the roof) rather than half way up.
+ELEVATED_STAND_COST = 6
 _INF = 1 << 30
 _WORK_PER_YIELD = 24
 
@@ -388,27 +399,33 @@ def dig_cost(solid: SolidFn, cell: Cell, ground_floor_z: int | None = None) -> i
     if z > GROUND_Z:
         return _INF
     best = UNREACHABLE_COST
+    exposed = False
     for dx, dy, dz in _FACES:
         ax, ay, az = x + dx, y + dy, z + dz
         if not (0 <= ax < MAP_SIZE and 0 <= ay < MAP_SIZE) or az < 0:
             continue
         if solid(ax, ay, az):
             continue
+        exposed = True
         floor = _floor_below(solid, ax, ay, az, CLAW_REACH + 1)
         if floor is None:
-            continue
-        if ground_floor_z is not None and floor < int(ground_floor_z) - 2:
             continue
         height = floor - z
         if height > CLAW_REACH:
             continue
+        if ground_floor_z is not None and floor < int(ground_floor_z) - 2:
+            # A floor of the structure itself (the roof a pillar stands on):
+            # reachable once a zombie has climbed up there.
+            best = min(best, ELEVATED_STAND_COST)
+            continue
         best = min(best, 1 if height <= 1 else 2)
         if best == 1:
             break
-    if best == UNREACHABLE_COST and ground_floor_z is not None:
-        # Buried but low (the core of a thick leg or tower base): the claw's
-        # 3x3x3 cube opens it up while clearing the outer voxels.
-        if -1 <= int(ground_floor_z) - z <= 2:
+    if best == UNREACHABLE_COST and not exposed:
+        best = BURIED_COST
+        if ground_floor_z is not None and -1 <= int(ground_floor_z) - z <= 2:
+            # Buried but low (the core of a thick leg or tower base): the
+            # claw's 3x3x3 cube opens it up while clearing the outer voxels.
             best = 2
     return best
 
@@ -461,6 +478,7 @@ def iter_plan_collapse(
     node_limit: int = 2500,
     max_cost: int = 48,
     cost_fn: Callable[[Cell], int] | None = None,
+    diagnostics: dict | None = None,
 ) -> Generator[None, None, CollapsePlan | None]:
     """Minimum-cost vertex cut between ``support`` and the ground.
 
@@ -473,6 +491,8 @@ def iter_plan_collapse(
     sources = tuple(dict.fromkeys(
         (int(c[0]), int(c[1]), int(c[2])) for c in support
     ))
+    if diagnostics is not None:
+        diagnostics.update(reason="no_support", explored=0, frontier=0, cost=0)
     if not sources:
         return None
     cost_of = cost_fn if cost_fn is not None else (
@@ -506,6 +526,8 @@ def iter_plan_collapse(
             # Unexpanded frontier: treat as ground (conservative).
             sink = True
             expanded.append(False)
+            if diagnostics is not None:
+                diagnostics["frontier"] += 1
         else:
             expanded.append(True)
             x, y, z = cell
@@ -537,6 +559,9 @@ def iter_plan_collapse(
         if work % _WORK_PER_YIELD == 0:
             yield
     count = len(cells)
+    if diagnostics is not None:
+        diagnostics["explored"] = count
+        diagnostics["reason"] = "no_grounding_connection"
     if not any(to_sink):
         # Nothing reaches the ground inside the bound: the server already
         # considers this floating (or the bound is tiny). Nothing to cut.
@@ -679,6 +704,9 @@ def iter_plan_collapse(
             node = prev
         total += bottleneck
         if total > max_cost:
+            if diagnostics is not None:
+                diagnostics["cost"] = total
+                diagnostics["reason"] = ("bounded_frontier" if diagnostics["frontier"] else "no_reachable_cut")
             return None
         yield
 
@@ -689,9 +717,13 @@ def iter_plan_collapse(
         if (2 * i) in reachable and (2 * i + 1) not in reachable
     ]
     if not cut_idx:
+        if diagnostics is not None:
+            diagnostics["reason"] = "no_disconnect_cut"
         return None
     cut = tuple(sorted(cells[i] for i in cut_idx))
     cost = sum(capacity[i] for i in cut_idx)
+    if diagnostics is not None:
+        diagnostics.update(reason="cut_found", cost=cost)
     falling = sum(1 for i in range(count) if (2 * i) in reachable) - len(cut_idx)
     return CollapsePlan(
         support=sources,
@@ -705,6 +737,335 @@ def iter_plan_collapse(
 
 def plan_collapse(solid: SolidFn, support: Iterable[Cell], **kwargs) -> CollapsePlan | None:
     return _run(iter_plan_collapse(solid, support, **kwargs))
+
+
+# Foundation cuts: a structure is taken off the ground at its contact layer.
+# The footprint follows the structure's own surface from the survivor's
+# support: a neighbouring column joins while its top is no more than
+# FOUNDATION_STEP blocks lower (a roof, a crown, a walkway, a trunk under
+# its crown), so the street, which lies far below, never does. At most this
+# many columns are read, this many voxels dug, this many voxels flooded to
+# prove the drop.
+FOUNDATION_STEP = 2
+FOUNDATION_TALL = 3
+FOUNDATION_COLUMNS = 2000
+FOUNDATION_MAX_CUT = 160
+# Proving the drop floods the structure once per layer tried; a whole city
+# block is not a foundation target and must fail fast, so the flood is
+# bounded well below a building's voxel count (a tree with its crown, its
+# walkway and a few prefab stacks leaning on it stays inside).
+FOUNDATION_VERIFY = 8000
+_AROUND = tuple((dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy)
+HeightFn = Callable[[int, int], int]
+
+
+def iter_falls_after(solid: SolidFn, removed: Iterable[Cell], support: Iterable[Cell],
+                     *, limit: int = FOUNDATION_VERIFY) -> Generator[None, None, bool | None]:
+    """``falls_after`` spread over yields; None when the flood outgrows ``limit``."""
+
+    gone = set(removed)
+
+    def present(x: int, y: int, z: int) -> bool:
+        return (x, y, z) not in gone and solid(x, y, z)
+
+    starts = [c for c in support if present(*c)]
+    if not starts:
+        return True
+    seen = set(starts)
+    stack = list(starts)
+    work = 0
+    while stack:
+        x, y, z = stack.pop()
+        if z > GROUND_Z:
+            return False
+        if len(seen) > limit:
+            return None
+        for dx, dy, dz in NEIGHBORS_18:
+            nxt = (x + dx, y + dy, z + dz)
+            if nxt not in seen and 0 <= nxt[2] and present(*nxt):
+                seen.add(nxt)
+                stack.append(nxt)
+        work += 1
+        if work % _WORK_PER_YIELD == 0:
+            yield
+    return True
+
+
+def iter_plan_foundation(
+    solid: SolidFn,
+    height: HeightFn,
+    support: Iterable[Cell],
+    *,
+    ground_floor_z: int,
+    column_limit: int = FOUNDATION_COLUMNS,
+    max_cut: int = FOUNDATION_MAX_CUT,
+    verify_limit: int = FOUNDATION_VERIFY,
+    diagnostics: dict | None = None,
+) -> Generator[None, None, CollapsePlan | None]:
+    """Cut the survivor's whole structure off the ground where it touches it.
+
+    The exact planner reads a structure voxel by voxel and gives up on a
+    big one (a tree with a walkway built from its crown, a building): its
+    budget runs out in the crown and the only cut it can see is a voxel in
+    mid-air. This planner reads the map's height field instead: the
+    footprint is the connected set of columns standing well above the
+    horde's floor (``FOUNDATION_TALL``) round the survivor's support, its
+    contact layer the footprint voxels sitting on the street, and the
+    server's own floating rule proves that taking that layer out drops him.
+    When terrain leans against the structure the two layers above the
+    contact are added once; a structure still standing after that (a hill,
+    a wall against a cliff) gets no plan.
+    """
+
+    if diagnostics is not None:
+        diagnostics.update(reason="no_support", columns=0, cut=0)
+    sources = tuple(dict.fromkeys((int(c[0]), int(c[1]), int(c[2])) for c in support))
+    if not sources:
+        return None
+    floor = int(ground_floor_z)
+
+    def inside(x: int, y: int) -> bool:
+        return 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE
+
+    _tops: dict[tuple[int, int], int] = {}
+
+    def tops_of(x: int, y: int) -> int:
+        value = _tops.get((x, y))
+        if value is None:
+            value = _tops[(x, y)] = height(x, y)
+        return value
+
+    footprint: set[tuple[int, int]] = set()
+    queue: deque[tuple[int, int]] = deque()
+    for cell in sources:
+        column = (cell[0], cell[1])
+        if column not in footprint and inside(*column) and tops_of(*column) <= floor - FOUNDATION_TALL:
+            footprint.add(column)
+            queue.append(column)
+    if not footprint:
+        if diagnostics is not None:
+            diagnostics["reason"] = "support_not_tall"
+        return None
+    def flat(x: int, y: int, top: int) -> bool:
+        """Is this column level with most of its surroundings: ground?
+
+        The street beside a wall, a hillside, a snowfield: their tops sit
+        within a block of their neighbours' median. A crown's sloping edge,
+        a walkway cell beside its pillar, a wall top beside the street do
+        not, and belong to the structure.
+        """
+
+        around = sorted(tops_of(x + dx, y + dy) for dx, dy in _AROUND if inside(x + dx, y + dy))
+        return bool(around) and abs(around[len(around) // 2] - top) <= 1
+
+    _grounds: dict[tuple[int, int], int] = {}
+
+    def local_ground(x: int, y: int) -> int:
+        """The ground level round a column: the low quartile of the tops on
+        rings six and ten blocks out (streets lie lower than roofs and
+        crowns, so a roof's own cells do not pass for ground)."""
+
+        value = _grounds.get((x, y))
+        if value is None:
+            samples = sorted(
+                tops_of(x + int(round(r * math.cos(a))), y + int(round(r * math.sin(a))))
+                for r in (6, 10) for a in (k * math.pi / 4.0 for k in range(8))
+                if inside(x + int(round(r * math.cos(a))), y + int(round(r * math.sin(a)))))
+            value = _grounds[(x, y)] = samples[(3 * len(samples)) // 4] if samples else GROUND_Z
+        return value
+
+    def ground_like(x: int, y: int, top: int) -> bool:
+        """Level with its neighbours and near the ground level round it:
+        the street, a hillside, the last step of a ramp down. Never a roof
+        interior (flat, but far above the street) or a crown's slope."""
+
+        return flat(x, y, top) and top >= local_ground(x, y) - FOUNDATION_STEP
+
+    def raised(x: int, y: int, top: int) -> bool:
+        """Does this column stand well above most of its surroundings?
+
+        A walkway cell beside a taller pillar, a crown cell beside the
+        trunk: the structure's surface steps down more than FOUNDATION_STEP
+        there, yet the column is still FOUNDATION_TALL above the ground
+        round it. A street cell beside a crater is not: most of its
+        neighbours are street.
+        """
+
+        around = sorted(tops_of(x + dx, y + dy) for dx, dy in _AROUND if inside(x + dx, y + dy))
+        return bool(around) and around[len(around) // 2] - top >= FOUNDATION_TALL
+
+    work = 0
+    while queue:
+        x, y = queue.popleft()
+        if len(footprint) > column_limit:
+            if diagnostics is not None:
+                diagnostics.update(reason="footprint_bounded", columns=len(footprint))
+            return None
+        top = tops_of(x, y)
+        for dx, dy in _AROUND:
+            column = (x + dx, y + dy)
+            if column in footprint or not inside(*column):
+                continue
+            other = tops_of(*column)
+            # The neighbour's top voxel must touch this column's solid (the
+            # server's 18-neighbour rule), so a crown never spreads onto a
+            # ridge beside it and a wall never takes the street with it.
+            if not any(solid(x, y, other + dz) for dz in (-1, 0, 1) if 0 <= other + dz <= GROUND_Z + 1):
+                continue
+            if ground_like(column[0], column[1], other):
+                continue
+            if other <= top + FOUNDATION_STEP or raised(column[0], column[1], other):
+                footprint.add(column)
+                queue.append(column)
+        work += 1
+        if work % 32 == 0:
+            yield
+    if diagnostics is not None:
+        diagnostics["columns"] = len(footprint)
+    # Where the structure meets the ground. A column's street is the highest
+    # ground beside it (the smallest top among its neighbours outside the
+    # footprint); a column inside the footprint takes the highest street its
+    # edge found. The contact voxel lies ``k`` above that street and must be
+    # joined to the column's top by solid all the way down (a crown cell
+    # over bare ground has air between; the ground under it is not the
+    # tree). Terrain and structure cannot be told apart by solidity, so the
+    # layer is tried from the street upward until the server's own floating
+    # rule confirms the drop: a trunk standing in a hollow needs the second
+    # layer, a wall on a mound the third.
+    streets: dict[tuple[int, int], int] = {}
+    interior: list[tuple[int, int]] = []
+    for x, y in sorted(footprint):
+        top = tops_of(x, y)
+        # Ground beside it: a column outside the footprint that is ground
+        # itself (level with its surroundings, near the ground level round
+        # it). A crown's sloping edge cell the flood left out is not, and
+        # must not put the street up in the branches; the last step of a
+        # ramp down is, so the step above it becomes the cut.
+        outside = [other for (nx, ny, other) in ((x + dx, y + dy, tops_of(x + dx, y + dy))
+                                                 for dx, dy in _AROUND
+                                                 if (x + dx, y + dy) not in footprint
+                                                 and inside(x + dx, y + dy))
+                   if other > top and ground_like(nx, ny, other)]
+        if outside:
+            streets[(x, y)] = min(outside)
+        else:
+            interior.append((x, y))
+    yield
+    if not streets:
+        if diagnostics is not None:
+            diagnostics["reason"] = "no_contact"
+        return None
+    # A column inside the footprint takes the street of the nearest edge
+    # column (a flood from the edges inward): the trunk under a crown gets
+    # the ground round the crown, never a prefab stack forty blocks away
+    # beside the walkway's far end.
+    frontier: deque[tuple[int, int]] = deque(sorted(streets))
+    while frontier:
+        cx, cy = frontier.popleft()
+        street = streets[(cx, cy)]
+        for dx, dy in _AROUND:
+            column = (cx + dx, cy + dy)
+            if column in footprint and column not in streets:
+                streets[column] = street
+                frontier.append(column)
+    for column in interior:
+        streets.setdefault(column, min(streets.values()))
+    tops = {column: tops_of(*column) for column in footprint}
+    yield
+
+    cut: list[Cell] = []
+    reason = "no_contact"
+    layer = 0
+    for k in (1, 2, 3):
+        # Up to three above the street: what a zombie standing beside the
+        # column reaches with the claw. Higher is no foundation.
+        contact: list[Cell] = []
+        for (x, y), street in sorted(streets.items()):
+            # Two layers above the street: the server joins voxels across
+            # an edge, so a column beside ground one block higher than the
+            # street it stands on still touches that ground from one layer
+            # up. Any solid of the column there counts (a trunk, a wall,
+            # the palm of a hand prefab leaning on the tree; its fingers
+            # above leave gaps). The claw's cube takes both layers at once.
+            for z in (street - k, street - k - 1):
+                if 0 <= z and z >= tops[(x, y)] and solid(x, y, z):
+                    contact.append((x, y, z))
+        yield
+        if not contact:
+            continue
+        if len(contact) > max_cut:
+            reason = "cut_too_large"
+            if diagnostics is not None:
+                diagnostics["cut"] = len(contact)
+            break
+        falls = yield from iter_falls_after(solid, contact, sources, limit=verify_limit)
+        if diagnostics is not None:
+            diagnostics.setdefault("attempts", []).append((k, len(contact)))
+            diagnostics["last_contact"] = tuple(contact)
+            diagnostics["footprint"] = frozenset(footprint)
+            diagnostics["streets"] = dict(streets)
+        if falls is None:
+            reason = "verify_bounded"
+            break
+        if falls:
+            cut = contact
+            layer = k
+            break
+        reason = "still_grounded"
+    if not cut:
+        if diagnostics is not None:
+            diagnostics["reason"] = reason
+        return None
+    # A rock or a shed the footprint picked up has its own contact voxels;
+    # the horde need not dig them. Drop each separate cluster of the cut in
+    # turn while the structure still falls without it (a few clusters, a
+    # few floods).
+    clusters: list[list[Cell]] = []
+    seen_cells: set[Cell] = set()
+    cut_set = set(cut)
+    for cell in sorted(cut):
+        if cell in seen_cells:
+            continue
+        cluster = [cell]
+        seen_cells.add(cell)
+        stack = [cell]
+        while stack:
+            cx, cy, cz = stack.pop()
+            for dx, dy in _AROUND:
+                for dz in (-1, 0, 1):
+                    nxt = (cx + dx, cy + dy, cz + dz)
+                    if nxt in cut_set and nxt not in seen_cells:
+                        seen_cells.add(nxt)
+                        cluster.append(nxt)
+                        stack.append(nxt)
+        clusters.append(cluster)
+    if 1 < len(clusters) <= 6:
+        for cluster in sorted(clusters, key=len, reverse=True):
+            trial = [c for c in cut if c not in set(cluster)]
+            if not trial:
+                continue
+            falls = yield from iter_falls_after(solid, trial, sources, limit=verify_limit)
+            if falls:
+                cut = trial
+    cut_cells = tuple(sorted(cut))
+    sites = claw_sites(cut_cells, solid)
+    if diagnostics is not None:
+        diagnostics.update(reason="foundation_found", cut=len(cut_cells), layer=layer)
+    return CollapsePlan(
+        support=sources,
+        cut=cut_cells,
+        sites=sites,
+        # Priced like the exact planner's reachable voxels: one at the
+        # claw's height, two for the layers above.
+        cost=len(cut_cells) * (1 if layer <= 1 else 2),
+        falling=0,
+        explored=len(footprint),
+    )
+
+
+def plan_foundation(solid: SolidFn, height: HeightFn, support: Iterable[Cell],
+                    **kwargs) -> CollapsePlan | None:
+    return _run(iter_plan_foundation(solid, height, support, **kwargs))
 
 
 def _chebyshev(a: Cell, b: Cell) -> int:
@@ -783,7 +1144,9 @@ def _run(generator):
 
 __all__ = [
     "Approach",
+    "BURIED_COST",
     "CollapsePlan",
+    "ELEVATED_STAND_COST",
     "Isolation",
     "approach",
     "claw_sites",
@@ -792,8 +1155,11 @@ __all__ = [
     "horde_floor",
     "isolation",
     "iter_approach",
+    "iter_falls_after",
     "iter_isolation",
     "iter_plan_collapse",
+    "iter_plan_foundation",
     "plan_collapse",
+    "plan_foundation",
     "support_cells",
 ]

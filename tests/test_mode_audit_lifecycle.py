@@ -51,7 +51,7 @@ def test_zombie_queued_combat_cannot_change_a_finished_match(event):
 def test_multihill_stalled_tick_cannot_score_beyond_hill_expiry(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("modes.multi_hill.time.time", lambda: now[0])
-    monkeypatch.setattr("modes.multi_hill.trigger_airstrike", lambda *_args: None)
+    monkeypatch.setattr(MultiHillMode, "_start_airstrike", lambda *_args: None)
     server = HillServer()
     server.config.mode_settings["mh"].update(score_limit=1000, base_active_time=10)
     mode = MultiHillMode(server)
@@ -74,7 +74,7 @@ def test_multihill_stalled_tick_cannot_score_beyond_hill_expiry(monkeypatch):
 def test_multihill_first_arrival_after_expiry_cannot_claim_or_score(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("modes.multi_hill.time.time", lambda: now[0])
-    monkeypatch.setattr("modes.multi_hill.trigger_airstrike", lambda *_args: None)
+    monkeypatch.setattr(MultiHillMode, "_start_airstrike", lambda *_args: None)
     server = HillServer()
     server.config.mode_settings["mh"].update(score_limit=1000, base_active_time=10)
     mode = MultiHillMode(server)

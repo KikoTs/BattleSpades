@@ -19,7 +19,7 @@ from server.game_constants import TEAM1, TEAM2  # noqa: E402
 from server.round_lifecycle import RoundLifecycle  # noqa: E402
 from server.team import Team  # noqa: E402
 from shared.bytes import ByteReader  # noqa: E402
-from shared.packet import ChangePlayer, SetScore  # noqa: E402
+from shared.packet import ChangePlayer, SetClassLoadout, SetScore  # noqa: E402
 
 
 class _Connection:
@@ -85,6 +85,8 @@ def _player(server, player_id, team, *, alive=True, position=(0.0, 0.0, 0.0)):
         score=0,
         health=100,
         position=position,
+        ammo_resets=0,
+        equipment_resets=0,
     )
 
     def apply(selection):
@@ -98,7 +100,20 @@ def _player(server, player_id, team, *, alive=True, position=(0.0, 0.0, 0.0)):
         player.spawned = False
         player.last_kill_type = int(kill_type)
 
+    def set_tool(tool: int, raw: bool = False) -> None:
+        assert raw and tool in player.loadout
+        player.tool_id = tool
+
+    def reset_ammo() -> None:
+        player.ammo_resets += 1
+
+    def reset_equipment() -> None:
+        player.equipment_resets += 1
+
     player.apply_class_selection = apply
+    player.set_tool = set_tool
+    player._reset_ammo = reset_ammo
+    player._reset_equipment_state = reset_equipment
     player.die = die
     player.send = connection.send
     server.players[player_id] = player
@@ -175,8 +190,8 @@ def test_vip_join_selection_rejects_non_gangster_class_and_loadout():
 
 def test_vip_selection_promotes_one_boss_per_team_and_tracks_them():
     server, mode = _new_mode()
-    blue = _player(server, 1, TEAM1)
-    green = _player(server, 2, TEAM2)
+    blue = _player(server, 1, TEAM1, position=(123.0, 45.0, 100.0))
+    green = _player(server, 2, TEAM2, position=(400.0, 80.0, 95.0))
 
     asyncio.run(mode.on_tick(1))
 
@@ -184,12 +199,20 @@ def test_vip_selection_promotes_one_boss_per_team_and_tracks_them():
     assert mode.vips == {TEAM1: blue, TEAM2: green}
     assert blue.class_id == int(C.MAFIA_VIPS[TEAM1])
     assert green.class_id == int(C.MAFIA_VIPS[TEAM2])
-    assert blue.last_kill_type == int(C.KILL.CLASS_CHANGE_KILL)
-    assert green.last_kill_type == int(C.KILL.CLASS_CHANGE_KILL)
-    assert server.respawned == [
-        (blue.id, int(C.MAFIA_VIPS[TEAM1])),
-        (green.id, int(C.MAFIA_VIPS[TEAM2])),
-    ]
+    assert not hasattr(blue, "last_kill_type")
+    assert not hasattr(green, "last_kill_type")
+    assert server.respawned == []
+    assert blue.position == (123.0, 45.0, 100.0)
+    assert green.position == (400.0, 80.0, 95.0)
+    for player in (blue, green):
+        assert player.alive and player.spawned
+        assert player.tool_id == player.loadout[-1]
+        assert player.ammo_resets == 1 and player.equipment_resets == 1
+    changes = [SetClassLoadout(ByteReader(packet[1:])) for packet in server.packets
+               if packet and packet[0] == SetClassLoadout.id]
+    assert {(packet.player_id, packet.class_id, packet.instant) for packet in changes} == {
+        (blue.id, blue.class_id, 1), (green.id, green.class_id, 1),
+    }
     visible = _visibility_packets(server.packets)
     assert {(packet.player_id, packet.high_minimap_visibility) for packet in visible} >= {
         (blue.id, 1), (green.id, 1),

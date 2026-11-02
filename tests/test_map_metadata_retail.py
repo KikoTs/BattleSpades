@@ -263,6 +263,22 @@ def test_live_spawns_land_inside_retail_spawn_areas(name, mode, area_key, team):
         assert any(x0 <= x <= x1 and y0 <= y <= y1 for x0, x1, y0, y1 in areas), (x, y)
 
 
+def test_occupation_prefers_a_safe_dry_slot_without_discarding_its_water_cache(monkeypatch):
+    wm = _world("SpookyMansion", "oc")
+    zones = wm.map_metadata.spawn_zones[TEAM1]
+    candidates = wm._get_spawn_candidates(TEAM1)
+    wet = next(c for c in candidates if wm.is_water_column(c[0], c[1]))
+    dry = next(c for c in candidates if not wm.is_water_column(c[0], c[1])
+        and wm.spawn_position_is_safe(wm.spawn_candidate_position(c, zones), team=TEAM1))
+    cached = [wet, dry]
+    wm._spawn_candidates[TEAM1] = cached
+    monkeypatch.setattr("server.world_manager.random.shuffle", lambda _items: None)
+    position = wm.get_spawn_point(TEAM1)
+    assert (int(position[0]), int(position[1])) == dry[:2]
+    assert wm.spawn_position_is_safe(position, team=TEAM1)
+    assert cached == [wet, dry]
+
+
 def test_trenches_ctf_team_anchors_are_the_retail_capture_bases():
     wm = _world("Trenches", "ctf")
     for team, (bx, by) in ((TEAM1, (127, 255)), (TEAM2, (384, 255))):

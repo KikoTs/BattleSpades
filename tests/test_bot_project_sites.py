@@ -161,6 +161,7 @@ def test_planned_prefab_passes_real_gateway_and_service_exactly(geometry, monkey
     owner = SimpleNamespace(id=1, team=2, name="ProjectFixture", class_id=bot.class_id,
                             is_bot=True, alive=True, spawned=True, x=bot.position[0],
                             y=bot.position[1], z=bot.position[2], blocks=bot.blocks,
+                            eye=bot.eye,
                             prefabs=list(bot.prefabs), loadout=list(bot.loadout), tool=bot.tool,
                             tool_is_raw=True, block_color=0xAABBCC,
                             send=lambda data, **_kwargs: owner_packets.append(data))

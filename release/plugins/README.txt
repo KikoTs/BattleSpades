@@ -1,6 +1,13 @@
 BattleSpades plugins
 ====================
 
+The bundled Music plugin provides personal opt-in music:
+  /music       Toggle your music
+  /music play  Start your music
+  /music stop  Stop your music
+Automatic in-game music is disabled by default. Ambience and game effects
+still play. Your choice lasts until you stop it or disconnect.
+
 Place trusted top-level `.py` files in this directory. Each file may define one
 or more subclasses of `plugins.base_plugin.BasePlugin`; they are discovered at
 server startup. Filenames beginning with `_` and files without a `.py` suffix

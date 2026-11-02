@@ -25,6 +25,45 @@ def actor(position):
     return SimpleNamespace(player=SimpleNamespace(x=position[0], y=position[1], z=position[2]))
 
 
+def test_blocked_distant_probe_cannot_permanently_silence_point_blank_combat():
+    server, director, _, runtime = _facing_fixture()
+    runtime.wall_probe_clear = False
+    runtime.next_wall_probe_at = 110.
+    assert director._fire_lane_clear(runtime, (1., 0., 0.), 1., 100.)
+    # This only ends the stale behavioral veto; longer wall rays remain
+    # blocked until their bounded fresh probe, and native hit authority is
+    # unchanged for all distances.
+    assert not director._fire_lane_clear(runtime, (8., 0., 0.), 8., 100.)
+
+
+def test_authored_jump_pause_retains_arc_authority_without_pressing_jump():
+    import time
+    server, director, bot, runtime = _facing_fixture()
+    now = time.monotonic()
+    runtime.intent = BotIntent(bot.id, runtime.generation, 100, 1, 1, 0, now, now+5,
+        MovementIntent(affordance=MovementAffordance.JUMP, jump_explicit=True),
+        debug_role="prefab_ascent:jump_beat")
+
+    async def simulate():
+        for tick in range(30):
+            server.loop_count = tick
+            runtime.intent = replace(runtime.intent, frame_id=100+tick,
+                created_at=now+tick/60)
+            director._apply_motor(runtime, now+tick/60, 1/60)
+            assert not bot.input.jump
+            await bot.simulate_tick(1/60)
+        before = bot.z
+        runtime.intent = replace(runtime.intent, frame_id=200,
+            movement=replace(runtime.intent.movement, jump=True))
+        for tick in range(30, 39):
+            server.loop_count = tick
+            director._apply_motor(runtime, now+tick/60, 1/60)
+            await bot.simulate_tick(1/60)
+        assert bot.z < before - .5
+
+    asyncio.run(simulate())
+
+
 def test_native_egypt_134_9_second_overshoot_releases_instead_of_driving_away():
     source = (272.457, 235.935, 215.743)
     waypoint = (272.5, 237.5, 215.75)

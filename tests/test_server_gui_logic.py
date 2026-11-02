@@ -202,8 +202,10 @@ def test_mode_choices_and_pools_use_installed_maps() -> None:
     assert [c.code for c in choices[:20:2]] == ["tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc"]
     assert [c.code for c in choices[1:20:2]] == ["hc_" + c.code for c in choices[:20:2]]
     from modes.unofficial.catalog import SPECS
-    assert [c.code for c in choices[20:]] == [s.code for s in SPECS]
-    assert all(c.title.startswith("[Unofficial]") for c in choices[20:])
+    assert choices[20].code == "czom" and choices[20].title == "Classic+ Zombies"
+    assert [c.code for c in choices[21:]] == [s.code for s in SPECS]
+    assert all(c.title.startswith("[Unofficial]") for c in choices[21:])
+    assert catalog.mode_pool(PROJECT_ROOT / "maps", "czom") == catalog.mode_pool(PROJECT_ROOT / "maps", "zom")
     installed = set(catalog.available_maps(PROJECT_ROOT / "maps"))
     for choice in choices:
         pool = catalog.mode_pool(PROJECT_ROOT / "maps", choice.code)

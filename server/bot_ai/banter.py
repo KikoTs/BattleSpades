@@ -37,6 +37,11 @@ _LINES: dict[str, tuple[str, ...]] = {
     "suicide": ("oops", "that was on purpose", "dont look at me", "gravity wins again"),
     "start": ("glhf", "gl all", "lets go", "hf", "good luck have fun"),
     "end": ("gg", "gg wp", "ggs", "good game all", "close one"),
+    "bridge": ("crossing's ready", "bridge is open", "mind the gap. fixed it"),
+    "breach": ("door's open", "new entrance", "made us a way through"),
+    "construction": ("that should hold", "a little cover", "built to last. hopefully"),
+    "objective": ("nice work team", "we got it", "good push"),
+    "yield": ("after you", "coming through?", "room for one more"),
 }
 
 
@@ -47,6 +52,7 @@ class _Voice:
     nemesis: int = -1
     nemesis_count: int = 0
     last_line: str = ""
+    context_at: float = -1000.
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +122,20 @@ class BotBanter:
         self._rng.shuffle(speakers)
         for player_id in speakers[:2]:
             self._say(now, player_id, kind, {}, boost=3.0, alive=True)
+
+    def on_context(self, now: float, player_id: int, cue: str) -> None:
+        """Sparse confirmed events share all ordinary typing/global limits."""
+        voice = self._voices.get(int(player_id))
+        if voice is None or now-voice.context_at < 15:
+            return
+        kind = ("bridge" if cue == "completed_bridge" else
+                "breach" if cue == "completed_breach" else
+                "construction" if cue.startswith("completed_") else
+                "objective" if cue == "objective_ack" else
+                "yield" if cue in {"yield_human", "yield_passage"} else "")
+        if kind:
+            voice.context_at = now
+            self._say(now, player_id, kind, {}, boost=.25, alive=True)
 
     def _say(self, now: float, player_id: int, kind: str, names: dict[str, object],
              *, boost: float, alive: bool) -> None:

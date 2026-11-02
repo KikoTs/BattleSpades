@@ -233,8 +233,8 @@ async def simulate(scenario: str, *, seconds: float = 90.0) -> SchematicPhysicsR
                     site = next((s for s in brain.cooperative.sites.sites.values()), None)
                 server.loop_count += 1
                 for player in players:
-                    if player.id % 6 == server.loop_count % 6:
-                        director._apply_motor(director._runtime[player.id], now, .1)
+                    if player.id % 2 == server.loop_count % 2:
+                        director._apply_motor(director._runtime[player.id], now, 1 / 30)
                 await server.simulation_runtime._simulate_players()
                 server.world_mutations.commit_ready()
                 await asyncio.sleep(0)

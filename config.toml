@@ -413,6 +413,7 @@ path_requests_per_second = 24
 # Beta tactical squads; set "classic" to retain the previous behavior layer.
 behavior_version = "cooperative"
 friendly_mischief = true
+social_interactions = true # brief friendly gestures; urgent tasks always interrupt
 # Occasional short bot chat lines after kills/deaths (hard rate limited).
 # Off by default; set true to bring the banter back.
 chatter = false
@@ -465,6 +466,10 @@ time_limit = 600
 infection_delay = 60.0 # retail ZOM_TIME_BEFORE_FIRST_INFECTION
 minimum_players = 2
 zombie_respawn_time = 10.0
+# Killed BOT zombies come back at a street-level spot 40-56 blocks from the
+# nearest survivor that no survivor can see (the team spawn when the map has
+# none); human zombies always use the team spawn.
+bot_respawn_near_action = true
 
 # The five objective modes below (Multi-Hill, Territory Control, Diamond Mine,
 # Demolition, Occupation) are fully playable: each runs its objective state
@@ -624,10 +629,9 @@ sustained_min_count = 20
 sustained_per_minute = 3.0
 
 [audio]
-# In-round music bed: a looping last_man_standing_00N track at every round
-# start and for joiners. A DELIBERATE DEVIATION kept on request: retail rounds
-# were silent (map ambience only) until the final 61 s (game_ending_00N), and
-# last_man_standing played only for the Zombie last survivor. false = retail.
+# Automatic round music is off. Each player can opt in with /music (toggle)
+# or /music play|stop through the Music plugin. Ambience and effects still play.
+# Set true only to restore legacy automatic bed/timeout/last-survivor/win music.
 mode_start_music = false
 
 [updates]

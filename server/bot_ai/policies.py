@@ -68,6 +68,9 @@ class ModeBotDecision:
     engagement_radius: float = 160.0
     # Public approach to watch once arrived; independent of the ground waypoint.
     watch_position: Vector3 | None = None
+    exact_height: bool = False
+    # Horde wave: cross the open at a sprint, weaving and hopping.
+    rush: bool = False
 
 
 _MODE_STRATEGIES: dict[str, ModeBotStrategy] = {
@@ -154,6 +157,8 @@ _MODE_ALIASES = {
     "teamdeathmatch": "tdm",
     "zombie": "zom",
     "zombies": "zom",
+    "czom": "zom",
+    "classic_zombie": "zom",
     "multihill": "mh",
     "multi_hill": "mh",
     "demolition": "dem",
@@ -186,6 +191,8 @@ def mode_strategy_for(mode_id: str) -> ModeBotStrategy:
 
     from modes.unofficial.catalog import CATALOG
     from server.hardcore import base_code
+    if str(mode_id).strip().lower().replace("-", "_") in {"czom", "classic_zombie"}:
+        return replace(_MODE_STRATEGIES["zom"], code="czom")
     code = _canonical_mode(mode_id)
     base = base_code(code)
     if base != code:
@@ -293,7 +300,9 @@ class TeamDeathmatchBotPolicy:
                 engagement_radius=10.0,
             )
 
-        if teamwork >= 0.7 and teammates and observer.player_id % 3 == 0:
+        slot = (_rotating_team_slot(frame, observer) if frame.behavior_version == "cooperative"
+                else observer.player_id)
+        if teamwork >= 0.7 and teammates and slot % 3 == 0:
             teammate = min(
                 teammates,
                 key=lambda player: _distance_squared(
@@ -319,7 +328,7 @@ class TeamDeathmatchBotPolicy:
             own_anchor is not None
             and caution > 0.75
             and aggression < 0.55
-            and observer.player_id % 4 == 0
+            and slot % 4 == 0
         ):
             overwatch = _toward(
                 own_anchor.position,
@@ -338,8 +347,9 @@ class TeamDeathmatchBotPolicy:
 
         assault = _formation_point(
             enemy_anchor.position,
-            observer.player_id + observer.team * 31,
-            8.0 + float(observer.player_id % 3) * 3.0,
+            observer.player_id + observer.team * 31
+            + (slot * 7 if frame.behavior_version == "cooperative" else 0),
+            8.0 + float(slot % 3) * 3.0,
         )
         return ModeBotDecision(
             assault,
@@ -458,9 +468,17 @@ class CTFBotPolicy:
         if own_base is not None and own_home:
             # An intel at home is the only thing worth guarding there; once
             # it is gone the guard joins the hunt or the raid.
-            guards = self._nearest(free, own_base.position,
-                                   0 if len(team) < 3 else 1 if len(team) < 7 else 2,
-                                   within=90.0)
+            count = 0 if len(team) < 3 else 1 if len(team) < 7 else 2
+            if frame.behavior_version == "cooperative":
+                candidates = [p for p in free if math.dist(p.position, own_base.position) <= 90]
+                # A nearby relief can take the next lease. Never recall a
+                # carrier, escort or a raider across the whole map just to
+                # shuffle names; urgent roles below retain nearest-first jobs.
+                guards = {p.player_id for p in sorted(candidates, key=lambda p: (
+                    math.dist(p.position, own_base.position)
+                    + 15 * _rotating_team_slot(frame, p), p.player_id))[:count]}
+            else:
+                guards = self._nearest(free, own_base.position, count, within=90.0)
             if me in guards:
                 return ModeBotDecision(
                     self._guard_point(frame, observer, own_base.position, enemy_intel),
@@ -748,6 +766,7 @@ _HORDE_ROLES = {
     3: "climb",
     4: "surround",
     5: "tunnel",
+    6: "advance",
 }
 
 
@@ -962,6 +981,7 @@ class ZombieBotPolicy:
             None,
         )
         target_position = target.position if target is not None else order.position
+        rush = bool(getattr(order, "rush", False))
         if role == "hunt":
             # The order's own position is the prey, or the next stretch of a
             # known way in to it (stairs round the back, a ramp, a door).
@@ -975,6 +995,7 @@ class ZombieBotPolicy:
                 objective_priority=0.98,
                 engagement_radius=160.0,
                 watch_position=target_position if via else None,
+                rush=rush,
             )
         if role == "flank":
             return ModeBotDecision(
@@ -987,22 +1008,46 @@ class ZombieBotPolicy:
                 # A flanker that sees its prey up close takes it.
                 engagement_radius=14.0,
                 watch_position=target_position,
+                rush=rush,
             )
         if role in ("dig_root", "tunnel"):
             return ModeBotDecision(
                 order.position,
                 "zombie_siege_dig" if role == "dig_root" else "zombie_hunt_tunnel",
                 sprint=True,
-                arrival_radius=1.5,
+                # Right onto the stand: a digger that stops a stride short
+                # has its voxel out of claw reach and stands there "arrived".
+                arrival_radius=0.75 if role == "dig_root" else 1.5,
                 directive="siege",
                 posture=ModeBotPosture.ASSAULT,
                 objective_priority=0.99,
                 engagement_radius=4.5,
                 watch_position=target_position,
+                # A dig stand can be on the roof the pillar stands on: the
+                # order names the exact floor, not the column's ground.
+                exact_height=role == "dig_root",
+                rush=rush,
+            )
+        if role == "advance":
+            # Approach under fire: walk to a rally spot his eye cannot see
+            # and wait there for the wave. Only a survivor who comes within
+            # claw reach is fought from cover.
+            return ModeBotDecision(
+                order.position,
+                "zombie_advance_cover",
+                sprint=True,
+                arrival_radius=2.0,
+                posture=ModeBotPosture.ASSAULT,
+                objective_priority=0.97,
+                engagement_radius=6.0,
+                watch_position=target_position,
             )
         if role == "climb":
+            # The order's position is the attack position to climb to (the
+            # roof beside his pillar, a cut site's stand, or the prey itself
+            # when nothing better is known); the prey is what to watch.
             return ModeBotDecision(
-                target_position,
+                order.position,
                 "zombie_siege_climb",
                 sprint=True,
                 arrival_radius=1.5,
@@ -1011,6 +1056,8 @@ class ZombieBotPolicy:
                 objective_priority=0.98,
                 engagement_radius=4.5,
                 watch_position=target_position,
+                exact_height=True,
+                rush=rush,
             )
         return ModeBotDecision(
             order.position,
@@ -1096,6 +1143,7 @@ class VIPBotPolicy:
         observer: PlayerSnapshot,
         *,
         retained_role: str = "",
+        guard_ids: frozenset[int] | None = None,
     ) -> ModeBotDecision | None:
         phase = str(frame.mode_phase).lower()
         own_vip = _objective(frame, "vip", observer.team)
@@ -1199,12 +1247,18 @@ class VIPBotPolicy:
         teammates = sorted({p.player_id for p in frame.players
                             if p.team == observer.team and p.is_bot and p.alive and p.spawned
                             and (own_vip is None or p.player_id != own_vip.carrier_id)})
-        # Exactly one bodyguard (when the team has a second bot to attack):
-        # every other bot goes for the enemy VIP. The lowest id is a stable
-        # designation, so the guard does not change as positions move.
+        # One leased bodyguard, with the rest attacking. Roster order stays
+        # stable through movement; cooperative teams rotate the designation
+        # with the other team jobs instead of making the lowest ID guard
+        # for its entire match.
+        if frame.behavior_version == "cooperative":
+            members = {p.player_id: p for p in frame.players}
+            teammates.sort(key=lambda player_id: _rotating_team_slot(frame, members[player_id]))
         guard_count = min(max(0, len(teammates) - 1), 1)
         guarding = observer.player_id in teammates[:guard_count]
-        if retained_role in {"vip_flank_attack", "vip_mop_up"} and guarding:
+        if guard_ids is not None:
+            guarding = observer.player_id in guard_ids
+        if guard_ids is None and retained_role in {"vip_flank_attack", "vip_mop_up"} and guarding:
             # Hysteresis only toward attacking: a retained attacker that was
             # just designated keeps attacking for the commitment window, a
             # guard that lost the designation leaves at once. Brief roster
@@ -1372,7 +1426,7 @@ class MultiHillBotPolicy:
                 "multihill_defend",
                 sprint=False,
                 arrival_radius=2.5,
-                directive="fortify" if observer.player_id % 3 == 0 else "",
+                directive="fortify" if _rotating_team_slot(frame, observer) % 3 == 0 else "",
                 posture=ModeBotPosture.DEFEND,
                 objective_priority=0.9,
                 engagement_radius=34.0,
@@ -1520,7 +1574,7 @@ class DemolitionBotPolicy:
         team = [player for player in frame.players
                 if player.team == observer.team and player.alive and player.spawned
                 and player.is_bot]
-        if _team_slot(frame, observer) % 4 == 0:
+        if _rotating_team_slot(frame, observer) % 4 == 0:
             return True
         damage = max(0, min(100, int(base.state)))
         wanted = max(1, min(len(team) // 2, (len(team) * damage) // 100))
@@ -1545,14 +1599,21 @@ class TerritoryControlBotPolicy:
             return _FALLBACK.decide(frame, observer)
         hostile = [item for item in territories if item.team != observer.team]
         friendly = [item for item in territories if item.team == observer.team]
+        # Capture anywhere inside the public volume. Its centre can be on a
+        # vanished bridge: walking below that marker does not claim it.
+        occupying = next((item for item in hostile if self._inside(item, observer.position)), None)
+        if occupying is not None:
+            return ModeBotDecision(observer.position, "territory_hold_capture", sprint=False,
+                arrival_radius=.6, directive="hold_capture", posture=ModeBotPosture.DEFEND,
+                objective_priority=.99, engagement_radius=28)
         # The capture bar shows an enemy draining a friendly base even when
         # no defender stands in it (the base is then "uncontested").
         besieged = [item for item in friendly
                     if int(item.attacker) >= 0 and int(item.attacker) != observer.team]
         if besieged and (
-            _team_slot(frame, observer) % 4 == 0
+            _rotating_team_slot(frame, observer) % 4 == 0
             # A second responder when it is already within reach.
-            or _team_slot(frame, observer) % 4 == 1
+            or _rotating_team_slot(frame, observer) % 4 == 1
             and min(math.dist(observer.position, item.position) for item in besieged) <= 90.0
         ):
             base = min(
@@ -1588,6 +1649,21 @@ class TerritoryControlBotPolicy:
             target_pool,
             key=lambda item: _distance_squared(observer.position, item.position),
         )
+        if (len(target.bounds) == 6 and observer.position[2] > target.bounds[5] + 1
+                and math.dist(observer.position[:2], target.position[:2]) <= 14):
+            builders = [p for p in frame.players if p.team == observer.team and p.is_bot
+                        and p.alive and p.spawned and p.grounded and not p.wade
+                        and p.blocks >= 12 and int(C.BLOCK_TOOL) in p.loadout
+                        and math.dist(p.position[:2], target.position[:2]) <= 14]
+            builder = min(builders, key=lambda p: (math.dist(p.position, target.position),
+                                                   _rotating_team_slot(frame, p)), default=None)
+            if builder is not None and builder.player_id == observer.player_id:
+                x0, x1, y0, y1, _z0, z1 = target.bounds
+                landing = (max(x0 + 1., min(x1 - 1., observer.position[0])),
+                           max(y0 + 1., min(y1 - 1., observer.position[1])), z1 - 1.)
+                return ModeBotDecision(landing, "territory_restore_access", arrival_radius=1,
+                    directive="climb", posture=ModeBotPosture.BUILD,
+                    objective_priority=.98, engagement_radius=12)
         return ModeBotDecision(
             target.position,
             "territory_contest" if int(target.state) else "territory_capture",
@@ -1597,6 +1673,13 @@ class TerritoryControlBotPolicy:
             objective_priority=0.92,
             engagement_radius=72.0,
         )
+
+    @staticmethod
+    def _inside(territory, position: Vector3) -> bool:
+        if len(territory.bounds) != 6:
+            return False
+        x0, x1, y0, y1, z0, z1 = territory.bounds
+        return x0 <= position[0] <= x1 and y0 <= position[1] <= y1 and z0 <= position[2] <= z1
 
 
 class DiamondMineBotPolicy:
@@ -2297,11 +2380,15 @@ class ModePolicyMemory:
     """Bounded worker-owned role/anchor hysteresis, reset at authoritative edges."""
 
     def __init__(self) -> None:
+        from .guard_handoffs import GuardHandoffs
+
+        self.guard_handoffs = GuardHandoffs()
         self.epoch = (-1, -1)
         self._states: dict[tuple[int, int], _ModeCommitment] = {}
 
     def reset(self) -> None:
         self._states.clear()
+        self.guard_handoffs.reset()
         self.epoch = (-1, -1)
 
     def forget(self, player_id: int, generation: int) -> None:
@@ -2315,6 +2402,12 @@ class ModePolicyMemory:
             self.epoch = epoch
         key = (observer.player_id, observer.generation)
         decision = objective_decision_for(frame, observer)
+        if (_canonical_mode(frame.mode_id) in {"vip", "hc_vip"}
+                and frame.behavior_version == "cooperative" and frame.mode_phase == "active"):
+            vip = _objective(frame, "vip", observer.team)
+            if vip is not None:
+                guards = self.guard_handoffs.guards(frame, observer.team, vip)
+                decision = VIPBotPolicy().decide(frame, observer, guard_ids=guards)
         if decision is None:
             decision = standing_order_for(frame, observer)
         if not mode_objective_committed(decision):
@@ -2337,7 +2430,8 @@ class ModePolicyMemory:
                                      or now < previous.last_seen):
             previous = None
         if previous is not None:
-            if (_canonical_mode(frame.mode_id) in ("vip", "hc_vip")
+            if (frame.behavior_version != "cooperative"
+                    and _canonical_mode(frame.mode_id) in ("vip", "hc_vip")
                     and previous.decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
                     and decision.role in {"vip_guard_formation", "vip_flank_attack", "vip_mop_up"}
                     and now - previous.role_since < 8):
@@ -2453,8 +2547,10 @@ def _guard_beat(frame: PerceptionFrame, observer: PlayerSnapshot, center: Vector
     The post changes every 18 seconds on an identity-staggered clock and stays
     inside the fortification radius of the guarded objective.
     """
-    beat = int((float(frame.created_at) + observer.player_id * 5.3) // 18.0)
-    return _formation_point(center, observer.player_id + beat * 5,
+    clock = frame.strategy_elapsed if frame.behavior_version == "cooperative" else frame.created_at
+    salt = frame.strategy_seed % 31 if frame.behavior_version == "cooperative" else 0
+    beat = int((float(clock) + observer.player_id * 5.3) // 18.0)
+    return _formation_point(center, observer.player_id + beat * 5 + salt,
                             radius + 2.5 * ((beat + observer.player_id) % 3))
 
 
@@ -2478,6 +2574,31 @@ def _team_bot_count(frame: PerceptionFrame, observer: PlayerSnapshot) -> int:
                | {observer.player_id})
 
 
+def _rotating_team_slot(frame: PerceptionFrame, observer: PlayerSnapshot) -> int:
+    """Rotate coherent team jobs on 45-second leases, with seeded roster order.
+
+    Every observer sees the same permutation and rotation, so variety does not
+    change the guard/attacker quota or send every bot to the same job. Lives do
+    not reshuffle it; mode/map epochs and the match seed do.
+    """
+    if frame.behavior_version != "cooperative":
+        return _team_slot(frame, observer)
+    roster = {player.player_id for player in frame.players
+              if player.team == observer.team and player.is_bot} | {observer.player_id}
+    salt = (int(frame.strategy_seed) * 0x9E3779B1 ^ int(frame.map_epoch) * 7919
+            ^ int(frame.mode_epoch) * 104729 ^ int(observer.team) * 31) & 0xFFFFFFFF
+
+    def rank(player_id: int) -> tuple[int, int]:
+        value = (int(player_id) ^ salt) & 0xFFFFFFFF
+        value = ((value ^ (value >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+        value = ((value ^ (value >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+        return value ^ (value >> 16), player_id
+
+    ordered = sorted(roster, key=rank)
+    epoch = int(max(0.0, frame.strategy_elapsed) // 45.0)
+    return (ordered.index(observer.player_id) + epoch) % len(ordered)
+
+
 def _passive_slot(frame: PerceptionFrame, observer: PlayerSnapshot, n: int) -> bool:
     """Whether this bot takes a team's 1-in-``n`` passive role (guard/escort).
 
@@ -2486,7 +2607,7 @@ def _passive_slot(frame: PerceptionFrame, observer: PlayerSnapshot, n: int) -> b
     """
 
     return (_team_bot_count(frame, observer) >= 2
-            and _team_slot(frame, observer) % n == 0)
+            and _rotating_team_slot(frame, observer) % n == 0)
 
 
 def _nearest_cell(position: Vector3, cells) -> tuple[int, int, int]:

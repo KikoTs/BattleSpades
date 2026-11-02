@@ -90,6 +90,16 @@ def send_player_score(server, player, *, reason: int | None = None) -> None:
     broadcast_player_packet(
         server, player_score_packet(player, reason=reason), int(player.id)
     )
+    # Public completed-objective cues, used only for short visible friendly
+    # acknowledgement. Carry ticks and ordinary kill score never create one.
+    objective_reasons = {int(C.CTF_CAPTURE_SCORE_REASON), int(C.DIA_CAPTURE_SCORE_REASON),
+                         int(C.TC_CLAIM_SCORE_REASON), int(C.MH_CLAIM_SCORE_REASON),
+                         int(C.OCC_BOOM_SCORE_REASON)}
+    stimuli = getattr(server, "bot_stimuli", None)
+    if reason in objective_reasons and stimuli is not None:
+        from server.bot_ai.messages import StimulusKind
+        stimuli.publish(StimulusKind.OBJECTIVE,tuple(float(v) for v in player.position),
+                        source_id=int(player.id),team=int(player.team),radius=24.,lifetime=2.)
 
 
 def send_team_score(server, team, *, reason: int | None = None) -> None:

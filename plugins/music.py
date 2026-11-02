@@ -1,12 +1,13 @@
 """Per-player gameplay music controls.
 
 Commands:
+    /music       (toggle)
     /music play
     /music stop
 
-This is the opt-in alternative to ``[audio] mode_start_music``.  For fully
-personal control, set ``mode_start_music = false`` so mode-wide broadcasts do
-not start a gameplay bed for everybody.  A player's ``play`` choice survives
+This is the default opt-in music controller. ``[audio] mode_start_music``
+defaults to false so automatic mode tracks do not override personal control.
+A player's ``play`` choice survives
 ordinary round restarts until that player uses ``stop`` or disconnects.
 """
 
@@ -25,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 class MusicPlugin(BasePlugin):
     name = "Music"
-    version = "1.0.0"
+    version = "1.1.0"
     author = "BattleSpades community"
-    description = "Personal gameplay music with /music play and /music stop."
+    description = "Personal gameplay music: /music toggles, /music play|stop."
 
     def __init__(self, server):
         super().__init__(server)
@@ -44,11 +45,11 @@ class MusicPlugin(BasePlugin):
 
         register_command(
             "music",
-            usage="/music <play|stop>",
+            usage="/music [play|stop]",
             description="Start or stop your personal gameplay music.",
         )(music_command)
         self._command_handler = music_command
-        logger.info("Music plugin loaded: /music play | /music stop")
+        logger.info("Music plugin loaded: /music [play|stop]")
 
     async def on_unload(self):
         self._stop_all()
@@ -86,11 +87,15 @@ class MusicPlugin(BasePlugin):
         if not self.enabled:
             await send_message(ctx.server, player, "Music plugin is disabled.")
             return
-        if len(ctx.args) != 1:
+        if len(ctx.args) > 1:
             await self._usage(ctx)
             return
 
-        action = str(ctx.args[0]).casefold()
+        player_id = self._player_id(player)
+        if ctx.args:
+            action = str(ctx.args[0]).casefold()
+        else:
+            action = "stop" if self._listeners.get(player_id) is player else "play"
         if action not in ("play", "stop"):
             await self._usage(ctx)
             return
@@ -102,7 +107,6 @@ class MusicPlugin(BasePlugin):
             )
             return
 
-        player_id = self._player_id(player)
         if player_id is None:
             await send_message(ctx.server, player, "Music is unavailable.")
             return
@@ -125,7 +129,7 @@ class MusicPlugin(BasePlugin):
         await send_message(ctx.server, player, "Music stopped.")
 
     async def _usage(self, ctx):
-        await send_message(ctx.server, ctx.player, "Usage: /music <play|stop>")
+        await send_message(ctx.server, ctx.player, "Usage: /music [play|stop]")
 
     def _stop_all(self):
         for player_id, player in tuple(self._listeners.items()):
@@ -155,11 +159,12 @@ class MusicPlugin(BasePlugin):
             or bool(getattr(mode, "retiring", False))
         ):
             return None
-        return id(mode), float(getattr(mode, "start_time", 0.0) or 0.0)
+        return (id(mode), float(getattr(mode, "start_time", 0.0) or 0.0),
+                getattr(self.server, "audio_music_revision", 0))
 
     def _global_gameplay_music_enabled(self) -> bool:
         return bool(
-            getattr(getattr(self.server, "config", None), "mode_start_music", True)
+            getattr(getattr(self.server, "config", None), "mode_start_music", False)
         )
 
     def _owns_slot(self, player_id: int, player) -> bool:

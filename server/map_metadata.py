@@ -552,6 +552,8 @@ def canonical_mode_code(mode: object) -> str:
         return value
     from server.hardcore import base_code
     code = base_code(mode_data.get(value).code)
+    if code == "czom":
+        return "zom"
     return value if code == "nor" and value != "nor" else code
 
 

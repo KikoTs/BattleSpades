@@ -13,12 +13,12 @@ from types import SimpleNamespace
 import pytest
 import shared.constants as C
 
-from server.bot_ai.cooperative_behavior import CooperativeBehavior
+from server.bot_ai.cooperative_behavior import CooperativeBehavior, identity
 from server.bot_ai.gateway import BotActionGateway
 from server.bot_ai.messages import BotActionKind, EntitySnapshot, PerceptionFrame
 from server.bot_ai.policies import ModeBotDecision
 from server.bot_ai.prefab_policy import load_bot_prefab_geometry
-from server.bot_ai.team_tasks import TaskStage
+from server.bot_ai.team_tasks import TaskStage, TeamProject
 from server.config import ServerConfig
 from server.deployable_actions import DeployableActionService
 from server.entities.registry import EntityRegistry
@@ -27,6 +27,34 @@ from tests.test_bot_project_sites import make_world, player
 
 
 LANE = (40.5, 20.5, 17.75)
+
+
+def test_verified_crossing_relays_runners_and_keeps_other_teammates_covering():
+    world = make_world()
+    coordinator = CooperativeBehavior(world)
+    owner = player()
+    first = player(player_id=2, position=(21.5, 20.5, 17.75))
+    second = player(player_id=3, position=(20.5, 22.5, 17.75))
+    goal = (28.5, 20.5, 17.75)
+    project = TeamProject(9, 2, "bridge", identity(owner), goal, LANE, 100., 140.,
+        stage=TaskStage.USE, cells=((25, 20, 20),),
+        participants={identity(first): 102., identity(second): 102.})
+    coordinator.teams.projects[9] = project
+    group = frame(first, 100., owner, second)
+    assert coordinator._support_project(group, first, None).role == "squad_advance"
+    waiting = coordinator._support_project(group, second, None)
+    assert waiting.role == "cover_teammate" and waiting.goal != goal
+    # A stationary lead cannot freeze the whole crew indefinitely.
+    later = replace(group, created_at=106.)
+    assert coordinator._support_project(later, second, None).role == "squad_advance"
+    arrived = move(second, goal)
+    assert coordinator._support_project(replace(later, players=(owner, first, arrived)), arrived, None) is None
+    assert identity(arrived) in project.used_by
+    assert coordinator._support_project(replace(later, players=(owner, first, arrived)), first, None).role == "squad_advance"
+    # A subsequent edit revokes the crossing before another runner can use it.
+    world._vxl.solids.remove((25, 20, 20))
+    assert coordinator._support_project(later, first, None) is None
+    assert not coordinator.teams.projects
 
 
 def frame(bot, now=100., *others, entities=(), epoch=1):
@@ -71,6 +99,7 @@ class ProjectAuthority:
 
     def execute(self, snapshot, order):
         self.owner.x, self.owner.y, self.owner.z = snapshot.position
+        self.owner.eye = snapshot.eye
         assert self.gateway.execute(self.owner, order.action)
         return replace(snapshot, blocks=self.owner.blocks,
             deployable_stock=tuple(sorted(self.owner.deployable_stock.items())),
@@ -178,6 +207,25 @@ def test_rejected_action_is_not_retried_and_death_clears_team_reservation():
     assert not coordinator.teams.projects
 
 
+def test_successful_method_memory_survives_death_but_not_team_or_round_change():
+    world, bot, coordinator = setup_outpost()
+    decide(coordinator, bot)
+    life = coordinator.lives[(bot.player_id, bot.generation)]
+    life.memory.record("bridge", (30., 20., 17.75), 100., True)
+    life.memory.record("breach", (40., 20., 17.75), 100., False)
+    coordinator.forget(bot.player_id, bot.generation)
+    reborn = replace(bot, life_id=bot.life_id + 1)
+    decide(coordinator, reborn, 102.)
+    remembered = coordinator.lives[(bot.player_id, bot.generation)].memory
+    assert remembered.preference("bridge", 102.) > 0
+    assert remembered.preference("breach", 102.) == 0
+    coordinator.forget(bot.player_id, bot.generation)
+    decide(coordinator, replace(reborn, team=3, life_id=reborn.life_id + 1), 103.)
+    assert coordinator.lives[(bot.player_id, bot.generation)].memory.preference("bridge", 103.) == 0
+    coordinator.reset()
+    assert not coordinator.experience and not coordinator.lives
+
+
 def setup_crossing(kind):
     world = make_world()
     bot = player(class_id=int(C.CLASS_MINER),
@@ -243,7 +291,7 @@ def test_crossing_requires_committed_geometry_then_builder_and_partner_use(kind)
     assert coordinator.teams.metrics["routes_used_by_partner"] == 1
 
 
-def test_destroyed_bridge_cancels_use_without_claiming_success():
+def test_destroyed_bridge_repairs_missing_deck_before_resuming_use():
     world, bot, partner, coordinator = setup_crossing("bridge")
     order = decide(coordinator, bot, 100., partner)
     site = coordinator.lives[(bot.player_id, bot.generation)].task.site
@@ -251,9 +299,54 @@ def test_destroyed_bridge_cancels_use_without_claiming_success():
     bot = replace(bot, last_action_request_id=order.action.request_id, last_task_accepted=True)
     assert decide(coordinator, bot, 100.2, partner).role == "cross_bridge"
     world._vxl.solids.discard(site.cells[-1])
-    decide(coordinator, bot, 100.4, partner)
-    assert coordinator.teams.metrics["tasks_failed"] == 1
+    repair = decide(coordinator, bot, 100.4, partner)
+    assert repair.action.kind is BotActionKind.BUILD_LINE
+    assert coordinator.teams.metrics["crossing_repairs"] == 1
+    assert coordinator.teams.metrics["tasks_failed"] == 0
     assert coordinator.teams.metrics["tasks_completed"] == 0
+
+
+def test_dead_breach_builder_hands_partial_work_to_capable_teammate():
+    world, bot, partner, coordinator = setup_crossing("breach")
+    decide(coordinator,bot,100.,partner)
+    original = coordinator.lives[(bot.player_id,bot.generation)].task
+    cells = original.site.cells
+    world._vxl.solids.difference_update(cells[:max(1,len(cells)//2)])
+    partner = replace(partner,class_id=int(C.CLASS_MINER),loadout=(int(C.SUPERSPADE_TOOL),))
+    dead = replace(bot,alive=False,spawned=False)
+    inherited = decide(coordinator,partner,101.,dead)
+    task = coordinator.lives[(partner.player_id,partner.generation)].task
+    assert task is not None and task.kind == "breach"
+    assert task.site.cells == cells and task.task_id != original.task_id
+    assert inherited.role == "squad_breach"
+    assert coordinator.teams.metrics["construction_handoffs"] == 1
+    assert task.pending is None
+
+
+def test_destroyed_bridge_without_materials_releases_job_without_free_repair():
+    world, bot, partner, coordinator = setup_crossing("bridge")
+    order=decide(coordinator,bot,100.,partner)
+    site=coordinator.lives[(bot.player_id,bot.generation)].task.site
+    world._vxl.solids.update(site.cells)
+    bot=replace(bot,blocks=0,last_action_request_id=order.action.request_id,last_task_accepted=True)
+    decide(coordinator,bot,100.2,partner)
+    world._vxl.solids.discard(site.cells[-1])
+    decide(coordinator,bot,100.4,partner)
+    assert coordinator.teams.metrics["tasks_failed"]==1
+    assert coordinator.teams.metrics["crossing_repairs"]==0
+
+
+def test_helper_builds_complete_crossing_for_observed_stranded_human():
+    world,bot,partner,coordinator=setup_crossing("bridge")
+    human=replace(move(partner,(28.5,20.5,17.75)),is_bot=False)
+    decide(coordinator,bot,100.,human,strategic=False)
+    order=decide(coordinator,bot,101.6,human,strategic=False)
+    task=coordinator.lives[(bot.player_id,bot.generation)].task
+    assert task is not None and task.kind=="bridge" and task.beneficiary==identity(human)
+    assert task.site.required_blocks<=bot.blocks
+    assert task.site.landing is not None
+    assert order.action.kind is BotActionKind.BUILD_LINE
+    assert world._vxl.solids.isdisjoint(task.site.cells)
 
 
 def test_cover_partner_keeps_its_role_between_candidate_evaluation_ticks():

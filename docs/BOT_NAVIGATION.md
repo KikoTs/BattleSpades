@@ -34,6 +34,30 @@ atlas and planner do not replace authoritative physics. Every immediate
 movement, jump, dig, and build is revalidated by the gameplay process before
 it can affect the world.
 
+When a stalled bot cannot walk to a higher goal, its climb search can recover
+onto a nearby higher surface, including the rim of an isolated plateau. The
+fallback does not require that rim to belong to the map's main ground region,
+and it excludes flat pit-floor destinations during the search. Water escape
+continues to target main ground. This fixes ArcticBase seed 19, where Scout and
+Medic bots repeatedly completed zero-motion segments for 90 seconds below an
+unreachable higher destination. With the same terrain and mixed roster, all
+eight bots escape within 24 simulated seconds through native movement and
+ordinary terrain actions.
+
+Zombie claw range uses full eye-to-eye distance. A survivor on another floor
+does not make the infected stop beneath them and swing. Horde dig, climb,
+surround and detour orders keep their navigation/work even under distant
+survivor fire; a survivor within claw reach can still interrupt. Direct hunts
+and water pursuit retain their normal combat and movement decisions.
+
+The production siege scenarios exercise platform and fortress removal through
+real physics, terrain damage and infection:
+
+```powershell
+py -3.12 scripts/bot_zombie_siege_scenario.py --map ArcticBase --structure platform --zombies 6 --survivors 1 --seconds 60
+py -3.12 scripts/bot_zombie_siege_scenario.py --map ArcticBase --structure fortress --zombies 6 --survivors 1 --seconds 60
+```
+
 Completing a final walking waypoint requires entering its destination cell or
 passing the waypoint between observations. Intermediate corners retain a
 small tolerance for smooth traversal. Jump completion requires the correct
@@ -210,6 +234,16 @@ Focused regressions are in `tests/test_bot_gameplay_overhaul.py`,
 `tests/fixtures/` contains the captured terrain used by those tests; keep these
 fixtures with source, even when removing disposable validation reports.
 
+Reproduce the isolated-pit recovery with an explicit all-bots success gate:
+
+```powershell
+py -3.12 -m scripts.bot_recovery_scenarios --scenario pit --map ArcticBase --bots 8 --seconds 45 --seed 19 --require-all --json tmp/bot-validation/arctic-pits.json
+```
+
+`--require-all` exits unsuccessfully if any bot remains trapped or dies. The
+JSON report retains each bot's final route, goal, atlas region and recovery
+state; `--trace-every 5 --trace-bot 3` prints those diagnostics while it runs.
+
 Long vertical jetpack routes, deliberate two-cell crouch tunnels, and richer
 prefab tactics remain outside the enabled navigation contract. The six-second
 buried-waterbed recovery is a normal death, not a successful route.
@@ -218,3 +252,12 @@ No finite matrix guarantees recovery on every destructible or custom map.
 Unreachable objectives, fully enclosed bodies, and multi-level terrain still
 need explicit regressions when discovered. These changes do not add packets,
 alter retail input semantics, or require a custom client.
+
+Full-roster mode, construction and last-player challenge coverage is described
+in [BOT_GAMEPLAY_VALIDATION.md](BOT_GAMEPLAY_VALIDATION.md).
+The [behavior checklist](BOT_HUMAN_BEHAVIOR_PLAN.md) and
+[implementation map](BOT_HUMAN_BEHAVIOR_IMPLEMENTATION.md) connect the movement,
+construction, social and Zombie rules to code and regressions. Roaming side
+checks preserve the requested travel vector and yield to combat, hazards and
+precise traversal. Zombie work compares owned access routes with structural
+cuts, retains useful partial work, and invalidates proofs when supports change.

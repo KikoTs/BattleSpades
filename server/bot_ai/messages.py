@@ -84,6 +84,7 @@ class StimulusKind(str, Enum):
     TEAM_SIGHTING = "team_sighting"
     # A player died here: the death cry, with the kill feed's killer as source.
     DEATH = "death"
+    FRIENDLY_ATTENTION = "friendly_attention"
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +266,9 @@ class PlayerSnapshot:
     # is told the same through the damage indicator it draws.
     last_damage_kind: int = -1
     can_dig: bool = True
+    crouching: bool = False
+    sneaking: bool = False
+    sprinting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +313,10 @@ class ObjectiveSnapshot:
     progress: float = 0.0
     attacker: int = -1
     expires_in: float = -1.0
+    planning_pending: bool = False
+    # Horde orders: a released wave is rushing a dangerous survivor; the
+    # carrier sprints, weaves and hops across the open instead of walking.
+    rush: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +330,8 @@ class Stimulus:
     source_id: int = -1
     team: int = -1
     uncertainty: float = 0.0
+    target_id: int = -1
+    target_life_id: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +360,12 @@ class PerceptionFrame:
     friendly_mischief: bool = True
     local_safety_complete: bool = True
     fun: FunState | None = None
+    # Shared match clock/seed for coherent, reproducible team-role rotation.
+    strategy_elapsed: float = 0.0
+    strategy_seed: int = 0
+    protected_build_bounds: tuple[tuple[int, int, int, int], ...] = ()
+    protected_build_circles: tuple[tuple[float, float, float], ...] = ()
+    social_interactions: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +392,12 @@ class MovementIntent:
     # Ordinary walking may run off ledges this many blocks high. Falls only
     # start to hurt at ten blocks, so a short drop is just more walking.
     walk_drop: int = 1
+    # Skills retain JUMP arc/clearance authority during preparation and
+    # flight, but only their explicit takeoff bit may press the jump key.
+    # Ordinary route JUMP edges keep the legacy implicit takeoff default.
+    jump_explicit: bool = False
+    # Internal sub-cell alignment for a verified takeoff/work position.
+    travel_arrival_radius: float = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +442,9 @@ class BotAction:
     burst_pause: float = 0.0
     # Internal task transaction, never a client protocol field.
     request_id: int = 0
+    # Geometry-aware construction uses a verified local anchor, including
+    # covered/multi-storey terrain. Older callers retain surface snapping.
+    exact_placement: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +472,8 @@ class BotIntent:
     life_id: int = -1
     # Fixed-size internal worker diagnostics, never client protocol data.
     debug_navigation: tuple[tuple[str, float | int | bool | str | Vector3 | None], ...] = ()
+    # Optional presentation cue; never an instruction to damage another player.
+    social_cue: str = ""
 
 
 @dataclass(frozen=True, slots=True)

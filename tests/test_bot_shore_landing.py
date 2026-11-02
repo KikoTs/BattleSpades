@@ -133,6 +133,43 @@ def test_next_excavation_face_preserves_owned_melee_cooldown():
     assert act(next_face, 100.75) is BotActionKind.MELEE
 
 
+def test_committed_retreat_reaches_a_new_approach_before_restarting_a_climb(monkeypatch):
+    from server.bot_ai.messages import MovementAffordance
+    from server.bot_ai.simple_navigation import RouteStep
+    from server.bot_ai.simple_worker import _BotState
+    from tests.test_simple_bot_tactics import _TacticalWorld, _player
+
+    observer = _player(1, 2, (10.5, 10.5, 236.75), is_bot=True,
+                       wade=True, grounded=False)
+    world = _TacticalWorld(water_step=RouteStep(
+        (10.5, 11.5, 236.75), MovementAffordance.SWIM,
+    ))
+    world.water_roam_step = lambda position, **kwargs: RouteStep(
+        (position[0] + 2., position[1], position[2]), MovementAffordance.SWIM,
+    )
+    brain = SimpleBotBrain(world)
+    brain.reset_for_map(1)
+    monkeypatch.setattr(brain, "_select_goal", lambda *args, **kwargs: None)
+    considered = []
+    monkeypatch.setattr(brain.skills, "consider_water",
+                        lambda *args, **kwargs: considered.append(args) or None)
+    state = _BotState(1, 1, observer.life_id, water_committed=True,
+                      water_recovery=True, water_escape_position=observer.position,
+                      water_escape_at=100., water_search_origin=observer.position,
+                      water_search_until=108., water_search_heading=(1., 0., 0.))
+    brain._states[(observer.player_id, observer.generation)] = state
+
+    for second in (100.2, 101., 102.):
+        intent = brain.decide(_frame(observer, created_at=second))
+        assert intent.debug_role == "water_search_shore"
+        assert intent.movement.direction[0] > .9
+    assert not considered
+
+    moved = replace(observer, position=(16.5, 10.5, 236.75))
+    brain.decide(_frame(moved, created_at=102.2))
+    assert considered
+
+
 @pytest.mark.parametrize("reenter_water", [False, True])
 def test_brief_bank_contact_retains_swim_recovery_until_sustained_dry_exit(
     monkeypatch, reenter_water

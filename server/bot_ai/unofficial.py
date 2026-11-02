@@ -14,7 +14,7 @@ from .messages import (BotAction, BotActionKind, BotIntent, BotIntentPriority, L
                        MovementAffordance, MovementIntent, PerceptionFrame,
                        PlayerSnapshot, Vector3, VoxelCoordinate)
 from .fun_messages import FunState
-from .policies import ModeBotDecision, ModeBotPosture
+from .policies import ModeBotDecision, ModeBotPosture, _rotating_team_slot
 from modes.unofficial.catalog import CATALOG
 from server.game_constants import WEAPON_PROFILES
 
@@ -105,10 +105,28 @@ def decision_for(frame: PerceptionFrame, observer: PlayerSnapshot) -> ModeBotDec
     if code == "night_shift":
         if team != int(C.TEAM1):
             return goal(f.exit if f.stage == 3 else dict(f.homes)[int(C.TEAM1)], "pressure_outpost", combat=90)
-        if f.stage == 1 and f.repair_cells:
-            return goal(min(f.repair_cells, key=lambda p: math.dist(observer.position, p)), "repair_barricade", "repair", 2, 10)
         if f.stage == 3:
             return goal(f.exit, "hold_evacuation", radius=3, combat=10)
+        active_ids = {p.player_id for p in f.players if p.active and not p.prisoner}
+        squad = sorted((p for p in frame.players if p.is_bot and p.team == team
+                        and p.alive and p.spawned and p.player_id in active_ids),
+                       key=lambda p: _rotating_team_slot(frame, p))
+        humans = sorted((p for p in frame.players if p.team == team and not p.is_bot
+                         and p.alive and p.spawned), key=lambda p: p.player_id)
+        slot = next((i for i, p in enumerate(squad) if p.player_id == pid), len(squad))
+        # Losing all humans ends survival even with living allied bots.
+        # Protect them while a bounded repair crew works; the old policy
+        # sent every ally to the same optional barricade during wave one.
+        guards = min(max(0, len(squad) - 2), len(humans) * 2, max(1, len(squad) // 3))
+        if humans and slot < guards:
+            return replace(goal(humans[slot % len(humans)].position, "guard_survivor",
+                                radius=4, combat=24), posture=ModeBotPosture.ESCORT,
+                           watch_position=enemy)
+        repairers = 1 if len(squad) <= 2 else min(2, max(0, len(squad) - guards - 2))
+        if (f.stage == 1 and f.repair_cells and guards <= slot < guards + repairers
+                and observer.blocks > 0 and int(C.BLOCK_TOOL) in observer.loadout):
+            cell = min(f.repair_cells, key=lambda p: math.dist(observer.position, p))
+            return goal(cell, "repair_barricade", "repair", 2, 10)
     carried = next((c for c in f.cargo if c.holder == pid), None)
     if carried is not None:
         if code == "last_exit":

@@ -13,7 +13,7 @@ from server.hardcore import MODE_CODES as HARDCORE_MODES, base_code, canonical
 #: Canonical registry codes accepted by ``[game] default_mode`` (modes/__init__).
 #: tests/test_server_gui_logic.py keeps this in step with the registry.
 REGISTERED_MODE_CODES = (
-    "tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc", "arena",
+    "tdm", "ctf", "cctf", "zom", "vip", "mh", "tc", "dia", "dem", "oc", "arena", "czom",
 ) + HARDCORE_MODES + tuple(spec.code for spec in ALL_SPECS)
 
 DIFFICULTIES = (
@@ -39,11 +39,14 @@ def mode_choices() -> list[ModeChoice]:
         minutes = int(mode.default_seconds // 60)
         choices.extend((ModeChoice(code, mode.title, minutes),
                         ModeChoice("hc_" + code, "Hardcore " + mode.title, minutes)))
+    choices.append(ModeChoice("czom", "Classic+ Zombies", 10))
     return choices + [ModeChoice(s.code, f"[Unofficial] {s.title}", max(1, s.duration // 60)) for s in SPECS]
 
 
 def mode_title(code: str) -> str:
     code = canonical(code)
+    if code in {"czom", "classic_zombie", "classic-zombie"}:
+        return "Classic+ Zombies"
     if code in HARDCORE_MODES:
         return "Hardcore " + LOBBY_MODES[base_code(code)].title
     if code in CATALOG:
@@ -73,6 +76,8 @@ def mode_pool(maps_dir: Path, mode: str) -> list[str]:
     """
 
     mode = base_code(mode)
+    if mode in {"czom", "classic_zombie", "classic-zombie"}:
+        mode = "zom"
     installed = {name.casefold(): name for name in available_maps(maps_dir)}
     if mode in CATALOG:
         # Read the preset on each selection so newly generated arenas appear
@@ -104,6 +109,8 @@ def custom_maps_for_mode(maps_dir: Path, mode: str) -> list[str]:
     from server_gui.workshop_import import custom_map_modes
 
     code = base_code(mode)
+    if code in {"czom", "classic_zombie", "classic-zombie"}:
+        code = "zom"
     return sorted((stem for stem, modes in custom_map_modes(maps_dir).items() if code in modes), key=str.casefold)
 
 

@@ -192,7 +192,7 @@ def test_result_payload_uses_only_bound_non_bot_players(monkeypatch):
     )
     server.players = {0: player, 1: bot}
     service = RevivalMasterService(server)
-    rows, _snapshots = service._result_players(winner=0)
+    rows, _snapshots, _records = service._result_players(winner=0)
     assert len(rows) == 1
     assert rows[0]["steamid"] == "1000000000"
     assert rows[0]["name"] == "CanonicalBuilder"
@@ -269,6 +269,7 @@ def test_overlapping_submissions_reserve_counters_once(tmp_path, monkeypatch):
     async def scenario():
         await asyncio.gather(service.submit_round_results(2), service.submit_round_results(2))
         assert len(attempts) == 1
+        service.begin_round()
         player.kills += 1
         player.score += 5
         await service.submit_round_results(3)
@@ -309,6 +310,7 @@ def test_departure_while_first_round_is_in_flight_keeps_only_new_delta(tmp_path,
     async def accept(path, payload):
         attempts.append(payload)
         if len(attempts) == 1:
+            service.begin_round()
             player.kills += 2
             player.score += 8
             service.accumulate_departing_player(player)

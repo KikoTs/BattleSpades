@@ -24,8 +24,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter, defaultdict
-from dataclasses import replace
+from dataclasses import asdict, replace
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -49,6 +50,19 @@ OBJ_TICKS = 30             # 2 Hz objective snapshot
 
 _REAL_MONOTONIC = time.monotonic
 _REAL_TIME = time.time
+_FUN_CLOCK = None
+
+
+class _AuditErrors(logging.Handler):
+    """Keep caught runtime failures from being reported as a successful audit."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if len(self.messages) < 32:
+            self.messages.append(self.format(record))
 
 
 class SimClock:
@@ -68,11 +82,25 @@ CLOCK = SimClock()
 
 
 def install_clock() -> None:
+    # The matrix imports the mode catalog before entering this function.
+    # FunMode's staticmethod captured the original callable at import time;
+    # replacing time.monotonic alone otherwise leaves its preparation/waves
+    # running on host time while every other subsystem is accelerated.
+    from modes.unofficial.base import FunMode
+    global _FUN_CLOCK
+    if _FUN_CLOCK is None:
+        _FUN_CLOCK = FunMode.__dict__["clock"]
+    FunMode.clock = staticmethod(CLOCK.monotonic)
     time.monotonic = CLOCK.monotonic
     time.time = CLOCK.time
 
 
 def uninstall_clock() -> None:
+    from modes.unofficial.base import FunMode
+    global _FUN_CLOCK
+    if _FUN_CLOCK is not None:
+        FunMode.clock = _FUN_CLOCK
+        _FUN_CLOCK = None
     time.monotonic = _REAL_MONOTONIC
     time.time = _REAL_TIME
 
@@ -91,6 +119,7 @@ def _make_sync_supervisor(decision_hz: float, path_rps: float):
         """AIThreadSupervisor whose batch body runs in-line via ``pump``."""
 
         def start(self, snapshot) -> None:  # noqa: D401
+            self._archive_construction()
             with self._lock:
                 self._latest_snapshot = snapshot
                 self._snapshot_serial += 1
@@ -113,6 +142,20 @@ def _make_sync_supervisor(decision_hz: float, path_rps: float):
             self.decision_ms_max = 0.0
             self.decision_errors = 0
             self.pump()
+
+        def _archive_construction(self) -> None:
+            if not hasattr(self, "construction_history"):
+                self.construction_history = []
+            brain = getattr(self, "_brain", None)
+            if brain is None:
+                return
+            sites = brain.cooperative.sites
+            if sites.metrics:
+                self.construction_history.append({
+                    "metrics": dict(sites.metrics), "history": list(sites.history),
+                    "sites": [site.status(self._world.solid) for site in sites.sites.values()],
+                })
+            self._brain = None
 
         def close(self, timeout: float = 3.0) -> None:
             with self._lock:
@@ -153,6 +196,7 @@ def _make_sync_supervisor(decision_hz: float, path_rps: float):
                 frames = tuple(sorted(self._frames.values(), key=lambda f: int(f.frame_id)))
                 self._frames.clear()
             if snapshot is not None:
+                self._archive_construction()
                 self._world.load(snapshot)
                 self._brain = SimpleBotBrain(self._world, decision_hz=self.decision_hz)
                 self._brain.reset_for_map(snapshot.map_epoch)
@@ -204,6 +248,8 @@ MODE_HOOKS = (
     # generic
     "on_mode_end", "_end_by_score", "_end_by_time", "_restart_round", "on_round_start",
     "on_round_end", "_run_end_sequence", "_focus_airstrike",
+    # Community modes: player scores, actual finishes and survival waves.
+    "award", "finish", "start_wave", "retire_wave", "on_bot_command",
 )
 
 
@@ -232,6 +278,12 @@ def instrument_mode(mode, events: list, now) -> None:
         if asyncio.iscoroutinefunction(original):
             def make(original=original, name=name):
                 async def wrapped(*args, **kwargs):
+                    if name in {"_cash_in", "_cash_in_loose"}:
+                        before = sum(t.score for t in mode.server.teams.values())
+                        result = await original(*args, **kwargs)
+                        if sum(t.score for t in mode.server.teams.values()) > before:
+                            events.append([round(now(), 2), name, _arg_summary(args, kwargs)])
+                        return result
                     events.append([round(now(), 2), name, _arg_summary(args, kwargs)])
                     return await original(*args, **kwargs)
                 return wrapped
@@ -251,11 +303,27 @@ def _r(value, digits=2):
     return round(float(value), digits)
 
 
+def source_digest(root: Path = ROOT) -> str:
+    """Identify the actual gameplay sources, including uncommitted fixes."""
+    digest = hashlib.sha256()
+    for folder in ("server", "modes", "shared"):
+        for path in sorted((root / folder).rglob("*.py")):
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+    for name in ("bot_audit_harness.py","bot_gameplay_scenarios.py","bot_zombie_horde_scenario.py"):
+        path=root / "scripts" / name
+        digest.update(name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, bots: int,
                    out: Path | None, class_ids: tuple[int, ...] = (),
                    natural_limits: bool = True, behavior: str | None = None,
-                   scenario=None, quiet: bool = True, max_bots: int = 0) -> dict:
+                   scenario=None, quiet: bool = True, max_bots: int = 0,
+                   maps_path: Path | None = None, humans: int = 0) -> dict:
     wall_started = time.perf_counter()
+    initial_digest = source_digest()
     install_clock()
     CLOCK.elapsed = 0.0
     random.seed(int(seed))
@@ -272,11 +340,11 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
     config = load_config(ROOT / "config.toml")
     config.default_mode = str(mode_name).lower()
     config.default_map = str(map_name)
-    config.maps_path = str(ROOT / "maps")
+    config.maps_path = str(maps_path or ROOT / "maps")
     config.bots.population_mode = "admin"
     config.bots.max_bots = max(int(bots), int(max_bots))
     config.bots.seed = int(seed)
-    config.max_players = max(int(config.max_players), int(bots), int(max_bots) + 8)
+    config.max_players = max(int(config.max_players), int(bots) + int(humans), int(max_bots) + 8)
     if behavior is not None:
         config.bots.behavior_version = behavior
     server = BattleSpadesServer(config)
@@ -379,6 +447,16 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
         return accepted
 
     director.gateway.execute = execute
+    construction_rejections: Counter = Counter()
+    original_reserve = server.construction.reserve_construction
+
+    def reserve(*args, **kwargs):
+        result = original_reserve(*args, **kwargs)
+        if result[0] is None:
+            construction_rejections[result[1]] += 1
+        return result
+
+    server.construction.reserve_construction = reserve
 
     result: dict = {
         "map": map_name, "mode": mode_name, "seed": int(seed), "bots": int(bots),
@@ -389,6 +467,7 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
     vis: dict[int, list] = defaultdict(list)
     objective_rows: list = []
     score_rows: list = []
+    fun_rows: list = []
     bot_meta: dict[int, dict] = {}
     error = ""
     no_intent_ticks: Counter = Counter()
@@ -397,8 +476,25 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
     parachute_ticks: Counter = Counter()
     tool_ticks: dict[int, Counter] = defaultdict(Counter)
     tick_ms_max = 0.0
+    audit_errors = _AuditErrors()
+    logging.getLogger().addHandler(audit_errors)
     try:
         await director.start(initial_count=int(bots))
+        if humans:
+            from scripts.bot_gameplay_scenarios import add_human
+            for index in range(humans):
+                await add_human(server, 2 + index % 2, f"Scenario participant {index + 1}")
+        if (getattr(server.mode, "owns_bot_population", False)
+                and len(director.bots) < bots and server.mode.ready()):
+            # Survival admits allies only during preparation. Enter through
+            # its real ready/new-round path, then join the requested friendly
+            # squad; leave all enemy-wave creation to the mode itself.
+            if server.mode.phase == "waiting":
+                await server.mode._new_round()
+            for _ in range(bots - len(director.bots)):
+                if await director.add_bot(team=2) is None:
+                    raise RuntimeError("mode-owned population could not admit the audit squad")
+        result["initial_bot_count"] = len(director.bots)
         if class_ids:
             # Optional forced classes (after the normal join) for ability probes.
             pass
@@ -409,18 +505,32 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
             on_tick = await scenario(server, director, CLOCK, scenario_state)
         total_ticks = max(1, int(round(float(seconds) * SIM_HZ)))
         world = server.world_manager
+        instrumented_mode = server.mode
         for tick in range(total_ticks):
             CLOCK.elapsed = tick / SIM_HZ
             server.loop_count += 1
             if on_tick is not None:
                 on_tick(tick, CLOCK.elapsed)
+            # Connected humans keep sending ClientData while idle. Without
+            # those input rows their authoritative physics intentionally waits,
+            # which would leave a test VIP floating after its floor collapsed.
+            for participant in tuple(server.players.values()):
+                if getattr(participant.connection, "scenario_participant", False):
+                    participant.record_input_frame(server.loop_count,
+                        getattr(participant.connection,"scenario_flags",(False,)*8),
+                        getattr(participant.connection,"scenario_orientation",participant.orientation),
+                        received_server_tick=server.loop_count)
             started = time.perf_counter()
             await server.simulation_runtime.step()
+            if server.mode is not instrumented_mode:
+                instrument_mode(server.mode, mode_events, now_fn)
+                instrumented_mode = server.mode
             supervisor.pump()
             tick_ms_max = max(tick_ms_max, (time.perf_counter() - started) * 1000.0)
             await asyncio.sleep(0)
             now = time.monotonic()
             live_bots = [p for p in server.players.values() if getattr(p, "is_bot", False)]
+            result["peak_bot_count"] = max(result.get("peak_bot_count", 0), len(live_bots))
             for bot in live_bots:
                 bid = int(bot.id)
                 runtime = director._runtime.get(bid)
@@ -503,6 +613,18 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
                 ][:40]])
                 score_rows.append([t, {int(k): int(getattr(v, "score", 0)) for k, v in server.teams.items()},
                                    str(director._mode_phase())])
+                snapshot_fun = getattr(server.mode, "bot_snapshot", None)
+                if tick % SIM_HZ == 0 and callable(snapshot_fun):
+                    fun = snapshot_fun()
+                    if fun is not None:
+                        def scores(mapping):
+                            return {f"player:{key.id}" if hasattr(key, "id") else f"team:{key}": value
+                                    for key, value in mapping.items()}
+                        fun_rows.append([t, asdict(fun), {
+                            "points": scores(getattr(server.mode, "points", {})),
+                            "match_points": scores(getattr(server.mode, "match_points", {})),
+                            "finishers": scores(getattr(server.mode, "finished", {})),
+                        }])
         result["simulated_seconds"] = (tick + 1) / SIM_HZ
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-3000:]}"
@@ -510,11 +632,23 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
     finally:
         Player.die = original_die
         Player.damage = original_damage
+        logging.getLogger().removeHandler(audit_errors)
         logging.disable(logging.NOTSET)
+
+    if audit_errors.messages and not error:
+        error = "Runtime failures during audit:\n" + "\n".join(audit_errors.messages)
 
     players = {int(p.id): p for p in server.players.values()}
     result.update({
+        "audit_version": 3,
         "error": error,
+        "runtime_errors": audit_errors.messages,
+        "source_digest": initial_digest,
+        "source_unchanged_during_run": initial_digest == source_digest(),
+        "requested_bots": int(bots),
+        "human_participants": int(humans),
+        "construction_rejections": dict(construction_rejections),
+        "maps_path": str(config.maps_path),
         "wall_seconds": round(time.perf_counter() - wall_started, 1),
         "tick_ms_max": round(tick_ms_max, 1),
         "decision_ms_max": round(getattr(supervisor, "decision_ms_max", 0.0), 1),
@@ -543,6 +677,7 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
         "actions": actions,
         "objectives": objective_rows,
         "scores": score_rows,
+        "fun": fun_rows,
         "trace": {str(k): v for k, v in trace.items()},
         "vis": {str(k): v for k, v in vis.items()},
         "planning": supervisor._world.planning_budget.snapshot() if getattr(supervisor, "_world", None) is not None and supervisor._world.planning_budget is not None else {},
@@ -550,17 +685,46 @@ async def run_case(*, map_name: str, mode_name: str, seed: int, seconds: float, 
     })
     try:
         from server.bot_ai.simple_worker import behavior_metrics_snapshot
+        result["navigation_state"] = {
+            str(key[0]): {
+                name: getattr(state, name, None) for name in (
+                    "goal_progress_at", "goal_best_distance", "navigation_progress_at",
+                    "navigation_window_at", "escape_attempts", "escape_goal", "escape_retry_at",
+                    "dead_end", "short_plans", "walkless_goal", "route_index",
+                    "corridor", "corridor_retry_at", "corridor_failed_goal", "next_plan_at",
+                )
+            } for key, state in supervisor._brain._states.items()
+        }
         metrics = behavior_metrics_snapshot(supervisor._brain)
         result["behavior_metrics"] = {
             "counters": metrics.get("counters", {}),
             "project_kinds": metrics.get("project_kinds", {}),
             "active_projects": metrics.get("active_projects", 0),
+            "events": metrics.get("events", ()),
+        }
+        sites = supervisor._brain.cooperative.sites
+        current_construction = {
+            "metrics": dict(sites.metrics),
+            "history": list(sites.history),
+            "sites": [site.status(supervisor._world.solid) for site in sites.sites.values()],
+        }
+        construction_epochs = [*getattr(supervisor, "construction_history", ()), current_construction]
+        construction_metrics: Counter = Counter()
+        for epoch in construction_epochs:
+            construction_metrics.update(epoch["metrics"])
+        result["construction"] = {
+            "metrics": dict(construction_metrics),
+            "epochs": construction_epochs,
         }
     except Exception:  # noqa: BLE001
         result["behavior_metrics"] = {}
     try:
         skills = supervisor._brain.skills
         result["skill_metrics"] = dict(getattr(skills, "metrics", {}) or {})
+        result["objective_siege"] = {"metrics":dict(supervisor._brain.objective_siege.metrics),
+            "events":list(supervisor._brain.objective_siege.events),
+            "jobs":[{"position":j.position,"floor":j.floor,"diagnostics":j.diagnostics}
+                    for j in supervisor._brain.objective_siege.jobs.values()]}
         result["skill_events"] = [list(map(lambda v: list(v) if isinstance(v, tuple) else v, e))
                                   for e in list(getattr(skills, "events", []))[-64:]]
     except Exception:  # noqa: BLE001
@@ -580,18 +744,29 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=300.0)
     parser.add_argument("--bots", type=int, default=12)
+    parser.add_argument("--max-bots", type=int, default=0)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--behavior", choices=("classic", "cooperative"), default=None)
+    parser.add_argument("--maps-path", type=Path)
+    parser.add_argument("--humans", type=int, default=0)
+    from scripts.bot_gameplay_scenarios import TARGET_SCENARIOS
+    parser.add_argument("--scenario", choices=TARGET_SCENARIOS)
     parser.add_argument("--unlimited", action="store_true",
                         help="raise score/time limits so one round runs for the whole case")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if args.out is not None and not args.out.is_absolute():
         args.out = ORIGINAL_CWD / args.out
+    scenario = None
+    if args.scenario:
+        from scripts.bot_gameplay_scenarios import target_scenario
+        scenario = target_scenario(args.scenario, seed=args.seed)
     result = asyncio.run(run_case(
         map_name=args.map, mode_name=args.mode, seed=args.seed, seconds=args.seconds,
         bots=args.bots, out=args.out, natural_limits=not args.unlimited,
         behavior=args.behavior, quiet=not args.verbose,
+        maps_path=args.maps_path, humans=args.humans, scenario=scenario,
+        max_bots=args.max_bots,
     ))
     uninstall_clock()
     kills = sum(1 for d in result["deaths"] if d[4] >= 0 and d[4] != d[1])

@@ -362,13 +362,16 @@ def test_territory_defender_relieves_an_uncontested_siege():
 
 
 def test_director_publishes_territory_progress_and_attacker():
-    territory = SimpleNamespace(zone=SimpleNamespace(center=(5.0, 6.0, 7.0)), owner=BLUE,
+    from modes.objective_zones import ObjectiveZone
+    zone = ObjectiveZone(0, (1, 9, 2, 10, 3, 11), (5.0, 6.0, 7.0))
+    territory = SimpleNamespace(zone=zone, owner=BLUE,
                                 attacker=GREEN, progress=0.3, contested=False)
     mode = SimpleNamespace(mode_code="tc", territories=[territory])
     director = object.__new__(BotDirector)
     director.server = SimpleNamespace(mode=mode, world_manager=SimpleNamespace(), players={})
     item = next(item for item in director._snapshot_objectives() if item.kind == "tc_territory")
     assert item.attacker == GREEN and abs(item.progress - 0.3) < 1e-9
+    assert item.bounds == zone.bounds
 
 
 # ------------------------------------------------------------ director safety

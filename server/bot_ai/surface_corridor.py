@@ -191,6 +191,17 @@ class SurfaceCorridorSearch:
     def _working_set_is_full(self) -> bool:
         return len(self.costs) + len(self.costs_back) >= _MAX_DISCOVERED
 
+    def _restart(self) -> None:
+        """Begin again from both ends with the current exclusions, same budget."""
+
+        for working in (self.frontier, self.costs, self.parents, self.closed,
+                        self.frontier_back, self.costs_back, self.children, self.closed_back):
+            working.clear()
+        self.costs[self.start] = 0.0
+        self.frontier.append((0.0, self.start, 0.0))
+        self.costs_back[self.target] = 0.0
+        self.frontier_back.append((0.0, self.target, 0.0))
+
     def exclude_edge(self, source: tuple[int, int, int], target: tuple[int, int, int]) -> None:
         """Retain bounded search work while learning a new local failure."""
         left = self._node(source[1] * self.width + source[0], source[2])
@@ -206,9 +217,15 @@ class SurfaceCorridorSearch:
             while nodes[-1] != self.target:
                 nodes.append(self.children[nodes[-1]])
             # An edge may have failed after it entered a search tree. Never
-            # return a corridor using that stale chain; the next search
-            # starts with current exclusions while unrelated work can finish.
+            # return a corridor using that stale chain. Giving the search up
+            # here left the brain with "no walk to the goal" for two minutes
+            # (a zombie jostled on London's bank blacklisted its own first
+            # step while the bridge was being found); start over with the
+            # exclusions instead, within the same expansion budget.
             if any(edge in self.blocked for edge in zip(nodes, nodes[1:])):
+                if self.expansions < _MAX_EXPANSIONS:
+                    self._restart()
+                    return
                 self._finish()
                 return
             # Preserve corners and height transitions. Limit straight sections

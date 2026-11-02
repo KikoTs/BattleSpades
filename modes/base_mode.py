@@ -617,7 +617,10 @@ class BaseMode(ABC):
         caller's gameplay bed).
         """
         import random
-        from server.audio import GAME_ENDING_TRACKS
+        from server.audio import GAME_ENDING_TRACKS, mode_start_music_enabled
+
+        if not mode_start_music_enabled(self.server):
+            return None
 
         if self.ended and self._end_sequence_running and not self.retiring:
             return random.choice(GAME_ENDING_TRACKS)

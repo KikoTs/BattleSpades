@@ -121,6 +121,13 @@ MODES: dict[str, ModeData] = {
                   'dia', 'tc', 'vip', 'zom', 'tut', 'ugc')
 }
 
+# Keep the Zombie scene and radar: Classic's feature bit globally hides the
+# minimap and would also apply Classic presentation to the infected team.
+MODES["czom"] = replace(
+    MODES["zom"], code="czom",
+    allowed_classes=(int(C.CLASS_CLASSIC_SOLDIER), int(C.CLASS_ZOMBIE)),
+)
+
 # Community names are server-side identifiers, never unknown retail mode IDs
 # or invented localization keys. Chat explains the custom rules.
 from modes.unofficial.catalog import CATALOG as _FUN_CATALOG, canonical as _fun_code
@@ -142,6 +149,8 @@ def get(code: str) -> ModeData:
     normalized = canonical(code)
     normalized = {
         'zombie': 'zom',
+        'classic_zombie': 'czom',
+        'classic-zombie': 'czom',
         'classic_ctf': 'cctf',
         'classic-ctf': 'cctf',
         'multihill': 'mh',

@@ -220,6 +220,6 @@ def test_perception_refresh_cannot_permanently_starve_one_motor_phase(monkeypatc
             await director.update(1.0 / 60.0)
 
     asyncio.run(run())
-    assert len(updates) >= 15, updates
-    assert max(b[0] - a[0] for a, b in zip(updates, updates[1:])) <= 8
-    assert all(0.1 <= dt <= 0.14 for _, dt in updates[1:])
+    assert len(updates) == 60, updates
+    assert max(b[0] - a[0] for a, b in zip(updates, updates[1:])) <= 2
+    assert all(dt == pytest.approx(1 / 30) for _, dt in updates[1:])

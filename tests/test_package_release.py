@@ -89,6 +89,15 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     assert (staged / "config.toml").is_file()
     assert (staged / "fleet.toml").is_file()
     assert (staged / "configs" / "official-tdm.toml").is_file()
+    assert (staged / "maps/unofficial/FoundryRun.vxl").read_bytes() == (
+        PROJECT_ROOT / "maps/unofficial/FoundryRun.vxl").read_bytes()
+    assert (staged / "maps/unofficial/FoundryRun.txt").read_bytes() == (
+        PROJECT_ROOT / "maps/unofficial/FoundryRun.txt").read_bytes()
+    for sidecar in ("Alcatraz.ugc", "CityOfChicago.ugc"):
+        assert (staged / "maps" / sidecar).read_bytes() == (
+            PROJECT_ROOT / "maps" / sidecar).read_bytes()
+    assert (staged / "configs/unofficial/block_hunt.toml").read_bytes() == (
+        PROJECT_ROOT / "configs/unofficial/block_hunt.toml").read_bytes()
     assert (staged / "LICENSE").is_file()
     assert (staged / "VERSION").read_text(encoding="utf-8").strip() == target.version
     assert sorted(path.name for path in (staged / "maps").glob("*.vxl")) == TRACKED_MAPS
@@ -97,6 +106,11 @@ def test_stage_release_copies_only_required_operator_content(tmp_path: Path) -> 
     ) == TRACKED_NAVIGATION
     assert sorted(path.name for path in (staged / "prefabs").glob("*.kv6")) == TRACKED_PREFABS
     assert (staged / "plugins" / "README.txt").is_file()
+    assert (staged / "plugins" / "music.py").read_bytes() == (
+        PROJECT_ROOT / "plugins" / "music.py"
+    ).read_bytes()
+    from server.plugin_loader import discover_plugin_classes
+    assert [plugin.name for plugin in discover_plugin_classes(staged / "plugins")] == ["Music"]
     assert (staged / "steam-runtime" / "README.txt").is_file()
     assert (staged / "client_patches" / "INSTALL.txt").is_file()
     assert (staged / "client_patches" / "session_transition_patch.py").is_file()

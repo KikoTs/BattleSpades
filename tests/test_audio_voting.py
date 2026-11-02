@@ -20,6 +20,7 @@ from server import audio, voting  # noqa: E402
 
 class FakeServer:
     def __init__(self):
+        self.config = SimpleNamespace(mode_start_music=True)
         self.sent = []
         self.players = {}
         self.connections = {}

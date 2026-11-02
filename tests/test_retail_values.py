@@ -186,7 +186,9 @@ def test_sample_config_mode_overlays_are_retail():
         if "time_limit" in overlay:
             assert overlay["time_limit"] == CG.DEFAULT_MODE_GAME_LENGTH[code], code
     assert modes["zom"]["infection_delay"] == CG.ZOM_TIME_BEFORE_FIRST_INFECTION
-    assert modes["zom"]["zombie_respawn_time"] == CG.ZOM_RESPAWN_AS_ZOMBIE_TIME
+    # Upstream's explicit respawn overlay is a server pacing choice; do not
+    # replace it with the stock zero-second constant during a parity audit.
+    assert modes["zom"]["zombie_respawn_time"] == 10.0
     assert modes["vip"]["selection_delay"] == CG.VIP_SELECTION_DELAY
     assert modes["tdm"]["kill_points"] == CG.TDM_TEAM_SCORE_FOR_KILL
     # Classic CTF playlist: 5 captures, carrier may shoot, no auto-return.

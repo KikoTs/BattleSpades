@@ -223,6 +223,20 @@ def test_detour_is_not_blacklisted_for_moving_away_from_final_goal() -> None:
     assert world.plan_calls in ([], [False])
 
 
+@pytest.mark.parametrize("height", [-8.0, 8.0])
+def test_zombie_does_not_stop_to_swing_at_a_survivor_on_another_floor(height) -> None:
+    observer = _player(1, TEAM1, (10.5, 10.5, 236.75),
+                       class_id=int(C.CLASS_ZOMBIE), is_bot=True,
+                       loadout=(int(C.ZOMBIEHAND_TOOL),),
+                       weapon_tool=int(C.ZOMBIEHAND_TOOL))
+    survivor = _player(2, TEAM2, (11.0, 10.5, observer.position[2] + height))
+    step = RouteStep((13.5, 10.5, 236.75), MovementAffordance.WALK)
+    intent = SimpleBotBrain(_TacticalWorld(route_step=step)).decide(_frame(observer, survivor))
+    assert intent.action.kind is not BotActionKind.MELEE
+    assert intent.debug_role == "combat_pursuit"
+    assert intent.movement.direction != (0.0, 0.0, 0.0)
+
+
 def test_stale_weapon_never_requests_fire_with_an_unowned_tool() -> None:
     smg = int(C.SMG_TOOL)
     turret = int(C.ROCKET_TURRET_TOOL)
@@ -1542,7 +1556,7 @@ def test_crowd_adjustment_never_invents_idle_movement() -> None:
     teammate = replace(observer, player_id=1)
     frame = _frame(observer, teammate)
 
-    movement = SimpleBotBrain._crowd_adjusted_movement(
+    movement = SimpleBotBrain(_TacticalWorld())._crowd_adjusted_movement(
         frame,
         MovementIntent(),
         action=BotAction(),
@@ -1556,7 +1570,7 @@ def test_swim_crowd_adjustment_preserves_forward_progress() -> None:
     teammate = replace(observer, player_id=1)
     frame = _frame(observer, teammate)
 
-    movement = SimpleBotBrain._crowd_adjusted_movement(
+    movement = SimpleBotBrain(_TacticalWorld())._crowd_adjusted_movement(
         frame,
         MovementIntent(
             direction=(1.0, 0.0, 0.0),

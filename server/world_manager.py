@@ -1523,6 +1523,13 @@ class WorldManager:
                     if clustered:
                         choices = clustered
             random.shuffle(choices)
+            if not any(self._zone_allows_water(zone) for zone in authored_zones):
+                # A generic random spawn should use an available dry cached
+                # column before its water fallback. Keep all columns cached
+                # for later terrain edits; explicit retail sea-spawn zones
+                # and mode-owned horizontal positions retain their behavior.
+                choices.sort(key=lambda candidate: self.is_water_column(
+                    int(candidate[0]), int(candidate[1])))
             for candidate in choices:
                 # Spawn slightly above equilibrium and let physics settle.
                 position = self.spawn_candidate_position(candidate, authored_zones)

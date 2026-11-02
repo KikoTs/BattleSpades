@@ -102,12 +102,31 @@ class BreachPlan:
     secondary: bool
     fire_interval: float
     estimated_swings: int
+    aim_point: Vector3 | None = None
 
     @property
     def target(self) -> Vector3:
         """Return the exact voxel centre the authoritative ray should hit."""
 
-        return tuple(float(value) + 0.5 for value in self.target_cell)
+        return self.aim_point or tuple(float(value) + 0.5 for value in self.target_cell)
+
+
+def visible_cell_aim(world, eye: Vector3, cell: tuple[int,int,int], *, reach: float = 3.1) -> Vector3 | None:
+    """A visible point inside the selected voxel, including its exposed face.
+
+    On a tall wall the centre of a low voxel can hide behind its upper
+    neighbour. The near face remains hittable; choosing that point preserves
+    the selected cell and the authoritative first-hit/range checks.
+    """
+    center=tuple(v+.5 for v in cell)
+    nearest=tuple(max(cell[a]+.05,min(cell[a]+.95,eye[a])) for a in range(3))
+    points=[center,nearest]
+    for axis in range(3):
+        point=list(center)
+        point[axis]=nearest[axis]
+        points.append(tuple(point))
+    return next((point for point in points if math.dist(eye,point)<=reach
+                 and world.has_line_of_sight(eye,point)),None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,11 +155,13 @@ class RoutePlan:
 class _BudgetedCorridorSearch:
     """Keep an incremental frontier intact when this observer must wait."""
 
-    __slots__ = ("_world", "_search", "deferred")
+    __slots__ = ("_world", "_search", "_key", "deferred")
 
-    def __init__(self, world: SimpleVoxelWorld, search: SurfaceCorridorSearch) -> None:
+    def __init__(self, world: SimpleVoxelWorld, search: SurfaceCorridorSearch,
+                 key: tuple | None = None) -> None:
         self._world = world
         self._search = search
+        self._key = key
         self.deferred = False
 
     def __getattr__(self, name):
@@ -153,6 +174,7 @@ class _BudgetedCorridorSearch:
         budget = world.planning_budget
         if budget is None:
             self._search.advance()
+            self._remember()
             return
         world._planning_requested = True
         job = (budget.try_acquire(world._planning_observer, world._planning_time)
@@ -169,6 +191,29 @@ class _BudgetedCorridorSearch:
         finally:
             job.expansions = self._search.expansions - before
             budget.finish(job, time.perf_counter() - started)
+        self._remember()
+
+    def _remember(self) -> None:
+        if self._key is not None and self._search.done:
+            self._world._remember_corridor(self._key, self._search.path)
+
+
+class _FinishedCorridor:
+    """A corridor another bot already searched for, served without work."""
+
+    __slots__ = ("path", "done", "deferred", "expansions")
+
+    def __init__(self, path: tuple[Vector3, ...]) -> None:
+        self.path = path
+        self.done = True
+        self.deferred = False
+        self.expansions = 0
+
+    def advance(self) -> None:
+        return
+
+    def exclude_edge(self, source: tuple[int, int, int], target: tuple[int, int, int]) -> None:
+        return
 
 
 class SimpleVoxelWorld:
@@ -181,6 +226,8 @@ class SimpleVoxelWorld:
         "_atlas",
         "_dirty_columns",
         "_corridor_supports",
+        "_corridor_cache",
+        "_plan_goal_region",
         "prefab_geometry",
         "planning_budget",
         "_planning_observer",
@@ -191,6 +238,7 @@ class SimpleVoxelWorld:
         "_column_version_base",
         "_column_version_latest",
         "_cell_health",
+        "mutation_history",
     )
 
     def __init__(self, *, planning_budget: PlanningBudget | None = None) -> None:
@@ -200,6 +248,12 @@ class SimpleVoxelWorld:
         self._atlas: NavigationAtlas | None = None
         self._dirty_columns: set[tuple[int, int]] = set()
         self._corridor_supports: bytearray | None = None
+        # Finished map-wide corridors by (start cell/4, target node, exclusions):
+        # a horde of sixteen asking for the same bridge runs one search.
+        # Cleared by any terrain edit; bounded.
+        self._corridor_cache: dict[tuple, tuple[Vector3, ...]] = {}
+        # Atlas region of the goal the current _plan is for (0 = unknown).
+        self._plan_goal_region = 0
         self.prefab_geometry = {}
         self.planning_budget = planning_budget
         self._planning_observer: ObserverKey | None = None
@@ -212,6 +266,7 @@ class SimpleVoxelWorld:
         # Non-default break thresholds (player-built walls) learned from
         # canonical terrain deltas; absent cells are authored map voxels.
         self._cell_health: dict[tuple[int, int, int], float] = {}
+        self.mutation_history = deque(maxlen=2048)
 
     def block_health(self, x: int, y: int, z: int) -> float:
         """Undamaged health of a solid cell as the gameplay server tracks it.
@@ -265,6 +320,7 @@ class SimpleVoxelWorld:
 
     def load(self, snapshot: MapSnapshot) -> None:
         """Replace all map-scoped state with one verified VXL snapshot."""
+        self.mutation_history.clear()
 
         self.map_epoch = int(snapshot.map_epoch)
         self.topology_version = int(snapshot.topology_version)
@@ -278,6 +334,7 @@ class SimpleVoxelWorld:
         self._atlas = None
         self._dirty_columns.clear()
         self._corridor_supports = None
+        self._corridor_cache.clear()
         self._cell_health = {}
         self.end_planning()
         if self.planning_budget is not None:
@@ -338,9 +395,12 @@ class SimpleVoxelWorld:
                     bool(change.solid),
                 )
                 self._record_cell_health(change)
+                self.mutation_history.append((version,int(change.x),int(change.y),bool(change.solid)))
                 self._dirty_columns.add((int(change.x), int(change.y)))
         self.topology_version = int(delta.topology_version)
         self._column_version_latest = self.topology_version
+        if delta.changed_cells:
+            self._corridor_cache.clear()
         if self._corridor_supports is not None and self._vxl is not None:
             for x, y in {(int(c.x), int(c.y)) for c in delta.changed_cells}:
                 if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
@@ -436,12 +496,17 @@ class SimpleVoxelWorld:
                     )
         supports = self._corridor_supports
 
-        def endpoint(position: Vector3, radius: int, vertical: float) -> int | None:
+        def endpoint(position: Vector3, radius: int, vertical: float,
+                     region: int = 0, avoid: tuple[int, int] | None = None) -> int | None:
             px, py = int(position[0]), int(position[1])
             candidates: list[tuple[float, int]] = []
             for y in range(max(0, py - radius), min(MAP_SIZE, py + radius + 1)):
                 for x in range(max(0, px - radius), min(MAP_SIZE, px + radius + 1)):
                     index = y * MAP_SIZE + x
+                    if (x, y) == avoid:
+                        continue
+                    if region and self._region_of(x, y) != region:
+                        continue
                     surface = self.surface(x, y, position[2], vertical_span=int(math.ceil(vertical)))
                     dz = (abs(surface.position[2] - position[2]) if surface else math.inf)
                     if surface is not None and surface.support_z < WATER_SUPPORT_Z and dz <= vertical:
@@ -452,9 +517,42 @@ class SimpleVoxelWorld:
 
         source = endpoint(start, 1, 1.5)
         named = self.goal_surface(goal)
-        # A goal inside a wall or over open water has no floor of its own.
-        target = (named.y * MAP_SIZE + named.x + named.support_z * MAP_SIZE * MAP_SIZE
-                  if named is not None else endpoint(goal, 6, 12.0))
+        target = None
+        if named is not None and source is not None:
+            # A survivor on a pillar, a roof or an islet stands on ground the
+            # walk cannot end on: the search from that perch is boxed in at
+            # once, found nothing, and the brain remembered "no walk there"
+            # for two minutes while the horde paced London's bank. Lead the
+            # corridor to the ground beside the perch instead; the climb is
+            # the planner's and the siege's business.
+            source_column = source % (MAP_SIZE * MAP_SIZE)
+            start_region = self._region_of(source_column % MAP_SIZE, source_column // MAP_SIZE)
+            perch = (int(named.x), int(named.y))
+            named_region = self._region_of(*perch)
+            other_land = bool(start_region and named_region and start_region != named_region)
+            built_perch = False
+            if start_region and not named_region and perch in self._dirty_columns:
+                # Player-built: a pillar or a stack on authored ground. The
+                # atlas knows the ground; the build stands three or more
+                # blocks above it with no step-height neighbour at its top.
+                index = perch[1] * MAP_SIZE + perch[0]
+                base = int(self._atlas.primary_support[index])
+                built_perch = (
+                    base != NO_SUPPORT and int(named.support_z) <= base - 3
+                    and not any(
+                        neighbour is not None
+                        and abs(int(neighbour.support_z) - int(named.support_z)) <= 2
+                        for neighbour in (
+                            self.surface(perch[0] + dx, perch[1] + dy, named.position[2],
+                                         vertical_span=2)
+                            for dx, dy in _CARDINAL_EDGES)))
+            if other_land or built_perch:
+                target = (endpoint(goal, 6, 12.0, start_region, perch)
+                          or endpoint(goal, 12, 12.0, start_region, perch))
+        if target is None:
+            # A goal inside a wall or over open water has no floor of its own.
+            target = (named.y * MAP_SIZE + named.x + named.support_z * MAP_SIZE * MAP_SIZE
+                      if named is not None else endpoint(goal, 6, 12.0))
         if source is None or target is None:
             return None
         blocked = frozenset(
@@ -468,13 +566,34 @@ class SimpleVoxelWorld:
             return sample.support_z if sample is not None else None
 
         area = MAP_SIZE * MAP_SIZE
+        key = None
+        if self.planning_budget is not None:
+            # Sixteen zombies on one bank hunting one survivor ask the same
+            # question; the first answer serves the bucket of starts around
+            # it (the brain joins a corridor from up to twelve blocks away).
+            bucket_x = (source % area) % MAP_SIZE // 4
+            bucket_y = (source % area) // MAP_SIZE // 4
+            key = (bucket_x, bucket_y, source // area, target, blocked)
+            for dx in (0, -1, 1):
+                for dy in (0, -1, 1):
+                    cached = self._corridor_cache.get(
+                        (bucket_x + dx, bucket_y + dy, source // area, target, blocked))
+                    if cached is not None:
+                        return _FinishedCorridor(cached)
         search = SurfaceCorridorSearch(bytes(supports), MAP_SIZE, MAP_SIZE,
                                        source % area, target % area, blocked,
                                        surface_at=layer_at, start_height=source // area,
                                        target_height=target // area,
                                        layers_of=self.standable_supports)
-        return (_BudgetedCorridorSearch(self, search)
+        return (_BudgetedCorridorSearch(self, search, key)
                 if self.planning_budget is not None else search)
+
+    def _remember_corridor(self, key: tuple, path: tuple[Vector3, ...]) -> None:
+        """Keep one finished map-wide answer for the next bot asking the same."""
+
+        if len(self._corridor_cache) >= 64:
+            self._corridor_cache.pop(next(iter(self._corridor_cache)))
+        self._corridor_cache[key] = tuple(path)
 
     def solid(self, x: int, y: int, z: int) -> bool:
         """Return collision occupancy, failing closed outside the map."""
@@ -630,6 +749,7 @@ class SimpleVoxelWorld:
         abilities: frozenset[MovementAffordance],
         dig_profile: DigProfile | None = None,
         allow_water: bool = False,
+        exact_goal_z: bool = False,
         blocked_edges: frozenset[
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = frozenset(),
@@ -638,7 +758,7 @@ class SimpleVoxelWorld:
     ) -> RoutePlan:
         """Admit one fair job; its traversal/breach searches share a cap."""
         arguments = dict(abilities=abilities, dig_profile=dig_profile,
-                         allow_water=allow_water, blocked_edges=blocked_edges,
+                         allow_water=allow_water, exact_goal_z=exact_goal_z, blocked_edges=blocked_edges,
                          _recover_start=_recover_start,
                          _prefer_existing_path=_prefer_existing_path)
         budget = self.planning_budget
@@ -668,6 +788,7 @@ class SimpleVoxelWorld:
         abilities: frozenset[MovementAffordance],
         dig_profile: DigProfile | None = None,
         allow_water: bool = False,
+        exact_goal_z: bool = False,
         blocked_edges: frozenset[
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = frozenset(),
@@ -725,6 +846,8 @@ class SimpleVoxelWorld:
                 start_node = recovered
         if start_node is None:
             return RoutePlan((), False, 0)
+        self._plan_goal_region = self._region_of(
+            int(math.floor(goal[0])), int(math.floor(goal[1])))
 
         if (
             dig_profile is not None
@@ -742,6 +865,7 @@ class SimpleVoxelWorld:
                 abilities=abilities,
                 dig_profile=None,
                 allow_water=allow_water,
+                exact_goal_z=exact_goal_z,
                 blocked_edges=blocked_edges,
                 _recover_start=False,
             )
@@ -774,6 +898,8 @@ class SimpleVoxelWorld:
             if target_surface is not None
             else None
         )
+        if exact_goal_z and local_goal_reachable:
+            target_support = int(round(float(goal[2]) + PLAYER_SUPPORT_OFFSET))
 
         def target_distance(node: tuple[int, int, int]) -> float:
             vertical = (
@@ -931,6 +1057,43 @@ class SimpleVoxelWorld:
             expansions,
         )
 
+    def _region_of(self, x: int, y: int) -> int:
+        """Atlas ground region of a column (0 when unknown, water or edited)."""
+
+        atlas = self._atlas
+        regions = getattr(atlas, "regions", None)
+        flags = getattr(atlas, "flags", None)
+        if (regions is None or flags is None
+                or not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE)
+                or (x, y) in self._dirty_columns):
+            return 0
+        index = y * int(getattr(atlas, "width", MAP_SIZE)) + x
+        if int(flags[index]) & int(ColumnFlag.WATER):
+            return 0
+        return int(regions[index])
+
+    def drop_into_pocket(self, x: int, y: int, nx: int, ny: int) -> bool:
+        """Would stepping down from (x, y) onto (nx, ny) leave the main ground for a pocket?
+
+        The planner authors drops of up to four blocks but jumps of two, so a
+        three-block ledge is a one-way door: London's riverside terrace at
+        (224-231, 274-291) sits three blocks below its street, with the
+        Thames on its other side, and the bounded search sent whole hordes
+        down onto it because it lies nearer the prey, where they stood until
+        the climb skills dug them out. A drop off the main ground into a
+        region that is neither the main ground nor the goal's is refused;
+        from inside a pocket any way may be the way out.
+        """
+
+        here = self._region_of(x, y)
+        there = self._region_of(nx, ny)
+        if not here or not there or here == there:
+            return False
+        main = int(getattr(self._atlas, "main_region_id", 0) or 0)
+        if here != main or there == main:
+            return False
+        return there != int(self._plan_goal_region)
+
     def _adjacent_start_surface(
         self,
         position: Vector3,
@@ -1020,6 +1183,7 @@ class SimpleVoxelWorld:
         position: Vector3,
         *,
         preferred_goal: Vector3 | None = None,
+        recovering: bool = False,
         blocked_edges: frozenset[
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = frozenset(),
@@ -1043,7 +1207,24 @@ class SimpleVoxelWorld:
         if current is None or current.support_z < WATER_SUPPORT_Z:
             return None
 
-        if preferred_goal is not None:
+        if preferred_goal is not None and recovering:
+            # A rejected landing calls for another nearby entrance to the
+            # intended land mass, not a ninety-block swim back to the islet
+            # just left. The ordinary nearest-shore flow is still the fallback
+            # when no strategic land region is known.
+            atlas=self._atlas
+            regions=getattr(atlas,"regions",())
+            width=int(getattr(atlas,"width",0))
+            index=int(math.floor(preferred_goal[1]))*width+int(math.floor(preferred_goal[0]))
+            region=int(regions[index]) if width and 0<=index<len(regions) else 0
+            if region>0 and int(atlas.primary_support[index]) < WATER_SUPPORT_Z-4:
+                region=int(atlas.main_region_id)
+            if region>0:
+                local=self._bounded_water_search(current,blocked_edges=blocked_edges,
+                                                  preferred_region=region)
+                if local is not None:
+                    return local
+        if preferred_goal is not None and not recovering:
             preferred_bank = self._preferred_water_bank(current, preferred_goal)
             if preferred_bank is not None:
                 bank_surface = self._live_dry_bank(
@@ -1741,6 +1922,7 @@ class SimpleVoxelWorld:
         blocked_edges: frozenset[
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = frozenset(),
+        preferred_region: int = 0,
     ) -> RouteStep | None:
         """Find a nearby live shore without any persistent recovery state."""
 
@@ -1752,7 +1934,12 @@ class SimpleVoxelWorld:
         samples: dict[tuple[int, int], SurfaceNode] = {start_key: start}
         dry_goal: tuple[int, int] | None = None
         expansions = 0
-        while frontier and expansions < _MAX_WATER_EXPANSIONS:
+        limit=1024 if preferred_region else _MAX_WATER_EXPANSIONS
+        def eligible_bank(x: int,y: int) -> bool:
+            atlas=self._atlas
+            return (not preferred_region or atlas is not None
+                    and int(atlas.regions[y*atlas.width+x])==preferred_region)
+        while frontier and expansions < limit:
             current_key = frontier.popleft()
             current = samples[current_key]
             expansions += 1
@@ -1766,6 +1953,8 @@ class SimpleVoxelWorld:
                     neighbor_key[1],
                 )
                 if dry_sample is not None:
+                    if not eligible_bank(*neighbor_key):
+                        continue
                     dry_edge = (
                         (current.x, current.y, current.support_z),
                         (
@@ -1806,6 +1995,8 @@ class SimpleVoxelWorld:
                 came_from[neighbor_key] = current_key
                 samples[neighbor_key] = sample
                 if sample.support_z < WATER_SUPPORT_Z:
+                    if not eligible_bank(*neighbor_key):
+                        continue
                     dry_goal = neighbor_key
                     frontier.clear()
                     break
@@ -2087,6 +2278,7 @@ class SimpleVoxelWorld:
                     # stood at such a lip until the motor's refusal timed out.
                     and not any(self.solid(nx, ny, z) for z in range(
                         int(support_z) - 3, int(sample.support_z)))
+                    and not self.drop_into_pocket(x, y, nx, ny)
                 ):
                     yield (
                         neighbor,

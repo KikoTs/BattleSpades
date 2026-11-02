@@ -243,9 +243,12 @@ def test_corridor_detours_far_beyond_the_direct_trip_are_rejected():
     around_the_map = (tuple((340., 250. - step * 8., 200.) for step in range(30))
                       + tuple((340. - step * 8., 10., 200.) for step in range(28))
                       + tuple((124., 18. + step * 8., 200.) for step in range(32)))
-    assert SimpleBotBrain._corridor_is_absurd(around_the_map, (342., 249., 200.), (128., 267., 200.))
+    # (A brain over a world without an atlas: no river to excuse the detour.)
+    brain = object.__new__(SimpleBotBrain)
+    brain.world = SimpleNamespace()
+    assert brain._corridor_is_absurd(around_the_map, (342., 249., 200.), (128., 267., 200.))
     bend = ((342., 249., 200.), (300., 200., 200.), (128., 267., 200.))
-    assert not SimpleBotBrain._corridor_is_absurd(bend, (342., 249., 200.), (128., 267., 200.))
+    assert not brain._corridor_is_absurd(bend, (342., 249., 200.), (128., 267., 200.))
 
 
 def _rocketeer(**changes):

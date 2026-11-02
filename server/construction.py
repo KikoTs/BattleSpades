@@ -263,7 +263,19 @@ class ConstructionSafetyService:
         return frozenset(result)
 
     def _protected(self, cell: Cell) -> bool:
+        bounds, circles = self.protected_areas()
         x, y, _z = cell
+        return (any(x0 <= x <= x1 and y0 <= y <= y1 for x0, x1, y0, y1 in bounds)
+                or any(self._within_xy(x, y, (cx, cy), radius) for cx, cy, radius in circles))
+
+    def protected_areas(self) -> tuple[tuple, tuple]:
+        """Immutable public build exclusions, shared with construction planning.
+
+        Rectangles use inclusive voxel coordinates. Circles test cell centres,
+        exactly as the authoritative reservation gate does.
+        """
+        rectangles = []
+        circles = []
         mode = getattr(self.server, "mode", None)
         bounds_by_team = getattr(mode, "base_bounds", None)
         if isinstance(bounds_by_team, dict):
@@ -271,8 +283,7 @@ class ConstructionSafetyService:
                 if bounds is None or len(bounds) < 4:
                     continue
                 x0, x1, y0, y1 = (int(value) for value in bounds[:4])
-                if x0 <= x <= x1 and y0 <= y <= y1:
-                    return True
+                rectangles.append((x0, x1, y0, y1))
 
         world = getattr(self.server, "world_manager", None)
         metadata = getattr(world, "map_metadata", None)
@@ -284,8 +295,7 @@ class ConstructionSafetyService:
                 for team_zones in zones:
                     for zone in team_zones:
                         x0, x1, y0, y1 = zone.xy_bounds()
-                        if x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1:
-                            return True
+                        rectangles.append((x0 - 1, x1 + 1, y0 - 1, y1 + 1))
 
         for attribute in ("base_positions", "intel_positions"):
             positions = getattr(mode, attribute, None)
@@ -293,9 +303,12 @@ class ConstructionSafetyService:
                 continue
             radius = 5 if attribute == "base_positions" else 2
             for position in positions.values():
-                if position is not None and self._within_xy(x, y, position, radius):
-                    return True
-        return False
+                if position is not None:
+                    try:
+                        circles.append((float(position[0]), float(position[1]), radius))
+                    except (IndexError, TypeError, ValueError):
+                        continue
+        return tuple(rectangles), tuple(circles)
 
     @staticmethod
     def _within_xy(x: int, y: int, position, radius: int) -> bool:

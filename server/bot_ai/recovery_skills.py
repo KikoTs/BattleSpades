@@ -35,7 +35,7 @@ about 0.6 s; walking climbs a one-block step without jumping.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import heapq
 import math
@@ -84,6 +84,8 @@ _WALK_COST = 0.27
 _SWIM_COST = 0.36
 _STEP_UP_COST = 0.45
 _STEP_DOWN_COST = 0.32
+# A native jump onto a ledge two blocks up (2.24-block rise; every class).
+_JUMP_COST = 0.9
 _PILLAR_COST = 0.85
 _BUILD_COST = 0.25
 _AIM_COST = 0.12
@@ -106,6 +108,7 @@ class StepKind(str, Enum):
     WALK = "walk"      # same level (or one down); floor may need a block
     SWIM = "swim"      # along the water plane
     STAIR = "stair"    # one level up into an adjacent column
+    JUMP = "jump"      # native jump edge validated by the surface navigator
     PILLAR = "pillar"  # one level up in place: jump, place a block below
     BRIDGE = "bridge"  # same level over a gap: place the floor, step onto it
 
@@ -123,6 +126,10 @@ class ClimbStep:
     destination: Node
     dig_cells: tuple[Cell, ...] = ()
     build_cells: tuple[Cell, ...] = ()
+    # Planned swing centres for a wide (3x3x3) digger that cannot re-lay a
+    # floor: their footprints clear ``dig_cells`` and spare every floor the
+    # plan still stands on. Empty for single-cell and column diggers.
+    aims: tuple[Cell, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +172,18 @@ class ClimbAbilities:
     @property
     def block_penalty(self) -> float:
         return _BLOCK_PENALTY_WITH_DIGGER if self.instant_dig else _BLOCK_PENALTY
+
+    @property
+    def keeps_floors(self) -> bool:
+        """A 3x3x3 digger with no block tool: every swing must spare the floors.
+
+        A Super Spade owner re-lays a floor its cube swing took (digging
+        refunds blocks); a Zombie's claw has no block tool at all, so the
+        planner must choose swing centres that leave the staircase standing.
+        """
+
+        return (self.dig is not None and self.dig.pattern == DIG_CUBE
+                and not self.can_build)
 
     @classmethod
     def from_observer(cls, observer: PlayerSnapshot) -> "ClimbAbilities":
@@ -383,15 +402,25 @@ class AscentGoal:
     label: str = ""
 
     @classmethod
-    def toward(cls, target: Vector3, *, radius: float = 1.5) -> "AscentGoal":
-        """Stand within ``radius`` of ``target`` at its height or higher."""
+    def toward(cls, target: Vector3, *, radius: float = 1.5,
+               reach: int = 3) -> "AscentGoal":
+        """Stand within ``radius`` of ``target``, from one level below its
+        support to ``reach`` levels above it.
+
+        ``target`` is a body position: the floor to stand on (a roof beside
+        a pillar, a cut site's stand) or a player. The band is the melee
+        reach around that floor, so a bot on a stack top two blocks higher
+        than the roof, or on the step just under it, has arrived; a 1x1
+        pillar top occupied by its builder never needs to be stood on.
+        """
 
         tx, ty = float(target[0]), float(target[1])
         target_support = int(round(float(target[2]) + SUPPORT_OFFSET))
+        highest = target_support - max(0, int(reach))
 
         def is_goal(node: Node) -> bool:
             return (math.hypot(node[0] + 0.5 - tx, node[1] + 0.5 - ty) <= radius
-                    and node[2] <= target_support + 1)
+                    and highest <= node[2] <= target_support + 1)
 
         def estimate(node: Node) -> tuple[float, int]:
             horizontal = max(0.0, math.hypot(node[0] + 0.5 - tx, node[1] + 0.5 - ty) - radius)
@@ -407,7 +436,19 @@ class AscentGoal:
         Uses the cached navigation atlas (connected primary ground). Returns
         ``None`` when the world has no atlas or no main ground nearby.
         """
+        return cls._ground_goal(world, start, radius=radius, candidates=candidates,
+                                minimum_rise=0, main_only=True)
 
+    @classmethod
+    def higher_ground(cls, world, start: Node, *, radius: int = 18) -> "AscentGoal | None":
+        """Leave a pit onto a higher nearby surface, including isolated plateaus."""
+        return cls._ground_goal(world, start, radius=radius, candidates=12,
+                                minimum_rise=1, main_only=False)
+
+    @classmethod
+    def _ground_goal(cls, world, start: Node, *, radius: int, candidates: int,
+                     minimum_rise: int, main_only: bool) -> "AscentGoal | None":
+        """Build a bounded surface goal without accepting an occupied pit floor."""
         atlas = getattr(world, "_atlas", None)
         if atlas is None or not getattr(atlas, "main_region_id", 0):
             return None
@@ -418,10 +459,15 @@ class AscentGoal:
         for y in range(max(0, y0 - radius), min(MAP_SIZE, y0 + radius + 1)):
             for x in range(max(0, x0 - radius), min(MAP_SIZE, x0 + radius + 1)):
                 index = y * width + x
-                if int(atlas.regions[index]) != main:
+                region = int(atlas.regions[index])
+                if not region or (main_only and region != main):
                     continue
                 primary = int(atlas.primary_support[index])
                 if primary >= WATER_SUPPORT_Z:
+                    continue
+                if minimum_rise > 0 and primary > s0 - minimum_rise:
+                    continue
+                if not main_only and not world.solid(x, y, primary):
                     continue
                 distance = abs(x - x0) + abs(y - y0)
                 found.append((distance * _WALK_COST + max(0, s0 - primary) * _STEP_UP_COST,
@@ -434,7 +480,8 @@ class AscentGoal:
 
         def is_goal(node: Node) -> bool:
             primary = goal_columns.get((node[0], node[1]))
-            return primary is not None and abs(node[2] - primary) <= 1
+            return (primary is not None and abs(node[2] - primary) <= 1
+                    and (minimum_rise <= 0 or node[2] <= s0 - minimum_rise))
 
         cache: dict[Node, tuple[float, int]] = {}
 
@@ -449,7 +496,7 @@ class AscentGoal:
                 cache[node] = value
             return value
 
-        return cls(is_goal, estimate, "main_ground")
+        return cls(is_goal, estimate, "main_ground" if main_only else "higher_ground")
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +523,92 @@ class _CachedWorld:
         return value
 
 
+class _MinusWorld:
+    """The world as the plan leaves it: cells earlier swings removed are air.
+
+    A 3x3x3 swing takes more than the step it was aimed at; the next move
+    of the same plan must not count on a floor that swing removed, and must
+    not pay for digging cells it already cleared.
+    """
+
+    __slots__ = ("_world", "_gone", "block_health")
+
+    def __init__(self, world: WorldReader, gone: frozenset[Cell]) -> None:
+        self._world = world
+        self._gone = gone
+        self.block_health = getattr(world, "block_health", None)
+
+    def solid(self, x: int, y: int, z: int) -> bool:
+        return (x, y, z) not in self._gone and self._world.solid(x, y, z)
+
+
+def _cube_footprint(aims: Iterable[Cell]) -> frozenset[Cell]:
+    return frozenset(cell for aim in aims for cell in melee_dig_positions(aim, DIG_CUBE))
+
+
+def cube_aims_keeping_floors(
+    world: WorldReader,
+    kind: StepKind,
+    node: Node,
+    dx: int,
+    dy: int,
+    required: Iterable[Cell],
+    spare: Iterable[Cell],
+) -> list[Cell] | None:
+    """Swing centres for a 3x3x3 digger whose footprints spare ``spare``.
+
+    A stair step needs the destination column's body cells and the head
+    room above the source. A cube centred on the destination column also
+    takes the floor of the step after (one further, one lower), which a
+    body without blocks can never put back, so the useful centre is the
+    cell beside the climber's head, perpendicular to the direction of
+    travel: it covers the whole step and nothing on the staircase line.
+    Candidates are ordered by how much of the way ahead they leave intact,
+    then greedily chosen by coverage. ``None`` when no footprint fits.
+    """
+
+    remaining = {cell for cell in required if world.solid(*cell)}
+    if not remaining:
+        return []
+    if any(not diggable(cell) for cell in remaining):
+        return None
+    spare = frozenset(spare)
+    x, y, s = node
+    nx, ny = x + dx, y + dy
+    px, py = -dy, dx
+    if kind is StepKind.STAIR:
+        top = s - 3
+    else:
+        top = s - 2
+    candidates: list[Cell] = []
+    for cx, cy in ((x + px, y + py), (x - px, y - py), (x, y), (nx, ny),
+                   (nx + px, ny + py), (nx - px, ny - py)):
+        for cz in (top, top - 1, top + 1, top - 2):
+            candidates.append((cx, cy, cz))
+    aims: list[Cell] = []
+    while remaining:
+        best: tuple[int, int, Cell] | None = None
+        for order, aim in enumerate(candidates):
+            if not diggable(aim) or not world.solid(*aim):
+                continue
+            footprint = set(melee_dig_positions(aim, DIG_CUBE))
+            if footprint & spare:
+                continue
+            covered = len(footprint & remaining)
+            if covered <= 0:
+                continue
+            key = (covered, -order, aim)
+            if best is None or key[:2] > best[:2]:
+                best = key
+        if best is None:
+            return None
+        aims.append(best[2])
+        remaining -= set(melee_dig_positions(best[2], DIG_CUBE))
+        if len(aims) > 3:
+            return None
+    return aims
+
+
 def _move(
     world: WorldReader,
     abilities: ClimbAbilities,
@@ -485,8 +618,19 @@ def _move(
     dy: int,
     wallet: int,
     avoid: frozenset[Cell] = frozenset(),
+    *,
+    keep_floors: bool = False,
+    keep: frozenset[Cell] = frozenset(),
 ) -> tuple[ClimbStep, float, int, int] | None:
-    """Validate one move; return (step, cost, blocks_spent, cells_dug)."""
+    """Validate one move; return (step, cost, blocks_spent, cells_dug).
+
+    ``keep_floors`` (a 3x3x3 digger without a block tool): swings are chosen
+    here so their footprints spare the floor stood on, the floor stepped
+    onto and, where any centre allows it, the straight continuation of the
+    staircase; the chosen centres travel with the step. ``keep`` lists
+    voxels no swing may remove (a team's prefab stacks): a move that would
+    dig one, or whose swings cannot spare them, is not a move.
+    """
 
     x, y, s = node
     profile = abilities.dig
@@ -503,7 +647,9 @@ def _move(
         # Head room for a full jump (the body vacates s-1 for ~0.6 s only
         # when nothing caps the 2.24-block rise).
         digs = ((x, y, s - 4), (x, y, s - 5)) if s - 5 >= 1 else ((x, y, s - 4),)
-        protected = ((x, y, s), floor)
+        if keep and any(cell in keep and world.solid(*cell) for cell in digs):
+            return None
+        protected = ((x, y, s), floor, *keep)
         swings = estimate_swings(world, digs, protected, profile)
         if swings is None:
             return None
@@ -516,6 +662,23 @@ def _move(
     nx, ny = x + dx, y + dy
     if not in_map(nx, ny) or not in_map(x, y):
         return None
+    if kind is StepKind.JUMP:
+        # Mount a ledge two blocks up in the next column: the native jump
+        # (2.24 blocks) does it from a standstill. Nothing is dug or built:
+        # the ledge, its standing room and the head room over the source
+        # must be there already. Not from the water (the bob is no jump).
+        destination = (nx, ny, s - 2)
+        if (s >= WATER_SUPPORT_Z or destination[2] - BODY_CELLS < 1 or destination in avoid
+                # A Super Spade's plan does not track what its cube swings
+                # removed (the executor re-lays floors from the refund); a
+                # ledge it may have taken is no jump target. The claw's plan
+                # tracks every removed cell, so its ledges are real.
+                or (profile is not None and profile.pattern == DIG_CUBE and not keep_floors)
+                or not world.solid(nx, ny, s - 2)
+                or any(world.solid(*cell) for cell in body_cells(destination))
+                or world.solid(x, y, s - 4) or world.solid(x, y, s - 5)):
+            return None
+        return ClimbStep(kind, node, destination), _JUMP_COST, 0, 0
     if kind is StepKind.STAIR:
         destination = (nx, ny, s - 1)
         digs = ((nx, ny, s - 4), (nx, ny, s - 3), (nx, ny, s - 2), (x, y, s - 4))
@@ -550,21 +713,47 @@ def _move(
         spent = 1
         if kind is StepKind.WALK:
             kind = StepKind.BRIDGE
-    protected = ((x, y, s), floor)
-    swings = estimate_swings(world, digs, protected, profile)
-    if swings is None:
-        return None
     solid_digs = tuple(cell for cell in digs if world.solid(*cell))
+    if keep and any(cell in keep for cell in solid_digs):
+        return None
+    protected = ((x, y, s), floor, *keep)
+    aims: tuple[Cell, ...] = ()
+    if keep_floors and solid_digs and profile is not None:
+        if kind is StepKind.SWIM:
+            return None
+        ahead = ((nx + dx, ny + dy, s - 2), (nx + dx, ny + dy, s - 1))
+        chosen = cube_aims_keeping_floors(world, kind, node, dx, dy, solid_digs,
+                                          (*protected, *ahead))
+        if chosen is None:
+            # No solid cell beside the climber's head (the first step into a
+            # wall from open ground, a one-block wall): the swing is centred
+            # on the step itself and takes the floor one further and one
+            # higher with it. The search sees what that swing removes and
+            # continues with a level walk before the next step up: a 2:1
+            # ramp instead of a 1:1 staircase, still without a block.
+            chosen = cube_aims_keeping_floors(world, kind, node, dx, dy, solid_digs,
+                                              protected)
+        if chosen is None:
+            return None
+        aims = tuple(chosen)
+        per_cell = max(profile.swings_for_health(_cell_health(world, cell))
+                       for cell in solid_digs)
+        swings = len(aims) * per_cell
+    else:
+        swings = estimate_swings(world, digs, protected, profile)
+        if swings is None:
+            return None
     cost = step_cost + spent * (_BUILD_COST + abilities.block_penalty)
     if swings:
         cost += swings * ((profile.fire_interval if profile else 0.0) + _AIM_COST)
-        if profile is not None and profile.pattern == DIG_CUBE and kind is StepKind.STAIR:
+        if (profile is not None and profile.pattern == DIG_CUBE and kind is StepKind.STAIR
+                and not keep_floors):
             # A 3x3x3 swing also removes the next step's floor; budget the
             # replacement block the executor will place.
             cost += _BUILD_COST + abilities.block_penalty * 0.5
     if kind is StepKind.SWIM and solid_digs:
         return None
-    return (ClimbStep(kind, node, destination, solid_digs, builds), cost, spent,
+    return (ClimbStep(kind, node, destination, solid_digs, builds, aims), cost, spent,
             len(solid_digs))
 
 
@@ -602,7 +791,8 @@ class AscentSearch:
 
     __slots__ = ("world", "start", "goal", "abilities", "radius", "max_expansions",
                  "allow_swim", "kinds", "avoid", "level_cost", "open_heap", "best",
-                 "parents", "wallets", "counter", "expansions", "plan", "status", "cube")
+                 "parents", "wallets", "counter", "expansions", "plan", "status", "cube",
+                 "keep_floors", "gone", "keep")
 
     def __init__(
         self,
@@ -616,6 +806,7 @@ class AscentSearch:
         allow_swim: bool = True,
         allowed_kinds: frozenset[StepKind] | None = None,
         avoid: Iterable[Cell] = (),
+        keep: Iterable[Cell] = (),
     ) -> None:
         self.world = _CachedWorld(world)
         self.start = start
@@ -626,8 +817,14 @@ class AscentSearch:
         self.allow_swim = bool(allow_swim)
         self.kinds = allowed_kinds or frozenset(StepKind)
         self.avoid = frozenset(avoid)
+        # Voxels no swing may take: a team's prefab stacks (their ladders
+        # are other climbers' way up).
+        self.keep = frozenset(keep)
         self.level_cost = typical_level_cost(abilities)
         self.cube = abilities.dig is not None and abilities.dig.pattern == DIG_CUBE
+        self.keep_floors = abilities.keeps_floors
+        # Per reached node: cells the last two swings of its path removed.
+        self.gone: dict[Node, frozenset[Cell]] = {}
         self.open_heap: list[tuple[float, float, int, Node]] = []
         self.best: dict[Node, float] = {start: 0.0}
         self.parents: dict[Node, tuple[Node, ClimbStep, int, int]] = {}
@@ -665,8 +862,11 @@ class AscentSearch:
                 return self.status
             wallet = wallets.get(node, int(abilities.blocks))
             parent = parents.get(node)
+            gone = self.gone.get(node) if self.keep_floors else None
+            view = _MinusWorld(self.world, gone) if gone else self.world
             for kind, dx, dy in _MOVES:
-                if kind in (StepKind.PILLAR, StepKind.STAIR) and kind not in self.kinds:
+                if (kind in (StepKind.PILLAR, StepKind.STAIR, StepKind.JUMP)
+                        and kind not in self.kinds):
                     continue
                 nx, ny = node[0] + dx, node[1] + dy
                 if (kind is StepKind.STAIR and parent is not None
@@ -684,7 +884,8 @@ class AscentSearch:
                     continue
                 if abs(nx - x0) > self.radius or abs(ny - y0) > self.radius:
                     continue
-                result = _move(self.world, abilities, node, kind, dx, dy, wallet, self.avoid)
+                result = _move(view, abilities, node, kind, dx, dy, wallet, self.avoid,
+                               keep_floors=self.keep_floors, keep=self.keep)
                 if result is None:
                     continue
                 step, move_cost, spent, dug = result
@@ -699,6 +900,20 @@ class AscentSearch:
                 best[destination] = total
                 wallets[destination] = wallet - spent + dug
                 parents[destination] = (node, step, spent, dug)
+                if self.keep_floors:
+                    # Everything this path's swings remove travels with it
+                    # (only cells that are solid now: the rest is air anyway),
+                    # so a later step never counts on a floor an earlier
+                    # swing took, however far back along the path.
+                    taken = gone or frozenset()
+                    if step.aims:
+                        taken = taken | frozenset(
+                            cell for cell in _cube_footprint(step.aims)
+                            if self.world.solid(*cell))
+                    if taken:
+                        self.gone[destination] = taken
+                    else:
+                        self.gone.pop(destination, None)
                 self.counter += 1
                 heapq.heappush(open_heap, (total + self._heuristic(destination), total,
                                            self.counter, destination))
@@ -708,7 +923,8 @@ class AscentSearch:
 
 _MOVES: tuple[tuple[StepKind, int, int], ...] = (
     (StepKind.PILLAR, 0, 0),
-    *((kind, dx, dy) for dx, dy in _CARDINALS for kind in (StepKind.STAIR, StepKind.WALK)),
+    *((kind, dx, dy) for dx, dy in _CARDINALS
+      for kind in (StepKind.STAIR, StepKind.WALK, StepKind.JUMP)),
 )
 
 
@@ -724,13 +940,14 @@ def plan_ascent(
     allowed_kinds: frozenset[StepKind] | None = None,
     avoid: Iterable[Cell] = (),
     time_budget: float = 0.06,
+    keep: Iterable[Cell] = (),
 ) -> AscentPlan | None:
     """One-shot :class:`AscentSearch`: the plan, or ``None`` when nothing is
     found within ``max_expansions``, ``radius`` columns or ``time_budget``."""
 
     search = AscentSearch(world, start, goal, abilities, radius=radius,
                           max_expansions=max_expansions, allow_swim=allow_swim,
-                          allowed_kinds=allowed_kinds, avoid=avoid)
+                          allowed_kinds=allowed_kinds, avoid=avoid, keep=keep)
     return search.plan if search.advance(time_budget) == "found" else None
 
 
@@ -747,7 +964,9 @@ def _reconstruct(start: Node, node: Node, parents, cost: float, expansions: int,
     steps.reverse()
     profile = abilities.dig
     for step in steps:
-        if step.dig_cells and profile is not None:
+        if step.aims:
+            swings += len(step.aims)
+        elif step.dig_cells and profile is not None:
             swings += len(step.dig_cells) if profile.pattern == DIG_SINGLE else 1
     seconds = max(0.0, cost - blocks * abilities.block_penalty)
     return AscentPlan(tuple(steps), round(cost, 3), blocks, swings, expansions,
@@ -803,8 +1022,11 @@ def plan_staircase_up(world: WorldReader, start: Node, direction: Vector3, level
     cost = 0.0
     wallet = int(abilities.blocks)
     node = start
+    keep = abilities.keeps_floors
+    gone: frozenset[Cell] = frozenset()
     for _ in range(max(0, int(levels))):
-        result = _move(world, abilities, node, StepKind.STAIR, dx, dy, wallet)
+        view = _MinusWorld(world, gone) if gone else world
+        result = _move(view, abilities, node, StepKind.STAIR, dx, dy, wallet, keep_floors=keep)
         if result is None:
             break
         step, move_cost, spent, dug = result
@@ -812,6 +1034,8 @@ def plan_staircase_up(world: WorldReader, start: Node, direction: Vector3, level
         cost += move_cost
         wallet += dug - spent
         node = step.destination
+        if keep and step.aims:
+            gone = gone | _cube_footprint(step.aims)
     if not steps:
         return None
     return AscentPlan(tuple(steps), round(cost, 3),
@@ -937,6 +1161,9 @@ class SkillCommand:
     action: BotAction = BotAction()
     secondary: bool = False
     reason: str = ""
+    travel_source: Vector3 | None = None
+    travel_waypoint: Vector3 | None = None
+    travel_arrival_radius: float = 0.35
 
 
 def _mix(*values: int) -> float:
@@ -982,6 +1209,8 @@ class LocomotionSkill:
     align_since: float = 0.0
     # A cell this skill found it cannot use (for the re-plan to avoid).
     blocked_cell: Cell | None = None
+    # Voxels no swing may take (a team's prefab stacks).
+    keep: frozenset = frozenset()
 
     @property
     def done(self) -> bool:
@@ -1125,6 +1354,11 @@ class LocomotionSkill:
         settled = bool(observer.grounded) or bool(observer.wade)
         if destination[2] >= WATER_SUPPORT_Z:
             return bool(observer.wade) or abs(support_error) <= 0.8
+        if step.kind is StepKind.JUMP:
+            # A native capsule may land on the next higher tread while its
+            # centre still overlaps this column. That is real ascent, not an
+            # off-plan fall; let the following verified step take ownership.
+            return settled and -2.25 <= support_error <= 1.0
         # Crouching lowers the body origin by 0.9.
         return settled and -0.45 <= support_error <= 1.0
 
@@ -1142,8 +1376,16 @@ class LocomotionSkill:
         digs = len(step.dig_cells) + (1 if step.kind is StepKind.STAIR else 0)
         return 3.5 + digs * swing * 2.5 + len(step.build_cells) * 1.5
 
-    def _protected(self, step: ClimbStep, profile: DigProfile | None = None) -> set[Cell]:
-        protected = {step.source, step.destination}
+    def _protected(self, step: ClimbStep, profile: DigProfile | None = None,
+                   keep_floors: bool = False) -> set[Cell]:
+        protected = {step.source, step.destination} | self.keep
+        if keep_floors:
+            # No block tool: the floors of the next two steps must survive
+            # every swing, as the planner's own swing centres do.
+            for later in self.plan.steps[self.index + 1:self.index + 3]:
+                if later.kind is not StepKind.PILLAR:
+                    protected.add(later.destination)
+            return protected
         if profile is not None and profile.pattern == DIG_CUBE:
             # A 3x3x3 swing cannot spare the next floor; it is re-laid from
             # the blocks the swing refunds.
@@ -1169,9 +1411,11 @@ class LocomotionSkill:
                                bool(observer.wade), sneak=True)
         # Swing from where the body stands (a player does not re-centre to
         # dig); never through the floor it is standing on.
-        protected = self._protected(step, profile) | {node_of(observer.position)}
+        protected = (self._protected(step, profile, abilities.keeps_floors)
+                     | {node_of(observer.position)})
         eye = tuple(float(value) for value in observer.eye)
-        aim = self._visible_aim(world, eye, remaining, protected, profile)
+        aim = self._visible_aim(world, eye, remaining, protected, profile,
+                                preferred=step.aims)
         if aim is None:
             # Remaining cells are hidden behind something we may not dig
             # (or out of reach): let the caller re-plan.
@@ -1198,14 +1442,36 @@ class LocomotionSkill:
 
     @staticmethod
     def _visible_aim(world: WorldReader, eye: Vector3, remaining: list[Cell],
-                     protected: set[Cell], profile: DigProfile) -> Cell | None:
+                     protected: set[Cell], profile: DigProfile,
+                     preferred: Iterable[Cell] = ()) -> Cell | None:
         candidates: list[tuple[int, float, Cell]] = []
         required = set(remaining)
+        # The planner's own centres first: they were chosen to spare the
+        # floors this plan still needs.
+        for aim in preferred:
+            if not world.solid(*aim) or not diggable(aim):
+                continue
+            footprint = set(melee_dig_positions(aim, profile.pattern))
+            if footprint & protected or not footprint & required:
+                continue
+            center = cell_center(aim)
+            if math.dist(eye, center) > MELEE_REACH:
+                continue
+            if first_solid_on_ray(world, eye, center) == aim:
+                return aim
         pool = set(remaining)
         if profile.pattern != DIG_SINGLE:
             for cell in remaining:
                 pool.add((cell[0], cell[1], cell[2] - 1))
                 pool.add((cell[0], cell[1], cell[2] + 1))
+        if profile.pattern == DIG_CUBE:
+            # A cube reaches a required cell from any neighbouring column
+            # too; those side centres are what spares a staircase's floors.
+            for cell in remaining:
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for dz in (-1, 0, 1):
+                            pool.add((cell[0] + dx, cell[1] + dy, cell[2] + dz))
         for aim in pool:
             if not world.solid(*aim) or not diggable(aim):
                 continue
@@ -1389,7 +1655,19 @@ class LocomotionSkill:
         look = (x + 0.5 + 0.08 * (self._jitter(17) - 0.5), y + 0.5 + 0.08 * (self._jitter(19) - 0.5),
                 float(s) - 0.6)
         center = node_position(step.source)
-        centering = _toward(observer.position, center, deadband=0.18)
+        centering = _toward(observer.position, center, deadband=0.02)
+        if (observer.grounded and not observer.wade
+                and math.dist(observer.position[:2], center[:2]) > 0.045):
+            # The planned headroom is above this column. Centre the native
+            # capsule before jumping so a neighbouring overhang cannot clip
+            # its edge. The short endpoint prevents the ledge motor probing
+            # a full stride beyond the single block and vetoing centring.
+            return SkillCommand(
+                "running", role=role+"_align", direction=centering,
+                sneak=True, affordance=MovementAffordance.WALK, look=look,
+                tool_id=int(C.BLOCK_TOOL), travel_source=observer.position,
+                travel_waypoint=center, travel_arrival_radius=0.025,
+            )
         if world.solid(*floor):
             # Placed: drift onto it and land.
             return SkillCommand("running", role=role + "_land", direction=centering,
@@ -1442,18 +1720,24 @@ class LocomotionSkill:
         # Steer at the end of the current run of plain moves of this kind
         # (a swim along a cliff, a level walk): one smooth line, no stops.
         last = step
+        last_index = self.index
+        heading = (step.destination[0]-step.source[0], step.destination[1]-step.source[1])
         if step.kind in (StepKind.SWIM, StepKind.WALK):
-            for later in self.plan.steps[self.index + 1:self.index + 6]:
+            for later_index, later in enumerate(self.plan.steps[self.index + 1:self.index + 6], self.index+1):
+                direction = (later.destination[0]-later.source[0], later.destination[1]-later.source[1])
                 if (later.kind is not step.kind or later.dig_cells or later.build_cells
-                        or later.destination[2] != step.destination[2]):
+                        or later.destination[2] != step.destination[2]
+                        or direction[0]*heading[1] != direction[1]*heading[0]
+                        or direction[0]*heading[0]+direction[1]*heading[1] <= 0):
                     break
                 last = later
+                last_index = later_index
         target = node_position(last.destination)
         # Ease into a spot where work starts (digging, a floor to lay) so
         # momentum does not carry the body past it.
-        following = self.plan.steps[self.index + 1] if self.index + 1 < len(self.plan.steps) else None
+        following = self.plan.steps[last_index + 1] if last_index + 1 < len(self.plan.steps) else None
         work_next = following is not None and (following.dig_cells or following.build_cells
-                                               or following.kind is StepKind.PILLAR)
+                                               or following.kind in {StepKind.PILLAR, StepKind.JUMP})
         arriving = math.hypot(target[0] - observer.position[0],
                               target[1] - observer.position[1]) < 0.9
         # Ease onto a laid step (open air around it) and into work spots.
@@ -1465,16 +1749,41 @@ class LocomotionSkill:
         stuck = now - self.step_started_at > 1.4
         climbing_out = wading and step.destination[2] < step.source[2]
         jump = climbing_out or (
+            step.kind is StepKind.JUMP and bool(observer.grounded)) or (
             step.kind is StepKind.STAIR and stuck and bool(observer.grounded))
         # Swimming to the climbing spot is urgent; a staircase is walked.
         sprint = step.kind is StepKind.SWIM or (step.kind is StepKind.WALK and last is not step)
-        return SkillCommand("running", role=role, direction=command.direction, jump=jump,
+        turn_next = (following is not None and
+            heading[0]*(following.destination[0]-following.source[0])
+            + heading[1]*(following.destination[1]-following.source[1]) <= 0)
+        if (work_next or turn_next) and math.dist(observer.position[:2], target[:2]) < 2.5:
+            sprint = False
+        already_raised = (step.kind is StepKind.JUMP and observer.grounded
+                          and step.destination[2] < step.source[2]
+                          and node_of(observer.position)[2] <= step.destination[2])
+        if step.kind is StepKind.JUMP and observer.grounded and not already_raised:
+            source = node_position(step.source)
+            if math.dist(observer.position[:2], source[:2]) > .35:
+                align = self._steer(observer, source, role, False, tolerance=.2, sneak=True)
+                return replace(align, look=self._gaze(step, observer),
+                               travel_source=observer.position, travel_waypoint=source)
+            if math.hypot(*observer.velocity[:2])*32 > 3:
+                return SkillCommand("running", role=role+"_brake", look=self._gaze(step, observer))
+        return SkillCommand("running", role=role, direction=command.direction, jump=jump and not already_raised,
                             sprint=sprint and not command.sneak, sneak=command.sneak,
-                            affordance=self._affordance(step, wading),
-                            crouch=False, look=self._gaze(step, observer))
+                            affordance=MovementAffordance.WALK if already_raised else self._affordance(step, wading),
+                            crouch=False, look=self._gaze(step, observer),
+                            travel_source=node_position(step.source), travel_waypoint=target)
 
     @staticmethod
     def _affordance(step: ClimbStep, wading: bool) -> MovementAffordance:
+        if step.kind is StepKind.JUMP:
+            return MovementAffordance.JUMP
+        if (step.kind is StepKind.WALK and not wading
+                and step.destination[2] - step.source[2] >= 2):
+            # Climbing back down a stack: walking off a ledge two or more
+            # levels is a drop, which the motor validates as such.
+            return MovementAffordance.DROP
         if step.kind is StepKind.SWIM or step.destination[2] >= WATER_SUPPORT_Z:
             return MovementAffordance.SWIM
         if wading and step.kind is not StepKind.PILLAR:
@@ -1597,6 +1906,7 @@ __all__ = [
     "LocomotionSkill",
     "SkillCommand",
     "StepKind",
+    "cube_aims_keeping_floors",
     "dig_aims",
     "estimate_swings",
     "face_supported",

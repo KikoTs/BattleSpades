@@ -58,7 +58,7 @@ FLAT_KEYS = [
     ("lobby", "votekick_cancelled_cooldown_seconds",
      "votekick_cancelled_cooldown_seconds", 45.0),
     ("lobby", "votekick_min_team_players", "votekick_min_team_players", 3),
-    ("audio", "mode_start_music", "mode_start_music", True),
+    ("audio", "mode_start_music", "mode_start_music", False),
     ("updates", "update_check_enabled", "update_check_enabled", True),
     ("updates", "update_manifest_url", "update_manifest_url",
      "https://www.aosplay.net/updates/stable.json"),

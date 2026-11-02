@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # heartbeat interval, but never more often than this.
 POPULATION_HEARTBEAT_MIN_GAP_SECONDS = 5.0
 POPULATION_POLL_SECONDS = 1.0
+# Long/custom rounds use the same bounded window as the account service.
+MAX_MATCH_EVIDENCE_SECONDS = 7 * 86400
 
 JOIN_CODE_PATTERN = re.compile(r"^~[A-Za-z0-9_-]{14}$")
 SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -136,6 +138,8 @@ class RevivalMasterService:
         self._round_match_id = uuid4().hex
         self._round_completed = False
         self._departed: dict[str, dict[str, Any]] = {}
+        self._round_records: dict[str, dict[str, Any]] = {}
+        self._departing_players: dict[int, Any] = {}
         self._pending_results: dict[str, dict[str, Any]] = {}
         self._result_task: asyncio.Task | None = None
         self._result_lock = asyncio.Lock()
@@ -560,9 +564,14 @@ class RevivalMasterService:
         return tuple(max(0, current[index] - previous[index]) for index in range(4))
 
     def accumulate_departing_player(self, player) -> None:
+        if id(player) in self._departing_players:
+            return
         legacy_id = getattr(player, "account_legacy_id", None)
         if not legacy_id or bool(getattr(player, "is_bot", False)):
             return
+        # A leave hook can finish the round before the roster removes this
+        # player. Keep a strong reference until removal and count them once.
+        self._departing_players[id(player)] = player
         kills, deaths, captures, score = self._player_delta(player)
         profile = self._profile_delta(player)
         participation = self._participation_delta(player)
@@ -618,6 +627,7 @@ class RevivalMasterService:
         self._round_match_id = uuid4().hex
         self._round_completed = False
         self._departed.clear()
+        self._round_records.clear()
         self._participation_baselines = {
             id(player): self._participation_counters(player)
             for player in self.server.players.values()
@@ -660,14 +670,28 @@ class RevivalMasterService:
 
     def _result_players(self, winner: int | None, *, finished: bool = True):
         combined: dict[str, dict[str, Any]] = {
-            legacy_id: {**values, "profile": {
+            legacy_id: {**values, "connected": False, "profile": {
                 stat: list(pair) for stat, pair in values.get("profile", {}).items()
-            }} for legacy_id, values in self._departed.items()
+            }} for legacy_id, values in self._round_records.items()
         }
+        for legacy_id, values in self._departed.items():
+            record = combined.setdefault(legacy_id, {
+                "name": values["name"], "team": values["team"],
+                "kills": 0, "deaths": 0, "captures": 0, "score": 0, "connected": False,
+            })
+            for key in ("kills", "deaths", "captures", "score"):
+                record[key] += values[key]
+            self._merge_profile(record, values.get("profile", {}))
+            previous = record.get("participation_seconds", (0.0, 0.0, 0.0))
+            seconds = values.get("participation_seconds", (0.0, 0.0, 0.0))
+            record["participation_seconds"] = tuple(previous[i] + seconds[i] for i in range(3))
+            for key in ("human_opponents", "bot_opponents"):
+                record[key] = max(record.get(key, 0), values.get(key, 0))
+            record["profile_managed"] = record.get("profile_managed", False) or values.get("profile_managed", False)
         connected_snapshots: dict[int, tuple[int, int, int, int]] = {}
         for player in self.server.players.values():
             legacy_id = getattr(player, "account_legacy_id", None)
-            if not legacy_id or bool(getattr(player, "is_bot", False)):
+            if not legacy_id or bool(getattr(player, "is_bot", False)) or id(player) in self._departing_players:
                 continue
             delta = self._player_delta(player)
             connected_snapshots[id(player)] = self._counters(player)
@@ -747,21 +771,32 @@ class RevivalMasterService:
                     },
                 }
             )
-        return players, connected_snapshots
+        return players, connected_snapshots, combined
 
     def _capture_round_results(self, winner: int | None, *, finished: bool = True) -> None:
         if (bool(getattr(self.server.config, "ugc_runtime", False))
                 or self.mode_code in {"ugc", "tut"}
                 or str(getattr(self.server.config, "default_mode", "")).lower() == "tutorial"):
             return
-        if not self.enabled or not self.write_token or self._closing:
+        if not self.enabled or not self.write_token or self._closing or self._round_completed:
+            return
+        ended_at = datetime.now(timezone.utc)
+        duration = max(0, int((ended_at - self._round_started_at).total_seconds()))
+        map_crc = getattr(getattr(self.server, "world_manager", None), "map_file_crc", None)
+        valid_match = 30 <= duration <= MAX_MATCH_EVIDENCE_SECONDS and isinstance(map_crc, int)
+        if not valid_match and (not finished or self._round_records):
+            # Never reinterpret an already checkpointed round as a legacy
+            # delta event: that would apply its cumulative counters twice.
             return
         if len(self._pending_results) >= 256:
             raise RevivalMasterError("round result memory queue is full; check the durable outbox")
-        players, snapshots = self._result_players(winner, finished=finished)
-        if finished:
-            self._round_completed = True
+        players, snapshots, records = self._result_players(winner, finished=finished)
+        players = [result for result in players
+                   if records[result["steamid"]] != self._round_records.get(result["steamid"])
+                   or (finished and records[result["steamid"]].get("connected"))]
         if not players:
+            if finished:
+                self._round_completed = True
             return
         from server import achievements
 
@@ -773,21 +808,15 @@ class RevivalMasterService:
                 # Optional: absent when nothing new was unlocked, and a
                 # master that predates the field ignores it.
                 result["achievements"] = list(unlocked)
-        event_id = "round_%s" % uuid4().hex
-        ended_at = datetime.now(timezone.utc)
-        duration = max(0, int((ended_at - self._round_started_at).total_seconds()))
-        self._pending_results[event_id] = {
-            "event_id": event_id,
+        event = {
             "server_id": self.server_id,
             "recorded_at": ended_at.isoformat(),
-            "players": players,
         }
         relay_id = os.environ.get("AOS_RELAY_LOBBY_ID", "").strip()
         if relay_id:
-            self._pending_results[event_id]["relay_lobby_id"] = relay_id
-        map_crc = getattr(getattr(self.server, "world_manager", None), "map_file_crc", None)
-        if 30 <= duration <= 14400 and isinstance(map_crc, int):
-            self._pending_results[event_id]["match"] = {
+            event["relay_lobby_id"] = relay_id
+        if valid_match:
+            event["match"] = {
                 "match_id": self._round_match_id,
                 "playlist_id": str(getattr(getattr(self.server.config, "steam", None), "playlist_id", 0)),
                 "mode_id": self.mode_code,
@@ -795,6 +824,7 @@ class RevivalMasterService:
                 "duration_seconds": duration,
                 "started_at": self._round_started_at.isoformat(),
                 "ended_at": ended_at.isoformat(),
+                "cumulative": True,
             }
             for result in players:
                 evidence = result["participation"]
@@ -804,9 +834,29 @@ class RevivalMasterService:
         else:
             for result in players:
                 result.pop("participation", None)
+        # A round can contain more than one roster's worth of distinct
+        # accounts. Respect both the API's 100-player and 256 KiB limits.
+        batches: list[list[dict[str, Any]]] = [[]]
+        batch_bytes = 0
+        for result in players:
+            size = len(json.dumps(result).encode("utf-8")) + 2
+            if size > 240_000:
+                raise RevivalMasterError("player result exceeds the upload limit")
+            if len(batches[-1]) == 100 or batch_bytes + size > 240_000:
+                batches.append([])
+                batch_bytes = 0
+            batches[-1].append(result)
+            batch_bytes += size
+        if len(self._pending_results) + len(batches) > 256:
+            raise RevivalMasterError("round result memory queue is full; check the durable outbox")
+        for batch in batches:
+            event_id = "round_%s" % uuid4().hex
+            self._pending_results[event_id] = {**event, "event_id": event_id, "players": batch}
         # Reserve these counters before the first await or the round reset.
         # The immutable event now owns them, independent of HTTP success.
         self._departed.clear()
+        self._round_records = records
+        self._round_completed = finished
         self._player_baselines.update(snapshots)
         self._profile_baselines.update({
             id(player): profile_snapshot(player) for player in self.server.players.values()
@@ -883,3 +933,17 @@ class RevivalMasterService:
             logger.exception("Could not capture Revival round results")
             return
         self._start_result_flush()
+
+    def schedule_departure_results(self) -> None:
+        """Settle partial activity now; later snapshots include only new credit."""
+        try:
+            self._capture_round_results(None, finished=False)
+        except Exception:
+            logger.exception("Could not capture Revival departure results")
+        finally:
+            present = {id(player) for player in self.server.players.values()}
+            self._departing_players = {
+                key: player for key, player in self._departing_players.items() if key in present
+            }
+        if self.enabled and self.write_token and not self._closing:
+            self._start_result_flush()

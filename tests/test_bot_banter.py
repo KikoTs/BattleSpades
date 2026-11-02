@@ -86,7 +86,7 @@ def _director(chatter: bool = True):
     director._started = True
     victim = SimpleNamespace(id=9, name="Victim", team=3 if killer.team != 3 else 2,
                              position=(30., 30., 30.))
-    runtime = SimpleNamespace(player=SimpleNamespace(alive=False), lock_confirmed_at=0.)
+    runtime = SimpleNamespace(player=SimpleNamespace(alive=True), lock_confirmed_at=0.)
     director._runtime[int(killer.id)] = runtime
     director.banter.register(int(killer.id), "Juno")
     director.banter._voices[int(killer.id)].chance = 1.0

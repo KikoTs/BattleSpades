@@ -1832,7 +1832,9 @@ def test_overlapping_friendly_bots_separate_without_reversing_route() -> None:
         players=(observer, teammate),
     )
 
-    movement = SimpleBotBrain._crowd_adjusted_movement(
+    # Separation only bends a step onto ground the body can walk: give it a floor.
+    floor = _world({(x, y, 20) for x in range(0, 30) for y in range(0, 30)})
+    movement = SimpleBotBrain(floor)._crowd_adjusted_movement(
         frame,
         MovementIntent(direction=(1.0, 0.0, 0.0)),
         action=BotAction(),

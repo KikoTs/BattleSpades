@@ -199,6 +199,7 @@ def test_bomb_explosion_picks_the_water_variant_below_the_water_plane():
 
 def test_last_man_music_does_not_restart_a_last_man_bed():
     server = _Server()
+    server.config = SimpleNamespace(mode_start_music=True)
     audio.play_gameplay_music(server)
     before = len(server.sent)
     assert audio.play_last_man_music(server) is False
@@ -250,6 +251,7 @@ def test_zombie_survivor_round_win_plays_ending_track_then_bed(monkeypatch):
     from tests.test_zombie import _player, _Server as _ZServer
 
     server = _ZServer()
+    server.config.mode_start_music = True
     for pid in (1, 2, 3):
         _player(server, pid)
     mode = ZombieMode(server)

@@ -186,7 +186,7 @@ def rule_speed_scale(config: object, class_id: int) -> float:
         multiplier *= speed_multiplier(class_id)
     if int(class_id) in ZOMBIE_CLASS_IDS and str(
         base_code(getattr(config, "game_mode", ""))
-    ).lower() in ("zom", "zombie"):
+    ).lower() in ("zom", "zombie", "czom", "classic_zombie", "classic-zombie"):
         multiplier *= float(rules.get("RULE_CLASS_SPEED"))
     return speed_scale(class_id, multiplier)
 

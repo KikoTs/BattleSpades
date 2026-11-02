@@ -8,10 +8,13 @@ changes before using what they built. Tactical evaluation is staggered at 2 Hz.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from collections import deque
 import math
 
 import shared.constants as C
 from server.game_constants import WEAPON_PROFILES
+from server.hardcore import base_code
+from server.dig_profiles import best_navigation_dig_profile
 
 from .behavior_memory import BehaviorMemory
 from .combat_profiles import envelope_for
@@ -96,6 +99,7 @@ class _Task:
     stand: Vector3 | None = None
     ready_at: float = 0.0
     waiting_since: float = 0.0
+    beneficiary: Identity | None = None
 
 
 @dataclass(slots=True)
@@ -118,6 +122,8 @@ class _Life:
     partner_holding: bool = False
     climb_order: TacticalOrder | None = None
     errand_order: TacticalOrder | None = None
+    stranded: dict[Identity, tuple[Vector3, float]] = field(default_factory=dict)
+    team: int = -1
 
 
 class CooperativeBehavior:
@@ -130,10 +136,14 @@ class CooperativeBehavior:
         self.teams = TeamTasks()
         self.patients: dict[Identity, tuple[Identity, float]] = {}
         self.sites = SchematicSites()
+        self.abandoned: dict[int, tuple[int, _Task, float]] = {}
+        self.experience: dict[tuple[int,int,int], deque] = {}
 
     def reset(self) -> None:
         self.lives.clear()
         self.patients.clear()
+        self.abandoned.clear()
+        self.experience.clear()
         self.teams = TeamTasks()
         if self.epoch != (-1, -1):
             # Sites requested before the first frame belong to that frame's map.
@@ -141,9 +151,21 @@ class CooperativeBehavior:
 
     def forget(self, player_id: int, generation: int) -> None:
         life = self.lives.pop((player_id, generation), None)
+        if life is not None and life.memory.outcomes:
+            if len(self.experience)>=128:
+                self.experience.pop(next(iter(self.experience)))
+            self.experience[(player_id,generation,life.team)]=deque(
+                (outcome for outcome in life.memory.outcomes if outcome[3]),maxlen=16)
         self.sites.forget((player_id, generation))
         if life and life.task:
-            self.teams.projects.pop(life.task.task_id, None)
+            project = self.teams.projects.pop(life.task.task_id, None)
+            task = life.task
+            if project and task.site is not None and task.kind in {"bridge", "breach", "rampart"}:
+                if len(self.abandoned) >= 8:
+                    self.abandoned.pop(next(iter(self.abandoned)))
+                self.abandoned[task.task_id] = (project.team, replace(task,
+                    pending=None, confirmed=False, action_site=None, built_cells=(),
+                    stage=TaskStage.APPROACH, phase="prepare"), life.last_seen + 20.)
         if life:
             self.patients = {key: value for key, value in self.patients.items()
                              if key != life.key and value[0] != life.key}
@@ -166,6 +188,10 @@ class CooperativeBehavior:
                 or life.prefabs != player.prefabs):
             self.forget(*key)
             life = self.lives[key] = _Life(identity(player), player.loadout, player.prefabs)
+            life.team=player.team
+            remembered=self.experience.get((*key,player.team))
+            if remembered is not None:
+                life.memory.outcomes=deque(remembered,maxlen=16)
         life.last_seen = now
         life.memory.observe(frame, player, visible)
         self._expire(frame, now)
@@ -319,6 +345,9 @@ class CooperativeBehavior:
                     return self._advance(frame, player, combat_visible, life, allies)
             return None
         contact = life.memory.contact(player.position, now)
+        inherited = self._inherit_work(frame, player, life, allies)
+        if inherited is not None:
+            return inherited
         lane = visible.eye if visible else contact.position if contact else (
             strategic.position if strategic else None)
         if fortifying and visible is None and contact is None:
@@ -329,6 +358,9 @@ class CooperativeBehavior:
         candidates: list[_Task] = []
         task_id = frame.frame_id * 256 + player.player_id
         if combat_visible is None:
+            rescue = self._rescue_task(frame,player,life,allies)
+            if rescue is not None:
+                candidates.append(rescue)
             supply = self._recovery_task(frame, player, life, allies)
             if supply is not None:
                 candidates.append(supply)
@@ -370,7 +402,9 @@ class CooperativeBehavior:
                     from .project_sites import find_breach_project
                     site = find_breach_project(self.world, player, lane)
                     kind = "breach"
-            elif player.blocks >= 6 and (combat_visible is None or player.reloading) and (creativity > .35 or fortifying):
+            elif (player.blocks >= 6 and (combat_visible is None or player.reloading)
+                  and (creativity > .35 or fortifying)
+                  and not (fortifying and self._fortification_sites(player.team, strategic.position))):
                 site = find_prefab_cover(self.world, player, lane,
                     friendly_positions=friends, reserved_cells=reserved)
                 kind = "strongpoint" if int(C.ROCKET_TURRET_TOOL) in player.loadout else "cover"
@@ -380,6 +414,7 @@ class CooperativeBehavior:
                 if kind == "rampart":
                     score = .8 + teamwork * .1
                 score -= life.memory.penalty(kind, site.position, now)
+                score += life.memory.preference(kind, now)
                 if score > .35:
                     patience = 24 + 48 * (profile.caution if profile else .5)
                     candidates.append(_Task(task_id, kind, site.approach, lane, now,
@@ -394,8 +429,11 @@ class CooperativeBehavior:
                 candidates.append(_Task(task_id, "investigate", contact.position, contact.position,
                     now, min(contact.expires_at, now + 6), score, progress_at=now))
         if (visible is None and now >= life.next_project and player.health >= 45
-                and not fortifying):
+                and (not fortifying or (building_ok and player.health >= 55
+                     and not any(task.kind == "rampart" for task in candidates)))):
             # Join a teammate's schematic, or (rarely, budgeted) start one.
+            # Survivor refuge walls must claim their grounded shared runs
+            # first; optional architecture can follow once the ring is secure.
             schematic = self._schematic_task(frame, player, life, strategic, allies,
                                              critical=False, lane=lane)
             if schematic is not None:
@@ -660,6 +698,12 @@ class CooperativeBehavior:
     def _advance(self, frame: PerceptionFrame, player: PlayerSnapshot,
                  visible: PlayerSnapshot | None, life: _Life,
                  allies: tuple[PlayerSnapshot, ...]) -> TacticalOrder | None:
+        task = life.task
+        if task is not None and task.beneficiary is not None and task.pending is None:
+            beneficiary = next((p for p in allies if identity(p)==task.beneficiary),None)
+            if beneficiary is None or math.dist(beneficiary.position,task.lane)>4:
+                self._finish(life,frame.created_at,False,"ally_no_longer_stranded")
+                return None
         order = self._advance_task(frame, player, visible, life, allies)
         task = life.task
         # Only the plain walk of an errand outlives a hop; see decide.
@@ -867,8 +911,23 @@ class CooperativeBehavior:
             self._finish(life, now, False, "support_changed")
             return None
         if task.built_cells and not all(self.world.solid(*cell) for cell in task.built_cells):
-            self._finish(life, now, False, "construction_destroyed")
-            return None
+            missing = sum(not self.world.solid(*cell) for cell in site.cells)
+            if (task.kind == "bridge" and int(C.BLOCK_TOOL) in player.loadout
+                    and 0 < missing <= min(6, player.blocks)
+                    and math.dist(player.position, site.approach) < 16):
+                # Repair a known short crossing from its original safe bank.
+                # Native BlockLine charges only missing voxels. The same
+                # complete support/exit/confirmation gates apply again.
+                task.built_cells = ()
+                approach = min((site.approach,site.landing),
+                    key=lambda point: math.dist(player.position,point))
+                task.site = site = replace(site,approach=approach)
+                task.phase, task.stage = "prepare", TaskStage.APPROACH
+                task.progress_at = now
+                self.teams.event("crossing_repairs", task.task_id, "missing_deck", now)
+            else:
+                self._finish(life, now, False, "construction_destroyed")
+                return None
         if task.phase == "mine_approach" and task.action_site:
             mine = task.action_site
             if (dict(player.deployable_stock).get(int(C.LANDMINE_TOOL), 0) <= 0
@@ -932,6 +991,17 @@ class CooperativeBehavior:
             return self._action(frame, player, task, BotAction(BotActionKind.BUILD_LINE,
                 int(C.BLOCK_TOOL), position=site.cells[0], end_position=site.cells[-1]), site)
         if task.kind == "bridge":
+            landing = site.landing
+            node = self.world.surface(math.floor(landing[0]),math.floor(landing[1]),
+                                      landing[2],vertical_span=1,clearance=3)
+            if node is None or abs(node.position[2]-landing[2])>1:
+                self._finish(life,now,False,"landing_changed")
+                return None
+            if math.dist(player.position, site.approach) > 1.25:
+                if now - task.progress_at > 8:
+                    self._finish(life, now, False, "bridge_approach_stalled")
+                    return None
+                return self._move(task, site.approach, "bridge_approach", .6)
             if not self.teams.allow_mutation(player.team, now, len(site.cells)):
                 self._finish(life, now, False, "construction_budget")
                 return None
@@ -1033,6 +1103,11 @@ class CooperativeBehavior:
             return
         life.memory.record(task.kind, task.goal, now, success)
         self.teams.event("tasks_completed" if success else "tasks_failed", task.task_id, reason, now)
+        completed = getattr(self, "on_completed", None)
+        if success and callable(completed):
+            point = (task.site.landing if task.site is not None and task.site.landing is not None
+                     else task.goal)
+            completed(life.key, task.kind, point, now)
         if task.kind == "schematic":
             site = self.sites.sites.get(task.schematic_id)
             if site is not None and task.step_index >= 0:
@@ -1052,6 +1127,96 @@ class CooperativeBehavior:
         life.task = None
         life.next_project = now + (8 if success else 12)
         life.next_evaluate = now + .6
+
+    def _rescue_task(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                     life: _Life, allies: tuple[PlayerSnapshot, ...]) -> _Task | None:
+        """Complete one practical crossing for a nearby stationary ally.
+
+        A visible, stable beneficiary and a verified far bank are required.
+        Nobody is moved, assumed stuck from one sample, or given resources.
+        """
+        teamwork = frame.profile.teamwork if frame.profile else .5
+        if (int(C.BLOCK_TOOL) not in player.loadout or player.blocks < 2
+                or teamwork < .35 or frame.created_at < life.next_project):
+            return None
+        now = frame.created_at
+        nearby = sorted((p for p in allies if p.player_id != player.player_id
+            and 4 < math.dist(player.position,p.position) <= 12
+            and abs(player.position[2]-p.position[2]) < 2
+            and p.grounded and not p.wade and math.hypot(*p.velocity[:2]) < .02
+            and self.world.has_line_of_sight(player.eye,p.eye)),
+            key=lambda p:(p.is_bot,math.dist(player.position,p.position)))[:2]
+        observed = {identity(p) for p in nearby}
+        life.stranded = {key:value for key,value in life.stranded.items() if key in observed}
+        for ally in nearby:
+            key = identity(ally)
+            previous = life.stranded.get(key)
+            if previous is None or math.dist(previous[0],ally.position)>1:
+                life.stranded[key]=(ally.position,now)
+                continue
+            if now-previous[1]<1.5:
+                continue
+            site = find_bridge_project(self.world,player,ally.position,
+                reserved_cells=self._reserved_cells(player.team))
+            if site is None or site.landing is None or math.dist(site.landing,ally.position)>6:
+                continue
+            if any(any(x0<=cell[0]<=x1 and y0<=cell[1]<=y1
+                       for x0,x1,y0,y1 in frame.protected_build_bounds) for cell in site.cells):
+                continue
+            walking = self.world.plan(player.position,ally.position,abilities=frozenset())
+            if walking.deferred:
+                continue
+            walk_length = 0.
+            last = player.position
+            for step in walking.steps:
+                walk_length += math.dist(last,step.waypoint)
+                last = step.waypoint
+            build_seconds = 1.+math.dist(player.position,site.landing)/4.
+            if walking.reached_segment_goal and walk_length/4. <= build_seconds+.75:
+                continue
+            task_id=frame.frame_id*256+player.player_id
+            return _Task(task_id,"bridge",site.approach,ally.position,now,now+20,
+                .82+.1*teamwork,site=site,progress_at=now,beneficiary=key)
+        return None
+
+    def _inherit_work(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                      life: _Life, allies: tuple[PlayerSnapshot, ...]) -> TacticalOrder | None:
+        """A capable teammate takes a short, freshly checked abandoned job."""
+        now = frame.created_at
+        for old_id, (team, previous, until) in tuple(self.abandoned.items()):
+            site = previous.site
+            if team != player.team or now >= until or site is None:
+                continue
+            if math.dist(player.position, site.approach) > 24:
+                continue
+            if previous.kind == "breach":
+                if best_navigation_dig_profile(player.loadout) is None:
+                    continue
+            elif (int(C.BLOCK_TOOL) not in player.loadout
+                    or sum(not self.world.solid(*cell) for cell in site.cells) > player.blocks):
+                continue
+            if not all(self.world.solid(*cell) for cell in site.support_cells):
+                self.abandoned.pop(old_id, None)
+                continue
+            stand = self.world.surface(math.floor(site.approach[0]), math.floor(site.approach[1]),
+                site.approach[2], vertical_span=1, clearance=3)
+            if stand is None or abs(stand.position[2] - site.approach[2]) > 1:
+                self.abandoned.pop(old_id, None)
+                continue
+            task_id = frame.frame_id * 256 + player.player_id
+            task = replace(previous, task_id=task_id, started_at=now, expires_at=now + 20,
+                           progress_at=now, best_distance=math.inf, next_action=1)
+            if previous.kind == "bridge" and all(self.world.solid(*cell) for cell in site.cells):
+                task.phase, task.stage = "occupy", TaskStage.USE
+            if not self.teams.reserve(TeamProject(task_id, team, task.kind, life.key,
+                    site.approach, task.lane, now, task.expires_at,
+                    cells=site.cells, last_progress_at=now)):
+                continue
+            self.abandoned.pop(old_id, None)
+            life.task = task
+            self.teams.event("construction_handoffs", task_id, task.kind, now)
+            return self._advance(frame, player, None, life, allies)
+        return None
 
     def _support_project(self, frame: PerceptionFrame, player: PlayerSnapshot,
                          visible: PlayerSnapshot | None) -> TacticalOrder | None:
@@ -1080,9 +1245,37 @@ class CooperativeBehavior:
                     project.participants.pop(identity(player), None)
                     project.used_by.add(identity(player))
                     self.teams.event("routes_used_by_partner", project.project_id, project.kind, now)
+                    if project.advance_owner == identity(player):
+                        project.previous_advance = project.advance_owner
+                        project.advance_owner = None
                     return None
-                return TacticalOrder(project.project_id, "squad_advance", project.position,
-                                     project.lane, arrival_radius=.35)
+                # One forward bound while the other participants cover the
+                # usable crossing. Actual arrival, death or a bounded lack of
+                # movement releases the next runner, never a global timer.
+                runners = {identity(p): p for p in frame.players
+                    if p.team == player.team and p.is_bot and p.alive and p.spawned
+                    and identity(p) in project.participants and identity(p) not in project.used_by}
+                runner = runners.get(project.advance_owner)
+                if runner is not None:
+                    gap = math.dist(runner.position, project.position)
+                    if gap < project.advance_best_distance - .5:
+                        project.advance_best_distance = gap
+                        project.advance_progress_at = now
+                    if now - project.advance_progress_at > 5:
+                        project.previous_advance = project.advance_owner
+                        project.advance_owner = None
+                elif project.advance_owner is not None:
+                    project.previous_advance = project.advance_owner
+                    project.advance_owner = None
+                if project.advance_owner is None and runners:
+                    options = [key for key in runners if key != project.previous_advance] or list(runners)
+                    project.advance_owner = min(options, key=lambda key: (
+                        math.dist(runners[key].position, project.position), key))
+                    project.advance_best_distance = math.dist(runners[project.advance_owner].position, project.position)
+                    project.advance_progress_at = now
+                if project.advance_owner == identity(player):
+                    return TacticalOrder(project.project_id, "squad_advance", project.position,
+                                         project.lane, arrival_radius=.35)
             dx, dy = project.lane[0] - project.position[0], project.lane[1] - project.position[1]
             length = max(1., math.hypot(dx, dy))
             sign = 1 if player.player_id % 2 else -1
@@ -1222,13 +1415,17 @@ class CooperativeBehavior:
             return True
         if strategic is None:
             return False
+        if strategic.directive == "hold_capture":
+            return False
         role = strategic.role
-        if canonical_mode_id(frame.mode_id) == "vip" and str(frame.mode_phase).lower() in {"active", ""}:
+        if base_code(canonical_mode_id(frame.mode_id)) == "vip" and str(frame.mode_phase).lower() in {"active", ""}:
             if role == "vip_rally":
                 return True  # the VIP itself, not recently hurt
             if role == "vip_guard_formation":
                 vip = self._own_vip(frame, player)
                 return vip is not None and math.dist(vip.position, player.position) <= 24
+        if strategic.directive == "fortify":
+            return math.dist(player.position, strategic.position) <= strategic.arrival_radius + 14
         if (strategic.posture is ModeBotPosture.DEFEND and strategic.directive != "fortify"
                 and frame.profile is not None and frame.profile.creativity >= .45):
             # A defender that already holds its post may dig in there, and
@@ -1270,7 +1467,7 @@ class CooperativeBehavior:
 
     def _keep_away(self, frame: PerceptionFrame, player: PlayerSnapshot,
                    ring_centre: Vector3 | None = None) -> tuple[tuple[Vector3, float], ...]:
-        points = []
+        points = [((x, y, 0.0), radius + .01) for x, y, radius in frame.protected_build_circles]
         for objective in frame.objectives[:16]:
             if objective.kind in {"zombie_refuge", "zombie_order", "vip", "last_survivor"}:
                 continue
@@ -1300,6 +1497,7 @@ class CooperativeBehavior:
                 continue
             choice = find_schematic_site(self.world.solid, schematic, centre, facing,
                                          exact=exact, keep_away=keep_away, reserved=reserved,
+                                         keep_out_bounds=frame.protected_build_bounds,
                                          bodies=bodies, occupant_body=player.position if occupant else None,
                                          seed=player.player_id)
             if choice is None:
@@ -1329,7 +1527,10 @@ class CooperativeBehavior:
         role = strategic.role if strategic is not None else ""
         site = self.sites.site_for(player.team, player.player_id, player.position, requested_only=True)
         score = .92
-        vip_mode = canonical_mode_id(frame.mode_id) == "vip"
+        vip_mode = base_code(canonical_mode_id(frame.mode_id)) == "vip"
+        if site is None and strategic is not None and strategic.directive == "fortify":
+            site = self._fortification_site(frame, player, strategic)
+            score = .94
         if site is None and vip_mode and role in {"vip_rally", "vip_guard_formation"}:
             shelter = next((s for s in self.sites.active_sites(player.team) if s.purpose == "vip_shelter"), None)
             if role == "vip_rally":
@@ -1400,6 +1601,43 @@ class CooperativeBehavior:
         site.builders[identity(player)] = now
         return task
 
+    def _fortification_sites(self, team: int, centre: Vector3) -> tuple[SchematicSite, ...]:
+        return tuple(site for site in self.sites.sites.values()
+                     if site.team == team and site.purpose in {
+                         "refuge_cover", "base_cover", "refuge_overwatch", "base_overwatch"}
+                     and math.dist(site.centre, centre) <= 28)
+
+    def _fortification_site(self, frame: PerceptionFrame, player: PlayerSnapshot,
+                            strategic: ModeBotDecision) -> SchematicSite | None:
+        """Build one coherent shelter/overwatch/cover compound around the mode goal."""
+        mode = base_code(canonical_mode_id(frame.mode_id))
+        if mode not in {"zom", "dem"} or player.blocks < 12:
+            return None
+        centre = strategic.position
+        related = self._fortification_sites(player.team, centre)
+        available = self.sites.site_for(player.team, player.player_id, player.position)
+        if available is not None and available in related:
+            return available
+        # A few useful buildings per defended location, with shared builders.
+        # Completed or rejected sites still consume their layout slot: no
+        # endless replacement loops filling the refuge with random prefabs.
+        layout = (
+            (("bunker", "pillbox"), 0.0, 11.0),
+            (("watchtower", "sniper_nest"), -11.0, 1.0),
+            (("sandbag_wall", "corner_cover"), 10.0, 7.0),
+        )
+        if len(related) >= len(layout):
+            return None
+        names, side, forward = layout[len(related)]
+        facing = self._threat_facing(frame, player, strategic)
+        fx, fy = facing
+        anchor = (centre[0] + fx * forward - fy * side,
+                  centre[1] + fy * forward + fx * side, centre[2])
+        purpose = ("refuge_" if mode == "zom" else "base_") + (
+            "overwatch" if len(related) == 1 else "cover")
+        return self._start_site(frame, player, names, anchor, facing, purpose,
+                                optional=False)
+
     def _vip_can_shelter(self, frame: PerceptionFrame, player: PlayerSnapshot) -> bool:
         """Box in only near help or home and away from spawn protection."""
 
@@ -1440,7 +1678,7 @@ class CooperativeBehavior:
         me = identity(player)
         if site.completed_at:
             spot = site.plan.placement.occupant
-            if (site.purpose == "overwatch" and spot is not None
+            if (site.purpose in {"overwatch", "refuge_overwatch", "base_overwatch"} and spot is not None
                     and site.occupant in (None, me) and now - site.completed_at < 25):
                 # Use what was built: climb the stair to the platform/step
                 # and watch the lane from it for a while.
@@ -1629,12 +1867,14 @@ class CooperativeBehavior:
 
     def _expire(self, frame: PerceptionFrame, now: float) -> None:
         observed = {(p.player_id, p.generation): (p.alive and p.spawned, p.life_id) for p in frame.players}
-        self.teams.expire(now, observed)
-        self.sites.refresh(self.world.solid, now, {key: life for key, (alive, life) in observed.items()
-                                                   if alive})
+        # Preserve unfinished work before expiring its dead owner's lease.
         for key, life in tuple(self.lives.items()):
             if now - life.last_seen > 15 or key in observed and observed[key] != (True, life.key[2]):
                 self.forget(*key)
+        self.teams.expire(now, observed)
+        self.sites.refresh(self.world.solid, now, {key: life for key, (alive, life) in observed.items()
+                                                   if alive})
+        self.abandoned = {key: record for key, record in self.abandoned.items() if record[2] > now}
         while len(self.lives) > 128:
             self.forget(*min(self.lives, key=lambda key: self.lives[key].last_seen))
         self.patients = {key: value for key, value in self.patients.items() if value[1] > now}

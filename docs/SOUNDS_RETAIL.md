@@ -151,18 +151,14 @@ stream cleanly and the next sound plays.
   and Map Creator tools.
 - 24-26 `cratedrop_flyby_*`: there is no supply-drop system.
 
-## Deviation kept on purpose
+## Personal music
 
-The server starts a random `last_man_standing` track as a looping bed at
-every round start and for every joiner. Retail had no in-round bed: the
-`INGAME_MUSIC` table only has last-man, ending and tutorial music. The bed
-was added earlier at Kiril's request for non-silent rounds. It is left in
-place here, and it is why the last-man cue is usually a no-op.
+Music now requires player opt-in by default. `[audio] mode_start_music = false`
+suppresses automatic bed, final-minute, victory, Tutorial and Zombie last-survivor music,
+including late joins. Ambience and game effects are independent. The Music
+plugin provides `/music` to toggle and `/music play|stop` to choose explicitly;
+only that connection receives its music. The preference lasts until stop or
+disconnect, and resumes after ordinary round changes. Explicitly setting the
+legacy switch to `true` restores automatic round music.
 
-Since 2026-09-27 it is a switch: `[audio] mode_start_music` (default
-`true`, the deviation). `false` gives the retail silence: round starts only
-send StopMusic (ending the previous round's track), joiners get no bed, and
-the final-minute `game_ending`, victory, Zombie last-man and Tutorial
-tracks still play (`server/audio.py` `gameplay_bed_track`).
-
-Tests: `tests/test_event_sounds.py`.
+Tests: `tests/test_music_plugin.py`, `tests/test_event_sounds.py`.

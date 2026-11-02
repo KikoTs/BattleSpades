@@ -47,6 +47,10 @@ class TeamProject:
     cells: tuple[tuple[int, int, int], ...] = ()
     last_progress_at: float = 0.0
     used_by: set[Identity] = field(default_factory=set)
+    advance_owner: Identity | None = None
+    advance_progress_at: float = 0.0
+    advance_best_distance: float = math.inf
+    previous_advance: Identity | None = None
 
 
 class TeamTasks:

@@ -167,6 +167,7 @@ class BotConfig:
     configured: bool = False
     behavior_version: str = "cooperative"
     friendly_mischief: bool = True
+    social_interactions: bool = True
     # Sparse, rate-limited bot chat reacting to kills and round boundaries.
     # Off by default: players found it noisy. ``[bots] chatter = true``.
     chatter: bool = False
@@ -657,11 +658,10 @@ class ServerConfig:
     votekick_min_team_players: int = 3
     # [audio] mode_start_music: start a looping in-round music bed (a
     # last_man_standing_00N track) at every round start and for joiners.
-    # A deliberate deviation kept on the owner's request: retail rounds were
-    # silent plus map ambience until the final 61 s (game_ending_00N), and
-    # last_man_standing played only for the Zombie last survivor. false =
-    # retail silence.
-    mode_start_music: bool = True
+    # Legacy automatic music, including final-minute/last-survivor/end tracks.
+    # Off by default: the Music plugin lets each player opt in with /music.
+    # Map ambience and gameplay sound cues are independent of this switch.
+    mode_start_music: bool = False
     # [updates]: read the shared update manifest at startup and log when a
     # newer server release exists (server/update_check.py). Never installs
     # anything; `BattleSpades --update` downloads and stages on request.
@@ -1469,6 +1469,9 @@ def load_config(
         config.bots.behavior_version = behavior
         config.bots.friendly_mischief = bool(
             b.get("friendly_mischief", config.bots.friendly_mischief)
+        )
+        config.bots.social_interactions = bool(
+            b.get("social_interactions", config.bots.social_interactions)
         )
         config.bots.chatter = bool(b.get("chatter", config.bots.chatter))
         prefix = b.get("name_prefix", config.bots.name_prefix)

@@ -12,6 +12,7 @@ from .tdm import TDMMode
 from .arena import ArenaMode
 from .vip import VIPMode
 from .zombie import ZombieMode
+from .classic_zombie import ClassicZombieMode
 from .multi_hill import MultiHillMode
 from .demolition import DemolitionMode
 from .diamond_mine import DiamondMineMode
@@ -30,6 +31,9 @@ _modes = {
     "vip": VIPMode,
     "zom": ZombieMode,
     "zombie": ZombieMode,
+    "czom": ClassicZombieMode,
+    "classic_zombie": ClassicZombieMode,
+    "classic-zombie": ClassicZombieMode,
     "mh": MultiHillMode,
     "multihill": MultiHillMode,
     "multi-hill": MultiHillMode,
@@ -96,6 +100,7 @@ __all__ = [
     "ArenaMode",
     "VIPMode",
     "ZombieMode",
+    "ClassicZombieMode",
     "MultiHillMode",
     "TerritoryControlMode",
     "DiamondMineMode",

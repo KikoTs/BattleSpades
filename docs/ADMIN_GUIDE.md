@@ -349,10 +349,20 @@ The optional cosmetic envelope is documented in [PROTOCOL.md](PROTOCOL.md).
 ### `[game]` and `[lobby]`
 
 - `default_mode`: `tdm`, `ctf`, `cctf`, `zom`, `vip`, `mh`, `tc`, `dia`,
-  `dem`, `oc`, or the non-retail extension `arena`. Aliases (`zombie`,
+  `dem`, `oc`, or the extensions `arena` and `czom` (Classic+ Zombies). Aliases (`zombie`,
   `occupation`, `diamond`, `classic_ctf`, ...) are stored as the short code.
   An unknown value stops the server at startup with the list of accepted
   names.
+  `classic_zombie` and `classic-zombie` resolve to `czom`. This variant keeps
+  Zombie infection, rounds, radar and horde navigation, with Deuce survivors
+  choosing the Classic+ rifle, SMG or shotgun. Zombie options use `[modes.zom]`;
+  explicit Classic weapon restrictions still apply. The stock `zom` roster and
+  default official fleet are unchanged.
+  `[modes.zom] bot_respawn_near_action` (default `true`): a killed bot zombie
+  comes back at a street-level spot 40-56 blocks from the nearest survivor
+  that no survivor can see, or at the team spawn when the map has none;
+  human zombies always use the team spawn. Set it to `false` for the stock
+  walk back from the spawn.
 - `default_map`: `.vxl` basename without a path. Default `MayanJungle`.
 - `movement_authority`: `server` (production) or diagnostic `client` echo.
 - `map_sync_mode`: production `full`; `auto` remains experimental.
@@ -497,8 +507,15 @@ visible and hidden entries.
   worker rates/budgets; `seed`;
   `clean_slate_games` (defaults to `3`, `0` disables only the periodic worker
   recycle); and bounded `debug_visualization`.
+  `behavior_version = "cooperative"` enables the tactical construction,
+  teamwork and human-interaction layer; `"classic"` keeps the earlier layer.
+  `social_interactions` (default `true`) permits brief local friendly looks
+  and gestures with per-bot, partner and shared-human cooldowns. Combat,
+  hazards, precise traversal and urgent mode work always preempt them.
+  `friendly_mischief` controls the separate optional decorative behavior.
   `chatter` (default `false`) turns the bots' short, rate-limited kill and
-  round chat lines back on. `name_prefix` (default `"[BOT]"`, printable
+  round chat lines back on, including occasional confirmed construction,
+  objective and courtesy events. `name_prefix` (default `"[BOT]"`, printable
   ASCII, at most 6 characters, `""` disables) is put in front of every bot's
   name, so the scoreboard, kill feed and chat of every client, retail
   included, show `[BOT]Pancake`. Bot names are drawn short enough that the
@@ -646,17 +663,16 @@ their thresholds (defaults in `config.toml`):
 - Sustained log-only violations: at least `sustained_min_count` (20) over
   `sustained_min_minutes` (5.0) at `sustained_per_minute` (3.0).
 
-### `[audio]`: in-round music
+### `[audio]`: personal music
 
-- `mode_start_music` (default `true`): at every round start, and for every
-  joiner, the server starts a looping in-round bed (a random
-  `last_man_standing_00N` track). This is a **deliberate deviation** from
-  retail, kept because the owner wants background music: retail rounds were
-  silent apart from map ambience until the final 61 s (`game_ending_00N`),
-  and `last_man_standing` played only for the Zombie last survivor. Set it
-  to `false` for the retail silence; round starts then only stop the
-  previous round's track. The final-minute, victory, Zombie last-man and
-  Tutorial tracks are unaffected.
+- `mode_start_music` (default `false`): automatic music is off, including
+  timeout, victory, Tutorial and Zombie last-survivor tracks. Map ambience and game
+  sound effects still play. `true` restores the legacy automatic round music.
+- The `Music` plugin is discovered by the default plugin configuration.
+  `/music` toggles music for the requesting player; `/music play` and
+  `/music stop` set it explicitly. The choice survives round changes until
+  the player stops it or disconnects. It never starts music for teammates.
+  Removing or disabling the plugin stops its listeners and removes `/music`.
 
 ### `[updates]`: update notices and `--update`
 

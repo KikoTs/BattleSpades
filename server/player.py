@@ -2158,7 +2158,7 @@ class Player:
             amount = float(amount) * float(rules.get("RULE_WEAPON_DAMAGE"))
             from server.hardcore import base_code
             mode_code = base_code(getattr(config, "default_mode", ""))
-            if mode_code in ("zom", "zombie") and int(
+            if mode_code in ("zom", "zombie", "czom", "classic_zombie", "classic-zombie") and int(
                 getattr(source, "class_id", -1)
             ) in {
                 int(C.CLASS_ZOMBIE),

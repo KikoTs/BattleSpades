@@ -244,6 +244,7 @@ def _forced(rows):
 
 def test_end_screen_joiner_gets_forced_scores_and_ending_track():
     server = _scoring_server()
+    server.config.mode_start_music = True
     mode = TDMMode(server)
     asyncio.run(mode.on_mode_start())
     mode.ended = True
@@ -259,6 +260,7 @@ def test_end_screen_joiner_gets_forced_scores_and_ending_track():
 
 def test_final_minute_joiner_gets_the_timeout_track_and_normal_joiner_nothing():
     server = _scoring_server()
+    server.config.mode_start_music = True
     mode = _PlainMode(server)
     asyncio.run(mode.on_mode_start())
     quiet = _Conn()

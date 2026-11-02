@@ -33,6 +33,7 @@ else:
 # server package. Tests pin its public-mode contract to server.mode_data.
 _BASE_MODES = ("tdm", "ctf", "cctf", "zom", "vip", "tc", "dia", "dem", "mh", "oc")
 PUBLIC_MODES = _BASE_MODES + tuple("hc_" + code for code in _BASE_MODES) + (
+    "czom",
     "block_hunt", "false_wall", "crumbling_run", "last_exit", "night_shift",
     "tunnel_rats", "bridge_chicken", "towerfall", "floor_tax", "hot_potato",
     "lockdown", "paint_raid", "smugglers_run", "one_in_the_spade",
@@ -41,6 +42,7 @@ PUBLIC_MODES = _BASE_MODES + tuple("hc_" + code for code in _BASE_MODES) + (
 )
 _MODE_ALIASES = {
     "zombie": "zom", "classic_ctf": "cctf", "classic-ctf": "cctf",
+    "classic_zombie": "czom", "classic-zombie": "czom",
     "multihill": "mh", "multi-hill": "mh", "territory_control": "tc",
     "territory-control": "tc", "diamond": "dia", "diamond_mine": "dia",
     "demolition": "dem", "occupation": "oc",

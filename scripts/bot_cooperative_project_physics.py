@@ -156,8 +156,8 @@ async def simulate_project(scenario: str, *, seconds: float = 24) -> ProjectPhys
                             result.project_cells = project.cells
                 server.loop_count += 1
                 for player in players:
-                    if player.id % 6 == server.loop_count % 6:
-                        director._apply_motor(director._runtime[player.id], now, .1)
+                    if player.id % 2 == server.loop_count % 2:
+                        director._apply_motor(director._runtime[player.id], now, 1 / 30)
                 await server.simulation_runtime._simulate_players()
                 server.world_mutations.commit_ready()
                 server.prefab_actions.tick()

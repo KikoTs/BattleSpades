@@ -103,10 +103,11 @@ def test_departure_rejoin_and_retry_reserve_rich_stats_once(tmp_path, monkeypatc
     service.server.players = {0: second}
     # Inspection is pure: repeated snapshotting cannot modify departed totals.
     for _ in range(2):
-        rows, _ = service._result_players(2)
+        rows, _, _ = service._result_players(2)
         assert rows[0]["stats"][str(C.MAP_SINGLEBLOCKS_ADDED_TOTAL)] == [21, 0]
     service._capture_round_results(2)
     event = next(iter(service._pending_results.values()))
+    service.begin_round()
     stats.add(second, C.MAP_SINGLEBLOCKS_ADDED_TOTAL, 3)
     assert event["players"][0]["stats"][str(C.MAP_SINGLEBLOCKS_ADDED_TOTAL)] == [21, 0]
     service._capture_round_results(2)
@@ -119,7 +120,7 @@ def test_non_ctf_objectives_do_not_fabricate_flag_captures(tmp_path, monkeypatch
     service, owner = result_service(tmp_path, monkeypatch)
     owner.captures = 3
     service.server.config.default_mode = "diamond_mine"
-    rows, _ = service._result_players(None)
+    rows, _, _ = service._result_players(None)
     assert "49" not in rows[0]["stats"]
 
 

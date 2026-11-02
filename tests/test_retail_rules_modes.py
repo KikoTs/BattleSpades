@@ -218,6 +218,7 @@ def test_patient_zero_first_life_gets_exactly_the_retail_window():
     now = [50.0]
     player = _ProtectedPlayer(id=7, team=ZOMBIE_TEAM, alive=True, spawned_at=50.0, rule=3.0, now=now)
     mode = ZombieMode.__new__(ZombieMode)
+    mode.server = SimpleNamespace(broadcast=lambda *_args, **_kwargs: None)
     mode._patient_zero_protection_pending = {7: player}
     asyncio.run(mode.on_player_spawn(player))
     assert player.spawn_protection_remaining() == float(C.FIRST_ZOMBIE_SPAWN_PROTECTION_TIME) == 0.5
@@ -242,6 +243,8 @@ def test_patient_zero_window_never_extends_a_shorter_rule():
 
 def test_infecting_patient_zero_marks_the_one_use_window():
     mode = ZombieMode.__new__(ZombieMode)
+    mode.server = SimpleNamespace(broadcast=lambda *_args, **_kwargs: None,
+                                  respawn_player=lambda _player: None)
     mode.patient_zero_ids = set()
     mode._patient_zero_protection_pending = {}
     mode._survivor_selection_by_player = {}
@@ -357,4 +360,6 @@ def test_first_to_hill_and_claim_hill_are_separate_awards(monkeypatch):
     mode._update_control(now[0])
     blue_a.position = zone.center
     mode._update_control(now[0])
-    assert blue_a.score == int(CG.MH_SCORE_FIRST) + int(CG.MH_SCORE_CLAIM)
+    # Upstream makes an empty hill neutral (it cannot keep scoring). Re-entry
+    # earns a new claim, while First to Hill is still paid only once.
+    assert blue_a.score == int(CG.MH_SCORE_FIRST) + 2 * int(CG.MH_SCORE_CLAIM)

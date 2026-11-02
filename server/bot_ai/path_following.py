@@ -126,6 +126,7 @@ def straight_walkable(world, origin: Vector3, target: Vector3,
     height = origin[2]
     behind = (int(math.floor(origin[0])), int(math.floor(origin[1])))
     solid = getattr(world, "solid", None)
+    pocket = getattr(world, "drop_into_pocket", None)
     samples = max(1, int(math.ceil(length / _SAMPLE_SPACING)))
     for number in range(1, samples + 1):
         travelled = min(length, number * _SAMPLE_SPACING)
@@ -138,6 +139,10 @@ def straight_walkable(world, origin: Vector3, target: Vector3,
             if centre is None:
                 centre = surface
         here = (int(math.floor(x)), int(math.floor(y)))
+        if (centre - height > _STEP_HEIGHT and here != behind and callable(pocket)
+                and pocket(behind[0], behind[1], here[0], here[1])):
+            # A ledge the body could run off, into a pocket it cannot leave.
+            return False
         if callable(solid):
             lifted = _lifted(solid, x, y, centre)
             if lifted < height - 0.5:

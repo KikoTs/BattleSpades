@@ -36,7 +36,7 @@ import shared.constants as C
 
 from modes.tdm import TDMMode
 from modes import get_mode_class
-from server.bot_ai.director import BotDirector
+from server.bot_ai.director import BotDirector, _MOTOR_PHASE_COUNT
 from server.bot_ai.messages import (
     BotActionKind,
     MovementAffordance,
@@ -53,7 +53,7 @@ from server.main import BattleSpadesServer
 
 SIMULATION_HZ = 60
 DECISION_INTERVAL_TICKS = 8
-MOTOR_PHASES = 6
+MOTOR_PHASES = _MOTOR_PHASE_COUNT
 TEAM_CONGESTION_RADIUS = 7.0
 TEAM_CONGESTION_BOTS = 4
 TEAM_CONGESTION_FAR_GOALS = 3
@@ -222,10 +222,16 @@ def _bot_state(
     )
     goal = getattr(intent, "debug_goal", None) if intent is not None else None
     state = brain._states.get((player.id, runtime.generation)) if brain is not None else None
+    skill_slot = (brain.skills._slots.get((player.id, runtime.generation))
+                  if brain is not None else None)
+    skill = skill_slot.skill if skill_slot is not None else None
     return WorstBotState(
         bot_id=int(player.id),
         navigation_state=({
             "class_id": player.class_id,
+            "blocks": int(getattr(player, "blocks", 0)),
+            "loadout": tuple(int(value) for value in getattr(player, "loadout", ())),
+            "burdensome": bool(getattr(player, "pickup_burdensome", False)),
             "goal_key": state.goal.key if state.goal is not None else None,
             "escape_goal": state.escape_goal,
             "escape_remaining": state.escape_until - now,
@@ -242,6 +248,17 @@ def _bot_state(
             "water_step_key": state.water_step_key,
             "water_committed": state.water_committed,
             "water_recovery": state.water_recovery,
+            "water_search_committed": now < state.water_search_until,
+            "skill_water_age": now - skill_slot.water_since if skill_slot and skill_slot.water_since is not None else None,
+            "skill_retry_remaining": skill_slot.retry_at - now if skill_slot else None,
+            "skill_goal": str(skill_slot.goal) if skill_slot else None,
+            "skill_pending": skill_slot.pending is not None if skill_slot else False,
+            "skill_index": skill.index if skill else None,
+            "skill_progress_age": now - skill_slot.progress_at if skill_slot else None,
+            "skill_reason": skill_slot.last_reason if skill_slot else None,
+            "skill_anchor_age": now - skill_slot.anchor_at if skill_slot else None,
+            "skill_avoided": [(cell, until-now) for cell, until in skill_slot.avoid.items()] if skill_slot else [],
+            "skill_events": [event for event in brain.skills.events if event[1] == int(player.id)][-5:] if brain else [],
             "corridor_index": state.corridor_index,
             "corridor": state.corridor,
             "route_index": state.route_index,
@@ -660,6 +677,10 @@ async def simulate_map(
                         )),
                         "wade": bool(traced.wade),
                         "grounded": bool(traced.grounded),
+                        "blocks": int(traced.blocks),
+                        "skill": brain.skills.describe(director._snapshot_player(traced)),
+                        "jump_input": bool(traced.input.jump),
+                        "crouching": bool(director._snapshot_player(traced).crouching),
                         "role": str(
                             getattr(intent, "debug_role", "idle") or "idle"
                         ),

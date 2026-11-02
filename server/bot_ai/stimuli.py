@@ -39,6 +39,8 @@ class _SoundEvent:
     radius: float
     source_id: int
     team: int
+    target_id: int = -1
+    target_life_id: int = -1
 
 
 class BotStimulusBus:
@@ -65,6 +67,8 @@ class BotStimulusBus:
         radius: float = 64.0,
         lifetime: float = 1.5,
         now: float | None = None,
+        target_id: int = -1,
+        target_life_id: int = -1,
     ) -> bool:
         """Publish one rate-limited finite event; malformed values fail closed."""
 
@@ -93,6 +97,8 @@ class BotStimulusBus:
                 radius,
                 int(source_id),
                 int(team),
+                int(target_id),
+                int(target_life_id),
             )
         )
         return True
@@ -156,6 +162,10 @@ class BotStimulusBus:
         for event in self._events:
             if event.expires_at <= current:
                 continue  # a short-lived step queued behind a longer blast
+            if event.kind is StimulusKind.FRIENDLY_ATTENTION and (
+                event.target_id != observer_id or event.team != team
+            ):
+                continue
             if team is not None and (event.source_id == observer_id or (
                     event.kind is StimulusKind.FOOTSTEP and event.team == team)):
                 continue
@@ -184,6 +194,8 @@ class BotStimulusBus:
                         source_id=event.source_id,
                         team=event.team,
                         uncertainty=uncertainty,
+                        target_id=event.target_id,
+                        target_life_id=event.target_life_id,
                     ),
                 )
             )

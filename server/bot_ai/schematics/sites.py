@@ -89,6 +89,7 @@ def find_schematic_site(solid: SolidFn, schematic: Schematic, centre: Vector3,
                         exact: bool = False,
                         any_rotation: bool = True,
                         keep_away: Sequence[tuple[Vector3, float]] = (),
+                        keep_out_bounds: Sequence[tuple[int, int, int, int]] = (),
                         reserved: frozenset[Cell] | set[Cell] = frozenset(),
                         bodies: Sequence[Vector3] = (),
                         occupant_body: Vector3 | None = None,
@@ -137,6 +138,9 @@ def find_schematic_site(solid: SolidFn, schematic: Schematic, centre: Vector3,
                 continue
             if any(math.hypot(cell[0] + .5 - point[0], cell[1] + .5 - point[1]) < radius
                    for point, radius in keep_away for cell in cells):
+                continue
+            if any(x0 <= x <= x1 and y0 <= y <= y1
+                   for x0, x1, y0, y1 in keep_out_bounds for x, y, _z in cells):
                 continue
             score = math.hypot(dx, dy) + (0 if rotation == preferred else 1.5) + len(placement.foundation) * .2
             fits.append((score, placement))

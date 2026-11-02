@@ -41,7 +41,7 @@ if str(ROOT) not in sys.path:
 
 import shared.constants as C  # noqa: E402
 from modes.tdm import TDMMode  # noqa: E402
-from server.bot_ai.director import BotDirector  # noqa: E402
+from server.bot_ai.director import BotDirector, _RuntimeBot, _MOTOR_PHASE_COUNT  # noqa: E402
 from server.bot_ai.messages import PerceptionFrame, VoxelChange, WorldDelta  # noqa: E402
 from server.bot_ai.policies import ModeBotDecision  # noqa: E402
 from server.bot_ai.simple_navigation import SimpleVoxelWorld  # noqa: E402
@@ -49,10 +49,11 @@ from server.bot_ai.simple_worker import SimpleBotBrain  # noqa: E402
 from server.config import ServerConfig  # noqa: E402
 from server.game_constants import TEAM1  # noqa: E402
 from server.main import BattleSpadesServer  # noqa: E402
+from server.player import Player  # noqa: E402
 
 SIMULATION_HZ = 60
 DECISION_INTERVAL_TICKS = 8
-MOTOR_PHASES = 6
+MOTOR_PHASES = _MOTOR_PHASE_COUNT
 WATER_SUPPORT = int(C.Z_ABOVE_WATERPLANE) + 1
 
 DEFAULT_CLASSES = (
@@ -81,6 +82,7 @@ class BotOutcome:
     builds_requested: int = 0
     lines_requested: int = 0
     roles: dict[str, int] = field(default_factory=dict)
+    navigation: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,6 +103,47 @@ class ScenarioResult:
     terrain_changes: int = 0
     skill_metrics: dict[str, int] = field(default_factory=dict)
     skill_events: list = field(default_factory=list)
+    clock_base: float = 0.0
+
+
+def _navigation_diagnostics(brain: SimpleBotBrain, player: Player,
+                            runtime: _RuntimeBot, now: float) -> dict[str, object]:
+    """Retain the actual route/search state when a recovery does not finish."""
+    state = brain._states.get((int(player.id), int(runtime.generation)))
+    if state is None:
+        return {}
+    search = state.corridor_search
+    atlas = getattr(brain.world, "_atlas", None)
+    here_index = int(math.floor(player.y)) * 512 + int(math.floor(player.x))
+    goal_index = (int(math.floor(state.goal.position[1])) * 512
+                  + int(math.floor(state.goal.position[0]))) if state.goal is not None else here_index
+    slot = getattr(brain.skills, "_slots", {}).get((int(player.id), int(runtime.generation)))
+    return {
+        "atlas": ({"main": int(atlas.main_region_id), "here": int(atlas.regions[here_index]),
+                   "goal": int(atlas.regions[goal_index]),
+                   "here_support": int(atlas.primary_support[here_index]),
+                   "goal_support": int(atlas.primary_support[goal_index]),
+                   "layers": int(atlas.layer_count[here_index])} if atlas is not None else {}),
+        "skill": ({"goal": str(slot.goal), "retry": round(slot.retry_at - now, 3),
+                   "anchor_age": round(now - slot.anchor_at, 3),
+                   "reason": slot.last_reason} if slot is not None else {}),
+        "goal": asdict(state.goal) if state.goal is not None else None,
+        "goal_standing_position": brain._goal_place(state.goal.position) if state.goal is not None else None,
+        "walkless_goal": state.walkless_goal,
+        "route": [(step.waypoint, step.affordance.value) for step in state.route],
+        "route_index": state.route_index,
+        "escape_goal": state.escape_goal,
+        "escape_remaining": round(state.escape_until - now, 3),
+        "progress_age": round(now - state.navigation_progress_at, 3),
+        "window_age": round(now - state.navigation_window_at, 3),
+        "goal_age": round(now - state.goal_progress_at, 3),
+        "corridor": state.corridor,
+        "corridor_index": state.corridor_index,
+        "corridor_search_done": search.done if search is not None else None,
+        "corridor_retry": round(state.corridor_retry_at - now, 3),
+        "blocked_edges": [(a, b, round(until - now, 3))
+                          for (a, b), until in list(state.blocked_edges.items())[:32]],
+    }
 
 
 def _pit_sites(world, atlas, count: int, depth: int, seed: int):
@@ -207,6 +250,7 @@ async def run_scenario(
     trace_every: float = 0.0,
     trace_bot: int | None = None,
     disable_skills: bool = False,
+    clock_base: float | None = None,
 ) -> ScenarioResult:
     if scenario not in {"water", "pit", "gap", "pillar", "staircase"}:
         raise ValueError(scenario)
@@ -282,9 +326,23 @@ async def run_scenario(
                             if world.map.get_solid(x, y, z):
                                 world.map.remove_point(x, y, z)
                 player.set_position(cx + 0.5, cy + 0.5, top + pit_depth - 2.25)
-                goals[player.id] = ((cx + pit_depth + 1.5, cy + 0.5, top - 2.25)
-                                    if scenario == "staircase"
-                                    else (cx + 0.5, cy + 0.5 + 12, top - 2.25))
+                if scenario == "staircase":
+                    goals[player.id] = (cx+pit_depth+1.5,cy+.5,top-2.25)
+                else:
+                    # Name a real rim, not a point twelve columns away whose
+                    # copied height can be inside another hill or in mid-air.
+                    # Recovery is still judged against the original shaft's
+                    # height and requires a native grounded body outside it.
+                    rims=[]
+                    for dx,dy in ((0,3),(3,0),(0,-3),(-3,0),(2,0),(-2,0),(0,2),(0,-2)):
+                        support=world.get_height(cx+dx,cy+dy)
+                        if abs(support-top)<=1 and all(not world.get_solid(cx+dx,cy+dy,support-dz)
+                                                       for dz in (1,2,3)):
+                            rims.append((abs(support-top),dx,dy,support))
+                    if not rims:
+                        raise RuntimeError("pit fixture has no validated rim destination")
+                    _,dx,dy,support=min(rims)
+                    goals[player.id]=(cx+dx+.5,cy+dy+.5,support-2.25)
                 pit_centres[player.id] = (cx, cy, top)
             world.map_raw_bytes = world.map.generate_vxl()
             worker.load(director._make_map_snapshot(current=False))
@@ -313,7 +371,10 @@ async def run_scenario(
             pending[int(version)].append(VoxelChange(int(x), int(y), int(z), bool(solid), int(color)))
 
         subscription = world.subscribe_mutations(remember)
-        base = math.ceil(time.monotonic() + 2.0)
+        from scripts.bot_map_matrix import simulation_clock_base
+        base = (math.ceil(time.monotonic() + 2.0) if clock_base is None else
+                simulation_clock_base(time.monotonic(), replay_base=clock_base))
+        result.clock_base = base
         clock = [base]
         patcher = patch.object(time, "monotonic", side_effect=lambda: clock[0])
         patcher.start()
@@ -327,8 +388,8 @@ async def run_scenario(
             goal = goals.get(int(observer.player_id))
             if goal is None:
                 return None
-            return ModeBotDecision(goal, "recovery_goal", arrival_radius=2.0,
-                                   directive=directive)
+            return ModeBotDecision(goal, "recovery_goal", arrival_radius=2.0 if scenario=="water" else .35,
+                                   directive=directive,exact_height=scenario!="water")
 
         with patch.object(brain.mode_policy, "decide", side_effect=decide):
             total_ticks = int(round(seconds * SIMULATION_HZ))
@@ -431,6 +492,8 @@ async def run_scenario(
                               f"wade={int(player.wade)} gr={int(player.grounded)} "
                               f"blk={player.blocks} role={getattr(intent, 'debug_role', '')}",
                               flush=True)
+                        print("   navigation=" + json.dumps(
+                            _navigation_diagnostics(brain, player, runtime, now)), flush=True)
                 result.simulated_seconds = elapsed
                 if all(o.recovered_at is not None for o in outcomes.values()):
                     break
@@ -439,6 +502,8 @@ async def run_scenario(
             outcome.final = tuple(round(v, 2) for v in player.position)
             outcome.blocks_used = blocks_before[player.id] - int(player.blocks)
             outcome.roles = dict(roles[player.id].most_common(8))
+            outcome.navigation = _navigation_diagnostics(
+                brain, player, director._runtime[player.id], clock[0])
         result.bots = list(outcomes.values())
         result.skill_metrics = dict(sorted(getattr(getattr(brain, "skills", None),
                                                    "metrics", {}).items()))
@@ -479,6 +544,10 @@ def main() -> int:
     parser.add_argument("--trace-bot", type=int, default=None)
     parser.add_argument("--disable-skills", action="store_true",
                         help="baseline: run without the locomotion skill driver")
+    parser.add_argument("--clock-base", type=float,
+                        help="replay a clock base; past bases shift forward by eight-second cycles")
+    parser.add_argument("--require-all", action="store_true",
+                        help="fail unless every bot recovers without dying")
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
     classes = (tuple(int(value) for value in args.classes.split(",") if value)
@@ -488,6 +557,7 @@ def main() -> int:
         seed=args.seed, classes=classes, gap_width=args.gap_width,
         pit_depth=args.pit_depth, trace_every=args.trace_every,
         trace_bot=args.trace_bot, disable_skills=args.disable_skills,
+        clock_base=args.clock_base,
     ))
     for outcome in result.bots:
         print(f"bot {outcome.bot_id} class={outcome.class_id} start={outcome.start} "
@@ -505,7 +575,8 @@ def main() -> int:
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
-    return 0
+    return int(args.require_all and (result.recovered != len(result.bots)
+                                    or any(bot.deaths for bot in result.bots)))
 
 
 if __name__ == "__main__":

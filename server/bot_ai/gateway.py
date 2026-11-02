@@ -356,7 +356,8 @@ class BotActionGateway:
                     int(getattr(player, "block_color", 0)) & 0xFF,
                 ),
                 loop_count=int(getattr(self.server, "loop_count", 0)),
-                snap_to_surface=True,
+                snap_to_surface=not action.exact_placement,
+                enforce_player_reach=True,
             )
         )
 

@@ -39,3 +39,26 @@ def test_invalid_clock_phases_fail_closed(phase):
 def test_nonfinite_replay_base_is_rejected():
     with pytest.raises(ValueError):
         simulation_clock_base(10, replay_base=math.nan)
+
+
+def test_preimported_community_modes_share_accelerated_clock_and_restore_it():
+    # Reproduce the real matrix import order, rather than importing a mode
+    # only after monkeypatching the time module.
+    from modes.unofficial.base import FunMode
+    from scripts.bot_audit_harness import CLOCK, install_clock, uninstall_clock
+    original = FunMode.__dict__["clock"]
+    previous_elapsed = CLOCK.elapsed
+    try:
+        install_clock()
+        CLOCK.elapsed = 0.
+        deadline = FunMode.clock() + 8.
+        CLOCK.elapsed = 7.9
+        assert FunMode.clock() < deadline
+        CLOCK.elapsed = 8.
+        assert FunMode.clock() == deadline
+        CLOCK.elapsed = 360.
+        assert FunMode.clock() - deadline == 352.
+    finally:
+        uninstall_clock()
+        CLOCK.elapsed = previous_elapsed
+    assert FunMode.__dict__["clock"] is original

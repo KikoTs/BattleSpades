@@ -57,7 +57,7 @@ SKILL_DIRECTIVES = frozenset({
 _SWIM_SECONDS_PER_CELL = 0.34
 _WATER_GRACE_SECONDS = 0.6
 _REPLAN_LIMIT = 3
-_BACKOFF_SECONDS = 8.0
+_BACKOFF_SECONDS = 1.5
 _STUCK_SECONDS = 6.0
 _STUCK_DISTANCE = 2.5
 _LOW_POCKET_SECONDS = 5.0
@@ -69,7 +69,7 @@ _SEARCH_SLICE = 0.012
 _SEARCH_GIVE_UP_SECONDS = 5.0
 # Whole-skill progress watchdog (a finished step or 0.75 blocks of motion).
 _WATER_STALL_SECONDS = 4.0
-_DRY_STALL_SECONDS = 7.0
+_DRY_STALL_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +114,7 @@ class _PendingSearch:
     goal_spec: tuple
     started_at: float
     accept: Callable[[AscentPlan], bool] | None = None
-    # Tried when this search finds nothing (stuck: toward goal, then main).
+    # Tried when this search finds nothing (stuck: toward goal, then the rim).
     fallback: tuple | None = None
 
 
@@ -122,8 +122,8 @@ class _PendingSearch:
 class _Slot:
     life_id: int
     skill: LocomotionSkill | None = None
-    # How to re-plan: ("main",), ("toward", target, radius), ("request", req)
-    # or ("bridge", goal).
+    # How to re-plan: ("main",), ("higher",), ("toward", target, radius),
+    # ("request", req) or ("bridge", goal).
     goal: tuple | None = None
     request: SkillRequest | None = None
     pending: _PendingSearch | None = None
@@ -141,6 +141,13 @@ class _Slot:
     progress_index: int = -1
     progress_position: Vector3 | None = None
     progress_at: float = 0.0
+    progress_work_key: tuple | None = None
+    progress_dig_remaining: int = 0
+    progress_build_present: int = 0
+    # When each recent failure (a failed step, a stall, a search that found
+    # nothing) happened; strategy code reads the count to change approach.
+    fail_times: list = field(default_factory=list)
+    failed_at: float = 0.0
 
 
 class LocomotionSkillDriver:
@@ -152,6 +159,9 @@ class LocomotionSkillDriver:
         self.metrics: dict[str, int] = {}
         # Bounded diagnostics: the last few failures with their context.
         self.events: list[tuple] = []
+        # Voxels no planned or executed swing may take: the team's prefab
+        # stacks (set by the worker from the prefab ascent before a climb).
+        self.keep: frozenset = frozenset()
 
     @property
     def _voxel_world(self) -> bool:
@@ -195,6 +205,39 @@ class LocomotionSkillDriver:
         slot.request = None
         slot.pending = None
 
+    def avoided(self, observer: PlayerSnapshot, now: float) -> frozenset:
+        slot = self._slot(observer)
+        slot.avoid = {cell: until for cell, until in slot.avoid.items() if until > now}
+        return frozenset(slot.avoid)
+
+    def recent_failures(self, observer: PlayerSnapshot, now: float,
+                        window: float = 20.0) -> int:
+        """Failures of this body's skills in the last ``window`` seconds.
+
+        Counts failed steps, stalls and searches that found nothing. The
+        prefab ascent turns to another side of its target after two.
+        """
+
+        slot = self._slots.get((int(observer.player_id), int(observer.generation)))
+        if slot is None or slot.life_id != int(observer.life_id):
+            return 0
+        slot.fail_times = [when for when in slot.fail_times if now - when <= window]
+        return len(slot.fail_times)
+
+    def failure_reason(self, observer: PlayerSnapshot) -> str:
+        """The last failure's reason (``climb_no_plan``, ``step_timeout``...)."""
+
+        slot = self._slots.get((int(observer.player_id), int(observer.generation)))
+        if slot is None or slot.life_id != int(observer.life_id):
+            return ""
+        return slot.last_reason
+
+    def _failed(self, slot: _Slot, now: float, reason: str) -> None:
+        slot.last_reason = reason
+        slot.failed_at = now
+        slot.fail_times.append(now)
+        del slot.fail_times[:-16]
+
     def describe(self, observer: PlayerSnapshot) -> str:
         slot = self._slots.get((int(observer.player_id), int(observer.generation)))
         if slot is None:
@@ -213,23 +256,32 @@ class LocomotionSkillDriver:
     def _search_for(self, goal_spec: tuple, start, abilities: ClimbAbilities,
                     avoid: tuple = ()) -> AscentSearch | None:
         kind = goal_spec[0]
-        if kind == "main":
-            target = AscentGoal.main_ground(self.world, start, radius=_MAIN_GROUND_RADIUS)
+        if kind in {"main", "higher"}:
+            target = (AscentGoal.main_ground(self.world, start, radius=_MAIN_GROUND_RADIUS)
+                      if kind == "main" else AscentGoal.higher_ground(
+                          self.world, start, radius=_MAIN_GROUND_RADIUS))
             if target is None:
                 return None
             return AscentSearch(self.world, start, target, abilities, radius=_MAIN_GROUND_RADIUS,
-                                max_expansions=_MAX_PLAN_EXPANSIONS, avoid=avoid)
+                                max_expansions=_MAX_PLAN_EXPANSIONS, avoid=avoid, keep=self.keep)
         if kind == "toward":
             return AscentSearch(self.world, start,
                                 AscentGoal.toward(goal_spec[1], radius=goal_spec[2]),
                                 abilities, radius=24, max_expansions=_MAX_PLAN_EXPANSIONS,
-                                avoid=avoid)
+                                avoid=avoid, keep=self.keep)
         return None
 
     def _begin_search(self, slot: _Slot, observer: PlayerSnapshot, profile, now: float,
                       purpose: str, goal_spec: tuple, *, accept=None,
                       fallback: tuple | None = None, avoid: tuple = ()) -> SkillCommand | None:
         start = node_of(observer.position)
+        if (observer.wade and start[2] < WATER_SUPPORT_Z
+                and not self.world.solid(*start)):
+            # A water hop raises the body above its real support. Its
+            # instantaneous feet cell is air, not a platform from which to
+            # build the first stair. Keep actual placed ledges, otherwise
+            # start from the immutable waterbed beneath this column.
+            start = (start[0], start[1], WATER_SUPPORT_Z)
         abilities = ClimbAbilities.from_observer(observer)
         search = self._search_for(goal_spec, start, abilities, avoid)
         if search is None:
@@ -237,6 +289,7 @@ class LocomotionSkillDriver:
                 return self._begin_search(slot, observer, profile, now, purpose, fallback,
                                           accept=accept, avoid=avoid)
             self._count(f"{purpose}_no_plan")
+            self._failed(slot, now, f"{purpose}_no_plan")
             slot.goal = None
             slot.retry_at = now + 3.0
             return None
@@ -256,6 +309,7 @@ class LocomotionSkillDriver:
                 slot.goal = None
                 slot.retry_at = now + 3.0
                 self._count(f"{pending.purpose}_search_timeout")
+                self._failed(slot, now, f"{pending.purpose}_search_timeout")
             return None
         slot.pending = None
         plan = pending.search.plan
@@ -269,11 +323,28 @@ class LocomotionSkillDriver:
                                       pending.fallback, accept=pending.accept,
                                       avoid=tuple(slot.avoid))
         self._count(f"{pending.purpose}_no_plan")
+        self._failed(slot, now, f"{pending.purpose}_no_plan")
+        self.events.append((round(now, 2), int(observer.player_id), pending.purpose,
+                            "no_plan", 0, 0, "", None, None,
+                            tuple(round(v, 2) for v in observer.position),
+                            bool(observer.grounded), bool(observer.wade)))
+        del self.events[:-64]
         slot.goal = None
-        slot.retry_at = now + 3.0
+        # A strategy order (``climb``) gets its next answer sooner: the
+        # strategy layer reads the failure and may move the body first.
+        slot.retry_at = now + (1.5 if pending.purpose == "climb" else 3.0)
         return None
 
     # -- execution -----------------------------------------------------------
+
+    def adopt(self, observer: PlayerSnapshot, profile: BotProfile | None,
+              plan: AscentPlan, now: float, *, purpose: str) -> SkillCommand | None:
+        """Walk a verified, now committed construction route using normal inputs."""
+        slot = self._slot(observer)
+        if not plan.steps or slot.skill is not None:
+            return None
+        self._start(slot, observer, profile, plan, purpose, now, None)
+        return self.step(observer, profile, now)
 
     def step(self, observer: PlayerSnapshot, profile: BotProfile | None,
              now: float) -> SkillCommand | None:
@@ -289,23 +360,53 @@ class LocomotionSkillDriver:
             slot.skill = None
             return None
         abilities = ClimbAbilities.from_observer(observer)
+        current = skill.current
+        work_progress = False
+        if current is not None:
+            work_key = (current.source, current.destination,
+                        current.dig_cells, current.build_cells)
+            remaining = sum(self.world.solid(*cell) for cell in current.dig_cells)
+            placed = sum(self.world.solid(*cell) for cell in current.build_cells)
+            if slot.progress_work_key == work_key:
+                work_progress = (remaining < slot.progress_dig_remaining
+                                 or placed > slot.progress_build_present)
+            slot.progress_work_key = work_key
+            slot.progress_dig_remaining = remaining
+            slot.progress_build_present = placed
         # Progress watchdog over the whole skill: a step finished, or the body
-        # moved. Afloat it is stricter, so a stuck climb hands the swimmer
-        # back to the shore flow quickly instead of bobbing in place.
+        # moved, or required terrain actually changed. Accepted swings and
+        # replacement plans alone cannot renew it. Partial excavation can.
         if (slot.progress_index != skill.index or slot.progress_position is None
+                or work_progress
                 or math.dist(observer.position[:2], slot.progress_position[:2]) >= 0.75
-                or abs(observer.position[2] - slot.progress_position[2]) >= 1.5):
+                or (observer.grounded
+                    and observer.position[2] <= slot.progress_position[2] - 1.5)):
             slot.progress_index = skill.index
             slot.progress_position = observer.position
             slot.progress_at = now
         limit = _WATER_STALL_SECONDS if observer.wade else _DRY_STALL_SECONDS
         if now - slot.progress_at > limit:
             self._count(f"{skill.purpose}_stalled")
+            stalled_step = skill.current
             self.events.append((round(now, 2), int(observer.player_id), skill.purpose,
-                                "stalled", skill.index, len(skill.plan.steps), "", None, None,
+                                "stalled", skill.index, len(skill.plan.steps),
+                                stalled_step.kind.value if stalled_step else "",
+                                stalled_step.source if stalled_step else None,
+                                stalled_step.destination if stalled_step else None,
                                 tuple(round(v, 2) for v in observer.position),
                                 bool(observer.grounded), bool(observer.wade)))
             del self.events[:-64]
+            # A whole-plan stall is evidence against this physical step too.
+            # Keeping only timeout failures made the next recovery choose the
+            # identical ledge after standing idle for another eight seconds.
+            if skill.current is not None:
+                slot.avoid[skill.current.destination] = now + 20.0
+            self._failed(slot, now, "stalled")
+            # Ordinary routing inherits the time already spent stuck. A new
+            # six-second grace here left a bot on its last constructed ledge
+            # for thirteen seconds before reconsidering the failed climb.
+            slot.anchor = observer.position
+            slot.anchor_at = slot.progress_at
             slot.skill = None
             slot.goal = None
             slot.request = None
@@ -329,7 +430,7 @@ class LocomotionSkillDriver:
             return command
         # Failed: re-plan from where the body actually is.
         slot.failures += 1
-        slot.last_reason = command.reason
+        self._failed(slot, now, command.reason)
         failed_step = skill.current
         self.events.append((round(now, 2), int(observer.player_id), skill.purpose,
                             command.reason, skill.index, len(skill.plan.steps),
@@ -372,17 +473,25 @@ class LocomotionSkillDriver:
         skill_level = float(getattr(profile, "skill", 0.5)) if profile is not None else 0.5
         reaction = float(getattr(profile, "reaction_time", 0.22)) if profile is not None else 0.22
         identity = int(observer.player_id) * 7919 + int(observer.life_id)
+        retrying_without_progress = slot.failures > 0 and slot.progress_position is not None
         slot.skill = LocomotionSkill(
             plan, purpose, now, identity=identity, skill=skill_level,
             reaction=max(0.05, min(0.6, reaction)), step_started_at=now,
             # Backwards bridging is the practised technique; casual players
             # bridge facing forward and looking down at the edge.
             backwards=skill_level >= 0.45,
+            keep=self.keep,
         )
         slot.goal = goal
-        slot.progress_index = -1
-        slot.progress_position = None
-        slot.progress_at = now
+        # A failed plan is not physical progress. Retain its clock across a
+        # retry; otherwise repeated hops and replacement step zeroes can
+        # renew the same blocked climb forever. Actual completed steps,
+        # horizontal travel or a settled higher landing still advance it.
+        slot.progress_index = 0 if retrying_without_progress else -1
+        slot.progress_work_key = None
+        if not retrying_without_progress:
+            slot.progress_position = None
+            slot.progress_at = now
         self._count(f"{purpose}_start")
 
     # -- triggers --------------------------------------------------------------
@@ -545,7 +654,9 @@ class LocomotionSkillDriver:
             return None
         self._count("stuck_considered")
         slot.anchor_at = now
-        main_spec = ("main",) if low_pocket else None
+        # The nearby rim can belong to an isolated plateau rather than the
+        # map's main region. A flat pocket floor is never a climb destination.
+        main_spec = ("higher",) if goal_above else (("main",) if low_pocket else None)
         first = ("toward", tuple(goal), 2.0) if goal_above else main_spec
         if first is None:
             slot.retry_at = now + 4.0
@@ -635,7 +746,7 @@ class LocomotionSkillDriver:
             return None
         return plan_ascent(self.world, start, AscentGoal.toward(request.target, radius=1.5),
                            abilities, radius=24, max_expansions=_MAX_PLAN_EXPANSIONS,
-                           time_budget=0.02)
+                           time_budget=0.02, keep=self.keep)
 
 
 def _same_request(left: SkillRequest | None, right: SkillRequest | None) -> bool:

@@ -1,9 +1,17 @@
 """Zombie siege / pursuit scenarios on a real map with the production worker.
 
 Idle, server-owned survivor bodies are placed on a synthetic structure
-(``pillar``, ``platform``, ``tower``) or on open ground far from the horde
-(``ground``). Zombie bots run through the real director, thread worker,
-motor, physics, combat, dig damage and the server's floating-block collapse.
+(``pillar``, ``platform``, ``tower``, ``fortress``), on a one-block pillar a
+player piled up on a real building roof (``roofpillar``) or against a wall
+on the ground (``wallpillar``; ``--height`` blocks, default 8), or on open
+ground far from the horde (``ground``). Zombie bots run through the real
+director, thread worker, motor, physics, combat, dig damage and the server's
+floating-block collapse, on the real clock.
+
+``--armed`` gives the survivor a rifle and a repair habit (see
+``bot_zombie_horde_scenario._ArmedSurvivor``): one validated shot every
+0.6-0.9 s at the nearest zombie in sight, one missing pillar voxel put back
+every 4 s (at most 20). Zombies he kills respawn on the mode's own timer.
 
 Measured per run:
 
@@ -13,6 +21,9 @@ Measured per run:
   (within 2.5 blocks horizontally, 3+ blocks below), sampled every 0.5 s
 * ``stuck_incidents``  8-second windows in which a zombie moved < 1.5
   blocks while > 3 blocks from every survivor and not clawing terrain
+* ``pile_seconds``  the pile integrated over the run (zombies x seconds)
+* ``survivor_shots`` / ``survivor_hits`` / ``survivor_kills`` / ``repairs``
+  with ``--armed``
 
 ``--baseline`` disables the horde coordinator (the old nearest-survivor
 hunt) for a before/after comparison.
@@ -46,6 +57,19 @@ from server.config import load_config  # noqa: E402
 from server.game_constants import DEFAULT_WEAPON_TOOL  # noqa: E402
 from server.main import BattleSpadesServer  # noqa: E402
 from server.player import Player  # noqa: E402
+
+# The accelerated harness owns the site finders, the player-built pillars and
+# the armed survivor; this script is its real-clock twin.
+from bot_zombie_horde_scenario import (  # noqa: E402
+    STAND,
+    _ArmedSurvivor,
+    _rooftop_site,
+    _street_anchor,
+    _wall_site,
+    build_structure,
+)
+
+PLAYER_PILLARS = ("roofpillar", "wallpillar")
 
 
 class _IdleConnection:
@@ -169,6 +193,8 @@ async def _run(args) -> dict:
             config.revival.enabled = False
         except AttributeError:
             pass
+    if getattr(args, "height", None) is None:
+        args.height = 8
     if args.baseline:
         BotDirector._objectives_zombie_horde = lambda self, mode: []
     server = BattleSpadesServer(config)
@@ -183,11 +209,22 @@ async def _run(args) -> dict:
     deadline = asyncio.get_running_loop().time() + 10.0
     while not director.status().running and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.02)
-    x, y, floor = _flat_site(world, rng)
+    wall_direction = None
+    if args.structure == "roofpillar":
+        x, y, floor = _rooftop_site(world, rng)
+    elif args.structure == "wallpillar":
+        x, y, floor, wall_direction = _wall_site(world, rng)
+    else:
+        x, y, floor = _flat_site(world, rng)
     survivors: list[Player] = []
     built_cells: list = []
     elevated = args.structure != "ground"
-    if elevated:
+    if args.structure in PLAYER_PILLARS:
+        tops, built_cells = build_structure(world, args.structure, x, y, floor,
+                                            height=int(args.height))
+        for tx, ty, tz in tops[: args.survivors]:
+            survivors.append(_spawn_survivor(server, (tx + 0.5, ty + 0.5, tz - STAND)))
+    elif elevated:
         tops, built_cells = _build(world, args.structure, x, y, floor)
         for tx, ty, tz in tops[: args.survivors]:
             survivors.append(_spawn_survivor(server, (tx + 0.5, ty + 0.5, tz - 2.25)))
@@ -203,6 +240,7 @@ async def _run(args) -> dict:
     server.mode.start_time = time.time()
     server.mode.time_limit = 10_000
     zombies = []
+    zombie_start_levels: list[float] = []
     for index in range(args.zombies):
         bot = await director.add_bot(team=ZOMBIE_TEAM, name=f"Zed{index}", difficulty="hard")
         if bot is None:
@@ -210,9 +248,17 @@ async def _run(args) -> dict:
         if elevated:
             angle = rng.uniform(0, 2 * math.pi)
             radius = rng.uniform(14, 24)
+            if wall_direction is not None:
+                # Start on the open side of the wall, like the horde harness.
+                away = math.atan2(-wall_direction[1], -wall_direction[0])
+                angle = away + rng.uniform(-0.6 * math.pi, 0.6 * math.pi)
             zx, zy = x + radius * math.cos(angle), y + radius * math.sin(angle)
             anchor = world.dry_ground_anchor(zx, zy, search=12)
+            if args.structure in PLAYER_PILLARS:
+                anchor = _street_anchor(world, rng, x, y, floor, args.structure,
+                                        wall_direction, anchor)
             bot.set_position(*anchor)
+            zombie_start_levels.append(round(float(anchor[2]), 1))
         zombies.append(bot)
     deadline = asyncio.get_running_loop().time() + 10.0
     while not director.status().running and asyncio.get_running_loop().time() < deadline:
@@ -221,9 +267,17 @@ async def _run(args) -> dict:
 
     supports = {s.id: support_cells(world.get_solid, s.position) for s in survivors}
     start_health = {s.id: s.health for s in survivors}
+    armed = None
+    if args.armed and survivors:
+        armed = _ArmedSurvivor(server, survivors[0], built_cells,
+                               supports.get(survivors[0].id, ()),
+                               random.Random(int(args.seed) * 7919 + 1))
     result = {
         "map": args.map, "structure": args.structure, "zombies": args.zombies,
         "survivors": len(survivors), "baseline": bool(args.baseline), "seed": args.seed,
+        "armed": bool(args.armed), "height": int(args.height),
+        "zombie_start_levels": zombie_start_levels,
+        "survivor_start_z": (round(float(survivors[0].z), 1) if survivors else None),
         "site": (x, y, floor), "collapse_s": None, "first_hit_s": None,
         "first_kill_s": None, "kills": 0, "pile_samples": [], "stuck_incidents": 0,
         "roles": Counter(), "survivor_reach_s": {},
@@ -243,6 +297,8 @@ async def _run(args) -> dict:
         tick_ms.append((time.perf_counter() - started) * 1000.0)
         living = [s for s in survivors
                   if s.alive and s.spawned and int(s.team) == SURVIVOR_TEAM]
+        if armed is not None:
+            armed.tick(t, zombies)
         for s in survivors:
             support = supports.get(s.id)
             if (elevated and support and s.alive and int(s.team) == SURVIVOR_TEAM
@@ -324,6 +380,9 @@ async def _run(args) -> dict:
     samples = result.pop("pile_samples")
     result["pile_mean"] = round(sum(samples) / len(samples), 2) if samples else 0.0
     result["pile_max"] = max(samples) if samples else 0
+    result["pile_seconds"] = round(sum(samples) * 0.5, 1)
+    if armed is not None:
+        result.update(armed.report())
     result["duration_s"] = round(min(args.seconds, steps * tick), 1)
     result["roles"] = dict(result["roles"].most_common(12))
     tick_ms.sort()
@@ -344,8 +403,14 @@ async def _run(args) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--map", default="ArcticBase")
-    parser.add_argument("--structure", choices=("pillar", "platform", "tower", "fortress", "ground"),
+    parser.add_argument("--structure",
+                        choices=("pillar", "platform", "tower", "fortress", "ground",
+                                 "roofpillar", "wallpillar"),
                         default="platform")
+    parser.add_argument("--height", type=int, default=None,
+                        help="roofpillar/wallpillar height in blocks (default 8)")
+    parser.add_argument("--armed", action="store_true",
+                        help="the survivor shoots back (rifle) and repairs his pillar")
     parser.add_argument("--zombies", type=int, default=8)
     parser.add_argument("--survivors", type=int, default=2)
     parser.add_argument("--seconds", type=float, default=120.0)

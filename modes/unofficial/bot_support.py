@@ -45,7 +45,7 @@ def snapshot(mode: FunMode) -> FunState:
             c.hidden, now >= c.available_at,
         ) for c in getattr(mode, "cargo", ())[:32]),
         exit=mode.anchor("exit"), exit_open=getattr(mode, "exit_open", False),
-        stage=getattr(mode, "stage", 0), red=getattr(mode, "red", False),
+        stage=getattr(mode, "stage", 0), wave=getattr(mode, "wave", 0), red=getattr(mode, "red", False),
         light_remaining=max(0.0, getattr(mode, "change_at", now) - now),
         checkpoints=tuple(getattr(mode, "course", ())),
         route=tuple(tuple(p) for p in mode.data.get("bot_route", ())[:128]),

@@ -69,3 +69,14 @@ class BehaviorMemory:
 
     def record(self, kind: str, position: Vector3, now: float, success: bool) -> None:
         self.outcomes.append((kind, position, now, success))
+
+    def preference(self, kind: str, now: float) -> float:
+        """Reuse a successful method, never its coordinates or feasibility.
+
+        Call only after fresh geometry/resource admission. Recent failures
+        reduce preference; site aversion still prevents rebuilding one spot.
+        """
+        evidence = sum((1. if success else -1.5) * max(0., 1. - (now-at) / 120.)
+                       for previous, _site, at, success in self.outcomes
+                       if previous == kind and 0 <= now-at < 120.)
+        return max(-.12, min(.12, evidence * .06))

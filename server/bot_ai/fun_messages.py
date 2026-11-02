@@ -36,6 +36,7 @@ class FunState:
     exit: Vector3 = (0.0, 0.0, 0.0)
     exit_open: bool = False
     stage: int = 0
+    wave: int = 0
     red: bool = False
     light_remaining: float = 0.0
     checkpoints: tuple[Vector3, ...] = ()

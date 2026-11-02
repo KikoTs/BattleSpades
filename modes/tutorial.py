@@ -31,6 +31,7 @@ from shared.packet import (
 from server.announcements import build_localised_overlay
 from server.audio import (
     SND_TUTORIAL_COMPLETE,
+    mode_start_music_enabled,
     play_music_to,
     play_sound_to,
 )
@@ -472,7 +473,8 @@ class TutorialMode(BaseMode):
         session = self._sessions.get(id(player))
         if session is None:
             return
-        play_music_to(connection, "tutorial_music_001")
+        if mode_start_music_enabled(self.server):
+            play_music_to(connection, "tutorial_music_001")
         session.revealed = True
         session.connection = connection
         session.revealed_at = time.monotonic()
@@ -504,7 +506,8 @@ class TutorialMode(BaseMode):
                 and session.connection is not None
                 and now - session.revealed_at >= 1.0
             ):
-                play_music_to(session.connection, "tutorial_music_001")
+                if mode_start_music_enabled(self.server):
+                    play_music_to(session.connection, "tutorial_music_001")
                 session.music_replayed = True
 
             origin_x, _origin_y = self.LANE_ORIGINS[session.lane_index]

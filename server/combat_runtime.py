@@ -2198,7 +2198,16 @@ class CombatSystem:
                     destroyed.append(tuple(cell))
                 elif total > 0.0:
                     damaged.append((tuple(cell), damage))
+        if destroyed or damaged:
+            self._note_terrain_work(player)
         return seed, amount, destroyed, damaged
+
+    @staticmethod
+    def _note_terrain_work(player) -> None:
+        """Credit canonical damage, never an accepted swing into empty air."""
+        if player is not None and bool(getattr(player, "is_bot", False)):
+            player.bot_terrain_work = (time.monotonic(),
+                int(getattr(player, "replication_generation", getattr(player, "deaths", 0))))
 
     def _apply_native_dig(
         self, player, block_pos, positions, damage_type: int, amount: float
@@ -2263,6 +2272,7 @@ class CombatSystem:
             self._queue_canonical_terrain_repair(positions)
             return False
 
+        self._note_terrain_work(player)
         player.add_blocks(len(destroyed_positions))
         # Broadcast the real per-hit amount even on the strike that crosses
         # the threshold. Every client maintains the same 2+2+2 ledger.
@@ -2409,6 +2419,8 @@ class CombatSystem:
                 max_distance,
                 self._distance(origin, self._block_center(block_pos)),
             )
+        self._note_friendly_attention(attacker, origin, direction, max_distance,
+                                      reach_eyes, reach_slack)
         hit = self._find_first_player_hit(attacker, origin, direction, max_distance)
         if hit is None:
             return False
@@ -2441,6 +2453,32 @@ class CombatSystem:
             self._note_player_hit(attacker, headshot)
             self._broadcast_player_hit_feedback(attacker, position)
         return True
+
+    def _note_friendly_attention(self, attacker, origin, direction, max_distance,
+                                 reach_eyes, reach_slack: float) -> None:
+        """A validated friendly melee tap is attention, never a retaliation cue."""
+        bus = getattr(self.server, "bot_stimuli", None)
+        if bus is None or bool(getattr(attacker, "is_bot", False)):
+            return
+        from server.mode_controls import enemies
+        nearest = None
+        for target in self.server.players.values():
+            if (target is attacker or not getattr(target, "is_bot", False)
+                    or not target.alive or not target.spawned
+                    or target.team != attacker.team or enemies(self.server, attacker, target)):
+                continue
+            hit = self._ray_hits_target(origin, direction, max_distance, target)
+            if hit is not None and (nearest is None or hit[0] < nearest[0]):
+                nearest = hit[0], target, hit[1]
+        if nearest is None or not self._within_eye_reach(
+                reach_eyes, nearest[2], float(MELEE_RANGE) + MELEE_EYE_SLACK + reach_slack):
+            return
+        from server.bot_ai.messages import StimulusKind
+        target = nearest[1]
+        bus.publish(StimulusKind.FRIENDLY_ATTENTION, tuple(attacker.position),
+                    source_id=int(attacker.id), team=int(attacker.team), radius=8,
+                    lifetime=1.5, target_id=int(target.id),
+                    target_life_id=int(getattr(target, "replication_generation", getattr(target, "deaths", 0))))
 
     def _within_eye_reach(self, eyes, point, reach: float) -> bool:
         """Is ``point`` within ``reach`` of any server-simulated eye?
@@ -2595,6 +2633,8 @@ class CombatSystem:
                 attacker, block_pos, damage, damage_type=damage_type,
                 causer_id=causer_id,
             )
+        if total > 0.0 or destroyed:
+            self._note_terrain_work(attacker)
         return total > 0.0
 
     # Block damage/removal wire contract (DECOMPILED from gameScene.pyd,

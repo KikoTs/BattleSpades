@@ -97,6 +97,7 @@ def test_end_sequence_emits_music_stats_and_restarts(monkeypatch):
 
     async def scenario():
         srv = _Server()
+        srv.config = SimpleNamespace(mode_start_music=True)
         mode = _Mode(srv)
         await mode.on_mode_start()
         srv.broadcast_packets.clear()      # drop the round-start music

@@ -64,6 +64,7 @@ class ZombiePhase(Enum):
 class ZombieMode(BaseMode):
     survivor_class_order = _SURVIVOR_CLASS_ORDER
     survivor_classes = _SURVIVOR_CLASSES
+    default_survivor_class = int(C.CLASS_SOLDIER)
     normalize_survivor_selection = staticmethod(normalize_class_selection)
 
     generic_scoring_enabled = False
@@ -103,6 +104,12 @@ class ZombieMode(BaseMode):
         self.zombie_respawn_time = max(0.0, float(overlay.get(
             "zombie_respawn_time", 10.0
         )))
+        # A killed BOT zombie comes back at a street-level spot 40-56 blocks
+        # from the nearest survivor that no survivor can see, when the map
+        # offers one; otherwise at the team spawn like a human zombie. The
+        # walk back from the stock spawn (110 blocks on London) left the
+        # survivors half a minute of nothing between waves.
+        self.bot_respawn_near_action = bool(overlay.get("bot_respawn_near_action", True))
         # Normal combat deaths create graves. Infection and administrative
         # team/class transitions use the grave-free corpse cleanup path.
         self.death_representation = "grave"
@@ -401,7 +408,7 @@ class ZombieMode(BaseMode):
             return self._zombie_selection()
         class_id = int(selection.class_id)
         if class_id not in self.survivor_classes:
-            class_id = int(C.CLASS_SOLDIER)
+            class_id = self.default_survivor_class
         return self.normalize_survivor_selection(
             class_id,
             selection.loadout,
@@ -420,7 +427,8 @@ class ZombieMode(BaseMode):
         if int(team) != ZOMBIE_TEAM:
             if int(selection.class_id) in self.survivor_classes:
                 return selection
-            return self.normalize_survivor_selection(int(C.CLASS_SOLDIER))
+            # Never let a bot spawn a human with a zombie/mode-only kit.
+            return self.normalize_survivor_selection(self.default_survivor_class)
         return self._zombie_selection(int(C.CLASS_ZOMBIE))
 
     def allows_class_selection(self, player: Player, selection: ClassSelection) -> bool:
@@ -516,7 +524,37 @@ class ZombieMode(BaseMode):
         infection_spawn = self.take_transition_spawn_point(player)
         if infection_spawn is not None:
             return infection_spawn
+        near = self._bot_zombie_respawn(player)
+        if near is not None:
+            return near
         return tuple(float(value) for value in super().get_spawn_point(player))
+
+    def _bot_zombie_respawn(self, player: Player) -> tuple[float, float, float] | None:
+        """A hidden street-level spot near the fight for a returning bot zombie."""
+
+        if (not self.bot_respawn_near_action or not bool(getattr(player, "is_bot", False))
+                or int(player.team) != ZOMBIE_TEAM or self.phase is not ZombiePhase.ACTIVE):
+            return None
+        world = getattr(self.server, "world_manager", None)
+        solid = getattr(world, "get_solid", None)
+        height = getattr(world, "get_height", None)
+        if not callable(solid) or not callable(height):
+            return None
+        survivors = [tuple(float(v) for v in p.position) for p in self._living_survivors()]
+        if not survivors:
+            return None
+        try:
+            from server.bot_ai.horde_strategy import bot_respawn_spot
+
+            water = getattr(world, "is_water_column", None)
+            spot = bot_respawn_spot(solid, height, water if callable(water) else None,
+                                    survivors, random.random())
+        except Exception:
+            logger.exception("bot zombie respawn spot failed; using the team spawn")
+            return None
+        if spot is None:
+            return None
+        return (float(spot[0]), float(spot[1]), float(spot[2]))
 
     def configure_state_data(self, packet) -> None:
         packet.team1_name = _ZOMBIE_TEAM_NAME_ID
@@ -735,7 +773,8 @@ class ZombieMode(BaseMode):
                     getattr(player, "ugc_tools", ()) or (),
                 )
             else:
-                selection = self.normalize_survivor_selection(int(C.CLASS_SOLDIER))
+                # A zombie's hand/prefab kit is not a human loadout.
+                selection = self.normalize_survivor_selection(self.default_survivor_class)
         player.apply_class_selection(selection)
         pending = getattr(player, "pending_selection", None)
         if (

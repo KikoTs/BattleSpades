@@ -116,8 +116,15 @@ def test_held_look_drops_old_angular_momentum_before_travel_resumes(planning_wai
     assert state.motor.pitch_velocity == state.motor.yaw_velocity == 0.
     state.intent = replace(wait, frame_id=2, debug_role="team_assault_enemy_side",
                            look=LookIntent((bot.eye_x + 6., bot.eye_y, bot.eye_z)))
-    director._apply_motor(state, now + .1, .1)
     # AncientEgypt trace bot7 previously jumped from -1.8 to -14.1 degrees
-    # after planning_wait because the old breach's velocity resumed.
-    assert held_pitch < state.motor.pitch <= 0.
-    assert state.motor.yaw == pytest.approx(held_yaw)
+    # after planning_wait because the old breach's velocity resumed. A small
+    # travel correction may wait for the anti-jitter dwell, but the stopped
+    # momentum must never return and the new look must then make progress.
+    pitches = [held_pitch]
+    for tick in range(1, 5):
+        director._apply_motor(state, now + tick * .1, .1)
+        pitches.append(state.motor.pitch)
+        assert held_pitch <= state.motor.pitch <= 0.
+        assert state.motor.yaw == pytest.approx(held_yaw)
+    assert pitches[-1] > held_pitch
+    assert all(a <= b for a, b in zip(pitches, pitches[1:]))

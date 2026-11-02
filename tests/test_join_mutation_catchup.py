@@ -658,6 +658,7 @@ def test_reveal_starts_join_music_and_ambience_before_terrain_catch_up():
     from shared.packet import PlayMusic, PlaySound
 
     server = BattleSpadesServer(ServerConfig())
+    server.config.mode_start_music = True
     server.world_manager.generate_flat_map()
     joiner = RecordingConnection(in_game=False)
     joiner.server = server
@@ -685,3 +686,16 @@ def test_reveal_starts_join_music_and_ambience_before_terrain_catch_up():
     joiner.in_game = False
     server.reveal_world_to(joiner)
     assert PlayMusic.id not in [data[0] for data in joiner.sent[before:]]
+
+
+def test_default_join_keeps_ambience_but_cannot_start_a_mode_track():
+    server = BattleSpadesServer(ServerConfig())
+    server.world_manager.generate_flat_map()
+    server.mode = SimpleNamespace(join_music_track=lambda: "game_ending_001")
+    joiner = RecordingConnection(in_game=True)
+    joiner.server = server
+    joiner.player = Player(9, "Joining", TEAM1, C.RIFLE_TOOL, joiner)
+    server._send_join_audio(joiner)
+    ids = [data[0] for data in joiner.sent]
+    assert 26 not in ids
+    assert 22 in ids
