@@ -170,7 +170,7 @@ def test_ancient_egypt_ugc_owns_vip_spawns_and_all_nine_crates():
         (int(C.HEALTH_CRATE), "health"),
         (int(C.HEALTH_CRATE), "health"),
     ]
-    assert [(entity.x, entity.y, entity.z) for entity in vip.entities] == pytest.approx([
+    expected_crates = [
         (288.457, 264.452, 217.75),
         (139.45, 261.548, 229.749),
         (15.519, 258.545, 233.742),
@@ -180,7 +180,12 @@ def test_ancient_egypt_ugc_owns_vip_spawns_and_all_nine_crates():
         (293.453, 201.452, 214.742),
         (139.45, 199.452, 228.741),
         (15.478, 201.536, 233.748),
-    ])
+    ]
+    crate_positions = [(entity.x, entity.y, entity.z) for entity in vip.entities]
+    # pytest.approx rejects nested sequences on newer pytest releases.
+    assert len(crate_positions) == len(expected_crates)
+    for actual, expected in zip(crate_positions, expected_crates):
+        assert actual == pytest.approx(expected)
 
     # AncientEgypt currently runs in TDM, so it needs the same authored zones
     # there as in VIP. Crates remain common to all modes.

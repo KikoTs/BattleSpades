@@ -418,11 +418,15 @@ def test_ctf_rebuild_after_removal_repeats_visual_set_position(
     assert (entity.x, entity.y, entity.z) == pytest.approx(
         (raised[0], raised[1], float(GROUND - 2))
     )
-    assert moves == pytest.approx([
+    expected_moves = [
         (entity_id, raised[0], raised[1], float(GROUND - 2)),
         (entity_id, settled[0], settled[1], float(GROUND)),
         (entity_id, raised[0], raised[1], float(GROUND - 2)),
-    ])
+    ]
+    # pytest.approx rejects nested sequences on newer pytest releases.
+    assert len(moves) == len(expected_moves)
+    for actual, expected in zip(moves, expected_moves):
+        assert actual == pytest.approx(expected)
     assert creates == []
     assert destroys == []
 

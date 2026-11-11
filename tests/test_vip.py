@@ -5,6 +5,8 @@ import sys
 import time
 from types import SimpleNamespace
 
+import pytest
+
 sys.modules.setdefault("toml", SimpleNamespace(load=lambda *a, **k: {}))
 
 import shared.constants as C  # noqa: E402
@@ -500,3 +502,105 @@ def test_live_vip_kill_bonus_is_separate_from_enemy_vip_percentage():
         int(C.SCORE_REASON.VIP_KILL_SCORE_REASON),
         int(C.SCORE_REASON.VIP_KILLENEMYVIP_SCORE_REASON),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Admin /time (Zockparadies VIP report, 2026-11-11): "/time 15" made every
+# later sub-round 15 s until a server restart, and on the 2026-10-15 image the
+# shortened clock also opened BaseMode's map ballot mid-match.
+# ---------------------------------------------------------------------------
+
+async def _time_command(server, value, replies):
+    import commands.server_commands as server_cmds
+    from commands.command_handler import CommandContext
+
+    async def capture(_server, _player, message):
+        replies.append(message)
+
+    original = server_cmds.send_message
+    server_cmds.send_message = capture
+    try:
+        await server_cmds.cmd_time(CommandContext(
+            server=server, player=SimpleNamespace(name="admin"),
+            args=[value], raw_args=value,
+        ))
+    finally:
+        server_cmds.send_message = original
+
+
+def test_admin_time_shortens_only_the_current_vip_subround(monkeypatch):
+    clock = [10_000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    server, mode = _new_mode()
+    ballots = []
+    server.vote_manager = SimpleNamespace(
+        active=False,
+        next_map=None,
+        ensure_map_vote=lambda now: ballots.append(now) or True,
+        ensure_round_end_map_vote=lambda now: ballots.append(now) or True,
+    )
+    _player(server, 1, TEAM1)
+    _player(server, 2, TEAM2)
+    configured = mode.time_limit
+    assert configured > 60
+
+    async def scenario():
+        replies = []
+        await mode.on_tick(1)
+        assert mode.phase is VIPPhase.ACTIVE
+        clock[0] += 30.0
+        await _time_command(server, "15", replies)
+        assert mode.countdown_seconds_remaining() == pytest.approx(15.0)
+        assert "0:15" in replies[-1] and "/time 15m" in replies[-1]
+
+        for tick in range(2, 2 + 14):
+            clock[0] += 1.0
+            await mode.on_tick(tick)
+        assert mode.rounds_played == 0 and ballots == []
+        clock[0] += 1.5
+        await mode.on_tick(20)
+        assert mode.rounds_played == 1
+        # A finished sub-round is not a finished match: no map ballot.
+        assert ballots == [] and not mode.ended
+
+        await mode._round_task
+        await mode.on_tick(21)  # drain the bounded sub-round respawns
+        await mode.on_tick(22)
+        assert mode.phase is VIPPhase.ACTIVE
+        assert mode.time_limit == configured
+        assert mode.countdown_seconds_remaining() == pytest.approx(configured)
+
+        # A later sub-round does not end after 15 s any more.
+        clock[0] += 20.0
+        await mode.on_tick(23)
+        assert mode.rounds_played == 1
+
+    asyncio.run(scenario())
+
+
+def test_admin_time_override_does_not_survive_a_same_map_restart(monkeypatch):
+    clock = [20_000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    server, mode = _new_mode()
+    configured = mode.time_limit
+
+    async def scenario():
+        await _time_command(server, "15", [])
+        assert mode.countdown_seconds_remaining() == pytest.approx(15.0)
+        # restart_round / a failed voted-map preflight reuse this instance.
+        await mode._restart_round()
+        assert mode.time_limit == configured
+
+    asyncio.run(scenario())
+
+
+def test_admin_time_moves_a_running_sudden_death_deadline(monkeypatch):
+    server, mode = _new_mode()
+    _player(server, 1, TEAM1)
+    _player(server, 2, TEAM2)
+    asyncio.run(mode.on_tick(1))
+    mode._subround_deadline = time.monotonic() + 50.0
+
+    asyncio.run(_time_command(server, "2m", []))
+
+    assert mode.countdown_seconds_remaining() == pytest.approx(120.0, abs=1.0)

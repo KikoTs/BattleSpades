@@ -253,38 +253,96 @@ async def cmd_fog(ctx: CommandContext):
     await send_message(ctx.server, ctx.player, f"Fog color set to ({r}, {g}, {b})")
 
 
+# Upper bound for an admin round clock: one day keeps float maths and the
+# HUD's m:ss display sane while covering any real event.
+_MAX_ROUND_SECONDS = 86_400
+
+
+def parse_round_time(text: str) -> int | None:
+    """``90`` / ``90s`` / ``15m`` / ``1h`` / ``14:30`` -> seconds, else None.
+
+    A bare number stays seconds (the historical /time unit); a suffix or
+    ``m:ss`` makes minutes explicit.
+    """
+    value = str(text).strip().lower()
+    seconds: int | None = None
+    if ":" in value:
+        minutes, _, secs = value.partition(":")
+        if minutes.isdigit() and secs.isdigit() and len(secs) == 2 and int(secs) < 60:
+            seconds = int(minutes) * 60 + int(secs)
+    else:
+        units = {"s": 1, "m": 60, "h": 3600}
+        if value[-1:] in units and value[:-1].isdigit():
+            seconds = int(value[:-1]) * units[value[-1]]
+        elif value.isdigit():
+            seconds = int(value)
+    if seconds is None or seconds > _MAX_ROUND_SECONDS:
+        return None
+    return seconds
+
+
+def _clock_text(seconds: float) -> str:
+    whole = max(0, int(seconds))
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 @register_command(
     name="time",
     admin_only=True,
-    usage="/time [seconds]",
-    description="Show or set remaining time",
+    usage="/time [seconds | 90s | 15m | 1h | m:ss]",
+    description="Show or set the current round's remaining time",
 )
 async def cmd_time(ctx: CommandContext):
-    """Show/set time."""
-    if ctx.server.mode:
-        if ctx.args:
-            try:
-                seconds = int(ctx.args[0])
-                if seconds < 0:
-                    raise ValueError
-                ctx.server.mode.time_limit = seconds
-                ctx.server.mode.start_time = time.time()
-                ctx.server.mode.elapsed_time = 0.0
-                await send_message(ctx.server, ctx.player, 
-                                   f"Time remaining set to {seconds} seconds")
-            except ValueError:
-                await send_message(ctx.server, ctx.player, "Invalid time value")
-        else:
-            remaining = max(
-                0.0,
-                ctx.server.mode.time_limit - ctx.server.mode.elapsed_time,
-            )
-            minutes = int(remaining) // 60
-            seconds = int(remaining) % 60
-            await send_message(ctx.server, ctx.player, 
-                               f"Time remaining: {minutes}:{seconds:02d}")
-    else:
+    """Show/set the CURRENT round's remaining time.
+
+    The override never rewrites a mode's configured limit: the next round
+    (VIP sub-round, Zombie outbreak, same-map restart, new map) uses the
+    configured clock again (BaseMode.set_remaining_time).
+    """
+    mode = ctx.server.mode
+    if not mode:
         await send_message(ctx.server, ctx.player, "No active game mode")
+        return
+    if ctx.args:
+        seconds = parse_round_time(ctx.args[0])
+        if seconds is None:
+            await send_message(
+                ctx.server, ctx.player,
+                "Invalid time. Examples: /time 90 (seconds), /time 15m, /time 14:30",
+            )
+            return
+        setter = getattr(mode, "set_remaining_time", None)
+        if callable(setter):
+            setter(seconds)
+        else:
+            # Duck-typed plugin modes without the BaseMode hook.
+            mode.time_limit = seconds
+            mode.start_time = time.time()
+            mode.elapsed_time = 0.0
+        message = (
+            f"This round now has {_clock_text(seconds)} left; "
+            "later rounds use the configured time limit"
+        )
+        if ctx.args[0].strip().isdigit() and seconds < 60:
+            message += f" (a bare number is seconds: use /time {seconds}m for minutes)"
+        await send_message(ctx.server, ctx.player, message)
+        return
+    countdown = getattr(mode, "countdown_seconds_remaining", None)
+    remaining = (
+        float(countdown(time.time()))
+        if callable(countdown)
+        else float(mode.time_limit) - float(mode.elapsed_time)
+    )
+    if float(getattr(mode, "time_limit", 0) or 0) <= 0 and remaining <= 0:
+        await send_message(ctx.server, ctx.player, "This round has no time limit")
+        return
+    await send_message(
+        ctx.server, ctx.player, f"Time remaining: {_clock_text(remaining)}"
+    )
 
 
 @register_command(

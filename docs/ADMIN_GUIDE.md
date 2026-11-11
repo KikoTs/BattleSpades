@@ -879,7 +879,10 @@ Admin commands are:
 - `/restart`, `/endround [team]`, `/say <message>`
   (`/map`, `/mode`, `/restart` and `/endround` are refused in the Map
   Creator and Tutorial sessions, which own their map and mode)
-- `/fog <r> <g> <b>`, `/time [seconds]`, `/balance`
+- `/fog <r> <g> <b>`, `/time [seconds | 90s | 15m | 1h | m:ss]`, `/balance`
+  (`/time` changes only the current round's remaining time — in VIP the
+  current sub-round, in Zombie the current outbreak; the next round uses the
+  configured limit again. A bare number is seconds.)
 - `/netcode [selfrow on|off] [offset n] [interval n]` (diagnostics only)
 - `/bots status|fill n|add n [team]|remove n|name|all|difficulty ...|debug ...`
 - `/roompassword` (player-hosted rooms only; see above)

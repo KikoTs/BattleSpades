@@ -679,6 +679,8 @@ class ZombieMode(BaseMode):
         selected = random.sample(pool, count)
         self.phase = ZombiePhase.ACTIVE
         self.infection_deadline = None
+        # Each outbreak is a new round: drop a previous round's /time override.
+        self.restore_configured_time_limit()
         self.start_time = now
         self.elapsed_time = 0.0
         self._timeout_music_played = False

@@ -57,6 +57,9 @@ class BaseMode(ABC):
         # Round timing
         self.start_time: float = 0.0
         self.elapsed_time: float = 0.0
+        # Configured clock saved by an admin /time override of the current
+        # round only; the next round start restores it (None = no override).
+        self._configured_time_limit: Optional[float] = None
         # Fixed remainder of accepted events at the first timeout check.
         # Later arrivals must not extend the deadline or change its winner.
         self._timeout_events_remaining: int | None = None
@@ -90,6 +93,9 @@ class BaseMode(ABC):
         self.winner = None
         self._timeout_music_played = False
         self._end_sequence_running = False
+        # A /time override belonged to the previous round only; a same-map
+        # restart reuses this instance and must get the configured clock.
+        self.restore_configured_time_limit()
         self.start_time = time.time()
         self.elapsed_time = 0.0
         self._timeout_events_remaining = None
@@ -230,6 +236,42 @@ class BaseMode(ABC):
         else:
             self._timeout_events_remaining = None
     
+    def set_remaining_time(self, seconds: float) -> None:
+        """Give only the CURRENT round ``seconds`` of remaining play (/time).
+
+        The round keeps its start time; its limit becomes "elapsed so far +
+        ``seconds``". The configured limit is saved and restored at the next
+        round start, so the override can never shorten or lengthen later
+        rounds (a same-map restart reuses this mode instance).
+        """
+        import time
+
+        seconds = max(0.0, float(seconds))
+        if getattr(self, "_configured_time_limit", None) is None:
+            self._configured_time_limit = self.time_limit
+        elapsed = max(0.0, time.time() - self.start_time) if self.started else 0.0
+        self.elapsed_time = elapsed
+        self.time_limit = elapsed + seconds
+        self._timeout_events_remaining = None
+        self._countdown_fired.clear()
+        self._countdown_last_remaining = float("inf")
+        from server.audio import TIMEOUT_MUSIC_SECONDS
+
+        if self._timeout_music_played and seconds > TIMEOUT_MUSIC_SECONDS:
+            # Extended out of the final minute: back to the gameplay bed so
+            # the finale cue can play again when the new deadline nears.
+            from server.audio import play_gameplay_music
+
+            self._timeout_music_played = False
+            play_gameplay_music(self.server)
+
+    def restore_configured_time_limit(self) -> None:
+        """Undo a /time override; called wherever a new round's clock starts."""
+        configured = getattr(self, "_configured_time_limit", None)
+        if configured is not None:
+            self.time_limit = configured
+            self._configured_time_limit = None
+
     async def on_round_start(self):
         """Called when a new round starts."""
         pass

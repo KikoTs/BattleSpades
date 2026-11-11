@@ -294,7 +294,9 @@ def test_class_multipliers_scale_damage_taken():
     assert R.victim_damage_multiplier(scout, headshot=True) == pytest.approx(1.43 * 1.5)
     assert R.victim_damage_multiplier(miner, headshot=True) == pytest.approx(1.1765 * 0.5)
     assert R.victim_damage_multiplier(builder) == 0.0
-    assert R.victim_damage_multiplier(zombie) == pytest.approx(0.6)
+    # b89f7f4 (2026-11-02): approved wiki-aligned tuning, 100 HP / 0.5 = 200
+    # effective HP (retail constants carried 0.6).
+    assert R.victim_damage_multiplier(zombie) == pytest.approx(0.5)
 
 
 def test_flying_rocketeer_pack_doubles_damage_taken():

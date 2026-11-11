@@ -229,12 +229,26 @@ class VIPMode(BaseMode):
             from server.audio import play_gameplay_music
 
             play_gameplay_music(self.server)
+        # An admin /time override covered one sub-round only. Without this a
+        # "/time 15" made every later sub-round 15 s until a server restart.
+        self.restore_configured_time_limit()
         self.start_time = time.time()
         self.elapsed_time = 0.0
         self._timeout_events_remaining = None
         self._timeout_music_played = False
         self._countdown_fired.clear()
         self._countdown_last_remaining = float("inf")
+
+    def set_remaining_time(self, seconds: float) -> None:
+        """/time sets the current sub-round's clock, never the configured one.
+
+        ``time_limit`` is the per-sub-round length here; BaseMode saves and
+        restores it. A sudden-death cap owns the countdown while it is set,
+        so move that deadline as well.
+        """
+        super().set_remaining_time(seconds)
+        if self._subround_deadline is not None:
+            self._subround_deadline = time.monotonic() + max(0.0, float(seconds))
 
     async def _end_by_time(self) -> None:
         """Time ran out in one VIP sub-round; do not end the whole match."""

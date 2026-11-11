@@ -519,3 +519,58 @@ def test_admin_password_is_redacted_from_command_log(
     assert player.admin is True
     assert "long-enough-secret" not in caplog.text
     assert "<redacted>" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("90", 90), ("90s", 90), ("15m", 900), ("1h", 3600), ("14:30", 870),
+     ("0", 0), (" 15M ", 900)],
+)
+def test_time_parses_explicit_units(text, seconds):
+    assert server_cmds.parse_round_time(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["", "abc", "-5", "1.5", "1:75", "1:5", "25h", "m"])
+def test_time_rejects_ambiguous_or_huge_values(text):
+    assert server_cmds.parse_round_time(text) is None
+
+
+def test_time_override_lasts_one_round_on_a_real_mode(captured, tmp_path, monkeypatch):
+    from modes.base_mode import BaseMode
+
+    clock = [1_000.0]
+    monkeypatch.setattr(server_cmds.time, "time", lambda: clock[0])
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    mode = BaseMode(server)
+    mode.time_limit = 1200
+    mode.started = True
+    mode.start_time = 1_000.0
+    server.mode = mode
+    adminp = FakePlayer("Admin", admin=True)
+    clock[0] = 1_900.0  # 15 minutes into a 20-minute round
+
+    run(server_cmds.cmd_time(ctx(server, adminp, "15m")))
+
+    assert mode.time_limit - (clock[0] - mode.start_time) == 900
+    assert mode.start_time == 1_000.0  # the round keeps its real start
+    assert captured[-1] == (
+        "Admin",
+        "This round now has 15:00 left; later rounds use the configured time limit",
+    )
+
+    run(server_cmds.cmd_time(ctx(server, adminp)))
+    assert captured[-1] == ("Admin", "Time remaining: 15:00")
+
+    mode.restore_configured_time_limit()  # what every new round start does
+    assert mode.time_limit == 1200
+
+
+def test_time_rejects_garbage_without_touching_the_clock(captured, tmp_path):
+    server = FakeServer(BanManager(str(tmp_path / "bans.json")))
+    server.mode = type("Mode", (), {"time_limit": 1200, "elapsed_time": 5.0, "start_time": 1.0})()
+    adminp = FakePlayer("Admin", admin=True)
+
+    run(server_cmds.cmd_time(ctx(server, adminp, "soon")))
+
+    assert server.mode.time_limit == 1200
+    assert "Invalid time" in captured[-1][1]
