@@ -88,6 +88,7 @@ async def cmd_kill(ctx: CommandContext):
 
 @register_command(
     name="team",
+    aliases=["t"],
     usage="/team <blue|green|spectator> [command ...]",
     description="Change your team; admins and spectators can also give a team's bots a command",
 )

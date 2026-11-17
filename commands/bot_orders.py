@@ -17,13 +17,22 @@ from .command_handler import CommandContext, register_command, send_message
 _USAGE_TAIL = " [bot name ...]"
 _ACTION_LIST = "follow, hold, attack, defend, protect, escort, free"
 
-# Every spelling /split accepts for an action, to the order it means.
+# Every spelling of an action (in /split and /team), to the order it means:
+# the long name, its aliases, and the short form (fo ho at de pr es fr).
 ACTIONS = {
-    "follow": "follow", "hold": "hold", "stay": "hold", "attack": "attack",
-    "assault": "attack", "defend": "defend", "protect": "protect",
-    "protectintel": "protect", "escort": "escort",
-    "free": "free", "resume": "free", "release": "free",
+    "follow": "follow", "fo": "follow",
+    "hold": "hold", "stay": "hold", "ho": "hold",
+    "attack": "attack", "assault": "attack", "at": "attack",
+    "defend": "defend", "de": "defend",
+    "protect": "protect", "protectintel": "protect", "pr": "protect",
+    "escort": "escort", "es": "escort",
+    "free": "free", "resume": "free", "release": "free", "fr": "free",
 }
+# Spellings of the /team <color> status and split commands.
+_STATUS_NAMES = ("status", "orders", "st")
+_SPLIT_NAMES = ("split", "sp")
+# /team's team argument: b = blue, g = green, a = all.
+_ALL_NAMES = ("all", "a")
 
 
 async def _target(ctx: CommandContext, team: int | None):
@@ -112,31 +121,31 @@ async def run_split(ctx: CommandContext, args, team: int | None = None,
     await _say(ctx, message, label)
 
 
-@register_command(name="follow", usage="/follow" + _USAGE_TAIL,
+@register_command(name="follow", aliases=["fo"], usage="/follow" + _USAGE_TAIL,
                   description="Your team's bots follow you")
 async def cmd_follow(ctx: CommandContext):
     await run_order(ctx, "follow", ctx.args)
 
 
-@register_command(name="hold", aliases=["stay"], usage="/hold" + _USAGE_TAIL,
+@register_command(name="hold", aliases=["stay", "ho"], usage="/hold" + _USAGE_TAIL,
                   description="Bots hold the spot where they stand")
 async def cmd_hold(ctx: CommandContext):
     await run_order(ctx, "hold", ctx.args)
 
 
-@register_command(name="attack", aliases=["assault"], usage="/attack" + _USAGE_TAIL,
+@register_command(name="attack", aliases=["assault", "at"], usage="/attack" + _USAGE_TAIL,
                   description="Bots push the enemy objective, or hunt the nearest enemy")
 async def cmd_attack(ctx: CommandContext):
     await run_order(ctx, "attack", ctx.args)
 
 
-@register_command(name="defend", usage="/defend" + _USAGE_TAIL,
+@register_command(name="defend", aliases=["de"], usage="/defend" + _USAGE_TAIL,
                   description="Bots guard your team's base or intel")
 async def cmd_defend(ctx: CommandContext):
     await run_order(ctx, "defend", ctx.args)
 
 
-@register_command(name="protect", aliases=["protectintel"],
+@register_command(name="protect", aliases=["protectintel", "pr"],
                   usage="/protect [intel] [bot name ...]",
                   description="Bots guard your intel, hunt its thief, and escort your carrier")
 async def cmd_protect(ctx: CommandContext):
@@ -144,25 +153,33 @@ async def cmd_protect(ctx: CommandContext):
     await run_order(ctx, "protect", names)
 
 
-@register_command(name="escort", usage="/escort" + _USAGE_TAIL,
+@register_command(name="escort", aliases=["es"], usage="/escort" + _USAGE_TAIL,
                   description="Bots escort your team's intel carrier, else you")
 async def cmd_escort(ctx: CommandContext):
     await run_order(ctx, "escort", ctx.args)
 
 
-@register_command(name="free", aliases=["resume", "release"], usage="/free" + _USAGE_TAIL,
+@register_command(name="free", aliases=["resume", "release", "fr"], usage="/free" + _USAGE_TAIL,
                   description="Release bots from orders; they play normally again")
 async def cmd_free(ctx: CommandContext):
     await run_order(ctx, "free", ctx.args)
 
 
-@register_command(name="status", aliases=["orders"], usage="/status" + _USAGE_TAIL,
-                  description="Show each of your team's bots: its order, split half and what it is doing")
+@register_command(name="status", aliases=["orders", "st"], usage="/status" + _USAGE_TAIL,
+                  description="Show each of your team's bots (both teams for spectators): order, split half, what it is doing")
 async def cmd_status(ctx: CommandContext):
+    if getattr(ctx.player, "team", None) not in (TEAM1, TEAM2):
+        # A spectator is on no team, so show both. It is read-only, so it needs
+        # no permission (unlike ordering with /team <color> <command>).
+        if await _target(ctx, TEAM1) is None:
+            return
+        for each in (TEAM1, TEAM2):
+            await run_status(ctx, ctx.args, each, team_label(ctx.server, each))
+        return
     await run_status(ctx, ctx.args)
 
 
-@register_command(name="split", usage="/split <action> [<action>]" + _USAGE_TAIL,
+@register_command(name="split", aliases=["sp"], usage="/split <action> [<action>]" + _USAGE_TAIL,
                   description="Split bots in two: one action keeps half their orders, two actions split the team")
 async def cmd_split(ctx: CommandContext):
     await run_split(ctx, ctx.args)
@@ -181,7 +198,8 @@ def team_tokens(server) -> dict[str, int]:
     """
 
     config = getattr(server, "config", None)
-    tokens = {"team1": TEAM1, "team2": TEAM2, str(TEAM1): TEAM1, str(TEAM2): TEAM2}
+    tokens = {"team1": TEAM1, "team2": TEAM2, str(TEAM1): TEAM1, str(TEAM2): TEAM2,
+              "b": TEAM1, "g": TEAM2}
     for team, attr in ((TEAM1, "team1_name"), (TEAM2, "team2_name")):
         name = str(getattr(config, attr, "") or "")
         if name:
@@ -215,7 +233,7 @@ async def team_command(ctx: CommandContext) -> None:
 
     server, player = ctx.server, ctx.player
     token = ctx.args[0].lower()
-    everyone = token == "all"
+    everyone = token in _ALL_NAMES
     team = None if everyone else team_tokens(server).get(token)
     if team is None and not everyone:
         await send_message(server, player,
@@ -240,10 +258,10 @@ async def team_command(ctx: CommandContext) -> None:
 
         async def runner(target_team, label):
             await run_order(ctx, action, rest, target_team, label)
-    elif command in ("status", "orders"):
+    elif command in _STATUS_NAMES:
         async def runner(target_team, label):
             await run_status(ctx, rest, target_team, label)
-    elif command == "split":
+    elif command in _SPLIT_NAMES:
         async def runner(target_team, label):
             await run_split(ctx, rest, target_team, label)
     else:

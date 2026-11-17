@@ -15,7 +15,7 @@ none, every bot on your team obeys.
 | `/escort [bot ...]` | | Escort the friendly carrier of the enemy intel, else you. Never splits, even when our intel is stolen. |
 | `/free [bot ...]` | `/resume`, `/release` | Release the bots; they play normally again. |
 | `/split <action> [<action>] [bot ...]` | | Split bots between two actions. See below. |
-| `/status [bot ...]` | `/orders` | One line per bot: its order, its `/split` half if any, and what it is doing right now. |
+| `/status [bot ...]` | `/orders` | One line per bot: its order, its `/split` half if any, and what it is doing right now. Players see their own team; **spectators see both teams**, labeled (read-only, so no permission is needed). `/team <color> status` shows one team and `/team all status` both. |
 
 A bot that carries intel always takes it home first, whatever it was ordered.
 The carrier is found from the intel objective, which follows its holder, so an
@@ -53,6 +53,38 @@ hunt the thief):
 - A bot that is itself carrying the intel goes home and takes no job.
 - When the carrier drops or dies, the jobs are dropped and every attacker pushes the
   intel again. A later carrier gets a fresh, deterministic split.
+
+## Short forms
+
+Every command and argument has a short form. They work as top-level commands (`/ho`,
+`/at rex`, `/st`), as the action arguments of `/split`, and as the command and team
+arguments of `/team`, in any case and in any mix of long and short.
+
+| Command | Short | Other aliases |
+| --- | --- | --- |
+| `/team` | `/t` | |
+| `/split` | `/sp` | |
+| `/follow` | `/fo` | |
+| `/hold` | `/ho` | `/stay` |
+| `/attack` | `/at` | `/assault` |
+| `/defend` | `/de` | |
+| `/protect` | `/pr` | `/protectintel` |
+| `/escort` | `/es` | |
+| `/free` | `/fr` | `/resume`, `/release` |
+| `/status` | `/st` | `/orders` |
+
+| Team argument | Short |
+| --- | --- |
+| `blue` | `b` |
+| `green` | `g` |
+| `all` (both teams) | `a` |
+
+The team shorts are arguments only: there is no `/b`, `/g` or `/a` command (`/b` is the
+existing `/ban` alias, which is left untouched). Examples: `/t b sp at pr` is `/team blue
+split attack protect`; `/T G SP FR AT` is `/team green split free attack`; `/t a st` is
+`/team all status`; `/sp ho fr` is `/split hold free`. A short action is also accepted
+where `/split` takes one, so `/sp pr intel at` works. No short form collides with an
+existing command or alias, and none is allowed to shadow one (a test enforces this).
 
 ## `/split`
 

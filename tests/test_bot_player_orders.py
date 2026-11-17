@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from dataclasses import replace
 
 from server.bot_ai.messages import ObjectiveSnapshot, PerceptionFrame, PlayerSnapshot
@@ -750,8 +751,9 @@ def test_status_command_lists_each_bot(monkeypatch):
     assert sent == ["No matching bots on your team"]
     spectator = SimpleNamespace(id=10, team=255, name="Spec", admin=False)
     sent.clear()
-    asyncio.run(handle_command(server, spectator, "status"))
-    assert sent == ["Join a team to command bots"]
+    asyncio.run(handle_command(server, spectator, "status"))       # a spectator sees both teams
+    assert sent == ["Team 2: Rex [defend]: guarding the base", "Team 2: Ada [free]: idle",
+                    "Team 3: Eve [free]: idle"]
     asyncio.run(handle_command(SimpleNamespace(bots=None, config=server.config), player, "status"))
     assert sent[-1] == "There are no bots to command"
 
@@ -1439,3 +1441,160 @@ def test_team_all_with_no_bots_or_a_bad_command_answers_once(monkeypatch):
     bots, director = _two_teams(boss)
     asyncio.run(handle_command(_server(director), boss, "team all dance"))
     assert sent == ["Unknown command 'dance'. Use: follow, hold, attack, defend, protect, escort, free, status, split"]
+
+
+# --------------------------------------------------------- /status for spectators
+
+def test_a_spectators_status_shows_both_teams_without_any_permission(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    bots, director = _two_teams(spec)
+    server = _server(director)                                     # spectator orders are NOT enabled
+    asyncio.run(handle_command(server, _admin(team=TEAM2), "team blue split hold attack"))
+    sent.clear()
+    asyncio.run(handle_command(server, spec, "status"))
+    assert len(sent) == 8
+    assert sent[0] == "Blue: Blu1 [hold, half 1]: idle" and sent[3] == "Blue: Blu4 [attack, half 2]: idle"
+    assert sent[4] == "Green: Grn11 [free]: idle"
+    sent.clear()
+    asyncio.run(handle_command(server, spec, "orders blu2 grn12"))                  # alias + name filter
+    assert sent == ["Blue: Blu2 [hold, half 1]: idle", "Green: Grn12 [free]: idle"]
+    sent.clear()
+    asyncio.run(handle_command(server, spec, "status zzz"))
+    assert sent == ["Blue: No matching bots on that team", "Green: No matching bots on that team"]
+
+
+def test_a_spectator_cannot_order_but_can_read_one_team_with_permission(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    bots, director = _two_teams(spec)
+    asyncio.run(handle_command(_server(director), spec, "team blue status"))          # ordering path: not allowed
+    assert sent == ["Spectators cannot command bots on this server"]
+    sent.clear()
+    asyncio.run(handle_command(_server(director, spectators=True), spec, "team blue status blu3"))
+    assert sent == ["Blu3 [free]: idle"]                                              # one team, unlabeled
+
+
+def test_players_and_admins_on_a_team_still_see_only_their_own_team(monkeypatch):
+    sent = _commands(monkeypatch)
+    member, boss = _human(9, team=TEAM1), _admin(team=TEAM2)
+    bots, director = _two_teams(member, boss)
+    server = _server(director)
+    asyncio.run(handle_command(server, member, "status"))
+    assert [m.split(" ")[0] for m in sent] == ["Blu1", "Blu2", "Blu3", "Blu4"]
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "status"))
+    assert [m.split(" ")[0] for m in sent] == ["Grn11", "Grn12", "Grn13", "Grn14"]
+
+
+def test_a_spectators_status_with_no_bots_answers_once(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    asyncio.run(handle_command(SimpleNamespace(bots=None, config=_server(None).config), spec, "status"))
+    assert sent == ["There are no bots to command"]
+
+
+# ------------------------------------------------------------------ short forms
+
+from commands.command_handler import _commands as _registry
+
+_SHORT_COMMANDS = {"t": "team", "sp": "split", "fo": "follow", "ho": "hold", "at": "attack",
+                   "de": "defend", "pr": "protect", "es": "escort", "fr": "free", "st": "status"}
+
+
+def test_every_short_command_form_maps_to_its_command():
+    for short, name in _SHORT_COMMANDS.items():
+        assert _registry[short].name == name, short
+
+
+def test_no_registered_command_name_or_alias_is_shadowed_by_another():
+    """The registry silently overwrites duplicates, so check every declared key still
+    resolves to the command that declared it (a short form must not hide /ban, /k, /w...)."""
+    seen = {}
+    for command in _registry.values():
+        seen[id(command)] = command
+    for command in seen.values():
+        for key in (command.name, *command.aliases):
+            assert _registry[key.lower()] is command, f"/{key} is shadowed by /{_registry[key.lower()].name}"
+    assert _registry["b"].name == "ban"                          # the existing /b was not taken
+    assert "a" not in _registry and "g" not in _registry         # team arguments, never commands
+
+
+def test_top_level_short_commands_work_in_any_case(monkeypatch):
+    sent = _commands(monkeypatch)
+    bots, director = _squad(4)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    run = lambda text: asyncio.run(handle_command(server, _human(9), text))
+    for text, said in (("ho", "4 bot(s) holding position"), ("AT bot1", "1 bot(s) attacking"),
+                       ("De", "4 bot(s) defending"), ("PR intel", "4 bot(s) protecting the intel"),
+                       ("Es bot2 bot3", "2 bot(s) escorting"), ("fO", "4 bot(s) following you"),
+                       ("FR bot4", "1 bot(s) released")):
+        run(text)
+        assert sent[-1] == said, (text, sent[-1])
+    run("st bot1")
+    assert sent[-1].startswith("Bot1 [protect]") or sent[-1].startswith("Bot1 [")
+    sent.clear()
+    run("sp ho at")                                              # split, short action names
+    assert sent == ["2 bot(s) holding position, 2 attacking"]
+    run("FR")
+    assert sent[-1] == "4 bot(s) released"
+
+
+def test_short_forms_mix_with_long_ones_inside_team_and_split(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin(team=TEAM2)
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("t b sp at pr")                                          # the example from the notes
+    assert sent[-1] == "2 bot(s) attacking, 2 protecting the intel"
+    assert _teams_of(director, TEAM1) == {1: ("attack", 1), 2: ("attack", 1), 3: ("protect", 2), 4: ("protect", 2)}
+    run("T G SPLIT FR Attack")                                   # any case, any mix
+    assert sent[-1] == "2 bot(s) free, 2 attacking"
+    run("team b hold")
+    assert sent[-1] == "4 bot(s) holding position"               # a plain order replaces the split
+    run("t g ho")
+    assert sent[-1] == "4 bot(s) holding position"
+    run("t a st blu1")
+    assert sent[-2:] == ["Blue: Blu1 [hold]: idle", "Green: No matching bots on your team"]   # the admin plays on green
+    run("t a sp ho fr")
+    assert sent[-2:] == ["Blue: 2 bot(s) holding position, 2 free", "Green: 2 bot(s) holding position, 2 free"]
+    run("t all fr")
+    assert sent[-2:] == ["Blue: 4 bot(s) released", "Green: 4 bot(s) released"]
+    run("t B es")
+    assert sent[-1] == "4 bot(s) escorting"
+    run("t g de blu1")                                           # bot names still work after a short action
+    assert sent[-1] == "No matching bots on your team"
+    run("t g de grn11")
+    assert sent[-1] == "1 bot(s) defending"
+    run("t b sp pr intel de")                                    # the "intel" word after a short protect
+    assert sent[-1] == "2 bot(s) protecting the intel, 2 defending"
+
+
+def test_b_and_g_also_name_the_teams_for_a_plain_team_switch_but_a_does_not():
+    tokens = team_tokens(_server(None))
+    assert tokens["b"] == TEAM1 and tokens["g"] == TEAM2 and "a" not in tokens
+
+
+def test_short_actions_in_a_status_and_split_with_a_spectator(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    bots, director = _two_teams(spec)
+    server = _server(director, spectators=True)
+    run = lambda text: asyncio.run(handle_command(server, spec, text))
+    run("t a sp ho at")
+    assert sent[-2:] == ["Blue: 2 bot(s) holding position, 2 attacking",
+                         "Green: 2 bot(s) holding position, 2 attacking"]
+    run("t g st grn13")
+    assert sent[-1] == "Grn13 [attack, half 2]: idle"
+
+
+def test_the_docs_list_every_short_form():
+    root = Path(__file__).resolve().parents[1]
+    guide = (root / "docs" / "BOT_CHAT_ORDERS.md").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for short, name in _SHORT_COMMANDS.items():
+        assert f"| `/{name}` | `/{short}` |" in guide, (name, short)
+        assert f"`{short}`={name}" in readme, (name, short)
+    for color, short in (("blue", "b"), ("green", "g"), ("all", "a")):
+        assert f"`{short}`={color}" in readme and f"`{short}`" in guide
