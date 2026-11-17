@@ -196,9 +196,17 @@ class BotConfig:
     # Share of /attack bots that escort a friendly carrier of the enemy intel
     # while the rest keep attacking; fixed per bot id while the carrier lives.
     order_attack_escort_ratio: float = 0.5
+    # Blocks from a friendly intel carrier within which the /attack bots that
+    # are not escorting him hunt enemies (they screen him when none is that close).
+    order_attack_intercept_radius: float = 40.0
     # /team <color> <command> lets admins order a team's bots from outside it;
     # true lets spectators do the same (off by default: admins only).
     order_team_command_spectators: bool = False
+    # Dropped enemy intel: the nearest ``order_pickup_count`` bots (per split
+    # half) within ``order_pickup_radius`` blocks of it, among those under
+    # attack, escort, protect, defend or follow, go and grab it.
+    order_pickup_count: int = 2
+    order_pickup_radius: float = 30.0
 
 
 @dataclass
@@ -1532,6 +1540,15 @@ def load_config(
         )))
         config.bots.order_attack_escort_ratio = min(1.0, max(0.0, float(
             b.get("order_attack_escort_ratio", config.bots.order_attack_escort_ratio)
+        )))
+        config.bots.order_attack_intercept_radius = min(400.0, max(0.0, float(
+            b.get("order_attack_intercept_radius", config.bots.order_attack_intercept_radius)
+        )))
+        config.bots.order_pickup_count = min(8, max(0, int(
+            b.get("order_pickup_count", config.bots.order_pickup_count)
+        )))
+        config.bots.order_pickup_radius = min(400.0, max(0.0, float(
+            b.get("order_pickup_radius", config.bots.order_pickup_radius)
         )))
         config.bots.order_team_command_spectators = bool(
             b.get("order_team_command_spectators", config.bots.order_team_command_spectators)

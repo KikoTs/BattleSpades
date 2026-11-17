@@ -78,7 +78,10 @@ FLAT_KEYS = [
     ("bots", "order_defend_chase_radius", "bots.order_defend_chase_radius", 40.0),
     ("bots", "order_protect_hunt_ratio", "bots.order_protect_hunt_ratio", 0.5),
     ("bots", "order_attack_escort_ratio", "bots.order_attack_escort_ratio", 0.5),
+    ("bots", "order_attack_intercept_radius", "bots.order_attack_intercept_radius", 40.0),
     ("bots", "order_team_command_spectators", "bots.order_team_command_spectators", False),
+    ("bots", "order_pickup_count", "bots.order_pickup_count", 2),
+    ("bots", "order_pickup_radius", "bots.order_pickup_radius", 30.0),
     ("bots", "chatter", "bots.chatter", False),
     ("bots", "name_prefix", "bots.name_prefix", "[BOT]"),
     ("admin", "creator_token", "admin_creator_token", ""),
@@ -178,6 +181,9 @@ def test_feature_fallback_constants_match_registration():
     assert config.bots.order_defend_chase_radius == player_orders.DEFAULT_DEFEND_CHASE_RADIUS
     assert config.bots.order_protect_hunt_ratio == player_orders.DEFAULT_PROTECT_HUNT_RATIO
     assert config.bots.order_attack_escort_ratio == player_orders.DEFAULT_ATTACK_ESCORT_RATIO
+    assert config.bots.order_attack_intercept_radius == player_orders.DEFAULT_ATTACK_INTERCEPT_RADIUS
+    assert config.bots.order_pickup_count == player_orders.DEFAULT_PICKUP_COUNT
+    assert config.bots.order_pickup_radius == player_orders.DEFAULT_PICKUP_RADIUS
     assert config.prefab_health_state_batch == prefab_actions.BLOCK_STATE_DEFAULT_ROWS
 
 
@@ -242,7 +248,10 @@ _CUSTOM_TOML = textwrap.dedent("""
     order_defend_chase_radius = 55
     order_protect_hunt_ratio = 0.25
     order_attack_escort_ratio = 0.75
+    order_attack_intercept_radius = 75
     order_team_command_spectators = true
+    order_pickup_count = 3
+    order_pickup_radius = 55
 
     [admin]
     creator_token = "abcdefghijklmnopqrstuvwxyz012345"
@@ -339,9 +348,10 @@ def test_order_keys_reach_the_director(custom_server):
 
     director = BotDirector.__new__(BotDirector)
     director.server = custom_server
-    assert director._order_params() == (9.5, 55.0)
+    assert director._order_params() == (9.5, 55.0, 75.0)
     assert server_ratios(custom_server) == (0.75, 0.25)
     assert custom_server.config.bots.order_team_command_spectators is True
+    assert (custom_server.config.bots.order_pickup_count, custom_server.config.bots.order_pickup_radius) == (3, 55.0)
 
 
 def test_bot_label_and_chat_keys_reach_bot_config(custom_server):
@@ -406,6 +416,9 @@ def test_out_of_range_values_are_clamped(tmp_path):
         order_defend_chase_radius = -4
         order_protect_hunt_ratio = 7
         order_attack_escort_ratio = -1
+        order_attack_intercept_radius = 9999
+        order_pickup_count = 99
+        order_pickup_radius = -5
         [anticheat]
         accuracy_percentile = 250
         headshot_hit_ratio = 4
@@ -426,6 +439,8 @@ def test_out_of_range_values_are_clamped(tmp_path):
     assert config.bots.order_defend_chase_radius == 0.0
     assert config.bots.order_protect_hunt_ratio == 1.0
     assert config.bots.order_attack_escort_ratio == 0.0
+    assert config.bots.order_attack_intercept_radius == 400.0
+    assert config.bots.order_pickup_count == 8 and config.bots.order_pickup_radius == 0.0
     assert config.anticheat.accuracy_percentile == 100.0
     assert config.anticheat.headshot_hit_ratio == 1.0
     assert config.anticheat.snap_frames == 1

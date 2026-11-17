@@ -1891,11 +1891,13 @@ class SimpleBotBrain:
             protected_objective = (
                 objective_distance > max(12.0, mode_decision.arrival_radius * 2)
                 and target_offset > max(16.0, envelope_for(weapon_tool).ideal_max * .8))
-            if (mode_decision.role.endswith("ctf_attack_intel")
-                    and objective_distance <= 18.0):
+            if ((mode_decision.role.endswith("ctf_attack_intel")
+                    and objective_distance <= 18.0)
+                    or mode_decision.role == "order_pickup"):
                 # Touching the intel IS the fight. A raider three blocks from
                 # the flag used to stop and duel its guard until it died; a
-                # player dives on the pickup and shoots on the way.
+                # player dives on the pickup and shoots on the way. A chat-
+                # ordered grab (order_pickup) always dives, from any distance.
                 protected_objective = True
 
         action = BotAction()

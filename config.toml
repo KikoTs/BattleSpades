@@ -450,9 +450,20 @@ order_hold_leash = 6.0
 order_defend_chase_radius = 40.0
 order_protect_hunt_ratio = 0.5
 order_attack_escort_ratio = 0.5
+# order_attack_intercept_radius: while a teammate carries the enemy intel, the
+# /attack bots that are not escorting him hunt the enemies nearest him within
+# this many blocks of him (and screen him when none is that close) instead of
+# camping the enemy base; they push the objective again when the intel resets.
+order_attack_intercept_radius = 40.0
 # order_team_command_spectators: /team <color> <command> orders a team's bots
 # from outside it. Admins always may; true also lets spectators.
 order_team_command_spectators = false
+# order_pickup_count / order_pickup_radius: when the enemy's intel lies dropped,
+# the nearest order_pickup_count bots (per /split half) within order_pickup_radius
+# blocks of it, under attack/escort/protect/defend/follow, run and grab it (they
+# then take it home and resume their order). /hold bots never do. 0 disables.
+order_pickup_count = 2
+order_pickup_radius = 30.0
 
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.

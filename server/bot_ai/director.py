@@ -2156,14 +2156,18 @@ class BotDirector:
         self._maintain_orders(book)
         return book.objectives((int(bot.id) for bot in self.bots), self._order_params())
 
-    def _order_params(self) -> tuple[float, float]:
+    def _order_params(self) -> tuple[float, float, float]:
         """The operator's worker-side ``[bots] order_*`` tunables, stamped on every order."""
-        from .player_orders import DEFAULT_DEFEND_CHASE_RADIUS, DEFAULT_HOLD_LEASH, clamp_params
+        from .player_orders import (
+            DEFAULT_ATTACK_INTERCEPT_RADIUS, DEFAULT_DEFEND_CHASE_RADIUS, DEFAULT_HOLD_LEASH,
+            clamp_params,
+        )
 
         config = getattr(self, "_config", None)
         return clamp_params(
             getattr(config, "order_hold_leash", DEFAULT_HOLD_LEASH),
             getattr(config, "order_defend_chase_radius", DEFAULT_DEFEND_CHASE_RADIUS),
+            getattr(config, "order_attack_intercept_radius", DEFAULT_ATTACK_INTERCEPT_RADIUS),
         )
 
     def _intel_holders(self) -> dict[int, int]:
@@ -2176,6 +2180,37 @@ class BotDirector:
             for team, holder in holders.items()
             if holder is not None
         }
+
+    def _dropped_enemy_intel(self, team: int):
+        """Where the enemy's intel lies dropped and uncarried (None if it does not)."""
+        mode = getattr(getattr(self, "server", None), "mode", None)
+        holders = getattr(mode, "intel_holder", None)
+        positions = getattr(mode, "intel_positions", None)
+        drops = getattr(mode, "intel_drop_time", None)
+        if not (isinstance(holders, dict) and isinstance(positions, dict) and isinstance(drops, dict)):
+            return None
+        enemy = TEAM2 if int(team) == TEAM1 else TEAM1
+        if holders.get(enemy) is not None or float(drops.get(enemy, 0.0)) <= 0.0:
+            return None
+        where = positions.get(enemy)
+        return tuple(float(v) for v in where) if where is not None else None
+
+    def _sync_order_pickups(self, book) -> None:
+        """Choose the bots that go and grab a dropped enemy intel, per team and split half."""
+        from .player_orders import DEFAULT_PICKUP_COUNT, DEFAULT_PICKUP_RADIUS
+
+        config = getattr(self, "_config", None)
+        count = max(0, int(getattr(config, "order_pickup_count", DEFAULT_PICKUP_COUNT)))
+        radius = max(0.0, float(getattr(config, "order_pickup_radius", DEFAULT_PICKUP_RADIUS)))
+        by_id = {int(bot.id): bot for bot in self.bots}
+        for team in _PLAYABLE_TEAMS:
+            book.sync_pickups(
+                team, self._dropped_enemy_intel(team),
+                {bot_id: tuple(float(v) for v in bot.position) for bot_id, bot in by_id.items()
+                 if int(bot.team) == team},
+                lambda bot_id: bool(getattr(by_id[bot_id], "alive", True)),
+                count, radius,
+            )
 
     def _sync_order_jobs(self, book) -> None:
         """Split the /attack and /protect bots between escort and push jobs.
@@ -2193,6 +2228,7 @@ class BotDirector:
         config = getattr(self, "_config", None)
         attack_ratio = getattr(config, "order_attack_escort_ratio", DEFAULT_ATTACK_ESCORT_RATIO)
         hunt_ratio = getattr(config, "order_protect_hunt_ratio", DEFAULT_PROTECT_HUNT_RATIO)
+        self._sync_order_pickups(book)
         holders = self._intel_holders()
         for team in _PLAYABLE_TEAMS:
             enemy = TEAM2 if team == TEAM1 else TEAM1
@@ -2223,7 +2259,9 @@ class BotDirector:
         of every type (follow, hold, escort, a split's halves ...), exactly as
         if they had typed /free; orders issued by other players stay. A
         ``/follow`` whose issuer is still connected but died or changed team
-        turns into ``/hold`` where the bot stands instead.
+        turns into ``/hold`` where the bot stands instead. So does an
+        ``/escort`` whose issuer died, unless the bot is escorting a friendly
+        carrier at that moment (then nothing changes until he is gone).
         """
         server = getattr(self, "server", None)
         players = getattr(server, "players", None)
@@ -2244,9 +2282,27 @@ class BotDirector:
                 and int(getattr(issuer, "team", -1)) == int(team)
             )
 
+        def issuer_dead(issuer_id: int, team: int) -> bool:
+            issuer = roster.get(int(issuer_id))
+            return (
+                issuer is not None
+                and int(getattr(issuer, "team", -1)) == int(team)
+                and not (bool(getattr(issuer, "alive", False))
+                         and bool(getattr(issuer, "spawned", True)))
+            )
+
+        holders = self._intel_holders()
+
+        def has_carrier(team: int, bot_id: int) -> bool:
+            """A teammate other than this bot holds the enemy intel."""
+            carrier = holders.get(TEAM2 if team == TEAM1 else TEAM1)
+            return carrier is not None and carrier != int(bot_id)
+
         book.release_orphaned_follows(
             issuer_alive,
             {int(bot.id): tuple(float(v) for v in bot.position) for bot in self.bots},
+            issuer_dead,
+            has_carrier,
         )
 
     def order_status(

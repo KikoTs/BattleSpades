@@ -8,7 +8,8 @@ from dataclasses import replace
 
 from server.bot_ai.messages import ObjectiveSnapshot, PerceptionFrame, PlayerSnapshot
 from server.bot_ai.player_orders import (
-    ATTACK, DEFEND, ESCORT, FOLLOW, HOLD, JOB_ESCORT, JOB_NONE, JOB_PUSH, PROTECT, PlayerOrder,
+    ATTACK, DEFEND, ESCORT, FOLLOW, HOLD, JOB_ESCORT, JOB_NONE, JOB_PICKUP, JOB_PUSH, PICKUP_CODES,
+    P_JOB, PROTECT, PlayerOrder,
     PlayerOrderBook, attack_escort_count, describe_role, protect_escort_count,
 )
 from server.bot_ai.policies import ModePolicyMemory
@@ -29,13 +30,15 @@ def _player(pid, team, pos, *, carried=-1, is_bot=True, alive=True):
 
 
 def _ctf(extra=(), *, enemy_intel_carrier=-1, own_intel_carrier=-1, own_intel_at=(52.0, 52.0, 40.0),
-         players=(), bot_at=(100.0, 100.0, 40.0), bot_id=BOT):
+         players=(), bot_at=(100.0, 100.0, 40.0), bot_id=BOT,
+         enemy_intel_at=(402.0, 402.0, 40.0), enemy_intel_state=0):
     bot = _player(bot_id, BLUE, bot_at)
     objectives = [
         ObjectiveSnapshot("ctf_base", BLUE, BASE),
         ObjectiveSnapshot("ctf_base", GREEN, ENEMY_BASE),
         ObjectiveSnapshot("ctf_intel", BLUE, own_intel_at, carrier_id=own_intel_carrier),
-        ObjectiveSnapshot("ctf_intel", GREEN, (402.0, 402.0, 40.0), carrier_id=enemy_intel_carrier),
+        ObjectiveSnapshot("ctf_intel", GREEN, enemy_intel_at, carrier_id=enemy_intel_carrier,
+                          state=enemy_intel_state),
         *extra,
     ]
     return bot, PerceptionFrame(
@@ -67,7 +70,7 @@ def _split_roles(code, ids, count_fn, *, carrier=True, thief=False, exclude=()):
     for bot_id in ids:
         book.issue(bot_id, PlayerOrder(code, BLUE, HUMAN, (120.0, 130.0, 40.0)))
     book.sync_jobs(BLUE, code, carrier and (thief or code == ATTACK), count_fn, exclude)
-    objectives = tuple(book.objectives(ids, (6.0, 40.0)))
+    objectives = tuple(book.objectives(ids, (6.0, 40.0, 40.0)))
     carrier_player = _player(30, BLUE, (300.0, 300.0, 40.0), carried=3, is_bot=False)
     thief_player = _player(31, GREEN, (200.0, 60.0, 40.0))
     roles = {}
@@ -121,22 +124,107 @@ def test_attack_pushes_enemy_intel():
 
 def test_attack_escort_job_follows_the_friendly_carrier():
     carrier = _player(OTHER, BLUE, (300.0, 300.0, 40.0), carried=3)
-    d = _decide(ATTACK, params=(6.0, 40.0, JOB_ESCORT), enemy_intel_carrier=OTHER, players=(carrier,))
+    d = _decide(ATTACK, params=(6.0, 40.0, 40.0, JOB_ESCORT), enemy_intel_carrier=OTHER, players=(carrier,))
     assert d.role == "order_attack_escort" and d.position == (300.0, 300.0, 40.0)
     assert d.posture.name == "ESCORT"
 
 
-def test_attack_push_job_keeps_attacking_the_enemy_base_not_the_carrier():
-    carrier = _player(OTHER, BLUE, (300.0, 300.0, 40.0), carried=3)
-    for params in ((6.0, 40.0, JOB_PUSH), (6.0, 40.0), ()):       # no job = plain attack
-        d = _decide(ATTACK, params=params, enemy_intel_carrier=OTHER, players=(carrier,))
-        assert d.role == "order_attack" and d.position == ENEMY_BASE, params
-        assert d.posture.name == "ASSAULT"
+def _enemy(pid, pos, alive=True):
+    return _player(pid, GREEN, pos, alive=alive)
+
+
+CARRIER_AT = (300.0, 300.0, 40.0)
+
+
+def _intercept(*enemies, params=(6.0, 40.0, 40.0, JOB_PUSH), bot_id=BOT):
+    carrier = _player(OTHER, BLUE, CARRIER_AT, carried=3)
+    bot, frame = _ctf((_order(ATTACK, params=params, bot_id=bot_id),), enemy_intel_carrier=OTHER,
+                      bot_id=bot_id, players=(carrier, *enemies))
+    return ModePolicyMemory().decide(frame, bot)
+
+
+def test_attackers_intercept_the_enemy_nearest_the_carrier_instead_of_camping_their_base():
+    near, farther = _enemy(40, (310.0, 300.0, 40.0)), _enemy(41, (330.0, 300.0, 40.0))
+    d = _intercept(farther, near, bot_id=12)                                    # an even id takes the nearest
+    assert d.role == "order_attack_intercept" and d.position == near.position   # nearest to the CARRIER, not the bot
+    assert d.position != ENEMY_BASE and d.posture.name == "ASSAULT"
+
+
+def test_attackers_only_hunt_enemies_within_the_radius_of_the_carrier():
+    outside = _enemy(40, (400.0, 300.0, 40.0))                                  # 100 blocks from the carrier
+    d = _intercept(outside)
+    assert d.role == "order_attack_intercept_screen" and d.position == CARRIER_AT
+    assert d.position != outside.position and d.position != ENEMY_BASE         # no hunting, no base camping
+    assert _intercept(outside, params=(6.0, 40.0, 120.0, JOB_PUSH)).role == "order_attack_intercept"
+    inside = _enemy(41, (320.0, 300.0, 40.0))
+    assert _intercept(inside, params=(6.0, 40.0, 0.0, JOB_PUSH)).role == "order_attack_intercept_screen"
+
+
+def test_attackers_screen_the_carrier_when_no_enemy_is_near():
+    d = _intercept()
+    assert d.role == "order_attack_intercept_screen" and d.position == CARRIER_AT
+    assert d.arrival_radius == 10.0 and d.posture.name == "ASSAULT" and d.sprint      # far away: sprint to him
+    close = _player(BOT, BLUE, (305.0, 300.0, 40.0))
+    carrier = _player(OTHER, BLUE, CARRIER_AT, carried=3)
+    _, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, 40.0, JOB_PUSH)),), enemy_intel_carrier=OTHER, players=(carrier,))
+    assert not ModePolicyMemory().decide(replace(frame, players=(close, carrier)), close).sprint
+
+
+def test_attackers_ignore_dead_enemies_and_pick_up_a_live_one():
+    dead = _enemy(40, (305.0, 300.0, 40.0), alive=False)
+    live = _enemy(41, (330.0, 300.0, 40.0))
+    d = _intercept(dead, live)
+    assert d.role == "order_attack_intercept" and d.position == live.position
+
+
+def test_interceptors_spread_over_the_two_nearest_enemies_by_bot_id():
+    a, b, c = _enemy(40, (305.0, 300.0, 40.0)), _enemy(41, (315.0, 300.0, 40.0)), _enemy(42, (330.0, 300.0, 40.0))
+    targets = {bot_id: _intercept(c, b, a, bot_id=bot_id).position for bot_id in (11, 12, 13, 14)}
+    assert targets[11] == targets[13] == b.position and targets[12] == targets[14] == a.position   # never the third
+    assert _intercept(a, bot_id=11).position == _intercept(a, bot_id=12).position == a.position    # one enemy: all on him
+
+
+def test_every_non_escort_attacker_intercepts_whatever_its_job():
+    near = _enemy(40, (310.0, 300.0, 40.0))
+    for params in ((6.0, 40.0, 40.0, JOB_PUSH), (6.0, 40.0, 40.0), ()):         # push job, no job, no params
+        d = _intercept(near, params=params)
+        assert d.role == "order_attack_intercept" and d.position == near.position, params
+
+
+def test_an_escort_job_still_escorts_even_with_enemies_near():
+    d = _intercept(_enemy(40, (310.0, 300.0, 40.0)), params=(6.0, 40.0, 40.0, JOB_ESCORT))
+    assert d.role == "order_attack_escort" and d.position == CARRIER_AT
+
+
+def test_interceptors_find_enemies_near_a_carrier_outside_the_perception_cohort():
+    far = (350.0, 120.0, 40.0)
+    near = _enemy(40, (355.0, 125.0, 40.0))
+    bot, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, 40.0, JOB_PUSH)),))
+    objectives = tuple(ObjectiveSnapshot("ctf_intel", GREEN, far, carrier_id=OTHER)
+                       if o.kind == "ctf_intel" and o.team == GREEN else o for o in frame.objectives)
+    d = ModePolicyMemory().decide(replace(frame, objectives=objectives, players=(bot, near)), bot)
+    assert d.role == "order_attack_intercept" and d.position == near.position
+
+
+def test_interceptors_push_the_objective_again_when_the_intel_resets():
+    near = _enemy(40, (310.0, 300.0, 40.0))
+    carrier = _player(OTHER, BLUE, CARRIER_AT, carried=3)
+    carrying = _decide(ATTACK, params=(6.0, 40.0, 40.0, JOB_PUSH), enemy_intel_carrier=OTHER, players=(carrier, near))
+    reset = _decide(ATTACK, params=(6.0, 40.0, 40.0, JOB_PUSH), enemy_intel_carrier=-1, players=(carrier, near))
+    assert carrying.role == "order_attack_intercept"
+    assert reset.role == "order_attack" and reset.position == (402.0, 402.0, 40.0)
+
+
+def test_intercept_roles_track_the_live_target_and_read_clearly_in_status():
+    from server.bot_ai.policies import _tracks_live_position
+    assert _tracks_live_position("order_attack_intercept") and _tracks_live_position("order_attack_intercept_screen")
+    assert describe_role("order_attack_intercept") == "intercepting an enemy near the carrier"
+    assert describe_role("order_attack_intercept_screen") == "screening the carrier"
 
 
 def test_attack_escort_finds_a_carrier_outside_the_perception_cohort():
     far = (350.0, 120.0, 40.0)
-    bot, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, JOB_ESCORT)),))
+    bot, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, 40.0, JOB_ESCORT)),))
     objectives = tuple(ObjectiveSnapshot("ctf_intel", GREEN, far, carrier_id=OTHER)
                        if o.kind == "ctf_intel" and o.team == GREEN else o for o in frame.objectives)
     d = ModePolicyMemory().decide(replace(frame, objectives=objectives), bot)
@@ -146,13 +234,13 @@ def test_attack_escort_finds_a_carrier_outside_the_perception_cohort():
 def test_when_the_carrier_is_gone_every_attack_bot_attacks_the_intel_again():
     carrier = _player(OTHER, BLUE, (300.0, 300.0, 40.0), carried=3)
     for job in (JOB_ESCORT, JOB_PUSH):                            # a stale job changes nothing
-        reset = _decide(ATTACK, params=(6.0, 40.0, job), enemy_intel_carrier=-1, players=(carrier,))
+        reset = _decide(ATTACK, params=(6.0, 40.0, 40.0, job), enemy_intel_carrier=-1, players=(carrier,))
         assert reset.role == "order_attack" and reset.position == (402.0, 402.0, 40.0)
 
 
 def test_attack_with_the_intel_in_its_own_hands_still_goes_home():
     bot = _player(BOT, BLUE, (100.0, 100.0, 40.0), carried=5)
-    _, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, JOB_ESCORT)),), enemy_intel_carrier=BOT)
+    _, frame = _ctf((_order(ATTACK, params=(6.0, 40.0, 40.0, JOB_ESCORT)),), enemy_intel_carrier=BOT)
     d = ModePolicyMemory().decide(replace(frame, players=(bot,)), bot)
     assert d.role == "order_capture" and d.position == BASE
 
@@ -160,12 +248,12 @@ def test_attack_with_the_intel_in_its_own_hands_still_goes_home():
 def test_attack_bots_split_by_id_between_escort_and_attack():
     roles, _ = _split_roles(ATTACK, [11, 12, 13, 14], lambda n: attack_escort_count(n, 0.5))
     assert roles == {11: "order_attack_escort", 12: "order_attack_escort",
-                     13: "order_attack", 14: "order_attack"}
+                     13: "order_attack_intercept_screen", 14: "order_attack_intercept_screen"}
 
 
 def test_a_single_attack_bot_attacks_and_the_ratio_always_leaves_an_attacker():
-    assert _split_roles(ATTACK, [11], lambda n: attack_escort_count(n, 0.5))[0] == {11: "order_attack"}
-    assert _split_roles(ATTACK, [11], lambda n: attack_escort_count(n, 1.0))[0] == {11: "order_attack"}
+    assert _split_roles(ATTACK, [11], lambda n: attack_escort_count(n, 0.5))[0] == {11: "order_attack_intercept_screen"}
+    assert _split_roles(ATTACK, [11], lambda n: attack_escort_count(n, 1.0))[0] == {11: "order_attack_intercept_screen"}
     escorting = lambda ratio, ids=(11, 12, 13, 14): sorted(
         i for i, r in _split_roles(ATTACK, list(ids), lambda n: attack_escort_count(n, ratio))[0].items()
         if r.endswith("escort"))
@@ -500,13 +588,13 @@ def test_director_publishes_the_configured_tunables():
                              order_protect_hunt_ratio=0.25)
     director = _director(_bot(1, "Rex", TEAM1), players=[_human()], config=config)
     director.give_order("hold", _human())
-    assert director._objectives_player_orders(None)[0].params == (9.0, 55.0, 0.0)
+    assert director._objectives_player_orders(None)[0].params == (9.0, 55.0, 40.0, 0.0)
 
 
 def test_director_without_config_falls_back_to_the_defaults():
     director = _director(_bot(1, "Rex", TEAM1))
     director.give_order("hold", SimpleNamespace(id=9, team=TEAM1))
-    assert director._objectives_player_orders(None)[0].params == (6.0, 40.0, 0.0)
+    assert director._objectives_player_orders(None)[0].params == (6.0, 40.0, 40.0, 0.0)
 
 
 def _jobs_of(director):
@@ -657,10 +745,96 @@ def test_any_teammate_can_free_bots_someone_else_ordered(monkeypatch):
 def test_other_orders_do_not_depend_on_the_issuer_staying_alive():
     issuer = _human()
     director = _director(_bot(1, "Rex", TEAM1), _bot(2, "Ada", TEAM1), players=[issuer])
-    director.give_order("escort", issuer, ("rex",))
+    director.give_order("defend", issuer, ("rex",))
     director.give_order("hold", issuer, ("ada",))
     issuer.alive = issuer.spawned = False
-    assert {o.carrier_id: o.state for o in director._objectives_player_orders(None)} == {1: ESCORT, 2: HOLD}
+    assert {o.carrier_id: o.state for o in director._objectives_player_orders(None)} == {1: DEFEND, 2: HOLD}
+
+
+def _escort_director(holders=None):
+    rex = _bot(1, "Rex", TEAM1, pos=(10.0, 10.0, 10.0))
+    issuer = _human()
+    director = _director(rex, players=[issuer])
+    director.server.mode = SimpleNamespace(intel_holder=holders if holders is not None else {})
+    director.give_order("escort", issuer)
+    return director, rex, issuer
+
+
+def test_escort_becomes_hold_at_the_bots_spot_when_the_issuer_dies():
+    director, rex, issuer = _escort_director()
+    assert director._objectives_player_orders(None)[0].state == ESCORT      # issuer alive
+    rex.position = (40.0, 41.0, 42.0)                                        # the bot moved with him
+    issuer.alive = issuer.spawned = False                                    # he dies
+    order = director._objectives_player_orders(None)[0]
+    assert order.state == HOLD and order.position == (40.0, 41.0, 42.0)
+    issuer.alive = issuer.spawned = True                                     # he respawns elsewhere
+    rex.position = (60.0, 60.0, 60.0)
+    order = director._objectives_player_orders(None)[0]
+    assert order.state == HOLD and order.position == (40.0, 41.0, 42.0)     # no chasing the respawn
+
+
+def test_escort_keeps_escorting_a_carrier_when_the_issuer_dies_and_converts_when_he_is_gone():
+    carrier = SimpleNamespace(id=30)
+    director, rex, issuer = _escort_director(holders={TEAM2: carrier})      # a teammate holds the enemy intel
+    issuer.alive = issuer.spawned = False
+    assert director._objectives_player_orders(None)[0].state == ESCORT      # escorting a different carrier
+    director.server.mode.intel_holder = {}                                   # the carrier drops or dies
+    rex.position = (7.0, 8.0, 9.0)
+    order = director._objectives_player_orders(None)[0]
+    assert order.state == HOLD and order.position == (7.0, 8.0, 9.0)        # the issuer is still dead: now it converts
+
+
+def test_escort_stays_when_the_carrier_is_gone_but_the_issuer_is_back():
+    carrier = SimpleNamespace(id=30)
+    director, rex, issuer = _escort_director(holders={TEAM2: carrier})
+    issuer.alive = issuer.spawned = False
+    director._objectives_player_orders(None)
+    issuer.alive = issuer.spawned = True                                     # respawned while the carrier lives
+    director.server.mode.intel_holder = {}
+    assert director._objectives_player_orders(None)[0].state == ESCORT      # escorts him again
+
+
+def test_a_bot_carrying_the_intel_itself_is_not_escorting_a_carrier():
+    director, rex, issuer = _escort_director(holders={TEAM2: SimpleNamespace(id=1)})   # the bot is the carrier
+    issuer.alive = issuer.spawned = False
+    assert director._objectives_player_orders(None)[0].state == HOLD
+
+
+def test_escort_ordered_from_outside_the_team_never_counts_as_an_issuer_who_died():
+    boss = _admin(team=TEAM2)                                                # an admin on green orders blue
+    bots, director = _two_teams(boss)
+    director.server.mode = SimpleNamespace(intel_holder={})
+    director.give_order("escort", boss, team=TEAM1)
+    boss.alive = boss.spawned = False                                        # he dies...
+    assert {o.state for o in director._objectives_player_orders(None)} == {ESCORT}
+    boss.team = 0                                                            # ...or spectates
+    assert {o.state for o in director._objectives_player_orders(None)} == {ESCORT}
+
+
+def test_an_escort_issuer_who_changes_team_does_not_convert_the_order():
+    director, rex, issuer = _escort_director()
+    issuer.team = TEAM2                                                      # left the bots' team, still alive
+    assert director._objectives_player_orders(None)[0].state == ESCORT
+
+
+def test_book_converts_only_escorts_with_a_dead_issuer_and_no_carrier_and_keeps_the_half():
+    book = _book(
+        (1, PlayerOrder(ESCORT, BLUE, HUMAN, (0.0, 0.0, 0.0), half=1)),
+        (2, PlayerOrder(ESCORT, BLUE, HUMAN, (0.0, 0.0, 0.0))),
+        (3, PlayerOrder(ESCORT, BLUE, 55, (0.0, 0.0, 0.0))),
+        (4, PlayerOrder(DEFEND, BLUE, HUMAN, (9.0, 9.0, 9.0))),
+    )
+    positions = {1: (1.0, 1.0, 1.0), 2: (2.0, 2.0, 2.0), 3: (3.0, 3.0, 3.0), 4: (4.0, 4.0, 4.0)}
+    converted = book.release_orphaned_follows(
+        lambda issuer, team: issuer == 55,                                   # only 55 is alive
+        positions,
+        issuer_dead=lambda issuer, team: issuer == HUMAN,
+        has_carrier=lambda team, bot_id: bot_id == 2,                        # bot 2 escorts a carrier
+    )
+    assert converted == [1]
+    assert book.get(1) == PlayerOrder(HOLD, BLUE, HUMAN, (1.0, 1.0, 1.0), 1)
+    assert book.get(2).code == ESCORT and book.get(3).code == ESCORT and book.get(4).code == DEFEND
+    assert book.release_orphaned_follows(lambda i, t: True, positions) == []   # no dead-issuer hook: escorts stay
 
 
 def test_orders_persist_while_the_ordered_bot_is_dead():
@@ -752,8 +926,11 @@ def test_status_command_lists_each_bot(monkeypatch):
     spectator = SimpleNamespace(id=10, team=255, name="Spec", admin=False)
     sent.clear()
     asyncio.run(handle_command(server, spectator, "status"))       # a spectator sees both teams
+    assert sent == ["Team 2 defend: Rex | free: Ada", "Team 3 free: Eve"]        # grouped, one line per group set
+    sent.clear()
+    asyncio.run(handle_command(server, spectator, "status full"))
     assert sent == ["Team 2: Rex [defend]: guarding the base", "Team 2: Ada [free]: idle",
-                    "Team 3: Eve [free]: idle"]
+                    "Team 3: Eve [free]: idle"]                                   # "full" gives the per-bot lines
     asyncio.run(handle_command(SimpleNamespace(bots=None, config=server.config), player, "status"))
     assert sent[-1] == "There are no bots to command"
 
@@ -1409,12 +1586,21 @@ def test_team_all_status_lists_both_teams_with_labels(monkeypatch):
     asyncio.run(handle_command(server, boss, "team blue split hold free"))
     sent.clear()
     asyncio.run(handle_command(server, boss, "team all status"))
+    assert sent == ["Blue hold 1: Blu1, Blu2 | free 2: Blu3, Blu4", "Green free: Grn11, Grn12, Grn13, Grn14"]
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "team all status blu1 grn14"))   # names filter both teams
+    assert sent == ["Blue hold 1: Blu1", "Green free: Grn14"]
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "team all status full"))         # full per-bot detail on request
     assert len(sent) == 8
     assert sent[0] == "Blue: Blu1 [hold, half 1]: idle" and sent[3] == "Blue: Blu4 [free, half 2]: idle"
     assert sent[4] == "Green: Grn11 [free]: idle"
     sent.clear()
-    asyncio.run(handle_command(server, boss, "team all status blu1 grn14"))   # names filter both teams
+    asyncio.run(handle_command(server, boss, "t a st full blu1 grn14"))       # short forms, any order of words
     assert sent == ["Blue: Blu1 [hold, half 1]: idle", "Green: Grn14 [free]: idle"]
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "team blue status"))              # a single team keeps full detail
+    assert len(sent) == 4 and sent[0] == "Blu1 [hold, half 1]: idle"
 
 
 def test_team_all_has_the_same_permissions_as_team(monkeypatch):
@@ -1453,12 +1639,15 @@ def test_a_spectators_status_shows_both_teams_without_any_permission(monkeypatch
     asyncio.run(handle_command(server, _admin(team=TEAM2), "team blue split hold attack"))
     sent.clear()
     asyncio.run(handle_command(server, spec, "status"))
+    assert sent == ["Blue hold 1: Blu1, Blu2 | attack 2: Blu3, Blu4", "Green free: Grn11, Grn12, Grn13, Grn14"]
+    sent.clear()
+    asyncio.run(handle_command(server, spec, "st full"))                            # "/st full" = full detail
     assert len(sent) == 8
     assert sent[0] == "Blue: Blu1 [hold, half 1]: idle" and sent[3] == "Blue: Blu4 [attack, half 2]: idle"
     assert sent[4] == "Green: Grn11 [free]: idle"
     sent.clear()
     asyncio.run(handle_command(server, spec, "orders blu2 grn12"))                  # alias + name filter
-    assert sent == ["Blue: Blu2 [hold, half 1]: idle", "Green: Grn12 [free]: idle"]
+    assert sent == ["Blue hold 1: Blu2", "Green free: Grn12"]
     sent.clear()
     asyncio.run(handle_command(server, spec, "status zzz"))
     assert sent == ["Blue: No matching bots on that team", "Green: No matching bots on that team"]
@@ -1556,7 +1745,7 @@ def test_short_forms_mix_with_long_ones_inside_team_and_split(monkeypatch):
     run("t g ho")
     assert sent[-1] == "4 bot(s) holding position"
     run("t a st blu1")
-    assert sent[-2:] == ["Blue: Blu1 [hold]: idle", "Green: No matching bots on your team"]   # the admin plays on green
+    assert sent[-2:] == ["Blue hold: Blu1", "Green: No matching bots on your team"]          # the admin plays on green
     run("t a sp ho fr")
     assert sent[-2:] == ["Blue: 2 bot(s) holding position, 2 free", "Green: 2 bot(s) holding position, 2 free"]
     run("t all fr")
@@ -1598,3 +1787,336 @@ def test_the_docs_list_every_short_form():
         assert f"`{short}`={name}" in readme, (name, short)
     for color, short in (("blue", "b"), ("green", "g"), ("all", "a")):
         assert f"`{short}`={color}" in readme and f"`{short}`" in guide
+
+
+# ------------------------------------------------------ dropped enemy intel pickup
+
+def _jobp(job):
+    """Order params carrying ``job``, whatever the params layout is."""
+    return ((6.0, 40.0, 40.0, 1.0)[:P_JOB] + (float(job),))
+
+
+DROP_AT = (150.0, 150.0, 40.0)
+
+
+def _dropped(code, job=JOB_PICKUP, **kw):
+    return _decide(code, params=_jobp(job), enemy_intel_at=DROP_AT, enemy_intel_state=1, **kw)
+
+
+def test_ordered_bots_chosen_for_a_dropped_intel_run_and_grab_it_sprinting():
+    for code in (ATTACK, ESCORT, PROTECT, DEFEND, FOLLOW):
+        d = _dropped(code)
+        assert d.role == "order_pickup" and d.position == DROP_AT, code
+        assert d.sprint and d.arrival_radius <= 1.5 and d.posture.name == "ASSAULT"
+        assert d.objective_priority > 0.9
+
+
+def test_hold_bots_never_grab_even_if_a_job_were_stamped():
+    d = _dropped(HOLD)
+    assert d.role == "order_hold" and d.position == (120.0, 130.0, 40.0)
+    assert HOLD not in PICKUP_CODES
+
+
+def test_the_grab_only_applies_while_the_intel_really_lies_dropped():
+    home = _decide(DEFEND, params=_jobp(JOB_PICKUP), enemy_intel_at=DROP_AT, enemy_intel_state=0)
+    assert home.role == "order_defend"                                       # state 0: at home, not dropped
+    carried = _decide(DEFEND, params=_jobp(JOB_PICKUP), enemy_intel_at=DROP_AT, enemy_intel_state=2,
+                      enemy_intel_carrier=OTHER)
+    assert carried.role == "order_defend"                                    # somebody holds it now
+    assert _dropped(DEFEND, job=JOB_NONE).role == "order_defend"            # not one of the chosen
+
+
+def test_a_bot_that_grabs_the_intel_takes_it_home_first_then_resumes_its_order():
+    human = _player(HUMAN, BLUE, (200.0, 210.0, 40.0), is_bot=False)
+    holding = _player(BOT, BLUE, (140.0, 140.0, 40.0), carried=5)
+    _, frame = _ctf((_order(ATTACK, params=_jobp(JOB_PICKUP)),), enemy_intel_carrier=BOT,
+                    enemy_intel_at=DROP_AT, enemy_intel_state=2)
+    d = ModePolicyMemory().decide(replace(frame, players=(holding, human)), holding)
+    assert d.role == "order_capture" and d.position == BASE and d.sprint        # the carrier rule wins
+    after = _decide(DEFEND, enemy_intel_state=0)                                # captured: intel home, no job
+    assert after.role == "order_defend" and after.position == BASE              # the order resumes
+
+
+def test_unchosen_orders_keep_their_roles_while_the_intel_lies_dropped():
+    for code, role in ((DEFEND, "order_defend"), (PROTECT, "order_protect_guard"), (HOLD, "order_hold")):
+        assert _dropped(code, job=JOB_NONE).role == role, code
+    assert _dropped(FOLLOW, job=JOB_NONE).role == "order_follow_escort"
+
+
+def test_attack_bots_not_sent_still_head_for_the_dropped_intel():
+    d = _dropped(ATTACK, job=JOB_NONE)
+    assert d.role == "order_attack" and d.position == DROP_AT                   # the intel is their objective anyway
+
+
+def test_escorts_head_for_the_dropped_intel_when_their_carrier_falls():
+    d = _dropped(ESCORT, job=JOB_NONE)
+    assert d.role == "order_escort_dropped" and d.position == DROP_AT
+    assert d.position != (200.0, 210.0, 40.0)                                   # not the issuer
+    assert d.posture.name == "ESCORT"
+
+
+def test_escorts_never_target_a_dead_carriers_body():
+    body = (300.0, 300.0, 40.0)
+    dead = _player(OTHER, BLUE, body, carried=3, alive=False)                   # still listed as the holder this frame
+    for code, params in ((ESCORT, ()), (ATTACK, _jobp(JOB_ESCORT)), (PROTECT, ())):
+        d = _decide(code, params=params, enemy_intel_carrier=OTHER, players=(dead,))
+        assert d.position != body, code
+    live = _player(OTHER, BLUE, body, carried=3)
+    assert _decide(ESCORT, enemy_intel_carrier=OTHER, players=(live,)).position == body   # a living carrier is escorted
+
+
+def test_escorts_do_not_follow_the_issuers_respawn_either_while_intel_lies_dropped():
+    d = _dropped(ESCORT, job=JOB_NONE)
+    assert d.role != "order_escort_issuer"
+
+
+def test_describe_role_reads_the_new_pickup_roles():
+    assert describe_role("order_pickup") == "grabbing the dropped intel"
+    assert describe_role("order_escort_dropped") == "heading for the dropped intel"
+
+
+# --- the book's selection
+
+def _near(bot_id, distance):
+    return (DROP_AT[0] + distance, DROP_AT[1], DROP_AT[2])
+
+
+def _pick_book(orders, **kw):
+    """A book plus the chosen grabbers for ``orders`` ({bot id: (code, half)}) at given distances."""
+    book = PlayerOrderBook()
+    for bot_id, (code, half, _distance) in orders.items():
+        book.issue(bot_id, PlayerOrder(code, BLUE, HUMAN, (0.0, 0.0, 0.0), half))
+    positions = {bot_id: _near(bot_id, d) for bot_id, (_c, _h, d) in orders.items()}
+    kw.setdefault("alive", lambda bot_id: True)
+    kw.setdefault("count", 2)
+    kw.setdefault("radius", 30.0)
+    book.sync_pickups(BLUE, kw.pop("dropped_at", DROP_AT), positions, **kw)
+    return book, positions
+
+
+def _chosen(book, ids):
+    return sorted(i for i in ids if book.job_of(i) == JOB_PICKUP)
+
+
+def test_the_nearest_count_bots_within_the_radius_are_chosen_ties_by_id():
+    orders = {1: (ATTACK, 0, 25.0), 2: (DEFEND, 0, 5.0), 3: (PROTECT, 0, 10.0), 4: (ESCORT, 0, 5.0),
+              5: (FOLLOW, 0, 12.0), 6: (ATTACK, 0, 40.0)}
+    book, _ = _pick_book(orders)
+    assert _chosen(book, orders) == [2, 4]                                  # 2 and 4 tie at 5 blocks
+    book, _ = _pick_book(orders, count=4)
+    assert _chosen(book, orders) == [2, 3, 4, 5]                            # then 10 and 12; 25 is 5th, 40 is out
+    book, _ = _pick_book(orders, count=9)
+    assert _chosen(book, orders) == [1, 2, 3, 4, 5]                         # 6 is beyond the 30-block radius
+    book, _ = _pick_book(orders, radius=8.0)
+    assert _chosen(book, orders) == [2, 4]
+
+
+def test_hold_free_dead_and_other_orders_are_never_chosen():
+    from server.bot_ai.player_orders import FREE
+    orders = {1: (HOLD, 0, 1.0), 2: (FREE, 1, 2.0), 3: (DEFEND, 0, 3.0), 4: (ATTACK, 0, 4.0), 5: (ATTACK, 0, 6.0)}
+    book, _ = _pick_book(orders, alive=lambda bot_id: bot_id != 3)
+    assert _chosen(book, orders) == [4, 5]                                  # hold, free and the dead bot are skipped
+
+
+def test_nothing_is_chosen_when_nothing_is_dropped_or_the_count_is_zero():
+    orders = {1: (ATTACK, 0, 1.0), 2: (ATTACK, 0, 2.0)}
+    assert _chosen(*[_pick_book(orders, dropped_at=None)[0], orders]) == []
+    assert _chosen(*[_pick_book(orders, count=0)[0], orders]) == []
+
+
+def test_each_split_half_picks_its_own_grabbers():
+    orders = {1: (ATTACK, 1, 4.0), 2: (ATTACK, 1, 5.0), 3: (ATTACK, 1, 6.0),
+              4: (DEFEND, 2, 2.0), 5: (DEFEND, 2, 3.0), 6: (DEFEND, 2, 9.0), 7: (HOLD, 2, 1.0)}
+    book, _ = _pick_book(orders)
+    assert _chosen(book, orders) == [1, 2, 4, 5]                            # two from each half, hold excluded
+    plain = {1: (ATTACK, 0, 4.0), 2: (DEFEND, 0, 5.0), 3: (ATTACK, 0, 6.0)}
+    assert len(_chosen(*[_pick_book(plain)[0], plain])) == 2                # an unsplit team is one group
+
+
+def test_grabbers_stay_chosen_while_eligible_and_are_replaced_when_they_die():
+    orders = {1: (ATTACK, 0, 5.0), 2: (ATTACK, 0, 6.0), 3: (ATTACK, 0, 20.0)}
+    book, positions = _pick_book(orders)
+    assert _chosen(book, orders) == [1, 2]
+    positions[3] = _near(3, 1.0)                                            # a newcomer is now nearest of all
+    book.sync_pickups(BLUE, DROP_AT, positions, lambda i: True, 2, 30.0)
+    assert _chosen(book, orders) == [1, 2]                                  # the runners keep their job
+    book.sync_pickups(BLUE, DROP_AT, positions, lambda i: i != 1, 2, 30.0)  # bot 1 dies
+    assert _chosen(book, orders) == [2, 3]                                  # the next nearest takes over
+    positions[2] = _near(2, 60.0)                                           # bot 2 is thrown far away
+    book.sync_pickups(BLUE, DROP_AT, positions, lambda i: i != 1, 2, 30.0)
+    assert _chosen(book, orders) == [3]
+
+
+def test_the_job_is_published_on_the_order_objective_and_cleared_with_the_drop():
+    orders = {1: (ATTACK, 0, 5.0), 2: (ATTACK, 0, 6.0), 3: (ATTACK, 0, 7.0)}
+    book, positions = _pick_book(orders)
+    jobs = {o.carrier_id: int(o.params[P_JOB]) for o in book.objectives(orders, (6.0, 40.0, 40.0, 1.0)[:P_JOB])}
+    assert jobs == {1: JOB_PICKUP, 2: JOB_PICKUP, 3: JOB_NONE}
+    book.sync_pickups(BLUE, None, positions, lambda i: True, 2, 30.0)       # picked up / returned
+    assert _chosen(book, orders) == []
+
+
+# --- the director
+
+def _drop_director(*bot_specs, config=None, drop_team=TEAM2, holders=None):
+    """TEAM1 bots as (id, distance from the drop, order) and the enemy (TEAM2) intel lying dropped."""
+    bots = [_bot(i, f"Bot{i}", TEAM1, pos=_near(i, d)) for i, d, _o in bot_specs]
+    human = _human(9)
+    director = _director(*bots, players=[human], config=config)
+    director.server.mode = SimpleNamespace(
+        intel_holder=holders if holders is not None else {}, intel_positions={drop_team: DROP_AT},
+        intel_drop_time={drop_team: 5.0})
+    for (i, _d, order) in bot_specs:
+        if order:
+            director.give_order(order, human, (f"bot{i}",))
+    return director, bots
+
+
+def _grabbers(director):
+    return sorted(o.carrier_id for o in director._objectives_player_orders(None) if int(o.params[P_JOB]) == JOB_PICKUP)
+
+
+def test_the_director_sends_the_nearest_two_eligible_bots_within_30_blocks():
+    director, _ = _drop_director((1, 4.0, "hold"), (2, 5.0, "attack"), (3, 9.0, "defend"), (4, 12.0, "protect"),
+                                 (5, 20.0, "follow"), (6, 31.0, "attack"), (7, 6.0, None))
+    assert _grabbers(director) == [2, 3]                      # hold (1) and the unordered bot (7) are skipped
+    director.give_order("free", _human(9), ("bot2",))        # one is released: the next nearest takes over
+    assert _grabbers(director) == [3, 4]
+
+
+def test_the_director_reads_count_and_radius_from_config():
+    config = SimpleNamespace(order_pickup_count=3, order_pickup_radius=15.0)
+    director, _ = _drop_director((1, 4.0, "attack"), (2, 8.0, "attack"), (3, 14.0, "attack"), (4, 16.0, "attack"), config=config)
+    assert _grabbers(director) == [1, 2, 3]
+    off, _ = _drop_director((1, 4.0, "attack"), config=SimpleNamespace(order_pickup_count=0))
+    assert _grabbers(off) == []
+
+
+def test_only_the_enemys_dropped_intel_sends_bots_never_our_own():
+    director, _ = _drop_director((1, 4.0, "attack"), (2, 5.0, "defend"), drop_team=TEAM1)   # OUR intel is dropped
+    assert _grabbers(director) == []
+    director, _ = _drop_director((1, 4.0, "attack"), (2, 5.0, "defend"), holders={TEAM2: SimpleNamespace(id=30)})
+    assert _grabbers(director) == []                          # picked up: nobody is sent any more
+    director.server.mode.intel_holder = {}
+    assert _grabbers(director) == [1, 2]                      # dropped again
+    director.server.mode.intel_drop_time = {TEAM2: 0.0}       # returned home
+    assert _grabbers(director) == []
+
+
+def test_a_split_sends_two_from_each_half_and_never_a_free_or_hold_half():
+    director, _ = _drop_director((1, 3.0, None), (2, 4.0, None), (3, 5.0, None), (4, 6.0, None),
+                                 (5, 7.0, None), (6, 8.0, None))
+    director.give_split("attack", "defend", _human(9))
+    assert _grabbers(director) == [1, 2, 4, 5]                # halves {1,2,3} and {4,5,6}: two each
+    director.give_order("free", _human(9))
+    director.give_split("hold", "attack", _human(9))
+    assert _grabbers(director) == [4, 5]                      # the hold half is skipped, the attack half grabs
+    director.give_order("free", _human(9))
+    director.give_split("free", "defend", _human(9))
+    assert _grabbers(director) == [4, 5]                      # a free half is skipped too
+
+
+def test_a_dead_bot_is_not_sent_and_a_grabber_that_dies_is_replaced():
+    director, bots = _drop_director((1, 4.0, "attack"), (2, 5.0, "attack"), (3, 6.0, "attack"))
+    assert _grabbers(director) == [1, 2]
+    bots[0].alive = False
+    assert _grabbers(director) == [2, 3]
+
+
+def test_the_other_team_goes_for_a_dropped_team1_intel():
+    bots = [_bot(i, f"Grn{i}", TEAM2, pos=_near(i, 4.0 + i)) for i in range(11, 14)]
+    director = _director(*bots, players=[_human(9, team=TEAM2)])
+    director.server.mode = SimpleNamespace(intel_holder={}, intel_positions={TEAM1: DROP_AT}, intel_drop_time={TEAM1: 5.0})
+    director.give_order("attack", _human(9, team=TEAM2))
+    assert _grabbers(director) == [11, 12]
+
+
+# --- the worker dives on the grab
+
+def test_a_chat_ordered_grab_dives_for_the_intel_from_any_distance_even_beside_a_defender():
+    from tests.test_bot_player_orders import _fighter as fighter
+    for distance in (6.0, 25.0, 45.0):
+        intel = (10.5 + distance, 10.5, _HEAD)
+        me = fighter(1, BLUE, 10.5, 10.5)
+        enemy = fighter(2, GREEN, intel[0] + 3.0, 14.5)
+        world = _TacticalWorld(route_step=RouteStep(intel, MovementAffordance.WALK))
+        decision = ModeBotDecision(intel, "order_pickup", sprint=True, arrival_radius=1.0,
+                                   posture=ModeBotPosture.ASSAULT, objective_priority=0.97, engagement_radius=40.0)
+        intent = SimpleBotBrain(world)._combat_intent(
+            _frame(me, enemy), me, enemy, _BotState(1, 1, me.life_id), _profile(), 100.0, decision)
+        assert intent.debug_role == "combat_objective:order_pickup", distance
+        assert intent.movement.direction[0] > 0.9, distance                 # straight at the intel
+
+
+# -------------------------------------------------------------- compact status format
+
+from commands.bot_orders import compact_status, parse_full
+
+
+def _rows(*groups):
+    """Status rows from (order, half, [names]) groups, in the order given."""
+    return [(name, order, half, "idle") for order, half, names in groups for name in names]
+
+
+def test_compact_status_groups_by_order_and_half_one_segment_each():
+    rows = _rows(("hold", 0, ["Rex", "Ann"]), ("attack", 1, ["Zed", "Moe"]))
+    assert compact_status("Blue", rows) == ["Blue hold: Rex, Ann | attack 1: Zed, Moe"]       # the example from the notes
+
+
+def test_compact_status_gathers_scattered_bots_and_puts_free_last():
+    rows = [("A", "free", 0, ""), ("B", "hold", 0, ""), ("C", "attack", 2, ""), ("D", "hold", 0, ""), ("E", "free", 0, "")]
+    assert compact_status("Green", rows) == ["Green hold: B, D | attack 2: C | free: A, E"]
+
+
+def test_compact_status_wraps_at_the_chat_width_and_repeats_the_label():
+    names = [f"Bot{n:02d}" for n in range(1, 16)]
+    rows = _rows(("hold", 0, names[:8]), ("attack", 1, names[8:12]), ("protect", 2, names[12:]))
+    lines = compact_status("Blue", rows)
+    assert all(len(line) <= 90 for line in lines) and all(line.startswith("Blue ") for line in lines)
+    joined = " ".join(lines)
+    assert all(name in joined for name in names)                                              # nobody is dropped
+    assert 2 <= len(lines) <= 3
+
+
+def test_a_group_too_long_for_one_line_is_split_across_lines_with_its_header():
+    names = [f"LongBotName{n:02d}" for n in range(1, 13)]                                     # ~13 chars each
+    lines = compact_status("Blue", _rows(("hold", 0, names)))
+    assert len(lines) >= 2 and all(len(line) <= 90 for line in lines)
+    assert all(line.startswith("Blue hold: ") for line in lines)
+    assert sum(line.count("LongBotName") for line in lines) == 12
+
+
+def test_two_teams_of_fifteen_bots_fit_in_about_ten_chat_lines_even_with_many_groups():
+    worst = []
+    for label, base in (("Blue", 0), ("Green", 100)):
+        orders = ["hold", "attack", "defend", "protect", "escort", "follow", "free"]
+        rows = [(f"B{base + n}x", orders[n % 7], (n % 3), "") for n in range(15)]            # 15 bots, up to 15 groups
+        worst += compact_status(label, rows)
+    assert len(worst) <= 10, len(worst)
+    best = compact_status("Blue", _rows(("hold", 0, [f"Pancake{n:02d}" for n in range(15)])))
+    assert len(best) <= 3                                   # 15 long names fill three 90-character lines
+
+
+def test_parse_full_takes_the_word_out_of_the_names():
+    assert parse_full(["full"]) == (True, [])
+    assert parse_full(["FULL", "rex"]) == (True, ["rex"])
+    assert parse_full(["rex", "full", "ann"]) == (True, ["rex", "ann"])
+    assert parse_full(["rex"]) == (False, ["rex"])
+    assert parse_full([]) == (False, [])
+
+
+def test_a_team_member_always_gets_full_detail_and_full_changes_nothing_for_them(monkeypatch):
+    sent = _commands(monkeypatch)
+    member = _human(9, team=TEAM1)
+    bots, director = _two_teams(member)
+    server = _server(director)
+    asyncio.run(handle_command(server, member, "status"))
+    first = list(sent)
+    sent.clear()
+    asyncio.run(handle_command(server, member, "st full"))
+    assert sent == first and len(first) == 4 and first[0] == "Blu1 [free]: idle"
+
+
+def test_the_docs_describe_the_compact_status():
+    guide = (Path(__file__).resolve().parents[1] / "docs" / "BOT_CHAT_ORDERS.md").read_text(encoding="utf-8")
+    assert "/status full" in guide and "/st full" in guide and "Blue hold: Rex, Ann | attack 1: Zed, Moe" in guide

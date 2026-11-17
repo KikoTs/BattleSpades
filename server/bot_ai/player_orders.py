@@ -16,13 +16,23 @@ anchor or the spot where the bot was ordered):
 ``hold``     stay where ordered; strafe within a leash while fighting
 ``attack``   push enemy intel, else enemy base, else hunt the nearest enemy;
              while a teammate carries the enemy intel, a share of the attackers
-             (``order_attack_escort_ratio``) escorts him and the rest push the
+             (``order_attack_escort_ratio``) escorts him and the rest intercept:
+             they hunt the enemies nearest the carrier (within
+             ``order_attack_intercept_radius`` of him) instead of camping the
              enemy base
 ``defend``   hold our base; chase a thief only while he is near the base
 ``protect``  intel-centric: escort a friendly carrier and/or hunt the thief of
              our intel at any distance (split by bot id when both), else guard
              our intel
-``escort``   escort the friendly carrier (else the issuer); never splits
+Dropped intel: when the enemy's intel lies dropped and uncarried, the nearest
+``order_pickup_count`` bots (within ``order_pickup_radius`` of it) under
+attack, escort, protect, defend or follow go and grab it, sprinting, within each
+half of a split independently; hold and free bots never do. A bot that grabs it
+takes it home first (the carrier rule), then resumes its order. Escorts whose
+carrier fell head for the dropped intel, not his body or the issuer.
+
+``escort``   escort the friendly carrier (else the issuer); never splits. When the
+             issuer dies and no carrier is being escorted it becomes ``hold``
 
 A bot carrying intel always takes it home first, whatever it was ordered.
 """
@@ -56,19 +66,27 @@ DONE_TEXT = {
     "free": "free",
 }
 
-# Operator tunables (``[bots] order_*``). The director stamps the first two on
+# Operator tunables (``[bots] order_*``). The director stamps the first three on
 # every published order as ``ObjectiveSnapshot.params`` and the bot's job as the
-# third, so the worker needs no config of its own; an empty ``params`` means
+# fourth, so the worker needs no config of its own; an empty ``params`` means
 # "use these defaults, no job".
 DEFAULT_HOLD_LEASH = 6.0            # blocks a holding bot may stray in a fight
 DEFAULT_DEFEND_CHASE_RADIUS = 40.0  # blocks from our base a thief is chased to
 DEFAULT_PROTECT_HUNT_RATIO = 0.5    # share of /protect bots that hunt the thief
 DEFAULT_ATTACK_ESCORT_RATIO = 0.5   # share of /attack bots that escort a carrier
-P_HOLD_LEASH, P_DEFEND_CHASE, P_JOB = 0, 1, 2
+DEFAULT_ATTACK_INTERCEPT_RADIUS = 40.0  # blocks from a friendly carrier enemies are hunted in
+P_HOLD_LEASH, P_DEFEND_CHASE, P_INTERCEPT, P_JOB = 0, 1, 2, 3
 
 # A bot's job while a friendly carrier exists. ``JOB_NONE`` means the plain
-# version of its order: /attack pushes the objective, /protect escorts.
-JOB_NONE, JOB_ESCORT, JOB_PUSH = 0, 1, 2
+# version of its order: /attack intercepts around the carrier, /protect escorts.
+JOB_NONE, JOB_ESCORT, JOB_PUSH, JOB_PICKUP = 0, 1, 2, 3
+
+# Dropped-intel pickup (``[bots] order_pickup_count`` / ``order_pickup_radius``).
+DEFAULT_PICKUP_COUNT = 2
+DEFAULT_PICKUP_RADIUS = 30.0
+# Orders whose bots may be sent to grab a dropped enemy intel. /hold and a free
+# half of a /split are not among them.
+PICKUP_CODES = frozenset({ATTACK, ESCORT, PROTECT, DEFEND, FOLLOW})
 
 # A bot already this far from our base counts as "out chasing": it keeps the
 # chase until the thief passes 25 % beyond the radius, so a thief walking the
@@ -77,12 +95,13 @@ _CHASE_HYSTERESIS = 1.25
 _AT_BASE_RADIUS = 12.0
 
 
-def clamp_params(hold_leash: float, defend_chase: float) -> tuple[float, float]:
+def clamp_params(hold_leash: float, defend_chase: float, intercept: float) -> tuple[float, float, float]:
     """Return the worker tunables in published order, each bounded to a sane range."""
 
     return (
         min(40.0, max(0.0, float(hold_leash))),
         min(400.0, max(0.0, float(defend_chase))),
+        min(400.0, max(0.0, float(intercept))),
     )
 
 
@@ -131,13 +150,15 @@ class PlayerOrderBook:
     order replaced by someone else's belongs to the new issuer.
     """
 
-    __slots__ = ("_orders", "_jobs")
+    __slots__ = ("_orders", "_jobs", "_pickups")
 
     def __init__(self) -> None:
         self._orders: dict[int, PlayerOrder] = {}
         # (team, order code) -> {bot id: job}, fixed while a friendly carrier
         # exists so a bot keeps its job through death and respawn.
         self._jobs: dict[tuple[int, int], dict[int, int]] = {}
+        # (team, split half) -> the bot ids sent to grab a dropped enemy intel.
+        self._pickups: dict[tuple[int, int], list[int]] = {}
 
     def issue(self, bot_id: int, order: PlayerOrder) -> None:
         self._orders[int(bot_id)] = order
@@ -148,6 +169,7 @@ class PlayerOrderBook:
     def clear_all(self) -> None:
         self._orders.clear()
         self._jobs.clear()
+        self._pickups.clear()
 
     def get(self, bot_id: int) -> PlayerOrder | None:
         return self._orders.get(int(bot_id))
@@ -215,21 +237,38 @@ class PlayerOrderBook:
             del self._orders[bot_id]
         return len(stale)
 
-    def release_orphaned_follows(self, issuer_alive, positions: dict[int, Vector3]) -> list[int]:
-        """Turn ``follow`` orders whose issuer is gone into ``hold`` where the bot stands.
+    def release_orphaned_follows(self, issuer_alive, positions: dict[int, Vector3],
+                                 issuer_dead=None, has_carrier=None) -> list[int]:
+        """Turn orders that follow an issuer who is gone into ``hold`` where the bot stands.
 
         ``issuer_alive(issuer_id, team)`` says whether that player is still alive
-        on the order's team. A bot never chases an issuer's respawn: it keeps
-        guarding the place it was at when the issuer fell. Returns the bot ids
-        converted. A bot with no known position keeps its order unchanged.
+        on the order's team. A ``follow`` whose issuer is not (died, or changed
+        team) converts. A bot never chases an issuer's respawn: it keeps
+        guarding the place it was at when the issuer fell.
+
+        An ``escort`` converts the same way when its issuer **died**
+        (``issuer_dead(issuer_id, team)``: connected, on the order's team, not
+        alive), unless ``has_carrier(team, bot_id)`` says the bot is escorting a
+        friendly carrier instead, which is a different job that changes nothing.
+        An issuer who was never on the team (an admin or spectator ordering from
+        outside with /team) does not count as dead.
+
+        Returns the bot ids converted. A bot with no known position keeps its
+        order unchanged.
         """
 
         converted: list[int] = []
         for bot_id, order in list(self._orders.items()):
-            if order.code != FOLLOW or bot_id not in positions:
+            if order.code not in (FOLLOW, ESCORT) or bot_id not in positions:
                 continue
-            if issuer_alive(order.issuer_id, order.team):
-                continue
+            if order.code == FOLLOW:
+                if issuer_alive(order.issuer_id, order.team):
+                    continue
+            else:
+                if issuer_dead is None or not issuer_dead(order.issuer_id, order.team):
+                    continue
+                if has_carrier is not None and has_carrier(order.team, bot_id):
+                    continue
             self._orders[bot_id] = PlayerOrder(
                 HOLD, order.team, order.issuer_id,
                 tuple(float(value) for value in positions[bot_id]),
@@ -275,9 +314,49 @@ class PlayerOrderBook:
             else:
                 table[bot_id] = JOB_PUSH
 
+    def sync_pickups(self, team: int, dropped_at, positions: dict[int, Vector3], alive,
+                     count: int, radius: float) -> None:
+        """Pick the bots of ``team`` that go and grab a dropped enemy intel.
+
+        ``dropped_at`` is where it lies (None: nothing is dropped, so nobody is
+        sent). Within each split half independently (half 0 is an unsplit team),
+        the ``count`` nearest bots within ``radius`` of it whose order is in
+        ``PICKUP_CODES`` and who are ``alive(bot_id)`` are chosen. A bot already
+        chosen stays chosen while it remains eligible, so the grabbers do not
+        trade places as they run; a bot that dies or is re-ordered to /hold is
+        replaced by the next nearest.
+        """
+
+        team = int(team)
+        if dropped_at is None or count <= 0:
+            for key in [key for key in self._pickups if key[0] == team]:
+                del self._pickups[key]
+            return
+        groups: dict[int, list[int]] = {}
+        for bot_id, order in self._orders.items():
+            if (order.team == team and order.code in PICKUP_CODES
+                    and bot_id in positions and alive(bot_id)):
+                distance = math.dist(positions[bot_id], dropped_at)
+                if distance <= radius:
+                    groups.setdefault(order.half, []).append(bot_id)
+        for key in [key for key in self._pickups if key[0] == team and key[1] not in groups]:
+            del self._pickups[key]
+        for half, eligible in groups.items():
+            chosen = [bot_id for bot_id in self._pickups.get((team, half), []) if bot_id in eligible]
+            for bot_id in sorted(eligible, key=lambda i: (math.dist(positions[i], dropped_at), i)):
+                if len(chosen) >= count:
+                    break
+                if bot_id not in chosen:
+                    chosen.append(bot_id)
+            self._pickups[(team, half)] = chosen[:count]
+
     def job_of(self, bot_id: int) -> int:
         order = self._orders.get(int(bot_id))
-        if order is None or order.half:
+        if order is None:
+            return JOB_NONE
+        if int(bot_id) in self._pickups.get((order.team, order.half), ()):
+            return JOB_PICKUP      # a grab beats the order's own job, in every half
+        if order.half:
             return JOB_NONE        # a bot inside a /split runs the plain version
         return self._jobs.get((order.team, order.code), {}).get(int(bot_id), JOB_NONE)
 
@@ -359,6 +438,8 @@ _ROLE_TEXT = {
     "order_attack": "pushing the enemy objective",
     "order_attack_hunt": "hunting the nearest enemy",
     "order_attack_escort": "escorting the carrier home",
+    "order_attack_intercept": "intercepting an enemy near the carrier",
+    "order_attack_intercept_screen": "screening the carrier",
     "order_defend": "guarding the base",
     "order_defend_hunt": "chasing the thief near our base",
     "order_protect_guard": "guarding our intel",
@@ -368,6 +449,8 @@ _ROLE_TEXT = {
     "order_escort_issuer": "escorting you",
     "order_escort_hold": "nobody to escort, holding",
     "order_capture": "bringing the intel home",
+    "order_pickup": "grabbing the dropped intel",
+    "order_escort_dropped": "heading for the dropped intel",
 }
 
 
@@ -390,6 +473,7 @@ def player_order_decision(frame: PerceptionFrame, observer: PlayerSnapshot):
     team = observer.team
     hold_leash = _param(order, P_HOLD_LEASH, DEFAULT_HOLD_LEASH)
     chase_radius = _param(order, P_DEFEND_CHASE, DEFAULT_DEFEND_CHASE_RADIUS)
+    intercept_radius = max(0.0, _param(order, P_INTERCEPT, DEFAULT_ATTACK_INTERCEPT_RADIUS))
     job = int(_param(order, P_JOB, JOB_NONE))
 
     own_base = _objective(frame, "ctf_base", team, enemy=False)
@@ -436,9 +520,17 @@ def player_order_decision(frame: PerceptionFrame, observer: PlayerSnapshot):
             return None
         if enemy_intel.carrier_id == observer.player_id:
             return None
-        live = _player(frame, enemy_intel.carrier_id)
-        if live is not None:
-            return tuple(live.position)
+        listed = next((p for p in frame.players if p.player_id == enemy_intel.carrier_id), None)
+        if listed is not None:
+            # A carrier who has fallen is a body, not a carrier: never escort
+            # his corpse (or the respawn that follows).
+            return tuple(listed.position) if _alive(listed) else None
+        return tuple(enemy_intel.position)
+
+    def dropped_enemy_intel():
+        """Where the enemy intel lies dropped and uncarried, or None."""
+        if enemy_intel is None or enemy_intel.carrier_id >= 0 or int(enemy_intel.state) != 1:
+            return None
         return tuple(enemy_intel.position)
 
     def thief_position():
@@ -454,6 +546,16 @@ def player_order_decision(frame: PerceptionFrame, observer: PlayerSnapshot):
             (_objective(frame, "team_anchor", team, enemy=False) or order).position
         )
 
+    # A dropped enemy intel: the nearest few bots (chosen by the director per
+    # split half) run and grab it. A bot that does goes home first, then
+    # resumes its order, by the carrier rule above.
+    lying = dropped_enemy_intel()
+    if lying is not None and job == JOB_PICKUP and code in PICKUP_CODES:
+        return ModeBotDecision(
+            lying, "order_pickup", sprint=True, arrival_radius=1.0,
+            posture=ModeBotPosture.ASSAULT, objective_priority=0.97, engagement_radius=40.0,
+        )
+
     if code == FOLLOW:
         issuer = _player(frame, order.attacker)
         if issuer is not None and issuer.team == team:
@@ -467,6 +569,10 @@ def player_order_decision(frame: PerceptionFrame, observer: PlayerSnapshot):
         carrier = friendly_carrier()
         if carrier is not None:
             return escort(carrier, "order_escort_carrier")
+        if lying is not None:
+            # The carrier fell and the intel lies where he did: go there, not to
+            # his body, his respawn or the issuer. The nearest few grab it.
+            return escort(lying, "order_escort_dropped")
         issuer = _player(frame, order.attacker)
         if issuer is not None and issuer.team == team and issuer.player_id != observer.player_id:
             return escort(issuer.position, "order_escort_issuer")
@@ -506,15 +612,35 @@ def player_order_decision(frame: PerceptionFrame, observer: PlayerSnapshot):
     if code == ATTACK:
         # While a teammate carries the enemy intel, the director has split the
         # team's attack-ordered bots by id (``order_attack_escort_ratio``) and
-        # fixed the jobs until the carrier drops or dies: escorts follow him,
-        # the rest keep attacking. The intel moves with its carrier, so the
-        # attackers aim at the enemy base instead of converging on him. When
-        # the intel resets there is no carrier and every bot attacks it again.
+        # fixed the jobs until the carrier drops or dies. Escorts follow him.
+        # The others intercept instead of camping the enemy base: they hunt the
+        # enemies nearest the carrier, within ``order_attack_intercept_radius``
+        # of him, and screen the carrier when none is that close. A bot with no
+        # job (a plain order inside a /split) intercepts too. When the intel
+        # resets there is no carrier and every bot attacks it again.
         carrier = friendly_carrier()
-        if carrier is not None and job == JOB_ESCORT:
-            return escort(carrier, "order_attack_escort")
+        if carrier is not None:
+            if job == JOB_ESCORT:
+                return escort(carrier, "order_attack_escort")
+            threats = sorted(
+                (p for p in frame.players
+                 if _alive(p) and p.team != team and math.dist(p.position, carrier) <= intercept_radius),
+                key=lambda p: (math.dist(p.position, carrier), p.player_id),
+            )[:2]
+            if threats:
+                # Spread over the two nearest by bot id so the pack does not
+                # all pile onto one man.
+                chosen = threats[observer.player_id % len(threats)]
+                return hunt(chosen.position, "order_attack_intercept",
+                            engagement=max(60.0, intercept_radius + 20.0))
+            return ModeBotDecision(
+                tuple(carrier), "order_attack_intercept_screen",
+                sprint=math.dist(observer.position, carrier) > 14.0, arrival_radius=10.0,
+                posture=ModeBotPosture.ASSAULT, objective_priority=0.95,
+                engagement_radius=max(40.0, intercept_radius),
+            )
         target = (
-            (None if carrier is not None else _objective(frame, "ctf_intel", team, enemy=True))
+            _objective(frame, "ctf_intel", team, enemy=True)
             or _objective(frame, "ctf_base", team, enemy=True)
             or _objective(frame, "team_anchor", team, enemy=True)
         )

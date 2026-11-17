@@ -411,7 +411,8 @@ Bot orders (any player on a team, no admin needed; see
 and `/split <action> [<action>]` to divide the bots between two jobs;
 admins (and spectators, if `order_team_command_spectators` is on) can command a team
 from outside with `/team <blue|green|all> <command>`, for example `/team blue split attack` or
-`/team all status`. Short forms (case-insensitive, usable at the top level and inside `/team` and
+`/team all status` (a spectator's `/status` and `/team all status` group bots by order and half, e.g.
+`Blue hold: Rex, Ann | attack 1: Zed, Moe`; `/status full` gives the per-bot detail). Short forms (case-insensitive, usable at the top level and inside `/team` and
 `/split`): `t`=team, `sp`=split, `fo`=follow, `ho`=hold, `at`=attack, `de`=defend, `pr`=protect,
 `es`=escort, `fr`=free, `st`=status; team arguments `b`=blue, `g`=green, `a`=all, so
 `/t b sp at pr` is `/team blue split attack protect` (full table in docs/BOT_CHAT_ORDERS.md)

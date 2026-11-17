@@ -10,6 +10,7 @@ below take an optional ``team`` so the same commands can address another team
 """
 
 from server.bot_ai.player_orders import DONE_TEXT
+from shared.constants import MAX_CHAT_SIZE
 from server.game_constants import TEAM1, TEAM2
 
 from .command_handler import CommandContext, register_command, send_message
@@ -74,8 +75,64 @@ async def run_order(ctx: CommandContext, order: str, names, team: int | None = N
 _STATUS_LINES = 12
 
 
+def parse_full(names) -> tuple[bool, list[str]]:
+    """Split the ``full`` flag (``/status full``, ``/st full``) from bot name arguments."""
+
+    rest = [name for name in names if name.lower() != "full"]
+    return len(rest) != len(list(names)), rest
+
+
+def _full_lines(rows) -> list[str]:
+    """One line per bot: ``Rex [hold, half 1]: holding position``."""
+
+    lines = []
+    for name, order, half, doing in rows[:_STATUS_LINES]:
+        detail = f"{order}, half {half}" if half else order
+        lines.append(f"{name} [{detail}]: {doing}")
+    if len(rows) > _STATUS_LINES:
+        lines.append(f"... and {len(rows) - _STATUS_LINES} more")
+    return lines
+
+
+def compact_status(label: str, rows, width: int = MAX_CHAT_SIZE) -> list[str]:
+    """Group a team's bots by order and half, one segment per group.
+
+    ``Blue hold: Rex, Ann | attack 1: Zed, Moe``. Segments share a line up to
+    ``width`` characters; a group too long for one line is split across several
+    (each repeating its header). Groups keep the order their first bot appears
+    in, free bots last, so two teams of 15 bots fit in a handful of lines.
+    """
+
+    groups: dict[tuple[str, int], list[str]] = {}
+    for name, order, half, _doing in rows:
+        groups.setdefault((order, half), []).append(name)
+    ordered = sorted(groups.items(), key=lambda item: item[0][0] == "free")   # stable: free last
+    prefix = f"{label} "
+    lines: list[str] = []
+    current = prefix
+    for (order, half), names in ordered:
+        head = f"{order} {half}" if half else order
+        pending = list(names)
+        while pending:
+            take = len(pending)
+            while take > 1 and len(f"{head}: {', '.join(pending[:take])}") + len(prefix) > width:
+                take -= 1
+            segment = f"{head}: {', '.join(pending[:take])}"
+            pending = pending[take:]
+            joined = segment if current == prefix else f" | {segment}"
+            if current != prefix and len(current) + len(joined) > width:
+                lines.append(current)
+                current, joined = prefix, segment
+            current += joined
+    if current != prefix:
+        lines.append(current)
+    return lines
+
+
 async def run_status(ctx: CommandContext, names, team: int | None = None,
                      label: str | None = None) -> None:
+    """One team's status, in full per-bot detail."""
+
     target = await _target(ctx, team)
     if target is None:
         return
@@ -85,11 +142,31 @@ async def run_status(ctx: CommandContext, names, team: int | None = None,
         where = "your team" if team == getattr(ctx.player, "team", None) else "that team"
         await _say(ctx, f"No matching bots on {where}", label)
         return
-    for name, order, half, doing in rows[:_STATUS_LINES]:
-        detail = f"{order}, half {half}" if half else order
-        await _say(ctx, f"{name} [{detail}]: {doing}", label)
-    if len(rows) > _STATUS_LINES:
-        await _say(ctx, f"... and {len(rows) - _STATUS_LINES} more", label)
+    for line in _full_lines(rows):
+        await _say(ctx, line, label)
+
+
+async def run_status_teams(ctx: CommandContext, names, teams, *, full: bool = False) -> None:
+    """Both teams' status for a spectator or ``/team all status``.
+
+    Compact by default (one line per group of bots sharing an order and half);
+    ``full`` gives the per-bot detail of a single team's ``/status`` for each.
+    """
+
+    target = await _target(ctx, teams[0])
+    if target is None:
+        return
+    director, _ = target
+    for each in teams:
+        label = team_label(ctx.server, each)
+        rows = director.order_status(ctx.player, tuple(names), team=each)
+        if not rows:
+            where = "your team" if each == getattr(ctx.player, "team", None) else "that team"
+            await _say(ctx, f"No matching bots on {where}", label)
+            continue
+        lines = _full_lines(rows) if full else compact_status(label, rows)
+        for line in lines:
+            await send_message(ctx.server, ctx.player, f"{label}: {line}" if full else line)
 
 
 async def run_split(ctx: CommandContext, args, team: int | None = None,
@@ -166,17 +243,16 @@ async def cmd_free(ctx: CommandContext):
 
 
 @register_command(name="status", aliases=["orders", "st"], usage="/status" + _USAGE_TAIL,
-                  description="Show each of your team's bots (both teams for spectators): order, split half, what it is doing")
+                  description="Show each of your team's bots: order, split half, what it is doing (spectators: both teams, grouped; add 'full' for detail)")
 async def cmd_status(ctx: CommandContext):
+    full, names = parse_full(ctx.args)
     if getattr(ctx.player, "team", None) not in (TEAM1, TEAM2):
-        # A spectator is on no team, so show both. It is read-only, so it needs
-        # no permission (unlike ordering with /team <color> <command>).
-        if await _target(ctx, TEAM1) is None:
-            return
-        for each in (TEAM1, TEAM2):
-            await run_status(ctx, ctx.args, each, team_label(ctx.server, each))
+        # A spectator is on no team, so show both, compactly unless asked for
+        # "full". It is read-only, so it needs no permission (unlike ordering
+        # with /team <color> <command>).
+        await run_status_teams(ctx, names, (TEAM1, TEAM2), full=full)
         return
-    await run_status(ctx, ctx.args)
+    await run_status(ctx, names)
 
 
 @register_command(name="split", aliases=["sp"], usage="/split <action> [<action>]" + _USAGE_TAIL,
@@ -259,8 +335,14 @@ async def team_command(ctx: CommandContext) -> None:
         async def runner(target_team, label):
             await run_order(ctx, action, rest, target_team, label)
     elif command in _STATUS_NAMES:
+        full, status_names = parse_full(rest)
+        if everyone:
+            if await _target(ctx, TEAM1) is not None:
+                await run_status_teams(ctx, status_names, (TEAM1, TEAM2), full=full)
+            return
+
         async def runner(target_team, label):
-            await run_status(ctx, rest, target_team, label)
+            await run_status(ctx, status_names, target_team, label)
     elif command in _SPLIT_NAMES:
         async def runner(target_team, label):
             await run_split(ctx, rest, target_team, label)

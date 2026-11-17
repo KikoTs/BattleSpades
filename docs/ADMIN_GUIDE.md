@@ -539,8 +539,13 @@ visible and hidden entries.
   `order_protect_hunt_ratio` (default 0.5, 0-1; the share of `/protect` bots
   that hunt the thief while a friendly carrier also needs escort) and
   `order_attack_escort_ratio` (default 0.5, 0-1; the share of `/attack` bots
-  that escort a friendly intel carrier while the rest keep attacking).
-  `order_team_command_spectators` (default `false`) controls `/team <color>
+  that escort a friendly intel carrier while the rest intercept) and
+  `order_attack_intercept_radius` (default 40.0 blocks, 0-400; the interceptors
+  hunt enemies within this distance of the carrier).
+  `order_pickup_count` (default 2, 0-8) and `order_pickup_radius` (default 30.0
+  blocks, 0-400): when the enemy's intel lies dropped, that many of the nearest
+  bots under attack, escort, protect, defend or follow, within the radius, go
+  and grab it (0 turns this off). `order_team_command_spectators` (default `false`) controls `/team <color>
   <command>`: admins can always order a team's bots from outside it, and `true`
   lets spectators do so too.
 - `[modes.<code>]`: `time_limit` seconds plus legacy aliases shown in the

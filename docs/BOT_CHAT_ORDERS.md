@@ -9,13 +9,13 @@ none, every bot on your team obeys.
 | --- | --- | --- |
 | `/follow [bot ...]` | | Escort you. If you die or change team, each following bot turns into a `/hold` at the spot where it stands and does **not** chase your respawn. If you disconnect, the order is freed (see below). |
 | `/hold [bot ...]` | `/stay` | Stay at the spot where the bot stood when ordered. In a fight the bot may strafe and dodge within the hold leash of that spot, then walks back when the fight is over. |
-| `/attack [bot ...]` | `/assault` | Push the enemy intel, else the enemy base, else hunt the nearest enemy. While a teammate carries the enemy intel the attackers split by bot id (see below): a share escorts him, the rest keep attacking the enemy base. When the carrier drops or dies, or the intel resets, every attacker pushes the objective again. |
+| `/attack [bot ...]` | `/assault` | Push the enemy intel, else the enemy base, else hunt the nearest enemy. While a teammate carries the enemy intel the attackers split by bot id (see below): a share escorts him, the rest **intercept** (hunt the enemies nearest the carrier, or screen him) instead of camping the enemy base. When the carrier drops or dies, or the intel resets, every attacker pushes the objective again. |
 | `/defend [bot ...]` | | Hold **our base**. A thief carrying our intel is chased only while he is within the chase radius of the base; beyond it the bot returns to and holds the base. |
 | `/protect [intel] [bot ...]` | `/protectintel` | Intel-centric, no distance leash. See the table below. |
-| `/escort [bot ...]` | | Escort the friendly carrier of the enemy intel, else you. Never splits, even when our intel is stolen. |
+| `/escort [bot ...]` | | Escort the friendly carrier of the enemy intel, else you. Never splits, even when our intel is stolen. If you die while a bot is escorting **you** (no carrier), it becomes a `/hold` where it stands, like `/follow`; a bot escorting a carrier is unaffected until he is gone. |
 | `/free [bot ...]` | `/resume`, `/release` | Release the bots; they play normally again. |
 | `/split <action> [<action>] [bot ...]` | | Split bots between two actions. See below. |
-| `/status [bot ...]` | `/orders` | One line per bot: its order, its `/split` half if any, and what it is doing right now. Players see their own team; **spectators see both teams**, labeled (read-only, so no permission is needed). `/team <color> status` shows one team and `/team all status` both. |
+| `/status [full] [bot ...]` | `/orders`, `/st` | Players see their own team, one line per bot: its order, its `/split` half if any, and what it is doing right now. **Spectators see both teams**, and `/team all status` shows both, in the compact format below; `/status full` (`/st full`) gives the per-bot detail instead. `/team <color> status` shows one team in full detail. Read-only, so spectators need no permission. |
 
 A bot that carries intel always takes it home first, whatever it was ordered.
 The carrier is found from the intel objective, which follows its holder, so an
@@ -41,9 +41,8 @@ job and a push job (`/attack`: escort or keep attacking; `/protect`: escort or
 hunt the thief):
 
 - `/attack` splits while a teammate carries the enemy intel. `order_attack_escort_ratio`
-  (default 0.5) of the attackers escort, rounded down; the rest keep attacking the
-  enemy base (the intel moves with its carrier, so they do not converge on him).
-  A single attacking bot attacks, and at least one bot always keeps attacking.
+  (default 0.5) of the attackers escort, rounded down; the rest **intercept**. A single
+  attacking bot intercepts, and at least one bot always does.
 - `/protect` splits while a friendly carrier and a thief both exist
   (`order_protect_hunt_ratio`, as above).
 - The escorts are the lowest bot ids. The jobs are **sticky**: fixed per bot id
@@ -51,8 +50,35 @@ hunt the thief):
   returns to the same job after respawn. Bots freed or newly ordered mid-carry
   never reshuffle the others; a newcomer fills whichever job is short.
 - A bot that is itself carrying the intel goes home and takes no job.
+- **Interceptors** (every attacker that is not escorting, including a plain `/attack` half
+  inside a `/split`) no longer camp the enemy base while a friendly carrier exists. They
+  look at the live enemies within `order_attack_intercept_radius` of the **carrier**
+  (default 40 blocks), sort them by distance to him, and hunt one of the two nearest,
+  chosen by bot id so the pack spreads out. When no enemy is that close they screen the
+  carrier (move up to him, in assault posture, ready to engage). They never go for the
+  enemy base while he lives; when the carrier drops or dies, or the intel resets, they
+  push the objective again.
 - When the carrier drops or dies, the jobs are dropped and every attacker pushes the
   intel again. A later carrier gets a fresh, deterministic split.
+
+## Status format
+
+- A **single team's** `/status` (a player's own team, or `/team blue status`) is one line per
+  bot, in full detail: `Rex [hold, half 1]: holding position (in position)`.
+- **A spectator's `/status` and `/team all status`** group the bots by order and split half, one
+  segment per group, so two teams of 15 bots fit in about ten chat lines:
+
+  ```
+  Blue hold: Rex, Ann | attack 1: Zed, Moe
+  Green defend: Bea, Cy | free: Dee
+  ```
+
+  A segment is `order[ half]: names`. Segments share a line up to the 90-character chat width; a
+  group too long for one line continues on the next with its header repeated; free bots come last.
+  The sub-goal is left out to keep it short.
+- **`/status full`** (short form `/st full`, also `/team all status full`) gives the full per-bot
+  lines on request, for a spectator or for both teams. Bot names after it still filter:
+  `/st full rex ann`.
 
 ## Short forms
 
@@ -142,6 +168,37 @@ outside the team: `/team blue protect`, `/team blue split attack`,
   yours on the bots it covers (they then belong to that member), and any teammate can
   `/free` bots you ordered.
 
+## Dropped intel
+
+When the **enemy's** intel lies dropped and uncarried (a carrier fell, or dropped it):
+
+- The nearest `order_pickup_count` bots (default 2) within `order_pickup_radius` (default 30
+  blocks) of it, among bots under `/attack`, `/escort`, `/protect`, `/defend` and `/follow`,
+  run and grab it, sprinting and diving for it even if a defender stands beside it. `/hold` bots
+  never go, and neither does a free half of a `/split`.
+- **Within each half of a split independently:** each half sends its own nearest bots.
+- A bot that grabs it takes it **home first** (the carrier rule that applies to every order), then
+  resumes its order. The other bots keep their roles; while the intel is carried again, `/escort` and
+  the attack/protect escorts escort the new carrier as before.
+- The chosen grabbers are kept while they stay eligible, so they do not trade places as they run; a
+  grabber that dies or is re-ordered to `/hold` is replaced by the next nearest.
+- **When the carrier an escort is following falls**, `/escort` bots (and attack escorts) no longer
+  head for his body, his respawn or the issuer: `/escort` bots go to the dropped intel (the nearest
+  ones grab it, the rest screen it), and `/attack` bots simply push the intel as their objective. A
+  carrier who is dead but still listed for a frame is never escorted.
+- `order_pickup_count = 0` turns the grab off.
+
+What the server itself allows (not changed here): the intel is picked up within 3 blocks with line of
+sight, and **nobody can pick it up for 2.5 seconds after it drops**, so a bot may stand on it briefly.
+
+**Our own dropped intel is not handled by orders.** If an enemy carrier is killed and drops *our*
+intel, `/protect` guards the spot (within 6 blocks, not touching it), `/defend` stays at the base and
+`/attack` goes after the enemy's. Moreover touching our own dropped intel returns it only when the
+rule `RULE_CTF_ENABLE_INTEL_RETURN_ON_TOUCH` is on (it is **off** by default); otherwise it comes back
+by the auto-return timer, and never in Classic+ (`intel_auto_return = false`), where it stays on the
+ground until an enemy picks it up again. Unordered bots send their two nearest to guard it
+(`ctf_recover_intel`).
+
 ## Order lifetime and ownership
 
 An order belongs to the bot, not to its life. It survives the bot's own death
@@ -157,10 +214,18 @@ and respawn (a `/hold` bot walks back to its post after respawning) and ends on:
 Ownership follows the latest order: a bot whose order is replaced by someone
 else's belongs to the new issuer, and only their disconnect frees it.
 
-`/follow` is the one order that also reacts to its issuer staying connected but
-going away. If the issuer dies or changes team, each following bot becomes a
-`/hold` at the spot where it stands. A spectator or an issuer who is merely dead
-keeps all their other orders.
+`/follow` and `/escort` also react to their issuer staying connected but going away:
+
+- `/follow`: if the issuer dies or changes team, each following bot becomes a `/hold` at the
+  spot where it stands, and never chases the respawn.
+- `/escort`: if the issuer **dies**, each bot that is escorting *them* (there is no friendly
+  carrier) becomes a `/hold` where it stands. A bot escorting a **different carrier** is not
+  affected; if the carrier is gone while the issuer is still dead, it converts then. If the
+  issuer is back before the carrier is gone it keeps escorting. An issuer who was never on
+  the team (an admin or spectator using `/team <color> escort`) does not count as dead, and
+  an issuer who merely changes team leaves the order as it is.
+
+Any other order keeps going when its issuer dies or spectates.
 
 ## Settings (`[bots]` in `config.toml`)
 
@@ -170,6 +235,9 @@ keeps all their other orders.
 | `order_defend_chase_radius` | `40.0` | Blocks from our base within which `/defend` chases a thief, 0-400. `0` never chases. |
 | `order_protect_hunt_ratio` | `0.5` | Share of `/protect` bots that hunt the thief when a carrier also needs escort, 0-1. |
 | `order_attack_escort_ratio` | `0.5` | Share of `/attack` bots that escort a friendly carrier of the enemy intel while the rest keep attacking, 0-1. |
+| `order_attack_intercept_radius` | `40.0` | Blocks from a friendly carrier within which interceptors hunt enemies, 0-400. `0` makes them only screen him. |
+| `order_pickup_count` | `2` | How many bots (per split half) go and grab a dropped enemy intel, 0-8. `0` turns it off. |
+| `order_pickup_radius` | `30.0` | Blocks from the dropped intel within which bots are eligible, 0-400. |
 | `order_team_command_spectators` | `false` | Lets spectators use `/team <color> <command>` too. Admins always may. |
 
 The director stamps the leash and chase radius, and each bot's job, on every
