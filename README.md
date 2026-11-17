@@ -407,7 +407,11 @@ browser, so verify registration with the source-tree checker described in the
 
 Bot orders (any player on a team, no admin needed; see
 [docs/BOT_CHAT_ORDERS.md](docs/BOT_CHAT_ORDERS.md)) — `/follow`, `/hold`, `/attack`,
-`/defend`, `/protect`, `/escort`, `/free`, `/status`, each with optional bot names
+`/defend`, `/protect`, `/escort`, `/free`, `/status`, each with optional bot names,
+and `/split <action> [<action>]` to divide the bots between two jobs;
+admins (and spectators, if `order_team_command_spectators` is on) can command a team
+from outside with `/team <blue|green|all> <command>`, for example `/team blue split attack` or
+`/team all status`
 
 **Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
 `/tp <player>`, `/god`, `/map <name>`, `/mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>`, `/restart`, `/say <msg>`,

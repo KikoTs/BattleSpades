@@ -196,6 +196,9 @@ class BotConfig:
     # Share of /attack bots that escort a friendly carrier of the enemy intel
     # while the rest keep attacking; fixed per bot id while the carrier lives.
     order_attack_escort_ratio: float = 0.5
+    # /team <color> <command> lets admins order a team's bots from outside it;
+    # true lets spectators do the same (off by default: admins only).
+    order_team_command_spectators: bool = False
 
 
 @dataclass
@@ -1530,6 +1533,9 @@ def load_config(
         config.bots.order_attack_escort_ratio = min(1.0, max(0.0, float(
             b.get("order_attack_escort_ratio", config.bots.order_attack_escort_ratio)
         )))
+        config.bots.order_team_command_spectators = bool(
+            b.get("order_team_command_spectators", config.bots.order_team_command_spectators)
+        )
 
     if "steam" in data:
         steam = data["steam"]

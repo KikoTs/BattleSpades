@@ -29,7 +29,7 @@ A bot carrying intel always takes it home first, whatever it was ordered.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from .messages import ObjectiveSnapshot, PerceptionFrame, PlayerSnapshot, Vector3
@@ -42,7 +42,19 @@ CODES = {
     "follow": FOLLOW, "hold": HOLD, "attack": ATTACK,
     "defend": DEFEND, "protect": PROTECT, "escort": ESCORT,
 }
+# A free half of a /split: the bot plays normally, but the book remembers which
+# half it is in. It is never published to the worker, so it steers nothing.
+FREE = 7
 NAMES = {value: key for key, value in CODES.items()}
+NAMES[FREE] = "free"
+# Every action a /split can give a half: the orders, or "free".
+SPLIT_CODES = {**CODES, "free": FREE}
+# What a bot is doing once it obeys, for the chat reply to an order or a /split.
+DONE_TEXT = {
+    "follow": "following you", "hold": "holding position", "attack": "attacking",
+    "defend": "defending", "protect": "protecting the intel", "escort": "escorting",
+    "free": "free",
+}
 
 # Operator tunables (``[bots] order_*``). The director stamps the first two on
 # every published order as ``ObjectiveSnapshot.params`` and the bot's job as the
@@ -104,6 +116,9 @@ class PlayerOrder:
     team: int
     issuer_id: int
     anchor: Vector3  # where the bot stood when ordered (hold point / fallback)
+    # 0 = a plain order; 1 or 2 = the first or second half of a /split. Halves
+    # are fixed by bot id and live in the order, so they survive death.
+    half: int = 0
 
 
 class PlayerOrderBook:
@@ -140,6 +155,12 @@ class PlayerOrderBook:
     def __len__(self) -> int:
         return len(self._orders)
 
+    def has_order(self, bot_id: int) -> bool:
+        """Whether the bot has an order that steers it (a free half does not)."""
+
+        order = self._orders.get(int(bot_id))
+        return order is not None and order.code != FREE
+
     def issuers(self) -> set[int]:
         """Player ids that issued at least one live order."""
 
@@ -152,6 +173,36 @@ class PlayerOrderBook:
         for bot_id in freed:
             del self._orders[bot_id]
         return freed
+
+    def split_active(self, team: int) -> bool:
+        """Whether ``team`` currently has bots in a /split."""
+
+        return any(order.half and order.team == int(team) for order in self._orders.values())
+
+    def dissolve_splits(self, team: int) -> int:
+        """End ``team``'s split: every bot keeps its order, now as a plain one."""
+
+        changed = 0
+        for bot_id, order in list(self._orders.items()):
+            if order.half and order.team == int(team):
+                if order.code == FREE:
+                    del self._orders[bot_id]      # a free half has nothing left to keep
+                else:
+                    self._orders[bot_id] = replace(order, half=0)
+                changed += 1
+        return changed
+
+    def normalize_splits(self) -> None:
+        """Dissolve any split that lost one of its halves (a half was freed,
+        left, or its issuer disconnected): one half is not a split."""
+
+        halves: dict[int, set[int]] = {}
+        for order in self._orders.values():
+            if order.half:
+                halves.setdefault(order.team, set()).add(order.half)
+        for team, present in halves.items():
+            if present != {1, 2}:
+                self.dissolve_splits(team)
 
     def drop_team_changes(self, bot_teams: dict[int, int]) -> int:
         """Forget orders whose bot now plays for another team. Returns the count."""
@@ -182,6 +233,7 @@ class PlayerOrderBook:
             self._orders[bot_id] = PlayerOrder(
                 HOLD, order.team, order.issuer_id,
                 tuple(float(value) for value in positions[bot_id]),
+                order.half,
             )
             converted.append(bot_id)
         return converted
@@ -206,7 +258,8 @@ class PlayerOrderBook:
         skip = {int(item) for item in exclude}
         members = sorted(
             bot_id for bot_id, order in self._orders.items()
-            if order.team == team and order.code == code and bot_id not in skip
+            if order.team == team and order.code == code and not order.half
+            and bot_id not in skip
         )
         table = self._jobs.setdefault(key, {})
         for gone in [bot_id for bot_id in table if bot_id not in members]:
@@ -224,8 +277,8 @@ class PlayerOrderBook:
 
     def job_of(self, bot_id: int) -> int:
         order = self._orders.get(int(bot_id))
-        if order is None:
-            return JOB_NONE
+        if order is None or order.half:
+            return JOB_NONE        # a bot inside a /split runs the plain version
         return self._jobs.get((order.team, order.code), {}).get(int(bot_id), JOB_NONE)
 
     def objectives(self, live_bot_ids, params: tuple[float, ...] = ()) -> list[ObjectiveSnapshot]:
@@ -243,6 +296,7 @@ class PlayerOrderBook:
                 params=(*params, float(self.job_of(bot_id))),
             )
             for bot_id, order in self._orders.items()
+            if order.code != FREE
         ]
 
 

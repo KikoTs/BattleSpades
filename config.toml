@@ -450,6 +450,9 @@ order_hold_leash = 6.0
 order_defend_chase_radius = 40.0
 order_protect_hunt_ratio = 0.5
 order_attack_escort_ratio = 0.5
+# order_team_command_spectators: /team <color> <command> orders a team's bots
+# from outside it. Admins always may; true also lets spectators.
+order_team_command_spectators = false
 
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.

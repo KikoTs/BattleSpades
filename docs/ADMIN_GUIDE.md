@@ -540,6 +540,9 @@ visible and hidden entries.
   that hunt the thief while a friendly carrier also needs escort) and
   `order_attack_escort_ratio` (default 0.5, 0-1; the share of `/attack` bots
   that escort a friendly intel carrier while the rest keep attacking).
+  `order_team_command_spectators` (default `false`) controls `/team <color>
+  <command>`: admins can always order a team's bots from outside it, and `true`
+  lets spectators do so too.
 - `[modes.<code>]`: `time_limit` seconds plus legacy aliases shown in the
   sample. These override `[game_rules]` only for that mode. An alias table
   name (`[modes.zombie]`) applies to its short code; `[modes.zom]` wins when

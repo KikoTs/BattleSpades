@@ -88,29 +88,37 @@ async def cmd_kill(ctx: CommandContext):
 
 @register_command(
     name="team",
-    usage="/team <team1|team2|spectator>",
-    description="Change your team",
+    usage="/team <blue|green|spectator> [command ...]",
+    description="Change your team; admins and spectators can also give a team's bots a command",
 )
 async def cmd_team(ctx: CommandContext):
-    """Change team through the same rules as the retail ChangeTeam packet."""
+    """Change team through the same rules as the retail ChangeTeam packet.
+
+    ``/team <color> <command> ...`` is the bot-order form (see
+    ``commands.bot_orders.team_command``) and changes nobody's team.
+    """
     if not ctx.args:
-        await send_message(ctx.server, ctx.player, "Usage: /team <team1|team2|spectator>")
+        await send_message(ctx.server, ctx.player, "Usage: /team <blue|green|spectator>")
+        return
+    if len(ctx.args) >= 2:
+        from .bot_orders import team_command
+
+        await team_command(ctx)
         return
 
     team_name = ctx.args[0].lower()
 
+    from .bot_orders import team_tokens
+
     team_map = {
-        "team1": TEAM1,
-        str(TEAM1): TEAM1,
-        "team2": TEAM2,
-        str(TEAM2): TEAM2,
+        **team_tokens(ctx.server),
         "spectator": TEAM_SPECTATOR,
         "spec": TEAM_SPECTATOR,
         str(TEAM_SPECTATOR): TEAM_SPECTATOR,
     }
 
     if team_name not in team_map:
-        await send_message(ctx.server, ctx.player, "Invalid team. Use: team1, team2, or spectator")
+        await send_message(ctx.server, ctx.player, "Invalid team. Use: blue, green, or spectator")
         return
 
     new_team = team_map[team_name]

@@ -78,6 +78,7 @@ FLAT_KEYS = [
     ("bots", "order_defend_chase_radius", "bots.order_defend_chase_radius", 40.0),
     ("bots", "order_protect_hunt_ratio", "bots.order_protect_hunt_ratio", 0.5),
     ("bots", "order_attack_escort_ratio", "bots.order_attack_escort_ratio", 0.5),
+    ("bots", "order_team_command_spectators", "bots.order_team_command_spectators", False),
     ("bots", "chatter", "bots.chatter", False),
     ("bots", "name_prefix", "bots.name_prefix", "[BOT]"),
     ("admin", "creator_token", "admin_creator_token", ""),
@@ -241,6 +242,7 @@ _CUSTOM_TOML = textwrap.dedent("""
     order_defend_chase_radius = 55
     order_protect_hunt_ratio = 0.25
     order_attack_escort_ratio = 0.75
+    order_team_command_spectators = true
 
     [admin]
     creator_token = "abcdefghijklmnopqrstuvwxyz012345"
@@ -339,6 +341,7 @@ def test_order_keys_reach_the_director(custom_server):
     director.server = custom_server
     assert director._order_params() == (9.5, 55.0)
     assert server_ratios(custom_server) == (0.75, 0.25)
+    assert custom_server.config.bots.order_team_command_spectators is True
 
 
 def test_bot_label_and_chat_keys_reach_bot_config(custom_server):

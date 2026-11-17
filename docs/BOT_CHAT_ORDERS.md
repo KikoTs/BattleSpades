@@ -14,7 +14,8 @@ none, every bot on your team obeys.
 | `/protect [intel] [bot ...]` | `/protectintel` | Intel-centric, no distance leash. See the table below. |
 | `/escort [bot ...]` | | Escort the friendly carrier of the enemy intel, else you. Never splits, even when our intel is stolen. |
 | `/free [bot ...]` | `/resume`, `/release` | Release the bots; they play normally again. |
-| `/status [bot ...]` | `/orders` | One line per bot: its order and what it is doing right now. |
+| `/split <action> [<action>] [bot ...]` | | Split bots between two actions. See below. |
+| `/status [bot ...]` | `/orders` | One line per bot: its order, its `/split` half if any, and what it is doing right now. |
 
 A bot that carries intel always takes it home first, whatever it was ordered.
 The carrier is found from the intel objective, which follows its holder, so an
@@ -53,6 +54,62 @@ hunt the thief):
 - When the carrier drops or dies, the jobs are dropped and every attacker pushes the
   intel again. A later carrier gets a fresh, deterministic split.
 
+## `/split`
+
+Actions: `follow`, `hold` (`stay`), `attack` (`assault`), `defend`, `protect`, `escort`, and `free`
+(`release`, `resume`). A `free` half plays normally but is still a half of the split.
+
+- **`/split <action>`** keeps the previous order on half of the bots that have an order
+  and gives the other half the new action (`/split free` frees that half). Bots without an
+  order are left alone. **When no bot has an order** (after `/free`, a map change or a fresh
+  start) the selected bots split into half free and half the new action, like
+  `/split free <action>`; the larger half is the free one. `/split free` alone with no
+  orders is refused, because it would leave everyone free.
+- **`/split <a> <b>`** stops everything and splits the team between `a` and `b`; either may be
+  `free`: `/split hold free`, `/split free attack`.
+- Bots are ordered by id. With an odd count the **larger half** goes to the first-named
+  action, or to the existing order in the single form. At least two bots are needed.
+- **Halves are fixed by bot id** and stored in the orders, so they survive death and
+  respawn. `/status` shows each bot's half (`Rex [hold, half 1]: ...`).
+- **A team that is already split cannot be split again**, by hand or automatically; the
+  command is refused with a message. Inside a split the automatic `/attack` and `/protect`
+  escort/hunt splitting is off: each half runs the plain version of its order (`/attack`
+  pushes the objective, `/protect` escorts when a carrier and a thief both exist).
+- **A new plain order replaces the whole split.** The bots keep the orders they have, but
+  they are no longer in a split, so the team can be split again. `/free` of a whole half
+  also leaves no split behind.
+- Ownership: the half given by `/split` belongs to whoever typed it; the half that kept
+  its order stays with its previous issuer. When an issuer disconnects their orders are
+  freed as above, and a split that lost a half dissolves.
+
+## `/team <color|all> <command> ...` (admins and spectators)
+
+An admin, or a spectator when the server allows it, can order a team's bots from
+outside the team: `/team blue protect`, `/team blue split attack`,
+`/team green split hold attack`, `/team green status`, `/team blue free rex`.
+
+- **`all`** runs the command for **both teams**: `/team all hold`, `/team all split free attack`,
+  `/team all status`. Each team answers on its own under a label (`Blue: 4 bot(s) holding
+  position`, `Green: ...`), and a refusal for one team (already split, `follow` from outside it)
+  never stops the other. The permissions are the same as for a single color.
+- **Color** is the server's own team name: `blue` and `green` for the stock teams,
+  or `team1` / `team2`, or the configured `[teams]` name. `/team blue` on its own
+  still just changes your team (and now accepts `blue` / `green` too).
+- **Command** is any of `follow`, `hold`, `attack`, `defend`, `protect`, `escort`, `free`,
+  `status` and `split`, with the same aliases, optional bot names and `/split` forms as
+  the plain commands.
+- **Who may:** admins always. Spectators only when `order_team_command_spectators = true`
+  (default `false`). A regular team member is told to use the plain command for their
+  own team, and a spectator on a server that does not allow it is told so.
+- **`follow`** needs an issuer on that team to follow, so it is refused (`/split` forms
+  naming `follow` too) when you are not on it. An admin playing on blue can `/team blue
+  follow`.
+- It never moves you: your own team does not change. Orders are recorded under your
+  player id like any other, so they are freed if you disconnect.
+- Other players' orders keep working as before: a team member's plain order replaces
+  yours on the bots it covers (they then belong to that member), and any teammate can
+  `/free` bots you ordered.
+
 ## Order lifetime and ownership
 
 An order belongs to the bot, not to its life. It survives the bot's own death
@@ -81,6 +138,7 @@ keeps all their other orders.
 | `order_defend_chase_radius` | `40.0` | Blocks from our base within which `/defend` chases a thief, 0-400. `0` never chases. |
 | `order_protect_hunt_ratio` | `0.5` | Share of `/protect` bots that hunt the thief when a carrier also needs escort, 0-1. |
 | `order_attack_escort_ratio` | `0.5` | Share of `/attack` bots that escort a friendly carrier of the enemy intel while the rest keep attacking, 0-1. |
+| `order_team_command_spectators` | `false` | Lets spectators use `/team <color> <command>` too. Admins always may. |
 
 The director stamps the leash and chase radius, and each bot's job, on every
 published order (`ObjectiveSnapshot.params`), so the isolated worker needs no

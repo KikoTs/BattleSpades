@@ -689,8 +689,8 @@ def test_order_status_reports_order_and_what_the_bot_is_doing():
     director.give_order("hold", _human(), ("rex",))
     director.give_order("protect", _human(), ("ada",))
     assert director.order_status(_human()) == [
-        ("Rex", "hold", "holding position (in position)"),
-        ("Ada", "protect", "dead, waiting to respawn"),
+        ("Rex", "hold", 0, "holding position (in position)"),
+        ("Ada", "protect", 0, "dead, waiting to respawn"),
     ]
     assert director.order_status(_human(), ("zzz",)) == []
 
@@ -831,3 +831,611 @@ def test_leashed_bot_keeps_shooting_while_it_dodges():
     from server.bot_ai.messages import BotActionKind
     intent = _held_fight(10.5, leash=6.0)
     assert intent.action.kind is BotActionKind.FIRE and intent.look.target_player_id == 2
+
+
+# ------------------------------------------------------------------------ /split
+
+def _squad(count=5, *, issuers=()):
+    """``count`` TEAM1 bots (ids 1..count) plus one TEAM2 bot, and the humans given."""
+    bots = [_bot(i, f"Bot{i}", TEAM1, pos=(float(i), 0.0, 0.0)) for i in range(1, count + 1)]
+    bots.append(_bot(90, "Enemy", TEAM2))
+    return bots, _director(*bots, players=list(issuers) or [_human()])
+
+
+def _state(director):
+    book = director.__dict__["_order_book"]
+    return {b.id: (NAMES_OF[book.get(b.id).code], book.get(b.id).half) if book.get(b.id) else None
+            for b in director.bots if b.team == TEAM1}
+
+
+from server.bot_ai.player_orders import NAMES as NAMES_OF
+
+
+def test_split_one_action_keeps_the_old_order_on_the_larger_half():
+    anna, ben = _human(9), _human(10)
+    bots, director = _squad(5, issuers=[anna, ben])
+    director.give_order("hold", anna)
+    count, message = director.give_split("attack", None, ben)
+    assert (count, message) == (5, "3 bot(s) keep their orders, 2 now attacking")
+    assert _state(director) == {1: ("hold", 1), 2: ("hold", 1), 3: ("hold", 1),
+                                4: ("attack", 2), 5: ("attack", 2)}
+    book = director.__dict__["_order_book"]
+    assert [book.get(i).issuer_id for i in (1, 2, 3)] == [9, 9, 9]          # kept: Anna's
+    assert [book.get(i).issuer_id for i in (4, 5)] == [10, 10]              # new half: Ben's
+
+
+def test_split_one_action_leaves_bots_without_orders_alone():
+    bots, director = _squad(6)
+    director.give_order("hold", _human(), ("bot1", "bot2", "bot3", "bot4"))
+    count, message = director.give_split("defend", None, _human())
+    assert count == 4 and message == "2 bot(s) keep their orders, 2 now defending"
+    state = _state(director)
+    assert state[5] is None and state[6] is None
+    assert {state[i][1] for i in (1, 2, 3, 4)} == {1, 2}
+
+
+def test_split_one_action_with_no_active_order_splits_all_bots_into_free_and_the_action():
+    bots, director = _squad(4)
+    count, message = director.give_split("attack", None, _human())
+    assert (count, message) == (4, "2 bot(s) free, 2 attacking")
+    assert _state(director) == {1: ("free", 1), 2: ("free", 1), 3: ("attack", 2), 4: ("attack", 2)}
+    assert [o.carrier_id for o in director._objectives_player_orders(None)] == [3, 4]   # free halves steer nothing
+    # After /free (or a map change, or a fresh start) the same thing happens again.
+    director.give_order("free", _human())
+    assert director.give_split("defend", None, _human())[0] == 4
+    # An odd count gives the larger half to free.
+    bots, director = _squad(5)
+    assert director.give_split("attack", None, _human())[1] == "3 bot(s) free, 2 attacking"
+
+
+def test_split_free_alone_with_no_orders_would_free_everyone_so_it_is_refused():
+    bots, director = _squad(4)
+    count, message = director.give_split("free", None, _human())
+    assert count == 0 and message.startswith("No bot has an order, so /split free would leave everyone free")
+    assert _state(director) == {1: None, 2: None, 3: None, 4: None}
+
+
+def test_split_with_no_orders_still_needs_two_bots():
+    bots, director = _squad(1)
+    assert director.give_split("attack", None, _human()) == (0, "A split needs at least two bots")
+
+
+def test_free_is_a_valid_action_in_both_split_forms():
+    bots, director = _squad(5)
+    assert director.give_split("hold", "free", _human()) == (5, "3 bot(s) holding position, 2 free")
+    assert _state(director) == {1: ("hold", 1), 2: ("hold", 1), 3: ("hold", 1), 4: ("free", 2), 5: ("free", 2)}
+    bots, director = _squad(4)
+    assert director.give_split("free", "attack", _human()) == (4, "2 bot(s) free, 2 attacking")
+    assert director.give_split("free", "free", _human())[0] == 0          # already split, and equal
+    bots, director = _squad(4)
+    assert director.give_split("free", "free", _human()) == (0, "Pick two different actions to split between")
+
+
+def test_split_free_with_orders_keeps_half_and_frees_the_other_half():
+    bots, director = _squad(5)
+    director.give_order("hold", _human())
+    count, message = director.give_split("free", None, _human())
+    assert (count, message) == (5, "3 bot(s) keep their orders, 2 now free")
+    assert _state(director) == {1: ("hold", 1), 2: ("hold", 1), 3: ("hold", 1), 4: ("free", 2), 5: ("free", 2)}
+    assert sorted(o.carrier_id for o in director._objectives_player_orders(None)) == [1, 2, 3]
+
+
+def test_a_free_half_shows_in_status_and_survives_death():
+    bots, director = _squad(4)
+    director.give_split("hold", "free", _human())
+    assert [(r[1], r[2]) for r in director.order_status(_human())] == [
+        ("hold", 1), ("hold", 1), ("free", 2), ("free", 2)]
+    before = _state(director)
+    for bot in bots[:4]:
+        bot.alive = False
+    director._objectives_player_orders(None)
+    for bot in bots[:4]:
+        bot.alive = True
+    director._objectives_player_orders(None)
+    assert _state(director) == before
+
+
+def test_a_plain_order_ends_a_split_with_a_free_half_and_leaves_nothing_behind():
+    bots, director = _squad(4)
+    director.give_split("hold", "free", _human())
+    director.give_order("follow", _human(), ("bot1",))
+    state = _state(director)
+    assert state[1] == ("follow", 0) and state[2] == ("hold", 0)
+    assert state[3] is None and state[4] is None                         # the free half is simply free again
+    assert not director.__dict__["_order_book"].split_active(TEAM1)
+
+
+def test_free_releases_a_free_half_too_and_a_split_that_lost_a_half_dissolves():
+    bots, director = _squad(4)
+    director.give_split("hold", "free", _human())
+    director.give_order("free", _human(), ("bot1", "bot2"))               # the whole ordered half
+    director._objectives_player_orders(None)
+    assert _state(director) == {1: None, 2: None, 3: None, 4: None}      # the free half dissolved with it
+    bots, director = _squad(4)
+    director.give_split("hold", "free", _human())
+    director.give_order("free", _human())
+    assert len(director.__dict__["_order_book"]) == 0
+
+
+def test_a_split_issuers_disconnect_clears_the_free_half_as_well():
+    anna = _human(9)
+    bots, director = _squad(4, issuers=[anna])
+    director.give_split("hold", "free", anna)
+    del director.server.players[anna.id]
+    director._objectives_player_orders(None)
+    assert len(director.__dict__["_order_book"]) == 0
+
+
+def test_split_free_through_chat_including_aliases_and_the_team_form(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin(team=TEAM2)
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("team blue split free attack")
+    assert sent[-1] == "2 bot(s) free, 2 attacking"
+    run("team blue free")
+    run("team blue split hold release")
+    assert sent[-1] == "2 bot(s) holding position, 2 free"
+    run("team green split resume defend")
+    assert sent[-1] == "2 bot(s) free, 2 defending"
+    run("team green status")
+    assert sent[-1].endswith("idle") and "free, half 1" in sent[-4]
+
+
+def test_split_needs_at_least_two_bots():
+    bots, director = _squad(3)
+    director.give_order("hold", _human(), ("bot1",))
+    assert director.give_split("attack", None, _human()) == (0, "A split needs at least two bots with orders")
+    assert director.give_split("attack", "hold", _human(), ("bot2",)) == (0, "A split needs at least two bots")
+
+
+def test_split_two_actions_stops_everything_and_gives_the_larger_half_to_the_first():
+    bots, director = _squad(5)
+    director.give_order("follow", _human(), ("bot1",))                       # replaced by the split
+    count, message = director.give_split("hold", "attack", _human())
+    assert (count, message) == (5, "3 bot(s) holding position, 2 attacking")
+    assert _state(director) == {1: ("hold", 1), 2: ("hold", 1), 3: ("hold", 1),
+                                4: ("attack", 2), 5: ("attack", 2)}
+
+
+def test_split_two_actions_even_count_and_name_order():
+    bots, director = _squad(4)
+    director.give_split("attack", "defend", _human())
+    assert _state(director) == {1: ("attack", 1), 2: ("attack", 1), 3: ("defend", 2), 4: ("defend", 2)}
+    bots, director = _squad(5)
+    director.give_split("defend", "attack", _human())                        # swapped names, odd count
+    assert [v[0] for v in _state(director).values()] == ["defend"] * 3 + ["attack"] * 2
+
+
+def test_split_two_actions_can_be_limited_to_named_bots():
+    bots, director = _squad(5)
+    count, _ = director.give_split("hold", "attack", _human(), ("bot2", "bot3", "bot4"))
+    assert count == 3
+    assert _state(director) == {1: None, 2: ("hold", 1), 3: ("hold", 1), 4: ("attack", 2), 5: None}
+
+
+def test_split_refuses_two_equal_actions_and_unknown_ones():
+    bots, director = _squad(4)
+    assert director.give_split("hold", "hold", _human())[0] == 0
+    assert director.give_split("fly", None, _human()) == (0, "Unknown action 'fly'")
+    assert director.give_split("free", None, _human())[0] == 0               # /free is not a split action
+
+
+def test_an_already_split_team_cannot_be_split_again_either_way():
+    bots, director = _squad(5)
+    director.give_split("hold", "attack", _human())
+    before = _state(director)
+    for first, second in (("defend", None), ("defend", "protect")):
+        count, message = director.give_split(first, second, _human())
+        assert count == 0 and message.startswith("Your team is already split. Give a plain order")
+    assert _state(director) == before
+
+
+def test_a_plain_order_replaces_the_whole_split():
+    bots, director = _squad(5)
+    director.give_split("hold", "attack", _human())
+    director.give_order("follow", _human())
+    assert set(_state(director).values()) == {("follow", 0)}
+    assert director.give_split("hold", "attack", _human())[0] == 5            # splittable again
+
+
+def test_a_plain_order_to_some_bots_ends_the_split_for_all_but_keeps_their_orders():
+    bots, director = _squad(5)
+    director.give_split("hold", "attack", _human())
+    director.give_order("defend", _human(), ("bot1",))
+    state = _state(director)
+    assert state[1] == ("defend", 0)
+    assert state[2] == ("hold", 0) and state[4] == ("attack", 0)              # no longer a split
+    assert not director.__dict__["_order_book"].split_active(TEAM1)
+
+
+def test_split_halves_survive_death_and_respawn():
+    bots, director = _squad(5)
+    director.give_split("hold", "attack", _human())
+    before = _state(director)
+    for bot in bots[:5]:
+        bot.alive = False
+    director._objectives_player_orders(None)
+    for bot in bots[:5]:
+        bot.alive = True
+    director._objectives_player_orders(None)
+    assert _state(director) == before
+
+
+def test_freeing_a_whole_half_leaves_no_split_behind():
+    bots, director = _squad(5)
+    director.give_split("hold", "attack", _human())
+    director.give_order("free", _human(), ("bot4", "bot5"))                   # the whole second half
+    director._objectives_player_orders(None)
+    assert _state(director) == {1: ("hold", 0), 2: ("hold", 0), 3: ("hold", 0), 4: None, 5: None}
+    assert director.give_split("defend", None, _human())[0] == 3              # a fresh split works
+
+
+def test_split_attack_bots_run_the_plain_order_with_no_automatic_job_split():
+    carrier = SimpleNamespace(id=30)
+    bots, director = _squad(6)
+    director.server.mode = SimpleNamespace(intel_holder={TEAM2: carrier})     # a friendly carrier exists
+    director.give_order("attack", _human())
+    assert sorted(_jobs_of(director).values()) == [JOB_ESCORT] * 3 + [JOB_PUSH] * 3   # automatic split
+    director.give_split("attack", "hold", _human())                           # now a manual split
+    assert set(_jobs_of(director).values()) == {JOB_NONE}                     # plain attack + plain hold
+
+
+def test_split_protect_bots_run_the_plain_version_and_escort():
+    bots, director = _squad(4)
+    director.server.mode = SimpleNamespace(intel_holder={TEAM2: SimpleNamespace(id=30), TEAM1: SimpleNamespace(id=31)})
+    director.give_order("protect", _human())
+    assert JOB_PUSH in _jobs_of(director).values()                            # carrier + thief: it splits
+    director.give_split("protect", "defend", _human())
+    assert set(_jobs_of(director).values()) == {JOB_NONE}
+
+
+def test_status_shows_each_bots_half():
+    bots, director = _squad(4)
+    director.give_split("hold", "attack", _human())
+    rows = director.order_status(_human())
+    assert [(r[1], r[2]) for r in rows] == [("hold", 1), ("hold", 1), ("attack", 2), ("attack", 2)]
+
+
+def test_an_orphaned_follow_inside_a_split_keeps_its_half():
+    book = _book((1, PlayerOrder(FOLLOW, BLUE, HUMAN, (0.0, 0.0, 0.0), half=2)))
+    book.release_orphaned_follows(lambda issuer, team: False, {1: (4.0, 5.0, 6.0)})
+    assert book.get(1) == PlayerOrder(HOLD, BLUE, HUMAN, (4.0, 5.0, 6.0), 2)
+
+
+def test_a_split_issuers_disconnect_frees_the_halves_they_gave():
+    anna, ben = _human(9), _human(10)
+    bots, director = _squad(4, issuers=[anna, ben])
+    director.give_split("hold", "attack", anna)                               # Anna's two-action split
+    del director.server.players[anna.id]
+    assert director._objectives_player_orders(None) == []                     # all of it freed
+    bots, director = _squad(4, issuers=[anna, ben])
+    director.give_order("hold", anna)
+    director.give_split("attack", None, ben)                                  # Ben re-orders half
+    del director.server.players[ben.id]                                       # Ben leaves
+    director._objectives_player_orders(None)                                  # the director's next pass
+    state = _state(director)
+    assert state[1] == ("hold", 0) and state[2] == ("hold", 0)                # Anna's half stays, no split
+    assert state[3] is None and state[4] is None
+
+
+def test_split_commands_reply_and_refuse_through_chat(monkeypatch):
+    sent = _commands(monkeypatch)
+    bots, director = _squad(5)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    player = _human(9)
+    run = lambda text: asyncio.run(handle_command(server, player, text))
+    run("split attack")                                                      # nothing ordered yet
+    run("split hold attack")                                                 # now split already
+    run("split defend")
+    run("split")
+    run("split fly")
+    assert sent[0] == "3 bot(s) free, 2 attacking"
+    assert sent[1].startswith("Your team is already split") and sent[2].startswith("Your team is already split")
+    assert sent[3].startswith("Usage: /split <action> [<action>]")
+    assert sent[4] == "Unknown action 'fly'. Actions: follow, hold, attack, defend, protect, escort, free"
+    sent.clear()
+    run("hold")                                                              # a plain order ends the split
+    run("split hold attack")
+    assert sent == ["5 bot(s) holding position", "3 bot(s) holding position, 2 attacking"]
+    sent.clear()
+    run("status bot1 bot5")
+    assert sent == ["Bot1 [hold, half 1]: idle", "Bot5 [attack, half 2]: idle"]
+    spectator = SimpleNamespace(id=11, team=0, name="Spec", admin=False)
+    sent.clear()
+    asyncio.run(handle_command(server, spectator, "split hold attack"))
+    assert sent == ["Join a team to command bots"]
+
+
+def test_split_command_accepts_aliases_names_and_the_intel_word(monkeypatch):
+    sent = _commands(monkeypatch)
+    bots, director = _squad(5)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    asyncio.run(handle_command(server, _human(9), "split stay assault bot1 bot2"))
+    assert sent == ["1 bot(s) holding position, 1 attacking"]
+    assert _state(director)[1] == ("hold", 1) and _state(director)[2] == ("attack", 2)
+    sent.clear()
+    bots, director = _squad(4)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    asyncio.run(handle_command(server, _human(9), "split protect intel hold"))
+    assert sent == ["2 bot(s) protecting the intel, 2 holding position"]
+
+
+def test_free_with_nothing_to_release_says_so(monkeypatch):
+    sent = _commands(monkeypatch)
+    bots, director = _squad(3)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    asyncio.run(handle_command(server, _human(9), "free"))
+    assert sent == ["None of those bots had an order"]
+
+
+def test_split_protect_intel_word_is_dropped_before_and_after_the_second_action(monkeypatch):
+    sent = _commands(monkeypatch)
+    bots, director = _squad(4)
+    server = SimpleNamespace(bots=director, config=SimpleNamespace(log_commands=False))
+    asyncio.run(handle_command(server, _human(9), "split hold protect intel bot1 bot2"))
+    assert sent == ["1 bot(s) holding position, 1 protecting the intel"]
+
+
+# ------------------------------------------------------- /team <color> <command>
+
+from commands.bot_orders import team_tokens
+
+
+def _server(director, *, spectators=False, names=("TEAM1_COLOR", "TEAM2_COLOR")):
+    config = SimpleNamespace(
+        log_commands=False, team1_name=names[0], team2_name=names[1],
+        bots=SimpleNamespace(order_team_command_spectators=spectators))
+    return SimpleNamespace(bots=director, config=config)
+
+
+def _two_teams(*humans):
+    bots = ([_bot(i, f"Blu{i}", TEAM1, pos=(float(i), 0.0, 0.0)) for i in range(1, 5)]
+            + [_bot(i, f"Grn{i}", TEAM2, pos=(float(i), 0.0, 0.0)) for i in range(11, 15)])
+    return bots, _director(*bots, players=list(humans))
+
+
+def _admin(pid=20, team=TEAM2):
+    return SimpleNamespace(id=pid, team=team, alive=True, spawned=True, name="Boss", admin=True)
+
+
+def _spectator(pid=21):
+    return SimpleNamespace(id=pid, team=0, alive=False, spawned=False, name="Spec", admin=False)
+
+
+def _teams_of(director, team):
+    book = director.__dict__.get("_order_book")
+    return {b.id: (NAMES_OF[book.get(b.id).code], book.get(b.id).half)
+            for b in director.bots if b.team == team and book is not None and book.get(b.id)}
+
+
+def test_team_names_resolve_to_the_servers_real_colours_and_ids():
+    tokens = team_tokens(_server(None))
+    assert tokens["blue"] == TEAM1 and tokens["green"] == TEAM2
+    assert tokens["team1"] == TEAM1 and tokens["team2"] == TEAM2
+    assert tokens["team1_color"] == TEAM1 and tokens["team2_color"] == TEAM2
+    custom = team_tokens(_server(None, names=("TEAM_RED", "TEAM_GOLD")))
+    assert custom["team_red"] == TEAM1 and custom["team_gold"] == TEAM2
+    assert "blue" not in custom and "green" not in custom        # the server's own names, not stock ones
+
+
+def test_an_admin_orders_the_other_teams_bots_without_changing_their_own_team(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin(team=TEAM2)
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    asyncio.run(handle_command(server, boss, "team blue protect"))
+    asyncio.run(handle_command(server, boss, "team blue split attack"))        # already ordered: keep half
+    assert sent[0] == "4 bot(s) protecting the intel"
+    assert sent[1] == "2 bot(s) keep their orders, 2 now attacking"
+    assert _teams_of(director, TEAM1) == {1: ("protect", 1), 2: ("protect", 1),
+                                          3: ("attack", 2), 4: ("attack", 2)}
+    assert _teams_of(director, TEAM2) == {}                                  # their own team untouched
+    assert boss.team == TEAM2
+    book = director.__dict__["_order_book"]
+    assert {book.get(i).issuer_id for i in (1, 2, 3, 4)} == {20}
+    assert {book.get(i).team for i in (1, 2, 3, 4)} == {TEAM1}
+
+
+def test_team_command_accepts_every_command_and_split_form(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("team green split hold attack")
+    assert sent[-1] == "2 bot(s) holding position, 2 attacking"
+    assert _teams_of(director, TEAM2) == {11: ("hold", 1), 12: ("hold", 1), 13: ("attack", 2), 14: ("attack", 2)}
+    run("team green status grn11")
+    assert sent[-1] == "Grn11 [hold, half 1]: idle"
+    run("team green free")
+    assert sent[-1] == "4 bot(s) released" and _teams_of(director, TEAM2) == {}
+    for text, said in (
+        ("team blue follow", "4 bot(s) following you"),
+        ("team blue hold blu1", "1 bot(s) holding position"),
+        ("team blue stay blu2", "1 bot(s) holding position"),
+        ("team blue assault", "4 bot(s) attacking"),
+        ("team blue defend", "4 bot(s) defending"),
+        ("team blue protect intel blu1", "1 bot(s) protecting the intel"),
+        ("team blue protectintel", "4 bot(s) protecting the intel"),
+        ("team blue escort", "4 bot(s) escorting"),
+        ("team blue release blu1", "1 bot(s) released"),
+        ("team team1 split defend hold", "2 bot(s) defending, 2 holding position"),
+    ):
+        if text == "team blue follow":
+            boss.team = TEAM1               # an admin playing on blue may /follow blue's bots
+        elif text == "team blue hold blu1":
+            boss.team = TEAM2
+        run(text)
+        assert sent[-1] == said, (text, sent[-1])
+
+
+def test_spectators_are_refused_unless_the_server_allows_them(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    bots, director = _two_teams(spec)
+    asyncio.run(handle_command(_server(director), spec, "team blue hold"))
+    assert sent == ["Spectators cannot command bots on this server"]
+    assert _teams_of(director, TEAM1) == {}
+    sent.clear()
+    asyncio.run(handle_command(_server(director, spectators=True), spec, "team blue hold"))
+    assert sent == ["4 bot(s) holding position"]
+    asyncio.run(handle_command(_server(director, spectators=True), spec, "team green split attack defend"))
+    assert sent[-1] == "2 bot(s) attacking, 2 defending"
+    assert spec.team == 0                                                       # still a spectator
+
+
+def test_a_plain_team_member_is_pointed_at_the_ordinary_commands(monkeypatch):
+    sent = _commands(monkeypatch)
+    member = _human(9, team=TEAM1)
+    bots, director = _two_teams(member)
+    asyncio.run(handle_command(_server(director, spectators=True), member, "team blue hold"))
+    assert sent == ["Only admins and spectators can use /team <color> <command>; "
+                    "use /<command> to order your own team's bots"]
+    assert _teams_of(director, TEAM1) == {}
+
+
+def test_team_command_rejects_unknown_teams_and_commands(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    asyncio.run(handle_command(server, boss, "team purple hold"))
+    asyncio.run(handle_command(server, boss, "team blue dance"))
+    assert sent[0] == "Unknown team 'purple'. Use blue, green or all (team1 or team2)"
+    assert sent[1] == "Unknown command 'dance'. Use: follow, hold, attack, defend, protect, escort, free, status, split"
+    assert _teams_of(director, TEAM1) == {}
+
+
+def test_follow_from_outside_the_team_is_refused_because_nobody_can_be_followed(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec = _spectator()
+    bots, director = _two_teams(spec)
+    server = _server(director, spectators=True)
+    asyncio.run(handle_command(server, spec, "team blue follow"))
+    asyncio.run(handle_command(server, spec, "team blue split follow attack"))
+    assert sent == ["You are not on that team, so there is nobody for /follow to follow"] * 2
+    assert _teams_of(director, TEAM1) == {}
+
+
+def test_status_of_an_empty_match_from_outside_says_that_team(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    asyncio.run(handle_command(_server(director), boss, "team blue status nobody"))
+    assert sent == ["No matching bots on that team"]
+
+
+def test_team_members_keep_their_own_orders_working_beside_a_spectators(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec, member = _spectator(), _human(9, team=TEAM1)
+    bots, director = _two_teams(spec, member)
+    server = _server(director, spectators=True)
+    asyncio.run(handle_command(server, spec, "team blue attack"))
+    asyncio.run(handle_command(server, member, "hold blu1 blu2"))             # the member re-orders two
+    book = director.__dict__["_order_book"]
+    assert [(book.get(i).code, book.get(i).issuer_id) for i in (1, 2, 3, 4)] == [
+        (HOLD, 9), (HOLD, 9), (ATTACK, 21), (ATTACK, 21)]
+    asyncio.run(handle_command(server, member, "free blu3"))                  # any teammate can free
+    assert book.get(3) is None and book.get(4) is not None
+    del director.server.players[spec.id]                                      # the spectator disconnects
+    assert sorted(o.carrier_id for o in director._objectives_player_orders(None)) == [1, 2]   # the member's stay
+
+
+# ----------------------------------------------------------- /team all <command>
+
+def test_team_all_applies_a_command_to_both_teams_under_labels(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin(team=TEAM2)
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("team all hold")
+    assert sent == ["Blue: 4 bot(s) holding position", "Green: 4 bot(s) holding position"]
+    assert _teams_of(director, TEAM1) == {i: ("hold", 0) for i in (1, 2, 3, 4)}
+    assert _teams_of(director, TEAM2) == {i: ("hold", 0) for i in (11, 12, 13, 14)}
+    sent.clear()
+    run("team all free")
+    assert sent == ["Blue: 4 bot(s) released", "Green: 4 bot(s) released"]
+    assert _teams_of(director, TEAM1) == {} and _teams_of(director, TEAM2) == {}
+    assert boss.team == TEAM2
+
+
+def test_team_all_split_forms_including_free_work_for_both_teams(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("team all split free attack")
+    assert sent == ["Blue: 2 bot(s) free, 2 attacking", "Green: 2 bot(s) free, 2 attacking"]
+    sent.clear()
+    run("team all hold")                                                     # a plain order ends both splits
+    run("team all split hold attack")
+    assert sent[-2:] == ["Blue: 2 bot(s) holding position, 2 attacking",
+                         "Green: 2 bot(s) holding position, 2 attacking"]
+    sent.clear()
+    run("team all split defend")                                             # both already split
+    assert [m.split(":")[0] for m in sent] == ["Blue", "Green"]
+    assert all("is already split" in m for m in sent)
+
+
+def test_team_all_keeps_going_when_one_team_refuses(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    run = lambda text: asyncio.run(handle_command(server, boss, text))
+    run("team blue split hold attack")                                       # only blue is split
+    sent.clear()
+    run("team all split defend")
+    assert sent[0].startswith("Blue: That team is already split")
+    assert sent[1] == "Green: 2 bot(s) free, 2 defending"                    # green still proceeds
+    sent.clear()
+    boss.team = TEAM2
+    run("team all follow")                                                   # an admin on green may /follow only green
+    assert sent[0] == "Blue: You are not on that team, so there is nobody for /follow to follow"
+    assert sent[1] == "Green: 4 bot(s) following you"
+
+
+def test_team_all_status_lists_both_teams_with_labels(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    bots, director = _two_teams(boss)
+    server = _server(director)
+    asyncio.run(handle_command(server, boss, "team blue split hold free"))
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "team all status"))
+    assert len(sent) == 8
+    assert sent[0] == "Blue: Blu1 [hold, half 1]: idle" and sent[3] == "Blue: Blu4 [free, half 2]: idle"
+    assert sent[4] == "Green: Grn11 [free]: idle"
+    sent.clear()
+    asyncio.run(handle_command(server, boss, "team all status blu1 grn14"))   # names filter both teams
+    assert sent == ["Blue: Blu1 [hold, half 1]: idle", "Green: Grn14 [free]: idle"]
+
+
+def test_team_all_has_the_same_permissions_as_team(monkeypatch):
+    sent = _commands(monkeypatch)
+    spec, member = _spectator(), _human(9, team=TEAM1)
+    bots, director = _two_teams(spec, member)
+    asyncio.run(handle_command(_server(director), spec, "team all hold"))
+    assert sent == ["Spectators cannot command bots on this server"]
+    sent.clear()
+    asyncio.run(handle_command(_server(director, spectators=True), spec, "team all hold"))
+    assert sent == ["Blue: 4 bot(s) holding position", "Green: 4 bot(s) holding position"]
+    sent.clear()
+    asyncio.run(handle_command(_server(director, spectators=True), member, "team all hold"))
+    assert sent[0].startswith("Only admins and spectators can use /team <color> <command>")
+    assert spec.team == 0
+
+
+def test_team_all_with_no_bots_or_a_bad_command_answers_once(monkeypatch):
+    sent = _commands(monkeypatch)
+    boss = _admin()
+    asyncio.run(handle_command(SimpleNamespace(bots=None, config=_server(None).config), boss, "team all hold"))
+    assert sent == ["There are no bots to command"]
+    sent.clear()
+    bots, director = _two_teams(boss)
+    asyncio.run(handle_command(_server(director), boss, "team all dance"))
+    assert sent == ["Unknown command 'dance'. Use: follow, hold, attack, defend, protect, escort, free, status, split"]
