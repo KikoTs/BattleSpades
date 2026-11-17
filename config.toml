@@ -437,6 +437,19 @@ skill_balance_max_shift = 0.35
 skill_balance_rate = 0.03
 skill_balance_deadband = 0.15
 skill_balance_min_events = 6
+# Chat orders (/follow /hold /attack /defend /protect /escort /free /status).
+# order_hold_leash: blocks a /hold bot may strafe from its post while fighting
+# (0 = stand still), returning when clear. order_defend_chase_radius: /defend
+# chases an intel thief only while he is within this many blocks of our base.
+# order_protect_hunt_ratio: share of /protect bots that hunt the thief when a
+# friendly carrier also needs escort; the rest escort, and one always does.
+# order_attack_escort_ratio: share of /attack bots that escort a friendly
+# carrier of the enemy intel while the rest keep attacking (a single bot
+# attacks). Both splits are fixed per bot id while the carrier lives.
+order_hold_leash = 6.0
+order_defend_chase_radius = 40.0
+order_protect_hunt_ratio = 0.5
+order_attack_escort_ratio = 0.5
 
 # Per-gamemode rules. Each [modes.<code>] table overrides that mode's
 # built-in defaults (server/mode_data.py). Omit a key to keep the default.

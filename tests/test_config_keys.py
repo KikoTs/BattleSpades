@@ -74,6 +74,10 @@ FLAT_KEYS = [
     ("bots", "skill_balance_rate", "bots.skill_balance_rate", 0.03),
     ("bots", "skill_balance_deadband", "bots.skill_balance_deadband", 0.15),
     ("bots", "skill_balance_min_events", "bots.skill_balance_min_events", 6),
+    ("bots", "order_hold_leash", "bots.order_hold_leash", 6.0),
+    ("bots", "order_defend_chase_radius", "bots.order_defend_chase_radius", 40.0),
+    ("bots", "order_protect_hunt_ratio", "bots.order_protect_hunt_ratio", 0.5),
+    ("bots", "order_attack_escort_ratio", "bots.order_attack_escort_ratio", 0.5),
     ("bots", "chatter", "bots.chatter", False),
     ("bots", "name_prefix", "bots.name_prefix", "[BOT]"),
     ("admin", "creator_token", "admin_creator_token", ""),
@@ -145,7 +149,7 @@ def test_shipped_config_loads_every_key_at_its_default():
 def test_feature_fallback_constants_match_registration():
     from modes import objective_guard
     from server import escape_watch, team_balance, voting
-    from server.bot_ai import skill_balance
+    from server.bot_ai import player_orders, skill_balance
     from server import prefab_actions
 
     config = ServerConfig()
@@ -169,6 +173,10 @@ def test_feature_fallback_constants_match_registration():
     assert config.bots.skill_balance_rate == skill_balance.DEFAULT_RATE
     assert config.bots.skill_balance_deadband == skill_balance.DEFAULT_DEADBAND
     assert config.bots.skill_balance_min_events == skill_balance.DEFAULT_MIN_EVENTS
+    assert config.bots.order_hold_leash == player_orders.DEFAULT_HOLD_LEASH
+    assert config.bots.order_defend_chase_radius == player_orders.DEFAULT_DEFEND_CHASE_RADIUS
+    assert config.bots.order_protect_hunt_ratio == player_orders.DEFAULT_PROTECT_HUNT_RATIO
+    assert config.bots.order_attack_escort_ratio == player_orders.DEFAULT_ATTACK_ESCORT_RATIO
     assert config.prefab_health_state_batch == prefab_actions.BLOCK_STATE_DEFAULT_ROWS
 
 
@@ -229,6 +237,10 @@ _CUSTOM_TOML = textwrap.dedent("""
     skill_balance_min_events = 9
     chatter = true
     name_prefix = "BOT_"
+    order_hold_leash = 9.5
+    order_defend_chase_radius = 55
+    order_protect_hunt_ratio = 0.25
+    order_attack_escort_ratio = 0.75
 
     [admin]
     creator_token = "abcdefghijklmnopqrstuvwxyz012345"
@@ -314,6 +326,21 @@ def test_bot_keys_reach_skill_balancer(custom_server):
     assert balancer._setting("skill_balance_min_events", 6) == 9
 
 
+def server_ratios(server):
+    """The (attack escort, protect hunt) shares a director would split with."""
+    bots = server.config.bots
+    return bots.order_attack_escort_ratio, bots.order_protect_hunt_ratio
+
+
+def test_order_keys_reach_the_director(custom_server):
+    from server.bot_ai.director import BotDirector
+
+    director = BotDirector.__new__(BotDirector)
+    director.server = custom_server
+    assert director._order_params() == (9.5, 55.0)
+    assert server_ratios(custom_server) == (0.75, 0.25)
+
+
 def test_bot_label_and_chat_keys_reach_bot_config(custom_server):
     bots = custom_server.config.bots
     assert bots.chatter is True
@@ -372,6 +399,10 @@ def test_out_of_range_values_are_clamped(tmp_path):
         skill_balance_max_shift = 5
         skill_balance_deadband = 2
         skill_balance_min_events = 0
+        order_hold_leash = 500
+        order_defend_chase_radius = -4
+        order_protect_hunt_ratio = 7
+        order_attack_escort_ratio = -1
         [anticheat]
         accuracy_percentile = 250
         headshot_hit_ratio = 4
@@ -388,6 +419,10 @@ def test_out_of_range_values_are_clamped(tmp_path):
     assert config.bots.skill_balance_max_shift == 0.9
     assert config.bots.skill_balance_deadband == 0.95
     assert config.bots.skill_balance_min_events == 1
+    assert config.bots.order_hold_leash == 40.0
+    assert config.bots.order_defend_chase_radius == 0.0
+    assert config.bots.order_protect_hunt_ratio == 1.0
+    assert config.bots.order_attack_escort_ratio == 0.0
     assert config.anticheat.accuracy_percentile == 100.0
     assert config.anticheat.headshot_hit_ratio == 1.0
     assert config.anticheat.snap_frames == 1

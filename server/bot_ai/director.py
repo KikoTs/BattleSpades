@@ -557,6 +557,8 @@ class BotDirector:
 
         if not self._started:
             return
+        if getattr(self, "_order_book", None) is not None:
+            self._order_book.clear_all()
         await self.prepare_for_game_transition()
         self._mode_epoch += 1
         self._clear_local_timeline()
@@ -1153,6 +1155,8 @@ class BotDirector:
         if force or map_signature != self._map_signature:
             self._map_signature = map_signature
             self._map_epoch += 1
+            if getattr(self, "_order_book", None) is not None:
+                self._order_book.clear_all()
             self._topology_version = int(getattr(world, "topology_version", 0))
             self._perception_cache_until = 0.0
             self._strategy_started_at = time.monotonic()
@@ -1867,6 +1871,7 @@ class BotDirector:
             ("team_anchor", self._objectives_team_anchors),
             ("zombie_refuge", self._objectives_zombie_refuge),
             ("zombie_order", self._objectives_zombie_horde),
+            ("player_order", self._objectives_player_orders),
             ("vip", self._objectives_vip),
             ("last_survivor", self._objectives_last_survivor),
         ):
@@ -2142,6 +2147,167 @@ class BotDirector:
             return life == _player_life_id(runtime.player) and 0 <= now-at <= 1.5
 
         return service.objectives(mode, self.server.world_manager, working=working)
+
+    def _objectives_player_orders(self, mode) -> list[ObjectiveSnapshot]:
+        """Chat-issued orders (/follow /hold ...), one objective per ordered bot."""
+        book = getattr(self, "_order_book", None)
+        if book is None or not len(book):
+            return []
+        self._maintain_orders(book)
+        return book.objectives((int(bot.id) for bot in self.bots), self._order_params())
+
+    def _order_params(self) -> tuple[float, float]:
+        """The operator's worker-side ``[bots] order_*`` tunables, stamped on every order."""
+        from .player_orders import DEFAULT_DEFEND_CHASE_RADIUS, DEFAULT_HOLD_LEASH, clamp_params
+
+        config = getattr(self, "_config", None)
+        return clamp_params(
+            getattr(config, "order_hold_leash", DEFAULT_HOLD_LEASH),
+            getattr(config, "order_defend_chase_radius", DEFAULT_DEFEND_CHASE_RADIUS),
+        )
+
+    def _intel_holders(self) -> dict[int, int]:
+        """``{intel team: player id of the carrier}`` for every carried intel."""
+        holders = getattr(getattr(getattr(self, "server", None), "mode", None), "intel_holder", None)
+        if not isinstance(holders, dict):
+            return {}
+        return {
+            int(team): int(holder.id)
+            for team, holder in holders.items()
+            if holder is not None
+        }
+
+    def _sync_order_jobs(self, book) -> None:
+        """Split the /attack and /protect bots between escort and push jobs.
+
+        A friendly carrier is a teammate holding the enemy intel; a thief is an
+        enemy holding ours. /attack splits while a carrier exists, /protect
+        while a carrier and a thief both do. The jobs are fixed by bot id for
+        as long as that lasts (see ``PlayerOrderBook.sync_jobs``).
+        """
+        from .player_orders import (
+            ATTACK, DEFAULT_ATTACK_ESCORT_RATIO, DEFAULT_PROTECT_HUNT_RATIO, PROTECT,
+            attack_escort_count, protect_escort_count,
+        )
+
+        config = getattr(self, "_config", None)
+        attack_ratio = getattr(config, "order_attack_escort_ratio", DEFAULT_ATTACK_ESCORT_RATIO)
+        hunt_ratio = getattr(config, "order_protect_hunt_ratio", DEFAULT_PROTECT_HUNT_RATIO)
+        holders = self._intel_holders()
+        for team in _PLAYABLE_TEAMS:
+            enemy = TEAM2 if team == TEAM1 else TEAM1
+            carrier = holders.get(enemy)        # holds the enemy's intel: one of ours
+            thief = holders.get(team)           # holds our intel: one of theirs
+            exclude = () if carrier is None else (carrier,)
+            book.sync_jobs(team, ATTACK, carrier is not None,
+                           lambda n, r=attack_ratio: attack_escort_count(n, r), exclude)
+            book.sync_jobs(team, PROTECT, carrier is not None and thief is not None,
+                           lambda n, r=hunt_ratio: protect_escort_count(n, r), exclude)
+
+    def _maintain_orders(self, book) -> None:
+        """Drop orders that no longer make sense before they are published.
+
+        A bot that changed team forgets its order. A ``/follow`` whose issuer
+        died, left or changed team becomes ``/hold`` at the bot's current spot,
+        so the bots never chase the issuer's respawn.
+        """
+        book.drop_team_changes({int(bot.id): int(bot.team) for bot in self.bots})
+        self._release_orphaned_follows(book)
+        self._sync_order_jobs(book)
+
+    def _release_orphaned_follows(self, book) -> None:
+        """Apply what happens to orders when the player who gave them goes away.
+
+        A player who left the server takes every order they issued with them,
+        of every type (follow, hold, escort, a split's halves ...), exactly as
+        if they had typed /free; orders issued by other players stay. A
+        ``/follow`` whose issuer is still connected but died or changed team
+        turns into ``/hold`` where the bot stands instead.
+        """
+        server = getattr(self, "server", None)
+        players = getattr(server, "players", None)
+        if not hasattr(players, "values"):
+            return  # no roster to judge issuers against (unit-test directors)
+        roster = {int(player.id): player for player in tuple(players.values())}
+        for issuer_id in book.issuers() - roster.keys():
+            freed = book.clear_issued_by(issuer_id)
+            if freed:
+                logger.info("Bot orders: issuer %s left, freed %d order(s)", issuer_id, len(freed))
+
+        def issuer_alive(issuer_id: int, team: int) -> bool:
+            issuer = roster.get(int(issuer_id))
+            return (
+                issuer is not None
+                and bool(getattr(issuer, "alive", False))
+                and bool(getattr(issuer, "spawned", True))
+                and int(getattr(issuer, "team", -1)) == int(team)
+            )
+
+        book.release_orphaned_follows(
+            issuer_alive,
+            {int(bot.id): tuple(float(v) for v in bot.position) for bot in self.bots},
+        )
+
+    def order_status(
+        self,
+        issuer: "Player",
+        names: tuple[str, ...] = (),
+    ) -> list[tuple[str, str, str]]:
+        """``(bot name, order, what it is doing)`` for the issuer's team's bots."""
+        from .player_orders import NAMES, describe_role
+
+        book = self.__dict__.get("_order_book")
+        team = int(getattr(issuer, "team", -1))
+        prefix = str(getattr(getattr(self, "_config", None), "name_prefix", "") or "")
+        rows: list[tuple[str, str, str]] = []
+        for bot in self._select_bots(team, names):
+            order = book.get(int(bot.id)) if book is not None else None
+            runtime = getattr(self, "_runtime", {}).get(int(bot.id))
+            intent = getattr(runtime, "intent", None)
+            if not bool(getattr(bot, "alive", True)):
+                doing = "dead, waiting to respawn"
+            elif intent is None:
+                doing = "idle"
+            else:
+                doing = describe_role(str(getattr(intent, "debug_role", "")))
+            label = bot.name[len(prefix):] if prefix and bot.name.startswith(prefix) else bot.name
+            rows.append((label, NAMES[order.code] if order is not None else "free", doing))
+        return rows
+
+    def _select_bots(self, team: int, names: tuple[str, ...]) -> list:
+        """The team's bots, narrowed to those whose name starts with or contains a name."""
+        candidates = [bot for bot in self.bots if int(bot.team) == team]
+        if names:
+            wanted = tuple(name.lower() for name in names)
+            candidates = [
+                bot for bot in candidates
+                if any(bot.name.lower().startswith(w) or w in bot.name.lower() for w in wanted)
+            ]
+        return candidates
+
+    def give_order(
+        self,
+        order: str,
+        issuer: "Player",
+        names: tuple[str, ...] = (),
+    ) -> tuple[int, str]:
+        """Order the issuer's team's bots (or the named ones). Returns (count, message)."""
+        from .player_orders import CODES, PlayerOrder, PlayerOrderBook
+
+        book = self.__dict__.get("_order_book")
+        if book is None:
+            book = self._order_book = PlayerOrderBook()
+        team = int(getattr(issuer, "team", -1))
+        candidates = self._select_bots(team, names)
+        if not candidates:
+            return 0, "No matching bots on your team"
+        if order == "free":
+            return sum(book.clear(int(bot.id)) for bot in candidates), "released"
+        code = CODES[order]
+        for bot in candidates:
+            position = tuple(float(v) for v in bot.position)
+            book.issue(int(bot.id), PlayerOrder(code, team, int(issuer.id), position))
+        return len(candidates), order
 
     def _objectives_zombie_refuge(self, mode) -> list[ObjectiveSnapshot]:
         refuge = self._zombie_refuge_objective(mode)

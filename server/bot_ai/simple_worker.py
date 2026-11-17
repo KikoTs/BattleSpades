@@ -228,6 +228,8 @@ _CHARGE_TOOLS = (int(C.DYNAMITE_TOOL), int(C.C4_TOOL))
 _CHARGE_REACH = 4.5
 # How far outside its own blast a bot goes before it stops running.
 _CHARGE_CLEARANCE = 2.5
+# How far ahead (blocks) a leashed post checks that a strafe stays inside its leash.
+_LEASH_STEP = 1.5
 # Outward normals of attachment faces 0-5 (entities.behaviors).
 _FACE_NORMALS = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
 _BLOCK_CANNON_TOOL = int(getattr(C, "SNOWBLOWER_TOOL", 29))
@@ -2111,19 +2113,37 @@ class SimpleBotBrain:
             affordance = pursuit.movement.affordance
             crouch = False
 
+        leash_free = False
         if protected_objective:
-            # One route owner survives both quiet and combat frames. Clearing
-            # it for a strafe before recreating it reset progress every tick;
-            # nearby enemies also used to pull escorts out of formation.
-            if pursuit is None:
-                pursuit = self._navigation_intent(
-                    frame, observer, state, pursuit_goal, now)
-            movement = pursuit.movement.direction
-            affordance = pursuit.movement.affordance
-            sprint = bool(mode_decision.sprint)
-            crouch = False
+            # A leashed post (a /hold order) lets the footwork chosen above
+            # strafe and dodge while the step stays inside the leash radius
+            # around the post; a step that would leave it falls through to the
+            # route back to the post, and the quiet-frame route does the same
+            # once the fight is over.
+            leash = float(mode_decision.leash_radius)
+            if leash > 0.0 and pursuit is None and math.hypot(movement[0], movement[1]) > 1e-6:
+                step = _normalized_xy(movement[0], movement[1])
+                post = mode_decision.position
+                leash_free = math.hypot(
+                    observer.position[0] + step[0] * _LEASH_STEP - post[0],
+                    observer.position[1] + step[1] * _LEASH_STEP - post[1],
+                ) <= leash
+            if leash_free:
+                sprint = False
+            else:
+                # One route owner survives both quiet and combat frames.
+                # Clearing it for a strafe before recreating it reset progress
+                # every tick; nearby enemies also used to pull escorts out of
+                # formation.
+                if pursuit is None:
+                    pursuit = self._navigation_intent(
+                        frame, observer, state, pursuit_goal, now)
+                movement = pursuit.movement.direction
+                affordance = pursuit.movement.affordance
+                sprint = bool(mode_decision.sprint)
+                crouch = False
 
-        if pursuit is None and math.hypot(movement[0], movement[1]) > 1e-6:
+        if pursuit is None and not leash_free and math.hypot(movement[0], movement[1]) > 1e-6:
             # A visible target can keep combat ownership indefinitely.  In a
             # one-column tunnel the preferred perpendicular strafe may be
             # terrain-blocked on both sides, so navigation's waypoint timeout

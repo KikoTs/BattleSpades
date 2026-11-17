@@ -17,6 +17,7 @@ from .anticheat_admin import *
 from .hud_admin import *
 from .fun import *
 from .hardcore import *
+from .bot_orders import *
 
 __all__ = [
     "handle_command",

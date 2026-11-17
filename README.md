@@ -405,6 +405,10 @@ browser, so verify registration with the source-tree checker described in the
 **Player** — `/help`, `/kill`, `/team <blue|green>`, `/score`, `/players`,
 `/pm <player> <msg>`, `/me <action>`, `/stats`, `/ping`
 
+Bot orders (any player on a team, no admin needed; see
+[docs/BOT_CHAT_ORDERS.md](docs/BOT_CHAT_ORDERS.md)) — `/follow`, `/hold`, `/attack`,
+`/defend`, `/protect`, `/escort`, `/free`, `/status`, each with optional bot names
+
 **Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
 `/tp <player>`, `/god`, `/map <name>`, `/mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>`, `/restart`, `/say <msg>`,
 `/fog <r> <g> <b>`, `/time`, `/balance`, `/bots status`,

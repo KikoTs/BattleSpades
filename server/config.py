@@ -186,6 +186,16 @@ class BotConfig:
     skill_balance_rate: float = 0.03
     skill_balance_deadband: float = 0.15
     skill_balance_min_events: int = 6
+    # Chat orders (server/bot_ai/player_orders.py): how far a /hold bot may
+    # strafe from its post in a fight, how close to our base a thief is chased
+    # by /defend, and the share of /protect bots that hunt the thief while the
+    # rest escort a friendly carrier.
+    order_hold_leash: float = 6.0
+    order_defend_chase_radius: float = 40.0
+    order_protect_hunt_ratio: float = 0.5
+    # Share of /attack bots that escort a friendly carrier of the enemy intel
+    # while the rest keep attacking; fixed per bot id while the carrier lives.
+    order_attack_escort_ratio: float = 0.5
 
 
 @dataclass
@@ -1506,6 +1516,19 @@ def load_config(
         )))
         config.bots.skill_balance_min_events = min(1000, max(1, int(
             b.get("skill_balance_min_events", config.bots.skill_balance_min_events)
+        )))
+        # Chat-order tunables; bounds match player_orders.clamp_params.
+        config.bots.order_hold_leash = min(40.0, max(0.0, float(
+            b.get("order_hold_leash", config.bots.order_hold_leash)
+        )))
+        config.bots.order_defend_chase_radius = min(400.0, max(0.0, float(
+            b.get("order_defend_chase_radius", config.bots.order_defend_chase_radius)
+        )))
+        config.bots.order_protect_hunt_ratio = min(1.0, max(0.0, float(
+            b.get("order_protect_hunt_ratio", config.bots.order_protect_hunt_ratio)
+        )))
+        config.bots.order_attack_escort_ratio = min(1.0, max(0.0, float(
+            b.get("order_attack_escort_ratio", config.bots.order_attack_escort_ratio)
         )))
 
     if "steam" in data:

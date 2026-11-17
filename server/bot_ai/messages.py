@@ -317,6 +317,10 @@ class ObjectiveSnapshot:
     # Horde orders: a released wave is rushing a dangerous survivor; the
     # carrier sprints, weaves and hops across the open instead of walking.
     rush: bool = False
+    # Free-form numeric tunables for server-published orders (chat orders
+    # carry the operator's ``[bots] order_*`` settings here so the worker needs
+    # no config of its own). Empty for every mode objective.
+    params: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
