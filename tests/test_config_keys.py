@@ -79,7 +79,6 @@ FLAT_KEYS = [
     ("bots", "order_protect_hunt_ratio", "bots.order_protect_hunt_ratio", 0.5),
     ("bots", "order_attack_escort_ratio", "bots.order_attack_escort_ratio", 0.5),
     ("bots", "order_attack_intercept_radius", "bots.order_attack_intercept_radius", 40.0),
-    ("bots", "order_team_command_spectators", "bots.order_team_command_spectators", False),
     ("bots", "order_pickup_count", "bots.order_pickup_count", 2),
     ("bots", "order_pickup_radius", "bots.order_pickup_radius", 30.0),
     ("bots", "chatter", "bots.chatter", False),
@@ -249,7 +248,6 @@ _CUSTOM_TOML = textwrap.dedent("""
     order_protect_hunt_ratio = 0.25
     order_attack_escort_ratio = 0.75
     order_attack_intercept_radius = 75
-    order_team_command_spectators = true
     order_pickup_count = 3
     order_pickup_radius = 55
 
@@ -350,7 +348,6 @@ def test_order_keys_reach_the_director(custom_server):
     director.server = custom_server
     assert director._order_params() == (9.5, 55.0, 75.0)
     assert server_ratios(custom_server) == (0.75, 0.25)
-    assert custom_server.config.bots.order_team_command_spectators is True
     assert (custom_server.config.bots.order_pickup_count, custom_server.config.bots.order_pickup_radius) == (3, 55.0)
 
 
@@ -601,3 +598,14 @@ def test_shipped_config_sets_no_dead_keys(tmp_path, caplog):
         load_config(ROOT / "config.toml")
     assert "[weapons]" not in caplog.text
     assert "map_size_" not in caplog.text
+
+
+def test_the_spectator_command_key_is_gone_and_a_leftover_line_is_ignored(tmp_path):
+    from server.config import BotConfig, load_config
+
+    assert not hasattr(BotConfig(), "order_team_command_spectators")
+    path = tmp_path / "config.toml"
+    path.write_text("[bots]\norder_team_command_spectators = true\norder_hold_leash = 9.0\n", encoding="utf-8")
+    config = load_config(path)
+    assert not hasattr(config.bots, "order_team_command_spectators")
+    assert config.bots.order_hold_leash == 9.0

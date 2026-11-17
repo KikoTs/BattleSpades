@@ -892,7 +892,8 @@ def test_chat_command_issues_order_and_replies(monkeypatch):
     assert {o.carrier_id: o.state for o in director._objectives_player_orders(None)} == {1: HOLD, 2: PROTECT}
     spectator = SimpleNamespace(id=10, team=255, name="Spec", admin=False)
     asyncio.run(handle_command(server, spectator, "attack"))
-    assert sent[-1] == "Join a team to command bots"
+    assert sent[-1] == REFUSED_SPECTATOR                         # a spectator who is not an admin gets nothing
+    assert {o.carrier_id for o in director._objectives_player_orders(None)} == {1, 2}   # and orders nobody
 
 
 def test_escort_is_its_own_command_and_protect_no_longer_aliases_it(monkeypatch):
@@ -925,7 +926,11 @@ def test_status_command_lists_each_bot(monkeypatch):
     assert sent == ["No matching bots on your team"]
     spectator = SimpleNamespace(id=10, team=255, name="Spec", admin=False)
     sent.clear()
-    asyncio.run(handle_command(server, spectator, "status"))       # a spectator sees both teams
+    asyncio.run(handle_command(server, spectator, "status"))       # not an admin: refused
+    assert sent == [REFUSED_SPECTATOR]
+    spectator.admin = True
+    sent.clear()
+    asyncio.run(handle_command(server, spectator, "status"))       # an admin spectating sees both teams
     assert sent == ["Team 2 defend: Rex | free: Ada", "Team 3 free: Eve"]        # grouped, one line per group set
     sent.clear()
     asyncio.run(handle_command(server, spectator, "status full"))
@@ -1324,7 +1329,11 @@ def test_split_commands_reply_and_refuse_through_chat(monkeypatch):
     spectator = SimpleNamespace(id=11, team=0, name="Spec", admin=False)
     sent.clear()
     asyncio.run(handle_command(server, spectator, "split hold attack"))
-    assert sent == ["Join a team to command bots"]
+    assert sent == [REFUSED_SPECTATOR]
+    spectator.admin = True                                        # an admin with no team of their own is pointed at /team
+    sent.clear()
+    asyncio.run(handle_command(server, spectator, "split hold attack"))
+    assert sent == ["Join a team to command bots, or use /team <color|all> <command>"]
 
 
 def test_split_command_accepts_aliases_names_and_the_intel_word(monkeypatch):
@@ -1359,13 +1368,11 @@ def test_split_protect_intel_word_is_dropped_before_and_after_the_second_action(
 
 # ------------------------------------------------------- /team <color> <command>
 
-from commands.bot_orders import team_tokens
+from commands.bot_orders import REFUSED_OTHER_TEAM, REFUSED_SPECTATOR, team_tokens
 
 
-def _server(director, *, spectators=False, names=("TEAM1_COLOR", "TEAM2_COLOR")):
-    config = SimpleNamespace(
-        log_commands=False, team1_name=names[0], team2_name=names[1],
-        bots=SimpleNamespace(order_team_command_spectators=spectators))
+def _server(director, *, names=("TEAM1_COLOR", "TEAM2_COLOR")):
+    config = SimpleNamespace(log_commands=False, team1_name=names[0], team2_name=names[1])
     return SimpleNamespace(bots=director, config=config)
 
 
@@ -1379,8 +1386,8 @@ def _admin(pid=20, team=TEAM2):
     return SimpleNamespace(id=pid, team=team, alive=True, spawned=True, name="Boss", admin=True)
 
 
-def _spectator(pid=21):
-    return SimpleNamespace(id=pid, team=0, alive=False, spawned=False, name="Spec", admin=False)
+def _spectator(pid=21, *, admin=False):
+    return SimpleNamespace(id=pid, team=0, alive=False, spawned=False, name="Spec", admin=admin)
 
 
 def _teams_of(director, team):
@@ -1450,29 +1457,33 @@ def test_team_command_accepts_every_command_and_split_form(monkeypatch):
         assert sent[-1] == said, (text, sent[-1])
 
 
-def test_spectators_are_refused_unless_the_server_allows_them(monkeypatch):
+def test_a_spectator_is_refused_unless_an_admin(monkeypatch):
     sent = _commands(monkeypatch)
     spec = _spectator()
     bots, director = _two_teams(spec)
     asyncio.run(handle_command(_server(director), spec, "team blue hold"))
-    assert sent == ["Spectators cannot command bots on this server"]
+    assert sent == [REFUSED_SPECTATOR]
     assert _teams_of(director, TEAM1) == {}
     sent.clear()
-    asyncio.run(handle_command(_server(director, spectators=True), spec, "team blue hold"))
+    boss = _spectator(22, admin=True)
+    asyncio.run(handle_command(_server(director), boss, "team blue hold"))
     assert sent == ["4 bot(s) holding position"]
-    asyncio.run(handle_command(_server(director, spectators=True), spec, "team green split attack defend"))
+    asyncio.run(handle_command(_server(director), boss, "team green split attack defend"))
     assert sent[-1] == "2 bot(s) attacking, 2 defending"
-    assert spec.team == 0                                                       # still a spectator
+    assert boss.team == 0                                                       # still a spectator
 
 
-def test_a_plain_team_member_is_pointed_at_the_ordinary_commands(monkeypatch):
+def test_a_team_member_may_use_team_for_their_own_colour_only(monkeypatch):
     sent = _commands(monkeypatch)
     member = _human(9, team=TEAM1)
     bots, director = _two_teams(member)
-    asyncio.run(handle_command(_server(director, spectators=True), member, "team blue hold"))
-    assert sent == ["Only admins and spectators can use /team <color> <command>; "
-                    "use /<command> to order your own team's bots"]
-    assert _teams_of(director, TEAM1) == {}
+    asyncio.run(handle_command(_server(director), member, "team green hold"))
+    assert sent == [REFUSED_OTHER_TEAM]
+    assert _teams_of(director, TEAM2) == {}
+    sent.clear()
+    asyncio.run(handle_command(_server(director), member, "team blue hold"))     # their own colour is just the long form
+    assert sent == ["4 bot(s) holding position"]
+    assert _teams_of(director, TEAM1) == {i: ("hold", 0) for i in (1, 2, 3, 4)}
 
 
 def test_team_command_rejects_unknown_teams_and_commands(monkeypatch):
@@ -1489,9 +1500,9 @@ def test_team_command_rejects_unknown_teams_and_commands(monkeypatch):
 
 def test_follow_from_outside_the_team_is_refused_because_nobody_can_be_followed(monkeypatch):
     sent = _commands(monkeypatch)
-    spec = _spectator()
+    spec = _spectator(admin=True)
     bots, director = _two_teams(spec)
-    server = _server(director, spectators=True)
+    server = _server(director)
     asyncio.run(handle_command(server, spec, "team blue follow"))
     asyncio.run(handle_command(server, spec, "team blue split follow attack"))
     assert sent == ["You are not on that team, so there is nobody for /follow to follow"] * 2
@@ -1506,11 +1517,11 @@ def test_status_of_an_empty_match_from_outside_says_that_team(monkeypatch):
     assert sent == ["No matching bots on that team"]
 
 
-def test_team_members_keep_their_own_orders_working_beside_a_spectators(monkeypatch):
+def test_team_members_keep_their_own_orders_working_beside_an_admin_spectators(monkeypatch):
     sent = _commands(monkeypatch)
-    spec, member = _spectator(), _human(9, team=TEAM1)
+    spec, member = _spectator(admin=True), _human(9, team=TEAM1)
     bots, director = _two_teams(spec, member)
-    server = _server(director, spectators=True)
+    server = _server(director)
     asyncio.run(handle_command(server, spec, "team blue attack"))
     asyncio.run(handle_command(server, member, "hold blu1 blu2"))             # the member re-orders two
     book = director.__dict__["_order_book"]
@@ -1603,19 +1614,20 @@ def test_team_all_status_lists_both_teams_with_labels(monkeypatch):
     assert len(sent) == 4 and sent[0] == "Blu1 [hold, half 1]: idle"
 
 
-def test_team_all_has_the_same_permissions_as_team(monkeypatch):
+def test_team_all_is_for_admins_only(monkeypatch):
     sent = _commands(monkeypatch)
-    spec, member = _spectator(), _human(9, team=TEAM1)
-    bots, director = _two_teams(spec, member)
+    spec, member, boss = _spectator(), _human(9, team=TEAM1), _spectator(22, admin=True)
+    bots, director = _two_teams(spec, member, boss)
     asyncio.run(handle_command(_server(director), spec, "team all hold"))
-    assert sent == ["Spectators cannot command bots on this server"]
+    assert sent == [REFUSED_SPECTATOR]
     sent.clear()
-    asyncio.run(handle_command(_server(director, spectators=True), spec, "team all hold"))
+    asyncio.run(handle_command(_server(director), member, "team all hold"))
+    assert sent == [REFUSED_OTHER_TEAM]
+    assert _teams_of(director, TEAM1) == {} and _teams_of(director, TEAM2) == {}
+    sent.clear()
+    asyncio.run(handle_command(_server(director), boss, "team all hold"))
     assert sent == ["Blue: 4 bot(s) holding position", "Green: 4 bot(s) holding position"]
-    sent.clear()
-    asyncio.run(handle_command(_server(director, spectators=True), member, "team all hold"))
-    assert sent[0].startswith("Only admins and spectators can use /team <color> <command>")
-    assert spec.team == 0
+    assert boss.team == 0
 
 
 def test_team_all_with_no_bots_or_a_bad_command_answers_once(monkeypatch):
@@ -1629,13 +1641,13 @@ def test_team_all_with_no_bots_or_a_bad_command_answers_once(monkeypatch):
     assert sent == ["Unknown command 'dance'. Use: follow, hold, attack, defend, protect, escort, free, status, split"]
 
 
-# --------------------------------------------------------- /status for spectators
+# ------------------------------------------------- /status for an admin spectating
 
-def test_a_spectators_status_shows_both_teams_without_any_permission(monkeypatch):
+def test_an_admin_spectators_status_shows_both_teams(monkeypatch):
     sent = _commands(monkeypatch)
-    spec = _spectator()
+    spec = _spectator(admin=True)
     bots, director = _two_teams(spec)
-    server = _server(director)                                     # spectator orders are NOT enabled
+    server = _server(director)
     asyncio.run(handle_command(server, _admin(team=TEAM2), "team blue split hold attack"))
     sent.clear()
     asyncio.run(handle_command(server, spec, "status"))
@@ -1653,18 +1665,20 @@ def test_a_spectators_status_shows_both_teams_without_any_permission(monkeypatch
     assert sent == ["Blue: No matching bots on that team", "Green: No matching bots on that team"]
 
 
-def test_a_spectator_cannot_order_but_can_read_one_team_with_permission(monkeypatch):
+def test_a_plain_spectator_cannot_read_any_status_but_an_admin_one_can(monkeypatch):
     sent = _commands(monkeypatch)
-    spec = _spectator()
-    bots, director = _two_teams(spec)
-    asyncio.run(handle_command(_server(director), spec, "team blue status"))          # ordering path: not allowed
-    assert sent == ["Spectators cannot command bots on this server"]
+    spec, boss = _spectator(), _spectator(22, admin=True)
+    bots, director = _two_teams(spec, boss)
+    for text in ("status", "st full", "team blue status", "team all status", "team all st full blu1"):
+        sent.clear()
+        asyncio.run(handle_command(_server(director), spec, text))
+        assert sent == [REFUSED_SPECTATOR], text
     sent.clear()
-    asyncio.run(handle_command(_server(director, spectators=True), spec, "team blue status blu3"))
+    asyncio.run(handle_command(_server(director), boss, "team blue status blu3"))
     assert sent == ["Blu3 [free]: idle"]                                              # one team, unlabeled
 
 
-def test_players_and_admins_on_a_team_still_see_only_their_own_team(monkeypatch):
+def test_players_and_admins_on_a_team_still_see_only_their_own_team_with_plain_status(monkeypatch):
     sent = _commands(monkeypatch)
     member, boss = _human(9, team=TEAM1), _admin(team=TEAM2)
     bots, director = _two_teams(member, boss)
@@ -1676,11 +1690,80 @@ def test_players_and_admins_on_a_team_still_see_only_their_own_team(monkeypatch)
     assert [m.split(" ")[0] for m in sent] == ["Grn11", "Grn12", "Grn13", "Grn14"]
 
 
-def test_a_spectators_status_with_no_bots_answers_once(monkeypatch):
+def test_an_admin_spectators_status_with_no_bots_answers_once(monkeypatch):
     sent = _commands(monkeypatch)
-    spec = _spectator()
+    spec = _spectator(admin=True)
     asyncio.run(handle_command(SimpleNamespace(bots=None, config=_server(None).config), spec, "status"))
     assert sent == ["There are no bots to command"]
+
+
+# ------------------------------------------------ who may command which team's bots
+
+_BLUE, _GREEN = "blue", "green"
+_OK, _SPEC, _OTHER, _NOTEAM = "ok", "spectator", "other-team", "no-team"
+_NOTEAM_TEXT = "Join a team to command bots, or use /team <color|all> <command>"
+_MATRIX_ROLES = {
+    "player": lambda: _human(9, team=TEAM1),
+    "spectator": lambda: _spectator(21),
+    "admin-player": lambda: _admin(20, team=TEAM1),
+    "admin-spectator": lambda: _spectator(22, admin=True),
+}
+# command -> the team (or "both") it orders, and the outcome for each role.
+_MATRIX = [
+    # plain commands act on the player's own team
+    ("hold",               "own",   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _NOTEAM})),
+    ("split hold attack",  "own",   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _NOTEAM})),
+    ("free",               "own",   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _NOTEAM})),
+    ("status",             "own",   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    # /team <color> <command>
+    ("team blue hold",     _BLUE,   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team blue split hold attack", _BLUE,
+                                    dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team blue status",   _BLUE,   dict(player=_OK, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team green hold",    _GREEN,  dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team green split hold attack", _GREEN,
+                                    dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team green status",  _GREEN,  dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team green free",    _GREEN,  dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    # /team all <command>
+    ("team all hold",      "both",  dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team all split hold attack", "both",
+                                    dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+    ("team all status",    "both",  dict(player=_OTHER, spectator=_SPEC, **{"admin-player": _OK, "admin-spectator": _OK})),
+]
+
+
+def _matrix_ids():
+    return [f"{role}:{text}" for text, _, outcomes in _MATRIX for role in outcomes]
+
+
+import pytest
+
+
+@pytest.mark.parametrize("role,text,target,outcome", [
+    (role, text, target, outcome)
+    for text, target, outcomes in _MATRIX for role, outcome in outcomes.items()
+], ids=_matrix_ids())
+def test_who_may_command_which_teams_bots(monkeypatch, role, text, target, outcome):
+    sent = _commands(monkeypatch)
+    who = _MATRIX_ROLES[role]()
+    bots, director = _two_teams(who)
+    asyncio.run(handle_command(_server(director), who, text))
+    if outcome == _OK:
+        assert sent and not any(m in (REFUSED_SPECTATOR, REFUSED_OTHER_TEAM, _NOTEAM_TEXT) for m in sent), sent
+        if text.split()[-1] != "status" and not text.endswith("free"):
+            acted = {t for t in (TEAM1, TEAM2) if _teams_of(director, t)}
+            expected = {TEAM1, TEAM2} if target == "both" else {TEAM1 if target in ("own", _BLUE) else TEAM2}
+            assert acted == expected, (acted, expected)
+        return
+    expected_text = {_SPEC: REFUSED_SPECTATOR, _OTHER: REFUSED_OTHER_TEAM, _NOTEAM: _NOTEAM_TEXT}[outcome]
+    assert sent == [expected_text]
+    assert _teams_of(director, TEAM1) == {} and _teams_of(director, TEAM2) == {}      # nothing was ordered
+
+
+def test_the_refusals_read_clearly():
+    assert REFUSED_SPECTATOR == "Spectators cannot command bots or read their status"
+    assert REFUSED_OTHER_TEAM == "You can only command your own team's bots; ask an admin to use /team"
 
 
 # ------------------------------------------------------------------ short forms
@@ -1765,11 +1848,11 @@ def test_b_and_g_also_name_the_teams_for_a_plain_team_switch_but_a_does_not():
     assert tokens["b"] == TEAM1 and tokens["g"] == TEAM2 and "a" not in tokens
 
 
-def test_short_actions_in_a_status_and_split_with_a_spectator(monkeypatch):
+def test_short_actions_in_a_status_and_split_with_an_admin_spectator(monkeypatch):
     sent = _commands(monkeypatch)
-    spec = _spectator()
+    spec = _spectator(admin=True)
     bots, director = _two_teams(spec)
-    server = _server(director, spectators=True)
+    server = _server(director)
     run = lambda text: asyncio.run(handle_command(server, spec, text))
     run("t a sp ho at")
     assert sent[-2:] == ["Blue: 2 bot(s) holding position, 2 attacking",

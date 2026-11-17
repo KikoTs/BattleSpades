@@ -1,9 +1,19 @@
 # Bot chat orders
 
-Any player on a team can order that team's server-owned bots from chat. Orders
-need no admin rights. Spectators are refused, and so is an order when the server
-has no bots. Optional arguments name bots (by name prefix or substring); with
-none, every bot on your team obeys.
+Any player on a team can order that team's server-owned bots from chat, and read
+that team's `/status`, without admin rights. Only their own team's: ordering the
+other team, or both (`/team all`), needs an admin. A spectator who is not an admin
+cannot use any bot command, `/status` and every `/team` form included. An admin,
+playing or spectating, can use either team and `/team all`. An order is also
+refused when the server has no bots. Optional arguments name bots (by name prefix
+or substring); with none, every bot on the team obeys.
+
+| Role | Own team | Other team / `/team all` | `/status` |
+| --- | --- | --- | --- |
+| Player on a team | orders, `/split`, `/free` | refused | own team only |
+| Spectator, not an admin | refused | refused | refused |
+| Admin playing | yes | yes | either team, or both |
+| Admin spectating | via `/team <color>` (no team of their own) | yes | both teams |
 
 | Command | Aliases | What the bots do |
 | --- | --- | --- |
@@ -15,7 +25,7 @@ none, every bot on your team obeys.
 | `/escort [bot ...]` | | Escort the friendly carrier of the enemy intel, else you. Never splits, even when our intel is stolen. If you die while a bot is escorting **you** (no carrier), it becomes a `/hold` where it stands, like `/follow`; a bot escorting a carrier is unaffected until he is gone. |
 | `/free [bot ...]` | `/resume`, `/release` | Release the bots; they play normally again. |
 | `/split <action> [<action>] [bot ...]` | | Split bots between two actions. See below. |
-| `/status [full] [bot ...]` | `/orders`, `/st` | Players see their own team, one line per bot: its order, its `/split` half if any, and what it is doing right now. **Spectators see both teams**, and `/team all status` shows both, in the compact format below; `/status full` (`/st full`) gives the per-bot detail instead. `/team <color> status` shows one team in full detail. Read-only, so spectators need no permission. |
+| `/status [full] [bot ...]` | `/orders`, `/st` | Players see their own team, one line per bot: its order, its `/split` half if any, and what it is doing right now. **An admin spectating sees both teams**, and an admin's `/team all status` shows both, in the compact format below; `/status full` (`/st full`) gives the per-bot detail instead. `/team <color> status` shows one team in full detail. Other players and non-admin spectators are refused for any team but their own. |
 
 A bot that carries intel always takes it home first, whatever it was ordered.
 The carrier is found from the intel objective, which follows its holder, so an
@@ -65,7 +75,7 @@ hunt the thief):
 
 - A **single team's** `/status` (a player's own team, or `/team blue status`) is one line per
   bot, in full detail: `Rex [hold, half 1]: holding position (in position)`.
-- **A spectator's `/status` and `/team all status`** group the bots by order and split half, one
+- **An admin spectator's `/status` and `/team all status`** group the bots by order and split half, one
   segment per group, so two teams of 15 bots fit in about ten chat lines:
 
   ```
@@ -77,7 +87,7 @@ hunt the thief):
   group too long for one line continues on the next with its header repeated; free bots come last.
   The sub-goal is left out to keep it short.
 - **`/status full`** (short form `/st full`, also `/team all status full`) gives the full per-bot
-  lines on request, for a spectator or for both teams. Bot names after it still filter:
+  lines on request, for both teams. Bot names after it still filter:
   `/st full rex ann`.
 
 ## Short forms
@@ -140,10 +150,9 @@ Actions: `follow`, `hold` (`stay`), `attack` (`assault`), `defend`, `protect`, `
   its order stays with its previous issuer. When an issuer disconnects their orders are
   freed as above, and a split that lost a half dissolves.
 
-## `/team <color|all> <command> ...` (admins and spectators)
+## `/team <color|all> <command> ...` (admins; players for their own colour)
 
-An admin, or a spectator when the server allows it, can order a team's bots from
-outside the team: `/team blue protect`, `/team blue split attack`,
+An admin can order a team's bots from outside the team: `/team blue protect`, `/team blue split attack`,
 `/team green split hold attack`, `/team green status`, `/team blue free rex`.
 
 - **`all`** runs the command for **both teams**: `/team all hold`, `/team all split free attack`,
@@ -156,9 +165,10 @@ outside the team: `/team blue protect`, `/team blue split attack`,
 - **Command** is any of `follow`, `hold`, `attack`, `defend`, `protect`, `escort`, `free`,
   `status` and `split`, with the same aliases, optional bot names and `/split` forms as
   the plain commands.
-- **Who may:** admins always. Spectators only when `order_team_command_spectators = true`
-  (default `false`). A regular team member is told to use the plain command for their
-  own team, and a spectator on a server that does not allow it is told so.
+- **Who may:** admins, playing or spectating, for either team and `all`. A player on a
+  team may use only their own colour, which is the plain command spelled longer
+  (`/team blue hold` on blue); another colour or `all` is refused. A spectator who is not an
+  admin is refused every form, `status` included.
 - **`follow`** needs an issuer on that team to follow, so it is refused (`/split` forms
   naming `follow` too) when you are not on it. An admin playing on blue can `/team blue
   follow`.
@@ -222,7 +232,7 @@ else's belongs to the new issuer, and only their disconnect frees it.
   carrier) becomes a `/hold` where it stands. A bot escorting a **different carrier** is not
   affected; if the carrier is gone while the issuer is still dead, it converts then. If the
   issuer is back before the carrier is gone it keeps escorting. An issuer who was never on
-  the team (an admin or spectator using `/team <color> escort`) does not count as dead, and
+  the team (an admin using `/team <color> escort`) does not count as dead, and
   an issuer who merely changes team leaves the order as it is.
 
 Any other order keeps going when its issuer dies or spectates.
@@ -238,7 +248,6 @@ Any other order keeps going when its issuer dies or spectates.
 | `order_attack_intercept_radius` | `40.0` | Blocks from a friendly carrier within which interceptors hunt enemies, 0-400. `0` makes them only screen him. |
 | `order_pickup_count` | `2` | How many bots (per split half) go and grab a dropped enemy intel, 0-8. `0` turns it off. |
 | `order_pickup_radius` | `30.0` | Blocks from the dropped intel within which bots are eligible, 0-400. |
-| `order_team_command_spectators` | `false` | Lets spectators use `/team <color> <command>` too. Admins always may. |
 
 The director stamps the leash and chase radius, and each bot's job, on every
 published order (`ObjectiveSnapshot.params`), so the isolated worker needs no

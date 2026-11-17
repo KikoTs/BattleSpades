@@ -3,10 +3,13 @@
 ``/follow /hold /attack /defend /protect /escort /free`` order them, ``/split``
 divides them between two jobs, ``/status`` reads back what each is doing.
 
-Any player on a team may order that team's bots. Optional arguments name bots
-(prefix or substring); with none, every bot on your team obeys. The runners
-below take an optional ``team`` so the same commands can address another team
-(see the ``/team <color> <command>`` form in ``commands/player.py``).
+Any player on a team may order that team's bots and read its ``/status``, and
+only that team's. A spectator who is not an admin may do nothing with bots at
+all. An admin, playing or spectating, may command either team or both
+(``/team <color|all> <command>``, see ``commands/player.py``). Optional
+arguments name bots (prefix or substring); with none, every bot on the team
+obeys. The runners below take an optional ``team`` so the same commands can
+address another team.
 """
 
 from server.bot_ai.player_orders import DONE_TEXT
@@ -36,9 +39,34 @@ _SPLIT_NAMES = ("split", "sp")
 _ALL_NAMES = ("all", "a")
 
 
-async def _target(ctx: CommandContext, team: int | None):
+REFUSED_SPECTATOR = "Spectators cannot command bots or read their status"
+REFUSED_OTHER_TEAM = "You can only command your own team's bots; ask an admin to use /team"
+
+
+def refusal(player, team: int | None, *, all_teams: bool = False) -> str | None:
+    """Why ``player`` may not command (or read the status of) ``team``'s bots, or None.
+
+    Admins may address any team or both; a team member only their own; a
+    spectator who is not an admin nothing. ``team`` None means the player's own.
+    """
+
+    if getattr(player, "admin", False):
+        return None
+    own = getattr(player, "team", None)
+    if own not in (TEAM1, TEAM2):
+        return REFUSED_SPECTATOR
+    if all_teams or (team is not None and int(team) != int(own)):
+        return REFUSED_OTHER_TEAM
+    return None
+
+
+async def _target(ctx: CommandContext, team: int | None, *, all_teams: bool = False):
     """The director and team a command acts on, or None after telling the player why."""
 
+    refused = refusal(ctx.player, team, all_teams=all_teams)
+    if refused is not None:
+        await send_message(ctx.server, ctx.player, refused)
+        return None
     director = getattr(ctx.server, "bots", None)
     if director is None or not getattr(director, "bots", None):
         await send_message(ctx.server, ctx.player, "There are no bots to command")
@@ -46,7 +74,9 @@ async def _target(ctx: CommandContext, team: int | None):
     if team is None:
         team = getattr(ctx.player, "team", None)
         if team not in (TEAM1, TEAM2):
-            await send_message(ctx.server, ctx.player, "Join a team to command bots")
+            # an admin who is spectating has no team of their own
+            await send_message(ctx.server, ctx.player,
+                               "Join a team to command bots, or use /team <color|all> <command>")
             return None
     return director, int(team)
 
@@ -147,13 +177,13 @@ async def run_status(ctx: CommandContext, names, team: int | None = None,
 
 
 async def run_status_teams(ctx: CommandContext, names, teams, *, full: bool = False) -> None:
-    """Both teams' status for a spectator or ``/team all status``.
+    """Both teams' status for an admin spectating, or ``/team all status``.
 
     Compact by default (one line per group of bots sharing an order and half);
     ``full`` gives the per-bot detail of a single team's ``/status`` for each.
     """
 
-    target = await _target(ctx, teams[0])
+    target = await _target(ctx, teams[0], all_teams=True)
     if target is None:
         return
     director, _ = target
@@ -243,13 +273,13 @@ async def cmd_free(ctx: CommandContext):
 
 
 @register_command(name="status", aliases=["orders", "st"], usage="/status" + _USAGE_TAIL,
-                  description="Show each of your team's bots: order, split half, what it is doing (spectators: both teams, grouped; add 'full' for detail)")
+                  description="Show each of your team's bots: order, split half, what it is doing (admins spectating: both teams, grouped; add 'full' for detail)")
 async def cmd_status(ctx: CommandContext):
     full, names = parse_full(ctx.args)
     if getattr(ctx.player, "team", None) not in (TEAM1, TEAM2):
-        # A spectator is on no team, so show both, compactly unless asked for
-        # "full". It is read-only, so it needs no permission (unlike ordering
-        # with /team <color> <command>).
+        # An admin who is spectating is on no team, so show both, compactly
+        # unless asked for "full". Any other spectator is refused (see
+        # ``refusal``).
         await run_status_teams(ctx, names, (TEAM1, TEAM2), full=full)
         return
     await run_status(ctx, names)
@@ -298,16 +328,20 @@ _TEAM_COMMANDS = ", ".join(("follow", "hold", "attack", "defend", "protect", "es
 
 
 async def team_command(ctx: CommandContext) -> None:
-    """``/team <color|all> <command> ...``: order another team's bots (admins, and
-    spectators when ``[bots] order_team_command_spectators`` allows it). ``all``
-    runs the command for both teams.
+    """``/team <color|all> <command> ...``: command a team's bots from a chat line.
 
-    It forwards to the same runners as the plain commands, so every command and
-    every ``/split`` form works, and orders obey the same rules: other players'
-    orders on that team keep working and any teammate can ``/free`` them.
+    Admins may address either team or ``all`` (both teams); a team member only
+    their own colour, which is the plain command spelled longer; a spectator who
+    is not an admin is refused. It forwards to the same runners as the plain
+    commands, so every command and every ``/split`` form works, and orders obey
+    the same rules: other players' orders on that team keep working and any
+    teammate can ``/free`` them.
     """
 
     server, player = ctx.server, ctx.player
+    if refusal(player, None) == REFUSED_SPECTATOR:
+        await send_message(server, player, REFUSED_SPECTATOR)
+        return
     token = ctx.args[0].lower()
     everyone = token in _ALL_NAMES
     team = None if everyone else team_tokens(server).get(token)
@@ -315,16 +349,9 @@ async def team_command(ctx: CommandContext) -> None:
         await send_message(server, player,
                            f"Unknown team '{ctx.args[0]}'. Use blue, green or all (team1 or team2)")
         return
-    is_spectator = getattr(player, "team", None) not in (TEAM1, TEAM2)
-    spectators_allowed = bool(getattr(getattr(getattr(server, "config", None), "bots", None),
-                                      "order_team_command_spectators", False))
-    if not (getattr(player, "admin", False) or (is_spectator and spectators_allowed)):
-        if is_spectator:
-            await send_message(server, player, "Spectators cannot command bots on this server")
-        else:
-            await send_message(server, player,
-                               "Only admins and spectators can use /team <color> <command>; "
-                               "use /<command> to order your own team's bots")
+    refused = refusal(player, team, all_teams=everyone)
+    if refused is not None:
+        await send_message(server, player, refused)
         return
     command, rest = ctx.args[1].lower(), ctx.args[2:]
     if command in ACTIONS:

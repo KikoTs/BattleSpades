@@ -199,9 +199,6 @@ class BotConfig:
     # Blocks from a friendly intel carrier within which the /attack bots that
     # are not escorting him hunt enemies (they screen him when none is that close).
     order_attack_intercept_radius: float = 40.0
-    # /team <color> <command> lets admins order a team's bots from outside it;
-    # true lets spectators do the same (off by default: admins only).
-    order_team_command_spectators: bool = False
     # Dropped enemy intel: the nearest ``order_pickup_count`` bots (per split
     # half) within ``order_pickup_radius`` blocks of it, among those under
     # attack, escort, protect, defend or follow, go and grab it.
@@ -1550,9 +1547,6 @@ def load_config(
         config.bots.order_pickup_radius = min(400.0, max(0.0, float(
             b.get("order_pickup_radius", config.bots.order_pickup_radius)
         )))
-        config.bots.order_team_command_spectators = bool(
-            b.get("order_team_command_spectators", config.bots.order_team_command_spectators)
-        )
 
     if "steam" in data:
         steam = data["steam"]

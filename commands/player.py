@@ -90,7 +90,7 @@ async def cmd_kill(ctx: CommandContext):
     name="team",
     aliases=["t"],
     usage="/team <blue|green|spectator> [command ...]",
-    description="Change your team; admins and spectators can also give a team's bots a command",
+    description="Change your team; with a command, order a team's bots (admins: any team or all)",
 )
 async def cmd_team(ctx: CommandContext):
     """Change team through the same rules as the retail ChangeTeam packet.
