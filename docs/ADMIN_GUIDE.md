@@ -532,6 +532,28 @@ visible and hidden entries.
   per second (default 0.03), ignoring edges inside `skill_balance_deadband`
   (default 0.15, 0-0.95) and teams with fewer than `skill_balance_min_events`
   kills and deaths (default 6).
+  Chat orders (see [BOT_CHAT_ORDERS.md](BOT_CHAT_ORDERS.md)) have seven
+  tunables in `[bots]`:
+  - `order_hold_leash` (default 6.0 blocks, 0-40). How far a `/hold` bot may
+    stray from its post in a fight. 0 makes it stand still.
+  - `order_defend_chase_radius` (default 40.0 blocks, 0-400). `/defend` chases
+    an intel thief only this close to our base.
+  - `order_protect_hunt_ratio` (default 0.5, 0-1). The share of `/protect` bots
+    that hunt the thief while a friendly carrier also needs escort.
+  - `order_attack_escort_ratio` (default 0.5, 0-1). The share of `/attack` bots
+    that escort a friendly intel carrier while the rest intercept.
+  - `order_attack_intercept_radius` (default 40.0 blocks, 0-400). The
+    interceptors hunt enemies within this distance of the carrier.
+  - `order_pickup_count` (default 2, 0-8). When the enemy's intel lies dropped,
+    this many of the nearest bots under attack, escort, protect, defend or
+    follow go and grab it. 0 turns this off.
+  - `order_pickup_radius` (default 30.0 blocks, 0-400). Only bots within this
+    distance of the dropped intel are eligible.
+
+  Who may command bots is not a setting. A player on a team orders and reads
+  `/status` for that team only. A spectator who is not an admin is refused
+  every bot command. An admin (playing or spectating) may use either team and
+  `/team all`.
 - `[modes.<code>]`: `time_limit` seconds plus legacy aliases shown in the
   sample. These override `[game_rules]` only for that mode. An alias table
   name (`[modes.zombie]`) applies to its short code; `[modes.zom]` wins when

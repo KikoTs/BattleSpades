@@ -71,6 +71,11 @@ class ModeBotDecision:
     exact_height: bool = False
     # Horde wave: cross the open at a sprint, weaving and hopping.
     rush: bool = False
+    # Protected-objective roles normally plant their feet on ``position`` for
+    # the whole fight. A positive leash lets the bot strafe and dodge inside
+    # this many blocks of ``position`` while an enemy is engaged, then walk
+    # back to ``position`` once it is clear. Zero keeps the stand-still rule.
+    leash_radius: float = 0.0
 
 
 _MODE_STRATEGIES: dict[str, ModeBotStrategy] = {
@@ -2306,7 +2311,7 @@ def mode_objective_committed(decision: ModeBotDecision | None) -> bool:
         decision.directive == "mine" or decision.objective_priority >= .9
         or decision.role.startswith(("ctf_", "classic_ctf_", "vip_", "multihill_",
                                      "territory_", "demolition_", "diamond_",
-                                     "occupation_", "zombie_", "arena_")))
+                                     "occupation_", "zombie_", "arena_", "order_")))
 
 
 def _watch_approach(frame: PerceptionFrame, observer: PlayerSnapshot,
@@ -2401,13 +2406,16 @@ class ModePolicyMemory:
             self.reset()
             self.epoch = epoch
         key = (observer.player_id, observer.generation)
-        decision = objective_decision_for(frame, observer)
-        if (_canonical_mode(frame.mode_id) in {"vip", "hc_vip"}
-                and frame.behavior_version == "cooperative" and frame.mode_phase == "active"):
-            vip = _objective(frame, "vip", observer.team)
-            if vip is not None:
-                guards = self.guard_handoffs.guards(frame, observer.team, vip)
-                decision = VIPBotPolicy().decide(frame, observer, guard_ids=guards)
+        from .player_orders import player_order_decision
+        decision = player_order_decision(frame, observer)  # chat orders win
+        if decision is None:
+            decision = objective_decision_for(frame, observer)
+            if (_canonical_mode(frame.mode_id) in {"vip", "hc_vip"}
+                    and frame.behavior_version == "cooperative" and frame.mode_phase == "active"):
+                vip = _objective(frame, "vip", observer.team)
+                if vip is not None:
+                    guards = self.guard_handoffs.guards(frame, observer.team, vip)
+                    decision = VIPBotPolicy().decide(frame, observer, guard_ids=guards)
         if decision is None:
             decision = standing_order_for(frame, observer)
         if not mode_objective_committed(decision):
@@ -2422,7 +2430,7 @@ class ModePolicyMemory:
                    item.position if item.carrier_id < 0 and item.kind != "vip" else None)
                   for item in frame.objectives
                   # Another zombie's horde order is not this bot's business.
-                  if item.kind != "zombie_order"
+                  if item.kind not in ("zombie_order", "player_order")
                   or item.carrier_id == observer.player_id),
         )
         previous = self._states.get(key)

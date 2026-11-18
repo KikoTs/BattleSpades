@@ -405,6 +405,19 @@ browser, so verify registration with the source-tree checker described in the
 **Player** — `/help`, `/kill`, `/team <blue|green>`, `/score`, `/players`,
 `/pm <player> <msg>`, `/me <action>`, `/stats`, `/ping`
 
+Bot orders (any player on a team can order and `/status` their own team's bots, no
+admin needed; spectators who are not admins get no bot commands; see
+[docs/BOT_CHAT_ORDERS.md](docs/BOT_CHAT_ORDERS.md)) — `/follow`, `/hold`, `/attack`,
+`/defend`, `/protect`, `/escort`, `/free`, `/status`, each with optional bot names,
+and `/split <action> [<action>]` to divide the bots between two jobs;
+admins, playing or spectating, can command either team or both from anywhere with
+`/team <blue|green|all> <command>`, for example `/team blue split attack` or
+`/team all status` (an admin's both-team `/status` and `/team all status` group bots by order and half, e.g.
+`Blue hold: Rex, Ann | attack 1: Zed, Moe`; `/status full` gives the per-bot detail). Short forms (case-insensitive, usable at the top level and inside `/team` and
+`/split`): `t`=team, `sp`=split, `fo`=follow, `ho`=hold, `at`=attack, `de`=defend, `pr`=protect,
+`es`=escort, `fr`=free, `st`=status; team arguments `b`=blue, `g`=green, `a`=all, so
+`/t b sp at pr` is `/team blue split attack protect` (full table in docs/BOT_CHAT_ORDERS.md)
+
 **Admin** (after `/admin <password>`) — `/kick`, `/ban`, `/mute`, `/unmute`,
 `/tp <player>`, `/god`, `/map <name>`, `/mode <tdm|ctf|cctf|zom|vip|mh|tc|dia|dem|oc|arena>`, `/restart`, `/say <msg>`,
 `/fog <r> <g> <b>`, `/time`, `/balance`, `/bots status`,

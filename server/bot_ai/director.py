@@ -557,6 +557,8 @@ class BotDirector:
 
         if not self._started:
             return
+        if getattr(self, "_order_book", None) is not None:
+            self._order_book.clear_all()
         await self.prepare_for_game_transition()
         self._mode_epoch += 1
         self._clear_local_timeline()
@@ -1153,6 +1155,8 @@ class BotDirector:
         if force or map_signature != self._map_signature:
             self._map_signature = map_signature
             self._map_epoch += 1
+            if getattr(self, "_order_book", None) is not None:
+                self._order_book.clear_all()
             self._topology_version = int(getattr(world, "topology_version", 0))
             self._perception_cache_until = 0.0
             self._strategy_started_at = time.monotonic()
@@ -1867,6 +1871,7 @@ class BotDirector:
             ("team_anchor", self._objectives_team_anchors),
             ("zombie_refuge", self._objectives_zombie_refuge),
             ("zombie_order", self._objectives_zombie_horde),
+            ("player_order", self._objectives_player_orders),
             ("vip", self._objectives_vip),
             ("last_survivor", self._objectives_last_survivor),
         ):
@@ -2142,6 +2147,354 @@ class BotDirector:
             return life == _player_life_id(runtime.player) and 0 <= now-at <= 1.5
 
         return service.objectives(mode, self.server.world_manager, working=working)
+
+    def _objectives_player_orders(self, mode) -> list[ObjectiveSnapshot]:
+        """Chat-issued orders (/follow /hold ...), one objective per ordered bot."""
+        book = getattr(self, "_order_book", None)
+        if book is None or not len(book):
+            return []
+        self._maintain_orders(book)
+        return book.objectives((int(bot.id) for bot in self.bots), self._order_params())
+
+    def _order_params(self) -> tuple[float, float, float]:
+        """The operator's worker-side ``[bots] order_*`` tunables, stamped on every order."""
+        from .player_orders import (
+            DEFAULT_ATTACK_INTERCEPT_RADIUS, DEFAULT_DEFEND_CHASE_RADIUS, DEFAULT_HOLD_LEASH,
+            clamp_params,
+        )
+
+        config = getattr(self, "_config", None)
+        return clamp_params(
+            getattr(config, "order_hold_leash", DEFAULT_HOLD_LEASH),
+            getattr(config, "order_defend_chase_radius", DEFAULT_DEFEND_CHASE_RADIUS),
+            getattr(config, "order_attack_intercept_radius", DEFAULT_ATTACK_INTERCEPT_RADIUS),
+        )
+
+    def _intel_holders(self) -> dict[int, int]:
+        """``{intel team: player id of the carrier}`` for every carried intel."""
+        holders = getattr(getattr(getattr(self, "server", None), "mode", None), "intel_holder", None)
+        if not isinstance(holders, dict):
+            return {}
+        return {
+            int(team): int(holder.id)
+            for team, holder in holders.items()
+            if holder is not None
+        }
+
+    def _dropped_enemy_intel(self, team: int):
+        """Where the enemy's intel lies dropped and uncarried (None if it does not)."""
+        mode = getattr(getattr(self, "server", None), "mode", None)
+        holders = getattr(mode, "intel_holder", None)
+        positions = getattr(mode, "intel_positions", None)
+        drops = getattr(mode, "intel_drop_time", None)
+        if not (isinstance(holders, dict) and isinstance(positions, dict) and isinstance(drops, dict)):
+            return None
+        enemy = TEAM2 if int(team) == TEAM1 else TEAM1
+        if holders.get(enemy) is not None or float(drops.get(enemy, 0.0)) <= 0.0:
+            return None
+        where = positions.get(enemy)
+        return tuple(float(v) for v in where) if where is not None else None
+
+    def _sync_order_pickups(self, book) -> None:
+        """Choose the bots that go and grab a dropped enemy intel, per team and split half."""
+        from .player_orders import DEFAULT_PICKUP_COUNT, DEFAULT_PICKUP_RADIUS
+
+        config = getattr(self, "_config", None)
+        count = max(0, int(getattr(config, "order_pickup_count", DEFAULT_PICKUP_COUNT)))
+        radius = max(0.0, float(getattr(config, "order_pickup_radius", DEFAULT_PICKUP_RADIUS)))
+        by_id = {int(bot.id): bot for bot in self.bots}
+        for team in _PLAYABLE_TEAMS:
+            book.sync_pickups(
+                team, self._dropped_enemy_intel(team),
+                {bot_id: tuple(float(v) for v in bot.position) for bot_id, bot in by_id.items()
+                 if int(bot.team) == team},
+                lambda bot_id: bool(getattr(by_id[bot_id], "alive", True)),
+                count, radius,
+            )
+
+    def _sync_order_jobs(self, book) -> None:
+        """Split the /attack and /protect bots between escort and push jobs.
+
+        A friendly carrier is a teammate holding the enemy intel; a thief is an
+        enemy holding ours. /attack splits while a carrier exists, /protect
+        while a carrier and a thief both do. The jobs are fixed by bot id for
+        as long as that lasts (see ``PlayerOrderBook.sync_jobs``).
+        """
+        from .player_orders import (
+            ATTACK, DEFAULT_ATTACK_ESCORT_RATIO, DEFAULT_PROTECT_HUNT_RATIO, PROTECT,
+            attack_escort_count, protect_escort_count,
+        )
+
+        config = getattr(self, "_config", None)
+        attack_ratio = getattr(config, "order_attack_escort_ratio", DEFAULT_ATTACK_ESCORT_RATIO)
+        hunt_ratio = getattr(config, "order_protect_hunt_ratio", DEFAULT_PROTECT_HUNT_RATIO)
+        self._sync_order_pickups(book)
+        holders = self._intel_holders()
+        for team in _PLAYABLE_TEAMS:
+            enemy = TEAM2 if team == TEAM1 else TEAM1
+            carrier = holders.get(enemy)        # holds the enemy's intel: one of ours
+            thief = holders.get(team)           # holds our intel: one of theirs
+            exclude = () if carrier is None else (carrier,)
+            book.sync_jobs(team, ATTACK, carrier is not None,
+                           lambda n, r=attack_ratio: attack_escort_count(n, r), exclude)
+            book.sync_jobs(team, PROTECT, carrier is not None and thief is not None,
+                           lambda n, r=hunt_ratio: protect_escort_count(n, r), exclude)
+
+    def _maintain_orders(self, book) -> None:
+        """Drop orders that no longer make sense before they are published.
+
+        A bot that changed team forgets its order. A ``/follow`` whose issuer
+        died, left or changed team becomes ``/hold`` at the bot's current spot,
+        so the bots never chase the issuer's respawn.
+        """
+        book.drop_team_changes({int(bot.id): int(bot.team) for bot in self.bots})
+        self._release_orphaned_follows(book)
+        book.normalize_splits()      # a split that lost a half is no split
+        self._sync_order_jobs(book)
+
+    def _release_orphaned_follows(self, book) -> None:
+        """Apply what happens to orders when the player who gave them goes away.
+
+        A player who left the server takes every order they issued with them,
+        of every type (follow, hold, escort, a split's halves ...), exactly as
+        if they had typed /free; orders issued by other players stay. A
+        ``/follow`` whose issuer is still connected but died or changed team
+        turns into ``/hold`` where the bot stands instead. So does an
+        ``/escort`` whose issuer died, unless the bot is escorting a friendly
+        carrier at that moment (then nothing changes until he is gone).
+        """
+        server = getattr(self, "server", None)
+        players = getattr(server, "players", None)
+        if not hasattr(players, "values"):
+            return  # no roster to judge issuers against (unit-test directors)
+        roster = {int(player.id): player for player in tuple(players.values())}
+        for issuer_id in book.issuers() - roster.keys():
+            freed = book.clear_issued_by(issuer_id)
+            if freed:
+                logger.info("Bot orders: issuer %s left, freed %d order(s)", issuer_id, len(freed))
+
+        def issuer_alive(issuer_id: int, team: int) -> bool:
+            issuer = roster.get(int(issuer_id))
+            return (
+                issuer is not None
+                and bool(getattr(issuer, "alive", False))
+                and bool(getattr(issuer, "spawned", True))
+                and int(getattr(issuer, "team", -1)) == int(team)
+            )
+
+        def issuer_dead(issuer_id: int, team: int) -> bool:
+            issuer = roster.get(int(issuer_id))
+            return (
+                issuer is not None
+                and int(getattr(issuer, "team", -1)) == int(team)
+                and not (bool(getattr(issuer, "alive", False))
+                         and bool(getattr(issuer, "spawned", True)))
+            )
+
+        holders = self._intel_holders()
+
+        def has_carrier(team: int, bot_id: int) -> bool:
+            """A teammate other than this bot holds the enemy intel."""
+            carrier = holders.get(TEAM2 if team == TEAM1 else TEAM1)
+            return carrier is not None and carrier != int(bot_id)
+
+        book.release_orphaned_follows(
+            issuer_alive,
+            {int(bot.id): tuple(float(v) for v in bot.position) for bot in self.bots},
+            issuer_dead,
+            has_carrier,
+        )
+
+    def order_status(
+        self,
+        issuer: "Player",
+        names: tuple[str, ...] = (),
+        team: int | None = None,
+    ) -> list[tuple[str, str, int, str]]:
+        """``(bot name, order, split half, what it is doing)`` for a team's bots.
+
+        The team is the issuer's own unless ``team`` names another (an admin or
+        spectator commanding a team from outside). The half is 0 for a plain
+        order, 1 or 2 inside a /split.
+        """
+        from .player_orders import NAMES, describe_role
+
+        book = self.__dict__.get("_order_book")
+        team = self._order_team(issuer, team)
+        prefix = str(getattr(getattr(self, "_config", None), "name_prefix", "") or "")
+        rows: list[tuple[str, str, int, str]] = []
+        for bot in self._select_bots(team, names):
+            order = book.get(int(bot.id)) if book is not None else None
+            runtime = getattr(self, "_runtime", {}).get(int(bot.id))
+            intent = getattr(runtime, "intent", None)
+            if not bool(getattr(bot, "alive", True)):
+                doing = "dead, waiting to respawn"
+            elif intent is None:
+                doing = "idle"
+            else:
+                doing = describe_role(str(getattr(intent, "debug_role", "")))
+            label = bot.name[len(prefix):] if prefix and bot.name.startswith(prefix) else bot.name
+            rows.append((label, NAMES[order.code] if order is not None else "free",
+                         order.half if order is not None else 0, doing))
+        return rows
+
+    def _select_bots(self, team: int, names: tuple[str, ...]) -> list:
+        """The team's bots, narrowed to those whose name starts with or contains a name."""
+        candidates = [bot for bot in self.bots if int(bot.team) == team]
+        if names:
+            wanted = tuple(name.lower() for name in names)
+            candidates = [
+                bot for bot in candidates
+                if any(bot.name.lower().startswith(w) or w in bot.name.lower() for w in wanted)
+            ]
+        return candidates
+
+    @staticmethod
+    def _order_team(issuer: "Player", team: int | None) -> int:
+        return int(getattr(issuer, "team", -1)) if team is None else int(team)
+
+    @staticmethod
+    def _where(issuer: "Player", team: int) -> str:
+        return "your team" if int(getattr(issuer, "team", -1)) == team else "that team"
+
+    def _order_book_for_write(self):
+        from .player_orders import PlayerOrderBook
+
+        book = self.__dict__.get("_order_book")
+        if book is None:
+            book = self._order_book = PlayerOrderBook()
+        return book
+
+    def _follow_refusal(self, action: str, issuer: "Player", team: int) -> str | None:
+        """/follow needs an issuer on the team to follow; nobody else can be."""
+        if action == "follow" and int(getattr(issuer, "team", -1)) != team:
+            return "You are not on that team, so there is nobody for /follow to follow"
+        return None
+
+    def give_order(
+        self,
+        order: str,
+        issuer: "Player",
+        names: tuple[str, ...] = (),
+        team: int | None = None,
+    ) -> tuple[int, str]:
+        """Order a team's bots (or the named ones). Returns (count, message).
+
+        The team is the issuer's own unless ``team`` names another. A count of
+        0 means nothing was ordered and the message says why. A plain order
+        replaces any /split the team had: the bots keep their orders but are no
+        longer in a split.
+        """
+        from .player_orders import CODES, PlayerOrder
+
+        book = self._order_book_for_write()
+        team = self._order_team(issuer, team)
+        candidates = self._select_bots(team, names)
+        if not candidates:
+            return 0, f"No matching bots on {self._where(issuer, team)}"
+        if order == "free":
+            freed = sum(book.clear(int(bot.id)) for bot in candidates)
+            book.normalize_splits()
+            return freed, "released"
+        refusal = self._follow_refusal(order, issuer, team)
+        if refusal is not None:
+            return 0, refusal
+        code = CODES[order]
+        book.dissolve_splits(team)
+        for bot in candidates:
+            position = tuple(float(v) for v in bot.position)
+            book.issue(int(bot.id), PlayerOrder(code, team, int(issuer.id), position))
+        return len(candidates), order
+
+    def give_split(
+        self,
+        first: str,
+        second: str | None,
+        issuer: "Player",
+        names: tuple[str, ...] = (),
+        team: int | None = None,
+    ) -> tuple[int, str]:
+        """Split a team's bots into two halves by bot id. Returns (count, message).
+
+        Any action may be ``free``: that half plays normally but is still a
+        half of the split.
+
+        ``/split <first>``: the bots that already have an order keep it on the
+        first half (the larger one when the count is odd) and the second half
+        takes ``first``; bots without an order are left alone. When no selected
+        bot has an order, the selected bots split into a free first half and a
+        second half taking ``first``. ``/split <first> <second>``: every
+        selected bot is re-ordered, the first half to ``first`` and the second
+        to ``second``. Halves are fixed by bot id and stored in the orders, so
+        they survive death. A team that is already split is refused. A count
+        of 0 means nothing changed and the message says why.
+        """
+        from dataclasses import replace
+
+        from .player_orders import DONE_TEXT, SPLIT_CODES, PlayerOrder
+
+        for action in (first, second):
+            if action is not None and action not in SPLIT_CODES:
+                return 0, f"Unknown action '{action}'"
+        book = self._order_book_for_write()
+        team = self._order_team(issuer, team)
+        where = self._where(issuer, team)
+        chosen = self._select_bots(team, names)
+        if not chosen:
+            return 0, f"No matching bots on {where}"
+        for action in (first, second):
+            refusal = self._follow_refusal(action, issuer, team) if action else None
+            if refusal is not None:
+                return 0, refusal
+        if book.split_active(team):
+            return 0, (f"{where.capitalize()} is already split. Give a plain order "
+                       "(or /free) to end the split first")
+
+        def position(bot):
+            return tuple(float(v) for v in bot.position)
+
+        def give(bot, action, half):
+            book.issue(int(bot.id), PlayerOrder(
+                SPLIT_CODES[action], team, int(issuer.id), position(bot), half=half))
+
+        by_id = sorted(chosen, key=lambda b: int(b.id))
+        if second is None:
+            covered = [b for b in by_id if book.has_order(int(b.id))]
+            if covered:
+                if len(covered) < 2:
+                    return 0, "A split needs at least two bots with orders"
+                keep = (len(covered) + 1) // 2
+                for index, bot in enumerate(covered):
+                    if index < keep:
+                        book.issue(int(bot.id), replace(book.get(int(bot.id)), half=1))
+                    else:
+                        give(bot, first, 2)
+                return len(covered), (f"{keep} bot(s) keep their orders, "
+                                      f"{len(covered) - keep} now {DONE_TEXT[first]}")
+            # Nobody has an order: half the bots play free, half take the action.
+            if first == "free":
+                return 0, ("No bot has an order, so /split free would leave everyone free. "
+                           "Use /split <action> to split the team between free and an action")
+            if len(by_id) < 2:
+                return 0, "A split needs at least two bots"
+            larger = (len(by_id) + 1) // 2
+            for index, bot in enumerate(by_id):
+                if index < larger:
+                    give(bot, "free", 1)
+                else:
+                    give(bot, first, 2)
+            return len(by_id), (f"{larger} bot(s) free, "
+                                f"{len(by_id) - larger} {DONE_TEXT[first]}")
+        if first == second:
+            return 0, "Pick two different actions to split between"
+        if len(by_id) < 2:
+            return 0, "A split needs at least two bots"
+        larger = (len(by_id) + 1) // 2
+        for index, bot in enumerate(by_id):
+            action, half = (first, 1) if index < larger else (second, 2)
+            give(bot, action, half)
+        return len(by_id), (f"{larger} bot(s) {DONE_TEXT[first]}, "
+                            f"{len(by_id) - larger} {DONE_TEXT[second]}")
 
     def _objectives_zombie_refuge(self, mode) -> list[ObjectiveSnapshot]:
         refuge = self._zombie_refuge_objective(mode)
